@@ -1,14 +1,13 @@
 package models
 
 type VoyagerMigrationDetailsVoyager struct {
+	MachineIp string `json:"machine_ip"`
 
-    MachineIp string `json:"machine_ip"`
+	Os string `json:"os"`
 
-    Os string `json:"os"`
+	AvailDiskBytes string `json:"avail_disk_bytes"`
 
-    AvailDiskBytes string `json:"avail_disk_bytes"`
+	ExportDir string `json:"export_dir"`
 
-    ExportDir string `json:"export_dir"`
-
-    ExportedSchemaLocation string `json:"exported_schema_location"`
+	ExportedSchemaLocation string `json:"exported_schema_location"`
 }

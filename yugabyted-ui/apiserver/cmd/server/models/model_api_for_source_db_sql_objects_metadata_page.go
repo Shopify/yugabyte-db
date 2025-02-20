@@ -1,6 +1,5 @@
 package models
 
 type ApiForSourceDbSqlObjectsMetadataPage struct {
-
-    Data AssessmentSourceDbObject `json:"data"`
+	Data AssessmentSourceDbObject `json:"data"`
 }

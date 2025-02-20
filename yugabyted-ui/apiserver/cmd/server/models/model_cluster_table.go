@@ -2,14 +2,13 @@ package models
 
 // ClusterTable - Model representing a DB table
 type ClusterTable struct {
+	Name string `json:"name"`
 
-    Name string `json:"name"`
+	Keyspace string `json:"keyspace"`
 
-    Keyspace string `json:"keyspace"`
+	Uuid string `json:"uuid"`
 
-    Uuid string `json:"uuid"`
+	Type YbApiEnum `json:"type"`
 
-    Type YbApiEnum `json:"type"`
-
-    SizeBytes int64 `json:"size_bytes"`
+	SizeBytes int64 `json:"size_bytes"`
 }

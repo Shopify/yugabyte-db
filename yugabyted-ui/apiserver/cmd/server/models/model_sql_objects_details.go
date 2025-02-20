@@ -2,14 +2,13 @@ package models
 
 // SqlObjectsDetails - Sql obejcts type and count
 type SqlObjectsDetails struct {
+	ObjectType string `json:"objectType"`
 
-    ObjectType string `json:"objectType"`
+	TotalCount int32 `json:"totalCount"`
 
-    TotalCount int32 `json:"totalCount"`
+	InvalidCount int32 `json:"invalidCount"`
 
-    InvalidCount int32 `json:"invalidCount"`
+	ObjectNames string `json:"objectNames"`
 
-    ObjectNames string `json:"objectNames"`
-
-    ObjectDetails string `json:"objectDetails"`
+	ObjectDetails string `json:"objectDetails"`
 }

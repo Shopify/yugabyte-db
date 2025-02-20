@@ -2,10 +2,9 @@ package models
 
 // RaftConfig - Raft Config
 type RaftConfig struct {
+	Uuid string `json:"uuid"`
 
-    Uuid string `json:"uuid"`
+	Role string `json:"role"`
 
-    Role string `json:"role"`
-
-    Location string `json:"location"`
+	Location string `json:"location"`
 }

@@ -1,6 +1,5 @@
 package models
 
 type ActivitiesResponse struct {
-
-    Data []ActivityData `json:"data"`
+	Data []ActivityData `json:"data"`
 }

@@ -1,6 +1,5 @@
 package models
 
 type ApiForMigrationAssessmentPage struct {
-
-    Data MigrationAssessmentReport `json:"data"`
+	Data MigrationAssessmentReport `json:"data"`
 }

@@ -2,10 +2,9 @@ package models
 
 // TableReplicationInfo - TableReplicationInfo
 type TableReplicationInfo struct {
+	NumReplicas int32 `json:"num_replicas"`
 
-    NumReplicas int32 `json:"num_replicas"`
+	PlacementBlocks []PlacementBlock `json:"placement_blocks"`
 
-    PlacementBlocks []PlacementBlock `json:"placement_blocks"`
-
-    PlacementUuid string `json:"placement_uuid"`
+	PlacementUuid string `json:"placement_uuid"`
 }

@@ -1,12 +1,11 @@
 package models
 
 type VoyagerMigrationDetailsTargetCluster struct {
+	Ip string `json:"ip"`
 
-    Ip string `json:"ip"`
+	Port string `json:"port"`
 
-    Port string `json:"port"`
+	Engine string `json:"engine"`
 
-    Engine string `json:"engine"`
-
-    Version string `json:"version"`
+	Version string `json:"version"`
 }

@@ -2,28 +2,27 @@ package models
 
 // NodeData - Node data
 type NodeData struct {
+	Name string `json:"name"`
 
-    Name string `json:"name"`
+	Host string `json:"host"`
 
-    Host string `json:"host"`
+	IsNodeUp bool `json:"is_node_up"`
 
-    IsNodeUp bool `json:"is_node_up"`
+	IsMaster bool `json:"is_master"`
 
-    IsMaster bool `json:"is_master"`
+	IsTserver bool `json:"is_tserver"`
 
-    IsTserver bool `json:"is_tserver"`
+	IsReadReplica bool `json:"is_read_replica"`
 
-    IsReadReplica bool `json:"is_read_replica"`
+	PreferenceOrder int32 `json:"preference_order"`
 
-    PreferenceOrder int32 `json:"preference_order"`
+	IsMasterUp bool `json:"is_master_up"`
 
-    IsMasterUp bool `json:"is_master_up"`
+	IsBootstrapping bool `json:"is_bootstrapping"`
 
-    IsBootstrapping bool `json:"is_bootstrapping"`
+	Metrics NodeDataMetrics `json:"metrics"`
 
-    Metrics NodeDataMetrics `json:"metrics"`
+	CloudInfo NodeDataCloudInfo `json:"cloud_info"`
 
-    CloudInfo NodeDataCloudInfo `json:"cloud_info"`
-
-    SoftwareVersion string `json:"software_version"`
+	SoftwareVersion string `json:"software_version"`
 }
