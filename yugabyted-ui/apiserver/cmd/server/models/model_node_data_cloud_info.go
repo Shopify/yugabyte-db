@@ -1,10 +1,9 @@
 package models
 
 type NodeDataCloudInfo struct {
+	Cloud string `json:"cloud"`
 
-    Cloud string `json:"cloud"`
+	Region string `json:"region"`
 
-    Region string `json:"region"`
-
-    Zone string `json:"zone"`
+	Zone string `json:"zone"`
 }

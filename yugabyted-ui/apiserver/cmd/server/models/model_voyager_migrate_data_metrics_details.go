@@ -2,20 +2,19 @@ package models
 
 // VoyagerMigrateDataMetricsDetails - Voyager data migration metrics details
 type VoyagerMigrateDataMetricsDetails struct {
+	MigrationUuid string `json:"migration_uuid"`
 
-    MigrationUuid string `json:"migration_uuid"`
+	TableName string `json:"table_name"`
 
-    TableName string `json:"table_name"`
+	SchemaName string `json:"schema_name"`
 
-    SchemaName string `json:"schema_name"`
+	MigrationPhase int32 `json:"migration_phase"`
 
-    MigrationPhase int32 `json:"migration_phase"`
+	Status int32 `json:"status"`
 
-    Status int32 `json:"status"`
+	CountLiveRows int64 `json:"count_live_rows"`
 
-    CountLiveRows int64 `json:"count_live_rows"`
+	CountTotalRows int64 `json:"count_total_rows"`
 
-    CountTotalRows int64 `json:"count_total_rows"`
-
-    InvocationTimestamp string `json:"invocation_timestamp"`
+	InvocationTimestamp string `json:"invocation_timestamp"`
 }

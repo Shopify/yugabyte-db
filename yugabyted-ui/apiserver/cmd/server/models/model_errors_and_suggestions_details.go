@@ -2,20 +2,19 @@ package models
 
 // ErrorsAndSuggestionsDetails - Errors and suggestions details
 type ErrorsAndSuggestionsDetails struct {
+	IssueType string `json:"issueType"`
 
-    IssueType string `json:"issueType"`
+	ObjectType string `json:"objectType"`
 
-    ObjectType string `json:"objectType"`
+	ObjectName string `json:"objectName"`
 
-    ObjectName string `json:"objectName"`
+	Reason string `json:"reason"`
 
-    Reason string `json:"reason"`
+	SqlStatement string `json:"sqlStatement"`
 
-    SqlStatement string `json:"sqlStatement"`
+	FilePath string `json:"filePath"`
 
-    FilePath string `json:"filePath"`
+	Suggestion string `json:"suggestion"`
 
-    Suggestion string `json:"suggestion"`
-
-    GH string `json:"GH"`
+	GH string `json:"GH"`
 }

@@ -1,6 +1,5 @@
 package models
 
 type IndividualMigrationTaskInfo struct {
-
-    Data MigrateSchemaTaskInfo `json:"data"`
+	Data MigrateSchemaTaskInfo `json:"data"`
 }

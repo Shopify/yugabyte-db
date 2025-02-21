@@ -2,10 +2,9 @@ package models
 
 // ColumnInfo - Column Info
 type ColumnInfo struct {
+	Column string `json:"column"`
 
-    Column string `json:"column"`
+	Id string `json:"id"`
 
-    Id string `json:"id"`
-
-    Type string `json:"type"`
+	Type string `json:"type"`
 }

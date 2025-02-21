@@ -2,22 +2,21 @@ package models
 
 // MigrationAssessmentReport - Details of the migration assessment report
 type MigrationAssessmentReport struct {
+	AssessmentStatus bool `json:"assessment_status"`
 
-    AssessmentStatus bool `json:"assessment_status"`
+	Summary AssessmentReportSummary `json:"summary"`
 
-    Summary AssessmentReportSummary `json:"summary"`
+	SourceEnvironment SourceEnvironmentInfo `json:"source_environment"`
 
-    SourceEnvironment SourceEnvironmentInfo `json:"source_environment"`
+	SourceDatabase SourceDatabaseInfo `json:"source_database"`
 
-    SourceDatabase SourceDatabaseInfo `json:"source_database"`
+	TargetRecommendations TargetClusterRecommendationDetails `json:"target_recommendations"`
 
-    TargetRecommendations TargetClusterRecommendationDetails `json:"target_recommendations"`
+	RecommendedRefactoring RecommendedRefactoringGraph `json:"recommended_refactoring"`
 
-    RecommendedRefactoring RecommendedRefactoringGraph `json:"recommended_refactoring"`
+	UnsupportedDataTypes []UnsupportedSqlInfo `json:"unsupported_data_types"`
 
-    UnsupportedDataTypes []UnsupportedSqlInfo `json:"unsupported_data_types"`
+	UnsupportedFunctions []UnsupportedSqlInfo `json:"unsupported_functions"`
 
-    UnsupportedFunctions []UnsupportedSqlInfo `json:"unsupported_functions"`
-
-    UnsupportedFeatures []UnsupportedSqlInfo `json:"unsupported_features"`
+	UnsupportedFeatures []UnsupportedSqlInfo `json:"unsupported_features"`
 }
