@@ -3,22 +3,15 @@ import {
   AppBar,
   Box,
   makeStyles,
-  MenuItem,
   Toolbar,
   Divider,
   Typography,
-  IconButton,
-  Link as MUILink,
   Badge,
   Link,
 } from "@material-ui/core";
 import { useTranslation } from "react-i18next";
 import { Link as RouterLink } from "react-router-dom";
 
-import { YBDropdown } from "@app/components";
-import HelpIcon from "@app/assets/help.svg";
-import FileIcon from "@app/assets/file.svg";
-import SlackIcon from "@app/assets/slack.svg";
 import HeartCheckIcon from "@app/assets/heart-check.svg";
 import AlertGreenIcon from "@app/assets/alert-green.svg";
 import {
@@ -75,10 +68,8 @@ const useStyles = makeStyles((theme) => ({
   },
 }));
 
-const LINK_DOCUMENTATION = "https://docs.yugabyte.com/preview/explore/";
 export const LINK_SUPPORT =
   "https://support.yugabyte.com/hc/en-us/requests/new?ticket_form_id=360003113431";
-const LINK_SLACK = "https://yugabyte-db.slack.com/";
 
 export const Header: FC = () => {
   const classes = useStyles();
@@ -201,32 +192,6 @@ export const Header: FC = () => {
             <YBTextBadge ml={1.5}>{t("clusterDetail.nodes.connMgrEnabled")}</YBTextBadge>
           </Link>
         )}
-        <div className={classes.toRight}>
-          <Box display="flex">
-            <MUILink className={classes.sendFeedback} href={LINK_SLACK} target="_blank">
-              <SlackIcon className={classes.menuIcon} />
-              <Typography variant="body2">{t("common.joinSlack")}</Typography>
-            </MUILink>
-          </Box>
-          <YBDropdown
-            origin={
-              <IconButton>
-                <HelpIcon />
-              </IconButton>
-            }
-          >
-            <MenuItem component="a" href={LINK_DOCUMENTATION} target="_blank">
-              <FileIcon className={classes.menuIcon} />
-              <Typography variant="body2">{t("common.documentation")}</Typography>
-            </MenuItem>
-            {/* <MenuItem component="a" href={LINK_SLACK} target="_blank">
-              <Box width={24} mr={1} display="flex" justifyContent="center">
-                <SlackIcon />
-              </Box>
-              <Typography variant="body2">{t('common.ybSlack')}</Typography>
-            </MenuItem> */}
-          </YBDropdown>
-        </div>
         <Divider orientation="horizontal" variant="middle" absolute className={classes.divider} />
       </Toolbar>
     </AppBar>

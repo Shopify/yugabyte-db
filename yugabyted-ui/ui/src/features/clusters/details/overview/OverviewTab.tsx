@@ -161,9 +161,9 @@ export const OverviewTab: FC = () => {
   if (!Object.values(RelativeInterval).includes(interval)) {
     interval = RelativeInterval.LastHour;
   }
-  const isUnder24Hours = (timeString: string) => {
-    return Math.abs(new Date().getTime() - new Date(timeString).getTime()) < 86400000;
-  };
+  // const isUnder24Hours = (timeString: string) => {
+  //   return Math.abs(new Date().getTime() - new Date(timeString).getTime()) < 86400000;
+  // };
   const changeInterval = (newInterval: string) => {
     const newLocation = { ...location };
     searchParams.set(SEARCH_PARAM_INTERVAL, newInterval);
@@ -228,13 +228,13 @@ export const OverviewTab: FC = () => {
 
   const bannerClosed = localStorage.getItem("PERMANENT_CLOSE_BANNER") === "true";
 
-  const hasClosedPermanently: boolean = localStorage.getItem("PERMANENT_CLOSE_GS") === "true";
-  const hasClosedForCurrent: boolean = sessionStorage.getItem("TEMP_CLOSE_GS_BOX") === "true";
-  const isClusterRecentlyCreated =
-    isUnder24Hours(String(clusterData?.data?.info.metadata.created_on));
+  // const hasClosedPermanently: boolean = localStorage.getItem("PERMANENT_CLOSE_GS") === "true";
+  // const hasClosedForCurrent: boolean = sessionStorage.getItem("TEMP_CLOSE_GS_BOX") === "true";
+  // const isClusterRecentlyCreated =
+  //   isUnder24Hours(String(clusterData?.data?.info.metadata.created_on));
   const hasNoTables: boolean = tablesData?.tables.length === 0;
-  const showGetStarted: boolean = !hasClosedPermanently && !hasClosedForCurrent &&
-    (isClusterRecentlyCreated || hasNoTables);
+  // const showGetStarted: boolean = !hasClosedPermanently && !hasClosedForCurrent &&
+  //   (isClusterRecentlyCreated || hasNoTables);
 
   const { data: healthCheckData } = useGetClusterHealthCheckQuery();
   var cluster = clusterData?.data;
@@ -247,7 +247,7 @@ export const OverviewTab: FC = () => {
   }, [clusterData, hasNoTables]);
   return (
     <>
-    {!bannerClosed && hasNoTables &&
+    {false && !bannerClosed && hasNoTables &&
         (<Paper className={classes.banner}>
             <Box display="flex" gridGap={3} alignItems="center">
               <PurpleMigration />
@@ -264,7 +264,7 @@ export const OverviewTab: FC = () => {
             <CloseImage onClick={handleBannerClose} className={classes.closeBtn}/>
         </Paper>)
     }
-    {showGetStarted && (
+    {false && (
           <div>
             <Slide direction="left" in={modalOpen} mountOnEnter unmountOnExit>
               <Paper elevation={10} className={classes.paperModal}>

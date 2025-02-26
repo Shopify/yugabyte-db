@@ -1,14 +1,13 @@
 import React, { FC, useState } from "react";
 import clsx from "clsx";
 import { Link, NavLink, NavLinkProps, useRouteMatch } from "react-router-dom";
-import { makeStyles, Typography, Link as MUILink, Box } from "@material-ui/core";
+import { makeStyles, Typography, Box } from "@material-ui/core";
 import { useTranslation } from "react-i18next";
 import { browserStorage } from "@app/helpers";
 
 import YBLogoFull from "@app/assets/yugabyteDB-logo.svg";
 import YBLogo from "@app/assets/yb-logo.svg";
 import RocketIcon from "@app/assets/rocket.svg";
-import MigrateIcon from "@app/assets/migration.svg";
 import DbSecurityIcon from "@app/assets/database-security.svg";
 import MetricsIcon from "@app/assets/stats.svg";
 import DoubleArrowIcon from "@app/assets/double-arrow-left.svg";
@@ -158,8 +157,6 @@ interface NavLinkWithDisableProps extends NavLinkProps {
   disabled?: boolean;
   className?: string;
 }
-
-const YB_WIN_TSHIRT_PAGE = "https://www.yugabyte.com/community-rewards/";
 
 const NavLinkWithDisable: FC<NavLinkWithDisableProps> = ({ disabled, ...rest }) => {
   return disabled ? <span className={rest.className}>{rest.children}</span> : <NavLink {...rest} />;
@@ -334,44 +331,8 @@ export const Sidebar: FC<{ projectId: string }> = ({ projectId }) => {
             </Typography>
           </NavLinkWithDisable>
         </div>
-        <Typography
-          variant="subtitle2"
-          className={clsx(classes.label, isCollapsed && classes.hidden)}
-        >
-          {t("clusterDetail.migrations")}
-        </Typography>
-        <NavLinkWithDisable
-          disabled={isDisabled}
-          to={`/migrations`}
-          isActive={(_, location) => /^\/migrations/.test(location.pathname)}
-          className={classes.link}
-          activeClassName={classes.linkActive}
-          data-testid="SidebarLinkMigrations"
-        >
-          <MigrateIcon className={classes.icon} />
-          <Typography variant="body2" noWrap className={clsx(isCollapsed && classes.fadeOut)}>
-            {t("common.migrations")}
-          </Typography>
-        </NavLinkWithDisable>
 
         <div className={clsx(classes.footer, isCollapsed && classes.footerSmall)}>
-          <MUILink
-            className={classes.linkRow}
-            href={YB_WIN_TSHIRT_PAGE}
-            target="_blank"
-            data-testid="systemStatus"
-          >
-            {!isCollapsed && (
-              <Typography
-                variant="body2"
-                noWrap
-                color="textSecondary"
-                className={classes.claimShirtIcon}
-              >
-                {t("common.claimTshirt")}
-              </Typography>
-            )}
-          </MUILink>
           <div
             className={clsx(classes.expandIcon, isCollapsed && classes.rotateExpandIcon)}
             onClick={toggleWidth}
