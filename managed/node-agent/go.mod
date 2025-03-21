@@ -7,7 +7,7 @@ replace golang.org/x/crypto => golang.org/x/crypto v0.18.0
 require (
 	github.com/apex/log v1.9.0
 	github.com/creack/pty v1.1.18
-	github.com/golang-jwt/jwt/v4 v4.4.2
+	github.com/golang-jwt/jwt/v4 v4.5.2
 	github.com/google/uuid v1.3.0
 	github.com/gorilla/mux v1.8.0
 	github.com/olekukonko/tablewriter v0.0.5
