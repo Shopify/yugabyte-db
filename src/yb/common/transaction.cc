@@ -35,6 +35,19 @@ const char* kGlobalTransactionsTableName = "transactions";
 
 namespace {
 
+// Returns a reference to a string that lives for the entire lifetime of the process.
+//
+// Why is this necessary?
+// ----------------------
+// `kGlobalTransactionsTableName` is a *const char\**.  At runtime we update that pointer to
+// `storage.c_str()` so that every call-site continues to see a simple C-string.  This makes the
+// change totally transparent to existing code, but it also means the underlying memory must
+// **never** be freed while the process is running.  Using a function-local `static` guarantees the
+// string's storage is allocated the first time we need it and remains valid until process exit.
+//
+// An alternative would be a global `std::string`, but the indirection through this helper
+// function keeps the symbol's visibility local to this translation unit and avoids static
+// initialization order issues.
 std::string& MutableTransactionsTableNameInternal() {
   static std::string table_name_storage;
   return table_name_storage;
