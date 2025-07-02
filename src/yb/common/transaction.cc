@@ -20,6 +20,7 @@
 #include "yb/util/result.h"
 #include "yb/util/tsan_util.h"
 #include "yb/util/flags.h"
+#include "yb/util/logging.h"
 
 using namespace std::literals;
 
@@ -31,6 +32,45 @@ namespace yb {
 YB_STRONGLY_TYPED_UUID_IMPL(TransactionId);
 
 const char* kGlobalTransactionsTableName = "transactions";
+
+namespace {
+
+std::string& MutableTransactionsTableNameInternal() {
+  static std::string table_name_storage;
+  return table_name_storage;
+}
+
+bool InitializeTableNameInternal(const std::string& region) {
+  if (region.empty()) {
+    kGlobalTransactionsTableName = "transactions";
+    MutableTransactionsTableNameInternal().clear();
+  } else {
+    auto& storage = MutableTransactionsTableNameInternal();
+    storage = "transactions_shopify_" + region;
+    kGlobalTransactionsTableName = storage.c_str();
+  }
+  return true;
+}
+
+}  // namespace
+
+void initializeGlobalTransactionTableName(const std::string& region) {
+  static std::once_flag once_flag;
+  static std::string init_region;
+
+  bool called_first_time = false;
+  std::call_once(once_flag, [&] {
+    InitializeTableNameInternal(region);
+    init_region = region;
+    called_first_time = true;
+  });
+
+  if (!called_first_time) {
+    LOG(WARNING) << "initializeGlobalTransactionTableName called more than once (first region='"
+                 << init_region << "', subsequent region='" << region << "'). Ignoring.";
+  }
+}
+
 const std::string kMetricsSnapshotsTableName = "metrics";
 const std::string kTransactionTablePrefix = "transactions_";
 

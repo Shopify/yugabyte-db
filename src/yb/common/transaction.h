@@ -467,6 +467,13 @@ MonoDelta TransactionRpcTimeout();
 CoarseTimePoint TransactionRpcDeadline();
 
 extern const char* kGlobalTransactionsTableName;
+// BEGIN_EDIT
+// Initializes the global transactions table name once at process startup.
+// If called with a non-empty region, the table name becomes
+//   "transactions_shopify_<region>".
+// Subsequent invocations are ignored and will emit a warning.
+void initializeGlobalTransactionTableName(const std::string& region);
+// END_EDIT
 extern const std::string kMetricsSnapshotsTableName;
 extern const std::string kTransactionTablePrefix;
 
