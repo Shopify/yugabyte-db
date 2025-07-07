@@ -79,6 +79,7 @@
 #include "yb/rocksutil/rocksdb_encrypted_file_factory.h"
 
 #include "yb/tserver/server_main_util.h"
+#include "yb/common/transaction.h"
 
 using std::string;
 using namespace std::placeholders;
@@ -132,6 +133,7 @@ DECLARE_bool(enable_ysql_conn_mgr_stats);
 DECLARE_uint32(ysql_conn_mgr_port);
 DECLARE_bool(ysql_conn_mgr_use_unix_conn);
 
+DECLARE_string(placement_region);
 
 namespace yb {
 namespace tserver {
@@ -274,6 +276,9 @@ int TabletServerMain(int argc, char** argv) {
 
   LOG_AND_RETURN_FROM_MAIN_NOT_OK(MasterTServerParseFlagsAndInit(
       TabletServerOptions::kServerType, /*is_master=*/false, &argc, &argv));
+
+  // Initialize the global transactions table name with the region configured for this tserver.
+  initializeGlobalTransactionTableName(FLAGS_placement_region);
 
   auto termination_monitor = TerminationMonitor::Create();
 

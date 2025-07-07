@@ -20,6 +20,7 @@
 #include "yb/util/result.h"
 #include "yb/util/tsan_util.h"
 #include "yb/util/flags.h"
+#include "yb/util/logging.h"
 
 using namespace std::literals;
 
@@ -31,6 +32,58 @@ namespace yb {
 YB_STRONGLY_TYPED_UUID_IMPL(TransactionId);
 
 const char* kGlobalTransactionsTableName = "transactions";
+
+namespace {
+
+// Returns a reference to a string that lives for the entire lifetime of the process.
+//
+// Why is this necessary?
+// ----------------------
+// `kGlobalTransactionsTableName` is a *const char\**.  At runtime we update that pointer to
+// `storage.c_str()` so that every call-site continues to see a simple C-string.  This makes the
+// change totally transparent to existing code, but it also means the underlying memory must
+// **never** be freed while the process is running.  Using a function-local `static` guarantees the
+// string's storage is allocated the first time we need it and remains valid until process exit.
+//
+// An alternative would be a global `std::string`, but the indirection through this helper
+// function keeps the symbol's visibility local to this translation unit and avoids static
+// initialization order issues.
+std::string& MutableTransactionsTableNameInternal() {
+  static std::string table_name_storage;
+  return table_name_storage;
+}
+
+bool InitializeTableNameInternal(const std::string& region) {
+  if (region.empty()) {
+    kGlobalTransactionsTableName = "transactions";
+    MutableTransactionsTableNameInternal().clear();
+  } else {
+    auto& storage = MutableTransactionsTableNameInternal();
+    storage = "transactions_shopify_" + region;
+    kGlobalTransactionsTableName = storage.c_str();
+  }
+  return true;
+}
+
+}  // namespace
+
+void initializeGlobalTransactionTableName(const std::string& region) {
+  static std::once_flag once_flag;
+  static std::string init_region;
+
+  bool called_first_time = false;
+  std::call_once(once_flag, [&] {
+    InitializeTableNameInternal(region);
+    init_region = region;
+    called_first_time = true;
+  });
+
+  if (!called_first_time) {
+    LOG(WARNING) << "initializeGlobalTransactionTableName called more than once (first region='"
+                 << init_region << "', subsequent region='" << region << "'). Ignoring.";
+  }
+}
+
 const std::string kMetricsSnapshotsTableName = "metrics";
 const std::string kTransactionTablePrefix = "transactions_";
 
