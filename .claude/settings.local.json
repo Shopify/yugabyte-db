@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rg:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)",
+      "Bash(mkdir:*)",
+      "Bash(cp:*)",
+      "Bash(true)",
+      "Bash(rm:*)",
+      "Bash(protoc:*)",
+      "Bash(go install:*)",
+      "Bash(go mod:*)",
+      "Bash(go build:*)",
+      "Bash(./yb-client:*)",
+      "Bash(make:*)",
+      "Bash(go test:*)"
+    ],
+    "deny": []
+  },
+  "model": "claude-opus-4-20250514"
+}

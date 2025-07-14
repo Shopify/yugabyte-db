@@ -1,0 +1,29 @@
+syntax = "proto2";
+
+package yb.rpc;
+
+option go_package = "github.com/Shopify/yugabyte-db/shopify-yb-client/pb;pb";
+
+message RemoteMethodPB {
+  required string service_name = 1;
+  required string method_name = 2;
+}
+
+message RequestHeader {
+  optional int32 call_id = 1;
+  optional RemoteMethodPB remote_method = 2;
+  optional uint32 timeout_millis = 3;
+  repeated fixed32 sidecar_offsets = 4 [packed = true];
+}
+
+message ResponseHeader {
+  required int32 call_id = 1;
+  optional bool is_error = 2 [ default = false ];
+  repeated uint32 sidecar_offsets = 3;
+}
+
+message ErrorStatusPB {
+  required string message = 1;
+  optional int32 code = 2;
+  optional int32 posix_code = 3;
+}

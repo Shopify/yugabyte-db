@@ -1,0 +1,181 @@
+syntax = "proto2";
+
+package yb.master;
+
+option go_package = "github.com/Shopify/yugabyte-db/shopify-yb-client/pb;pb";
+
+message ListTabletServersRequestPB {
+  optional bool primary_only = 1 [default = false];
+  optional bytes tablespace_id = 2;
+}
+
+message ListTabletServersResponsePB {
+  optional MasterErrorPB error = 1;
+
+  message Entry {
+    required NodeInstancePB instance_id = 1;
+    optional TSRegistrationPB registration = 2;
+    optional int32 millis_since_heartbeat = 3;
+    optional bool alive = 4;
+  }
+  repeated Entry servers = 2;
+}
+
+// Basic types needed for the response
+message MasterErrorPB {
+  enum Code {
+    UNKNOWN_ERROR = 1;
+    INVALID_TABLE = 2;
+    NOT_THE_LEADER = 3;
+  }
+  required Code code = 1;
+  required AppStatusPB status = 2;
+}
+
+message AppStatusPB {
+  required int32 code = 1;
+  required string message = 2;
+  optional int32 posix_code = 3;
+}
+
+message NodeInstancePB {
+  required bytes permanent_uuid = 1;
+  required int64 instance_seqno = 2;
+  optional int64 start_time_us = 3;
+}
+
+message TSRegistrationPB {
+  optional ServerRegistrationPB common = 1;
+  repeated TSInformationPB capabilities = 2;
+}
+
+message ServerRegistrationPB {
+  repeated HostPortPB private_rpc_addresses = 1;
+  repeated HostPortPB broadcast_addresses = 2;
+  repeated HostPortPB http_addresses = 3;
+  optional string placement_cloud = 4;
+  optional string placement_region = 5;
+  optional string placement_zone = 6;
+  optional bytes placement_uuid = 7;
+}
+
+message HostPortPB {
+  optional string host = 1;
+  optional uint32 port = 2;
+}
+
+message TSInformationPB {
+  enum TSInfoType {
+    UNKNOWN = 0;
+    READ_REPLICA = 1;
+  }
+  required TSInfoType tserver_type = 1;
+}
+
+// Additional RPC messages for other endpoints
+
+// ListMasters messages
+message ListMastersRequestPB {
+}
+
+message ListMastersResponsePB {
+  repeated ServerEntryPB masters = 1;
+  optional MasterErrorPB error = 2;
+}
+
+message ServerEntryPB {
+  optional AppStatusPB error = 1;
+  optional NodeInstancePB instance_id = 2;
+  optional ServerRegistrationPB registration = 3;
+  optional PeerRole role = 4;
+}
+
+enum PeerRole {
+  FOLLOWER = 0;
+  LEADER = 1;
+  CANDIDATE = 2;
+  UNKNOWN_ROLE = 999;
+}
+
+// GetMasterRegistration messages
+message GetMasterRegistrationRequestPB {
+}
+
+message GetMasterRegistrationResponsePB {
+  required NodeInstancePB instance_id = 1;
+  optional ServerRegistrationPB registration = 2;
+  optional PeerRole role = 3;
+  optional MasterErrorPB error = 4;
+}
+
+// GetMasterClusterConfig messages
+message GetMasterClusterConfigRequestPB {
+}
+
+message GetMasterClusterConfigResponsePB {
+  optional MasterErrorPB error = 1;
+  optional SysClusterConfigEntryPB cluster_config = 2;
+}
+
+message SysClusterConfigEntryPB {
+  optional int32 version = 1;
+  optional ReplicationInfoPB replication_info = 2;
+  optional BlacklistPB server_blacklist = 3;
+  optional string cluster_uuid = 4;
+  optional EncryptionInfoPB encryption_info = 5;
+  optional bytes consumer_registry = 6;  // Simplified - we don't parse CDC info
+  optional BlacklistPB leader_blacklist = 7;
+  optional string universe_uuid = 8;
+}
+
+message BlacklistPB {
+  repeated HostPortPB hosts = 1;
+  optional int32 initial_replica_load = 2;
+  optional int32 initial_leader_load = 3;
+}
+
+message ReplicationInfoPB {
+  optional PlacementInfoPB live_replicas = 1;
+  repeated PlacementInfoPB read_replicas = 2;
+  repeated CloudInfoPB affinitized_leaders = 3;
+  repeated CloudInfoListPB multi_affinitized_leaders = 4;
+}
+
+message CloudInfoListPB {
+  repeated CloudInfoPB cloud_infos = 1;
+}
+
+message PlacementInfoPB {
+  optional int32 num_replicas = 1;
+  repeated PlacementBlockPB placement_blocks = 2;
+  optional bytes placement_uuid = 3;
+}
+
+message PlacementBlockPB {
+  optional CloudInfoPB cloud_info = 1;
+  optional int32 min_num_replicas = 2;
+}
+
+message CloudInfoPB {
+  optional string placement_cloud = 1;
+  optional string placement_region = 2;
+  optional string placement_zone = 3;
+}
+
+message EncryptionInfoPB {
+  optional bool encryption_enabled = 1;
+  optional bytes universe_key_registry_encoded = 2;
+  optional string key_path = 3;
+  optional string latest_version_id = 4;
+  optional bool key_in_memory = 5;
+}
+
+// Connection context message
+message ConnectionContextPB {
+  optional UserInformationPB user_info = 1;
+}
+
+message UserInformationPB {
+  optional string effective_user = 1;
+  optional string real_user = 2;
+}
