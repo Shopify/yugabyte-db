@@ -318,6 +318,20 @@ enum CDCSDKRequestSource {
   WALSENDER = 2;
 }
 
+// Server-side row filtering for CDC streams.
+// Allows clients to filter records at the source, reducing network traffic
+// and client-side processing for multi-tenant and selective streaming scenarios.
+// Only filters data rows (INSERT/UPDATE/DELETE); transaction markers and DDL
+// records are always included.
+message CDCRowFilterPB {
+  // Name of the column to filter on (e.g., "shop_id")
+  optional string column_name = 1;
+
+  // List of int64 values to match against (column_value IN values)
+  // For single value filtering, pass a list with one element
+  repeated int64 values = 2;
+}
+
 message GetChangesRequestPB {
   optional bytes stream_id = 1;
   // Tablet to get the changes for.
@@ -363,6 +377,13 @@ message GetChangesRequestPB {
 
   // If true, update the cdc_state checkpoint as part of this request.
   optional bool force_update_cdc_state_checkpoint = 17;
+
+  // Server-side row filtering to reduce network traffic and client-side processing.
+  // If specified, only records matching the filter will be returned in the response.
+  // Transaction markers (BEGIN/COMMIT) and DDL records can optionally be included
+  // regardless of filter result (controlled by filter settings).
+  // Empty/absent filter returns all records (backward compatible behavior).
+  optional CDCRowFilterPB row_filter = 18;
 }
 
 message KeyValuePairPB {

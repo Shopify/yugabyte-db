@@ -25,6 +25,7 @@
 
 #include "yb/cdc/cdc_error.h"
 #include "yb/cdc/cdc_producer.h"
+#include "yb/cdc/cdc_row_filter.h"
 #include "yb/cdc/cdc_service.pb.h"
 #include "yb/cdc/cdc_service.proxy.h"
 #include "yb/cdc/cdc_service_context.h"
@@ -1904,6 +1905,43 @@ void CDCServiceImpl::GetChanges(
         producer_tablet, commit_timestamp, cached_schema_details,
         OpId::FromPB(resp->cdc_sdk_checkpoint()));
     impl_->UpdateSchemaPackingStorages(schema_packing_storages);
+
+    // Apply server-side row filtering if specified
+    if (req->has_row_filter() && status.ok()) {
+      CDCRowFilter row_filter(req->row_filter());
+      if (!row_filter.IsEmpty()) {
+        VLOG(1) << "Applying row filter to " << resp->cdc_sdk_proto_records_size()
+                << " records for tablet " << req->tablet_id();
+
+        auto* records = resp->mutable_cdc_sdk_proto_records();
+        google::protobuf::RepeatedPtrField<CDCSDKProtoRecordPB> filtered_records;
+
+        int original_count = records->size();
+        int filtered_count = 0;
+
+        for (auto& record : *records) {
+          auto matches = row_filter.Matches(record.row_message());
+          if (!matches.ok()) {
+            LOG(WARNING) << "Filter evaluation failed for tablet " << req->tablet_id()
+                         << ": " << matches.status();
+            // On filter error, include the record (fail-open)
+            *filtered_records.Add() = std::move(record);
+            continue;
+          }
+
+          if (*matches) {
+            *filtered_records.Add() = std::move(record);
+            filtered_count++;
+          }
+        }
+
+        // Replace response records with filtered records
+        resp->mutable_cdc_sdk_proto_records()->Swap(&filtered_records);
+
+        VLOG(1) << "Row filter kept " << filtered_count << " of " << original_count
+                << " records for tablet " << req->tablet_id();
+      }
+    }
   }
 
   if (FLAGS_enable_xcluster_stat_collection) {

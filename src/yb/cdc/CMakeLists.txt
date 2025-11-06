@@ -102,6 +102,7 @@ ADD_YB_LIBRARY(
 
 set(CDC_SRCS
   cdc_service.cc
+  cdc_row_filter.cc
   xrepl_metrics.cc
   xcluster_producer.cc
   xcluster_producer_bootstrap.cc
@@ -121,4 +122,5 @@ ADD_YB_LIBRARY(
 
 # Tests
 set(YB_TEST_LINK_LIBS integration-tests ${YB_MIN_TEST_LIBS})
+ADD_YB_TEST(cdc_row_filter-test)
 ADD_YB_TEST(xcluster_producer-test)
