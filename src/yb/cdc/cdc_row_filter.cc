@@ -11,6 +11,8 @@
 // under the License.
 
 #include "yb/cdc/cdc_row_filter.h"
+#include "yb/util/result.h"
+#include "yb/util/status_macros.h"
 
 #include <algorithm>
 
