@@ -11,12 +11,12 @@
 // under the License.
 
 #include "yb/cdc/cdc_row_filter.h"
-#include "yb/util/result.h"
-#include "yb/util/status_macros.h"
 
 #include <algorithm>
 
 #include "yb/util/logging.h"
+#include "yb/util/result.h"
+#include "yb/util/status_format.h"
 
 namespace yb {
 namespace cdc {
