@@ -37,34 +37,36 @@
 # under the License.
 #
 
-. "${BASH_SOURCE%/*}/../../../build-support/common-build-env.sh"
-
-if [[ -z ${BUILD_ROOT:-} ]]; then
-  set_cmake_build_type_and_compiler_type
-  set_build_root
-fi
-
-find_or_download_thirdparty
-
-THIRDPARTY_BUILD_TYPE=uninstrumented
-
-thirdparty_installed_dir_from_cmake_cache=$(
-  grep --max-count=1 "YB_THIRDPARTY_INSTALLED_DIR:STRING=" "${BUILD_ROOT}/CMakeCache.txt"
-)
-
-if [[ -n ${thirdparty_installed_dir_from_cmake_cache} ]]; then
-  thirdparty_installed_dir=${thirdparty_installed_dir_from_cmake_cache#*:STRING=}
+# Check if protoc is available on the system PATH first
+if which protoc > /dev/null 2>&1; then
+  PROTOC_BIN=$( which protoc )
 else
-  thirdparty_installed_dir="$YB_THIRDPARTY_DIR/installed/$THIRDPARTY_BUILD_TYPE"
-fi
-PROTOC_BIN=${thirdparty_installed_dir}/${THIRDPARTY_BUILD_TYPE}/bin/protoc
+  # Fall back to thirdparty protoc
+  . "${BASH_SOURCE%/*}/../../../build-support/common-build-env.sh"
 
-if [[ ! -f $PROTOC_BIN ]]; then
-  if which protoc > /dev/null; then
-    PROTOC_BIN=$( which protoc )
+  if [[ -z ${BUILD_ROOT:-} ]]; then
+    set_cmake_build_type_and_compiler_type
+    set_build_root
+  fi
+
+  find_or_download_thirdparty
+
+  THIRDPARTY_BUILD_TYPE=uninstrumented
+
+  thirdparty_installed_dir_from_cmake_cache=$(
+    grep --max-count=1 "YB_THIRDPARTY_INSTALLED_DIR:STRING=" "${BUILD_ROOT}/CMakeCache.txt"
+  )
+
+  if [[ -n ${thirdparty_installed_dir_from_cmake_cache} ]]; then
+    thirdparty_installed_dir=${thirdparty_installed_dir_from_cmake_cache#*:STRING=}
   else
-    fatal "Error: protoc is missing at '$PROTOC_BIN' (YB_THIRDPARTY_DIR=$YB_THIRDPARTY_DIR) and " \
-          "on the PATH"
+    thirdparty_installed_dir="$YB_THIRDPARTY_DIR/installed/$THIRDPARTY_BUILD_TYPE"
+  fi
+  PROTOC_BIN=${thirdparty_installed_dir}/${THIRDPARTY_BUILD_TYPE}/bin/protoc
+
+  if [[ ! -f $PROTOC_BIN ]]; then
+    echo "Error: protoc is missing at '$PROTOC_BIN' (YB_THIRDPARTY_DIR=$YB_THIRDPARTY_DIR) and on the PATH"
+    exit 1
   fi
 fi
 

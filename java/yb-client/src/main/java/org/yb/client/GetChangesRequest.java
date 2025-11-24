@@ -16,7 +16,9 @@ package org.yb.client;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Message;
 import io.netty.buffer.ByteBuf;
+import java.util.List;
 import org.yb.cdc.CdcService;
+import org.yb.cdc.CdcService.CDCRowFilterPB;
 import org.yb.cdc.CdcService.GetChangesRequestPB;
 import org.yb.cdc.CdcService.GetChangesResponsePB;
 import org.yb.util.Pair;
@@ -39,24 +41,34 @@ public class GetChangesRequest extends YRpc<GetChangesResponse> {
   private final String tableId;
   private final long safeHybridTime;
   private final int walSegmentIndex;
+  private final String rowFilterColumnName;
+  private final List<Long> rowFilterValues;
 
   public GetChangesRequest(YBTable table, String streamId, String tabletId,
    long term, long index, byte[] key, int write_id, long time, boolean needSchemaInfo) {
     this(table, streamId, tabletId, term, index, key, write_id, time, needSchemaInfo,
-         null, new String(""), -1);
+         null, new String(""), -1, 0, null, null);
   }
 
   public GetChangesRequest(YBTable table, String streamId, String tabletId, long term, long index,
       byte[] key, int write_id, long time, boolean needSchemaInfo,
       CdcSdkCheckpoint explicitCheckpoint, String tableId, long safeHybridTime) {
     this(table, streamId, tabletId, term, index, key, write_id, time, needSchemaInfo,
-        explicitCheckpoint, tableId, safeHybridTime, 0);
+        explicitCheckpoint, tableId, safeHybridTime, 0, null, null);
   }
 
   public GetChangesRequest(YBTable table, String streamId, String tabletId, long term, long index,
       byte[] key, int write_id, long time, boolean needSchemaInfo,
       CdcSdkCheckpoint explicitCheckpoint, String tableId, long safeHybridTime,
       int walSegmentIndex) {
+    this(table, streamId, tabletId, term, index, key, write_id, time, needSchemaInfo,
+        explicitCheckpoint, tableId, safeHybridTime, walSegmentIndex, null, null);
+  }
+
+  public GetChangesRequest(YBTable table, String streamId, String tabletId, long term, long index,
+      byte[] key, int write_id, long time, boolean needSchemaInfo,
+      CdcSdkCheckpoint explicitCheckpoint, String tableId, long safeHybridTime,
+      int walSegmentIndex, String rowFilterColumnName, List<Long> rowFilterValues) {
     super(table);
     this.streamId = streamId;
     this.tabletId = tabletId;
@@ -70,6 +82,8 @@ public class GetChangesRequest extends YRpc<GetChangesResponse> {
     this.tableId = tableId;
     this.safeHybridTime = safeHybridTime;
     this.walSegmentIndex = walSegmentIndex;
+    this.rowFilterColumnName = rowFilterColumnName;
+    this.rowFilterValues = rowFilterValues;
   }
 
   @Override
@@ -113,6 +127,14 @@ public class GetChangesRequest extends YRpc<GetChangesResponse> {
     }
 
     builder.setWalSegmentIndex(walSegmentIndex);
+
+    // Add row filter if specified
+    if (rowFilterColumnName != null && rowFilterValues != null && !rowFilterValues.isEmpty()) {
+      CDCRowFilterPB.Builder filterBuilder = CDCRowFilterPB.newBuilder();
+      filterBuilder.setColumnName(rowFilterColumnName);
+      filterBuilder.addAllValues(rowFilterValues);
+      builder.setRowFilter(filterBuilder.build());
+    }
 
     return toChannelBuffer(header, builder.build());
   }

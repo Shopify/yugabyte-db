@@ -595,6 +595,57 @@ public class AsyncYBClient implements AutoCloseable {
       CdcSdkCheckpoint explicitCheckpoint,
       long safeHybridTime,
       int walSegmentIndex) {
+    return getChangesCDCSDK(
+        table,
+        streamId,
+        tabletId,
+        term,
+        index,
+        key,
+        write_id,
+        time,
+        needSchemaInfo,
+        explicitCheckpoint,
+        safeHybridTime,
+        walSegmentIndex,
+        null,
+        null);
+  }
+
+  /**
+   * Get changes for a given tablet and stream with optional row filtering.
+   *
+   * @param table the table to get changes for.
+   * @param streamId the stream to get changes for.
+   * @param tabletId the tablet to get changes for.
+   * @param term the term of the checkpoint.
+   * @param index the index of the checkpoint.
+   * @param key the key of the checkpoint.
+   * @param write_id the write id of the checkpoint.
+   * @param time the time of the checkpoint.
+   * @param needSchemaInfo whether schema info is needed.
+   * @param explicitCheckpoint the explicit checkpoint.
+   * @param safeHybridTime the safe hybrid time.
+   * @param walSegmentIndex the wal segment index.
+   * @param rowFilterColumnName the column name to filter on (null for no filtering).
+   * @param rowFilterValues the list of int64 values to match (null for no filtering).
+   * @return a Deferred object to track the progress of the get changes operation.
+   */
+  public Deferred<GetChangesResponse> getChangesCDCSDK(
+      YBTable table,
+      String streamId,
+      String tabletId,
+      long term,
+      long index,
+      byte[] key,
+      int write_id,
+      long time,
+      boolean needSchemaInfo,
+      CdcSdkCheckpoint explicitCheckpoint,
+      long safeHybridTime,
+      int walSegmentIndex,
+      String rowFilterColumnName,
+      java.util.List<Long> rowFilterValues) {
     checkIsClosed();
     GetChangesRequest rpc =
         new GetChangesRequest(
@@ -610,7 +661,9 @@ public class AsyncYBClient implements AutoCloseable {
             explicitCheckpoint,
             table.getTableId(),
             safeHybridTime,
-            walSegmentIndex);
+            walSegmentIndex,
+            rowFilterColumnName,
+            rowFilterValues);
     rpc.maxAttempts = this.maxAttempts;
     Deferred<GetChangesResponse> d = rpc.getDeferred();
     d.addErrback(
