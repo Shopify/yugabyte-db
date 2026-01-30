@@ -563,7 +563,8 @@ class PgApiImpl {
                    bool is_region_local,
                    PgStatement **handle,
                    YbcPgTransactionSetting transaction_setting =
-                       YbcPgTransactionSetting::YB_TRANSACTIONAL);
+                       YbcPgTransactionSetting::YB_TRANSACTIONAL,
+                   const char *query_comment = nullptr);
 
   Status ExecInsert(PgStatement *handle);
 
@@ -579,7 +580,8 @@ class PgApiImpl {
                    bool is_region_local,
                    PgStatement **handle,
                    YbcPgTransactionSetting transaction_setting =
-                       YbcPgTransactionSetting::YB_TRANSACTIONAL);
+                       YbcPgTransactionSetting::YB_TRANSACTIONAL,
+                   const char *query_comment = nullptr);
 
   Status ExecUpdate(PgStatement *handle);
 
@@ -589,7 +591,8 @@ class PgApiImpl {
                    bool is_region_local,
                    PgStatement **handle,
                    YbcPgTransactionSetting transaction_setting =
-                       YbcPgTransactionSetting::YB_TRANSACTIONAL);
+                       YbcPgTransactionSetting::YB_TRANSACTIONAL,
+                   const char *query_comment = nullptr);
 
   Status ExecDelete(PgStatement *handle);
 

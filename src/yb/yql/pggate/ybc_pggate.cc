@@ -1599,9 +1599,10 @@ YbcStatus YBCPgNewInsert(const YbcPgOid database_oid,
                          const YbcPgOid table_relfilenode_oid,
                          bool is_region_local,
                          YbcPgStatement *handle,
-                         YbcPgTransactionSetting transaction_setting) {
+                         YbcPgTransactionSetting transaction_setting,
+                         const char *query_comment) {
   const PgObjectId table_id(database_oid, table_relfilenode_oid);
-  return ToYBCStatus(pgapi->NewInsert(table_id, is_region_local, handle, transaction_setting));
+  return ToYBCStatus(pgapi->NewInsert(table_id, is_region_local, handle, transaction_setting, query_comment));
 }
 
 YbcStatus YBCPgExecInsert(YbcPgStatement handle) {
@@ -1631,9 +1632,10 @@ YbcStatus YBCPgNewUpdate(const YbcPgOid database_oid,
                          const YbcPgOid table_relfilenode_oid,
                          bool is_region_local,
                          YbcPgStatement *handle,
-                         YbcPgTransactionSetting transaction_setting) {
+                         YbcPgTransactionSetting transaction_setting,
+                         const char *query_comment) {
   const PgObjectId table_id(database_oid, table_relfilenode_oid);
-  return ToYBCStatus(pgapi->NewUpdate(table_id, is_region_local, handle, transaction_setting));
+  return ToYBCStatus(pgapi->NewUpdate(table_id, is_region_local, handle, transaction_setting, query_comment));
 }
 
 YbcStatus YBCPgExecUpdate(YbcPgStatement handle) {
@@ -1645,9 +1647,10 @@ YbcStatus YBCPgNewDelete(const YbcPgOid database_oid,
                          const YbcPgOid table_relfilenode_oid,
                          bool is_region_local,
                          YbcPgStatement *handle,
-                         YbcPgTransactionSetting transaction_setting) {
+                         YbcPgTransactionSetting transaction_setting,
+                         const char *query_comment) {
   const PgObjectId table_id(database_oid, table_relfilenode_oid);
-  return ToYBCStatus(pgapi->NewDelete(table_id, is_region_local, handle, transaction_setting));
+  return ToYBCStatus(pgapi->NewDelete(table_id, is_region_local, handle, transaction_setting, query_comment));
 }
 
 YbcStatus YBCPgExecDelete(YbcPgStatement handle) {

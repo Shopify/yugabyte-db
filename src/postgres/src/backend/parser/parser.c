@@ -499,3 +499,59 @@ invalid_pair:
 								 yyscanner)));
 	return NULL;				/* keep compiler quiet */
 }
+
+/*
+ * extract_first_sql_comment
+ *     Extract the first C-style block comment from a SQL query string
+ *     Returns palloc'd string with comment content (without delimiters), or NULL
+ */
+char *
+extract_first_sql_comment(const char *query_string)
+{
+	const char *start;
+	const char *end;
+	int			len;
+	char	   *comment;
+	char	   *p;
+
+	if (!query_string)
+		return NULL;
+
+	/* Find start of comment */
+	start = strstr(query_string, "/*");
+	if (!start)
+		return NULL;
+
+	/* Find end of comment */
+	end = strstr(start + 2, "*/");
+	if (!end)
+		return NULL;
+
+	/* Extract content between comment delimiters */
+	len = end - (start + 2);
+	if (len <= 0)
+		return NULL;
+
+	comment = palloc(len + 1);
+	memcpy(comment, start + 2, len);
+	comment[len] = '\0';
+
+	/* Trim leading/trailing whitespace */
+	p = comment;
+	while (*p && isspace((unsigned char) *p))
+		p++;
+
+	if (*p == '\0')
+	{
+		pfree(comment);
+		return NULL;
+	}
+
+	/* Trim trailing */
+	len = strlen(p);
+	while (len > 0 && isspace((unsigned char) p[len - 1]))
+		len--;
+	p[len] = '\0';
+
+	return p == comment ? comment : pstrdup(p);
+}

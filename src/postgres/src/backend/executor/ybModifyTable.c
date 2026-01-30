@@ -57,6 +57,7 @@
 #include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/ybplan.h"
+#include "parser/parser.h"
 #include "pg_yb_utils.h"
 #include "tcop/pquery.h"
 #include "utils/builtins.h"
@@ -420,13 +421,18 @@ YBCExecuteInsertInternal(Oid dboid,
 {
 	Oid			relfileNodeId = YbGetRelfileNodeId(rel);
 	YbcPgStatement insert_stmt = NULL;
+	char	   *query_comment = NULL;
+
+	/* Extract SQL comment for CDC tracking */
+	query_comment = extract_first_sql_comment(debug_query_string);
 
 	/* Create the INSERT request and add the values from the tuple. */
 	HandleYBStatus(YBCPgNewInsert(dboid,
 								  relfileNodeId,
 								  YBCIsRegionLocal(rel),
 								  &insert_stmt,
-								  transaction_setting));
+								  transaction_setting,
+								  query_comment));
 
 	YBCApplyInsertRow(insert_stmt, rel, slot, onConflictAction, ybctid,
 					  transaction_setting);
@@ -779,7 +785,8 @@ YBCExecuteInsertIndexForDb(Oid dboid,
 								  YBCIsRegionLocal(index), &insert_stmt,
 								  (is_non_distributed_txn_write ?
 								   YB_NON_TRANSACTIONAL :
-								   YB_TRANSACTIONAL)));
+								   YB_TRANSACTIONAL),
+								  NULL /* query_comment */));
 
 	callback(insert_stmt, indexstate, index, values, isnull,
 			 RelationGetNumberOfAttributes(index),
@@ -824,16 +831,21 @@ YBCExecuteDelete(Relation rel,
 	YbcPgStatement delete_stmt = NULL;
 	Datum		ybctid;
 	Oid			relfileNodeId = YbGetRelfileNodeId(rel);
+	char	   *query_comment = NULL;
 
 	/* YB_SINGLE_SHARD_TRANSACTION always implies target tuple wasn't fetched. */
 	Assert((transaction_setting != YB_SINGLE_SHARD_TRANSACTION) || !target_tuple_fetched);
+
+	/* Extract SQL comment for CDC tracking */
+	query_comment = extract_first_sql_comment(debug_query_string);
 
 	/* Create DELETE request. */
 	HandleYBStatus(YBCPgNewDelete(dboid,
 								  relfileNodeId,
 								  YBCIsRegionLocal(rel),
 								  &delete_stmt,
-								  transaction_setting));
+								  transaction_setting,
+								  query_comment));
 
 	/*
 	 * Look for ybctid. Raise error if ybctid is not found.
@@ -1004,7 +1016,8 @@ YBCExecuteDeleteIndex(Relation index,
 								  YbGetRelfileNodeId(index),
 								  YBCIsRegionLocal(index),
 								  &delete_stmt,
-								  YB_TRANSACTIONAL));
+								  YB_TRANSACTIONAL,
+								  NULL /* query_comment */));
 
 	callback(delete_stmt, indexstate, index, values, isnull,
 			 IndexRelationGetNumberOfKeyAttributes(index),
@@ -1050,6 +1063,7 @@ YBCExecuteUpdate(ResultRelInfo *resultRelInfo,
 	Oid			relid = RelationGetRelid(rel);
 	YbcPgStatement update_stmt = NULL;
 	Datum		ybctid;
+	char	   *query_comment = NULL;
 
 
 	/* YB_SINGLE_SHARD_TRANSACTION always implies target tuple wasn't fetched. */
@@ -1058,12 +1072,16 @@ YBCExecuteUpdate(ResultRelInfo *resultRelInfo,
 	/* Update the tuple with table oid */
 	slot->tts_tableOid = RelationGetRelid(rel);
 
+	/* Extract SQL comment for CDC tracking */
+	query_comment = extract_first_sql_comment(debug_query_string);
+
 	/* Create update statement. */
 	HandleYBStatus(YBCPgNewUpdate(dboid,
 								  YbGetRelfileNodeId(rel),
 								  YBCIsRegionLocal(rel),
 								  &update_stmt,
-								  transaction_setting));
+								  transaction_setting,
+								  query_comment));
 
 	/*
 	 * Look for ybctid. Raise error if ybctid is not found.
@@ -1325,7 +1343,8 @@ YBCExecuteUpdateIndex(Relation index,
 								  YbGetRelfileNodeId(index),
 								  YBCIsRegionLocal(index),
 								  &update_stmt,
-								  YB_TRANSACTIONAL));
+								  YB_TRANSACTIONAL,
+								  NULL /* query_comment */));
 
 	callback(update_stmt, index, values, isnull,
 			 RelationGetNumberOfAttributes(index),
@@ -1353,7 +1372,8 @@ YBCExecuteUpdateLoginAttempts(Oid roleid,
 								  YbRoleProfileRelationId,
 								  YBCIsRegionLocal(rel),
 								  &update_stmt,
-								  YB_SINGLE_SHARD_TRANSACTION));
+								  YB_SINGLE_SHARD_TRANSACTION,
+								  NULL /* query_comment */));
 
 	/*
 	 * Look for ybctid. Raise error if ybctid is not found.
@@ -1449,7 +1469,8 @@ YBCDeleteSysCatalogTuple(Relation rel, HeapTuple tuple)
 								  relfileNodeId,
 								  YBCIsRegionLocal(rel),
 								  &delete_stmt,
-								  YB_TRANSACTIONAL));
+								  YB_TRANSACTIONAL,
+								  NULL /* query_comment */));
 
 	/* Bind ybctid to identify the current row. */
 	YbcPgExpr	ybctid_expr = YBCNewConstant(delete_stmt, BYTEAOID, InvalidOid,
@@ -1492,7 +1513,8 @@ YBCUpdateSysCatalogTupleForDb(Oid dboid, Relation rel, HeapTuple oldtuple,
 								  relid,
 								  YBCIsRegionLocal(rel),
 								  &update_stmt,
-								  YB_TRANSACTIONAL));
+								  YB_TRANSACTIONAL,
+								  NULL /* query_comment */));
 
 	AttrNumber	minattr = YBGetFirstLowInvalidAttributeNumber(rel);
 	Bitmapset  *pkey = YBGetTablePrimaryKeyBms(rel);

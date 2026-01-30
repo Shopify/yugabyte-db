@@ -157,7 +157,8 @@ YbIncrementMasterDBLogicalClientVersionTableEntryImpl(Oid db_oid)
 								  YBLogicalClientVersionRelationId,
 								  false /* is_region_local */ ,
 								  &update_stmt,
-								  YB_TRANSACTIONAL));
+								  YB_TRANSACTIONAL,
+								  NULL /* query_comment */));
 
 	Relation	rel = RelationIdGetRelation(YBLogicalClientVersionRelationId);
 	Datum		ybctid = YbGetMasterLogicalClientVersionTableEntryYbctid(rel, db_oid);
@@ -264,7 +265,8 @@ YbCreateMasterDBLogicalClientVersionTableEntry(Oid db_oid)
 								  YBLogicalClientVersionRelationId,
 								  false /* is_region_local */ ,
 								  &insert_stmt,
-								  YB_SINGLE_SHARD_TRANSACTION));
+								  YB_SINGLE_SHARD_TRANSACTION,
+								  NULL /* query_comment */));
 
 	Relation	rel = RelationIdGetRelation(YBLogicalClientVersionRelationId);
 	Datum		ybctid = YbGetMasterLogicalClientVersionTableEntryYbctid(rel, db_oid);
@@ -317,7 +319,8 @@ YbDeleteMasterDBLogicalClientVersionTableEntry(Oid db_oid)
 								  YBLogicalClientVersionRelationId,
 								  false /* is_region_local */ ,
 								  &delete_stmt,
-								  YB_SINGLE_SHARD_TRANSACTION));
+								  YB_SINGLE_SHARD_TRANSACTION,
+								  NULL /* query_comment */));
 
 	Relation	rel = RelationIdGetRelation(YBLogicalClientVersionRelationId);
 	Datum		ybctid = YbGetMasterLogicalClientVersionTableEntryYbctid(rel, db_oid);

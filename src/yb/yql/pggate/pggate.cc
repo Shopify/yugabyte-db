@@ -1522,12 +1522,17 @@ Result<PgStatement*> PgApiImpl::NewInsertBlock(
 
 Status PgApiImpl::NewInsert(
     const PgObjectId& table_id, bool is_region_local, PgStatement **handle,
-    YbcPgTransactionSetting transaction_setting) {
+    YbcPgTransactionSetting transaction_setting, const char *query_comment) {
   *handle = nullptr;
-  return AddToCurrentPgMemctx(
-    VERIFY_RESULT(PgInsert::Make(
-        pg_session_, table_id, is_region_local, transaction_setting, /* packed= */ false)),
-    handle);
+  auto insert = VERIFY_RESULT(PgInsert::Make(
+      pg_session_, table_id, is_region_local, transaction_setting, /* packed= */ false));
+
+  // Set query comment if provided
+  if (query_comment) {
+    insert->SetQueryComment(query_comment);
+  }
+
+  return AddToCurrentPgMemctx(std::move(insert), handle);
 }
 
 Status PgApiImpl::ExecInsert(PgStatement* handle) {
@@ -1552,11 +1557,17 @@ Status PgApiImpl::InsertStmtSetIsBackfill(PgStatement* handle, bool is_backfill)
 
 Status PgApiImpl::NewUpdate(
     const PgObjectId& table_id, bool is_region_local, PgStatement** handle,
-    YbcPgTransactionSetting transaction_setting) {
+    YbcPgTransactionSetting transaction_setting, const char *query_comment) {
   *handle = nullptr;
-  return AddToCurrentPgMemctx(
-      VERIFY_RESULT(PgUpdate::Make(pg_session_, table_id, is_region_local, transaction_setting)),
-      handle);
+  auto update = VERIFY_RESULT(PgUpdate::Make(
+      pg_session_, table_id, is_region_local, transaction_setting));
+
+  // Set query comment if provided
+  if (query_comment) {
+    update->SetQueryComment(query_comment);
+  }
+
+  return AddToCurrentPgMemctx(std::move(update), handle);
 }
 
 Status PgApiImpl::ExecUpdate(PgStatement* handle) {
@@ -1567,11 +1578,17 @@ Status PgApiImpl::ExecUpdate(PgStatement* handle) {
 
 Status PgApiImpl::NewDelete(
     const PgObjectId& table_id, bool is_region_local, PgStatement** handle,
-    YbcPgTransactionSetting transaction_setting) {
+    YbcPgTransactionSetting transaction_setting, const char *query_comment) {
   *handle = nullptr;
-  return AddToCurrentPgMemctx(
-      VERIFY_RESULT(PgDelete::Make(pg_session_, table_id, is_region_local, transaction_setting)),
-      handle);
+  auto delete_stmt = VERIFY_RESULT(PgDelete::Make(
+      pg_session_, table_id, is_region_local, transaction_setting));
+
+  // Set query comment if provided
+  if (query_comment) {
+    delete_stmt->SetQueryComment(query_comment);
+  }
+
+  return AddToCurrentPgMemctx(std::move(delete_stmt), handle);
 }
 
 Status PgApiImpl::ExecDelete(PgStatement* handle) {

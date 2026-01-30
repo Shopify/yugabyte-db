@@ -553,6 +553,10 @@ message RowMessage {
   // DocKey for the row in a table. Only populated for DMLs in the streaming phase but not
   // for other ops such as DDL/BEGIN/COMMIT/SAFEPOINT. Not populated in the Snapshot phase.
   optional bytes primary_key = 18;
+
+  // SQL comment extracted from query (/* comment */)
+  // Enables correlation across multi-shard transactions
+  optional string query_comment = 19;
 }
 
 message CDCSDKProtoRecordPB {

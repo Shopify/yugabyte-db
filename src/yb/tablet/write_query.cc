@@ -121,6 +121,13 @@ void SetupKeyValueBatch(const tserver::WriteRequestPB& client_request, LWWritePB
   if (client_request.has_external_hybrid_time()) {
     out_request->set_external_hybrid_time(client_request.external_hybrid_time());
   }
+  // Copy query_comment from first PgsqlWriteRequestPB that has one
+  for (const auto& pgsql_req : client_request.pgsql_write_batch()) {
+    if (pgsql_req.has_query_comment()) {
+      out_request->dup_query_comment(pgsql_req.query_comment());
+      break;
+    }
+  }
 }
 
 template <class Code, class Resp>

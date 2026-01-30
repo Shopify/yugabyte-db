@@ -648,7 +648,8 @@ YbcStatus YBCPgNewInsert(YbcPgOid database_oid,
                          YbcPgOid table_relfilenode_oid,
                          bool is_region_local,
                          YbcPgStatement *handle,
-                         YbcPgTransactionSetting transaction_setting);
+                         YbcPgTransactionSetting transaction_setting,
+                         const char *query_comment);
 
 YbcStatus YBCPgExecInsert(YbcPgStatement handle);
 
@@ -663,7 +664,8 @@ YbcStatus YBCPgNewUpdate(YbcPgOid database_oid,
                          YbcPgOid table_relfilenode_oid,
                          bool is_region_local,
                          YbcPgStatement *handle,
-                         YbcPgTransactionSetting transaction_setting);
+                         YbcPgTransactionSetting transaction_setting,
+                         const char *query_comment);
 
 YbcStatus YBCPgExecUpdate(YbcPgStatement handle);
 
@@ -672,7 +674,8 @@ YbcStatus YBCPgNewDelete(YbcPgOid database_oid,
                          YbcPgOid table_relfilenode_oid,
                          bool is_region_local,
                          YbcPgStatement *handle,
-                         YbcPgTransactionSetting transaction_setting);
+                         YbcPgTransactionSetting transaction_setting,
+                         const char *query_comment);
 
 YbcStatus YBCPgExecDelete(YbcPgStatement handle);
 

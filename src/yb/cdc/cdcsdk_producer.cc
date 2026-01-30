@@ -1426,6 +1426,12 @@ Status PopulateCDCSDKWriteRecord(
       row_message->set_primary_key(primary_key.ToBuffer());
       CDCSDKOpIdPB* cdc_sdk_op_id_pb = proto_record->mutable_cdc_sdk_op_id();
       SetCDCSDKOpId(msg->id().term(), msg->id().index(), record_batch_idx, "", cdc_sdk_op_id_pb);
+
+      // Add query comment if present
+      if (msg->has_write() && msg->write().has_query_comment()) {
+        row_message->set_query_comment(msg->write().query_comment().ToBuffer());
+      }
+
       is_packed_row_record = false;
 
       // Check whether operation is WRITE or DELETE.
@@ -1650,6 +1656,12 @@ Status PopulateCDCSDKDDLRecord(
   row_message->set_pgschema_name(schema.SchemaName());
   row_message->set_commit_time(msg->hybrid_time());
   SetTableProperties(table_properties->ToGoogleProtobuf(), cdc_sdk_table_properties_pb);
+
+  // Add query comment for DDL if present
+  if (msg->has_change_metadata_request() &&
+      msg->change_metadata_request().has_query_comment()) {
+    row_message->set_query_comment(msg->change_metadata_request().query_comment().ToBuffer());
+  }
 
   throughput_metrics->records_sent++;
   throughput_metrics->bytes_sent += proto_record->ByteSizeLong();

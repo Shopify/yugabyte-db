@@ -543,7 +543,8 @@ YbIncrementMasterDBCatalogVersionTableEntryImpl(Oid db_oid,
 								  YBCatalogVersionRelationId,
 								  false /* is_region_local */ ,
 								  &update_stmt,
-								  YB_TRANSACTIONAL));
+								  YB_TRANSACTIONAL,
+								  NULL /* query_comment */));
 
 	Relation	rel = RelationIdGetRelation(YBCatalogVersionRelationId);
 	Datum		ybctid = YbGetMasterCatalogVersionTableEntryYbctid(rel, db_oid);
@@ -727,7 +728,8 @@ YbCreateMasterDBCatalogVersionTableEntry(Oid db_oid)
 								  YBCatalogVersionRelationId,
 								  false /* is_region_local */ ,
 								  &insert_stmt,
-								  YB_SINGLE_SHARD_TRANSACTION));
+								  YB_SINGLE_SHARD_TRANSACTION,
+								  NULL /* query_comment */));
 
 	Relation	rel = RelationIdGetRelation(YBCatalogVersionRelationId);
 	Datum		ybctid = YbGetMasterCatalogVersionTableEntryYbctid(rel, db_oid);
@@ -833,7 +835,8 @@ YbDeleteMasterDBCatalogVersionTableEntry(Oid db_oid)
 								  YBCatalogVersionRelationId,
 								  false /* is_region_local */ ,
 								  &delete_stmt,
-								  YB_SINGLE_SHARD_TRANSACTION));
+								  YB_SINGLE_SHARD_TRANSACTION,
+								  NULL /* query_comment */));
 
 	Relation	rel = RelationIdGetRelation(YBCatalogVersionRelationId);
 	Datum		ybctid = YbGetMasterCatalogVersionTableEntryYbctid(rel, db_oid);
