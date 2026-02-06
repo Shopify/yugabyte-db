@@ -425,4 +425,44 @@ macro(yb_find_third_party_dependencies)
   ADD_THIRDPARTY_LIB(pcre
     STATIC_LIB "${PCRE_STATIC_LIB}")
 
+  ## OpenTelemetry
+  find_package(OpenTelemetry REQUIRED)
+  include_directories(SYSTEM ${OPENTELEMETRY_INCLUDE_DIR})
+
+  # Core libraries
+  ADD_THIRDPARTY_LIB(opentelemetry_common
+    SHARED_LIB "${OPENTELEMETRY_COMMON_LIB}")
+  ADD_THIRDPARTY_LIB(opentelemetry_trace
+    SHARED_LIB "${OPENTELEMETRY_TRACE_LIB}")
+  ADD_THIRDPARTY_LIB(opentelemetry_metrics
+    SHARED_LIB "${OPENTELEMETRY_METRICS_LIB}")
+  ADD_THIRDPARTY_LIB(opentelemetry_resources
+    SHARED_LIB "${OPENTELEMETRY_RESOURCES_LIB}")
+  ADD_THIRDPARTY_LIB(opentelemetry_version
+    SHARED_LIB "${OPENTELEMETRY_VERSION_LIB}")
+  
+  # OTLP protocol support
+  ADD_THIRDPARTY_LIB(opentelemetry_proto
+    STATIC_LIB "${OPENTELEMETRY_PROTO_LIB}")
+  ADD_THIRDPARTY_LIB(opentelemetry_otlp_recordable
+    SHARED_LIB "${OPENTELEMETRY_OTLP_RECORDABLE_LIB}")
+  
+  # OTLP HTTP exporters
+  ADD_THIRDPARTY_LIB(opentelemetry_exporter_otlp_http
+    SHARED_LIB "${OPENTELEMETRY_EXPORTER_OTLP_HTTP_LIB}")
+  ADD_THIRDPARTY_LIB(opentelemetry_exporter_otlp_http_client
+    SHARED_LIB "${OPENTELEMETRY_EXPORTER_OTLP_HTTP_CLIENT_LIB}")
+  ADD_THIRDPARTY_LIB(opentelemetry_exporter_otlp_http_metric
+    SHARED_LIB "${OPENTELEMETRY_EXPORTER_OTLP_HTTP_METRIC_LIB}")
+  ADD_THIRDPARTY_LIB(opentelemetry_http_client_curl
+    SHARED_LIB "${OPENTELEMETRY_HTTP_CLIENT_CURL_LIB}")
+  
+  # Testing/debugging exporters
+  ADD_THIRDPARTY_LIB(opentelemetry_exporter_in_memory
+    SHARED_LIB "${OPENTELEMETRY_EXPORTER_IN_MEMORY_LIB}")
+  ADD_THIRDPARTY_LIB(opentelemetry_exporter_ostream_span
+    SHARED_LIB "${OPENTELEMETRY_EXPORTER_OSTREAM_SPAN_LIB}")
+  ADD_THIRDPARTY_LIB(opentelemetry_exporter_ostream_metrics
+    SHARED_LIB "${OPENTELEMETRY_EXPORTER_OSTREAM_METRICS_LIB}")
+
 endmacro()

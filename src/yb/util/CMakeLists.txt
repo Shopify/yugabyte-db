@@ -184,6 +184,7 @@ set(UTIL_SRCS
   one_time_bool.cc
   operation_counter.cc
   os-util.cc
+  otel.cc
   path_util.cc
   pb_util-internal.cc
   pb_util.cc
@@ -265,7 +266,13 @@ set(UTIL_LIBS
   protobuf
   zlib
   ${OPENSSL_CRYPTO_LIBRARY}
-  ${OPENSSL_SSL_LIBRARY})
+  ${OPENSSL_SSL_LIBRARY}
+  opentelemetry_otlp_recordable
+  opentelemetry_exporter_otlp_http
+  opentelemetry_exporter_otlp_http_client
+  opentelemetry_trace
+  opentelemetry_resources
+)
 
 if(NOT APPLE)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DROCKSDB_FALLOCATE_PRESENT")

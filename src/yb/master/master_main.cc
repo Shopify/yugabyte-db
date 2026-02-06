@@ -49,6 +49,7 @@
 #include "yb/util/logging.h"
 #include "yb/util/main_util.h"
 #include "yb/util/mem_tracker.h"
+#include "yb/util/otel.h"
 #include "yb/util/result.h"
 #include "yb/util/size_literals.h"
 #include "yb/util/thread.h"
@@ -134,6 +135,13 @@ static int MasterMain(int argc, char** argv) {
   // End of setting master flags
   // ==============================================================================================
 
+  util::OpenTelemetry::Init();
+
+  // Test creating a span
+  auto tracer = util::OpenTelemetry::GetTracer("yb-master-main");
+  auto span = tracer->StartSpan("master_initialization");
+  span->SetAttribute("master.host", host_name);  
+
   LOG(INFO) << "Initializing master server...";
   LOG_AND_RETURN_FROM_MAIN_NOT_OK(server.Init());
 
@@ -168,6 +176,11 @@ static int MasterMain(int argc, char** argv) {
   }
 
   server.Shutdown();
+
+  span->End();
+
+  // Cleanup OpenTelemetry
+  util::OpenTelemetry::Shutdown();
 
   // Best effort flush of log without any mutex.
   google::FlushLogFilesUnsafe(0);

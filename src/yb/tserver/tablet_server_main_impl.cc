@@ -64,6 +64,7 @@
 #include "yb/util/logging.h"
 #include "yb/util/main_util.h"
 #include "yb/util/mem_tracker.h"
+#include "yb/util/otel.h"
 #include "yb/util/port_picker.h"
 #include "yb/util/result.h"
 #include "yb/util/size_literals.h"
@@ -476,12 +477,24 @@ int TabletServerMain(int argc, char** argv) {
   LOG_AND_RETURN_FROM_MAIN_NOT_OK(MasterTServerParseFlagsAndInit(
       TabletServerOptions::kServerType, /*is_master=*/false, &argc, &argv));
 
+  util::OpenTelemetry::Init();
+
+  // Test creating a span
+  auto tracer = util::OpenTelemetry::GetTracer("yb-tserver-main");
+  auto span = tracer->StartSpan("tserver_initialization");
+  span->SetAttribute("tserver.host", host_name);  
+
   Services services;
   LOG_AND_RETURN_FROM_MAIN_NOT_OK(StartServices(services));
 
   services.termination_monitor->WaitForTermination();
 
   LOG_AND_RETURN_FROM_MAIN_NOT_OK(ShutdownServices(services));
+
+  span->End();
+
+  // Cleanup OpenTelemetry
+  util::OpenTelemetry::Shutdown();
 
   // Best effort flush of log without any mutex.
   google::FlushLogFilesUnsafe(0);
