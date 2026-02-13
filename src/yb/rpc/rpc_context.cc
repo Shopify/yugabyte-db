@@ -147,6 +147,8 @@ RpcContext::RpcContext(std::shared_ptr<YBInboundCall> call,
     RespondRpcFailure(ErrorStatusPB::ERROR_INVALID_REQUEST, s);
     return;
   }
+  // Create OpenTelemetry span after successful parameter parsing
+  call_->CreateServerSpan();
   TRACE_EVENT_ASYNC_BEGIN1("rpc_call", "RPC", this, "call", call_->ToString());
 }
 

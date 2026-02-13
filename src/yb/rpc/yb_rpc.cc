@@ -310,6 +310,12 @@ Status YBInboundCall::ParseFrom(const MemTrackerPtr& mem_tracker, CallData* call
   DVLOG(4) << "Parsed YBInboundCall header: " << header_.call_id;
   UpdateWaitStateInfo();
 
+  // Extract trace context from header if present and tracing is enabled
+  if (common::OpenTelemetry::IsTracingEnabled() && !header_.trace_context.empty()) {
+    auto parsed_trace_context = VERIFY_RESULT(ParseTraceContext(header_.trace_context));
+    parent_span_context_ = VERIFY_RESULT(parsed_trace_context.ToSpanContext());
+  }
+
   consumption_ = ScopedTrackedConsumption(mem_tracker, call_data->size());
   request_data_ = std::move(*call_data);
 
@@ -319,6 +325,28 @@ Status YBInboundCall::ParseFrom(const MemTrackerPtr& mem_tracker, CallData* call
   }
 
   return Status::OK();
+}
+
+void YBInboundCall::CreateServerSpan() {
+  if (!parent_span_context_) {
+    return;  // No parent context, skip span creation
+  }
+
+  auto parsed_method = ParseRemoteMethod(header_.remote_method);
+  if (!parsed_method.ok()) {
+    return;
+  }
+
+  auto span_name = Format("rpc.$0.$1", parsed_method->service, parsed_method->method);
+  span_ = common::OpenTelemetry::GetSpanWithParentContext(
+      "rpc.inbound", span_name, *parent_span_context_);
+
+  if (span_) {
+    span_->SetAttribute("rpc.service_name", parsed_method->service.ToBuffer());
+    span_->SetAttribute("rpc.method_name", parsed_method->method.ToBuffer());
+    span_->SetAttribute("rpc.call_id", header_.call_id);
+    span_->SetAttribute("rpc.timeout_ms", header_.timeout_ms);
+  }
 }
 
 Status YBInboundCall::SerializeResponseBuffer(AnyMessageConstPtr response, bool is_success) {
@@ -430,12 +458,23 @@ Status YBInboundCall::ParseParam(RpcCallParams* params) {
 
 void YBInboundCall::RespondSuccess(AnyMessageConstPtr response) {
   TRACE_EVENT0("rpc", "InboundCall::RespondSuccess");
+  if (span_) {
+    span_->SetStatus(opentelemetry::trace::StatusCode::kOk);
+    span_->End();
+    span_.reset();
+  }
   Respond(response, true);
 }
 
 void YBInboundCall::RespondFailure(ErrorStatusPB::RpcErrorCodePB error_code,
                                    const Status& status) {
   TRACE_EVENT0("rpc", "InboundCall::RespondFailure");
+
+  if (span_) {
+    span_->SetStatus(opentelemetry::trace::StatusCode::kError, status.ToUserMessage());
+    span_->End();
+    span_.reset();
+  }
 
   // Release memory early and prevent building an oversized error response.
   sidecars_.Reset();

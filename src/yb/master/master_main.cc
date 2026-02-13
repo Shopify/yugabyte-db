@@ -32,6 +32,7 @@
 
 #include <iostream>
 
+#include "yb/common/otel.h"
 #include "yb/common/wire_protocol.h"
 
 #include "yb/consensus/log_util.h"
@@ -49,7 +50,6 @@
 #include "yb/util/logging.h"
 #include "yb/util/main_util.h"
 #include "yb/util/mem_tracker.h"
-#include "yb/util/otel.h"
 #include "yb/util/result.h"
 #include "yb/util/size_literals.h"
 #include "yb/util/thread.h"
@@ -135,12 +135,10 @@ static int MasterMain(int argc, char** argv) {
   // End of setting master flags
   // ==============================================================================================
 
-  util::OpenTelemetry::Init();
+  common::OpenTelemetry::Init("yb-master");
 
   // Test creating a span
-  auto tracer = util::OpenTelemetry::GetTracer("yb-master-main");
-  auto span = tracer->StartSpan("master_initialization");
-  span->SetAttribute("master.host", host_name);  
+  auto span = common::OpenTelemetry::GetSpan("yb-master-main", "master_initialization");
 
   LOG(INFO) << "Initializing master server...";
   LOG_AND_RETURN_FROM_MAIN_NOT_OK(server.Init());
@@ -165,9 +163,11 @@ static int MasterMain(int argc, char** argv) {
             [&termination_monitor]() { termination_monitor->Terminate(); });
       },
       &total_mem_watcher_thread));
+  span->End();
 
   termination_monitor->WaitForTermination();
 
+  span = common::OpenTelemetry::GetSpan("yb-master-main", "master_shutdown");
   total_mem_watcher->Shutdown();
   LOG_AND_RETURN_FROM_MAIN_NOT_OK(ThreadJoiner(total_mem_watcher_thread.get()).Join());
 
@@ -180,7 +180,7 @@ static int MasterMain(int argc, char** argv) {
   span->End();
 
   // Cleanup OpenTelemetry
-  util::OpenTelemetry::Shutdown();
+  common::OpenTelemetry::Shutdown();
 
   // Best effort flush of log without any mutex.
   google::FlushLogFilesUnsafe(0);

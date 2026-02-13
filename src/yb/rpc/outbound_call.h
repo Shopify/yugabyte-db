@@ -47,6 +47,8 @@
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
 
+#include "yb/common/otel.h"
+
 #include "yb/gutil/integral_types.h"
 #include "yb/gutil/macros.h"
 
@@ -346,6 +348,10 @@ class OutboundCall : public RpcCall {
   void SetConnectionId(const ConnectionId& value, const std::string* hostname) {
     conn_id_ = value;
     hostname_ = hostname;
+    if (span_) {
+      span_->SetAttribute("net.peer.name", *hostname);
+      span_->SetAttribute("net.peer.address", yb::ToString(value.remote()));
+    }
   }
 
   void SetThreadPoolFailure(const Status& status) EXCLUDES(mtx_) {
@@ -468,6 +474,9 @@ class OutboundCall : public RpcCall {
   // conn_id_ is not set in the constructor, but is set in SetConnectionId together with hostname_
   // before the call is queued, so no synchronization is needed.
   ConnectionId conn_id_;
+
+  // open telemetry span with scope
+  common::OpenTelemetry::SpanWithScopePtr span_;
 
  private:
   friend class RpcController;

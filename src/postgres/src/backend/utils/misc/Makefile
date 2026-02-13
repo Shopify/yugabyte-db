@@ -20,6 +20,7 @@ OBJS = \
 	yb_exceptions_for_func_pushdown.o \
 	yb_file_utils.o \
 	yb_index_check.o \
+	yb_otel_utils.o \
 	yb_query_diagnostics.o \
 	yb_tcmalloc_utils.o \
 	yb_ysql_conn_mgr_helper.o \

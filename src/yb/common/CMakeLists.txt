@@ -107,6 +107,7 @@ set(COMMON_SRCS
   transaction.cc
   wire_protocol.cc
   llvm_profile_dumper.cc
+  otel.cc
   version_info.cc
   xcluster_util.cc
   ysql_operation_lease.cc
@@ -120,7 +121,12 @@ set(COMMON_LIBS
   yb_util
   yb_bfql
   yb_bfpg
-  gutil)
+  gutil
+  opentelemetry_otlp_recordable
+  opentelemetry_exporter_otlp_http
+  opentelemetry_exporter_otlp_http_client
+  opentelemetry_trace
+  opentelemetry_resources)
 
 if (NOT APPLE)
   list(APPEND COMMON_LIBS libuuid)

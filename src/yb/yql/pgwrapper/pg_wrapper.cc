@@ -64,6 +64,7 @@
 DECLARE_bool(enable_ysql_conn_mgr);
 DECLARE_int32(ysql_conn_mgr_max_pools);
 DECLARE_bool(openssl_require_fips);
+DECLARE_bool(otel_enable_tracing);
 
 DEPRECATE_FLAG(string, pg_proxy_bind_address, "02_2024");
 
@@ -938,6 +939,7 @@ Status PgWrapper::Start() {
   proc_->SetEnv("YB_ALLOW_CLIENT_SET_TSERVER_KEY_AUTH",
       FLAGS_enable_ysql_conn_mgr ? "1" : "0");
 
+  proc_->SetEnv("FLAGS_otel_enable_tracing", FLAGS_otel_enable_tracing ? "1" : "0");
   rpc::SetOpenSSLEnv(&*proc_);
 
   RETURN_NOT_OK(proc_->Start());

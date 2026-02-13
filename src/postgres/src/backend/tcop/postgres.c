@@ -99,6 +99,7 @@
 #include "utils/syscache.h"
 #include "yb/yql/pggate/ybc_gflags.h"
 #include "yb/yql/pggate/ybc_pggate.h"
+#include "yb_otel_utils.h"
 #include "yb_tcmalloc_utils.h"
 #include "yb_ysql_conn_mgr_helper.h"
 #include <arpa/inet.h>
@@ -708,6 +709,8 @@ pg_parse_query(const char *query_string)
 	List	   *raw_parsetree_list;
 
 	TRACE_POSTGRESQL_QUERY_PARSE_START(query_string);
+	size_t span_id = YBCOtelStartSpan("query_parse");
+	YBCOtelSetAttributeStr(span_id, "query", query_string);
 
 	if (log_parser_stats)
 		ResetUsage();
@@ -736,6 +739,7 @@ pg_parse_query(const char *query_string)
 	 * here.
 	 */
 
+	YBCOtelEndSpan(span_id);
 	TRACE_POSTGRESQL_QUERY_PARSE_DONE(query_string);
 
 	return raw_parsetree_list;
@@ -782,6 +786,8 @@ pg_analyze_and_rewrite_fixedparams(RawStmt *parsetree,
 	List	   *querytree_list;
 
 	TRACE_POSTGRESQL_QUERY_REWRITE_START(query_string);
+	size_t span_id = YBCOtelStartSpan("query_rewrite");
+	YBCOtelSetAttributeStr(span_id, "query", query_string);
 
 	/*
 	 * (1) Perform parse analysis.
@@ -800,6 +806,7 @@ pg_analyze_and_rewrite_fixedparams(RawStmt *parsetree,
 	 */
 	querytree_list = pg_rewrite_query(query);
 
+	YBCOtelEndSpan(span_id);
 	TRACE_POSTGRESQL_QUERY_REWRITE_DONE(query_string);
 
 	return querytree_list;
@@ -821,6 +828,8 @@ pg_analyze_and_rewrite_varparams(RawStmt *parsetree,
 	List	   *querytree_list;
 
 	TRACE_POSTGRESQL_QUERY_REWRITE_START(query_string);
+	size_t span_id = YBCOtelStartSpan("query_rewrite");
+	YBCOtelSetAttributeStr(span_id, "query", query_string);
 
 	/*
 	 * (1) Perform parse analysis.
@@ -853,6 +862,7 @@ pg_analyze_and_rewrite_varparams(RawStmt *parsetree,
 	 */
 	querytree_list = pg_rewrite_query(query);
 
+	YBCOtelEndSpan(span_id);
 	TRACE_POSTGRESQL_QUERY_REWRITE_DONE(query_string);
 
 	return querytree_list;
@@ -875,6 +885,8 @@ pg_analyze_and_rewrite_withcb(RawStmt *parsetree,
 	List	   *querytree_list;
 
 	TRACE_POSTGRESQL_QUERY_REWRITE_START(query_string);
+	size_t span_id = YBCOtelStartSpan("query_rewrite");
+	YBCOtelSetAttributeStr(span_id, "query", query_string);
 
 	/*
 	 * (1) Perform parse analysis.
@@ -893,6 +905,7 @@ pg_analyze_and_rewrite_withcb(RawStmt *parsetree,
 	 */
 	querytree_list = pg_rewrite_query(query);
 
+	YBCOtelEndSpan(span_id);
 	TRACE_POSTGRESQL_QUERY_REWRITE_DONE(query_string);
 
 	return querytree_list;
@@ -1010,6 +1023,8 @@ pg_plan_query(Query *querytree, const char *query_string, int cursorOptions,
 	Assert(ActiveSnapshotSet());
 
 	TRACE_POSTGRESQL_QUERY_PLAN_START();
+	size_t span_id = YBCOtelStartSpan("query_plan");
+	YBCOtelSetAttributeStr(span_id, "query", query_string);
 
 	if (log_planner_stats)
 		ResetUsage();
@@ -1069,6 +1084,7 @@ pg_plan_query(Query *querytree, const char *query_string, int cursorOptions,
 	if (Debug_print_plan)
 		elog_node_display(LOG, "plan", plan, Debug_pretty_print);
 
+	YBCOtelEndSpan(span_id);
 	TRACE_POSTGRESQL_QUERY_PLAN_DONE();
 
 	return plan;
@@ -1228,6 +1244,9 @@ exec_simple_query(const char *query_string)
 	pgstat_report_activity(STATE_RUNNING, yb_redacted_query_string);
 
 	TRACE_POSTGRESQL_QUERY_START(query_string);
+	YbReadTraceParentFromQuery(query_string);
+	size_t span_id = YBCOtelStartSpanWithTraceParent("query_execution_simple", YbGetCurrentTraceparent());
+	YBCOtelSetAttributeStr(span_id, "query", query_string);
 
 	/*
 	 * We use save_log_statement_stats so ShowUsage doesn't report incorrect
@@ -1596,6 +1615,7 @@ exec_simple_query(const char *query_string)
 	if (save_log_statement_stats)
 		ShowUsage("QUERY STATISTICS");
 
+	YBCOtelEndSpan(span_id);
 	TRACE_POSTGRESQL_QUERY_DONE(query_string);
 
 	debug_query_string = NULL;
@@ -6242,6 +6262,12 @@ PostgresMain(const char *dbname, const char *username)
 	MemoryContextSwitchTo(row_description_context);
 	initStringInfo(&row_description_buf);
 	MemoryContextSwitchTo(TopMemoryContext);
+
+	/*
+	 * YB: Set up OpenTelemetry for this session. This should be done before
+	 * processing any queries, so that we can capture telemetry for all queries.
+	 */
+	YbSetUpOtel();
 
 	/*
 	 * POSTGRES main processing loop begins here

@@ -80,6 +80,19 @@ message RequestHeader {
 
   optional AshMetadataPB metadata = 5;
 
+  message TraceContext {
+    // 8 bytes (high 64 bits of trace_id)
+    required fixed64 trace_id_hi = 1;
+    // 8 bytes (low 64 bits of trace_id)
+    required fixed64 trace_id_lo = 2;
+    // 8 bytes
+    required fixed64 span_id = 3;
+    // Low byte: flags, High byte: version (1-2 bytes on wire)
+    required uint32 version_and_flags = 4;
+  }
+
+  optional TraceContext trace_context = 7;
+
   // CRC32C for message body and header without CRC field. Use 15 as max 1 byte tag.
   optional fixed32 crc = 15;
 }

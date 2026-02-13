@@ -24,6 +24,7 @@
 
 #include <boost/version.hpp>
 
+#include "yb/common/otel.h"
 #include "yb/rpc/binary_call_parser.h"
 #include "yb/rpc/circular_read_buffer.h"
 #include "yb/rpc/connection_context.h"
@@ -199,6 +200,10 @@ class YBInboundCall : public InboundCall {
 
   Result<RefCntSlice> ExtractSidecar(size_t idx) const;
 
+  // Create a server-side OpenTelemetry span from the parent span context.
+  // Should be called after the request is successfully parsed.
+  void CreateServerSpan();
+
   size_t DynamicMemoryUsage() const override {
     return InboundCall::DynamicMemoryUsage() +
            response_data_memory_usage_.load(std::memory_order_acquire);
@@ -235,6 +240,12 @@ class YBInboundCall : public InboundCall {
 
   // Cache of result of YBInboundCall::ToString().
   mutable std::string cached_to_string_;
+
+  // Parsed parent span context from trace_context header field, if present.
+  std::optional<opentelemetry::trace::SpanContext> parent_span_context_;
+
+  // OpenTelemetry span with scope.
+  common::OpenTelemetry::SpanWithScopePtr span_;
 };
 
 class YBOutboundConnectionContext : public YBConnectionContext {

@@ -40,6 +40,8 @@
 #include <google/protobuf/message.h>
 #include <google/protobuf/repeated_field.h>
 
+#include "opentelemetry/trace/span_context.h"
+
 #include "yb/rpc/rpc_fwd.h"
 
 #include "yb/util/result.h"
@@ -76,6 +78,7 @@ struct ParsedRequestHeader {
   uint32_t timeout_ms = 0;
   boost::iterator_range<const uint32_t*> sidecar_offsets;
   Slice metadata;
+  Slice trace_context;
   std::optional<uint32_t> crc;
 
   std::string RemoteMethodAsString() const;
@@ -101,7 +104,17 @@ struct ParsedRemoteMethod {
   Slice method;
 };
 
+struct ParsedTraceContext {
+  uint64_t trace_id_hi = 0;
+  uint64_t trace_id_lo = 0;
+  uint64_t span_id = 0;
+  uint32_t version_and_flags = 0;
+
+  Result<opentelemetry::trace::SpanContext> ToSpanContext() const;
+};
+
 Result<ParsedRemoteMethod> ParseRemoteMethod(const Slice& buf);
+Result<ParsedTraceContext> ParseTraceContext(const Slice& buf);
 Status ParseMetadata(Slice buf, AnyMessagePtr out);
 Status ParseMetadataFromSharedMemory(uint8_t** input, size_t length, AnyMessagePtr out);
 

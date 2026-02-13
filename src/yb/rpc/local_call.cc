@@ -40,6 +40,9 @@ LocalOutboundCall::LocalOutboundCall(
                    response_storage, controller, std::move(rpc_metrics), std::move(callback),
                    callback_thread_pool, /* metadata_serializer_factory= */ nullptr) {
   TRACE_TO(trace_, "LocalOutboundCall");
+  if (span_) {
+    span_->SetAttribute("rpc.local_call", true);
+  }
 }
 
 Status LocalOutboundCall::SetRequestParam(

@@ -74,6 +74,7 @@
 /* YB includes */
 #include "pg_yb_utils.h"
 #include "yb/yql/pggate/ybc_pg_typedefs.h"
+#include "yb_otel_utils.h"
 
 /*
  *	User-tweakable parameters
@@ -2280,6 +2281,8 @@ StartTransaction(void)
 	MyProc->lxid = vxid.localTransactionId;
 
 	TRACE_POSTGRESQL_TRANSACTION_START(vxid.localTransactionId);
+	size_t span_id = YBCOtelStartSpan("transaction_start");
+	YBCOtelSetAttributeInt32(span_id, "transaction.id", vxid.localTransactionId);
 
 	/*
 	 * set transaction_timestamp() (a/k/a now()).  Normally, we want this to
@@ -2324,6 +2327,8 @@ StartTransaction(void)
 	if (YbIsClientYsqlConnMgr() && OidIsValid(s->prevUser))
 		yb_ysql_conn_mgr_superuser_existed = yb_ysql_conn_mgr_superuser_existed || superuser();
 	ShowTransactionState("StartTransaction");
+
+	YBCOtelEndSpan(span_id);
 }
 
 /*
@@ -2529,6 +2534,9 @@ CommitTransaction(void)
 	}
 
 	TRACE_POSTGRESQL_TRANSACTION_COMMIT(MyProc->lxid);
+	size_t span_id = YBCOtelStartSpan("transaction_commit");
+	YBCOtelSetAttributeInt32(span_id, "transaction.id", MyProc->lxid);
+
 
 	/*
 	 * Let others know about no transaction in progress by me. Note that this
@@ -2652,6 +2660,8 @@ CommitTransaction(void)
 		elapsed_time = INSTR_TIME_GET_MICROSEC(yb_commit_endtime);
 		YbRecordCommitLatency(elapsed_time);
 	}
+
+	YBCOtelEndSpan(span_id);
 
 	RESUME_INTERRUPTS();
 }
@@ -3097,6 +3107,8 @@ AbortTransaction(void)
 	}
 
 	TRACE_POSTGRESQL_TRANSACTION_ABORT(MyProc->lxid);
+	size_t span_id = YBCOtelStartSpan("transaction_abort");
+	YBCOtelSetAttributeInt32(span_id, "transaction.id", MyProc->lxid);
 
 	/*
 	 * Let others know about no transaction in progress by me. Note that this
@@ -3150,6 +3162,8 @@ AbortTransaction(void)
 
 	/* Reset the value of the sticky connection */
 	s->ybUncommittedStickyObjectCount = 0;
+
+	YBCOtelEndSpan(span_id);
 
 	/*
 	 * State remains TRANS_ABORT until CleanupTransaction().

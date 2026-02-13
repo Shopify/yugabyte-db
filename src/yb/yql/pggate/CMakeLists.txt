@@ -63,6 +63,7 @@ set(PGGATE_SRCS
     pg_value.cc
     pg_ybctid_reader.cc
     ybc_gflags.cc
+    ybc_otel.cc
     ybc_pg_shared_mem.cc
     ybc_pggate.cc)
 

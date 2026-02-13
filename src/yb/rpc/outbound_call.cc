@@ -250,9 +250,29 @@ OutboundCall::OutboundCall(const RemoteMethod& remote_method,
 
   IncrementCounter(rpc_metrics_->outbound_calls_created);
   IncrementGauge(rpc_metrics_->outbound_calls_alive);
-}
+  span_ = common::OpenTelemetry::GetSpan("rpc.outbound", "rpc." + remote_method_.service_name() + "." + remote_method_.method_name());
+  if (span_) {
+    span_->SetAttribute("rpc.service_name", remote_method_.service_name());
+    span_->SetAttribute("rpc.method_name", remote_method_.method_name());
+    span_->SetAttribute("rpc.call_id", call_id_);
+    if (controller_->timeout().Initialized()) {
+      span_->SetAttribute("rpc.timeout_ms", controller_->timeout().ToMilliseconds());
+    }
+  }
+ }
 
 OutboundCall::~OutboundCall() {
+  if (span_) {
+    auto status = STATUS_FORMAT(
+      Incomplete,
+      "$0 RPC (request call id $2) to $1 reached destructor without callback invocation",
+      remote_method_.method_name(),
+      conn_id_.remote(),
+      call_id_);
+    span_->SetStatus(opentelemetry::v1::trace::StatusCode::kError, status.ToUserMessage());
+    span_->End();
+  }
+
   {
     auto current_state = state();
     bool was_callback_invoked = callback_invoked();
@@ -338,11 +358,36 @@ Status OutboundCall::SetRequestParam(
     metadata_size += 1; // add tag size of RequestHeader::kMetadataFieldNumber
   }
 
+  size_t trace_context_size = 0;
+  size_t trace_context_message_size = 0;
+  uint32_t version_and_flags = 0;
+  opentelemetry::trace::TraceId trace_id;
+  opentelemetry::trace::SpanId span_id;
+  if (span_) {
+    auto span_context = span_->GetContext();
+    if (span_context.IsValid()) {
+      trace_id = span_context.trace_id();
+      span_id = span_context.span_id();
+      auto trace_flags = span_context.trace_flags();
+      // TraceContext message size:
+      // - trace_id_hi: 1 byte tag + 8 bytes fixed64
+      // - trace_id_lo: 1 byte tag + 8 bytes fixed64
+      // - span_id: 1 byte tag + 8 bytes fixed64
+      // - version_and_flags: 1 byte tag + varint (depends on combined value)
+      constexpr uint32_t kVersion = 0;
+      version_and_flags = (kVersion << 8) | trace_flags.flags();
+      size_t version_and_flags_varint_size = Output::VarintSize32(version_and_flags);
+      trace_context_message_size = 3 * 9 + 1 + version_and_flags_varint_size; // 3 fixed64s + tag + varint
+      trace_context_size = 1 + Output::VarintSize64(trace_context_message_size) + trace_context_message_size;
+    }
+  }
+
   auto use_crc = FLAGS_rpc_enable_crc;
   size_t header_pb_len = 1 + call_id_size + // int32 call_id = 1
                          serialized_remote_method.size() + // RemoteMethodPB remote_method = 2
                          1 + timeout_ms_size + // uint32 timeout_millis = 3
-                         metadata_size; // AshMetadataPB metadata = 5
+                         metadata_size + // AshMetadataPB metadata = 5
+                         trace_context_size; // TraceContext trace_context = 7
   if (use_crc) {
     header_pb_len += 1 + sizeof(uint32_t); // fixed32 crc = 6;
   }
@@ -387,6 +432,42 @@ Status OutboundCall::SetRequestParam(
         (RequestHeader::kMetadataFieldNumber << 3) | WireFormatLite::WIRETYPE_LENGTH_DELIMITED,
         dst);
     dst = metadata_serializer_->SerializeToArray(dst);
+  }
+
+  if (trace_context_size > 0) {
+    // Write TraceContext submessage (values already extracted above)
+    dst = Output::WriteTagToArray(
+        (RequestHeader::kTraceContextFieldNumber << 3) | WireFormatLite::WIRETYPE_LENGTH_DELIMITED,
+        dst);
+    dst = Output::WriteVarint32ToArray(
+        narrow_cast<uint32_t>(trace_context_message_size), dst);
+
+    // trace_id_hi (high 64 bits)
+    dst = Output::WriteTagToArray(
+        (RequestHeader::TraceContext::kTraceIdHiFieldNumber << 3) | WireFormatLite::WIRETYPE_FIXED64,
+        dst);
+    dst = Output::WriteLittleEndian64ToArray(
+        BigEndian::Load64(trace_id.Id().data()), dst);
+
+    // trace_id_lo (low 64 bits)
+    dst = Output::WriteTagToArray(
+        (RequestHeader::TraceContext::kTraceIdLoFieldNumber << 3) | WireFormatLite::WIRETYPE_FIXED64,
+        dst);
+    dst = Output::WriteLittleEndian64ToArray(
+        BigEndian::Load64(trace_id.Id().data() + 8), dst);
+
+    // span_id
+    dst = Output::WriteTagToArray(
+        (RequestHeader::TraceContext::kSpanIdFieldNumber << 3) | WireFormatLite::WIRETYPE_FIXED64,
+        dst);
+    dst = Output::WriteLittleEndian64ToArray(
+        BigEndian::Load64(span_id.Id().data()), dst);
+
+    // version_and_flags
+    dst = Output::WriteTagToArray(
+        RequestHeader::TraceContext::kVersionAndFlagsFieldNumber << 3,
+        dst);
+    dst = Output::WriteVarint32ToArray(version_and_flags, dst);
   }
 
   // CRC should be at the end of header, otherwise adjust CRC filling logic below.
@@ -593,6 +674,10 @@ void OutboundCall::SetResponse(CallResponse&& resp) {
       return;
     }
     if (SetState(RpcCallState::FINISHED_SUCCESS)) {
+      if (span_) {
+        span_->SetStatus(opentelemetry::v1::trace::StatusCode::kOk, status.ToUserMessage());
+        span_->End();
+      }
       InvokeCallback(now);
     }
   } else {
@@ -637,6 +722,11 @@ void OutboundCall::SetFinished() {
         MicrosecondsSinceStart(CoarseMonoClock::Now()));
   }
   if (SetState(RpcCallState::FINISHED_SUCCESS)) {
+    if (span_) {
+      Status ok_status;
+      span_->SetStatus(opentelemetry::v1::trace::StatusCode::kOk, ok_status.ToUserMessage());
+      span_->End();
+    }
     InvokeCallback();
   }
 }
@@ -668,6 +758,10 @@ void OutboundCall::SetFailed(const Status &status, std::unique_ptr<ErrorStatusPB
     }
   }
   if (invoke_callback) {
+    if (span_) {
+      span_->SetStatus(opentelemetry::v1::trace::StatusCode::kError, status.ToUserMessage());
+      span_->End();
+    }
     InvokeCallback();
   }
 }
@@ -675,19 +769,23 @@ void OutboundCall::SetFailed(const Status &status, std::unique_ptr<ErrorStatusPB
 void OutboundCall::SetTimedOut() {
   TRACE_TO(trace_, "Call TimedOut.");
   bool invoke_callback;
+  auto status = STATUS_FORMAT(
+      TimedOut,
+      "$0 RPC (request call id $3) to $1 timed out after $2",
+      remote_method_.method_name(),
+      conn_id_.remote(),
+      controller_->timeout(),
+      call_id_);
   {
-    auto status = STATUS_FORMAT(
-        TimedOut,
-        "$0 RPC (request call id $3) to $1 timed out after $2",
-        remote_method_.method_name(),
-        conn_id_.remote(),
-        controller_->timeout(),
-        call_id_);
     std::lock_guard l(mtx_);
     status_ = std::move(status);
     invoke_callback = SetState(RpcCallState::TIMED_OUT);
   }
   if (invoke_callback) {
+    if (span_) {
+      span_->SetStatus(opentelemetry::v1::trace::StatusCode::kError, status.ToUserMessage());
+      span_->End();
+    }
     InvokeCallback();
   }
 }

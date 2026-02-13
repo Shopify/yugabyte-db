@@ -221,6 +221,9 @@ Status ParseHeader(
       case RequestHeader::kMetadataFieldNumber:
         parsed_header->metadata = VERIFY_RESULT(ParseString(buf, "metadata", in));
         break;
+      case RequestHeader::kTraceContextFieldNumber:
+        parsed_header->trace_context = VERIFY_RESULT(ParseString(buf, "trace_context", in));
+        break;
       default: {
         if (!SkipField(tag & 7, in)) {
           return STATUS_FORMAT(Corruption, "Unable to skip: $0", tag);
@@ -364,6 +367,71 @@ Result<ParsedRemoteMethod> ParseRemoteMethod(const Slice& buf) {
     }
   }
   return result;
+}
+
+Result<ParsedTraceContext> ParseTraceContext(const Slice& buf) {
+  CodedInputStream in(buf.data(), narrow_cast<int>(buf.size()));
+  in.PushLimit(narrow_cast<int>(buf.size()));
+  ParsedTraceContext result;
+  while (in.BytesUntilLimit() > 0) {
+    auto tag = in.ReadTag();
+    auto field = tag >> 3;
+    switch (field) {
+      case RequestHeader::TraceContext::kTraceIdHiFieldNumber:
+        if (!in.ReadLittleEndian64(&result.trace_id_hi)) {
+          return STATUS(Corruption, "Unable to decode trace_id_hi");
+        }
+        break;
+      case RequestHeader::TraceContext::kTraceIdLoFieldNumber:
+        if (!in.ReadLittleEndian64(&result.trace_id_lo)) {
+          return STATUS(Corruption, "Unable to decode trace_id_lo");
+        }
+        break;
+      case RequestHeader::TraceContext::kSpanIdFieldNumber:
+        if (!in.ReadLittleEndian64(&result.span_id)) {
+          return STATUS(Corruption, "Unable to decode span_id");
+        }
+        break;
+      case RequestHeader::TraceContext::kVersionAndFlagsFieldNumber:
+        if (!in.ReadVarint32(&result.version_and_flags)) {
+          return STATUS(Corruption, "Unable to decode version_and_flags");
+        }
+        break;
+      default: {
+        if (!SkipField(tag & 7, &in)) {
+          return STATUS_FORMAT(Corruption, "Unable to skip: $0", tag);
+        }
+      }
+    }
+  }
+  return result;
+}
+
+Result<opentelemetry::trace::SpanContext> ParsedTraceContext::ToSpanContext() const {
+  // Reconstruct trace ID from high and low 64-bit values (big-endian format)
+  uint8_t trace_id_bytes[16];
+  BigEndian::Store64(trace_id_bytes, trace_id_hi);
+  BigEndian::Store64(trace_id_bytes + 8, trace_id_lo);
+
+  // Reconstruct span ID (big-endian format)
+  uint8_t span_id_bytes[8];
+  BigEndian::Store64(span_id_bytes, span_id);
+
+  // Extract flags from low byte of version_and_flags
+  uint8_t flags = version_and_flags & 0xFF;
+
+  auto span_context = opentelemetry::trace::SpanContext(
+      opentelemetry::trace::TraceId(trace_id_bytes),
+      opentelemetry::trace::SpanId(span_id_bytes),
+      opentelemetry::trace::TraceFlags(flags),
+      true  // is_remote
+  );
+  
+  if (!span_context.IsValid()) {
+    return STATUS(Corruption, "Invalid trace context: trace_id_hi/lo or span_id is zero");
+  }
+  
+  return span_context;
 }
 
 std::string ParsedRequestHeader::RemoteMethodAsString() const {

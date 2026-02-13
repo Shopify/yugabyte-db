@@ -36,6 +36,7 @@
 #include <iostream>
 
 #include "yb/common/llvm_profile_dumper.h"
+#include "yb/common/otel.h"
 #include "yb/common/termination_monitor.h"
 #include "yb/common/ysql_operation_lease.h"
 
@@ -64,7 +65,6 @@
 #include "yb/util/logging.h"
 #include "yb/util/main_util.h"
 #include "yb/util/mem_tracker.h"
-#include "yb/util/otel.h"
 #include "yb/util/port_picker.h"
 #include "yb/util/result.h"
 #include "yb/util/size_literals.h"
@@ -477,24 +477,24 @@ int TabletServerMain(int argc, char** argv) {
   LOG_AND_RETURN_FROM_MAIN_NOT_OK(MasterTServerParseFlagsAndInit(
       TabletServerOptions::kServerType, /*is_master=*/false, &argc, &argv));
 
-  util::OpenTelemetry::Init();
+  common::OpenTelemetry::Init("yb-tserver");
 
   // Test creating a span
-  auto tracer = util::OpenTelemetry::GetTracer("yb-tserver-main");
-  auto span = tracer->StartSpan("tserver_initialization");
-  span->SetAttribute("tserver.host", host_name);  
-
+  auto span = common::OpenTelemetry::GetSpan("yb-tserver-main", "tserver_initialization");
   Services services;
   LOG_AND_RETURN_FROM_MAIN_NOT_OK(StartServices(services));
+  span->End();
 
   services.termination_monitor->WaitForTermination();
+
+  span = common::OpenTelemetry::GetSpan("yb-tserver-main", "tserver_shutdown");
 
   LOG_AND_RETURN_FROM_MAIN_NOT_OK(ShutdownServices(services));
 
   span->End();
 
   // Cleanup OpenTelemetry
-  util::OpenTelemetry::Shutdown();
+  common::OpenTelemetry::Shutdown();
 
   // Best effort flush of log without any mutex.
   google::FlushLogFilesUnsafe(0);
