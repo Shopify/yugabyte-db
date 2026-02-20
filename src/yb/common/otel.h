@@ -60,6 +60,7 @@ public:
     GetSpanWithParentContext(
       const std::string& tracer_name, const std::string& span_name,
       const opentelemetry::trace::SpanContext& parent_context);
+  static void EndSpan(SpanWithScopePtr span_ptr);
 
   // NOTE: the next four functions are only needed for postgres spans,
   //    which are not using the C++ API and thus need to be managed manually.

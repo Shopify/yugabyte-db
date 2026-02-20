@@ -35,6 +35,8 @@
 
 #include "yb/rpc/secure_stream.h"
 
+#include "yb/common/version_info.h"
+
 #include "yb/util/debug/sanitizer_scopes.h"
 #include "yb/util/env_util.h"
 #include "yb/util/errno.h"
@@ -940,6 +942,7 @@ Status PgWrapper::Start() {
       FLAGS_enable_ysql_conn_mgr ? "1" : "0");
 
   proc_->SetEnv("FLAGS_otel_enable_tracing", FLAGS_otel_enable_tracing ? "1" : "0");
+  proc_->SetEnv("YB_VERSION_STRING", VersionInfo::GetShortVersionString());
   rpc::SetOpenSSLEnv(&*proc_);
 
   RETURN_NOT_OK(proc_->Start());

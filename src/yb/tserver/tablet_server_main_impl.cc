@@ -483,7 +483,7 @@ int TabletServerMain(int argc, char** argv) {
   auto span = common::OpenTelemetry::GetSpan("yb-tserver-main", "tserver_initialization");
   Services services;
   LOG_AND_RETURN_FROM_MAIN_NOT_OK(StartServices(services));
-  span->End();
+  common::OpenTelemetry::EndSpan(span);
 
   services.termination_monitor->WaitForTermination();
 
@@ -491,7 +491,7 @@ int TabletServerMain(int argc, char** argv) {
 
   LOG_AND_RETURN_FROM_MAIN_NOT_OK(ShutdownServices(services));
 
-  span->End();
+  common::OpenTelemetry::EndSpan(span);
 
   // Cleanup OpenTelemetry
   common::OpenTelemetry::Shutdown();

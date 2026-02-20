@@ -24,23 +24,24 @@ namespace trace_api = opentelemetry::trace;
 
 void OpenTelemetry::Init(const std::string& service_name) {
   if (!FLAGS_otel_enable_tracing) {
-
-    // Check environment variable override.
-    // NOTE: this variable is set by yb-tserver when starting postmaster
-    //    All postgres backends will inherit this environment variable,
-    //    so they can check it to decide whether to enable tracing.
-    const char* env_enable_tracing = getenv("FLAGS_otel_enable_tracing");
-    if (env_enable_tracing != nullptr) {
-      std::string env_value(env_enable_tracing);
-      if (env_value != "true" && env_value != "1") {
-        LOG(INFO) << "OpenTelemetry tracing is disabled (enable_tracing=false)";
-        return;
-      }
-    }
+    LOG(INFO) << "OpenTelemetry tracing is disabled (enable_tracing=false)";
+    return;
   }
 
   tracing_enabled_.store(true);
   LOG(INFO) << "OpenTelemetry tracing is enabled (enable_tracing=true)";
+
+  // Determine version string
+  std::string version_string;
+  const char* version_env = getenv("YB_VERSION_STRING");
+  if (version_env != nullptr) {
+    // Postgres backend - tserver passed version via env var
+    version_string = version_env;
+  } else {
+    // Master/tserver - initialize VersionInfo
+    CHECK_OK(VersionInfo::Init());
+    version_string = VersionInfo::GetShortVersionString();
+  }
 
   main_thread_id_ = std::this_thread::get_id();
   auto exporter = std::make_unique<otlp::OtlpHttpExporter>();
@@ -49,14 +50,12 @@ void OpenTelemetry::Init(const std::string& service_name) {
   auto processor = std::make_unique<trace_sdk::BatchSpanProcessor>(
       std::move(exporter), batch_options);
 
-  CHECK_OK(VersionInfo::Init());
-
   auto hostname_result = GetHostname();
   std::string hostname = hostname_result.ok() ? *hostname_result : "unknown";
 
   auto resource_attributes = resource::ResourceAttributes{
       {"service.name", service_name},
-      {"service.version", VersionInfo::GetShortVersionString()},
+      {"service.version", version_string},
       {"process.pid", std::to_string(getpid())},
       {"host.name", hostname}
   };
@@ -98,7 +97,6 @@ opentelemetry::nostd::shared_ptr<opentelemetry::trace::Tracer> OpenTelemetry::Ge
   return trace_api::Provider::GetTracerProvider()->GetTracer(name, "1.0.0");
 }
 
-// opentelemetry::nostd::shared_ptr<opentelemetry::trace::Span>
 OpenTelemetry::SpanWithScopePtr OpenTelemetry::GetSpan(const std::string& tracer_name, const std::string& span_name) {
   if (!tracing_enabled_.load()) {
     return SpanWithScopePtr(nullptr);
@@ -132,10 +130,11 @@ size_t OpenTelemetry::StartSpan(const std::string& tracer_name, const std::strin
 }
 
 size_t OpenTelemetry::StartSpanWithTraceParent(const std::string& tracer_name, const std::string& span_name, const std::string& trace_parent) {
-  if (!tracing_enabled_.load() || trace_parent.empty()) {
+  if (!tracing_enabled_.load()) {
     return 0;
   }
 
+  // TODO: add sampling code here for when the parent is empty. Always create a span if there is a parent context.
   CHECK_EQ(std::this_thread::get_id(), main_thread_id_)
       << "StartSpanWithTraceParent called from wrong thread - must use postgres backend only";
 
@@ -145,7 +144,9 @@ size_t OpenTelemetry::StartSpanWithTraceParent(const std::string& tracer_name, c
 
   opentelemetry::nostd::shared_ptr<opentelemetry::trace::Span> span;
   trace_api::StartSpanOptions options;
-  options.parent = ParseTraceParent(trace_parent);
+  if (!trace_parent.empty()) {
+    options.parent = ParseTraceParent(trace_parent);
+  }
 
   span = tracer->StartSpan(span_name, options);
 
@@ -153,7 +154,6 @@ size_t OpenTelemetry::StartSpanWithTraceParent(const std::string& tracer_name, c
   return span_stack_.size();
 }
 
-// opentelemetry::nostd::shared_ptr<opentelemetry::trace::Span>
 OpenTelemetry::SpanWithScopePtr OpenTelemetry::GetSpanWithParentContext(
     const std::string& tracer_name, const std::string& span_name,
     const opentelemetry::trace::SpanContext& parent_context) {
@@ -169,6 +169,13 @@ OpenTelemetry::SpanWithScopePtr OpenTelemetry::GetSpanWithParentContext(
 
   auto span = tracer->StartSpan(span_name, options);
   return std::make_shared<SpanWithScope>(span);
+}
+
+void OpenTelemetry::EndSpan(SpanWithScopePtr span_ptr) {
+  if (span_ptr == nullptr) {
+    return;
+  }
+  span_ptr->End();
 }
 
 void OpenTelemetry::EndSpan(size_t span_id) {
@@ -199,7 +206,9 @@ void OpenTelemetry::ClearAllSpans() {
 
   // End all spans in the stack, marking them as not having a normal return
   // since we're clearing them without returning from the function they were created in.
-  EndSpan(1);
+  if (!span_stack_.empty()) {
+    EndSpan(1);
+  }
 }
 
 void OpenTelemetry::SetAttribute(size_t span_id, const std::string& key, const opentelemetry::common::AttributeValue &value) {

@@ -163,7 +163,7 @@ static int MasterMain(int argc, char** argv) {
             [&termination_monitor]() { termination_monitor->Terminate(); });
       },
       &total_mem_watcher_thread));
-  span->End();
+  common::OpenTelemetry::EndSpan(span);
 
   termination_monitor->WaitForTermination();
 
@@ -177,7 +177,7 @@ static int MasterMain(int argc, char** argv) {
 
   server.Shutdown();
 
-  span->End();
+  common::OpenTelemetry::EndSpan(span);
 
   // Cleanup OpenTelemetry
   common::OpenTelemetry::Shutdown();
