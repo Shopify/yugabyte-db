@@ -4,6 +4,8 @@
 #include "opentelemetry/exporters/otlp/otlp_http_exporter.h"
 #include "opentelemetry/trace/provider.h"
 #include "opentelemetry/sdk/trace/batch_span_processor.h"
+#include "opentelemetry/sdk/trace/samplers/parent.h"
+#include "opentelemetry/sdk/trace/samplers/trace_id_ratio.h"
 #include "opentelemetry/sdk/trace/tracer_provider.h"
 
 #include "yb/util/flags/flag_tags.h"
@@ -12,7 +14,8 @@
 DEFINE_NON_RUNTIME_bool(otel_enable_tracing, false,
     "Enable OpenTelemetry distributed tracing. Requires server restart to take effect.");
 
-// TODO: add sampling configuration to control the amount of tracing data collected.
+DEFINE_NON_RUNTIME_double(otel_sampling_ratio, 0.01,
+    "Sampling ratio for root spans (0.0 to 1.0). Only applies when no parent trace context is provided.");
 
 namespace yb {
 namespace common {
@@ -61,8 +64,13 @@ void OpenTelemetry::Init(const std::string& service_name) {
   };
   auto resource_ptr = resource::Resource::Create(resource_attributes);
 
+  // Create parent-based sampler with 1% sampling for root spans
+  auto root_sampler = std::make_shared<trace_sdk::TraceIdRatioBasedSampler>(FLAGS_otel_sampling_ratio);
+  auto sampler = std::make_unique<trace_sdk::ParentBasedSampler>(root_sampler);
+
   auto provider = opentelemetry::nostd::shared_ptr<trace_api::TracerProvider>(
-      new trace_sdk::TracerProvider(std::move(processor), resource_ptr));
+      new trace_sdk::TracerProvider(std::move(processor), resource_ptr, std::move(sampler)));
+
   trace_api::Provider::SetTracerProvider(provider);
 
   LOG(INFO) << "OpenTelemetry initialized";

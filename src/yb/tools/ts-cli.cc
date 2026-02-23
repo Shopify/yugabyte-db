@@ -33,6 +33,7 @@
 
 #include <memory>
 
+#include "yb/common/otel.h"
 #include "yb/common/schema.h"
 #include "yb/common/schema_pbutil.h"
 #include "yb/common/transaction.h"
@@ -1122,5 +1123,13 @@ static int TsCliMain(int argc, char** argv) {
 } // namespace yb
 
 int main(int argc, char** argv) {
-  return yb::tools::TsCliMain(argc, argv);
+  // Initialize OpenTelemetry
+  yb::common::OpenTelemetry::Init("yb-ts-cli");
+
+  int result = yb::tools::TsCliMain(argc, argv);
+
+  // Cleanup OpenTelemetry
+  yb::common::OpenTelemetry::Shutdown();
+
+  return result;
 }

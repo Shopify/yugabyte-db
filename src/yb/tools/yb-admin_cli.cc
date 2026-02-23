@@ -43,6 +43,7 @@
 
 #include "yb/common/hybrid_time.h"
 #include "yb/common/json_util.h"
+#include "yb/common/otel.h"
 #include "yb/common/transaction.h"
 #include "yb/common/wire_protocol.h"
 #include "yb/common/xcluster_util.h"
@@ -3128,7 +3129,14 @@ Status CheckArgumentsCount(size_t count, size_t min, size_t max) {
 }  // namespace yb
 
 int main(int argc, char** argv) {
+  // Initialize OpenTelemetry
+  yb::common::OpenTelemetry::Init("yb-admin");
+
   yb::Status s = yb::tools::ClusterAdminCli().Run(argc, argv);
+
+  // Cleanup OpenTelemetry
+  yb::common::OpenTelemetry::Shutdown();
+
   if (s.ok()) {
     return 0;
   }
