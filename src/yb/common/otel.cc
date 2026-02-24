@@ -110,9 +110,6 @@ OpenTelemetry::SpanWithScopePtr OpenTelemetry::GetSpan(const std::string& tracer
     return SpanWithScopePtr(nullptr);
   }
 
-  // TODO: add sampling code here. If there is a parent context, create a new span.
-  //    Otherwise, use sampling configuration to decide whether to create a new span.
-
   auto tracer = GetTracer(tracer_name);
   auto span = tracer->StartSpan(span_name);
   return std::make_shared<SpanWithScope>(span);
@@ -142,7 +139,6 @@ size_t OpenTelemetry::StartSpanWithTraceParent(const std::string& tracer_name, c
     return 0;
   }
 
-  // TODO: add sampling code here for when the parent is empty. Always create a span if there is a parent context.
   CHECK_EQ(std::this_thread::get_id(), main_thread_id_)
       << "StartSpanWithTraceParent called from wrong thread - must use postgres backend only";
 
@@ -217,6 +213,17 @@ void OpenTelemetry::ClearAllSpans() {
   if (!span_stack_.empty()) {
     EndSpan(1);
   }
+}
+
+size_t OpenTelemetry::GetLastSpanId() {
+  if (!tracing_enabled_.load()) {
+    return 0;
+  }
+
+  CHECK_EQ(std::this_thread::get_id(), main_thread_id_)
+      << "GetLastSpanId called from wrong thread - must use postgres backend only";
+
+  return span_stack_.size();
 }
 
 void OpenTelemetry::SetAttribute(size_t span_id, const std::string& key, const opentelemetry::common::AttributeValue &value) {

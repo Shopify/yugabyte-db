@@ -709,8 +709,7 @@ pg_parse_query(const char *query_string)
 	List	   *raw_parsetree_list;
 
 	TRACE_POSTGRESQL_QUERY_PARSE_START(query_string);
-	size_t span_id = YBCOtelStartSpan("query_parse");
-	YBCOtelSetAttributeStr(span_id, "query", query_string);
+	size_t span_id = YBCOtelStartSpan("query_parse", query_string);
 
 	if (log_parser_stats)
 		ResetUsage();
@@ -786,8 +785,7 @@ pg_analyze_and_rewrite_fixedparams(RawStmt *parsetree,
 	List	   *querytree_list;
 
 	TRACE_POSTGRESQL_QUERY_REWRITE_START(query_string);
-	size_t span_id = YBCOtelStartSpan("query_rewrite");
-	YBCOtelSetAttributeStr(span_id, "query", query_string);
+	size_t span_id = YBCOtelStartSpan("query_rewrite", query_string);
 
 	/*
 	 * (1) Perform parse analysis.
@@ -828,8 +826,7 @@ pg_analyze_and_rewrite_varparams(RawStmt *parsetree,
 	List	   *querytree_list;
 
 	TRACE_POSTGRESQL_QUERY_REWRITE_START(query_string);
-	size_t span_id = YBCOtelStartSpan("query_rewrite");
-	YBCOtelSetAttributeStr(span_id, "query", query_string);
+	size_t span_id = YBCOtelStartSpan("query_rewrite", query_string);
 
 	/*
 	 * (1) Perform parse analysis.
@@ -885,8 +882,7 @@ pg_analyze_and_rewrite_withcb(RawStmt *parsetree,
 	List	   *querytree_list;
 
 	TRACE_POSTGRESQL_QUERY_REWRITE_START(query_string);
-	size_t span_id = YBCOtelStartSpan("query_rewrite");
-	YBCOtelSetAttributeStr(span_id, "query", query_string);
+	size_t span_id = YBCOtelStartSpan("query_rewrite", query_string);
 
 	/*
 	 * (1) Perform parse analysis.
@@ -1023,8 +1019,7 @@ pg_plan_query(Query *querytree, const char *query_string, int cursorOptions,
 	Assert(ActiveSnapshotSet());
 
 	TRACE_POSTGRESQL_QUERY_PLAN_START();
-	size_t span_id = YBCOtelStartSpan("query_plan");
-	YBCOtelSetAttributeStr(span_id, "query", query_string);
+	size_t span_id = YBCOtelStartSpan("query_plan", query_string);
 
 	if (log_planner_stats)
 		ResetUsage();
@@ -1244,9 +1239,7 @@ exec_simple_query(const char *query_string)
 	pgstat_report_activity(STATE_RUNNING, yb_redacted_query_string);
 
 	TRACE_POSTGRESQL_QUERY_START(query_string);
-	YbReadTraceParentFromQuery(query_string);
-	size_t span_id = YBCOtelStartSpanWithTraceParent("query_execution_simple", YbGetCurrentTraceparent());
-	YBCOtelSetAttributeStr(span_id, "query", query_string);
+	size_t span_id = YBCOtelStartSpan("query_execution_simple", query_string);
 
 	/*
 	 * We use save_log_statement_stats so ShowUsage doesn't report incorrect

@@ -2281,7 +2281,7 @@ StartTransaction(void)
 	MyProc->lxid = vxid.localTransactionId;
 
 	TRACE_POSTGRESQL_TRANSACTION_START(vxid.localTransactionId);
-	size_t span_id = YBCOtelStartSpan("transaction_start");
+	size_t span_id = YBCOtelStartSpan("transaction_start", NULL);
 	YBCOtelSetAttributeInt32(span_id, "transaction.id", vxid.localTransactionId);
 
 	/*
@@ -2534,7 +2534,7 @@ CommitTransaction(void)
 	}
 
 	TRACE_POSTGRESQL_TRANSACTION_COMMIT(MyProc->lxid);
-	size_t span_id = YBCOtelStartSpan("transaction_commit");
+	size_t span_id = YBCOtelStartSpan("transaction_commit", NULL);
 	YBCOtelSetAttributeInt32(span_id, "transaction.id", MyProc->lxid);
 
 
@@ -3107,7 +3107,7 @@ AbortTransaction(void)
 	}
 
 	TRACE_POSTGRESQL_TRANSACTION_ABORT(MyProc->lxid);
-	size_t span_id = YBCOtelStartSpan("transaction_abort");
+	size_t span_id = YBCOtelStartSpan("transaction_abort", NULL);
 	YBCOtelSetAttributeInt32(span_id, "transaction.id", MyProc->lxid);
 
 	/*

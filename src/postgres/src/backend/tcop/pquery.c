@@ -714,7 +714,7 @@ PortalRun(Portal portal, long count, bool isTopLevel, bool run_once,
 	AssertArg(PortalIsValid(portal));
 
 	TRACE_POSTGRESQL_QUERY_EXECUTE_START();
-	size_t span_id = YBCOtelStartSpan("query_execution");
+	size_t span_id = YBCOtelStartSpan("query_execution", NULL);
 
 	/* Initialize empty completion data */
 	if (qc)
@@ -1257,7 +1257,7 @@ PortalRunMulti(Portal portal,
 			 * process a plannable query.
 			 */
 			TRACE_POSTGRESQL_QUERY_EXECUTE_START();
-			size_t span_id = YBCOtelStartSpan("query_execution");
+			size_t span_id = YBCOtelStartSpan("query_execution", NULL);
 
 			if (log_executor_stats)
 				ResetUsage();

@@ -61,8 +61,9 @@ public:
       const std::string& tracer_name, const std::string& span_name,
       const opentelemetry::trace::SpanContext& parent_context);
   static void EndSpan(SpanWithScopePtr span_ptr);
+  static bool IsTracingEnabled();
 
-  // NOTE: the next four functions are only needed for postgres spans,
+  // NOTE: the following functions are only needed for postgres spans,
   //    which are not using the C++ API and thus need to be managed manually.
   //    Consider keeping this functionality in pggate directly if we don't expect to need it elsewhere.
   //    Also, it can only be used by single threaded application such as postgres backend,
@@ -72,7 +73,7 @@ public:
   static void EndSpan(size_t span_id);
   static void ClearAllSpans();
   static void SetAttribute(size_t span_id, const std::string& key, const opentelemetry::common::AttributeValue &value);
-  static bool IsTracingEnabled();
+  static size_t GetLastSpanId();
 
 private:
   static inline std::vector<SpanWithScope> span_stack_;

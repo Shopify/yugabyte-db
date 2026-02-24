@@ -10,8 +10,7 @@ extern "C" {
 void YBCOtelInit();
 void YBCOtelShutdown();
 
-size_t YBCOtelStartSpan(const char* span_name);
-size_t YBCOtelStartSpanWithTraceParent(const char* span_name, const char* traceparent);
+size_t YBCOtelStartSpan(const char* span_name, const char* query_string);
 void YBCOtelEndSpan(size_t span_id);
 void YBCOtelClearAllSpans();
 void YBCOtelSetAttributeStr(size_t span_id, const char* key, const char* value);
