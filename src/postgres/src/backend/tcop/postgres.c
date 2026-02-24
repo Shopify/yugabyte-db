@@ -98,6 +98,7 @@
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/syscache.h"
+#include "tcop/yb_pipeline.h"
 #include "yb/yql/pggate/ybc_pggate.h"
 #include "yb_tcmalloc_utils.h"
 #include "yb_ysql_conn_mgr_helper.h"
@@ -199,6 +200,9 @@ static bool UseSemiNewlineNewline = false;	/* -j switch */
 static bool RecoveryConflictPending = false;
 static bool RecoveryConflictRetryable = true;
 static ProcSignalReason RecoveryConflictReason;
+
+/* YB: pipeline parallel execution state */
+static YbPipeline *yb_pipeline = NULL;
 
 /* reused buffer to pass to SendRowDescriptionMessage() */
 static MemoryContext row_description_context = NULL;
@@ -5800,6 +5804,28 @@ yb_exec_execute_message(long max_rows,
 	YbRefreshSessionStatsDuringExecution();
 }
 
+/*
+ * Thin wrappers that expose internal functions for the pipeline execution
+ * engine in yb_pipeline_exec.c.
+ */
+void
+yb_exec_execute_message_for_pipeline(const char *portal_name, long max_rows)
+{
+	exec_execute_message(portal_name, max_rows);
+}
+
+void
+yb_finish_xact_command_for_pipeline(void)
+{
+	finish_xact_command();
+}
+
+void
+yb_start_xact_command_for_pipeline(void)
+{
+	yb_start_xact_command_internal(false);
+}
+
 static void
 yb_report_cache_version_restart(const char *query, ErrorData *edata)
 {
@@ -6237,6 +6263,10 @@ PostgresMain(const char *dbname, const char *username)
 		 */
 		if (doing_extended_query_message)
 			ignore_till_sync = true;
+
+		/* YB: Reset pipeline state on error. */
+		if (yb_pipeline != NULL)
+			YbPipelineReset(yb_pipeline);
 
 		/* We don't have a transaction command open anymore */
 		xact_started = false;
@@ -6727,6 +6757,22 @@ PostgresMain(const char *dbname, const char *username)
 
 					pq_getmsgend(&input_message);
 
+					/*
+					 * YB pipeline parallelism: if enabled and this is part of
+					 * a batch (more messages before Sync), buffer the Execute
+					 * instead of running it now.  The pipeline will be
+					 * dispatched when Sync arrives.
+					 */
+					if (yb_enable_pipeline_parallelism &&
+						IsYugaByteEnabled() &&
+						YbIsBatchedExecution())
+					{
+						if (yb_pipeline == NULL)
+							yb_pipeline = YbPipelineCreate();
+						YbPipelineAddEntry(yb_pipeline, portal_name, max_rows);
+						break;
+					}
+
 					MemoryContext oldcontext = CurrentMemoryContext;
 					const YBQueryRetryData *retry_data = yb_collect_portal_restart_data(portal_name);
 
@@ -7005,6 +7051,34 @@ PostgresMain(const char *dbname, const char *username)
 					 */
 					pq_getmsgend(&input_message);
 					MemoryContext oldcontext = CurrentMemoryContext;
+
+					/*
+					 * YB pipeline parallelism: if we buffered Execute messages,
+					 * execute them now through the pipeline engine before
+					 * finishing the transaction command.
+					 */
+					if (yb_pipeline != NULL && yb_pipeline->num_entries > 0)
+					{
+						PG_TRY();
+						{
+							if (yb_pipeline->num_entries > 1)
+								YbPipelineExecute(yb_pipeline);
+							else
+							{
+								yb_exec_execute_message_for_pipeline(
+									yb_pipeline->entries[0].portal_name,
+									yb_pipeline->entries[0].max_rows);
+							}
+						}
+						PG_CATCH();
+						{
+							YbPipelineReset(yb_pipeline);
+							PG_RE_THROW();
+						}
+						PG_END_TRY();
+						YbPipelineReset(yb_pipeline);
+					}
+
 					PG_TRY();
 					{
 						finish_xact_command();

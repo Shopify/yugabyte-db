@@ -103,4 +103,10 @@ extern bool set_plan_disabling_options(const char *arg,
 									   GucContext context, GucSource source);
 extern const char *get_stats_option_name(const char *arg);
 
+/* YB: Functions exposed for pipeline parallel execution (yb_pipeline_exec.c) */
+extern void yb_exec_execute_message_for_pipeline(const char *portal_name,
+												 long max_rows);
+extern void yb_finish_xact_command_for_pipeline(void);
+extern void yb_start_xact_command_for_pipeline(void);
+
 #endif							/* TCOPPROT_H */

@@ -754,6 +754,14 @@ extern bool yb_enable_inplace_index_update;
 extern bool yb_enable_advisory_locks;
 
 /*
+ * Enable parallel execution of independent queries in an extended query
+ * protocol pipeline. When enabled, queries that do not conflict (based on
+ * table-level read/write analysis) are submitted concurrently through pggate.
+ */
+extern bool yb_enable_pipeline_parallelism;
+extern int yb_pipeline_max_parallel_queries;
+
+/*
  * Enable invalidation messages.
  */
 extern bool yb_enable_invalidation_messages;

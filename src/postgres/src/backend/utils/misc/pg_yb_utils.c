@@ -2168,6 +2168,9 @@ int			yb_max_num_invalidation_messages = 4096;
 /* DEPRECATED */
 bool		yb_enable_advisory_locks = true;
 
+bool		yb_enable_pipeline_parallelism = false;
+int			yb_pipeline_max_parallel_queries = 8;
+
 
 YBUpdateOptimizationOptions yb_update_optimization_options = {
 	.has_infra = true,

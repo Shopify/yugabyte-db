@@ -3306,6 +3306,16 @@ static struct config_bool ConfigureNamesBool[] =
 	},
 
 	{
+		{"yb_enable_pipeline_parallelism", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enable parallel execution of independent queries in extended query protocol pipelines."),
+			NULL
+		},
+		&yb_enable_pipeline_parallelism,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"yb_ignore_freeze_with_copy", PGC_USERSET, ERROR_HANDLING_OPTIONS,
 			gettext_noop("Ignore the FREEZE flag on COPY FROM command."),
 			NULL,
@@ -5474,6 +5484,16 @@ static struct config_int ConfigureNamesInt[] =
 		},
 		&yb_invalidation_message_expiration_secs,
 		10, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_pipeline_max_parallel_queries", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Maximum number of independent queries to execute in parallel within a pipeline."),
+			NULL
+		},
+		&yb_pipeline_max_parallel_queries,
+		8, 1, 64,
 		NULL, NULL, NULL
 	},
 

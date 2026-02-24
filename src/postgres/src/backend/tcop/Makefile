@@ -18,6 +18,8 @@ OBJS = \
 	fastpath.o \
 	postgres.o \
 	pquery.o \
-	utility.o
+	utility.o \
+	yb_pipeline_analyze.o \
+	yb_pipeline_exec.o
 
 include $(top_srcdir)/src/backend/common.mk
