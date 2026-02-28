@@ -13,6 +13,10 @@ static char yb_current_traceparent[YB_TRACEPARENT_LEN] = {0};
 * Format: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01
 *
 * Returns: length of valid traceparent (55 chars), or 0 if invalid
+*
+* Query comments follow the sqlcommenter format with key='value' pairs, e.g.:
+*   application='myapp',traceparent='00-abc...-01'
+* wrapped in a SQL block comment.
 */
 static size_t
 YBCValidateTraceparent(const char* str) {
@@ -88,30 +92,35 @@ YBCReadTraceParentFromQuery(const char *query_string)
 			return;  // Malformed comment
 		}
 
-		// Parse comma-separated key:value pairs within this comment
+		// Parse comma-separated key='value' pairs within this comment (sqlcommenter format)
 		while (pos < comment_end) {
 			// Skip whitespace
 			while (*pos && isspace((unsigned char)*pos))
 				pos++;
 
-			// Check for "traceparent:"
-			if (strncmp(pos, "traceparent:", 12) == 0) {
+			// Check for "traceparent=" (sqlcommenter format: key='value')
+			if (strncmp(pos, "traceparent=", 12) == 0) {
 				pos += 12;
 
-				// Skip whitespace after colon
+				// Skip whitespace after equals sign
 				while (*pos && isspace((unsigned char)*pos))
 					pos++;
+
+				// Require opening single quote
+				if (*pos != '\'')
+					break;
+				pos++;
 
 				const char* value_start = pos;
 
 				// Validate traceparent value
 				size_t len = YBCValidateTraceparent(value_start);
-				if (len == YB_TRACEPARENT_LEN - 1) {
+				if (len == YB_TRACEPARENT_LEN - 1 && value_start[len] == '\'') {
 					memcpy(yb_current_traceparent, value_start, len);
 					yb_current_traceparent[len] = '\0';
 					return;
 				}
-				// Invalid format, continue searching
+				// Invalid format or missing closing quote, continue searching
 			}
 
 			// Find next comma or end of comment

@@ -351,6 +351,9 @@ class OutboundCall : public RpcCall {
     if (span_) {
       span_->SetAttribute("net.peer.name", *hostname);
       span_->SetAttribute("net.peer.address", yb::ToString(value.remote()));
+      // Drop the scope here: for remote calls, span_->End() will be called on the reactor thread,
+      // not the calling thread. The scope must be released on the thread that installed it.
+      span_->scope.reset();
     }
   }
 
