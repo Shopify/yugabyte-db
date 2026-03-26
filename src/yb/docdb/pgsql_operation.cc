@@ -1513,7 +1513,8 @@ Status PgsqlWriteOperation::ApplyInsert(const DocOperationApplyData& data, IsUps
         std::optional<RowPackContext> pack_context;
         if (pack_row) {
           pack_context.emplace(
-              request_, data, VERIFY_RESULT(RowPackerData::Create(request_, *doc_read_context_)));
+              request_, data, VERIFY_RESULT(RowPackerData::Create(request_, *doc_read_context_)),
+              is_upsert && FLAGS_ysql_mark_update_packed_row /* is_update */);
         } else {
           RETURN_NOT_OK(data.doc_write_batch->SetPrimitive(
               DocPath(key, KeyEntryValue::kLivenessColumn),
@@ -1540,7 +1541,8 @@ Status PgsqlWriteOperation::ApplyInsert(const DocOperationApplyData& data, IsUps
     }
   } else if (pack_row) {
     RowPackContext pack_context(
-        request_, data, VERIFY_RESULT(RowPackerData::Create(request_, *doc_read_context_)));
+        request_, data, VERIFY_RESULT(RowPackerData::Create(request_, *doc_read_context_)),
+        is_upsert && FLAGS_ysql_mark_update_packed_row /* is_update */);
 
     auto column_id_extractor = [](const PgsqlColumnValuePB& column_value) {
       return column_value.column_id();
