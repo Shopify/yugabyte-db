@@ -1006,6 +1006,9 @@ Status PopulateCDCSDKIntentRecord(
       new_cdc_record_needed =
           (prev_key != primary_key) ||
           (value_type == dockv::ValueEntryType::kTombstone && decoded_key.num_subkeys() == 0) ||
+          // A packed row after a DELETE (upsert on existing row) must start a new INSERT record,
+          // otherwise the INSERT data is lost because the DELETE was already emitted.
+          (IsPackedRow(value_type) && row_message->op() == RowMessage_Op_DELETE) ||
           prev_intent_phy_time != intent.intent_ht.hybrid_time().GetPhysicalValueMicros();
     } else {
       new_cdc_record_needed = (prev_key != primary_key) || (col_count >= schema.num_columns());
