@@ -162,6 +162,14 @@ Status PopulateWriteRecord(
     }
 
     DCHECK(record);
+
+    // Upsert pattern: packed row following a DELETE tombstone for the same key.
+    // Convert to WRITE so consumer processes the row data as an update.
+    if (record->operation() == CDCRecordPB::DELETE && dockv::IsPackedRow(value_type) &&
+        prev_key == primary_key) {
+      record->set_operation(CDCRecordPB::WRITE);
+    }
+
     auto kv_pair = record->add_changes();
     kv_pair->set_key(write_pair.key().ToBuffer());
     kv_pair->mutable_value()->set_binary_value(write_pair.value().ToBuffer());

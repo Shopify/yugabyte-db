@@ -1050,8 +1050,10 @@ Status PopulateCDCSDKIntentRecord(
     if (FLAGS_enable_single_record_update) {
       new_cdc_record_needed =
           (prev_key != primary_key) ||
-          (value_type == dockv::ValueEntryType::kTombstone && decoded_key.num_subkeys() == 0) ||
-          prev_intent_phy_time != intent.intent_ht.hybrid_time().GetPhysicalValueMicros();
+          // Split same-key intents at different times into separate records, but not when
+          // the intent is a full-row tombstone (upsert pattern: tombstone + packed row).
+          (prev_intent_phy_time != intent.intent_ht.hybrid_time().GetPhysicalValueMicros() &&
+           !(value_type == dockv::ValueEntryType::kTombstone && decoded_key.num_subkeys() == 0));
     } else {
       new_cdc_record_needed = (prev_key != primary_key) || (col_count >= schema.num_columns());
     }
@@ -1188,6 +1190,17 @@ Status PopulateCDCSDKIntentRecord(
 
     prev_key = primary_key;
     prev_intent_phy_time = intent.intent_ht.hybrid_time().GetPhysicalValueMicros();
+
+    // Upsert pattern: packed row following a DELETE tombstone for the same key.
+    // Convert to UPDATE so the packed row data is processed instead of being dropped.
+    if (!new_cdc_record_needed && row_message->op() == RowMessage_Op_DELETE &&
+        IsPackedRow(value_type)) {
+      SetOperation(row_message, OpType::UPDATE, schema);
+      is_packed_row_record = true;
+      col_count = schema.num_key_columns();
+      row_message->clear_old_tuple();
+    }
+
     if (IsInsertOrUpdate(*row_message)) {
       if (auto packed_row_version = GetPackedRowVersion(value_type)) {
         col_count += VERIFY_RESULT(PopulatePackedRows(
@@ -1576,6 +1589,17 @@ Status PopulateCDCSDKWriteRecord(
     }
     prev_key = primary_key;
     DCHECK(proto_record);
+
+    // Upsert pattern: packed row following a DELETE tombstone for the same key.
+    // Convert to UPDATE so the packed row data is processed instead of being dropped.
+    if (row_message->op() == RowMessage_Op_DELETE && IsPackedRow(value_type) &&
+        prev_key == primary_key) {
+      SetOperation(row_message, OpType::UPDATE, schema);
+      is_packed_row_record = true;
+      // Clear before-image data populated for the DELETE — it will be
+      // re-populated for the UPDATE at the end of the function.
+      row_message->clear_old_tuple();
+    }
 
     if (IsInsertOrUpdate(*row_message)) {
       const yb::docdb::LWKeyValuePairPB& next_write_pair = *(std::next(it, 1));

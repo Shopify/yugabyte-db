@@ -190,6 +190,31 @@ TEST_F(XClusterProducerTest, GetChangesBasic) {
   ASSERT_GT(resp.checkpoint().op_id().index(), last_op_id.index());
 }
 
+// Verify that an upsert (re-insert of existing key) produces a WRITE record, not DELETE.
+// With packed rows, an upsert generates a tombstone + packed row for the same key.
+// The CDC producer should detect this pattern and emit WRITE instead of DELETE.
+TEST_F(XClusterProducerTest, UpsertProducesWrite) {
+  auto resp = ASSERT_RESULT(GetChanges());
+  ASSERT_EQ(resp.records_size(), 0);
+  auto last_op_id = resp.checkpoint().op_id();
+
+  // Insert a row (key=0, value=0).
+  ASSERT_OK(InsertRows(0, 1));
+  resp = ASSERT_RESULT(GetChanges(last_op_id));
+  ASSERT_EQ(resp.records_size(), 1);
+  ASSERT_EQ(resp.records(0).operation(), CDCRecordPB::WRITE);
+  last_op_id = resp.checkpoint().op_id();
+
+  // Re-insert the same key (key=0, value=0) — this is an upsert.
+  // With packed rows enabled, DocDB writes a tombstone + packed row for the same key.
+  ASSERT_OK(InsertRows(0, 1));
+  resp = ASSERT_RESULT(GetChanges(last_op_id));
+
+  // Should produce a single WRITE record, not a DELETE.
+  ASSERT_EQ(resp.records_size(), 1);
+  ASSERT_EQ(resp.records(0).operation(), CDCRecordPB::WRITE);
+}
+
 // Verify GetChanges errors out when the wrong AutoFlags config version is set.
 TEST_F(XClusterProducerTest, GetChangesWithAutoFlags) {
   auto config_version = ASSERT_RESULT(GetAutoFlagsConfigVersion());
