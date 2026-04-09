@@ -1051,9 +1051,9 @@ Status PopulateCDCSDKIntentRecord(
       new_cdc_record_needed =
           (prev_key != primary_key) ||
           // Split same-key intents at different times into separate records, but not when
-          // the intent is a full-row tombstone (upsert pattern: tombstone + packed row).
+          // the current record is DELETE and a packed row follows (upsert pattern).
           (prev_intent_phy_time != intent.intent_ht.hybrid_time().GetPhysicalValueMicros() &&
-           !(value_type == dockv::ValueEntryType::kTombstone && decoded_key.num_subkeys() == 0));
+           !(row_message && row_message->op() == RowMessage_Op_DELETE && IsPackedRow(value_type)));
     } else {
       new_cdc_record_needed = (prev_key != primary_key) || (col_count >= schema.num_columns());
     }
