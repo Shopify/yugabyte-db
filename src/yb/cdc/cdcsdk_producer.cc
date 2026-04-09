@@ -145,6 +145,44 @@ bool IsRootLevelTombstone(
   return value_type == dockv::ValueEntryType::kTombstone && decoded_key.num_subkeys() == 0;
 }
 
+bool IsDeleteBeforeUpdateOfSameRow(
+    const CDCSDKProtoRecordPB& delete_record, const CDCSDKProtoRecordPB& update_record) {
+  if (!delete_record.has_row_message() || !update_record.has_row_message()) {
+    return false;
+  }
+
+  const auto& delete_row = delete_record.row_message();
+  const auto& update_row = update_record.row_message();
+  return delete_row.op() == RowMessage_Op_DELETE &&
+         update_row.op() == RowMessage_Op_UPDATE &&
+         delete_row.table_id() == update_row.table_id() &&
+         delete_row.primary_key() == update_row.primary_key() &&
+         delete_row.commit_time() == update_row.commit_time() &&
+         delete_row.transaction_id() == update_row.transaction_id();
+}
+
+uint32_t RemoveDeleteBeforeUpdateRecords(
+    const int start_index, GetChangesResponsePB* resp, CDCThroughputMetrics* throughput_metrics) {
+  uint32_t removed_records = 0;
+  auto* records = resp->mutable_cdc_sdk_proto_records();
+  for (int index = start_index; index + 1 < records->size();) {
+    if (!IsDeleteBeforeUpdateOfSameRow(records->Get(index), records->Get(index + 1))) {
+      ++index;
+      continue;
+    }
+
+    const auto removed_record_size = records->Get(index).ByteSizeLong();
+    records->DeleteSubrange(index, 1);
+    ++removed_records;
+    if (throughput_metrics) {
+      --throughput_metrics->records_sent;
+      throughput_metrics->bytes_sent -= removed_record_size;
+    }
+  }
+
+  return removed_records;
+}
+
 void SetOperation(RowMessage* row_message, OpType type, const Schema& schema) {
   switch (type) {
     case OpType::INSERT:
@@ -982,6 +1020,7 @@ Status PopulateCDCSDKIntentRecord(
     const bool& end_of_transaction,
     CDCThroughputMetrics* throughput_metrics) {
   auto tablet = VERIFY_RESULT(tablet_peer->shared_tablet());
+  const int resp_records_start = resp->cdc_sdk_proto_records_size();
 
   const bool colocated = tablet->metadata()->colocated();
   const bool is_sys_catalog_tablet = tablet->metadata()->IsSysCatalog();
@@ -1338,6 +1377,8 @@ Status PopulateCDCSDKIntentRecord(
         reverse_index_key, commit_time, prev_key.ToBuffer(), throughput_metrics);
   }
 
+  RemoveDeleteBeforeUpdateRecords(resp_records_start, resp, throughput_metrics);
+
   return Status::OK();
 }
 
@@ -1402,6 +1443,7 @@ Status PopulateCDCSDKWriteRecord(
     FillBeginRecordForSingleShardTransaction(
         msg->hybrid_time(), xrepl_origin_id, resp, throughput_metrics);
   }
+  const int resp_records_start = resp->cdc_sdk_proto_records_size();
 
   auto tablet_ptr = VERIFY_RESULT(tablet_peer->shared_tablet());
   const auto& batch = msg->write().write_batch();
@@ -1675,6 +1717,8 @@ Status PopulateCDCSDKWriteRecord(
     throughput_metrics->records_sent++;
     throughput_metrics->bytes_sent += proto_record->ByteSizeLong();
   }
+
+  records_added -= RemoveDeleteBeforeUpdateRecords(resp_records_start, resp, throughput_metrics);
 
   if (FLAGS_cdc_populate_end_markers_transactions) {
     // If there are no records added, we do not need to populate the begin-commit block
