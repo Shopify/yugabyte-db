@@ -140,6 +140,11 @@ Result<bool> IsPackedRowUpdate(const dockv::ValueEntryType value_type, Slice val
   return VERIFY_RESULT(dockv::ParsePackedRowV2Header(value_slice)).IsUpdate();
 }
 
+bool IsRootLevelTombstone(
+    const dockv::ValueEntryType value_type, const dockv::SubDocKey& decoded_key) {
+  return value_type == dockv::ValueEntryType::kTombstone && decoded_key.num_subkeys() == 0;
+}
+
 void SetOperation(RowMessage* row_message, OpType type, const Schema& schema) {
   switch (type) {
     case OpType::INSERT:
@@ -1047,6 +1052,20 @@ Status PopulateCDCSDKIntentRecord(
     // Compare key hash with previously seen key hash to determine whether the write pair
     // is part of the same row or not.
     Slice primary_key(key.data(), key_size);
+    const bool end_of_intents = i + 1 == intents.size();
+    if (IsRootLevelTombstone(value_type, decoded_key) && !end_of_intents) {
+      Slice next_key(intents[i + 1].key_buf);
+      const auto next_key_size =
+          VERIFY_RESULT(dockv::DocKey::EncodedSize(next_key, dockv::DocKeyPart::kWholeDocKey));
+      Slice next_primary_key(next_key.data(), next_key_size);
+      if (next_primary_key == primary_key &&
+          intents[i + 1].intent_ht.hybrid_time() == intent.intent_ht.hybrid_time()) {
+        // Row rewrites such as INSERT .. ON CONFLICT DO UPDATE can emit a row tombstone before the
+        // replacement write. Skip the intermediate tombstone so CDC surfaces the final UPDATE.
+        continue;
+      }
+    }
+
     if (FLAGS_enable_single_record_update) {
       new_cdc_record_needed =
           (prev_key != primary_key) ||
@@ -1233,7 +1252,7 @@ Status PopulateCDCSDKIntentRecord(
     row_message->set_table_id(table_id);
 
     // Get the next intent to see if it should go into a new record.
-    bool is_last_intent = (i == intents.size() -1);
+    bool is_last_intent = (i == intents.size() - 1);
     docdb::IntentKeyValueForCDC next_intent;
     if (!is_last_intent) {
       next_intent = intents[i + 1];
@@ -1442,6 +1461,20 @@ Status PopulateCDCSDKWriteRecord(
     // Compare key hash with previously seen key hash to determine whether the write pair
     // is part of the same row or not.
     Slice primary_key(key.data(), key_size);
+    auto next_it = std::next(it);
+    const bool end_of_write_batch = next_it == batch.write_pairs().cend();
+    if (IsRootLevelTombstone(value_type, decoded_key) && !end_of_write_batch) {
+      Slice next_key(next_it->key());
+      const auto next_key_size =
+          VERIFY_RESULT(dockv::DocKey::EncodedSize(next_key, dockv::DocKeyPart::kWholeDocKey));
+      Slice next_primary_key(next_key.data(), next_key_size);
+      if (next_primary_key == primary_key) {
+        // Row rewrites can stage a top-level tombstone immediately before the replacement write.
+        // Ignore that tombstone so the row is emitted with its final INSERT/UPDATE semantics.
+        continue;
+      }
+    }
+
     if (prev_key != primary_key || (!FLAGS_enable_single_record_update && row_message &&
                                     row_message->op() == RowMessage_Op_UPDATE)) {
       Slice sub_doc_key = key;
@@ -1578,10 +1611,11 @@ Status PopulateCDCSDKWriteRecord(
     DCHECK(proto_record);
 
     if (IsInsertOrUpdate(*row_message)) {
-      const yb::docdb::LWKeyValuePairPB& next_write_pair = *(std::next(it, 1));
-      bool end_of_write_batch = (std::next(it, 1) == batch.write_pairs().cend());
-      bool populate_new_record = VERIFY_RESULT(
-          ShouldPopulateNewWriteRecord(end_of_write_batch, next_write_pair, primary_key));
+      bool populate_new_record = end_of_write_batch;
+      if (!populate_new_record) {
+        populate_new_record =
+            VERIFY_RESULT(ShouldPopulateNewWriteRecord(false, *next_it, primary_key));
+      }
 
       if (auto version = GetPackedRowVersion(value_type)) {
         RETURN_NOT_OK(PopulatePackedRows(

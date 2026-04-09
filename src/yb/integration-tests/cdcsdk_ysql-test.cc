@@ -12427,6 +12427,65 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestPackedRowUpdateFlag)) {
   ASSERT_EQ(insert_count, 1);
   ASSERT_EQ(update_count, 1);
 }
+
+// Existing-row upserts can rewrite the row internally, but CDC should surface the final UPDATE.
+TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(UpsertConflictUpdateEmitsUpdate)) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_single_record_update) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_packed_row) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_use_packed_row_v2) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_pack_full_row_update) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_mark_update_packed_row) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_history_retention_interval_sec) = 0;
+
+  ASSERT_OK(SetUpWithParams(1, 1, false));
+  auto table = ASSERT_RESULT(CreateTable(&test_cluster_, kNamespaceName, kTableName));
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+  ASSERT_OK(test_client()->GetTablets(table, 0, &tablets, nullptr));
+  ASSERT_EQ(tablets.size(), 1);
+
+  xrepl::StreamId stream_id = ASSERT_RESULT(CreateDBStreamWithReplicationSlot());
+  auto set_resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets));
+  ASSERT_FALSE(set_resp.has_error());
+
+  auto conn = ASSERT_RESULT(test_cluster_.ConnectToDB(kNamespaceName));
+  ASSERT_OK(conn.ExecuteFormat(
+      "INSERT INTO $0($1, $2) VALUES (1, 10)", kTableName, kKeyColumnName, kValueColumnName));
+
+  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.ExecuteFormat(
+      "INSERT INTO $0($1, $2) VALUES (1, 20) ON CONFLICT ($1) DO UPDATE SET $2 = EXCLUDED.$2",
+      kTableName, kKeyColumnName, kValueColumnName));
+  ASSERT_OK(conn.Execute("COMMIT"));
+
+  ASSERT_OK(WaitForFlushTables(
+      {table.table_id()}, /* add_indexes = */ false,
+      /* timeout_secs = */ 30, /* is_compaction = */ false));
+
+  auto pending_changes = GetAllPendingChangesFromCdc(stream_id, tablets);
+
+  const uint32_t expected_count[] = {1, 1, 1, 0, 0, 0};
+  uint32_t count[] = {0, 0, 0, 0, 0, 0};
+  ExpectedRecord expected_records[] = {{0, 0}, {1, 10}, {1, 20}};
+  RowMessage::Op expected_record_types[] = {
+      RowMessage::DDL, RowMessage::INSERT, RowMessage::UPDATE};
+
+  uint32_t seen_dml_records = 0;
+  for (const auto& record : pending_changes.records) {
+    if (record.row_message().op() == RowMessage::BEGIN ||
+        record.row_message().op() == RowMessage::COMMIT) {
+      continue;
+    }
+
+    ASSERT_LT(seen_dml_records, 3);
+    ASSERT_EQ(record.row_message().op(), expected_record_types[seen_dml_records]);
+    CheckRecord(record, expected_records[seen_dml_records], count);
+    ++seen_dml_records;
+  }
+
+  ASSERT_EQ(seen_dml_records, 3);
+  CheckCount(expected_count, count);
+}
+
 // This test verifies that we do not miss any records when LogCache::ReadOps() reads WAL Ops from
 // the active segment with combined size greater than FLAGS_consensus_max_batch_size_bytes (default
 // value 4 MB).
