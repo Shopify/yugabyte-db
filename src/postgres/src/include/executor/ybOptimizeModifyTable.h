@@ -38,3 +38,5 @@ extern void YbComputeModifiedColumnsAndSkippableEntities(ModifyTableState *mtsta
 														 bool beforeRowUpdateTriggerFired);
 
 extern bool YbIsPrimaryKeyUpdated(Relation rel, const Bitmapset *updated_cols);
+extern bool YbArePrimaryKeyValuesEqual(Relation rel, HeapTuple oldtuple,
+									   TupleTableSlot *newslot);

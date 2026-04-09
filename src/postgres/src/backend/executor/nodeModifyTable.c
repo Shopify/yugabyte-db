@@ -2506,6 +2506,19 @@ lreplace:
 
 		if (*yb_is_pk_updated)
 		{
+			/*
+			 * Verify PK values actually changed.  For ON CONFLICT DO UPDATE
+			 * SET pk = EXCLUDED.pk, the PK values are unchanged since the
+			 * conflict was detected on the PK constraint.  In that case we
+			 * can use the cheaper UPDATE path instead of DELETE + INSERT.
+			 */
+			if (oldtuple &&
+				YbArePrimaryKeyValuesEqual(resultRelationDesc, oldtuple, slot))
+				*yb_is_pk_updated = false;
+		}
+
+		if (*yb_is_pk_updated)
+		{
 			YBCExecuteUpdateReplace(resultRelationDesc, context->planSlot, slot, estate);
 			row_found = true;
 		}

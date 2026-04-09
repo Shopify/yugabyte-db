@@ -595,3 +595,50 @@ YbIsPrimaryKeyUpdated(Relation rel, const Bitmapset *updated_cols)
 {
 	return bms_overlap(YBGetTablePrimaryKeyBms(rel), updated_cols);
 }
+
+/*
+ * YbArePrimaryKeyValuesEqual
+ *		Check whether the primary key column values in oldtuple and newslot
+ *		are identical.  Returns true if all PK values match.
+ *
+ * This is used to avoid an unnecessary DELETE + INSERT (YBCExecuteUpdateReplace)
+ * when PK columns appear in the SET clause but their values haven't actually
+ * changed.  A common case is INSERT ... ON CONFLICT DO UPDATE SET pk = EXCLUDED.pk,
+ * where the PK values are guaranteed to be the same since the conflict was
+ * detected on the PK constraint.
+ */
+bool
+YbArePrimaryKeyValuesEqual(Relation rel, HeapTuple oldtuple, TupleTableSlot *newslot)
+{
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	Bitmapset  *pk_bms = YBGetTablePrimaryKeyBms(rel);
+	int			minattr = YBGetFirstLowInvalidAttributeNumber(rel);
+	int			bms_idx = -1;
+
+	while ((bms_idx = bms_next_member(pk_bms, bms_idx)) >= 0)
+	{
+		AttrNumber	attnum = bms_idx + minattr;
+		bool		old_isnull;
+		bool		new_isnull;
+		Datum		old_val;
+		Datum		new_val;
+		Form_pg_attribute attr;
+
+		/* Skip system columns — only compare user PK columns. */
+		if (attnum <= 0)
+			continue;
+
+		old_val = heap_getattr(oldtuple, attnum, tupdesc, &old_isnull);
+		new_val = slot_getattr(newslot, attnum, &new_isnull);
+
+		if (old_isnull != new_isnull)
+			return false;
+		if (old_isnull)
+			continue;
+
+		attr = TupleDescAttr(tupdesc, attnum - 1);
+		if (!datumIsEqual(old_val, new_val, attr->attbyval, attr->attlen))
+			return false;
+	}
+	return true;
+}
