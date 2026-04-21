@@ -142,6 +142,15 @@ DEFINE_RUNTIME_bool(cluster_balancer_stepdown_to_preferred_leader_on_remove, tru
     "If true, when removing a replica which happens to be the leader from a tablet, the cluster "
     "balancer will step down the leader to a tserver in the most preferred zone.");
 
+DEFINE_RUNTIME_string(load_balancer_strategy,
+    yb::master::kLoadBalancerStrategyCountBased,
+    "Which cluster balancer strategy to use. Options are \"count_based\" (default, balances "
+    "tablet and leader counts) and \"heat_aware_experimental\" (reserved for future heat-aware "
+    "balancing). Unknown or reserved values currently fall back to \"count_based\". "
+    "Note: this flag intentionally does not use a set-membership validator so that a typo or "
+    "an unrecognized value from a gflags file is logged and safely falls back to count-based "
+    "rather than rejected outright.");
+
 DECLARE_int32(replication_factor);
 
 METRIC_DEFINE_gauge_int64(cluster,
@@ -326,7 +335,8 @@ bool ClusterLoadBalancer::IsLoadBalancerEnabled() const {
 
 // Cluster balancer class.
 ClusterLoadBalancer::ClusterLoadBalancer(CatalogManager* cm)
-    : random_(GetRandomSeed32()),
+    : strategy_(CreateLoadBalancerStrategy(FLAGS_load_balancer_strategy)),
+      random_(GetRandomSeed32()),
       is_enabled_(FLAGS_enable_load_balancing),
       activity_buffer_(FLAGS_load_balancer_num_idle_runs) {
   ResetGlobalState(false /* initialize_ts_descs */);
@@ -743,6 +753,9 @@ void ClusterLoadBalancer::RunClusterBalancer(
     const LeaderEpoch& epoch, const std::vector<TableInfoPtr>& tables,
     const TabletInfoMap& tablet_map) {
   epoch_ = epoch;
+  // Refresh the strategy once per outer run so runtime changes to load_balancer_strategy take
+  // effect between runs but not mid-run.
+  strategy_ = CreateLoadBalancerStrategy(FLAGS_load_balancer_strategy);
   SysClusterConfigEntryPB config = CHECK_RESULT(catalog_manager_->GetClusterConfig());
 
   std::unique_ptr<Options> options_unique_ptr =
@@ -832,6 +845,9 @@ void ClusterLoadBalancer::ResetGlobalState(bool initialize_ts_descs) {
 void ClusterLoadBalancer::ResetTableStatePtr(const TableId& table_id, Options* options) {
   auto table_state = std::make_unique<PerTableLoadState>(global_state_.get());
   table_state->options_ = options;
+  DCHECK(strategy_ != nullptr) << "ClusterLoadBalancer::strategy_ must be set before building "
+                               << "per-table state";
+  table_state->scorer_ = &strategy_->scorer();
   state_ = table_state.get();
   per_table_states_[table_id] = std::move(table_state);
 

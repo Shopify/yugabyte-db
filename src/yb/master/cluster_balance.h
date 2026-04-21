@@ -28,6 +28,7 @@
 #include "yb/master/master_fwd.h"
 #include "yb/master/cluster_balance_util.h"
 #include "yb/master/cluster_balance_activity_info.h"
+#include "yb/master/cluster_balance_strategy.h"
 #include "yb/master/ts_descriptor.h"
 #include "yb/master/ysql_tablespace_manager.h"
 
@@ -334,6 +335,10 @@ class ClusterLoadBalancer {
 
   std::unique_ptr<GlobalLoadState> global_state_;
   std::unique_ptr<PerRunState> per_run_state_;
+
+  // Strategy selected for the current run. Refreshed from the load_balancer_strategy flag at the
+  // start of each RunClusterBalancer so runtime flag changes take effect between runs.
+  std::unique_ptr<LoadBalancerStrategy> strategy_;
 
   // The catalog manager of the Master that actually has the Tablet and TS state. The object is not
   // managed by this class, but by the Master's unique_ptr.

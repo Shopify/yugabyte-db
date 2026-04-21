@@ -45,6 +45,8 @@ DECLARE_int64(remote_bootstrap_rate_limit_bytes_per_sec);
 namespace yb {
 namespace master {
 
+class LoadScorer;
+
 using ::yb::ReplicaType;
 
 struct CBTabletMetadata {
@@ -562,6 +564,10 @@ class PerTableLoadState {
 
   // The knobs we use for tweaking the flow of the algorithm.
   Options* options_;
+
+  // Non-owning pointer to the load scorer for the current run. Set by the caller before
+  // AnalyzeTablets runs. Required by LoadComparator / LeaderLoadComparator.
+  const LoadScorer* scorer_ = nullptr;
 
   // Pointer to the cluster global state so that it can be updated when operations like add or
   // remove are executed.

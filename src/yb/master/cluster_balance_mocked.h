@@ -20,6 +20,7 @@ class ClusterLoadBalancerMocked : public ClusterLoadBalancer {
 
     auto table_state = std::make_unique<PerTableLoadState>(global_state_.get());
     table_state->options_ = &options_;
+    table_state->scorer_ = &strategy_->scorer();
     state_ = table_state.get();
     per_table_states_[table_id] = std::move(table_state);
     ResetOptions();
@@ -96,6 +97,7 @@ class ClusterLoadBalancerMocked : public ClusterLoadBalancer {
     }
     auto table_state = std::make_unique<PerTableLoadState>(global_state_.get());
     table_state->options_ = options;
+    table_state->scorer_ = &strategy_->scorer();
     table_state->check_ts_liveness_ = false;
     state_ = table_state.get();
 
@@ -109,6 +111,15 @@ class ClusterLoadBalancerMocked : public ClusterLoadBalancer {
   void SetOptions(ReplicaType type, const std::string& placement_uuid) {
     state_->options_->type = type;
     state_->options_->placement_uuid = placement_uuid;
+  }
+
+  // Swaps the active strategy and re-points the current per-table state's scorer at it. Intended
+  // for tests that want to exercise specific strategies without relying on the gflag.
+  void SetStrategyForTest(std::unique_ptr<LoadBalancerStrategy> strategy) {
+    strategy_ = std::move(strategy);
+    for (auto& [_, table_state] : per_table_states_) {
+      table_state->scorer_ = &strategy_->scorer();
+    }
   }
 
   void ResetOptions() { SetOptions(ReplicaType::kLive, ""); }

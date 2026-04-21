@@ -55,7 +55,8 @@ from time import strftime, localtime
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 
-from yugabyte.common_util import get_yb_src_root_from_build_root  # noqa
+from yugabyte.common_util import get_yb_src_root_from_build_root, is_yb_src_root  # noqa
+from yugabyte.cmake_cache import load_cmake_cache  # noqa
 from yugabyte import git_util  # noqa
 
 
@@ -113,6 +114,53 @@ def get_ynp_version(managed_dir: str) -> Optional[str]:
         return None
 
 
+def validate_git_repo_dir(candidate_dir: Optional[str]) -> Optional[str]:
+    if not candidate_dir:
+        return None
+    normalized_dir = os.path.realpath(os.path.abspath(candidate_dir))
+    return normalized_dir if is_yb_src_root(normalized_dir) else None
+
+
+def get_git_repo_dir_from_cmake_cache(build_dir: str) -> Optional[str]:
+    cmake_cache_path = os.path.join(build_dir, 'CMakeCache.txt')
+    if not os.path.exists(cmake_cache_path):
+        return None
+
+    try:
+        return validate_git_repo_dir(load_cmake_cache(build_dir).get('CMAKE_HOME_DIRECTORY'))
+    except Exception as ex:
+        logging.warning("Failed to determine git repo dir from %s: %s", cmake_cache_path, ex)
+        return None
+
+
+def resolve_git_repo_dir(build_dir: str) -> Optional[str]:
+    env_src_root = validate_git_repo_dir(os.environ.get('YB_SRC_ROOT'))
+    if env_src_root:
+        return env_src_root
+
+    git_repo_dir = get_yb_src_root_from_build_root(build_dir, must_succeed=False)
+    if git_repo_dir:
+        return git_repo_dir
+
+    return get_git_repo_dir_from_cmake_cache(build_dir)
+
+
+def determine_git_hash(build_dir: str, git_hash_arg: Optional[str]) -> Optional[str]:
+    if git_hash_arg:
+        return git_hash_arg
+
+    if 'YB_VERSION_INFO_GIT_SHA1' in os.environ:
+        git_hash = os.environ['YB_VERSION_INFO_GIT_SHA1']
+        logging.info("Git SHA1 provided using the YB_VERSION_INFO_GIT_SHA1 env var: %s", git_hash)
+        return git_hash
+
+    git_repo_dir = resolve_git_repo_dir(build_dir)
+    if git_repo_dir:
+        return get_git_sha1(git_repo_dir)
+
+    return None
+
+
 def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
@@ -153,24 +201,14 @@ def main() -> int:
                         id_output)
                     raise
 
-    git_repo_dir = get_yb_src_root_from_build_root(os.getcwd(), must_succeed=False)
+    build_dir = os.getcwd()
+    git_repo_dir = resolve_git_repo_dir(build_dir)
     if git_repo_dir:
         clean_repo = is_git_repo_clean(git_repo_dir)
     else:
         clean_repo = False
 
-    git_hash: Optional[str]
-    if args.git_hash:
-        # Git hash provided on the command line.
-        git_hash = args.git_hash
-    elif 'YB_VERSION_INFO_GIT_SHA1' in os.environ:
-        git_hash = os.environ['YB_VERSION_INFO_GIT_SHA1']
-        logging.info("Git SHA1 provided using the YB_VERSION_INFO_GIT_SHA1 env var: %s", git_hash)
-    elif git_repo_dir:
-        # No command line git hash, find it in the local git repository.
-        git_hash = get_git_sha1(git_repo_dir)
-    else:
-        git_hash = None
+    git_hash = determine_git_hash(build_dir, args.git_hash)
 
     path_to_version_file = os.path.join(
         os.path.dirname(os.path.realpath(__file__)), "..", "..", "version.txt")

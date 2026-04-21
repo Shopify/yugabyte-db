@@ -245,7 +245,10 @@ def get_yb_src_root_from_build_root(
     Given a build directory, find the YB Git repository's root corresponding to it.
     """
     yb_src_root = None
-    current_dir = build_dir
+    # Keep the absolute path without resolving symlinks so that the "__build" suffix on
+    # symlinked external-build aliases (e.g. /work/yugabyte-db__build -> /mnt/builds/tmp/...)
+    # is preserved for the sibling-source heuristic below.
+    current_dir = os.path.abspath(build_dir)
     while current_dir != '/':
         subdir_candidates = [current_dir]
         # Handle the "external build" directory case, in which the code is located in e.g.
@@ -256,7 +259,7 @@ def get_yb_src_root_from_build_root(
                 subdir_candidates = subdir_candidates[:-1]
 
         for git_subdir_candidate in subdir_candidates:
-            git_dir_candidate = os.path.join(current_dir, git_subdir_candidate)
+            git_dir_candidate = os.path.realpath(os.path.abspath(git_subdir_candidate))
             if is_yb_src_root(git_dir_candidate):
                 yb_src_root = git_dir_candidate
                 break

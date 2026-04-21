@@ -19,6 +19,7 @@
 
 #include "yb/common/common_net.h"
 #include "yb/master/catalog_entity_info.h"
+#include "yb/master/cluster_balance_strategy.h"
 #include "yb/master/master_cluster.pb.h"
 
 #include "yb/util/atomic.h"
@@ -123,52 +124,15 @@ PerTableLoadState::~PerTableLoadState() {}
 
 bool PerTableLoadState::LeaderLoadComparator::operator()(
     const TabletServerId& a, const TabletServerId& b) {
-  // Primary criteria: whether tserver is leader blacklisted.
-  auto a_leader_blacklisted =
-      global_state_->leader_blacklisted_servers_.find(a) !=
-          global_state_->leader_blacklisted_servers_.end();
-  auto b_leader_blacklisted =
-      global_state_->leader_blacklisted_servers_.find(b) !=
-          global_state_->leader_blacklisted_servers_.end();
-  if (a_leader_blacklisted != b_leader_blacklisted) {
-    return !a_leader_blacklisted;
-  }
-
-  // Use global leader load as tie-breaker.
-  auto a_load = state_->GetLeaderLoad(a);
-  auto b_load = state_->GetLeaderLoad(b);
-  if (a_load == b_load) {
-    a_load = state_->global_state_->GetGlobalLeaderLoad(a);
-    b_load = state_->global_state_->GetGlobalLeaderLoad(b);
-    if (a_load == b_load) {
-      return a < b;
-    }
-  }
-  // Secondary criteria: tserver leader load.
-  return a_load < b_load;
+  DCHECK(state_->scorer_ != nullptr)
+      << "PerTableLoadState::scorer_ must be set before sorting leader load";
+  return state_->scorer_->CompareLeaderLoad(*state_, *global_state_, a, b);
 }
 
 bool PerTableLoadState::CompareLoad(
     const TabletServerId& a, const TabletServerId& b, optional_ref<const TabletId> tablet_id) {
-  auto load_a = GetLoad(a);
-  auto load_b = GetLoad(b);
-  if (load_a != load_b) {
-    return load_a < load_b;
-  }
-  // Use global load as a heuristic to help break ties.
-  load_a = global_state_->GetGlobalLoad(a);
-  load_b = global_state_->GetGlobalLoad(b);
-  if (load_a != load_b) {
-    return load_a < load_b;
-  }
-  if (tablet_id) {
-    load_a = GetTabletDriveLoad(a, *tablet_id);
-    load_b = GetTabletDriveLoad(b, *tablet_id);
-    if (load_a != load_b) {
-      return load_a < load_b;
-    }
-  }
-  return a < b;
+  DCHECK(scorer_ != nullptr) << "PerTableLoadState::scorer_ must be set before sorting load";
+  return scorer_->CompareLoad(*this, *global_state_, a, b, tablet_id);
 }
 
 size_t PerTableLoadState::GetLoad(const TabletServerId& ts_uuid) const {
