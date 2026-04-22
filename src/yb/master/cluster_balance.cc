@@ -26,6 +26,7 @@
 #include "yb/gutil/casts.h"
 
 #include "yb/master/catalog_manager_util.h"
+#include "yb/master/cluster_balance_heat_cache.h"
 #include "yb/master/master_fwd.h"
 #include "yb/master/master.h"
 #include "yb/master/master_error.h"
@@ -152,6 +153,13 @@ DEFINE_RUNTIME_string(load_balancer_strategy,
     "rather than rejected outright.");
 
 DECLARE_int32(replication_factor);
+DECLARE_bool(enable_load_balancer_heat_telemetry);
+
+DEFINE_RUNTIME_int32(load_balancer_heat_staleness_threshold_secs, 60,
+    "Maximum age of a per-leader heat report (in seconds) that the cluster balancer will consider "
+    "fresh. Leader heat older than this is ignored when aggregating per-tserver heat for "
+    "heat-aware balancing. Should comfortably exceed the tserver heartbeat-metrics interval "
+    "(tserver_heartbeat_metrics_interval_ms) to tolerate a dropped heartbeat.");
 
 METRIC_DEFINE_gauge_int64(cluster,
                           is_load_balancing_enabled,
@@ -416,6 +424,10 @@ void ClusterLoadBalancer::RunClusterBalancerWithOptions(
   // Set blacklist upfront since per table states require it.
   // Also, set tservers that have pending deletes.
   SetBlacklistAndPendingDeleteTS();
+
+  // Build per-tserver heat aggregates from the leader heat cache once per run. Nothing downstream
+  // reads this yet — Phase 3's heat-aware strategy will consume it.
+  AggregateLeaderHeatIntoGlobalState();
 
   for (const auto& table : tables) {
     if (SkipLoadBalancing(*table)) {
@@ -1832,6 +1844,29 @@ void ClusterLoadBalancer::SetBlacklistAndPendingDeleteTS() {
     AddTSIfBlacklisted(ts_desc, l->pb.server_blacklist(), false /* leader_blacklist */);
     AddTSIfBlacklisted(ts_desc, l->pb.leader_blacklist(), true /* leader_blacklist */);
     global_state_->pending_deletes_[ts_desc->permanent_uuid()] = ts_desc->TabletsPendingDeletion();
+  }
+}
+
+void ClusterLoadBalancer::AggregateLeaderHeatIntoGlobalState() {
+  // Phase 2: heat aggregates exist only to be wired up. The count-based strategy ignores them;
+  // the Phase 1 parity tests assert this by seeding heat and comparing traces.
+  if (!FLAGS_enable_load_balancer_heat_telemetry) {
+    return;
+  }
+  auto* heat_cache = catalog_manager_->GetClusterBalanceHeatCache();
+  if (heat_cache == nullptr) {
+    return;
+  }
+  const auto staleness = MonoDelta::FromSeconds(FLAGS_load_balancer_heat_staleness_threshold_secs);
+  const auto fresh = heat_cache->SnapshotFresh(staleness);
+  for (const auto& [tablet_id, record] : fresh) {
+    if (record.leader_uuid.empty()) {
+      continue;
+    }
+    auto& agg = global_state_->heat_by_ts_[record.leader_uuid];
+    agg.sum_read_ops_per_sec += record.read_ops_per_sec;
+    agg.sum_write_ops_per_sec += record.write_ops_per_sec;
+    agg.leader_tablet_count++;
   }
 }
 

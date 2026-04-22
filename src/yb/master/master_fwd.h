@@ -56,6 +56,7 @@ class CdcsdkManager;
 class CdcsdkManagerIf;
 class CloneStateManager;
 class XClusterRpcTasks;
+class ClusterBalanceHeatCache;
 class ClusterConfigInfo;
 class ClusterLoadBalancer;
 class FlushManager;

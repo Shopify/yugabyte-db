@@ -327,6 +327,16 @@ class GlobalLoadState {
   // List of tablet server ids that have pending deletes.
   std::unordered_map<TabletServerId, std::set<TabletId>> pending_deletes_;
 
+  // Per-tserver aggregate leader heat. Populated at the start of a balancer run from the
+  // ClusterBalanceHeatCache when the enable_load_balancer_heat_telemetry AutoFlag is on.
+  // Phase 2 only populates; nothing reads it yet. Phase 3's heat-aware strategy will consume it.
+  struct TServerLeaderHeat {
+    double sum_read_ops_per_sec = 0;
+    double sum_write_ops_per_sec = 0;
+    int leader_tablet_count = 0;  // number of reporting leaders contributing to the sums
+  };
+  std::unordered_map<TabletServerId, TServerLeaderHeat> heat_by_ts_;
+
   ClusterBalancerActivityInfo activity_info_;
 
  private:

@@ -89,6 +89,7 @@ set(MASTER_SRCS
   clone/clone_tasks.cc
   cluster_balance.cc
   cluster_balance_activity_info.cc
+  cluster_balance_heat_cache.cc
   cluster_balance_strategy.cc
   cluster_balance_util.cc
   encryption_manager.cc
@@ -264,6 +265,7 @@ ADD_YB_TEST(catalog_manager-test)
 ADD_YB_TEST(catalog_manager_mini_cluster_test)
 ADD_YB_TEST(clone/clone_state_manager-test)
 ADD_YB_TEST(cluster_balance_activity_info-test)
+ADD_YB_TEST(cluster_balance_heat_cache-test)
 ADD_YB_TEST(cluster_balance_preferred_leader-test)
 ADD_YB_TEST(cluster_balance_strategy-test)
 ADD_YB_TEST(flush_manager-test)

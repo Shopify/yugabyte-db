@@ -27,6 +27,7 @@
 #include "yb/master/async_rpc_tasks.h"
 #include "yb/master/catalog_entity_info.pb.h"
 #include "yb/master/catalog_manager.h"
+#include "yb/master/cluster_balance_heat_cache.h"
 #include "yb/master/leader_epoch.h"
 #include "yb/master/master_heartbeat.pb.h"
 #include "yb/master/master_heartbeat.service.h"
@@ -67,6 +68,8 @@ TAG_FLAG(master_enable_universe_uuid_heartbeat_check, advanced);
 
 DEFINE_test_flag(bool, skip_processing_tablet_metadata, false,
                  "Whether to skip processing tablet metadata for TSHeartbeat.");
+
+DECLARE_bool(enable_load_balancer_heat_telemetry);
 
 DEFINE_RUNTIME_int32(catalog_manager_report_batch_size, 1,
     "The max number of tablets evaluated in the heartbeat as a single SysCatalog update.");
@@ -473,6 +476,31 @@ void MasterHeartbeatServiceImpl::TSHeartbeat(
         std::unordered_map<TabletId, TabletLeaderMetricsPB> id_to_leader_metrics;
         for (auto& info : req->leader_info()) {
           id_to_leader_metrics[info.tablet_id()] = info;
+        }
+        // Update the per-tablet leader heat cache from any rate fields the tserver sent. Gated
+        // on the AutoFlag so a partially-upgraded cluster that somehow receives these fields
+        // does not start mixing in heat signal before the flag flips.
+        //
+        // A reporting tserver that is no longer the active leader for a tablet sends leader_info
+        // without rate fields (see tserver_metrics_heartbeat_data_provider). In that case we
+        // proactively drop any cached record that still attributes leadership to this tserver,
+        // so step-down invalidates stale heat immediately rather than waiting the full
+        // load_balancer_heat_staleness_threshold_secs window.
+        if (FLAGS_enable_load_balancer_heat_telemetry) {
+          auto* heat_cache = catalog_manager_->GetClusterBalanceHeatCache();
+          const MonoTime now = MonoTime::Now();
+          for (const auto& info : req->leader_info()) {
+            if (info.has_leader_read_ops_per_sec() || info.has_leader_write_ops_per_sec()) {
+              LeaderHeatRecord record;
+              record.leader_uuid = ts_desc->id();
+              record.read_ops_per_sec = info.leader_read_ops_per_sec();
+              record.write_ops_per_sec = info.leader_write_ops_per_sec();
+              record.last_updated = now;
+              heat_cache->UpdateLeaderHeat(info.tablet_id(), record);
+            } else {
+              heat_cache->ClearLeaderHeatIfFrom(info.tablet_id(), ts_desc->id());
+            }
+          }
         }
         for (const auto& metadata : req->storage_metadata()) {
           std::optional<TabletLeaderMetricsPB> leader_metrics;

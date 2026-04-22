@@ -509,6 +509,18 @@ class Tablet : public AbstractTablet,
   // Set the conter to at least 'value'.
   void UpdateMonotonicCounter(int64_t value);
 
+  // Per-peer read/write op counters sampled by the master-side load balancer to build
+  // heat-aware balancing signals. Increment* is called at the same sites as the existing
+  // kQlRead/WriteLatency latency trackers.
+  void IncrementReadOpsServed() { read_ops_served_.fetch_add(1, std::memory_order_relaxed); }
+  void IncrementWriteOpsServed() { write_ops_served_.fetch_add(1, std::memory_order_relaxed); }
+  uint64_t GetReadOpsServed() const {
+    return read_ops_served_.load(std::memory_order_relaxed);
+  }
+  uint64_t GetWriteOpsServed() const {
+    return write_ops_served_.load(std::memory_order_relaxed);
+  }
+
   const RaftGroupMetadata *metadata() const { return metadata_.get(); }
   RaftGroupMetadata *metadata() { return metadata_.get(); }
 
@@ -1268,6 +1280,13 @@ class Tablet : public AbstractTablet,
   client::YBMetaDataCache* metadata_cache_;
 
   std::atomic<int64_t> last_committed_write_index_{0};
+
+  // Monotonic counters of user-facing read/write ops served by this tablet peer. Incremented
+  // alongside the existing kQlReadLatency / kQlWriteLatency latency trackers. The load balancer
+  // samples these (via GetReadOpsServed / GetWriteOpsServed) on the heartbeat-metrics interval
+  // to derive per-leader op rates for heat-aware balancing.
+  std::atomic<uint64_t> read_ops_served_{0};
+  std::atomic<uint64_t> write_ops_served_{0};
 
   HybridTimeLeaseProvider ht_lease_provider_;
 

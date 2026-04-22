@@ -42,6 +42,11 @@ DEFINE_RUNTIME_bool(tserver_heartbeat_metrics_add_replication_status, true,
 DEFINE_RUNTIME_bool(tserver_heartbeat_metrics_add_leader_info, true,
             "Add leader info to metrics tserver sends to master");
 
+DEFINE_RUNTIME_AUTO_bool(enable_load_balancer_heat_telemetry, kLocalPersisted, false, true,
+    "When true, leader tservers emit per-tablet-peer read/write op rates in each heartbeat, and "
+    "the master aggregates them per-tserver for the cluster load balancer. Changes no balancing "
+    "decisions on its own; phase 3 of heat-aware balancing will consume the aggregate.");
+
 DECLARE_uint64(rocksdb_max_file_size_for_compaction);
 
 using namespace std::literals;
@@ -72,6 +77,15 @@ void TServerMetricsHeartbeatDataProvider::DoAddData(
   bool should_add_tablet_data =
       FLAGS_tserver_heartbeat_metrics_add_drive_data && no_full_tablet_report;
 
+  // Time delta since the last heartbeat-metrics run, used below to compute per-leader op rates.
+  const MonoDelta heartbeat_interval = CoarseMonoClock::Now() - prev_run_time();
+  const double heartbeat_interval_secs = heartbeat_interval.ToSeconds();
+
+  // Rebuild per-tablet prev counters as we iterate; drops entries for tablets that are no longer
+  // present on this tserver. Avoids a separate cleanup pass.
+  std::unordered_map<TabletId, PrevTabletOpCounts> next_prev_tablet_op_counts;
+  next_prev_tablet_op_counts.reserve(prev_tablet_op_counts_.size());
+
   for (const auto& tablet_peer : server().tablet_manager()->GetTabletPeers()) {
     if (tablet_peer) {
       auto tablet = tablet_peer->shared_tablet_maybe_null();
@@ -80,6 +94,17 @@ void TServerMetricsHeartbeatDataProvider::DoAddData(
         total_file_sizes += on_disk_size_info.sst_files_disk_size;
         uncompressed_file_sizes += on_disk_size_info.uncompressed_sst_files_disk_size;
         num_files += tablet->GetCurrentVersionNumSSTFiles();
+
+        // Sample and refresh per-tablet op baselines for every tablet, every heartbeat —
+        // independent of should_add_tablet_data and independent of whether this peer is currently
+        // a leader. On full-tablet-report heartbeats the storage-metadata block below is skipped,
+        // but prev_run_time() still advances; without this unconditional refresh the next
+        // incremental heartbeat would compute a rate by subtracting counters from a much older
+        // sample while dividing by only one heartbeat interval, inflating the reported rate.
+        const uint64_t cur_reads = tablet->GetReadOpsServed();
+        const uint64_t cur_writes = tablet->GetWriteOpsServed();
+        next_prev_tablet_op_counts[tablet_peer->tablet_id()] = {cur_reads, cur_writes};
+
         if (should_add_tablet_data && tablet_peer->log_available() &&
             CanServeTabletData(tablet_peer->tablet_metadata()->tablet_data_state())) {
           auto storage_metadata = req->add_storage_metadata();
@@ -103,6 +128,27 @@ void TServerMetricsHeartbeatDataProvider::DoAddData(
               if (leader_lease_status == consensus::LeaderLeaseStatus::HAS_LEASE) {
                 leader_info->set_ht_lease_expiration(ht_lease_exp);
               }
+
+              // Emit heat rates only when this peer is the recognized active leader. Followers
+              // may still serve reads (and their op counters still advance), but those counters
+              // must not flow into the master's leader-heat aggregate or they would inflate
+              // leader_tablet_count on every tserver holding a follower replica.
+              if (FLAGS_enable_load_balancer_heat_telemetry &&
+                  leader_lease_status == consensus::LeaderLeaseStatus::HAS_LEASE) {
+                const auto prev_it = prev_tablet_op_counts_.find(tablet_peer->tablet_id());
+                if (prev_it != prev_tablet_op_counts_.end() && heartbeat_interval_secs > 0) {
+                  const uint64_t prev_reads = prev_it->second.reads;
+                  const uint64_t prev_writes = prev_it->second.writes;
+                  // Guard against counter reset across a leader step-down / new tablet-peer
+                  // instance: treat a negative delta as zero rather than a huge spike.
+                  const double reads_per_sec = (cur_reads >= prev_reads) ?
+                      (static_cast<double>(cur_reads - prev_reads) / heartbeat_interval_secs) : 0;
+                  const double writes_per_sec = (cur_writes >= prev_writes) ?
+                      (static_cast<double>(cur_writes - prev_writes) / heartbeat_interval_secs) : 0;
+                  leader_info->set_leader_read_ops_per_sec(reads_per_sec);
+                  leader_info->set_leader_write_ops_per_sec(writes_per_sec);
+                }
+              }
             }
           }
         }
@@ -121,6 +167,10 @@ void TServerMetricsHeartbeatDataProvider::DoAddData(
       }
     }
   }
+  // Swap in the freshly-built prev-counter map; any entries not refreshed above (e.g. tablets
+  // that were removed from this tserver) are dropped.
+  prev_tablet_op_counts_ = std::move(next_prev_tablet_op_counts);
+
   // Report xCluster consumer heartbeat info via the metric collector only when a full report is
   // required. The partial reports are sent via the regular heartbeat request.
   if (needs_full_tablet_report && FLAGS_tserver_heartbeat_metrics_add_replication_status) {

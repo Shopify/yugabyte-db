@@ -2034,6 +2034,7 @@ Status Tablet::HandleRedisReadRequest(const docdb::ReadOperationData& read_opera
 
   ScopedTabletMetricsLatencyTracker metrics_tracker(
       metrics_.get(), TabletEventStats::kQlReadLatency);
+  IncrementReadOpsServed();
 
   docdb::RedisReadOperation doc_op(redis_read_request, doc_db(), read_operation_data);
   RETURN_NOT_OK(doc_op.Execute());
@@ -2073,6 +2074,7 @@ Status Tablet::HandleQLReadRequest(
 
   ScopedTabletMetricsLatencyTracker metrics_tracker(
       metrics_scope.metrics(), TabletEventStats::kQlReadLatency);
+  IncrementReadOpsServed();
 
   docdb::QLRocksDBStorage storage{
       LogPrefix(), doc_db(metrics_scope.metrics()), encoded_partition_bounds_};
@@ -2193,6 +2195,7 @@ Status Tablet::DoHandlePgsqlReadRequest(
     PgsqlReadRequestResult* result) {
   ScopedTabletMetricsLatencyTracker metrics_tracker(
       metrics, TabletEventStats::kQlReadLatency);
+  IncrementReadOpsServed();
 
   docdb::QLRocksDBStorage storage{LogPrefix(), doc_db(metrics), encoded_partition_bounds_};
 

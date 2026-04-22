@@ -371,6 +371,11 @@ class ClusterLoadBalancer {
 
   virtual void SetBlacklistAndPendingDeleteTS();
 
+  // Snapshots fresh entries out of the catalog-manager's leader heat cache and aggregates them
+  // per-tserver into `global_state_->heat_by_ts_`. No-op unless the
+  // enable_load_balancer_heat_telemetry AutoFlag is on. Phase 2 populates only; Phase 3 consumes.
+  virtual void AggregateLeaderHeatIntoGlobalState();
+
   void TrackTask(const std::shared_ptr<RetryingRpcTask>& task);
 
   struct UnderReplicatedTabletInfo {

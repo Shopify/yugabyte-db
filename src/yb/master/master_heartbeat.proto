@@ -113,6 +113,11 @@ message TabletLeaderMetricsPB {
   optional consensus.LeaderLeaseStatus
       leader_lease_status = 2[default = NO_MAJORITY_REPLICATED_LEASE];
   optional fixed64 ht_lease_expiration = 3;
+
+  // Populated by the leader tserver when FLAGS_enable_load_balancer_heat_telemetry
+  // is true. Averages over the heartbeat-metrics interval; not cumulative counters.
+  optional double leader_read_ops_per_sec = 4;
+  optional double leader_write_ops_per_sec = 5;
 }
 
 message XClusterConsumerStreamTabletStatusPB {

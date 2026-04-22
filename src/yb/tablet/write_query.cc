@@ -396,6 +396,7 @@ void WriteQuery::Finished(WriteOperation* operation, const Status& status) {
           make_unsigned(MonoDelta(MonoTime::Now() - start_time_).ToMicroseconds());
       metrics_->Increment(tablet::TabletEventStats::kQlWriteLatency, op_duration_usec);
     }
+    tablet->IncrementWriteOpsServed();
   }
 
   auto& metadata = *tablet->metadata();

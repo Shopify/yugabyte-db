@@ -11,6 +11,7 @@
 // under the License.
 //
 
+#include <functional>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -60,9 +61,16 @@ class ClusterBalanceStrategyParityTest : public LoadBalancerMockedBase {
 
   // Drives the balancer through a bounded number of add and leader-move decisions, recording each.
   // Uses a cap so a runaway strategy can't spin forever if parity regresses.
-  Result<std::vector<Decision>> CollectTrace(int max_decisions = 12) NO_THREAD_SAFETY_ANALYSIS {
+  // `post_reset_hook`, if provided, runs after the per-run global state is rebuilt but before any
+  // decisions are taken — the right place to seed heat aggregates.
+  Result<std::vector<Decision>> CollectTrace(
+      int max_decisions = 12,
+      std::function<void()> post_reset_hook = {}) NO_THREAD_SAFETY_ANALYSIS {
     std::vector<Decision> trace;
     RETURN_NOT_OK(ResetLoadBalancerAndAnalyzeTablets());
+    if (post_reset_hook) {
+      post_reset_hook();
+    }
     for (int i = 0; i < max_decisions; ++i) {
       TabletId tablet;
       TabletServerId from_ts;
@@ -144,6 +152,39 @@ TEST_F(ClusterBalanceStrategyParityTest, UnknownStrategyFallsBackToCountBased) {
   ASSERT_EQ(count_trace.size(), unknown_trace.size());
   for (size_t i = 0; i < count_trace.size(); ++i) {
     EXPECT_EQ(count_trace[i], unknown_trace[i]);
+  }
+}
+
+// Phase 2 adds a `heat_by_ts_` aggregate on `GlobalLoadState` but the count-based strategy must
+// continue to ignore it. Seed arbitrary per-tserver heat values and assert the decision trace is
+// identical to a run with no heat seeded.
+TEST_F(ClusterBalanceStrategyParityTest, CountBasedStrategyIgnoresHeat) {
+  PrepareImbalancedScenario();
+
+  cb_.SetStrategyForTest(
+      CreateLoadBalancerStrategy(kLoadBalancerStrategyCountBased));
+  auto baseline_trace = ASSERT_RESULT(CollectTrace());
+
+  cb_.SetStrategyForTest(
+      CreateLoadBalancerStrategy(kLoadBalancerStrategyCountBased));
+  // Seed extreme heat on the tservers that exist in PrepareImbalancedScenario (three from
+  // PrepareTestStateMultiAz with uuids "0"/"1"/"2", plus the extra "3333" added in zone "a").
+  // The count-based scorer only looks at counts, so any heat value must not perturb the trace.
+  auto seed_heat = [this]() {
+    cb_.SetHeatForTest(
+        "0", {.sum_read_ops_per_sec = 1e6, .sum_write_ops_per_sec = 1e6,
+              .leader_tablet_count = 42});
+    cb_.SetHeatForTest(
+        "3333", {.sum_read_ops_per_sec = 0, .sum_write_ops_per_sec = 0,
+                 .leader_tablet_count = 0});
+  };
+  auto heat_trace = ASSERT_RESULT(CollectTrace(/*max_decisions=*/12, seed_heat));
+
+  ASSERT_EQ(baseline_trace.size(), heat_trace.size());
+  for (size_t i = 0; i < baseline_trace.size(); ++i) {
+    EXPECT_EQ(baseline_trace[i], heat_trace[i])
+        << "Decision " << i << " differs when heat is seeded: "
+        << baseline_trace[i].ToString() << " vs " << heat_trace[i].ToString();
   }
 }
 

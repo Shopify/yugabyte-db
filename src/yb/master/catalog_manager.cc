@@ -126,6 +126,7 @@
 #include "yb/master/cdcsdk_manager.h"
 #include "yb/master/clone/clone_state_manager.h"
 #include "yb/master/cluster_balance.h"
+#include "yb/master/cluster_balance_heat_cache.h"
 #include "yb/master/encryption_manager.h"
 #include "yb/master/leader_epoch.h"
 #include "yb/master/master_admin.pb.h"
@@ -1074,6 +1075,7 @@ CatalogManager::CatalogManager(Master* master, SysCatalogTable* sys_catalog)
       tablet_exists_(false),
       state_(kConstructed),
       load_balance_policy_(std::make_unique<ClusterLoadBalancer>(this)),
+      cluster_balance_heat_cache_(std::make_unique<ClusterBalanceHeatCache>()),
       tablegroup_manager_(std::make_unique<YsqlTablegroupManager>()),
       object_lock_info_manager_(std::make_unique<ObjectLockInfoManager>(*master_, *this)),
       permissions_manager_(std::make_unique<PermissionsManager>(this)),

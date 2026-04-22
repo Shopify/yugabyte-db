@@ -890,6 +890,12 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
 
   ClusterLoadBalancer* cluster_balancer() override { return load_balance_policy_.get(); }
 
+  // Returns the per-tablet leader heat cache populated from tserver heartbeats when the
+  // enable_load_balancer_heat_telemetry AutoFlag is on. Never null.
+  ClusterBalanceHeatCache* GetClusterBalanceHeatCache() {
+    return cluster_balance_heat_cache_.get();
+  }
+
   // This never returns nullptr.
   XClusterManagerIf* GetXClusterManager() override;
   // This never returns nullptr.
@@ -2550,6 +2556,13 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
 
   // Policy for load balancing tablets on tablet servers.
   std::unique_ptr<ClusterLoadBalancer> load_balance_policy_;
+
+  // Per-tablet leader heat telemetry cache. Populated by master_heartbeat_service whenever a
+  // leader tserver reports load_balancer_heat_telemetry fields; read by ClusterLoadBalancer at
+  // the start of each balancer run to aggregate per-tserver heat into GlobalLoadState. Kept here
+  // (rather than on ClusterLoadBalancer) so it is reachable from the heartbeat code without
+  // routing through the balancer.
+  std::unique_ptr<ClusterBalanceHeatCache> cluster_balance_heat_cache_;
 
   // Use the Raft config that has been bootstrapped to update the in-memory state of master options
   // and also the on-disk state of the consensus meta object.

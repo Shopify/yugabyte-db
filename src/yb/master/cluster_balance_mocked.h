@@ -122,6 +122,14 @@ class ClusterLoadBalancerMocked : public ClusterLoadBalancer {
     }
   }
 
+  // Seed per-tserver heat aggregates on the current run's global state. Exists because the
+  // count-based strategy must provably ignore heat values and tests need to assert that under
+  // extreme seeds the decision trace is unchanged.
+  void SetHeatForTest(
+      const TabletServerId& ts_uuid, const GlobalLoadState::TServerLeaderHeat& heat) {
+    global_state_->heat_by_ts_[ts_uuid] = heat;
+  }
+
   void ResetOptions() { SetOptions(ReplicaType::kLive, ""); }
 
   Options options_;

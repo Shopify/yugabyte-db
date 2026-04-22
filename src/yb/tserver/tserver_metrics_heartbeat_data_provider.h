@@ -13,6 +13,9 @@
 
 #pragma once
 
+#include <unordered_map>
+
+#include "yb/common/entity_ids_types.h"
 #include "yb/tserver/heartbeater.h"
 
 namespace yb {
@@ -33,6 +36,14 @@ class TServerMetricsHeartbeatDataProvider : public PeriodicalHeartbeatDataProvid
   // Stores the total read and writes ops for computing iops.
   uint64_t prev_reads_ = 0;
   uint64_t prev_writes_ = 0;
+
+  // Per-tablet previous read/write op counters used to compute per-leader op rates for
+  // heat-aware balancing telemetry. Pruned lazily each iteration.
+  struct PrevTabletOpCounts {
+    uint64_t reads = 0;
+    uint64_t writes = 0;
+  };
+  std::unordered_map<TabletId, PrevTabletOpCounts> prev_tablet_op_counts_;
 };
 
 } // namespace tserver
