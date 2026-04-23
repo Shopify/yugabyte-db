@@ -25,6 +25,39 @@ namespace master {
 class GlobalLoadState;
 class PerTableLoadState;
 
+// Outcome returned by LoadBalancerStrategy::AssessLeaderMove for a (high_uuid, low_uuid) pair.
+// Mirrors the control flow of the original inline decision block in
+// ClusterLoadBalancer::GetLeaderToMove so the caller can preserve legacy semantics verbatim while
+// letting strategies (e.g. HeatAware) inject new trigger conditions.
+struct LeaderMoveAssessment {
+  // When false, the balancer advances past this (high, low) pair (either continues or breaks,
+  // depending on should_break_inner_loop). When true, the caller looks for a moveable tablet
+  // between high_uuid and low_uuid and propagates `reason` into LeaderMoveDetails.
+  bool should_move = false;
+
+  // Human-readable rationale, copied into LeaderMoveDetails and logged by MoveLeader.
+  std::string reason;
+
+  // Heat-aware strategies set this to true when the move was triggered on heat grounds (i.e. the
+  // count-based assessment declined and a heat-bucket gap exists). Scopes cooldown bookkeeping so
+  // placement-repair and blacklist-driven stepdowns do not poison the heat cooldown map.
+  bool is_heat_driven = false;
+
+  // Mirrors the pre-existing `is_global_balancing_move` local so the caller can keep its
+  // can_perform_global_operations_ accounting.
+  bool is_global_balancing_move = false;
+
+  // When should_move is false, tells the caller to `break` out of the inner right-index loop
+  // rather than `continue`. Reproduces the pre-existing "no more moves available at this
+  // configuration" early-exit behavior.
+  bool should_break_inner_loop = false;
+
+  // When true, the caller should return std::nullopt from GetLeaderToMove entirely — no further
+  // (left, right) pair is going to produce a move under this strategy. Reproduces the original
+  // `load_variance == 0 && right == last_pos` early return.
+  bool should_return_nullopt = false;
+};
+
 // Abstract scoring seam used by PerTableLoadState when sorting tablet servers by load and leader
 // load. Implementations are expected to be stateless so that the same LoadScorer can be reused by
 // the std::sort comparators that PerTableLoadState constructs during a balancer run.
@@ -61,14 +94,81 @@ class CountBasedLoadScorer : public LoadScorer {
       const TabletServerId& a, const TabletServerId& b) const override;
 };
 
-// Owns the scorer plus any future per-run strategy state. Phase 1 only exposes the scorer; phase 3
-// will extend this with candidate-selection and move-evaluation hooks.
+// Heat-aware scorer. Delegates CompareLoad to count-based (tablet placement does not use leader
+// heat). For CompareLeaderLoad it quantizes weighted heat into integer buckets sized by
+// FLAGS_load_balancer_heat_hysteresis_ops_per_sec and orders by bucket first, falling through to
+// count-based within a bucket. Integer bucketing avoids the pairwise-threshold strict-weak-order
+// defect that a naked |heat_a - heat_b| < threshold comparator would introduce.
+class HeatAwareLoadScorer : public LoadScorer {
+ public:
+  bool CompareLoad(
+      const PerTableLoadState& state, const GlobalLoadState& global_state,
+      const TabletServerId& a, const TabletServerId& b,
+      optional_ref<const TabletId> tablet_id) const override;
+
+  bool CompareLeaderLoad(
+      const PerTableLoadState& state, const GlobalLoadState& global_state,
+      const TabletServerId& a, const TabletServerId& b) const override;
+
+ private:
+  CountBasedLoadScorer count_based_;
+};
+
+// Owns the scorer plus the strategy's move-assessment policy. Phase 1 exposed only the scorer;
+// Phase 3 adds AssessLeaderMove so strategies can inject their own move-trigger conditions
+// (the count-based variance check, heat-bucket differences, etc.) into ClusterLoadBalancer's
+// leader-move loop.
 class LoadBalancerStrategy {
  public:
   virtual ~LoadBalancerStrategy() = default;
 
   virtual const std::string& name() const = 0;
   virtual const LoadScorer& scorer() const = 0;
+
+  // Decides whether a leader move from `high_uuid` to `low_uuid` is warranted under this strategy.
+  // The caller has already sorted tservers ascending by leader load using `scorer()` and filtered
+  // out blacklisted-with-zero-leaders; this hook replaces the inline reason-assignment block that
+  // previously lived in ClusterLoadBalancer::GetLeaderToMove.
+  //
+  // `count_based_threshold_capping` signals that count-based's ShouldSkipLeaderBalancing would
+  // have short-circuited balancing at the configured `leader_balance_threshold` if this run used
+  // the count-based strategy. For count-based itself this is always false at the point
+  // AssessLeaderMove is called (we would have already returned from GetLeaderToMove). For
+  // heat-aware, it is true whenever the main loop was entered purely because a heat-bucket gap
+  // override_d the threshold cap; in that case, per-pair count-driven moves must stay suppressed
+  // so leader_balance_threshold semantics are preserved for count-balancing decisions while heat-
+  // driven moves (and blacklist drains) remain legal.
+  virtual LeaderMoveAssessment AssessLeaderMove(
+      const PerTableLoadState& state, const GlobalLoadState& global_state,
+      const TabletServerId& high_uuid, const TabletServerId& low_uuid,
+      bool high_leader_blacklisted, bool left_equals_right,
+      bool right_equals_last_pos, bool can_balance_globally,
+      bool count_based_threshold_capping) const = 0;
+
+  // Pre-loop short-circuit for GetLeaderToMove's `leader_balance_threshold` cap. Returns true iff
+  // this strategy is sure no leader move is warranted given the current state and the configured
+  // threshold. The count-based implementation replicates the legacy "max non-blacklisted leader
+  // count <= threshold" check; heat-aware additionally requires all non-blacklisted tservers to
+  // share the same heat bucket, so a hot-but-count-light tserver cannot spuriously trigger the
+  // short-circuit.
+  //
+  // The legacy inline version walked `sorted_leader_load` right-to-left and used the rightmost
+  // non-blacklisted entry as the "load max". That only works when the comparator sorts by count,
+  // which the heat-aware scorer no longer does. Strategies now compute the relevant maxima
+  // themselves so the short-circuit is independent of sort order.
+  virtual bool ShouldSkipLeaderBalancing(
+      const PerTableLoadState& state, const GlobalLoadState& global_state,
+      const std::vector<TabletServerId>& sorted_leader_load,
+      size_t adjusted_leader_threshold) const = 0;
+
+  // Side-channel that answers "would count-based's threshold short-circuit have fired here?"
+  // Independent of the active strategy. GetLeaderToMove uses the answer to decide whether the
+  // main loop is running purely because heat-aware overrode the skip, in which case the active
+  // strategy's AssessLeaderMove is expected to keep plain count-driven moves suppressed.
+  virtual bool CountBasedThresholdCapsBalancing(
+      const PerTableLoadState& state, const GlobalLoadState& global_state,
+      const std::vector<TabletServerId>& sorted_leader_load,
+      size_t adjusted_leader_threshold) const = 0;
 };
 
 class CountBasedLoadBalancerStrategy : public LoadBalancerStrategy {
@@ -76,17 +176,78 @@ class CountBasedLoadBalancerStrategy : public LoadBalancerStrategy {
   const std::string& name() const override;
   const LoadScorer& scorer() const override { return scorer_; }
 
+  LeaderMoveAssessment AssessLeaderMove(
+      const PerTableLoadState& state, const GlobalLoadState& global_state,
+      const TabletServerId& high_uuid, const TabletServerId& low_uuid,
+      bool high_leader_blacklisted, bool left_equals_right,
+      bool right_equals_last_pos, bool can_balance_globally,
+      bool count_based_threshold_capping) const override;
+
+  bool ShouldSkipLeaderBalancing(
+      const PerTableLoadState& state, const GlobalLoadState& global_state,
+      const std::vector<TabletServerId>& sorted_leader_load,
+      size_t adjusted_leader_threshold) const override;
+
+  // For count-based the "would count-based have capped?" question is literally the same as
+  // "would ShouldSkipLeaderBalancing have fired?". Delegates.
+  bool CountBasedThresholdCapsBalancing(
+      const PerTableLoadState& state, const GlobalLoadState& global_state,
+      const std::vector<TabletServerId>& sorted_leader_load,
+      size_t adjusted_leader_threshold) const override;
+
  private:
   CountBasedLoadScorer scorer_;
+};
+
+class HeatAwareLoadBalancerStrategy : public LoadBalancerStrategy {
+ public:
+  const std::string& name() const override;
+  const LoadScorer& scorer() const override { return scorer_; }
+
+  // First asks the count-based policy. If count-based would move, returns its verdict unchanged
+  // (preserves Phase 1/2 parity when heat is cold or flat). If count-based declines but
+  // `bucket(Heat(high_uuid)) > bucket(Heat(low_uuid))`, returns a heat-driven move with
+  // is_heat_driven=true.
+  //
+  // Under `count_based_threshold_capping=true` (i.e. leader_balance_threshold would have stopped
+  // count-based from balancing entirely), plain count-driven should_move verdicts are suppressed
+  // for non-blacklisted sources; only heat-bucket gaps (or blacklist drains) may produce a move.
+  LeaderMoveAssessment AssessLeaderMove(
+      const PerTableLoadState& state, const GlobalLoadState& global_state,
+      const TabletServerId& high_uuid, const TabletServerId& low_uuid,
+      bool high_leader_blacklisted, bool left_equals_right,
+      bool right_equals_last_pos, bool can_balance_globally,
+      bool count_based_threshold_capping) const override;
+
+  // Count-based says skip only when max non-blacklisted leader count is at or below the
+  // threshold; heat-aware requires that AND all non-blacklisted tservers sharing a heat bucket.
+  // If any two non-blacklisted tservers span different buckets, a heat-driven move is still
+  // possible even when count-based would cap out.
+  bool ShouldSkipLeaderBalancing(
+      const PerTableLoadState& state, const GlobalLoadState& global_state,
+      const std::vector<TabletServerId>& sorted_leader_load,
+      size_t adjusted_leader_threshold) const override;
+
+  // Delegates to the embedded count-based strategy. Independent of heat state — this answers
+  // "would count-based have capped balancing?" which heat-aware uses to decide whether plain
+  // count moves are allowed at per-pair assessment time.
+  bool CountBasedThresholdCapsBalancing(
+      const PerTableLoadState& state, const GlobalLoadState& global_state,
+      const std::vector<TabletServerId>& sorted_leader_load,
+      size_t adjusted_leader_threshold) const override;
+
+ private:
+  HeatAwareLoadScorer scorer_;
+  CountBasedLoadBalancerStrategy count_based_;
 };
 
 // Flag values for --load_balancer_strategy.
 extern const char* const kLoadBalancerStrategyCountBased;
 extern const char* const kLoadBalancerStrategyHeatAwareExperimental;
 
-// Factory. `heat_aware_experimental` is reserved but not yet implemented; in phase 1 the factory
-// logs a warning and returns the count-based strategy as a safe fallback. Unknown names also fall
-// back to count-based.
+// Factory. Returns a CountBasedLoadBalancerStrategy for `count_based`, a
+// HeatAwareLoadBalancerStrategy for `heat_aware_experimental`, and falls back to count-based
+// (with a warning) for any other name so that a flag typo does not silently stop balancing.
 std::unique_ptr<LoadBalancerStrategy> CreateLoadBalancerStrategy(const std::string& name);
 
 }  // namespace master

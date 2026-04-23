@@ -130,6 +130,90 @@ class ClusterLoadBalancerMocked : public ClusterLoadBalancer {
     global_state_->heat_by_ts_[ts_uuid] = heat;
   }
 
+  // Seed a per-tablet heat record on the current run's global state. Tests that want to exercise
+  // the in-run projection done by ProjectLeaderHeatMoveIntoGlobalState need an entry in
+  // heat_by_tablet_ so that a subsequent MoveLeader will know how much to subtract from the
+  // source and add to the destination. Production populates this map in
+  // AggregateLeaderHeatIntoGlobalState from ClusterBalanceHeatCache::SnapshotFresh.
+  void SetTabletHeatForTest(const TabletId& tablet_id, const LeaderHeatRecord& record) {
+    global_state_->heat_by_tablet_[tablet_id] = record;
+  }
+
+  // Read-only accessor for a tserver's heat aggregate. Exposed so tests can assert on the
+  // post-move projected state of heat_by_ts_.
+  GlobalLoadState::TServerLeaderHeat GetHeatForTest(const TabletServerId& ts_uuid) const {
+    const auto it = global_state_->heat_by_ts_.find(ts_uuid);
+    return it == global_state_->heat_by_ts_.end() ? GlobalLoadState::TServerLeaderHeat{}
+                                                  : it->second;
+  }
+
+  // Read-only accessor for the per-tablet heat snapshot. Tests use it to assert that the cached
+  // record's leader_uuid was rewritten on a successful move.
+  std::optional<LeaderHeatRecord> GetTabletHeatForTest(const TabletId& tablet_id) const {
+    const auto it = global_state_->heat_by_tablet_.find(tablet_id);
+    if (it == global_state_->heat_by_tablet_.end()) {
+      return std::nullopt;
+    }
+    return it->second;
+  }
+
+  // Re-runs the load and leader-load sort after tests have seeded heat. In production,
+  // AggregateLeaderHeatIntoGlobalState runs before AnalyzeTablets's SortLeaderLoad so the sort
+  // reflects heat. In the mocked test flow tests call AnalyzeTablets first and seed heat after,
+  // so tests that exercise heat-aware sort ordering must re-sort explicitly to replicate the
+  // production ordering.
+  void ResortAfterHeatSeedForTest() {
+    if (state_ != nullptr) {
+      state_->SortLoad();
+      state_->SortLeaderLoad();
+    }
+  }
+
+  // Exposes the heat-aware cooldown map size so tests can assert that non-heat-driven paths
+  // (count-based moves, placement-repair stepdowns) never populate it.
+  size_t GetHeatAwareCooldownSizeForTest() const {
+    return heat_aware_recent_leader_moves_.size();
+  }
+
+  // Simulates a successful heat-driven leader move without going through MoveLeader. Useful in
+  // unit tests that want to prime the cooldown map directly.
+  void RecordHeatAwareLeaderMoveForTest(
+      const TabletId& tablet_id, const TabletServerId& from_ts, const TabletServerId& to_ts) {
+    RecordHeatAwareLeaderMove(tablet_id, from_ts, to_ts);
+  }
+
+  // Test-only accessor for the otherwise-private cooldown predicate. Lets tests assert on the
+  // (tablet_id, from_ts, to_ts) key granularity without going through a full balancer run.
+  // Not const — the underlying predicate evicts stale entries when it detects a recorded move
+  // that did not actually take effect (failed async stepdown).
+  bool IsInHeatAwareCooldownForTest(
+      const TabletId& tablet_id, const TabletServerId& from_ts,
+      const TabletServerId& to_ts) {
+    return IsInHeatAwareCooldown(tablet_id, from_ts, to_ts);
+  }
+
+  // Direct entry point to the in-run heat projection helper. Lets tests exercise edge cases
+  // (empty to_ts from RemoveReplica's leader-stepdown path, stale leader_uuid, tablet with no
+  // fresh heat) without having to reproduce the full RemoveReplica → MoveLeader control flow.
+  void ProjectLeaderHeatMoveForTest(
+      const TabletId& tablet_id, const TabletServerId& from_ts, const TabletServerId& to_ts) {
+    ProjectLeaderHeatMoveIntoGlobalState(tablet_id, from_ts, to_ts);
+  }
+
+  // Returns true iff heat_by_ts_ has an entry for ts_uuid (including default-constructed entries
+  // inserted via operator[]). Tests use this to assert the projection did not inadvertently
+  // create a bogus heat_by_ts_[""] entry when to_ts was empty.
+  bool HasHeatEntryForTest(const TabletServerId& ts_uuid) const {
+    return global_state_->heat_by_ts_.count(ts_uuid) > 0;
+  }
+
+  // Drives the once-per-run heat aggregation + cooldown-eviction hook without spinning up a full
+  // balancer run. Tests use this to verify that cooldown eviction runs even when
+  // enable_load_balancer_heat_telemetry is disabled.
+  void AggregateLeaderHeatForTest() {
+    AggregateLeaderHeatIntoGlobalState();
+  }
+
   void ResetOptions() { SetOptions(ReplicaType::kLive, ""); }
 
   Options options_;

@@ -26,6 +26,7 @@
 
 #include "yb/master/catalog_entity_info.pb.h"
 #include "yb/master/cluster_balance_activity_info.h"
+#include "yb/master/cluster_balance_heat_cache.h"
 #include "yb/master/ts_descriptor.h"
 
 #include "yb/util/size_literals.h"
@@ -101,7 +102,20 @@ struct CBTabletMetadata {
   std::set<TabletServerId> leader_blacklisted_tablet_servers;
 
   // The tablet server id of the leader in this tablet's peer group.
+  //
+  // This field is mutated by MoveLeader — both the in-run projections issued as the balancer
+  // makes decisions and the start-of-run replay of pending_stepdown_leader_tasks_ in
+  // AnalyzeTablets. Consumers that need "who the leader actually was when we read the replica
+  // map" (e.g. to decide whether a previously-issued stepdown has taken effect) must read
+  // initial_leader_uuid instead; leader_uuid can be a projection of moves that have not yet
+  // landed on the ground.
   TabletServerId leader_uuid;
+
+  // The tablet server id of the leader as observed from the replica map by UpdateTablet. Captured
+  // once per run and never mutated afterward, so it stays an authoritative answer to "is the
+  // leader still on X?" even after AnalyzeTablets' pending-task replay has projected leader_uuid
+  // forward to a stepdown destination that is still in flight.
+  TabletServerId initial_leader_uuid;
 
   // Leader stepdown failures. We use this to prevent retrying the same leader stepdown too soon.
   LeaderStepDownFailureTimes leader_stepdown_failures;
@@ -336,6 +350,17 @@ class GlobalLoadState {
     int leader_tablet_count = 0;  // number of reporting leaders contributing to the sums
   };
   std::unordered_map<TabletServerId, TServerLeaderHeat> heat_by_ts_;
+
+  // Snapshot of the per-tablet LeaderHeatRecord set aggregated into heat_by_ts_ above. Populated
+  // alongside heat_by_ts_ in AggregateLeaderHeatIntoGlobalState at the start of a run; consulted
+  // from ClusterLoadBalancer::MoveLeader so a successful leader move can subtract the moved
+  // tablet's contribution from its source tserver's aggregate and add it to the destination's.
+  // Keeping the snapshot here — instead of re-querying ClusterBalanceHeatCache mid-run — pins
+  // the values that were aggregated at run start (so in-run projections stay consistent with the
+  // strategy's initial decisions) and avoids reacquiring the cache's spinlock per move. The
+  // record's leader_uuid is mutated in place on each successful move so later iterations see the
+  // new owner. Reset (alongside heat_by_ts_) on every ResetGlobalState.
+  std::unordered_map<TabletId, LeaderHeatRecord> heat_by_tablet_;
 
   ClusterBalancerActivityInfo activity_info_;
 

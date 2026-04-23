@@ -237,6 +237,12 @@ class ClusterLoadBalancer {
     std::string reason;
     // Whether to also remove the replica after stepping down the leader.
     bool also_remove_replica = false;
+    // True when the move was triggered by the heat-aware strategy on heat grounds (the
+    // count-based assessment declined and a heat-bucket gap exists). Populated by
+    // LoadBalancerStrategy::AssessLeaderMove. Used by MoveLeader to decide whether to record
+    // this move in heat_aware_recent_leader_moves_ — only heat-driven moves do, so ordinary
+    // count-based balancing and placement-repair stepdowns do not poison the cooldown map.
+    bool is_heat_driven = false;
   };
   // Move leaders load from a lower priority to a high priority TServers.
   // This is called before normal leader load balancing which balances load within each priority.
@@ -352,6 +358,85 @@ class ClusterLoadBalancer {
 
   std::shared_ptr<YsqlTablespaceManager> tablespace_manager_;
 
+  // Composite key for heat_aware_recent_leader_moves_. Keying on the full (tablet, from, to)
+  // triple — not just tablet_id — means a single heat-driven move does not block legitimate
+  // subsequent moves for the same tablet to a different destination, or even back to the
+  // original source after heat shifts.
+  struct HeatCooldownKey {
+    TabletId tablet_id;
+    TabletServerId from_ts;
+    TabletServerId to_ts;
+
+    bool operator==(const HeatCooldownKey& other) const {
+      return tablet_id == other.tablet_id && from_ts == other.from_ts && to_ts == other.to_ts;
+    }
+  };
+
+  struct HeatCooldownKeyHash {
+    size_t operator()(const HeatCooldownKey& k) const {
+      size_t h = std::hash<std::string>{}(k.tablet_id);
+      h ^= std::hash<std::string>{}(k.from_ts) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+      h ^= std::hash<std::string>{}(k.to_ts) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+      return h;
+    }
+  };
+
+  // Returns true when `tablet_id` was moved from `from_ts` to `to_ts` by the heat-aware
+  // strategy within the last `load_balancer_heat_leader_move_cooldown_secs` seconds. Used by
+  // GetLeaderToMove to skip heat-driven re-proposals of a move the balancer just made.
+  //
+  // Not const: when the per-tablet view shows the recorded destination is not the current leader,
+  // the earlier async stepdown must have failed (SendMoveLeader only schedules the task; it does
+  // not wait for the transfer). In that case the entry is stale — we evict it and return false so
+  // the retry is not wrongly suppressed for the remainder of the cooldown window.
+  bool IsInHeatAwareCooldown(const TabletId& tablet_id, const TabletServerId& from_ts,
+                             const TabletServerId& to_ts);
+
+  // Records a successful heat-driven leader move at `MonoTime::Now()`. Called from MoveLeader
+  // only when LeaderMoveDetails::is_heat_driven is true.
+  void RecordHeatAwareLeaderMove(const TabletId& tablet_id, const TabletServerId& from_ts,
+                                 const TabletServerId& to_ts);
+
+  // Drops entries from heat_aware_recent_leader_moves_ that are older than the cooldown window.
+  // Invoked from AggregateLeaderHeatIntoGlobalState (once per run, under the same AutoFlag gate
+  // as heat aggregation).
+  void EvictExpiredHeatCooldowns();
+
+  // Projects the effect of a successful leader move onto the in-run heat aggregates. Subtracts
+  // the moved tablet's per-tablet heat contribution from `heat_by_ts_[from_ts]` and adds it to
+  // `heat_by_ts_[to_ts]`, then rewrites the per-tablet record's leader_uuid to `to_ts` so any
+  // later iteration in the same balancer run sees the new owner. No-op when:
+  //   - enable_load_balancer_heat_telemetry is off (heat_by_tablet_ is empty anyway, but we avoid
+  //     doing the lookup),
+  //   - to_ts is empty (RemoveReplica's leader-stepdown path invokes MoveLeader with an empty
+  //     destination when cluster_balancer_stepdown_to_preferred_leader_on_remove is off or when
+  //     SelectBestLeaderAfterStepdown cannot find a viable replica; crediting heat_by_ts_[""]
+  //     would pollute the aggregate),
+  //   - the tablet has no fresh record in heat_by_tablet_ (the tablet never contributed to the
+  //     aggregate, so nothing to move between tservers),
+  //   - the cached leader_uuid does not match from_ts (the aggregate was already attributed to a
+  //     different leader in this run — touching it would double-correct).
+  // Called from MoveLeader on every successful SendMoveLeader, regardless of is_heat_driven:
+  // count-based, blacklist-drain, and preferred-leader moves that happen first in the same run
+  // must also refresh the heat view, otherwise subsequent heat-aware iterations would re-drain a
+  // now-cold source based on the pre-run snapshot.
+  void ProjectLeaderHeatMoveIntoGlobalState(const TabletId& tablet_id,
+                                            const TabletServerId& from_ts,
+                                            const TabletServerId& to_ts);
+
+  // Persistent across balancer runs — survives ResetGlobalState. Maps the most recent
+  // heat-driven leader move for each (tablet, from_ts, to_ts) triple to the time it was issued.
+  std::unordered_map<HeatCooldownKey, MonoTime, HeatCooldownKeyHash>
+      heat_aware_recent_leader_moves_;
+
+  // Per-run maintenance + heat aggregation hook. Evicts expired heat-aware leader-move cooldown
+  // entries unconditionally (the map survives ResetGlobalState so the sweep must run every pass,
+  // including passes where enable_load_balancer_heat_telemetry is off — otherwise toggling that
+  // flag off freezes the map indefinitely). Then, when the AutoFlag is on, snapshots fresh
+  // entries out of the catalog-manager's leader heat cache and aggregates them per-tserver into
+  // `global_state_->heat_by_ts_` / `heat_by_tablet_`.
+  virtual void AggregateLeaderHeatIntoGlobalState();
+
   friend class LoadBalancerMockedBase;
 
  private:
@@ -370,11 +455,6 @@ class ClusterLoadBalancer {
       const std::vector<TabletServerId>& sorted_leader_load);
 
   virtual void SetBlacklistAndPendingDeleteTS();
-
-  // Snapshots fresh entries out of the catalog-manager's leader heat cache and aggregates them
-  // per-tserver into `global_state_->heat_by_ts_`. No-op unless the
-  // enable_load_balancer_heat_telemetry AutoFlag is on. Phase 2 populates only; Phase 3 consumes.
-  virtual void AggregateLeaderHeatIntoGlobalState();
 
   void TrackTask(const std::shared_ptr<RetryingRpcTask>& task);
 

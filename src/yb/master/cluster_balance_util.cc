@@ -215,6 +215,11 @@ Status PerTableLoadState::UpdateTablet(TabletInfo *tablet) {
     // know if we have any leader for this tablet, even if outside of our cluster.
     if (replica.role == PeerRole::LEADER) {
       tablet_meta.leader_uuid = ts_uuid;
+      // Snapshot the observed-from-replica-map leader before AnalyzeTablets' pending-task replay
+      // has a chance to project leader_uuid forward. Consumers that need ground truth (e.g. the
+      // heat-aware cooldown's stranded-leader eviction) must read initial_leader_uuid — leader_uuid
+      // may be mutated later in this same run by state_->MoveLeader.
+      tablet_meta.initial_leader_uuid = ts_uuid;
     }
 
     tablet_meta.size = std::max(tablet_meta.size, replica.drive_info.total_size);

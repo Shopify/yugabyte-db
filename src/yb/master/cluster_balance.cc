@@ -27,6 +27,7 @@
 
 #include "yb/master/catalog_manager_util.h"
 #include "yb/master/cluster_balance_heat_cache.h"
+#include "yb/master/cluster_balance_strategy.h"
 #include "yb/master/master_fwd.h"
 #include "yb/master/master.h"
 #include "yb/master/master_error.h"
@@ -160,6 +161,24 @@ DEFINE_RUNTIME_int32(load_balancer_heat_staleness_threshold_secs, 60,
     "fresh. Leader heat older than this is ignored when aggregating per-tserver heat for "
     "heat-aware balancing. Should comfortably exceed the tserver heartbeat-metrics interval "
     "(tserver_heartbeat_metrics_interval_ms) to tolerate a dropped heartbeat.");
+
+DEFINE_RUNTIME_double(load_balancer_heat_read_weight, 1.0,
+    "Weight applied to per-tserver sum of leader read_ops_per_sec when the heat-aware balancer "
+    "scores tservers for leader moves. Set to 0 to ignore reads entirely.");
+
+DEFINE_RUNTIME_double(load_balancer_heat_write_weight, 1.0,
+    "Weight applied to per-tserver sum of leader write_ops_per_sec when the heat-aware balancer "
+    "scores tservers for leader moves. Set to 0 to ignore writes entirely.");
+
+DEFINE_RUNTIME_double(load_balancer_heat_hysteresis_ops_per_sec, 50.0,
+    "Heat bucket size for the heat-aware balancer. Weighted heat is quantized to "
+    "floor(heat / bucket_size); tservers in the same bucket are treated as equal on heat and "
+    "fall through to count-based ordering. Also the minimum inter-bucket gap that triggers a "
+    "heat-driven move. Must be > 0 for the heat-aware strategy to make any heat-driven moves.");
+
+DEFINE_RUNTIME_int32(load_balancer_heat_leader_move_cooldown_secs, 300,
+    "After the heat-aware balancer moves a leader for a (tablet, from_ts, to_ts) triple, do not "
+    "repeat that same move for this many seconds. Set to 0 to disable the cooldown.");
 
 METRIC_DEFINE_gauge_int64(cluster,
                           is_load_balancing_enabled,
@@ -926,6 +945,14 @@ Status ClusterLoadBalancer::AnalyzeTablets(const TableInfoPtr& table) {
       const auto& to_ts = state_->pending_stepdown_leader_tasks_[table->id()][tablet_id];
       VLOG(3) << Format("Adding pending leader stepdown task for tablet $0 from TS $1 to TS $2",
           tablet_id, from_ts, to_ts);
+      // Reconcile the retained heat snapshot before MoveLeader projects leader_uuid forward.
+      // AggregateLeaderHeatIntoGlobalState took heat_by_ts_ / heat_by_tablet_ at the start of the
+      // run; without this projection heat_by_tablet_[tablet].leader_uuid would still credit
+      // from_ts while per_tablet_meta_ / sorted_leader_load_ already reflect to_ts. A later
+      // heat-driven to_ts -> C move would then fail the record.leader_uuid != from_ts guard in
+      // ProjectLeaderHeatMoveIntoGlobalState and silently skip heat projection, causing heat_by_ts_
+      // to drift out of sync with the balancer's own decisions for the remainder of the run.
+      ProjectLeaderHeatMoveIntoGlobalState(tablet_id, from_ts, to_ts);
       RETURN_NOT_OK(state_->MoveLeader(tablet->id(), from_ts, to_ts));
     }
     if (state_->pending_add_replica_tasks_[table->id()].count(tablet_id) > 0) {
@@ -1330,39 +1357,56 @@ Result<std::optional<ClusterLoadBalancer::LeaderMoveDetails>>
   size_t adjusted_leader_threshold = implicit_cast<size_t>(
       state_->AdjustLeaderBalanceThreshold(static_cast<int>(sorted_leader_load.size())));
 
-  // Find out if there are leaders to be moved.
+  // Pre-loop short-circuit. Two independent questions:
+  //   (a) Is there a leader-blacklisted tserver with leaders on it? If so, we must enter the
+  //       main loop to drain it regardless of count/heat thresholds.
+  //   (b) Absent a blacklist drain, does the active strategy see any reason to balance? This
+  //       used to inline `high_load <= adjusted_leader_threshold` on the sort order's rightmost
+  //       entry, which quietly assumed count-based sort. Under heat-aware sort the rightmost
+  //       non-blacklisted entry is the heat-max, not the count-max, so the strategy computes
+  //       the relevant maxima itself.
+  bool blacklisted_drain_pending = false;
   for (auto right = sorted_leader_load.size(); right > 0;) {
     --right;
     const TabletServerId& high_load_uuid = sorted_leader_load[right];
-    auto high_leader_blacklisted =
+    const bool high_leader_blacklisted =
         (global_state_->leader_blacklisted_servers_.find(high_load_uuid) !=
          global_state_->leader_blacklisted_servers_.end());
-    auto high_load = state_->GetLeaderLoad(high_load_uuid);
+    const auto high_load = state_->GetLeaderLoad(high_load_uuid);
     if (high_leader_blacklisted) {
       if (high_load > 0) {
-        // Leader blacklisted tserver with a leader replica.
-        break;
-      } else {
-        // Leader blacklisted tserver without leader replica.
-        VLOG(3) << "Tablet server " << high_load_uuid << " is blacklisted but has 0"
-                << " leader load for this table, continue to the next ts";
-        continue;
-      }
-    } else {
-      if (adjusted_leader_threshold > 0 && high_load <= adjusted_leader_threshold) {
-        // Non-leader blacklisted tserver with not too many leader replicas.
-        // TODO(Sanket): Even though per table load is below the configured threshold,
-        // we might want to do global leader balancing above a certain threshold that is lower
-        // than the per table threshold. Can add another gflag/knob here later.
-        VLOG(3) << "Tablet server " << high_load_uuid << " is not blacklisted "
-                << " and has load below threshold, not found any leader to move";
-        return std::nullopt;
-      } else {
-        // Non-leader blacklisted tserver with too many leader replicas.
+        blacklisted_drain_pending = true;
         break;
       }
+      VLOG(3) << "Tablet server " << high_load_uuid << " is blacklisted but has 0"
+              << " leader load for this table, continue to the next ts";
+      continue;
     }
+    // First non-blacklisted from the right — under heat-aware this may not be the count-max, so
+    // fall through to the strategy-driven short-circuit decision below.
+    break;
   }
+
+  DCHECK(strategy_ != nullptr);
+  if (!blacklisted_drain_pending &&
+      strategy_->ShouldSkipLeaderBalancing(
+          *state_, *global_state_, sorted_leader_load, adjusted_leader_threshold)) {
+    VLOG(3) << "Strategy " << strategy_->name() << " reports no leader move is warranted at "
+            << "adjusted_leader_threshold=" << adjusted_leader_threshold;
+    return std::nullopt;
+  }
+
+  // Threshold capping must only apply when a non-count-based strategy (heat-aware) overrode the
+  // pre-loop skip via a heat-bucket gap. When we're in the loop solely because of a blacklist
+  // drain, count-based would also have entered the loop, and once inside it issues ordinary
+  // count-driven moves from non-blacklisted sources whenever load variance warrants — nothing
+  // about a blacklist drain should retroactively suppress those. Gating on
+  // `!blacklisted_drain_pending` keeps heat-aware's per-pair suppression aligned with the
+  // question it actually cares about: "did heat admit us past the count-based skip?"
+  const bool count_based_threshold_capping =
+      !blacklisted_drain_pending &&
+      strategy_->CountBasedThresholdCapsBalancing(
+          *state_, *global_state_, sorted_leader_load, adjusted_leader_threshold);
 
   // The algorithm to balance the leaders is very similar to the one for tablets:
   //
@@ -1402,51 +1446,38 @@ Result<std::optional<ClusterLoadBalancer::LeaderMoveDetails>>
       auto high_leader_blacklisted =
           global_state_->leader_blacklisted_servers_.contains(high_load_uuid);
       ssize_t high_load = state_->GetLeaderLoad(high_load_uuid);
-      ssize_t low_load = state_->GetLeaderLoad(low_load_uuid);
-      ssize_t load_variance = high_load - low_load;
-
-      bool is_global_balancing_move = false;
 
       // Check for state change or end conditions.
       if (high_leader_blacklisted && high_load == 0) {
         continue;  // No leaders to move from this blacklisted TS.
       }
-      std::string reason;
-      if (load_variance >= state_->options_->kMinLoadVarianceToBalance /* 2 */) {
-        reason = Format("Source tserver has more leaders for this table than destination ($0 > $1)",
-                        high_load, low_load);
-      } else if (high_leader_blacklisted) {
-        reason = Format("Leader is on leader blacklisted tserver", high_load_uuid);
+
+      // Delegate the move-trigger decision to the active strategy. CountBased reproduces the
+      // original variance / blacklist / global-balancing logic verbatim; HeatAware layers a
+      // heat-bucket override on top.
+      DCHECK(strategy_ != nullptr);
+      const LeaderMoveAssessment assessment = strategy_->AssessLeaderMove(
+          *state_, *global_state_, high_load_uuid, low_load_uuid,
+          high_leader_blacklisted,
+          /* left_equals_right */ left == right,
+          /* right_equals_last_pos */ right == last_pos,
+          CanBalanceGlobalLoad(),
+          count_based_threshold_capping);
+
+      if (assessment.should_return_nullopt) {
+        return std::nullopt;
       }
-      if (left == right || reason.empty()) {
-        // Global leader balancing only if per table variance is > 0.
-        if (load_variance == 0 && right == last_pos) {
-          // We can return as we don't have any other moves to make.
-          return std::nullopt;
-        }
-        // Check if we can benefit from global leader balancing.
-        // If we have > 0 load_variance and there are no per table moves left.
-        if (load_variance > 0 && CanBalanceGlobalLoad()) {
-          auto global_high_load = state_->global_state_->GetGlobalLeaderLoad(high_load_uuid);
-          auto global_low_load = state_->global_state_->GetGlobalLeaderLoad(low_load_uuid);
-          int global_load_variance = global_high_load - global_low_load;
-          // Already globally balanced. Since we are sorted by (leaders, global leader load), we can
-          // break here as there are no other leaders for us to move to this left tserver.
-          // However, as opposed to global load balancing, we cannot return early here, and instead
-          // must just break. This is because for global load balancing we can always find a tablet
-          // to move from the high load TS to the low load TS (assuming proper placements). But for
-          // leader balancing, we have the additional constraint that both tservers must have a peer
-          // for this tablet. Thus we must continue to the next left tserver.
-          if (global_load_variance < state_->options_->kMinLoadVarianceToBalance /* 2 */) {
-            break;
-          }
-          reason = Format("Source tserver has more global leaders than destination ($0 > $1)",
-                          global_high_load, global_low_load);
-          VLOG(3) << "This is a global leader balancing pass";
-          is_global_balancing_move = true;
-        } else {
+      if (!assessment.should_move) {
+        if (assessment.should_break_inner_loop) {
           break;
         }
+        continue;
+      }
+
+      std::string reason = assessment.reason;
+      const bool is_global_balancing_move = assessment.is_global_balancing_move;
+      if (is_global_balancing_move) {
+        VLOG(3) << "This is a global leader balancing pass";
       }
 
       // Find the leaders on the higher loaded TS that have running peers on the lower loaded TS.
@@ -1460,7 +1491,8 @@ Result<std::optional<ClusterLoadBalancer::LeaderMoveDetails>>
           .from_ts = high_load_uuid,
           .to_ts = low_load_uuid,
           .to_ts_path = path,
-          .reason = std::move(reason),
+          .reason = reason,
+          .is_heat_driven = assessment.is_heat_driven,
         };
 
         VLOG(3) << "For leader balancing found tablet " << tablet_id << " to move from "
@@ -1488,6 +1520,20 @@ Result<std::optional<ClusterLoadBalancer::LeaderMoveDetails>>
                        << move_details.tablet_id;
         }
 
+        // Heat-aware cooldown: skip this candidate only when the proposed move is itself
+        // heat-driven. The map is populated from heat-driven moves alone, but leadership can
+        // drift back between runs (preferred-leader, placement repair, manual stepdown), and
+        // when that happens a legitimate count-based or blacklist-drain move with the same
+        // (tablet, from, to) triple must NOT be suppressed by a stale heat cooldown entry.
+        // Gating on `assessment.is_heat_driven` keeps the cooldown scoped to the decisions
+        // it was designed to debounce.
+        if (assessment.is_heat_driven &&
+            IsInHeatAwareCooldown(tablet_id, high_load_uuid, low_load_uuid)) {
+          VLOG(3) << "Skipping tablet " << tablet_id << " leader move from " << high_load_uuid
+                  << " to " << low_load_uuid << ": still in heat-aware cooldown window.";
+          continue;
+        }
+
         if (!is_global_balancing_move) {
           can_perform_global_operations_ = false;
         }
@@ -1496,8 +1542,15 @@ Result<std::optional<ClusterLoadBalancer::LeaderMoveDetails>>
     }
   }
 
-  // Should never get here.
-  FATAL_ERROR("Cluster balancing algorithm reached invalid state!");
+  // Falling through the outer loop means the scan examined every (left, right) pair and found no
+  // move worth taking. Under count-based sort the inner-loop break / should_return_nullopt paths
+  // terminated the scan early and this point was unreachable (hence the legacy FATAL_ERROR). Under
+  // heat-aware sort, HeatAwareLoadBalancerStrategy::AssessLeaderMove deliberately refuses to
+  // propagate count-based's termination flags (they encode count-sort invariants that may not
+  // hold), so the outer loop can legitimately exhaust. Treat that as "no move selected" — the
+  // stronger invariant the legacy code was guarding is already enforced by the pre-loop
+  // ShouldSkipLeaderBalancing / blacklist checks, which run before we ever get here.
+  return std::nullopt;
 }
 
 Result<bool> ClusterLoadBalancer::HandleRemoveReplicas(
@@ -1598,9 +1651,30 @@ Result<std::optional<ClusterLoadBalancer::LeaderMoveDetails>>
   //
   // If the current leader load is 0, we know that there is no match in this priority and move to
   // higher priorities.
-  for (auto lower_priority = state_->sorted_leader_load_.size(); lower_priority > 1;) {
+  //
+  // Affinitized-priority balancing is a count-optimization: the goal is to drain leaders off
+  // lower-priority zones and consolidate them in the preferred zone, using the count-lightest
+  // destination first. Both loop invariants below depend on that — the right-to-left source scan
+  // breaks on the first non-blacklisted count=0 entry (only correct when all count=0 entries are
+  // at the left), and the front-to-back destination scan takes the front as the least-loaded.
+  // Under heat_aware_experimental, state_->sorted_leader_load_ is ordered by heat bucket first
+  // (with count as a within-bucket tiebreaker), so both invariants break: a hot zero-count
+  // tserver can land at the right of its priority, and the cool-but-count-heavy tserver can land
+  // at the front of the preferred zone. We rebuild a locally count-sorted view and use it only
+  // for this path; same-priority heat-aware balancing continues to use the strategy-ordered
+  // sorted_leader_load_ elsewhere.
+  CountBasedLoadScorer count_scorer;
+  std::vector<std::vector<TabletServerId>> sorted_by_count = state_->sorted_leader_load_;
+  for (auto& priority_set : sorted_by_count) {
+    std::sort(priority_set.begin(), priority_set.end(),
+              [&](const TabletServerId& a, const TabletServerId& b) {
+                return count_scorer.CompareLeaderLoad(*state_, *global_state_, a, b);
+              });
+  }
+
+  for (auto lower_priority = sorted_by_count.size(); lower_priority > 1;) {
     lower_priority--;
-    auto& leader_set = state_->sorted_leader_load_[lower_priority];
+    auto& leader_set = sorted_by_count[lower_priority];
     for (size_t idx = leader_set.size(); idx > 0;) {
       idx--;
       const TabletServerId& from_uuid = leader_set[idx];
@@ -1620,7 +1694,7 @@ Result<std::optional<ClusterLoadBalancer::LeaderMoveDetails>>
       const std::set<TabletId>& leaders = state_->per_ts_meta_[from_uuid].leaders;
       for (size_t higher_priority = 0; higher_priority < lower_priority; higher_priority++) {
         // higher_priority is always guaranteed not to contain blacklisted servers.
-        for (const auto& to_uuid : state_->sorted_leader_load_[higher_priority]) {
+        for (const auto& to_uuid : sorted_by_count[higher_priority]) {
           auto peers = GetLeadersOnTSToMove(
               global_state_->drive_aware_, leaders, state_->per_ts_meta_[to_uuid]);
 
@@ -1789,8 +1863,167 @@ Status ClusterLoadBalancer::MoveLeader(const LeaderMoveDetails& move_details) {
   RETURN_NOT_OK(SendMoveLeader(
       tablet_opt->get(), move_details.from_ts, move_details.also_remove_replica,
       move_details.reason, move_details.to_ts));
+  if (move_details.is_heat_driven) {
+    // Scope cooldown bookkeeping to heat-driven moves. Count-based balancing, preferred-leader
+    // cross-zone moves, and placement-repair stepdowns all share this MoveLeader path but must
+    // not populate the heat cooldown map — that would suppress future heat-aware moves for
+    // unrelated reasons.
+    RecordHeatAwareLeaderMove(move_details.tablet_id, move_details.from_ts, move_details.to_ts);
+  }
+  // Refresh the in-run heat aggregates so subsequent leader-move iterations (either the per-table
+  // loop in RunClusterBalancerWithOptions or the repeated HandleLeaderMoves dispatch at
+  // cluster_balance.cc:685-703) see the post-move heat distribution instead of the stale start-of-
+  // run snapshot. Applied on every successful move — see the helper's doc comment for why this is
+  // strategy-agnostic.
+  ProjectLeaderHeatMoveIntoGlobalState(
+      move_details.tablet_id, move_details.from_ts, move_details.to_ts);
   return state_->MoveLeader(
       move_details.tablet_id, move_details.from_ts, move_details.to_ts, move_details.to_ts_path);
+}
+
+void ClusterLoadBalancer::ProjectLeaderHeatMoveIntoGlobalState(
+    const TabletId& tablet_id, const TabletServerId& from_ts, const TabletServerId& to_ts) {
+  if (to_ts.empty()) {
+    // RemoveReplica's leader-stepdown path (cluster_balance.cc:1753) can invoke MoveLeader with an
+    // empty to_ts — either because cluster_balancer_stepdown_to_preferred_leader_on_remove is off,
+    // or because SelectBestLeaderAfterStepdown found no viable replica. In that case Raft will
+    // elect the new leader and the master will not know where heat actually lands until the next
+    // heartbeat-driven refresh. Crediting heat_by_ts_[""] would pollute the aggregate and rewriting
+    // heat_by_tablet_[tablet].leader_uuid to "" would strand this tablet's heat until
+    // AggregateLeaderHeatIntoGlobalState runs again at the start of the next balancer run. Leave
+    // the aggregates at their start-of-run snapshot — imprecise but safe; the next run's snapshot
+    // will reflect the new leader.
+    return;
+  }
+  auto& heat_by_tablet = global_state_->heat_by_tablet_;
+  auto tablet_it = heat_by_tablet.find(tablet_id);
+  if (tablet_it == heat_by_tablet.end()) {
+    // No fresh telemetry was aggregated for this tablet at run start (either the cache had no
+    // record, the record was older than load_balancer_heat_staleness_threshold_secs, or the
+    // tablet had no leader_uuid reported). Nothing contributed to heat_by_ts_ for this tablet,
+    // so nothing to adjust. A count-based or blacklist-drain move for a tablet without fresh
+    // heat is the common case and must be a zero-cost path.
+    return;
+  }
+  auto& record = tablet_it->second;
+  if (record.leader_uuid != from_ts) {
+    // The aggregate for this tablet was attributed to a different tserver at run start. Possible
+    // causes: (a) a prior move in this same run already rewrote leader_uuid to some other
+    // destination and we're now looking at a stale `from_ts` (the caller constructed
+    // LeaderMoveDetails before the earlier move landed); (b) the cache recorded a newer leader
+    // between when the heartbeat set leader_uuid and when AggregateLeaderHeatIntoGlobalState ran.
+    // Either way, subtracting from heat_by_ts_[from_ts] now would over-correct a bucket that
+    // already does not contain this tablet's contribution. Skip the adjustment — the aggregates
+    // stay internally consistent with what was credited at run start.
+    return;
+  }
+  auto& heat_by_ts = global_state_->heat_by_ts_;
+  auto from_it = heat_by_ts.find(from_ts);
+  if (from_it != heat_by_ts.end()) {
+    from_it->second.sum_read_ops_per_sec -= record.read_ops_per_sec;
+    from_it->second.sum_write_ops_per_sec -= record.write_ops_per_sec;
+    if (from_it->second.leader_tablet_count > 0) {
+      from_it->second.leader_tablet_count--;
+    }
+    // Floating-point accumulation can drift slightly negative after many moves; clamp to 0 so
+    // Heat() in cluster_balance_strategy.cc never produces a negative bucket index, which would
+    // violate the strict-weak-order guarantee of the bucket-based comparator (see the
+    // HeatAwareTraceIsDeterministicAcrossHysteresis test).
+    if (from_it->second.sum_read_ops_per_sec < 0.0) {
+      from_it->second.sum_read_ops_per_sec = 0.0;
+    }
+    if (from_it->second.sum_write_ops_per_sec < 0.0) {
+      from_it->second.sum_write_ops_per_sec = 0.0;
+    }
+  }
+  auto& to_agg = heat_by_ts[to_ts];
+  to_agg.sum_read_ops_per_sec += record.read_ops_per_sec;
+  to_agg.sum_write_ops_per_sec += record.write_ops_per_sec;
+  to_agg.leader_tablet_count++;
+  // Rewrite the per-tablet record so a subsequent move of the same tablet in the same run
+  // projects from the new leader, not the original one. Matches how state_->MoveLeader keeps
+  // per-tablet leader bookkeeping in sync.
+  record.leader_uuid = to_ts;
+}
+
+bool ClusterLoadBalancer::IsInHeatAwareCooldown(
+    const TabletId& tablet_id, const TabletServerId& from_ts,
+    const TabletServerId& to_ts) {
+  const int32_t cooldown_secs = FLAGS_load_balancer_heat_leader_move_cooldown_secs;
+  if (cooldown_secs <= 0) {
+    return false;
+  }
+  const auto it = heat_aware_recent_leader_moves_.find({tablet_id, from_ts, to_ts});
+  if (it == heat_aware_recent_leader_moves_.end()) {
+    return false;
+  }
+  if (MonoTime::Now().GetDeltaSince(it->second) > MonoDelta::FromSeconds(cooldown_secs)) {
+    // Stale by age — evict so repeat lookups within this run are constant-time and the table
+    // stays bounded even if EvictExpiredHeatCooldowns has not run yet.
+    heat_aware_recent_leader_moves_.erase(it);
+    return false;
+  }
+  // Stranded-leader eviction: if the current leader is still on from_ts, the stepdown RPC we
+  // issued synchronously at MoveLeader time never took effect (either the async call failed or
+  // it is still in flight). In that state the cooldown is counterproductive — leaving it live
+  // would keep blocking the same (tablet, from, to) retry for the remainder of
+  // load_balancer_heat_leader_move_cooldown_secs (default 300s), stranding a hot leader on
+  // from_ts long after the ~20s min_leader_stepdown_retry_interval_ms debounce at GetLeaderToMove
+  // has elapsed. Evict so the next heat-aware pass can retry.
+  //
+  // We compare against initial_leader_uuid, NOT leader_uuid. AnalyzeTablets replays pending
+  // stepdown tasks via state_->MoveLeader before any new decision is made, which projects
+  // leader_uuid forward to the pending task's to_ts even when the real leader is still on
+  // from_ts (slow stepdown, async failure being retried, etc.). initial_leader_uuid is a
+  // snapshot of the replica map and is never mutated by MoveLeader, so it stays an
+  // authoritative answer to "is the leader actually on from_ts?" across runs.
+  //
+  // This also preserves the existing destination-only-failure guard: the failures map cannot
+  // distinguish our own A -> B failure from an unrelated C -> B failure, so consulting it here
+  // would drop the cooldown on any B-destined failure and let a subsequent drift-back-to-A
+  // trigger a churn-inducing repeat move (HeatCooldownNotEvictedByUnrelatedStepdownFailure).
+  // initial_leader_uuid is unambiguous: if the actual leader is on from_ts, our move did not
+  // leave an effect to debounce.
+  //
+  // Trade-off: if leadership ever drifts back to from_ts organically (e.g. manual stepdown
+  // after a successful move) while the heat cooldown is live, we will also evict and re-issue
+  // the move. That is narrow in practice within a single priority tier — cross-tier
+  // preferred-leader affinity is count-only per Phase 3 scope — and the one extra move is
+  // preferable to the multi-minute stall the stranded-leader case otherwise produces.
+  if (state_ != nullptr) {
+    const auto meta_it = state_->per_tablet_meta_.find(tablet_id);
+    if (meta_it != state_->per_tablet_meta_.end() &&
+        meta_it->second.initial_leader_uuid == from_ts) {
+      heat_aware_recent_leader_moves_.erase(it);
+      return false;
+    }
+  }
+  return true;
+}
+
+void ClusterLoadBalancer::RecordHeatAwareLeaderMove(
+    const TabletId& tablet_id, const TabletServerId& from_ts, const TabletServerId& to_ts) {
+  heat_aware_recent_leader_moves_[{tablet_id, from_ts, to_ts}] = MonoTime::Now();
+}
+
+void ClusterLoadBalancer::EvictExpiredHeatCooldowns() {
+  const int32_t cooldown_secs = FLAGS_load_balancer_heat_leader_move_cooldown_secs;
+  if (cooldown_secs <= 0) {
+    // When the cooldown is disabled, drop everything — no point holding entries that cannot
+    // influence a decision.
+    heat_aware_recent_leader_moves_.clear();
+    return;
+  }
+  const MonoDelta max_age = MonoDelta::FromSeconds(cooldown_secs);
+  const MonoTime now = MonoTime::Now();
+  for (auto it = heat_aware_recent_leader_moves_.begin();
+       it != heat_aware_recent_leader_moves_.end();) {
+    if (now.GetDeltaSince(it->second) > max_age) {
+      it = heat_aware_recent_leader_moves_.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 void ClusterLoadBalancer::GetAllAffinitizedZones(
@@ -1848,17 +2081,25 @@ void ClusterLoadBalancer::SetBlacklistAndPendingDeleteTS() {
 }
 
 void ClusterLoadBalancer::AggregateLeaderHeatIntoGlobalState() {
-  // Phase 2: heat aggregates exist only to be wired up. The count-based strategy ignores them;
-  // the Phase 1 parity tests assert this by seeding heat and comparing traces.
+  // Evict stale cooldown entries at the start of every run, regardless of whether heat telemetry
+  // is on. heat_aware_recent_leader_moves_ survives ResetGlobalState, so if an operator disables
+  // enable_load_balancer_heat_telemetry while entries are live, gating this sweep behind the
+  // flag would pin them in the map indefinitely — breaking the bounded-size guarantee on the
+  // cooldown map and silently extending the effective cooldown window if the flag is later
+  // re-enabled. The sweep itself is O(N) over a map bounded by the cooldown window and is
+  // independent of the heat cache.
+  EvictExpiredHeatCooldowns();
+
   if (!FLAGS_enable_load_balancer_heat_telemetry) {
     return;
   }
+
   auto* heat_cache = catalog_manager_->GetClusterBalanceHeatCache();
   if (heat_cache == nullptr) {
     return;
   }
   const auto staleness = MonoDelta::FromSeconds(FLAGS_load_balancer_heat_staleness_threshold_secs);
-  const auto fresh = heat_cache->SnapshotFresh(staleness);
+  auto fresh = heat_cache->SnapshotFresh(staleness);
   for (const auto& [tablet_id, record] : fresh) {
     if (record.leader_uuid.empty()) {
       continue;
@@ -1868,6 +2109,11 @@ void ClusterLoadBalancer::AggregateLeaderHeatIntoGlobalState() {
     agg.sum_write_ops_per_sec += record.write_ops_per_sec;
     agg.leader_tablet_count++;
   }
+  // Retain the fresh snapshot so MoveLeader can adjust heat_by_ts_ incrementally after each
+  // successful leader move within this run. We move rather than copy because `fresh` is otherwise
+  // discarded at the end of this function. Empty-leader_uuid entries are kept in the map (they
+  // simply will not match any from_ts during mid-run lookups).
+  global_state_->heat_by_tablet_ = std::move(fresh);
 }
 
 void ClusterLoadBalancer::InitializeTSDescriptors() {

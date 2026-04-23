@@ -77,7 +77,13 @@ class LoadBalancerMockedBase : public YBTest {
   };
 
   // Don't need locks for mock class.
-  Result<PendingTasks> ResetLoadBalancerAndAnalyzeTablets() NO_THREAD_SAFETY_ANALYSIS  {
+  // `pre_analyze_hook`, if provided, runs after the fresh global state is constructed but before
+  // AnalyzeTablets runs. This mirrors production's ordering in RunClusterBalancerWithOptions,
+  // where AggregateLeaderHeatIntoGlobalState executes ahead of AnalyzeTablets. Tests that need to
+  // seed heat state for AnalyzeTablets' pending-task replay to observe use this hook — the
+  // ResetLoadBalancerState call above wipes global_state_, so seeding earlier would be lost.
+  Result<PendingTasks> ResetLoadBalancerAndAnalyzeTablets(
+      std::function<void()> pre_analyze_hook = {}) NO_THREAD_SAFETY_ANALYSIS  {
     ResetLoadBalancerState();
 
     cb_.GetAllDescriptors(&cb_.global_state_->ts_descs_);
@@ -93,6 +99,10 @@ class LoadBalancerMockedBase : public YBTest {
     int removes = 0;
     int stepdowns = 0;
     RETURN_NOT_OK(cb_.CountPendingTasks(table, &adds, &removes, &stepdowns));
+
+    if (pre_analyze_hook) {
+      pre_analyze_hook();
+    }
 
     RETURN_NOT_OK(cb_.AnalyzeTablets(table));
     return PendingTasks { adds, removes, stepdowns };
