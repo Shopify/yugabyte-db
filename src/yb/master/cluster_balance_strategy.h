@@ -58,6 +58,40 @@ struct LeaderMoveAssessment {
   bool should_return_nullopt = false;
 };
 
+// Outcome returned by LoadBalancerStrategy::AssessTabletMove for a (high_uuid, low_uuid) pair
+// in ClusterLoadBalancer::GetLoadToMove. Mirrors the control flow of the original inline decision
+// block so the caller can preserve legacy semantics verbatim while letting heat-aware strategies
+// inject new trigger conditions. Parallel to LeaderMoveAssessment but for tablet add/move
+// decisions rather than leader stepdowns.
+struct TabletMoveAssessment {
+  // When true, the caller looks for a tablet to move between high_uuid and low_uuid and
+  // propagates `reason` into the AddOrMoveReplica log line.
+  bool should_move = false;
+
+  // Human-readable rationale, logged by AddOrMoveReplica and surfaced in cluster balancer VLOGs.
+  std::string reason;
+
+  // Heat-aware strategies set this to true when the move was triggered on heat grounds (i.e. the
+  // count-based assessment declined and a PlacementHeat-bucket gap exists). Scopes cooldown
+  // bookkeeping on heat_aware_recent_tablet_moves_ so placement-repair, blacklist-drain, and
+  // plain count-based tablet moves do not poison the heat cooldown map.
+  bool is_heat_driven = false;
+
+  // Mirrors the pre-existing `is_global_balancing_move` local so the caller can keep its
+  // can_perform_global_operations_ accounting around cross-table global balancing.
+  bool is_global_balancing_move = false;
+
+  // When true, the caller should `break` out of the inner right-index loop rather than
+  // `continue`. Reproduces the original early-exit behaviors at cluster_balance.cc:1199 and
+  // cluster_balance.cc:1212.
+  bool should_break_inner_loop = false;
+
+  // When true, the caller should return false from GetLoadToMove entirely — no further
+  // (left, right) pair will produce a move under this strategy. Reproduces the original
+  // `load_variance == 0 && right == last_pos` early return at cluster_balance.cc:1182.
+  bool should_return_false = false;
+};
+
 // Abstract scoring seam used by PerTableLoadState when sorting tablet servers by load and leader
 // load. Implementations are expected to be stateless so that the same LoadScorer can be reused by
 // the std::sort comparators that PerTableLoadState constructs during a balancer run.
@@ -169,6 +203,21 @@ class LoadBalancerStrategy {
       const PerTableLoadState& state, const GlobalLoadState& global_state,
       const std::vector<TabletServerId>& sorted_leader_load,
       size_t adjusted_leader_threshold) const = 0;
+
+  // Decides whether a tablet move from `high_uuid` to `low_uuid` is warranted under this
+  // strategy. Replaces the inline `load_variance` / `is_global_balancing_move` /
+  // `GetPossiblyTransientLoad` decision block that previously lived in
+  // ClusterLoadBalancer::GetLoadToMove. The caller has already sorted sorted_load_ ascending
+  // by this strategy's `CompareLoad` and is iterating (left, right) from outside in.
+  //
+  // `left_equals_right` and `right_is_last_pos` match the named state variables inside
+  // GetLoadToMove. `can_balance_globally` mirrors the `CanBalanceGlobalLoad()` result once for
+  // the whole call (reading it per-iteration inside the strategy would drift from the outer
+  // loop's view of per-run global-balancing state).
+  virtual TabletMoveAssessment AssessTabletMove(
+      const PerTableLoadState& state, const GlobalLoadState& global_state,
+      const TabletServerId& high_uuid, const TabletServerId& low_uuid,
+      bool left_equals_right, bool right_is_last_pos, bool can_balance_globally) const = 0;
 };
 
 class CountBasedLoadBalancerStrategy : public LoadBalancerStrategy {
@@ -194,6 +243,15 @@ class CountBasedLoadBalancerStrategy : public LoadBalancerStrategy {
       const PerTableLoadState& state, const GlobalLoadState& global_state,
       const std::vector<TabletServerId>& sorted_leader_load,
       size_t adjusted_leader_threshold) const override;
+
+  // Extracted verbatim from the pre-Phase-4 inline decision block in
+  // ClusterLoadBalancer::GetLoadToMove. Produces the same control flow (should_move / break /
+  // return_false / global-balancing fallback) that the inline code path did — any drift from
+  // the pre-Phase-4 behavior is a bug.
+  TabletMoveAssessment AssessTabletMove(
+      const PerTableLoadState& state, const GlobalLoadState& global_state,
+      const TabletServerId& high_uuid, const TabletServerId& low_uuid,
+      bool left_equals_right, bool right_is_last_pos, bool can_balance_globally) const override;
 
  private:
   CountBasedLoadScorer scorer_;
@@ -235,6 +293,17 @@ class HeatAwareLoadBalancerStrategy : public LoadBalancerStrategy {
       const PerTableLoadState& state, const GlobalLoadState& global_state,
       const std::vector<TabletServerId>& sorted_leader_load,
       size_t adjusted_leader_threshold) const override;
+
+  // First asks the count-based policy. If count-based would move (including global-balancing
+  // moves), returns its verdict unchanged — this preserves parity with count-based when heat
+  // is cold or flat. If count-based declines and terminates (break / return_false), returns
+  // its verdict unchanged so strategy does not extend the scan past count-based's search
+  // bounds. Otherwise, if `bucket(PlacementHeat(high_uuid)) > bucket(PlacementHeat(low_uuid))`,
+  // returns a heat-driven move with is_heat_driven=true.
+  TabletMoveAssessment AssessTabletMove(
+      const PerTableLoadState& state, const GlobalLoadState& global_state,
+      const TabletServerId& high_uuid, const TabletServerId& low_uuid,
+      bool left_equals_right, bool right_is_last_pos, bool can_balance_globally) const override;
 
  private:
   HeatAwareLoadScorer scorer_;

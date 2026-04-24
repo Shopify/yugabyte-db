@@ -25,6 +25,8 @@
 DECLARE_double(load_balancer_heat_read_weight);
 DECLARE_double(load_balancer_heat_write_weight);
 DECLARE_double(load_balancer_heat_hysteresis_ops_per_sec);
+DECLARE_double(load_balancer_heat_replication_write_weight);
+DECLARE_double(load_balancer_heat_placement_hysteresis_ops_per_sec);
 
 namespace yb {
 namespace master {
@@ -56,6 +58,67 @@ int64_t HeatBucketForTs(const GlobalLoadState& global_state, const TabletServerI
   const auto it = global_state.heat_by_ts_.find(ts_uuid);
   const double heat = (it == global_state.heat_by_ts_.end()) ? 0.0 : Heat(it->second);
   return HeatBucket(heat, bucket_size);
+}
+
+// Placement heat: weighted composition of this tserver's write-side costs — both the leader-side
+// write work (from heat_by_ts_) and the follower-side replicated writes (from tablet_heat_by_ts_).
+// Read heat is deliberately EXCLUDED from this score. A tablet *move* redistributes which tserver
+// holds each replica, but it does not redistribute read traffic: YugabyteDB reads flow to the
+// Raft leader by default (follower reads are opt-in and unmeasured by leader-side telemetry), so
+// moving an arbitrary replica — which GetTabletToMove is free to pick from any running tablet on
+// the source, including tablets that tserver follows, not leads — does not necessarily relieve
+// the measured read hotspot. Baking reads into this score made CompareLoad sort on a signal that
+// the Phase 4 mechanism cannot act on, producing remote-bootstrap churn that did not reduce read
+// load. Read hotspots belong to the Phase 3 leader-move path (CompareLeaderLoad / Heat()), which
+// *can* redistribute read traffic by stepping down leadership — and which still scores reads via
+// `load_balancer_heat_read_weight`. See reviewer comment at cluster_balance_strategy.cc:75-77 for
+// the detailed argument.
+//
+// tablet_heat_by_ts_ is "every peer's write cost" and therefore double-counts the leader's own
+// write contribution for every tablet it leads; subtract it out so the two terms add cleanly.
+// Missing entries on either side contribute 0, matching the "no telemetry ⇒ no influence"
+// convention used throughout the heat path.
+double PlacementHeat(const GlobalLoadState& gs, const TabletServerId& ts) {
+  // load_balancer_heat_replication_write_weight = 0 is documented as "collapse Phase 4 to Phase 3":
+  // no tablet-move behavior driven by write-heat. A follower move cannot redistribute leader-side
+  // write work (writes always land on the Raft leader, wherever it sits), so even if the leader-
+  // write term were non-zero the move wouldn't shift the signal that selected the pair. Returning
+  // 0 here gates the entire tablet-move heat path on the replication knob, matching the contract
+  // covered by HeatAwareReplicationWeightZeroSuppressesTabletMove.
+  if (FLAGS_load_balancer_heat_replication_write_weight <= 0.0) {
+    return 0.0;
+  }
+
+  double leader_write_heat = 0.0;
+  double leader_write_rate = 0.0;
+  const auto leader_it = gs.heat_by_ts_.find(ts);
+  if (leader_it != gs.heat_by_ts_.end()) {
+    leader_write_heat =
+        FLAGS_load_balancer_heat_write_weight * leader_it->second.sum_write_ops_per_sec;
+    leader_write_rate = leader_it->second.sum_write_ops_per_sec;
+  }
+
+  double replicated_write_heat = 0.0;
+  const auto repl_it = gs.tablet_heat_by_ts_.find(ts);
+  if (repl_it != gs.tablet_heat_by_ts_.end()) {
+    // tablet_heat_by_ts_ includes the leader's own write contribution for every tablet it leads.
+    // Subtracting `leader_write_rate` here leaves exactly the follower-side replicated writes,
+    // which is what the replication_write_weight knob should scale.
+    const double follower_only = std::max(0.0, repl_it->second - leader_write_rate);
+    replicated_write_heat = FLAGS_load_balancer_heat_replication_write_weight * follower_only;
+  }
+
+  return leader_write_heat + replicated_write_heat;
+}
+
+int64_t PlacementHeatBucket(double heat, double bucket_size) {
+  DCHECK_GT(bucket_size, 0.0);
+  return static_cast<int64_t>(std::floor(heat / bucket_size));
+}
+
+int64_t PlacementHeatBucketForTs(const GlobalLoadState& gs, const TabletServerId& ts_uuid,
+                                 double bucket_size) {
+  return PlacementHeatBucket(PlacementHeat(gs, ts_uuid), bucket_size);
 }
 
 }  // namespace
@@ -117,8 +180,29 @@ bool HeatAwareLoadScorer::CompareLoad(
     const PerTableLoadState& state, const GlobalLoadState& global_state,
     const TabletServerId& a, const TabletServerId& b,
     optional_ref<const TabletId> tablet_id) const {
-  // Phase 3 does not alter tablet placement decisions. Heat is only available for leader peers,
-  // so using it to order follower placement would be a category error; defer to count-based.
+  // Phase 4: order by placement-heat bucket first, falling through to count-based within a
+  // bucket. Placement heat sums leader-side read/write plus follower-side replicated writes
+  // (see PlacementHeat above) so this comparator is the right signal for tablet add/remove
+  // decisions — which is what CompareLoad drives via LoadComparator and SortLoad.
+  //
+  // Unlike CompareLeaderLoad we do NOT add a blacklist short-circuit here: the count-based
+  // CompareLoad has no blacklist branch either, since blacklisted tservers are filtered out
+  // of add/remove decisions by HandleAddIfMissingPlacement / HandleRemoveIfWrongPlacement
+  // before sorting runs. Adding one would diverge from count-based in cases where the heat
+  // path is supposed to be invisible.
+  //
+  // Strict weak ordering is preserved by integer bucketing: bucket IDs are totally ordered
+  // int64_t values, and the count-based comparator (used as the within-bucket tiebreaker) is
+  // already transitive. If the hysteresis flag is disabled (<= 0), fall straight through to
+  // count-based so nothing heat-aware changes — a runtime-disable escape hatch.
+  const double bucket_size = FLAGS_load_balancer_heat_placement_hysteresis_ops_per_sec;
+  if (bucket_size > 0.0) {
+    const int64_t bucket_a = PlacementHeatBucketForTs(global_state, a, bucket_size);
+    const int64_t bucket_b = PlacementHeatBucketForTs(global_state, b, bucket_size);
+    if (bucket_a != bucket_b) {
+      return bucket_a < bucket_b;
+    }
+  }
   return count_based_.CompareLoad(state, global_state, a, b, tablet_id);
 }
 
@@ -241,6 +325,65 @@ bool CountBasedLoadBalancerStrategy::CountBasedThresholdCapsBalancing(
     size_t adjusted_leader_threshold) const {
   return ShouldSkipLeaderBalancing(state, global_state, sorted_leader_load,
                                    adjusted_leader_threshold);
+}
+
+TabletMoveAssessment CountBasedLoadBalancerStrategy::AssessTabletMove(
+    const PerTableLoadState& state, const GlobalLoadState& global_state,
+    const TabletServerId& high_uuid, const TabletServerId& low_uuid,
+    bool left_equals_right, bool right_is_last_pos, bool can_balance_globally) const {
+  // Extracted verbatim from the pre-Phase-4 inline decision block in
+  // ClusterLoadBalancer::GetLoadToMove (cluster_balance.cc:1196-1238). Do not edit without
+  // re-checking that original semantics are preserved — the parity-preserving tests in
+  // load_balancer_mocked-test depend on byte-for-byte behavior.
+  TabletMoveAssessment out;
+
+  const ssize_t load_variance = static_cast<ssize_t>(state.GetLoad(high_uuid)) -
+                                static_cast<ssize_t>(state.GetLoad(low_uuid));
+  bool is_global_balancing_move = false;
+
+  // Outer "state change or end conditions" block.
+  if (left_equals_right || load_variance < state.options_->kMinLoadVarianceToBalance) {
+    if (right_is_last_pos && load_variance == 0) {
+      // Either both left and right are at the end, or there is no load variance anywhere, so
+      // no moves are possible under this sort order. Bail the entire GetLoadToMove call.
+      out.should_return_false = true;
+      return out;
+    }
+    if (load_variance > 0 && can_balance_globally) {
+      const int global_load_variance = global_state.GetGlobalLoad(high_uuid) -
+                                       global_state.GetGlobalLoad(low_uuid);
+      if (global_load_variance < state.options_->kMinLoadVarianceToBalance) {
+        // Already globally balanced. Since we are sorted ascending by global load, there are
+        // no other (low, high) pairs that could produce a global-balancing move either.
+        out.should_return_false = true;
+        return out;
+      }
+      is_global_balancing_move = true;
+    } else {
+      // Variance too low AND no global-balancing rescue. Advance the outer loop by breaking
+      // out of the inner scan.
+      out.should_break_inner_loop = true;
+      return out;
+    }
+  }
+
+  // Transient-load check. If the high tserver has over-replicated tablets about to be removed,
+  // moving more onto the low side would over-commit once removals land. Skip this pair.
+  if (!is_global_balancing_move &&
+      load_variance - static_cast<ssize_t>(state.GetPossiblyTransientLoad(high_uuid)) <
+          state.options_->kMinLoadVarianceToBalance) {
+    // Neither should_move nor break nor return — "continue to next right-index iteration".
+    return out;
+  }
+
+  out.should_move = true;
+  out.is_global_balancing_move = is_global_balancing_move;
+  out.reason = is_global_balancing_move ?
+      Format("Source tserver has more tablets (globally) than destination ($0 > $1)",
+             global_state.GetGlobalLoad(high_uuid), global_state.GetGlobalLoad(low_uuid)) :
+      Format("Source tserver has more tablets for this table than destination ($0 > $1)",
+             state.GetLoad(high_uuid), state.GetLoad(low_uuid));
+  return out;
 }
 
 const std::string& CountBasedLoadBalancerStrategy::name() const {
@@ -400,6 +543,143 @@ bool HeatAwareLoadBalancerStrategy::CountBasedThresholdCapsBalancing(
     size_t adjusted_leader_threshold) const {
   return count_based_.ShouldSkipLeaderBalancing(state, global_state, sorted_leader_load,
                                                 adjusted_leader_threshold);
+}
+
+TabletMoveAssessment HeatAwareLoadBalancerStrategy::AssessTabletMove(
+    const PerTableLoadState& state, const GlobalLoadState& global_state,
+    const TabletServerId& high_uuid, const TabletServerId& low_uuid,
+    bool left_equals_right, bool right_is_last_pos, bool can_balance_globally) const {
+  // Ask count-based first. If it wants to move (including global balancing), pass the verdict
+  // through — preserves parity with count-based when heat is cold or flat and guarantees that
+  // count-unequal tablet counts always drive the decision even under the heat-aware strategy.
+  TabletMoveAssessment count_based = count_based_.AssessTabletMove(
+      state, global_state, high_uuid, low_uuid, left_equals_right, right_is_last_pos,
+      can_balance_globally);
+  if (count_based.should_move) {
+    return count_based;
+  }
+
+  // Count-based declined. Every refusal path below returns a plain decline rather than
+  // propagating count_based's verdict, because count_based's termination flags
+  // (should_return_false / should_break_inner_loop) encode a COUNT-ascending sort invariant that
+  // heat-aware sort only satisfies WITHIN a single bucket. Across bucket boundaries the next
+  // `right` candidate may sit in a cooler bucket with a LARGER count than the current high —
+  // where a valid count-driven move exists — and inheriting count_based's break/return_false
+  // would mask it. Mirrors AssessLeaderMove's treatment; see that function for the full
+  // argument.
+  //
+  // The one termination signal we *do* re-assert here is the structural `left_equals_right`
+  // bound: the inner loop has reached its structural limit and must advance the outer loop.
+  // We set should_break_inner_loop explicitly rather than propagating count_based's version
+  // (which carries count-sort assumptions) so the intent is independent of how
+  // CountBasedLoadBalancerStrategy::AssessTabletMove encodes it.
+  if (left_equals_right) {
+    TabletMoveAssessment out;
+    out.should_break_inner_loop = true;
+    return out;
+  }
+
+  const double bucket_size = FLAGS_load_balancer_heat_placement_hysteresis_ops_per_sec;
+  if (bucket_size <= 0.0) {
+    return TabletMoveAssessment{};  // Hysteresis disabled; no heat override available.
+  }
+  const int64_t high_bucket = PlacementHeatBucketForTs(global_state, high_uuid, bucket_size);
+  const int64_t low_bucket = PlacementHeatBucketForTs(global_state, low_uuid, bucket_size);
+  if (high_bucket <= low_bucket) {
+    return TabletMoveAssessment{};  // No heat gap at this pair; continue the scan.
+  }
+
+  // Count-regression guard. Heat-aware sort orders `sorted_load_` bucket-first and count-second-
+  // within-bucket, so after the heat rank flips, `low_uuid` (the sort's "low" end) may actually
+  // have strictly MORE tablets than `high_uuid`. Issuing AddOrMoveReplica(high -> low) in that
+  // state would take a count-heavy tserver `low` and pile another replica onto it, and the
+  // subsequent over-replicated remove will drop the peer from the only peer set that still
+  // includes the original (cool) `high` — so the next run observes a cluster that is MORE
+  // count-imbalanced, not less. Mirror AssessLeaderMove's guard: refuse strict count-regressions,
+  // but keep the `low_load == high_load` case (the canonical Phase 4 scenario where counts are
+  // perfectly balanced and heat alone must drive the decision).
+  //
+  // On refusal, return a plain decline (TabletMoveAssessment{}) — NOT count_based — so the outer
+  // loop continues decrementing `right` instead of breaking. Reason: count_based's termination
+  // flags (should_break_inner_loop / should_return_false) are derived from load_variance under
+  // count-ascending sort, where decrementing right only encounters tservers with strictly smaller
+  // count. Under heat-aware sort the inner loop crosses bucket boundaries as right decrements, so
+  // the next right candidate may have a LARGER count than the current high (if it sits in a cooler
+  // bucket) and yield a valid count-driven move. Propagating count_based's break here would mask
+  // that move. Mirrors AssessLeaderMove's treatment at cluster_balance_strategy.cc:466-470.
+  const ssize_t high_load = static_cast<ssize_t>(state.GetLoad(high_uuid));
+  const ssize_t low_load = static_cast<ssize_t>(state.GetLoad(low_uuid));
+  if (low_load > high_load) {
+    return TabletMoveAssessment{};
+  }
+
+  // Global-load regression guard. Count-based's AssessTabletMove only consults global load when
+  // the PER-TABLE variance is already positive (see the `load_variance > 0 && can_balance_globally`
+  // branch in CountBasedLoadBalancerStrategy::AssessTabletMove). On a locally count-balanced table
+  // — the canonical Phase 4 scenario — that branch never fires, and count-based returns with no
+  // should_move signal. If we then issue a heat-driven high -> low move without checking global
+  // load, we can happily pile another replica onto a tserver that is already globally heavier,
+  // because heat-aware sort orders by heat bucket and ignores global placement. Guard against that:
+  // when global balancing is enabled, refuse heat-driven moves whose source is globally lighter
+  // than OR equal to the destination (GetGlobalLoad(high) <= GetGlobalLoad(low)).
+  //
+  // Equal global loads are ALSO refused: the heat move commits the add on `low` immediately but
+  // the paired remove on `high` does not land until the next run. Between add and remove the
+  // global spread is 1 (low=+1); after the remove it is 2 (low=+1, high=-1). When global
+  // balancing is enabled the next run's count-based global branch will see that 2-tablet skew
+  // and issue a compensating move — potentially moving the just-added replica right back to the
+  // source, because count-based global balancing has no heat awareness. Allowing equal-global
+  // heat moves makes the heat path fight the global-balancing policy and wastes move budget on
+  // two cancelling moves. Refuse upfront.
+  //
+  // On refusal return a plain decline (TabletMoveAssessment{}) for the same reason as the
+  // count-regression path above: the outer loop must continue the scan rather than inherit
+  // count_based's termination flags, which were derived under an assumption of count-ascending
+  // sort that heat-aware ordering does not satisfy.
+  //
+  // `can_balance_globally` is plumbed from ClusterLoadBalancer::CanBalanceGlobalLoad(), which is
+  // false when FLAGS_enable_global_load_balancing is off or when an earlier within-table move has
+  // already committed this run (consumed the global-balancing budget). In those cases operators
+  // have either disabled global balancing outright or we have no global budget left to spend — so
+  // there is no global policy for the heat path to fight, and it is correct to skip this guard
+  // and let heat alone drive the decision.
+  if (can_balance_globally) {
+    const ssize_t high_global = global_state.GetGlobalLoad(high_uuid);
+    const ssize_t low_global = global_state.GetGlobalLoad(low_uuid);
+    if (high_global <= low_global) {
+      return TabletMoveAssessment{};
+    }
+  }
+
+  // Transient-load guard. Mirror CountBasedLoadBalancerStrategy::AssessTabletMove's skip at
+  // cluster_balance_strategy.cc:370-377: when the apparent load variance is at or above the
+  // balancing threshold BUT entirely (or near-entirely) absorbed by over-replicated tablets
+  // queued for removal on the hot source, count-based deliberately declined the move because
+  // the imbalance will resolve itself once those removes land. Letting the heat override fire
+  // anyway would take the move beyond the natural post-cleanup state — the destination
+  // receives a fresh add, the transient removes drop high's count, and the result is a
+  // destination that is count-heavier than the source. Refuse instead.
+  //
+  // Deliberately gated on `load_variance >= kMinLoadVarianceToBalance` so the canonical
+  // Phase 4 scenario (counts genuinely flat, transient == 0, heat alone drives the decision)
+  // still fires. In that scenario load_variance == 0, so this branch is never entered and
+  // control falls through to the should_move assignment below.
+  const ssize_t load_variance = high_load - low_load;
+  const ssize_t transient_high =
+      static_cast<ssize_t>(state.GetPossiblyTransientLoad(high_uuid));
+  if (load_variance >= state.options_->kMinLoadVarianceToBalance &&
+      load_variance - transient_high < state.options_->kMinLoadVarianceToBalance) {
+    return TabletMoveAssessment{};
+  }
+
+  TabletMoveAssessment out;
+  out.should_move = true;
+  out.is_heat_driven = true;
+  out.is_global_balancing_move = false;
+  out.reason = Format(
+      "Placement heat imbalance: source bucket $0 exceeds destination bucket $1 "
+      "(bucket_size=$2 ops/sec)", high_bucket, low_bucket, bucket_size);
+  return out;
 }
 
 const std::string& HeatAwareLoadBalancerStrategy::name() const {

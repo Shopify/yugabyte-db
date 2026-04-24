@@ -14,6 +14,7 @@
 #include "yb/master/cluster_balance.h"
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <utility>
 
@@ -179,6 +180,28 @@ DEFINE_RUNTIME_double(load_balancer_heat_hysteresis_ops_per_sec, 50.0,
 DEFINE_RUNTIME_int32(load_balancer_heat_leader_move_cooldown_secs, 300,
     "After the heat-aware balancer moves a leader for a (tablet, from_ts, to_ts) triple, do not "
     "repeat that same move for this many seconds. Set to 0 to disable the cooldown.");
+
+DEFINE_RUNTIME_double(load_balancer_heat_replication_write_weight, 1.0,
+    "Weight applied to follower-side replicated write_ops_per_sec when the heat-aware balancer "
+    "scores tservers for tablet add/remove decisions. Every tablet peer bears the same write "
+    "rate the leader reports (Raft replication), so this knob scales how much that follower "
+    "cost should influence tablet placement. Set to 0 to treat follower write replication as "
+    "free, in which case heat-aware tablet moves collapse to the Phase 3 leader-only behavior.");
+
+DEFINE_RUNTIME_double(load_balancer_heat_placement_hysteresis_ops_per_sec, 200.0,
+    "Bucket size for placement-heat comparisons in the heat-aware tablet-move path. Defaults to "
+    "several times the leader-only hysteresis (load_balancer_heat_hysteresis_ops_per_sec) "
+    "because placement heat aggregates across every tablet a tserver follows, so absolute "
+    "numbers are typically several times larger than leader-only heat. Two tservers in the "
+    "same bucket are treated as equal on placement heat and fall through to count-based "
+    "ordering. Must be > 0 for the heat-aware strategy to issue heat-driven tablet moves.");
+
+DEFINE_RUNTIME_int32(load_balancer_heat_tablet_move_cooldown_secs, 600,
+    "After the heat-aware balancer adds-or-moves a replica for a (tablet, from_ts, to_ts) "
+    "triple on heat grounds, do not repeat that same move for this many seconds. Defaults "
+    "higher than the leader cooldown because tablet moves are more expensive (remote "
+    "bootstrap vs fast Raft stepdown). Set to 0 to disable the cooldown (and drop any "
+    "accumulated entries on the next balancer run).");
 
 METRIC_DEFINE_gauge_int64(cluster,
                           is_load_balancing_enabled,
@@ -932,10 +955,41 @@ Status ClusterLoadBalancer::AnalyzeTablets(const TableInfoPtr& table) {
 
   for (const auto& tablet : tablets) {
     const auto& tablet_id = tablet->id();
+    // Snapshot the catalog's current replica map for this tablet once per iteration. Used below
+    // to detect whether a pending task's replica-set change has already been reflected in the
+    // catalog. If it has, AggregateLeaderHeatIntoGlobalState has already credited/debited
+    // tablet_heat_by_ts_ for the new replica configuration, and projecting the pending task on
+    // top would double-apply the delta — leaving the aggregate roughly one tablet's write-heat
+    // too hot on a pending-add destination or too cold on a pending-remove source for the rest
+    // of the run. The projection should only fire when it is restoring state_ / the aggregate
+    // to the future catalog view that the pending task is ABOUT to produce, not echoing state
+    // that has already materialized. Cheap — GetReplicaLocations() returns a shared_ptr to the
+    // tablet's cached replica map and does not block on the catalog.
+    auto current_replicas = tablet->GetReplicaLocations();
+
     if (state_->pending_remove_replica_tasks_[table->id()].count(tablet_id) > 0) {
       const auto& from_ts = state_->pending_remove_replica_tasks_[table->id()][tablet_id];
       VLOG(3) << Format("Adding pending remove replica task for tablet $0 from TS $1", tablet_id,
           from_ts);
+      // Phase 4: keep tablet_heat_by_ts_ in sync with per_ts_meta_ across pending replays.
+      // AggregateLeaderHeatIntoGlobalState populated the aggregate from tablet_map_ at the start
+      // of the run, i.e. from the catalog's current replica config — which for an in-flight
+      // remove still credits the source tserver with this tablet's replicated-write heat.
+      // Without this projection, CompareLoad would continue to sort `from_ts` as if it still
+      // bore that load, potentially re-picking it as a heat-driven source in the very scenarios
+      // (slow remote bootstrap, queued remove) Phase 4 is meant to handle.
+      //
+      // Guard: if the catalog's current_replicas no longer includes from_ts, the async remove
+      // already landed and AggregateLeaderHeatIntoGlobalState has already debited this tablet's
+      // contribution from tablet_heat_by_ts_[from_ts]. Projecting again would subtract the same
+      // delta a second time and under-count from_ts for the rest of the run. (nullptr replicas
+      // means the catalog has no view of this tablet's peers — treat as "no information",
+      // conservative: skip the projection.)
+      const bool catalog_reflects_remove =
+          current_replicas == nullptr || current_replicas->count(from_ts) == 0;
+      if (!catalog_reflects_remove) {
+        ProjectReplicaRemoveIntoGlobalState(tablet_id, from_ts);
+      }
       RETURN_NOT_OK(state_->RemoveReplica(tablet_id, from_ts));
     }
     if (state_->pending_stepdown_leader_tasks_[table->id()].count(tablet_id) > 0) {
@@ -959,6 +1013,23 @@ Status ClusterLoadBalancer::AnalyzeTablets(const TableInfoPtr& table) {
       const auto& to_ts = state_->pending_add_replica_tasks_[table->id()][tablet_id];
       VLOG(3) << Format("Adding pending add replica task for tablet $0 to TS $1", tablet_id,
           to_ts);
+      // Phase 4 counterpart of the remove projection above: the pending add is not yet reflected
+      // in tablet_map_, so tablet_heat_by_ts_[to_ts] is under-credited. Project now so CompareLoad
+      // sees `to_ts` at its true placement-heat rank for the rest of this run — otherwise a
+      // brand-new heat-driven source → to_ts decision can fire on a tserver that is already being
+      // loaded up with this very tablet.
+      //
+      // Guard: if the catalog's current_replicas already includes to_ts, the async add already
+      // landed and AggregateLeaderHeatIntoGlobalState has already credited this tablet's
+      // contribution to tablet_heat_by_ts_[to_ts]. Projecting again would add the same delta a
+      // second time and over-count to_ts for the rest of the run — so CompareLoad would sort
+      // to_ts as hotter than reality and could steer a later heat-driven move AWAY from it,
+      // exactly inverting the feedback intent of this projection.
+      const bool catalog_reflects_add =
+          current_replicas != nullptr && current_replicas->count(to_ts) > 0;
+      if (!catalog_reflects_add) {
+        ProjectReplicaAddIntoGlobalState(tablet_id, to_ts);
+      }
       RETURN_NOT_OK(state_->AddReplica(tablet->id(), to_ts));
     }
   }
@@ -1167,73 +1238,52 @@ Result<bool> ClusterLoadBalancer::GetLoadToMove(
   // and are already breaking the invariance rule, as that means that any further differences in
   // the interval between left and right cannot have load > kMinLoadVarianceToBalance.
   ssize_t last_pos = state_->sorted_load_.size() - 1;
+  const bool can_balance_globally = CanBalanceGlobalLoad();
   for (ssize_t left = 0; left <= last_pos; ++left) {
     for (auto right = last_pos; right >= 0; --right) {
       const TabletServerId& low_load_uuid = state_->sorted_load_[left];
       const TabletServerId& high_load_uuid = state_->sorted_load_[right];
-      ssize_t load_variance = state_->GetLoad(high_load_uuid) - state_->GetLoad(low_load_uuid);
-      bool is_global_balancing_move = false;
 
-      // Check for state change or end conditions.
-      if (left == right || load_variance < state_->options_->kMinLoadVarianceToBalance) {
-        if (right == last_pos && load_variance == 0) {
-          // Either both left and right are at the end, or there is no load_variance, which means
-          // there will be no load_variance for any TSs between left and right, so we can return.
-          return false;
-        }
-        // If there is load variance, then there is a chance we can benefit from globally balancing.
-        if (load_variance > 0 && CanBalanceGlobalLoad()) {
-          int global_load_variance = global_state_->GetGlobalLoad(high_load_uuid) -
-                                     global_state_->GetGlobalLoad(low_load_uuid);
-          if (global_load_variance < state_->options_->kMinLoadVarianceToBalance) {
-            // Already globally balanced. Since we are sorted by global load, we can return here as
-            // there are no other moves for us to make.
-            return false;
-          }
-          VLOG(3) << "Global data load balancing is in effect now";
-          // Mark this move as a global balancing move and try to find a tablet to move.
-          is_global_balancing_move = true;
-        } else {
-          // The load_variance is too low, which means we weren't able to find a load to move to
-          // the left tserver. Continue and try with the next left tserver.
-          break;
-        }
+      // Delegate the "is this pair eligible for a move, and on what grounds?" decision to the
+      // active strategy. Count-based preserves the pre-Phase-4 inline semantics verbatim;
+      // heat-aware additionally returns should_move=true on heat grounds when count-based
+      // would have declined with a `continue`. See AssessTabletMove implementations in
+      // cluster_balance_strategy.cc for the control-flow map.
+      const auto assessment = strategy_->AssessTabletMove(
+          *state_, *global_state_, high_load_uuid, low_load_uuid,
+          left == right, right == last_pos, can_balance_globally);
+      if (assessment.should_return_false) {
+        return false;
       }
-
-      // There may be lots of over-replicated tablets on the high load tserver that are about to be
-      // removed. If removing those tablets would drop the load variance below the minimum, skip
-      // this pair of tservers to avoid adding extra replicas.
-      // For example, consider the case where tserver A has 100 tablets and tserver B is added to
-      // the same zone. We want to move 50 tablets, but without this check (and with unlimited adds
-      // or laggy removes), we would move 99 tablets to TS B and then remove evenly from both.
-      if (!is_global_balancing_move &&
-          load_variance - state_->GetPossiblyTransientLoad(high_load_uuid) <
-              state_->options_->kMinLoadVarianceToBalance) {
+      if (assessment.should_break_inner_loop) {
+        break;
+      }
+      if (!assessment.should_move) {
+        // Count-based transient-load skip or heat-aware "no bucket gap": continue the scan.
         VLOG(3) << Format(
-            "Skipping tserver pair $0 and $1 because load variance including "
-            "over-replicated tablets would be too low.", high_load_uuid, low_load_uuid);
+            "Skipping tserver pair $0 and $1 because neither count-based nor heat criteria "
+            "select it for this iteration.", high_load_uuid, low_load_uuid);
         continue;
       }
 
+      if (assessment.is_global_balancing_move) {
+        VLOG(3) << "Global data load balancing is in effect now";
+      }
+
       // If we don't find a tablet_id to move between these two TSs, advance the state.
-      auto tablet_to_move = VERIFY_RESULT(GetTabletToMove(high_load_uuid, low_load_uuid));
+      auto tablet_to_move = VERIFY_RESULT(
+          GetTabletToMove(high_load_uuid, low_load_uuid, assessment.is_heat_driven));
       if (tablet_to_move) {
-        // If we got this far, we have the candidate we want, so fill in the output params and
-        // return. The tablet_id is filled in from GetTabletToMove.
         *from_ts = high_load_uuid;
         *to_ts = low_load_uuid;
         *moving_tablet_id = *tablet_to_move;
         VLOG(3) << "Found tablet " << *moving_tablet_id << " to move from "
                 << *from_ts << " to ts " << *to_ts;
-        auto reason = is_global_balancing_move ?
-            Format("Source tserver has more tablets (globally) than destination ($0 > $1)",
-                   global_state_->GetGlobalLoad(high_load_uuid),
-                   global_state_->GetGlobalLoad(low_load_uuid)) :
-            Format("Source tserver has more tablets for this table than destination ($0 > $1)",
-                   state_->GetLoad(high_load_uuid), state_->GetLoad(low_load_uuid));
-        RETURN_NOT_OK(AddOrMoveReplica(*moving_tablet_id, high_load_uuid, low_load_uuid, reason));
-        // Update global state if necessary.
-        if (!is_global_balancing_move) {
+        RETURN_NOT_OK(AddOrMoveReplica(*moving_tablet_id, high_load_uuid, low_load_uuid,
+                                       assessment.reason, assessment.is_heat_driven));
+        // Update global state if necessary — preserves the pre-Phase-4 rule that issuing a
+        // within-table move disqualifies further global-balancing work in the same run.
+        if (!assessment.is_global_balancing_move) {
           can_perform_global_operations_ = false;
         }
         return true;
@@ -1241,12 +1291,20 @@ Result<bool> ClusterLoadBalancer::GetLoadToMove(
     }
   }
 
-  // Should never get here.
-  return STATUS(IllegalState, "Cluster balancing algorithm reached illegal state.");
+  // Falling through the outer loop means the scan examined every (left, right) pair and found no
+  // tablet move worth taking. Under count-based sort the inner-loop break / should_return_false
+  // paths terminated the scan early and this point was unreachable (hence the legacy FATAL_ERROR).
+  // Under heat-aware sort, HeatAwareLoadBalancerStrategy::AssessTabletMove deliberately refuses to
+  // propagate count-based's termination flags across bucket boundaries (those flags encode count-
+  // sort invariants that heat-aware ordering violates), and the bundled Phase 4.5 fix extended
+  // that refusal to every non-structural path. So the outer loop can legitimately exhaust — treat
+  // that as "no move selected". Mirrors the GetLeaderToMove fallthrough at cluster_balance.cc:
+  // 1727-1735.
+  return false;
 }
 
 Result<std::optional<TabletId>> ClusterLoadBalancer::GetTabletToMove(
-    const TabletServerId& from_ts, const TabletServerId& to_ts) {
+    const TabletServerId& from_ts, const TabletServerId& to_ts, bool is_heat_driven) {
   const auto& from_ts_meta = state_->per_ts_meta_[from_ts];
   // If drive aware, all_tablets is sorted by decreasing drive load.
   auto all_tablets_by_drive = GetTServerTabletsByDrive(global_state_->drive_aware_, from_ts_meta);
@@ -1266,11 +1324,147 @@ Result<std::optional<TabletId>> ClusterLoadBalancer::GetTabletToMove(
       if (ContainsKey(from_ts_meta.disabled_by_ts_tablets, tablet_id)) {
         continue;
       }
+      // Heat-aware tablet-move cooldown: skip candidates whose (tablet, from_ts, to_ts) triple
+      // is still in the cooldown window. The cooldown is populated only by heat-driven moves
+      // (see AddOrMoveReplica), and we only honor it when this selection was itself heat-driven.
+      // A count-driven move is a separate policy — it ranks by drive/placement/cloud-info and
+      // has its own legitimacy, so debouncing it on the back of a prior heat decision would
+      // suppress valid count rebalances (e.g., the tablet lands back on from_ts via other
+      // means before the 10-minute window expires). Scoping by (from, to) is deliberate:
+      // moving the same tablet to a different destination or back to a different source
+      // remains legal even within the heat-driven path.
+      if (is_heat_driven && IsInHeatAwareTabletMoveCooldown(tablet_id, from_ts, to_ts)) {
+        VLOG(3) << Format(
+            "Skipping tablet $0 ($1 -> $2) because a heat-driven move for this triple is in "
+            "cooldown", tablet_id, from_ts, to_ts);
+        continue;
+      }
 
       if (VERIFY_RESULT(state_->CanAddTabletToTabletServer(tablet_id, to_ts))) {
         filtered_drive_tablets.insert(tablet_id);
       }
     }
+  }
+
+  // Heat-aware tablet selection. AssessTabletMove fired should_move on heat grounds (a
+  // PlacementHeat bucket gap between from_ts and to_ts), but we still need to pick a tablet
+  // whose replicated-write heat W = heat_by_tablet_[t].write_ops_per_sec actually shifts the
+  // tablet_heat_by_ts_ aggregates toward each other without flipping the gap. Moving one
+  // replica transfers W off from_ts and onto to_ts, so the new gap is (gap - 2W); W > gap/2
+  // would flip the imbalance and invite a hot-potato oscillation the next run. See Phase 4.5
+  // design in /Users/craig/.claude/plans/curious-floating-planet.md for the full argument.
+  //
+  // Refuse (return nullopt) on any of three heat-degenerate inputs: (a) tablet-side gap is
+  // non-positive (source hot only via leader reads — tablet moves don't redistribute reads);
+  // (b) no candidate has W > 0 (telemetry absent or the pair qualified purely on leader-read
+  // heat); (c) every candidate exceeds W ≤ gap/2 (strict overshoot guard). Refusal lets the
+  // outer GetLoadToMove loop try other pairs rather than consuming the move + cooldown budget
+  // on a heat-neutral placement swap.
+  if (is_heat_driven) {
+    const auto& tablet_heat_by_ts = global_state_->tablet_heat_by_ts_;
+    double H_high = 0.0;
+    double H_low = 0.0;
+    if (auto it = tablet_heat_by_ts.find(from_ts); it != tablet_heat_by_ts.end()) {
+      H_high = it->second;
+    }
+    if (auto it = tablet_heat_by_ts.find(to_ts); it != tablet_heat_by_ts.end()) {
+      H_low = it->second;
+    }
+    const double gap = H_high - H_low;
+    if (gap <= 0.0) {
+      VLOG(3) << Format(
+          "Heat-driven move refused: tablet_heat_by_ts_ gap is non-positive for $0 -> $1 "
+          "(H_high=$2, H_low=$3). PlacementHeat gap likely driven by leader reads; tablet "
+          "moves cannot redistribute reads.", from_ts, to_ts, H_high, H_low);
+      return std::nullopt;
+    }
+    const double target = gap / 2.0;
+
+    // Per-pair placement check. CanAddTabletToTabletServer already filters tablets whose
+    // destination is not in a valid placement block; the remaining check mirrors the count-
+    // driven path's per-tablet `same_placement` guard, but the inputs are purely per-ts so
+    // we hoist it. If placement constraints exist and the pair spans blocks, no tablet can
+    // move between them.
+    if (!state_->placement_.placement_blocks().empty()) {
+      auto from_ts_block = state_->GetValidPlacement(from_ts);
+      auto to_ts_block = state_->GetValidPlacement(to_ts);
+      bool same_placement = false;
+      if (to_ts_block.has_value() && from_ts_block.has_value()) {
+        same_placement = TSDescriptor::generate_placement_id(*from_ts_block) ==
+                         TSDescriptor::generate_placement_id(*to_ts_block);
+      }
+      if (!same_placement) {
+        VLOG(3) << Format(
+            "Heat-driven move refused: from_ts $0 and to_ts $1 are in different placement "
+            "blocks.", from_ts, to_ts);
+        return std::nullopt;
+      }
+    }
+
+    const auto& heat_by_tablet = global_state_->heat_by_tablet_;
+    const auto to_ts_ci = state_->per_ts_meta_[to_ts].descriptor->GetCloudInfo();
+
+    std::optional<TabletId> best;
+    double best_W = 0.0;
+    CatalogManagerUtil::CloudInfoSimilarity best_ci = CatalogManagerUtil::NO_MATCH;
+    size_t best_drive_idx = std::numeric_limits<size_t>::max();
+
+    for (size_t drive_idx = 0; drive_idx < all_filtered_tablets_by_drive.size(); ++drive_idx) {
+      const auto& tablets = all_filtered_tablets_by_drive[drive_idx].second;
+      for (const TabletId& tablet_id : tablets) {
+        auto heat_it = heat_by_tablet.find(tablet_id);
+        const double W = (heat_it == heat_by_tablet.end())
+            ? 0.0 : heat_it->second.write_ops_per_sec;
+        if (W <= 0.0) {
+          // Zero-heat tablet cannot reduce the replicated-write gap. Refuse rather than fall
+          // through to cloud-info — that would reintroduce heat-neutral churn and cost a
+          // cooldown slot for a placement that buys no heat progress.
+          continue;
+        }
+        if (W > target) {
+          // Strict overshoot guard: moving this tablet would flip the gap (gap_new < 0).
+          continue;
+        }
+        TabletServerId leader_ts = state_->per_tablet_meta_[tablet_id].leader_uuid;
+        CatalogManagerUtil::CloudInfoSimilarity ci = CatalogManagerUtil::NO_MATCH;
+        if (!leader_ts.empty() && !FLAGS_load_balancer_ignore_cloud_info_similarity) {
+          const auto leader_ci = state_->per_ts_meta_[leader_ts].descriptor->GetCloudInfo();
+          ci = CatalogManagerUtil::ComputeCloudInfoSimilarity(leader_ci, to_ts_ci);
+        }
+        // Rank: primary W (higher=better), secondary cloud-info similarity (higher=better),
+        // tertiary drive index (lower=better; drives are sorted by decreasing load when drive-
+        // aware). Drive-load is a deterministic tiebreaker only — heat-driven moves balance
+        // across tservers, not drives within a tserver, so scan every drive.
+        bool replace;
+        if (!best) {
+          replace = true;
+        } else if (W != best_W) {
+          replace = W > best_W;
+        } else if (ci != best_ci) {
+          replace = static_cast<int>(ci) > static_cast<int>(best_ci);
+        } else {
+          replace = drive_idx < best_drive_idx;
+        }
+        if (replace) {
+          best = tablet_id;
+          best_W = W;
+          best_ci = ci;
+          best_drive_idx = drive_idx;
+        }
+      }
+    }
+
+    if (!best) {
+      VLOG(3) << Format(
+          "Heat-driven move refused: no tablet on $0 has W in (0, $1] for move to $2 "
+          "(gap=$3). Every candidate is either zero-heat or exceeds the no-flip ceiling; "
+          "the outer loop will try other pairs.", from_ts, target, to_ts, gap);
+    } else {
+      VLOG(3) << Format(
+          "Heat-driven selection picked tablet $0 for move $1 -> $2 (W=$3, gap=$4, "
+          "target=$5).", *best, from_ts, to_ts, best_W, gap, target);
+    }
+    return best;
   }
 
   // Below, we choose a tablet to move. We first filter out any tablets which cannot be moved
@@ -1586,9 +1780,41 @@ Result<bool> ClusterLoadBalancer::HandleRemoveReplicas(
       return STATUS_FORMAT(IllegalState, "No tservers to remove from over-replicated "
                            "tablet $0", tablet_id);
     }
-    // Sort in reverse to first try to remove a replica from the highest loaded TS.
-    sort(sorted_ts.rbegin(), sorted_ts.rend(), comparator);
-    std::string remove_candidate = sorted_ts[0];
+
+    // Heat-move-aware removal hint. If the over-replication was produced by a heat-driven add in
+    // an earlier run, heat_aware_recent_tablet_moves_ records (tablet, from_ts, to_ts). Under
+    // heat-aware sort, the paired remove can accidentally land on to_ts — the just-added peer
+    // picked up +1 count, the heat aggregate on to_ts is incremented by the hot tablet's W
+    // (AggregateLeaderHeatIntoGlobalState re-sources from the catalog each run), and if the
+    // bucket gap has closed enough for both source and destination to land in the same bucket,
+    // the within-bucket count-ascending tiebreaker reverse-sorts to_ts to sorted_ts[0]. Removing
+    // to_ts would undo the heat move. Preempt with from_ts — the peer we intended to drain —
+    // whenever both endpoints are still in the over-replicated peer set.
+    //
+    // Only heat-driven adds populate heat_aware_recent_tablet_moves_; count-based moves,
+    // placement-repair paths, and the count-based strategy all leave the map empty, so under
+    // those paths this scan is a no-op and the legacy reverse-sort below runs unchanged.
+    std::string heat_driven_source;
+    for (const auto& entry : heat_aware_recent_tablet_moves_) {
+      if (entry.first.tablet_id != tablet_id) continue;
+      const bool from_still_peer =
+          std::find(sorted_ts.begin(), sorted_ts.end(), entry.first.from_ts) != sorted_ts.end();
+      const bool to_still_peer =
+          std::find(sorted_ts.begin(), sorted_ts.end(), entry.first.to_ts) != sorted_ts.end();
+      if (from_still_peer && to_still_peer) {
+        heat_driven_source = entry.first.from_ts;
+        break;
+      }
+    }
+
+    std::string remove_candidate;
+    if (!heat_driven_source.empty()) {
+      remove_candidate = std::move(heat_driven_source);
+    } else {
+      // Sort in reverse to first try to remove a replica from the highest loaded TS.
+      sort(sorted_ts.rbegin(), sorted_ts.rend(), comparator);
+      remove_candidate = sorted_ts[0];
+    }
     *out_tablet_id = tablet_id;
     *out_from_ts = remove_candidate;
     // Do force leader stepdown, as we are either not the leader or we are allowed to step down.
@@ -1745,7 +1971,7 @@ Result<bool> ClusterLoadBalancer::HandleLeaderMoves(
 
 Status ClusterLoadBalancer::AddOrMoveReplica(
     const TabletId& tablet_id, const std::string& from_ts, const TabletServerId& to_ts,
-    const std::string& reason) {
+    const std::string& reason, bool is_heat_driven_tablet_move) {
   // from_ts is only used for logging, because the remove replica happens in a later cluster
   // balancer iteration (once the tablet is already over-replicated).
   if (from_ts.empty()) {
@@ -1761,7 +1987,38 @@ Status ClusterLoadBalancer::AddOrMoveReplica(
         tablet_id, from_ts, to_ts);
   }
   RETURN_NOT_OK(SendAddReplica(tablet_opt->get(), to_ts, reason));
-  return state_->AddReplica(tablet_id, to_ts);
+  RETURN_NOT_OK(state_->AddReplica(tablet_id, to_ts));
+  // Project the new replica's write contribution into tablet_heat_by_ts_ on every successful
+  // add — including count-based moves — so later in-run iterations see the post-add heat
+  // distribution. The projection is strategy-agnostic: a count-based add that happens to land
+  // on a cool destination still shifts placement heat towards that destination, and the next
+  // heat-aware decision in this run should see it.
+  ProjectReplicaAddIntoGlobalState(tablet_id, to_ts);
+  if (is_heat_driven_tablet_move && !from_ts.empty()) {
+    // Phase 4.5 reviewer P1: project the paired remove on from_ts immediately, mirroring the
+    // ProjectReplicaAddIntoGlobalState credit on to_ts just above. Without this, mid-run
+    // heat-driven selections on the same (from_ts, to_ts) pair see only the +W to_ts credit
+    // and miss the matching -W from_ts debit — the async remove task lands in the NEXT run's
+    // HandleRemoveReplicas phase, not this one. GetTabletToMove's gap = tablet_heat_by_ts_
+    // [from_ts] - tablet_heat_by_ts_[to_ts] would then shrink by only W per successful add,
+    // so its `W <= gap/2` ceiling underestimates cumulative shift. Two adds with W = gap/2
+    // each would pass the ceiling individually, and once both paired removes land the pair's
+    // replicated-write gap flips sign — the hot-potato oscillation the ceiling was designed
+    // to prevent. Projecting -W here makes gap_seen shrink by 2W per add, which is the correct
+    // post-all-removes delta. The projection is ephemeral: AggregateLeaderHeatIntoGlobalState
+    // rebuilds tablet_heat_by_ts_ from the catalog at the start of the next run, so a wrong
+    // guess (HandleRemoveReplicas eventually removing from a different peer than from_ts)
+    // self-corrects rather than persisting.
+    //
+    // Only record in the cooldown map when the heat-aware strategy actively chose this move on
+    // heat grounds AND it is a move (not a bare add — adds have no from_ts to key against). A
+    // pure add with an empty from_ts is not a "move" in the cooldown sense and would produce a
+    // degenerate key of (tablet, "", to_ts) that cannot be distinguished from future empty-
+    // from_ts adds for the same tablet.
+    ProjectReplicaRemoveIntoGlobalState(tablet_id, from_ts);
+    RecordHeatAwareTabletMove(tablet_id, from_ts, to_ts);
+  }
+  return Status::OK();
 }
 
 Status ClusterLoadBalancer::RemoveReplica(
@@ -1791,7 +2048,12 @@ Status ClusterLoadBalancer::RemoveReplica(
   } else {
     RETURN_NOT_OK(SendRemoveReplica(tablet_opt->get(), ts_uuid, reason));
   }
-  return state_->RemoveReplica(tablet_id, ts_uuid);
+  RETURN_NOT_OK(state_->RemoveReplica(tablet_id, ts_uuid));
+  // Project the removed replica out of tablet_heat_by_ts_ so later in-run iterations see a
+  // correct placement-heat view. Strategy-agnostic, same reasoning as the symmetric add
+  // projection in AddOrMoveReplica.
+  ProjectReplicaRemoveIntoGlobalState(tablet_id, ts_uuid);
+  return Status::OK();
 }
 
 TabletServerId ClusterLoadBalancer::SelectBestLeaderAfterStepdown(
@@ -1946,6 +2208,47 @@ void ClusterLoadBalancer::ProjectLeaderHeatMoveIntoGlobalState(
   record.leader_uuid = to_ts;
 }
 
+void ClusterLoadBalancer::ProjectReplicaAddIntoGlobalState(
+    const TabletId& tablet_id, const TabletServerId& ts) {
+  if (ts.empty()) {
+    return;
+  }
+  auto& heat_by_tablet = global_state_->heat_by_tablet_;
+  const auto tablet_it = heat_by_tablet.find(tablet_id);
+  if (tablet_it == heat_by_tablet.end()) {
+    // No fresh telemetry for this tablet; nothing to credit. Common when heat aggregation is
+    // off, or when a recently-created tablet has not yet reported.
+    return;
+  }
+  global_state_->tablet_heat_by_ts_[ts] += tablet_it->second.write_ops_per_sec;
+}
+
+void ClusterLoadBalancer::ProjectReplicaRemoveIntoGlobalState(
+    const TabletId& tablet_id, const TabletServerId& ts) {
+  if (ts.empty()) {
+    return;
+  }
+  auto& heat_by_tablet = global_state_->heat_by_tablet_;
+  const auto tablet_it = heat_by_tablet.find(tablet_id);
+  if (tablet_it == heat_by_tablet.end()) {
+    return;
+  }
+  auto& aggregate = global_state_->tablet_heat_by_ts_;
+  const auto ts_it = aggregate.find(ts);
+  if (ts_it == aggregate.end()) {
+    return;
+  }
+  ts_it->second -= tablet_it->second.write_ops_per_sec;
+  // Floating-point drift: clamp to 0 so PlacementHeatBucket() never returns a negative bucket
+  // index, which would violate strict weak ordering in the comparator and flip pair orderings
+  // unpredictably. Not clearing the entry entirely — a future add for this tablet may credit
+  // back into it, and a nonzero-but-tiny value is fine (both the numerator and bucket_size are
+  // positive doubles).
+  if (ts_it->second < 0.0) {
+    ts_it->second = 0.0;
+  }
+}
+
 bool ClusterLoadBalancer::IsInHeatAwareCooldown(
     const TabletId& tablet_id, const TabletServerId& from_ts,
     const TabletServerId& to_ts) {
@@ -2026,6 +2329,102 @@ void ClusterLoadBalancer::EvictExpiredHeatCooldowns() {
   }
 }
 
+bool ClusterLoadBalancer::IsInHeatAwareTabletMoveCooldown(
+    const TabletId& tablet_id, const TabletServerId& from_ts, const TabletServerId& to_ts) {
+  const int32_t cooldown_secs = FLAGS_load_balancer_heat_tablet_move_cooldown_secs;
+  if (cooldown_secs <= 0) {
+    return false;
+  }
+  const auto it = heat_aware_recent_tablet_moves_.find({tablet_id, from_ts, to_ts});
+  if (it == heat_aware_recent_tablet_moves_.end()) {
+    return false;
+  }
+  if (MonoTime::Now().GetDeltaSince(it->second) > MonoDelta::FromSeconds(cooldown_secs)) {
+    // Stale by age — evict so repeat lookups within this run are constant-time and the map
+    // stays bounded even between EvictExpiredTabletMoveCooldowns sweeps.
+    heat_aware_recent_tablet_moves_.erase(it);
+    return false;
+  }
+  // Stranded-add eviction: SendAddReplica is asynchronous (remote bootstrap + consensus config
+  // change on to_ts). If that work never completes — bootstrap failure, transient network, etc.
+  // — the replica never lands on to_ts, but the cooldown would otherwise keep blocking the same
+  // heat-driven retry for up to load_balancer_heat_tablet_move_cooldown_secs (default 600s),
+  // stranding a failed heat move well beyond the existing task retry cadence.
+  //
+  // Only evict on POSITIVE evidence that the add did not take effect: per_run_state_->tablet_map_
+  // resolves the tablet AND its replica map lacks to_ts, AND state_->per_ts_meta_ (if available)
+  // does not confirm to_ts just gained the replica via our own in-run AddReplica projection. If
+  // either source says to_ts hosts the replica, or if neither has authoritative data, leave the
+  // cooldown live — mirrors Phase 3's stranded-leader eviction guard, which similarly only evicts
+  // when per_tablet_meta_ positively confirms the stranded condition.
+  //
+  // The state_ half of the check is what keeps the cooldown live for the entry we just recorded
+  // in this same run: after AddOrMoveReplica, state_ reflects the replica on to_ts, but
+  // tablet_map_ (catalog view) will not catch up until to_ts heartbeats the replica back in.
+  // Without the state_ check, the newly-recorded cooldown would evict itself on the very next
+  // lookup within the same run.
+  //
+  // Trade-off: if bootstrap is simply slow (large tablet, RBS throttled) and still in progress,
+  // and state_ has been reset for the next run before tablet_map_ catches up, we will also evict
+  // and redispatch — matches Phase 3's "prefer an extra move over a multi-minute stall" policy.
+  // The redispatched SendAddReplica is deduplicated by pending-task tracking or starts a fresh
+  // attempt, so the cost of an over-eager evict is bounded.
+  if (per_run_state_ == nullptr) {
+    // No cluster-wide view available (e.g. outside a balancer run / test harness driving the
+    // map directly). Without it we cannot distinguish stranded from in-flight, so leave the
+    // cooldown live.
+    return true;
+  }
+  const auto tablet_it = per_run_state_->tablet_map_.find(tablet_id);
+  if (tablet_it == per_run_state_->tablet_map_.end()) {
+    // Tablet unknown to the catalog — could be a deleted tablet or (in tests) a synthetic id.
+    // Lack the authority to call it stranded.
+    return true;
+  }
+  auto replica_locations = tablet_it->second->GetReplicaLocations();
+  if (replica_locations == nullptr) {
+    return true;  // Replica map read failed; keep cooldown.
+  }
+  if (replica_locations->count(to_ts) > 0) {
+    return true;  // Catalog confirms to_ts hosts the replica — happy-path.
+  }
+  if (state_ != nullptr) {
+    const auto ts_meta_it = state_->per_ts_meta_.find(to_ts);
+    if (ts_meta_it != state_->per_ts_meta_.end() &&
+        ts_meta_it->second.running_tablets.count(tablet_id) > 0) {
+      return true;  // In-run state_ confirms the just-recorded add — do not evict ourselves.
+    }
+  }
+  // Positive evidence: tablet exists in catalog, to_ts is NOT in its replica map, and no in-run
+  // AddReplica projection says otherwise. The add did not take effect — evict so a retry can
+  // fire.
+  heat_aware_recent_tablet_moves_.erase(it);
+  return false;
+}
+
+void ClusterLoadBalancer::RecordHeatAwareTabletMove(
+    const TabletId& tablet_id, const TabletServerId& from_ts, const TabletServerId& to_ts) {
+  heat_aware_recent_tablet_moves_[{tablet_id, from_ts, to_ts}] = MonoTime::Now();
+}
+
+void ClusterLoadBalancer::EvictExpiredTabletMoveCooldowns() {
+  const int32_t cooldown_secs = FLAGS_load_balancer_heat_tablet_move_cooldown_secs;
+  if (cooldown_secs <= 0) {
+    heat_aware_recent_tablet_moves_.clear();
+    return;
+  }
+  const MonoDelta max_age = MonoDelta::FromSeconds(cooldown_secs);
+  const MonoTime now = MonoTime::Now();
+  for (auto it = heat_aware_recent_tablet_moves_.begin();
+       it != heat_aware_recent_tablet_moves_.end();) {
+    if (now.GetDeltaSince(it->second) > max_age) {
+      it = heat_aware_recent_tablet_moves_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 void ClusterLoadBalancer::GetAllAffinitizedZones(
     const ReplicationInfoPB& replication_info,
     std::vector<AffinitizedZonesSet>* affinitized_zones) const {
@@ -2082,13 +2481,14 @@ void ClusterLoadBalancer::SetBlacklistAndPendingDeleteTS() {
 
 void ClusterLoadBalancer::AggregateLeaderHeatIntoGlobalState() {
   // Evict stale cooldown entries at the start of every run, regardless of whether heat telemetry
-  // is on. heat_aware_recent_leader_moves_ survives ResetGlobalState, so if an operator disables
+  // is on. Both cooldown maps survive ResetGlobalState, so if an operator disables
   // enable_load_balancer_heat_telemetry while entries are live, gating this sweep behind the
   // flag would pin them in the map indefinitely — breaking the bounded-size guarantee on the
-  // cooldown map and silently extending the effective cooldown window if the flag is later
-  // re-enabled. The sweep itself is O(N) over a map bounded by the cooldown window and is
+  // cooldown maps and silently extending the effective cooldown window if the flag is later
+  // re-enabled. The sweeps are O(N) over maps bounded by the cooldown window and are
   // independent of the heat cache.
   EvictExpiredHeatCooldowns();
+  EvictExpiredTabletMoveCooldowns();
 
   if (!FLAGS_enable_load_balancer_heat_telemetry) {
     return;
@@ -2109,10 +2509,48 @@ void ClusterLoadBalancer::AggregateLeaderHeatIntoGlobalState() {
     agg.sum_write_ops_per_sec += record.write_ops_per_sec;
     agg.leader_tablet_count++;
   }
+  // Phase 4: after per-leader aggregation, build the per-tserver placement-heat aggregate by
+  // fanning each tablet's leader-reported write_ops_per_sec across every tserver that currently
+  // runs a replica of that tablet. Under Raft replication every peer processes every write, so
+  // this is the correct signal for tablet placement (CompareLoad) decisions.
+  //
+  // The replica set is sourced from per_run_state_->tablet_map_ (the catalog manager's
+  // TabletInfoMap), which is populated before this helper runs — unlike state_->per_ts_meta_,
+  // which is per-table and is not set up until later in RunClusterBalancerWithOptions when
+  // AnalyzeTablets runs. Using tablet_map_ also means we see replicas across all tables in one
+  // pass and do not need to wait until every table's state has been built.
+  auto& tablet_heat_by_ts = global_state_->tablet_heat_by_ts_;
+  if (per_run_state_ != nullptr) {
+    for (const auto& [tablet_id, record] : fresh) {
+      if (record.write_ops_per_sec == 0.0) {
+        // Read-only or idle tablet: no follower cost to attribute. Saves a pass over the replica
+        // map for every tablet that reports only reads (or has not yet seen a write since the
+        // last interval). Reads remain captured in heat_by_ts_ via the loop above.
+        continue;
+      }
+      auto tablet_it = per_run_state_->tablet_map_.find(tablet_id);
+      if (tablet_it == per_run_state_->tablet_map_.end()) {
+        continue;
+      }
+      auto replica_locations = tablet_it->second->GetReplicaLocations();
+      if (replica_locations == nullptr) {
+        continue;
+      }
+      for (const auto& [ts_uuid, replica] : *replica_locations) {
+        // Every consensus peer — voter or learner — processes replicated writes, so attribute
+        // the tablet's write heat to all of them. Stale replicas still count: the master's
+        // view of the consensus config is the authoritative set of tservers that will be asked
+        // to accept writes for this tablet.
+        tablet_heat_by_ts[ts_uuid] += record.write_ops_per_sec;
+      }
+    }
+  }
   // Retain the fresh snapshot so MoveLeader can adjust heat_by_ts_ incrementally after each
-  // successful leader move within this run. We move rather than copy because `fresh` is otherwise
-  // discarded at the end of this function. Empty-leader_uuid entries are kept in the map (they
-  // simply will not match any from_ts during mid-run lookups).
+  // successful leader move within this run, and so ProjectReplicaAdd/RemoveIntoGlobalState
+  // can look up the write contribution to shift across tablet_heat_by_ts_ on adds/removes.
+  // We move rather than copy because `fresh` is otherwise discarded at the end of this
+  // function. Empty-leader_uuid entries are kept in the map (they simply will not match any
+  // from_ts during mid-run lookups).
   global_state_->heat_by_tablet_ = std::move(fresh);
 }
 

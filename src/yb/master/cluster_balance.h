@@ -276,16 +276,30 @@ class ClusterLoadBalancer {
   Result<bool> GetLoadToMove(
       TabletId* moving_tablet_id, TabletServerId* from_ts, TabletServerId* to_ts);
 
+  // When `is_heat_driven` is true, the caller is asking on behalf of a heat-override pair
+  // assessment. Tablet selection is then replicated-write-heat-aware: pick the largest
+  // write_ops_per_sec candidate that transfers strictly less than half the
+  // tablet_heat_by_ts_ gap between from_ts and to_ts. Refuse (return nullopt) when the gap
+  // is non-positive, when no candidate has W > 0, or when every candidate exceeds the ceiling
+  // — the count-driven loop can still surface moves for other pairs. The false default keeps
+  // count-based and placement-repair callers on the legacy drive/placement/cloud-info path.
   Result<std::optional<TabletId>> GetTabletToMove(
-      const TabletServerId& from_ts, const TabletServerId& to_ts);
+      const TabletServerId& from_ts, const TabletServerId& to_ts,
+      bool is_heat_driven = false);
 
   // Issue the change config and modify the in-memory state for adding or moving a replica on the
   // specified tablet server.
   // from_ts may be empty for adds and is only used for logging. The remove replica for moves
   // happens in a later cluster balancer iteration (once the tablet is over-replicated).
+  //
+  // `is_heat_driven_tablet_move` is set to true by GetLoadToMove only when the heat-aware
+  // strategy's AssessTabletMove returned is_heat_driven=true for this pair. It scopes the
+  // write into heat_aware_recent_tablet_moves_ so placement-repair paths
+  // (HandleAddIfMissingPlacement, HandleAddIfWrongPlacement) and count-based moves — all of
+  // which call AddOrMoveReplica with the default `false` — never populate the cooldown map.
   Status AddOrMoveReplica(
       const TabletId& tablet_id, const TabletServerId& from_ts, const TabletServerId& to_ts,
-      const std::string& reason);
+      const std::string& reason, bool is_heat_driven_tablet_move = false);
 
   // Issue the change config and modify the in-memory state for removing a replica on the specified
   // tablet server.
@@ -424,10 +438,55 @@ class ClusterLoadBalancer {
                                             const TabletServerId& from_ts,
                                             const TabletServerId& to_ts);
 
+  // Adds the tablet's leader-reported write_ops_per_sec to `tablet_heat_by_ts_[ts]`. Called
+  // from AddOrMoveReplica after the replica has been placed on `ts`. Every peer of the tablet
+  // bears the same write cost under Raft replication, so the follower-side placement-heat
+  // aggregate must grow by exactly the leader's reported rate on every successful add.
+  // No-op when the tablet has no entry in heat_by_tablet_ (no fresh telemetry was aggregated
+  // at run start, or the heat cache was empty), or when `ts` is empty.
+  void ProjectReplicaAddIntoGlobalState(const TabletId& tablet_id, const TabletServerId& ts);
+
+  // Subtracts the tablet's leader-reported write_ops_per_sec from `tablet_heat_by_ts_[ts]`.
+  // Called from RemoveReplica after SendRemoveReplica succeeds. Floating-point accumulation
+  // can drift slightly negative after many projections; the value is clamped to 0 to keep the
+  // placement-heat bucket indices from going negative under the strict-weak-order guarantee
+  // of the comparator.
+  void ProjectReplicaRemoveIntoGlobalState(const TabletId& tablet_id, const TabletServerId& ts);
+
   // Persistent across balancer runs — survives ResetGlobalState. Maps the most recent
   // heat-driven leader move for each (tablet, from_ts, to_ts) triple to the time it was issued.
   std::unordered_map<HeatCooldownKey, MonoTime, HeatCooldownKeyHash>
       heat_aware_recent_leader_moves_;
+
+  // Analogous cooldown map for heat-driven tablet add/move decisions. Kept separate from the
+  // leader cooldown above so a leader move of T:A→B does not block a subsequent tablet move
+  // of the same triple and vice versa — the two operations have different cost profiles
+  // (fast Raft stepdown vs. full remote bootstrap). Populated only by AddOrMoveReplica when
+  // is_heat_driven_tablet_move is true, so count-based balancing and placement-repair moves
+  // never enter the map. Consulted by GetTabletToMove to skip heat-driven re-proposals
+  // within load_balancer_heat_tablet_move_cooldown_secs.
+  std::unordered_map<HeatCooldownKey, MonoTime, HeatCooldownKeyHash>
+      heat_aware_recent_tablet_moves_;
+
+  // Returns true when `tablet_id` was moved from `from_ts` to `to_ts` by the heat-aware
+  // strategy within the last `load_balancer_heat_tablet_move_cooldown_secs` seconds. Used by
+  // GetTabletToMove to skip heat-driven re-proposals of a move the balancer just made.
+  // Non-const: stale-by-age entries are evicted in place.
+  bool IsInHeatAwareTabletMoveCooldown(
+      const TabletId& tablet_id, const TabletServerId& from_ts, const TabletServerId& to_ts);
+
+  // Records a successful heat-driven tablet add/move at `MonoTime::Now()`. Called from
+  // AddOrMoveReplica only when is_heat_driven_tablet_move is true. Count-based moves,
+  // placement-repair moves, and wrong-placement moves never call this — the
+  // is_heat_driven_tablet_move flag threads through from AssessTabletMove to scope it.
+  void RecordHeatAwareTabletMove(
+      const TabletId& tablet_id, const TabletServerId& from_ts, const TabletServerId& to_ts);
+
+  // Drops entries from heat_aware_recent_tablet_moves_ that are older than the cooldown
+  // window. Invoked from AggregateLeaderHeatIntoGlobalState alongside the leader-cooldown
+  // sweep — same once-per-run site, same "sweep unconditionally so toggling the telemetry
+  // AutoFlag off does not pin the map" rationale.
+  void EvictExpiredTabletMoveCooldowns();
 
   // Per-run maintenance + heat aggregation hook. Evicts expired heat-aware leader-move cooldown
   // entries unconditionally (the map survives ResetGlobalState so the sweep must run every pass,

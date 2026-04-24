@@ -56,6 +56,60 @@ class ClusterLoadBalancerMocked : public ClusterLoadBalancer {
     return per_table_states_[table_id].get();
   }
 
+  // Phase 4: test accessor for the shared global state. Used by tests that need to invoke
+  // strategy-level hooks (e.g. AssessTabletMove) directly without routing through
+  // GetLoadToMove — global_state_ itself is protected on the base class.
+  GlobalLoadState& GlobalStateForTest() { return *global_state_; }
+
+  // Phase 4.5: direct entry point for ClusterLoadBalancer::GetTabletToMove. Lets tests exercise
+  // the heat-aware tablet-selection branch with arbitrary seeded heat without constructing a
+  // full balancer run — the heat-qualified pair would otherwise have to be driven through
+  // AssessTabletMove + HandleAddReplicas, which in the multi-az fixture gives at most one
+  // candidate per source and cannot test "pick the best of N". The is_heat_driven argument is
+  // forwarded verbatim so tests can assert both branches.
+  Result<std::optional<TabletId>> GetTabletToMoveForTest(
+      const TabletServerId& from_ts, const TabletServerId& to_ts, bool is_heat_driven) {
+    return GetTabletToMove(from_ts, to_ts, is_heat_driven);
+  }
+
+  // Phase 4.5: test accessor for the per-table over-replicated set. Phase 4.5 tests use this to
+  // mark a specific tablet as ineligible during the filter phase so the heat-aware branch has to
+  // compose correctly with the existing candidate filters. state_ itself is protected on the base
+  // class.
+  void AddTabletToOverReplicatedForTest(const TabletId& tablet_id) {
+    state_->tablets_over_replicated_.insert(tablet_id);
+  }
+
+  // Phase 4.5 reviewer P2: set per_tablet_meta_[tablet_id].is_over_replicated so
+  // GetPossiblyTransientLoad counts the tablet's owning tservers against the transient-load
+  // safeguard. Separate from AddTabletToOverReplicatedForTest because the filter-phase check
+  // consults the per-table tablets_over_replicated_ set, while GetPossiblyTransientLoad
+  // consults the per-tablet meta's is_over_replicated flag — tests need to exercise each
+  // path independently.
+  void MarkTabletIsOverReplicatedForTest(const TabletId& tablet_id) {
+    state_->per_tablet_meta_[tablet_id].is_over_replicated = true;
+  }
+
+  // Phase 4.6: register (tablet_id, ts_uuid) as an over-replicated peer pair — inserts tablet_id
+  // into tablets_over_replicated_ AND appends ts_uuid to the tablet's
+  // over_replicated_tablet_servers list. HandleRemoveReplicas iterates the per-table set and
+  // reads the per-tablet peer list, so both must be populated for the removal path to pick up
+  // the over-replication. Distinct from AddTabletToOverReplicatedForTest (per-table set only)
+  // and MarkTabletIsOverReplicatedForTest (per-tablet is_over_replicated flag only).
+  void SetTabletOverReplicatedOnTsForTest(
+      const TabletId& tablet_id, const TabletServerId& ts_uuid) {
+    state_->tablets_over_replicated_.insert(tablet_id);
+    state_->per_tablet_meta_[tablet_id].over_replicated_tablet_servers.insert(ts_uuid);
+  }
+
+  // Phase 4: seed GetGlobalLoad's output for a specific tserver without routing through the full
+  // catalog-building path (AddRunningTablet etc.). Used by tests that exercise the global-load
+  // regression guard in HeatAwareLoadBalancerStrategy::AssessTabletMove. Delegates to
+  // GlobalLoadState::SetRunningTabletCountForTest because per_ts_global_meta_ itself is private.
+  void SetGlobalRunningTabletCountForTest(const TabletServerId& ts_uuid, int count) {
+    global_state_->SetRunningTabletCountForTest(ts_uuid, count);
+  }
+
   void SetBlacklistAndPendingDeleteTS() override {
     for (const auto& ts_desc : global_state_->ts_descs_) {
       AddTSIfBlacklisted(ts_desc, blacklist_, false);
@@ -139,6 +193,47 @@ class ClusterLoadBalancerMocked : public ClusterLoadBalancer {
     global_state_->heat_by_tablet_[tablet_id] = record;
   }
 
+  // Phase 4: seed the per-tserver follower-write heat aggregate directly. Production populates
+  // it by fanning heat_by_tablet_ across running peers inside AggregateLeaderHeatIntoGlobalState;
+  // tests that want to exercise PlacementHeat / CompareLoad / AssessTabletMove without also
+  // having to construct a fully-seeded heat_by_tablet_ + consistent replica map can use this to
+  // shortcut the aggregate directly. Counterpart of SetHeatForTest.
+  void SetTabletHeatByTsForTest(const TabletServerId& ts_uuid, double aggregate) {
+    global_state_->tablet_heat_by_ts_[ts_uuid] = aggregate;
+  }
+
+  // Read-only accessor for the per-tserver follower-write heat aggregate, mirroring
+  // GetHeatForTest. Tests use this to assert the projections applied by
+  // ProjectReplicaAddIntoGlobalState / ProjectReplicaRemoveIntoGlobalState landed correctly.
+  double GetTabletHeatByTsForTest(const TabletServerId& ts_uuid) const {
+    const auto it = global_state_->tablet_heat_by_ts_.find(ts_uuid);
+    return it == global_state_->tablet_heat_by_ts_.end() ? 0.0 : it->second;
+  }
+
+  // Phase 4: direct entry points for the tablet-move cooldown. Mirror
+  // RecordHeatAwareLeaderMoveForTest / IsInHeatAwareCooldownForTest so tests can exercise the
+  // cooldown's (tablet, from, to) key granularity without threading a full balancer run.
+  void RecordHeatAwareTabletMoveForTest(
+      const TabletId& tablet_id, const TabletServerId& from_ts, const TabletServerId& to_ts) {
+    RecordHeatAwareTabletMove(tablet_id, from_ts, to_ts);
+  }
+
+  bool IsInHeatAwareTabletMoveCooldownForTest(
+      const TabletId& tablet_id, const TabletServerId& from_ts,
+      const TabletServerId& to_ts) {
+    return IsInHeatAwareTabletMoveCooldown(tablet_id, from_ts, to_ts);
+  }
+
+  // Direct entry points for the per-replica heat projections, symmetric to
+  // ProjectLeaderHeatMoveForTest. Lets tests exercise the projection math without having to
+  // reproduce the full AddOrMoveReplica / RemoveReplica control flow.
+  void ProjectReplicaAddForTest(const TabletId& tablet_id, const TabletServerId& ts) {
+    ProjectReplicaAddIntoGlobalState(tablet_id, ts);
+  }
+  void ProjectReplicaRemoveForTest(const TabletId& tablet_id, const TabletServerId& ts) {
+    ProjectReplicaRemoveIntoGlobalState(tablet_id, ts);
+  }
+
   // Read-only accessor for a tserver's heat aggregate. Exposed so tests can assert on the
   // post-move projected state of heat_by_ts_.
   GlobalLoadState::TServerLeaderHeat GetHeatForTest(const TabletServerId& ts_uuid) const {
@@ -173,6 +268,13 @@ class ClusterLoadBalancerMocked : public ClusterLoadBalancer {
   // (count-based moves, placement-repair stepdowns) never populate it.
   size_t GetHeatAwareCooldownSizeForTest() const {
     return heat_aware_recent_leader_moves_.size();
+  }
+
+  // Phase 4: mirror of GetHeatAwareCooldownSizeForTest for the tablet-move cooldown map.
+  // Tests use this to assert that placement-repair / wrong-placement tablet adds never populate
+  // the map (is_heat_driven_tablet_move defaults to false on those paths).
+  size_t GetHeatAwareTabletMoveCooldownSizeForTest() const {
+    return heat_aware_recent_tablet_moves_.size();
   }
 
   // Simulates a successful heat-driven leader move without going through MoveLeader. Useful in
@@ -212,6 +314,15 @@ class ClusterLoadBalancerMocked : public ClusterLoadBalancer {
   // enable_load_balancer_heat_telemetry is disabled.
   void AggregateLeaderHeatForTest() {
     AggregateLeaderHeatIntoGlobalState();
+  }
+
+  // Phase 4: construct per_run_state_ over the fixture's tablet_map_. Production does this at
+  // the top of RunClusterBalancerWithOptions; the mocked harness drives AnalyzeTablets directly
+  // and so leaves per_run_state_ nullptr by default. Tests that need
+  // IsInHeatAwareTabletMoveCooldown or AggregateLeaderHeatIntoGlobalState to see the catalog's
+  // live replica map (e.g. stranded-add eviction, replication-heat aggregation) call this first.
+  void SetupPerRunStateForTest() {
+    per_run_state_ = std::make_unique<PerRunState>(tablet_map_);
   }
 
   void ResetOptions() { SetOptions(ReplicaType::kLive, ""); }

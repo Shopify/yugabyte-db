@@ -315,6 +315,15 @@ class GlobalLoadState {
   // Get global leader load for a certain TS.
   int GetGlobalLeaderLoad(const TabletServerId& ts_uuid) const;
 
+  // Test-only: directly set the running-tablet count that backs GetGlobalLoad for a specific
+  // tserver. Inline so it is available to consumers that pull cluster_balance_util.h without a
+  // corresponding .cc link. Tests that need to exercise code paths gated on GetGlobalLoad (e.g.
+  // HeatAwareLoadBalancerStrategy::AssessTabletMove's global-regression guard) without building
+  // a realistic multi-table topology use this to set the number directly.
+  void SetRunningTabletCountForTest(const TabletServerId& ts_uuid, int count) {
+    per_ts_global_meta_[ts_uuid].running_tablets_count = count;
+  }
+
   std::string ToString() {
     std::string out = "{ drive_aware: " + std::to_string(drive_aware_) + ", ts_info: {[";
     for (const auto& ts_info : ts_descs_) {
@@ -361,6 +370,21 @@ class GlobalLoadState {
   // record's leader_uuid is mutated in place on each successful move so later iterations see the
   // new owner. Reset (alongside heat_by_ts_) on every ResetGlobalState.
   std::unordered_map<TabletId, LeaderHeatRecord> heat_by_tablet_;
+
+  // Per-tserver aggregate of replicated-write heat borne by every peer (leader + followers) of
+  // every tablet in heat_by_tablet_. Populated at the end of AggregateLeaderHeatIntoGlobalState
+  // by fanning each tablet's leader-reported write_ops_per_sec across all tservers that run a
+  // replica of that tablet. Maintained across the run by ProjectReplicaAddIntoGlobalState /
+  // ProjectReplicaRemoveIntoGlobalState on every successful tablet add/remove. Unlike
+  // heat_by_ts_ (which tracks leader-side cost only, including reads), this aggregate tracks
+  // follower cost too and is the right signal for tablet placement balancing — Raft write
+  // replication means every peer bears the same write rate the leader reports. The leader's own
+  // write contribution is included here; PlacementHeat() in cluster_balance_strategy.cc
+  // subtracts it back out at read time so the count-based leader write is not double-counted.
+  // Leader moves between existing peers are a no-op on this aggregate (both sides already carry
+  // the write cost), so MoveLeader does not project into it. Reset on every ResetGlobalState
+  // (via fresh GlobalLoadState allocation).
+  std::unordered_map<TabletServerId, double> tablet_heat_by_ts_;
 
   ClusterBalancerActivityInfo activity_info_;
 
