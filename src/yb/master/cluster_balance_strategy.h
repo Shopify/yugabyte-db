@@ -128,11 +128,14 @@ class CountBasedLoadScorer : public LoadScorer {
       const TabletServerId& a, const TabletServerId& b) const override;
 };
 
-// Heat-aware scorer. Delegates CompareLoad to count-based (tablet placement does not use leader
-// heat). For CompareLeaderLoad it quantizes weighted heat into integer buckets sized by
-// FLAGS_load_balancer_heat_hysteresis_ops_per_sec and orders by bucket first, falling through to
-// count-based within a bucket. Integer bucketing avoids the pairwise-threshold strict-weak-order
-// defect that a naked |heat_a - heat_b| < threshold comparator would introduce.
+// Heat-aware scorer. For CompareLoad it orders by placement-heat bucket first, falling through to
+// count-based within a bucket. Placement heat combines leader-side write heat with follower-side
+// replicated-write heat and intentionally excludes read heat because moving a follower replica
+// does not redistribute leader reads. For CompareLeaderLoad it quantizes weighted leader heat into
+// integer buckets sized by FLAGS_load_balancer_heat_hysteresis_ops_per_sec and orders by bucket
+// first, again falling through to count-based within a bucket. Integer bucketing avoids the
+// pairwise-threshold strict-weak-order defect that a naked |heat_a - heat_b| < threshold
+// comparator would introduce.
 class HeatAwareLoadScorer : public LoadScorer {
  public:
   bool CompareLoad(

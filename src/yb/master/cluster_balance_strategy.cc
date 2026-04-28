@@ -181,9 +181,10 @@ bool HeatAwareLoadScorer::CompareLoad(
     const TabletServerId& a, const TabletServerId& b,
     optional_ref<const TabletId> tablet_id) const {
   // Phase 4: order by placement-heat bucket first, falling through to count-based within a
-  // bucket. Placement heat sums leader-side read/write plus follower-side replicated writes
-  // (see PlacementHeat above) so this comparator is the right signal for tablet add/remove
-  // decisions — which is what CompareLoad drives via LoadComparator and SortLoad.
+  // bucket. Placement heat sums leader-side write heat plus follower-side replicated writes
+  // (see PlacementHeat above; read heat is intentionally excluded) so this comparator is the
+  // right signal for tablet add/remove decisions — which is what CompareLoad drives via
+  // LoadComparator and SortLoad.
   //
   // Unlike CompareLeaderLoad we do NOT add a blacklist short-circuit here: the count-based
   // CompareLoad has no blacklist branch either, since blacklisted tservers are filtered out

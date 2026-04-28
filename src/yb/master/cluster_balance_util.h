@@ -351,8 +351,9 @@ class GlobalLoadState {
   std::unordered_map<TabletServerId, std::set<TabletId>> pending_deletes_;
 
   // Per-tserver aggregate leader heat. Populated at the start of a balancer run from the
-  // ClusterBalanceHeatCache when the enable_load_balancer_heat_telemetry AutoFlag is on.
-  // Phase 2 only populates; nothing reads it yet. Phase 3's heat-aware strategy will consume it.
+  // ClusterBalanceHeatCache when the enable_load_balancer_heat_telemetry AutoFlag is on, then
+  // consumed by the active load-balancer strategy when ordering leader candidates and deciding
+  // heat-driven leader moves.
   struct TServerLeaderHeat {
     double sum_read_ops_per_sec = 0;
     double sum_write_ops_per_sec = 0;

@@ -148,8 +148,9 @@ DEFINE_RUNTIME_bool(cluster_balancer_stepdown_to_preferred_leader_on_remove, tru
 DEFINE_RUNTIME_string(load_balancer_strategy,
     yb::master::kLoadBalancerStrategyCountBased,
     "Which cluster balancer strategy to use. Options are \"count_based\" (default, balances "
-    "tablet and leader counts) and \"heat_aware_experimental\" (reserved for future heat-aware "
-    "balancing). Unknown or reserved values currently fall back to \"count_based\". "
+    "tablet and leader counts) and \"heat_aware_experimental\" (balances using per-tserver "
+    "heat buckets while preserving count-based tie-breakers and safety checks). Unknown values "
+    "currently fall back to \"count_based\". "
     "Note: this flag intentionally does not use a set-membership validator so that a typo or "
     "an unrecognized value from a gflags file is logged and safely falls back to count-based "
     "rather than rejected outright.");
@@ -467,8 +468,9 @@ void ClusterLoadBalancer::RunClusterBalancerWithOptions(
   // Also, set tservers that have pending deletes.
   SetBlacklistAndPendingDeleteTS();
 
-  // Build per-tserver heat aggregates from the leader heat cache once per run. Nothing downstream
-  // reads this yet — Phase 3's heat-aware strategy will consume it.
+  // Build per-tserver heat aggregates from the leader heat cache once per run. The active
+  // strategy consumes these aggregates later in the same run when ordering tservers and assessing
+  // heat-driven leader / tablet moves.
   AggregateLeaderHeatIntoGlobalState();
 
   for (const auto& table : tables) {
