@@ -1300,8 +1300,7 @@ Status PgSession::ReleaseSessionObjectLock(const YbcObjectLockId& lock_id, bool 
   auto& options = *req.mutable_options();
   RETURN_NOT_OK(pg_txn_manager_->CalculateIsolation(
       false /* read_only, doesn't matter */,
-      pg_txn_manager_->GetTxnPriorityRequirement(RowMarkType::ROW_MARK_ABSENT),
-      IsLocalObjectLockOp(false)));
+      pg_txn_manager_->GetTxnPriorityRequirement(RowMarkType::ROW_MARK_ABSENT)));
   RETURN_NOT_OK(SetupPerformOptions(
       VERIFY_RESULT(FlushBufferedEntities(PgFlushDebugContext::ReleaseLock(lock_id))), &options));
   if (release_all) {
