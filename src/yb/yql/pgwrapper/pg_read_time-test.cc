@@ -1050,4 +1050,14 @@ TEST_F(PgReadTimeTest, ReadTimeAfterParallelExecution) {
   }
 }
 
+TEST_F(PgReadTimeTest, CheckDeferredReadAfterCommitVisibilityInsertFirst) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn.Execute("SET yb_read_after_commit_visibility TO deferred"));
+
+  CheckReadTimePickedOnDocdb([&conn]() {
+    ASSERT_OK(conn.Execute("INSERT INTO t VALUES (1, 1)"));
+  });
+}
+
 } // namespace yb::pgwrapper
