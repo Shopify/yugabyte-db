@@ -123,6 +123,13 @@ VOLATILE PARALLEL SAFE
 AS 'yb_index_check';
 
 CREATE OR REPLACE FUNCTION
+  yb_backfill_external_index(indexrelid regclass)
+RETURNS void
+LANGUAGE INTERNAL
+VOLATILE
+AS 'yb_backfill_external_index';
+
+CREATE OR REPLACE FUNCTION
   yb_compute_row_ybctid(relid oid, key_atts record, ybidxbasectid bytea DEFAULT NULL)
 RETURNS bytea
 LANGUAGE INTERNAL

@@ -228,6 +228,24 @@ static relopt_bool boolRelOpts[] =
 		},
 		true
 	},
+	{
+		{
+			"yb_external_maintenance",
+			"Declares a YB LSM index as externally maintained.",
+			RELOPT_KIND_YB_LSM,
+			AccessExclusiveLock
+		},
+		false
+	},
+	{
+		{
+			"yb_lazy_index_serving",
+			"Allows the planner to use an externally maintained YB LSM index.",
+			RELOPT_KIND_YB_LSM,
+			ShareUpdateExclusiveLock
+		},
+		false
+	},
 	/* list terminator */
 	{{NULL}}
 };
@@ -2216,6 +2234,10 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		offsetof(StdRdOptions, yb_auto_analyze) + offsetof(YbAutoAnalyzeOpts, min_cooldown_ms)},
 		{"yb_auto_analyze_max_cooldown", RELOPT_TYPE_INT,
 		offsetof(StdRdOptions, yb_auto_analyze) + offsetof(YbAutoAnalyzeOpts, max_cooldown_ms)},
+		{"yb_external_maintenance", RELOPT_TYPE_BOOL,
+		offsetof(StdRdOptions, yb_external_maintenance)},
+		{"yb_lazy_index_serving", RELOPT_TYPE_BOOL,
+		offsetof(StdRdOptions, yb_lazy_index_serving)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate, kind,

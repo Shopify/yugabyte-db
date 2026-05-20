@@ -16002,6 +16002,7 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 	bool		repl_null[Natts_pg_class];
 	bool		repl_repl[Natts_pg_class];
 	static char *validnsps[] = HEAP_RELOPT_NAMESPACES;
+	bool		yb_lazy_index_serving_changed = false;
 
 	if (defList == NIL && operation != AT_ReplaceRelOptions)
 		return;					/* nothing to do */
@@ -16053,7 +16054,38 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 			break;
 		case RELKIND_INDEX:
 		case RELKIND_PARTITIONED_INDEX:
-			(void) index_reloptions(rel->rd_indam->amoptions, newOptions, true);
+			{
+				bytea	   *parsed_options =
+					index_reloptions(rel->rd_indam->amoptions, newOptions, true);
+
+				if (IsYBRelation(rel) &&
+					rel->rd_rel->relkind == RELKIND_INDEX &&
+					rel->rd_rel->relam == LSM_AM_OID)
+				{
+					bool		old_external_maintenance =
+						YbIsExternallyMaintainedIndex(rel);
+					bool		old_lazy_index_serving =
+						YbIndexOptionsAreServing(rel->rd_options);
+					bool		new_external_maintenance =
+						YbIndexOptionsAreExternallyMaintained(parsed_options);
+					bool		new_lazy_index_serving =
+						YbIndexOptionsAreServing(parsed_options);
+
+					if (old_external_maintenance != new_external_maintenance)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("yb_external_maintenance cannot be changed after index creation")));
+
+					if (new_lazy_index_serving && !new_external_maintenance)
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								 errmsg("yb_lazy_index_serving requires yb_external_maintenance")));
+
+					if (old_external_maintenance &&
+						old_lazy_index_serving != new_lazy_index_serving)
+						yb_lazy_index_serving_changed = true;
+				}
+			}
 			break;
 		default:
 			ereport(ERROR,
@@ -16138,6 +16170,20 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 
 	CatalogTupleUpdate(pgclass, &newtuple->t_self, newtuple);
 	UnlockTuple(pgclass, &tuple->t_self, InplaceUpdateTupleLock);
+
+	/*
+	 * Lazy-index serving state changes affect which indexes may be considered
+	 * while planning queries against the indexed base table.  The reloption
+	 * update invalidates the index relation, but cached SELECT plans usually
+	 * depend on the base table, so invalidate that relation as well.
+	 */
+	if (yb_lazy_index_serving_changed)
+	{
+		Oid			heapid = IndexGetRelation(relid, false);
+
+		if (OidIsValid(heapid))
+			CacheInvalidateRelcacheByRelid(heapid);
+	}
 
 	InvokeObjectPostAlterHook(RelationRelationId, RelationGetRelid(rel), 0);
 

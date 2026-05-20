@@ -409,6 +409,110 @@ IsYBRelation(Relation relation)
 }
 
 bool
+YbIndexOptionsAreExternallyMaintained(bytea *options)
+{
+	return options != NULL &&
+		((StdRdOptions *) options)->yb_external_maintenance;
+}
+
+bool
+YbIndexOptionsAreServing(bytea *options)
+{
+	return options != NULL &&
+		((StdRdOptions *) options)->yb_lazy_index_serving;
+}
+
+bool
+YbIsExternallyMaintainedIndex(Relation relation)
+{
+	return IsYBRelation(relation) &&
+		relation->rd_rel->relkind == RELKIND_INDEX &&
+		relation->rd_rel->relam == LSM_AM_OID &&
+		YbIndexOptionsAreExternallyMaintained(relation->rd_options);
+}
+
+bool
+YbLazyIndexIsUsable(Relation relation)
+{
+	if (!YbIsExternallyMaintainedIndex(relation))
+		return true;
+
+	return yb_index_consistency == YB_INDEX_CONSISTENCY_EVENTUAL &&
+		YbIndexOptionsAreServing(relation->rd_options);
+}
+
+Datum
+yb_backfill_external_index(PG_FUNCTION_ARGS)
+{
+	Oid			indexId = PG_GETARG_OID(0);
+	Oid			heapId;
+	Relation	heapRel;
+	Relation	indexRel;
+	IndexInfo  *indexInfo;
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
+
+	if (!IsYugaByteEnabled())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("yb_backfill_external_index is only supported in YugabyteDB")));
+
+	heapId = IndexGetRelation(indexId, false);
+	if (!OidIsValid(heapId))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("relation %u is not an index", indexId)));
+
+	heapRel = table_open(heapId, ShareUpdateExclusiveLock);
+	indexRel = index_open(indexId, RowExclusiveLock);
+
+	if (!YbIsExternallyMaintainedIndex(indexRel))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("index \"%s\" is not externally maintained",
+						RelationGetRelationName(indexRel))));
+
+	if (!indexRel->rd_index->indisready || !indexRel->rd_index->indisvalid)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("index \"%s\" is not ready for backfill",
+						RelationGetRelationName(indexRel))));
+
+	if (indexRel->rd_index->indisunique || indexRel->rd_index->indisprimary)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("unique and primary-key indexes cannot be externally maintained")));
+
+	indexInfo = BuildIndexInfo(indexRel);
+	indexInfo->ii_Concurrent = false;
+	indexInfo->ii_BrokenHotChain = false;
+
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	SetUserIdAndSecContext(heapRel->rd_rel->relowner,
+						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+	save_nestlevel = NewGUCNestLevel();
+
+	PG_TRY();
+	{
+		IndexBuildResult *stats;
+
+		stats = indexRel->rd_indam->ambuild(heapRel, indexRel, indexInfo);
+		Assert(PointerIsValid(stats));
+	}
+	PG_FINALLY();
+	{
+		AtEOXact_GUC(false, save_nestlevel);
+		SetUserIdAndSecContext(save_userid, save_sec_context);
+		index_close(indexRel, RowExclusiveLock);
+		table_close(heapRel, ShareUpdateExclusiveLock);
+	}
+	PG_END_TRY();
+
+	PG_RETURN_VOID();
+}
+
+bool
 IsYBRelationById(Oid relid)
 {
 	Relation	relation = RelationIdGetRelation(relid);
@@ -8235,6 +8339,7 @@ YbIndexSetNewRelfileNode(Relation indexRel, Oid newRelfileNodeId,
 				   indexedRel,
 				   splitOpt,
 				   true /* skip_index_backfill */ ,
+				   YbIsExternallyMaintainedIndex(indexRel),
 				   indexedRel->yb_table_properties->is_colocated,
 				   indexedRel->yb_table_properties->tablegroup_oid,
 				   InvalidOid /* colocation ID */ ,

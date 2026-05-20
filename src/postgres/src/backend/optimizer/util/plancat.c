@@ -262,6 +262,12 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 				continue;
 			}
 
+			if (!YbLazyIndexIsUsable(indexRelation))
+			{
+				index_close(indexRelation, NoLock);
+				continue;
+			}
+
 			/*
 			 * If the index is valid, but cannot yet be used, ignore it; but
 			 * mark the plan we are generating as transient. See

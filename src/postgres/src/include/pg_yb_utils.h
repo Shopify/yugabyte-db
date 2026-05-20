@@ -194,6 +194,18 @@ extern bool IsYBRelationById(Oid relid);
 
 extern bool IsYBRelation(Relation relation);
 
+typedef enum YbIndexConsistencyMode
+{
+	YB_INDEX_CONSISTENCY_STRONG = 0,
+	YB_INDEX_CONSISTENCY_EVENTUAL
+} YbIndexConsistencyMode;
+
+extern int	yb_index_consistency;
+extern bool YbIndexOptionsAreExternallyMaintained(bytea *options);
+extern bool YbIndexOptionsAreServing(bytea *options);
+extern bool YbIsExternallyMaintainedIndex(Relation relation);
+extern bool YbLazyIndexIsUsable(Relation relation);
+
 /*
  * Same as IsYBRelation but it additionally includes views on YugaByte
  * relations i.e. views on persistent (non-temporary) tables.

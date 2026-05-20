@@ -1310,6 +1310,7 @@ Status PgApiImpl::NewCreateIndex(const char* database_name,
                                  bool is_sys_catalog_index,
                                  bool is_unique_index,
                                  bool skip_index_backfill,
+                                 bool yb_external_maintenance,
                                  bool if_not_exist,
                                  bool is_colocated_via_database,
                                  const PgObjectId& tablegroup_oid,
@@ -1325,7 +1326,7 @@ Status PgApiImpl::NewCreateIndex(const char* database_name,
           tablegroup_oid, colocation_id, tablespace_oid, false /* is_matview */, pg_table_id,
           old_relfilenode_id, false /* is_truncate */, pg_txn_manager_->IsDdlMode(),
           pg_txn_manager_->IsDdlModeWithRegularTransactionBlock(), base_table_id,
-          is_unique_index, skip_index_backfill),
+          is_unique_index, skip_index_backfill, yb_external_maintenance),
       handle);
 }
 

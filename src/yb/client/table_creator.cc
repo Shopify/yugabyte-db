@@ -244,6 +244,11 @@ YBTableCreator& YBTableCreator::skip_index_backfill(const bool skip_index_backfi
   return *this;
 }
 
+YBTableCreator& YBTableCreator::externally_maintained_index(bool externally_maintained) {
+  index_info_->set_is_externally_maintained(externally_maintained);
+  return *this;
+}
+
 YBTableCreator& YBTableCreator::use_mangled_column_name(bool value) {
   index_info_->set_use_mangled_column_name(value);
   return *this;

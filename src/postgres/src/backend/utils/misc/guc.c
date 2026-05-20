@@ -295,6 +295,7 @@ static const char *show_tcmalloc_sample_period(void);
 static const char *yb_show_maxconnections(void);
 static void assign_tcmalloc_sample_period(int newval, void *extra);
 static void assign_yb_pg_batch_detection_mechanism(int new_value, void *extra);
+static void assign_yb_index_consistency(int new_value, void *extra);
 static void assign_ysql_upgrade_mode(bool newval, void *extra);
 static void check_reserved_prefixes(const char *varName);
 static void assign_yb_enable_cbo(int new_value, void *extra);
@@ -678,6 +679,12 @@ const struct config_enum_entry yb_read_after_commit_visibility_options[] = {
 	{NULL, 0, false}
 };
 
+static const struct config_enum_entry yb_index_consistency_options[] = {
+	{"strong", YB_INDEX_CONSISTENCY_STRONG, false},
+	{"eventual", YB_INDEX_CONSISTENCY_EVENTUAL, false},
+	{NULL, 0, false}
+};
+
 const struct config_enum_entry yb_sampling_algorithm_options[] = {
 	{"full_table_scan", YB_SAMPLING_ALGORITHM_FULL_TABLE_SCAN, false},
 	{"block_based_sampling", YB_SAMPLING_ALGORITHM_BLOCK_BASED_SAMPLING, false},
@@ -849,6 +856,7 @@ static char *recovery_target_lsn_string;
 static char *restrict_nonsystem_relation_kind_string;
 
 bool		yb_enable_memory_tracking = true;
+int			yb_index_consistency = YB_INDEX_CONSISTENCY_EVENTUAL;
 static char *yb_effective_transaction_isolation_level_string;
 static char *yb_xcluster_consistency_level_string;
 static char *yb_read_time_string;
@@ -7922,6 +7930,19 @@ static struct config_enum ConfigureNamesEnum[] =
 		YB_SAMPLING_ALGORITHM_BLOCK_BASED_SAMPLING,
 		yb_sampling_algorithm_options,
 		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_index_consistency", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Controls whether externally maintained lazy indexes may be planned."),
+			gettext_noop("eventual allows serving lazy indexes to be planned with normal index "
+						 "optimizations. strong excludes lazy indexes from planning."),
+			GUC_EXPLAIN
+		},
+		&yb_index_consistency,
+		YB_INDEX_CONSISTENCY_EVENTUAL,
+		yb_index_consistency_options,
+		NULL, assign_yb_index_consistency, NULL
 	},
 
 	{
@@ -17027,6 +17048,13 @@ static void
 assign_yb_pg_batch_detection_mechanism(int new_value, void *extra)
 {
 	yb_pg_batch_detection_mechanism = new_value;
+}
+
+static void
+assign_yb_index_consistency(int new_value, void *extra)
+{
+	if (yb_index_consistency != new_value)
+		ResetPlanCache();
 }
 
 static void

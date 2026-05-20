@@ -305,6 +305,10 @@ message IndexInfoPB {
   // are not included in this count. Moreover, after backfill is completed, this field is no longer
   // updated.
   optional double num_rows_backfilled_in_index = 36;
+
+  // The index is defined by YugabyteDB but maintained by an external materializer. In the
+  // current YSQL flow, write-path suppression is enforced before tablet writes are generated.
+  optional bool is_externally_maintained = 37 [ default = false ];
 }
 
 // The possible order modes for clients.

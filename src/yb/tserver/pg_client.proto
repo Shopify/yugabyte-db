@@ -464,6 +464,10 @@ message PgCreateTableRequestPB {
   // Used to setup the session in case the table is being created in a
   // transaction block with transactional ddl enabled i.e. use_regular_transaction_block is true.
   PgPerformOptionsPB options = 27;
+
+  // Actual for index only. If set, YSQL creates and plans the index but does not maintain it
+  // from the base-table write path.
+  bool yb_external_maintenance = 28;
 }
 
 message PgCreateTableResponsePB {

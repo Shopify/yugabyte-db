@@ -148,6 +148,9 @@ class YBTableCreator {
   // For index table: sets whether to do online schema migration when creating index.
   YBTableCreator& skip_index_backfill(const bool skip_index_backfill);
 
+  // For index table: sets whether the index is maintained outside YugabyteDB.
+  YBTableCreator& externally_maintained_index(bool externally_maintained);
+
   // For vector index table: adds vector index-specific options.
   YBTableCreator& add_vector_options(const PgVectorIdxOptionsPB& vec_options);
 

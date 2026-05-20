@@ -1,0 +1,941 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Externally Maintained Lazy Indexes</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #18202a;
+      --muted: #5d6875;
+      --subtle: #eef1f4;
+      --line: #d7dee6;
+      --paper: #fbfcfd;
+      --panel: #ffffff;
+      --nav: #111820;
+      --nav-2: #1f2a35;
+      --blue: #2563eb;
+      --green: #15803d;
+      --amber: #b45309;
+      --red: #b42318;
+      --teal: #0f766e;
+      --shadow: 0 12px 28px rgba(24, 32, 42, 0.08);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--paper);
+      line-height: 1.5;
+    }
+
+    a {
+      color: inherit;
+    }
+
+    .shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+    }
+
+    .sidebar {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      padding: 28px 22px;
+      color: #f6f8fb;
+      background: linear-gradient(180deg, var(--nav), var(--nav-2));
+      overflow-y: auto;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 28px;
+    }
+
+    .brand-mark {
+      width: 42px;
+      height: 42px;
+      display: grid;
+      place-items: center;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.08);
+      font-weight: 800;
+      letter-spacing: 0;
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.15;
+    }
+
+    .brand span {
+      display: block;
+      margin-top: 4px;
+      color: #b8c3cf;
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .nav-list {
+      display: grid;
+      gap: 6px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .nav-list a {
+      display: block;
+      padding: 9px 10px;
+      border-radius: 8px;
+      color: #dce4ee;
+      text-decoration: none;
+      font-size: 14px;
+    }
+
+    .nav-list a:hover,
+    .nav-list a:focus {
+      background: rgba(255, 255, 255, 0.10);
+      outline: none;
+    }
+
+    .sidebar-note {
+      margin-top: 28px;
+      padding: 14px;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: 8px;
+      color: #c8d2dd;
+      background: rgba(255, 255, 255, 0.06);
+      font-size: 13px;
+    }
+
+    main {
+      min-width: 0;
+    }
+
+    .section {
+      border-bottom: 1px solid var(--line);
+    }
+
+    .section-inner {
+      width: min(1180px, calc(100vw - 80px));
+      margin: 0 auto;
+      padding: 54px 0;
+    }
+
+    .hero .section-inner {
+      padding-top: 42px;
+      padding-bottom: 38px;
+    }
+
+    .eyebrow {
+      margin: 0 0 12px;
+      color: var(--blue);
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    h2,
+    h3 {
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 0 0 18px;
+      font-size: clamp(30px, 5vw, 54px);
+      line-height: 1.02;
+    }
+
+    h3 {
+      margin: 0 0 12px;
+      font-size: 22px;
+      line-height: 1.2;
+    }
+
+    h4 {
+      margin: 0 0 8px;
+      font-size: 15px;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 0;
+    }
+
+    .lede {
+      max-width: 880px;
+      color: #3b4654;
+      font-size: 19px;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 30px;
+    }
+
+    .summary-card,
+    .walk-card,
+    .test-card,
+    .risk-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .summary-card {
+      padding: 18px;
+      min-height: 142px;
+    }
+
+    .summary-card strong {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .summary-card p {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .blue { color: var(--blue); }
+    .green { color: var(--green); }
+    .amber { color: var(--amber); }
+    .red { color: var(--red); }
+    .teal { color: var(--teal); }
+
+    .band {
+      background: #f4f7fa;
+    }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
+      gap: 28px;
+      align-items: start;
+    }
+
+    .callout {
+      padding: 20px;
+      border: 1px solid #c8d7ec;
+      border-left: 5px solid var(--blue);
+      border-radius: 8px;
+      background: #f7fbff;
+    }
+
+    .callout p + p {
+      margin-top: 12px;
+    }
+
+    .code {
+      margin: 18px 0 0;
+      padding: 16px;
+      border-radius: 8px;
+      color: #f4f8fb;
+      background: #101820;
+      overflow-x: auto;
+      font-family: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .diagram-wrap {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      overflow-x: auto;
+    }
+
+    .diagram {
+      display: block;
+      width: 100%;
+      min-width: 850px;
+      height: auto;
+    }
+
+    .diagram text {
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+
+    .flow-caption {
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .walk-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 24px;
+    }
+
+    .walk-card {
+      padding: 18px;
+    }
+
+    .walk-card .path {
+      display: block;
+      margin-bottom: 10px;
+      color: var(--blue);
+      font-family: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }
+
+    .walk-card p,
+    .risk-card p,
+    .test-card p {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .walk-card ul,
+    .rules-list,
+    .check-list {
+      margin: 12px 0 0;
+      padding-left: 20px;
+      color: #3d4855;
+      font-size: 14px;
+    }
+
+    .walk-card li + li,
+    .rules-list li + li,
+    .check-list li + li {
+      margin-top: 7px;
+    }
+
+    .sequence {
+      display: grid;
+      gap: 10px;
+      margin-top: 22px;
+      counter-reset: seq;
+    }
+
+    .sequence-item {
+      display: grid;
+      grid-template-columns: 46px minmax(0, 1fr);
+      gap: 14px;
+      align-items: start;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .sequence-item::before {
+      counter-increment: seq;
+      content: counter(seq);
+      width: 38px;
+      height: 38px;
+      display: grid;
+      place-items: center;
+      border-radius: 8px;
+      color: #ffffff;
+      background: var(--teal);
+      font-weight: 800;
+    }
+
+    .sequence-item p {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .test-grid,
+    .risk-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 24px;
+    }
+
+    .test-card,
+    .risk-card {
+      padding: 18px;
+    }
+
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 9px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      color: #344151;
+      background: #f8fafc;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .footer {
+      padding: 34px 0;
+      color: #c8d2dd;
+      background: var(--nav);
+    }
+
+    .footer .section-inner {
+      padding: 0;
+    }
+
+    .footer code {
+      color: #ffffff;
+    }
+
+    :not(pre) > code {
+      padding: 2px 5px;
+      border: 1px solid #dbe3ed;
+      border-radius: 5px;
+      color: #1e3a8a;
+      background: #f8fafc;
+      font-family: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 0.88em;
+      overflow-wrap: anywhere;
+    }
+
+    .footer :not(pre) > code {
+      border-color: rgba(255, 255, 255, 0.18);
+      color: #ffffff;
+      background: rgba(255, 255, 255, 0.08);
+    }
+
+    @media (max-width: 980px) {
+      .shell {
+        display: block;
+      }
+
+      .sidebar {
+        position: relative;
+        height: auto;
+      }
+
+      .nav-list {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .section-inner {
+        width: min(100% - 34px, 900px);
+      }
+
+      .summary-grid,
+      .walk-grid,
+      .test-grid,
+      .risk-grid,
+      .two-col {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 560px) {
+      .sidebar {
+        padding: 22px 16px;
+      }
+
+      .nav-list {
+        grid-template-columns: 1fr;
+      }
+
+      .section-inner {
+        width: min(100% - 28px, 900px);
+        padding: 38px 0;
+      }
+
+      h2 {
+        font-size: 34px;
+      }
+
+      .lede {
+        font-size: 17px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar" aria-label="Page navigation">
+      <div class="brand">
+        <div class="brand-mark">YB</div>
+        <div>
+          <h1>Lazy Indexes</h1>
+          <span>Externally maintained YSQL indexes</span>
+        </div>
+      </div>
+      <ol class="nav-list">
+        <li><a href="#overview">Overview</a></li>
+        <li><a href="#flow">System Flow</a></li>
+        <li><a href="#semantics">Semantics</a></li>
+        <li><a href="#walkthrough">Code Walkthrough</a></li>
+        <li><a href="#mock-qe">Mock Materializer</a></li>
+        <li><a href="#validation">Validation</a></li>
+        <li><a href="#scope">Scope and Risks</a></li>
+      </ol>
+      <div class="sidebar-note">
+        Static site. No build step. Upload this directory as-is.
+      </div>
+    </aside>
+
+    <main>
+      <section id="overview" class="section hero">
+        <div class="section-inner">
+          <p class="eyebrow">Phase 1-3 Yugabyte-side prototype</p>
+          <h2>Yugabyte defines the index. QueryEngine maintains it later.</h2>
+          <p class="lede">
+            Externally maintained lazy indexes keep the normal YSQL secondary index table and planner
+            integration, but remove index maintenance from the base-table write transaction. A serving
+            lazy index can be used for fast reads with eventual-consistency semantics; strong reads
+            exclude lazy indexes and use only Yugabyte-maintained indexes or the base table.
+          </p>
+
+          <div class="summary-grid" aria-label="Design summary">
+            <article class="summary-card">
+              <strong class="blue">DDL</strong>
+              <p>Create a normal YB LSM secondary index with <code>WITH (yb_external_maintenance = true)</code>.</p>
+            </article>
+            <article class="summary-card">
+              <strong class="green">Writes</strong>
+              <p>Base-table inserts, updates, and deletes skip externally maintained index tables.</p>
+            </article>
+            <article class="summary-card">
+              <strong class="amber">Reads</strong>
+              <p><code>eventual</code> mode can use serving lazy indexes exactly like normal indexes.</p>
+            </article>
+            <article class="summary-card">
+              <strong class="red">Strong Mode</strong>
+              <p><code>strong</code> mode hides lazy indexes from planning, preserving strong query behavior.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="flow" class="section band">
+        <div class="section-inner">
+          <p class="eyebrow">System level</p>
+          <h2>How it works</h2>
+          <div class="diagram-wrap" role="img" aria-label="System flow diagram for externally maintained lazy indexes">
+            <svg class="diagram" viewBox="0 0 1120 690" xmlns="http://www.w3.org/2000/svg">
+              <defs>
+                <marker id="arrow-blue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+                  <path d="M 0 0 L 12 6 L 0 12 z" fill="#2563eb"/>
+                </marker>
+                <marker id="arrow-green" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+                  <path d="M 0 0 L 12 6 L 0 12 z" fill="#15803d"/>
+                </marker>
+                <marker id="arrow-amber" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+                  <path d="M 0 0 L 12 6 L 0 12 z" fill="#b45309"/>
+                </marker>
+                <marker id="arrow-red" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+                  <path d="M 0 0 L 12 6 L 0 12 z" fill="#b42318"/>
+                </marker>
+                <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+                  <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#18202a" flood-opacity="0.12"/>
+                </filter>
+              </defs>
+
+              <rect x="20" y="20" width="1080" height="650" rx="10" fill="#ffffff" stroke="#d7dee6"/>
+
+              <text x="56" y="66" font-size="20" font-weight="800" fill="#18202a">Externally Maintained Lazy Index Flow</text>
+              <text x="56" y="92" font-size="13" fill="#5d6875">Control plane defines metadata. Write path skips index maintenance. QueryEngine backfills asynchronously. Planner gates by consistency mode.</text>
+
+              <rect x="58" y="132" width="240" height="104" rx="8" fill="#f8fafc" stroke="#cbd5e1" filter="url(#shadow)"/>
+              <text x="82" y="166" font-size="15" font-weight="800" fill="#18202a">Application DDL</text>
+              <text x="82" y="192" font-size="13" fill="#344151">CREATE INDEX ... WITH</text>
+              <text x="82" y="212" font-size="13" fill="#344151">(yb_external_maintenance=true)</text>
+
+              <rect x="424" y="132" width="280" height="104" rx="8" fill="#eff6ff" stroke="#bfdbfe" filter="url(#shadow)"/>
+              <text x="448" y="166" font-size="15" font-weight="800" fill="#18202a">Yugabyte Catalog + DocDB</text>
+              <text x="448" y="192" font-size="13" fill="#344151">Creates index table and metadata</text>
+              <text x="448" y="212" font-size="13" fill="#344151">Skips initial index build</text>
+
+              <rect x="824" y="132" width="220" height="104" rx="8" fill="#f0fdf4" stroke="#bbf7d0" filter="url(#shadow)"/>
+              <text x="848" y="166" font-size="15" font-weight="800" fill="#18202a">Non-Serving Index</text>
+              <text x="848" y="192" font-size="13" fill="#344151">yb_lazy_index_serving=false</text>
+              <text x="848" y="212" font-size="13" fill="#344151">Hidden from planner</text>
+
+              <path d="M 304 184 L 414 184" stroke="#2563eb" stroke-width="3" fill="none" marker-end="url(#arrow-blue)"/>
+              <path d="M 714 184 L 814 184" stroke="#2563eb" stroke-width="3" fill="none" marker-end="url(#arrow-blue)"/>
+
+              <rect x="58" y="304" width="240" height="112" rx="8" fill="#fff7ed" stroke="#fed7aa" filter="url(#shadow)"/>
+              <text x="82" y="338" font-size="15" font-weight="800" fill="#18202a">Base Table Writes</text>
+              <text x="82" y="364" font-size="13" fill="#344151">INSERT / UPDATE / DELETE</text>
+              <text x="82" y="384" font-size="13" fill="#344151">commit without lazy index writes</text>
+
+              <rect x="424" y="304" width="280" height="112" rx="8" fill="#fefce8" stroke="#fde68a" filter="url(#shadow)"/>
+              <text x="448" y="338" font-size="15" font-weight="800" fill="#18202a">QueryEngine / Mock QE</text>
+              <text x="448" y="364" font-size="13" fill="#344151">Scans primary table out of band</text>
+              <text x="448" y="384" font-size="13" fill="#344151">Backfills index entries</text>
+
+              <rect x="824" y="304" width="220" height="112" rx="8" fill="#ecfdf5" stroke="#a7f3d0" filter="url(#shadow)"/>
+              <text x="848" y="338" font-size="15" font-weight="800" fill="#18202a">Serving Lazy Index</text>
+              <text x="848" y="364" font-size="13" fill="#344151">yb_lazy_index_serving=true</text>
+              <text x="848" y="384" font-size="13" fill="#344151">Eligible in eventual mode</text>
+
+              <path d="M 304 360 L 414 360" stroke="#b45309" stroke-width="3" fill="none" marker-end="url(#arrow-amber)"/>
+              <path d="M 714 360 L 814 360" stroke="#15803d" stroke-width="3" fill="none" marker-end="url(#arrow-green)"/>
+              <path d="M 936 248 L 936 292" stroke="#15803d" stroke-width="3" fill="none" marker-end="url(#arrow-green)"/>
+
+              <rect x="58" y="504" width="240" height="112" rx="8" fill="#f8fafc" stroke="#cbd5e1" filter="url(#shadow)"/>
+              <text x="82" y="538" font-size="15" font-weight="800" fill="#18202a">Read Query</text>
+              <text x="82" y="564" font-size="13" fill="#344151">WHERE / ORDER / LIMIT / JOIN</text>
+              <text x="82" y="584" font-size="13" fill="#344151">normal planner pipeline</text>
+
+              <rect x="424" y="484" width="280" height="72" rx="8" fill="#eef2ff" stroke="#c7d2fe" filter="url(#shadow)"/>
+              <text x="448" y="516" font-size="15" font-weight="800" fill="#18202a">eventual</text>
+              <text x="448" y="538" font-size="13" fill="#344151">planner may use serving lazy index</text>
+
+              <rect x="424" y="584" width="280" height="72" rx="8" fill="#fef2f2" stroke="#fecaca" filter="url(#shadow)"/>
+              <text x="448" y="616" font-size="15" font-weight="800" fill="#18202a">strong</text>
+              <text x="448" y="638" font-size="13" fill="#344151">planner excludes lazy indexes</text>
+
+              <rect x="824" y="484" width="220" height="72" rx="8" fill="#ecfdf5" stroke="#a7f3d0" filter="url(#shadow)"/>
+              <text x="848" y="516" font-size="15" font-weight="800" fill="#18202a">Fast Stale Read</text>
+              <text x="848" y="538" font-size="13" fill="#344151">index scan / pushdowns allowed</text>
+
+              <rect x="824" y="584" width="220" height="72" rx="8" fill="#fff7ed" stroke="#fed7aa" filter="url(#shadow)"/>
+              <text x="848" y="616" font-size="15" font-weight="800" fill="#18202a">Strong Read Plan</text>
+              <text x="848" y="638" font-size="13" fill="#344151">base table or maintained index</text>
+
+              <path d="M 304 544 L 414 520" stroke="#2563eb" stroke-width="3" fill="none" marker-end="url(#arrow-blue)"/>
+              <path d="M 304 576 L 414 620" stroke="#b42318" stroke-width="3" fill="none" marker-end="url(#arrow-red)"/>
+              <path d="M 714 520 L 814 520" stroke="#15803d" stroke-width="3" fill="none" marker-end="url(#arrow-green)"/>
+              <path d="M 714 620 L 814 620" stroke="#b45309" stroke-width="3" fill="none" marker-end="url(#arrow-amber)"/>
+
+              <path d="M 178 248 L 178 292" stroke="#b45309" stroke-width="3" stroke-dasharray="8 6" fill="none" marker-end="url(#arrow-amber)"/>
+              <text x="196" y="276" font-size="12" fill="#b45309">stale window opens</text>
+            </svg>
+            <p class="flow-caption">
+              The key split is planner visibility, not special execution semantics. In eventual mode,
+              a serving lazy index participates in normal planning. In strong mode, the same index is
+              filtered out before path creation.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section id="semantics" class="section">
+        <div class="section-inner">
+          <p class="eyebrow">Read and write semantics</p>
+          <h2>Expected behavior</h2>
+          <div class="two-col">
+            <div class="callout">
+              <h3>Eventual is intentionally stale</h3>
+              <p>
+                The design accepts missing rows, stale rows, stale ordering, stale limits, stale
+                aggregates, and stale join inputs whenever the chosen plan uses a lazy index.
+              </p>
+              <p>
+                This matches the product goal: remove index maintenance from the write transaction,
+                then opt into the index for read acceleration when staleness is acceptable.
+              </p>
+            </div>
+            <div>
+              <pre class="code"><code>CREATE INDEX lazy_idx
+ON orders(status)
+WITH (yb_external_maintenance = true);
+
+-- Hidden until materialized.
+ALTER INDEX lazy_idx SET (yb_lazy_index_serving = true);
+
+-- Session-level planner policy.
+SET yb_index_consistency = eventual; -- can use lazy indexes
+SET yb_index_consistency = strong;   -- excludes lazy indexes</code></pre>
+              <ul class="rules-list">
+                <li>Lazy index creation is non-unique, non-primary, non-constraint, non-partitioned, and non-concurrent.</li>
+                <li><code>yb_external_maintenance</code> is creation-time metadata and cannot be changed later.</li>
+                <li><code>yb_lazy_index_serving</code> is the operator-controlled planner visibility flag.</li>
+                <li>Serving lazy indexes are not rechecked against the base table by default.</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="walkthrough" class="section band">
+        <div class="section-inner">
+          <p class="eyebrow">Code walkthrough</p>
+          <h2>Changes by subsystem</h2>
+          <div class="walk-grid">
+            <article class="walk-card">
+              <span class="path">src/postgres/src/backend/access/common/reloptions.c<br>src/postgres/src/include/utils/rel.h</span>
+              <h3>Reloptions</h3>
+              <p>Registers two YB LSM index storage parameters and stores them in <code>StdRdOptions</code>.</p>
+              <ul>
+                <li><code>yb_external_maintenance</code> declares ownership by an external materializer.</li>
+                <li><code>yb_lazy_index_serving</code> controls planner visibility after materialization.</li>
+              </ul>
+            </article>
+
+            <article class="walk-card">
+              <span class="path">src/postgres/src/backend/utils/misc/guc.c<br>src/postgres/src/include/pg_yb_utils.h</span>
+              <h3>Planner Mode</h3>
+              <p>Adds <code>yb_index_consistency</code> as a user-settable enum with <code>eventual</code> and <code>strong</code> modes.</p>
+              <ul>
+                <li>Default is <code>eventual</code> for the read-optimization path.</li>
+                <li><code>strong</code> provides a simple escape hatch for consistent reads.</li>
+                <li>Changing the mode resets the session plan cache so prepared statements replan.</li>
+              </ul>
+            </article>
+
+            <article class="walk-card">
+              <span class="path">src/postgres/src/backend/utils/misc/pg_yb_utils.c</span>
+              <h3>Shared Helpers</h3>
+              <p>Centralizes checks for externally maintained indexes and planner usability.</p>
+              <ul>
+                <li><code>YbIsExternallyMaintainedIndex</code> validates YB LSM index state.</li>
+                <li><code>YbLazyIndexIsUsable</code> applies consistency and serving gates.</li>
+                <li><code>yb_backfill_external_index</code> supports the batch mock materializer.</li>
+              </ul>
+            </article>
+
+            <article class="walk-card">
+              <span class="path">src/postgres/src/backend/commands/indexcmds.c</span>
+              <h3>Create Index</h3>
+              <p>Validates lazy index DDL and changes create behavior for external maintenance.</p>
+              <ul>
+                <li>Rejects unique, primary, constraint, exclusion, partitioned, and concurrent lazy indexes.</li>
+                <li>For lazy indexes, creates metadata and DocDB table but skips initial index build.</li>
+                <li>Forces lazy indexes to start non-serving.</li>
+              </ul>
+            </article>
+
+            <article class="walk-card">
+              <span class="path">src/postgres/src/backend/executor/execIndexing.c</span>
+              <h3>Write Path</h3>
+              <p>Filters externally maintained indexes out of <code>ExecOpenIndices</code>.</p>
+              <ul>
+                <li>Base-table DML no longer opens lazy indexes for maintenance.</li>
+                <li><code>ri_NumIndices</code> is reset after filtering so later executor loops see the reduced list.</li>
+              </ul>
+            </article>
+
+            <article class="walk-card">
+              <span class="path">src/postgres/src/backend/optimizer/util/plancat.c</span>
+              <h3>Planner Gate</h3>
+              <p>Filters indexes while collecting relation metadata for planning.</p>
+              <ul>
+                <li>Non-serving lazy indexes are hidden.</li>
+                <li>Serving lazy indexes are visible in <code>eventual</code> mode.</li>
+                <li>All lazy indexes are hidden in <code>strong</code> mode.</li>
+              </ul>
+            </article>
+
+            <article class="walk-card">
+              <span class="path">src/postgres/src/backend/commands/tablecmds.c</span>
+              <h3>ALTER Guards</h3>
+              <p>Prevents metadata drift and invalidates plans when serving state changes.</p>
+              <ul>
+                <li><code>yb_external_maintenance</code> cannot be changed after index creation.</li>
+                <li><code>yb_lazy_index_serving=true</code> requires <code>yb_external_maintenance=true</code>.</li>
+                <li>Serving flips invalidate the indexed base table's relcache so cached plans replan.</li>
+              </ul>
+            </article>
+
+            <article class="walk-card">
+              <span class="path">src/yb/common/common.proto<br>src/yb/tserver/pg_client.proto<br>src/yb/yql/pggate/*<br>src/yb/client/table_creator.*</span>
+              <h3>Metadata Propagation</h3>
+              <p>Propagates the external-maintenance bit through pggate, tserver, client, and <code>IndexInfoPB</code>.</p>
+              <ul>
+                <li>DocDB treats the index metadata as externally maintained.</li>
+                <li>YSQL behavior still gates from reloptions for planner and executor decisions.</li>
+              </ul>
+            </article>
+
+            <article class="walk-card">
+              <span class="path">src/postgres/src/backend/catalog/yb_system_functions.sql<br>src/postgres/src/include/catalog/pg_proc.dat<br>src/postgres/src/include/catalog/catalog.h</span>
+              <h3>Internal Backfill Helper</h3>
+              <p>Adds <code>yb_backfill_external_index(regclass)</code> for batch-only validation.</p>
+              <ul>
+                <li>Uses normal index build insertion logic.</li>
+                <li>Validates the target is a non-unique externally maintained index.</li>
+              </ul>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="mock-qe" class="section">
+        <div class="section-inner">
+          <p class="eyebrow">Batch materialization</p>
+          <h2>Mock QueryEngine flow</h2>
+          <div class="sequence">
+            <div class="sequence-item">
+              <div>
+                <h3>Resolve the index</h3>
+                <p><code>scripts/yb_lazy_index_mock_qe.py</code> verifies the target exists and has <code>yb_external_maintenance=true</code>.</p>
+              </div>
+            </div>
+            <div class="sequence-item">
+              <div>
+                <h3>Mark non-serving</h3>
+                <p>The script runs <code>ALTER INDEX ... SET (yb_lazy_index_serving = false)</code> so queries cannot plan the index while it is being populated.</p>
+              </div>
+            </div>
+            <div class="sequence-item">
+              <div>
+                <h3>Backfill from the base table</h3>
+                <p>The script calls <code>SELECT yb_backfill_external_index('schema.index'::regclass);</code> to scan the base table and write index entries.</p>
+              </div>
+            </div>
+            <div class="sequence-item">
+              <div>
+                <h3>Flip serving</h3>
+                <p>After the batch run, the script sets <code>yb_lazy_index_serving=true</code>, making the index eligible in <code>eventual</code> mode.</p>
+              </div>
+            </div>
+          </div>
+          <pre class="code"><code>scripts/yb_lazy_index_mock_qe.py public.lazy_idx \
+  --ysqlsh /path/to/yugabyte-db/bin/ysqlsh \
+  --host 127.0.0.1 \
+  --port 15433 \
+  --user yugabyte \
+  --database yugabyte</code></pre>
+        </div>
+      </section>
+
+      <section id="validation" class="section band">
+        <div class="section-inner">
+          <p class="eyebrow">End-to-end validation</p>
+          <h2>What passed locally</h2>
+          <div class="test-grid">
+            <article class="test-card">
+              <h3>Build</h3>
+              <p>Built with the documented fallback command from <code>BUILDING_YUGABYTE.md</code>.</p>
+              <div class="pill-row">
+                <span class="pill">release</span>
+                <span class="pill">daemons</span>
+                <span class="pill">initdb</span>
+                <span class="pill">--sj</span>
+                <span class="pill">--no-ccache</span>
+              </div>
+            </article>
+
+            <article class="test-card">
+              <h3>Binary Checks</h3>
+              <p><code>yb-master</code>, <code>yb-tserver</code>, <code>yb-admin</code>, and <code>bin/ysqlsh</code> were present and executable.</p>
+              <div class="pill-row">
+                <span class="pill">yb-master</span>
+                <span class="pill">yb-tserver</span>
+                <span class="pill">yb-admin</span>
+                <span class="pill">ysqlsh</span>
+              </div>
+            </article>
+
+            <article class="test-card">
+              <h3>Planner Gating</h3>
+              <p>Before serving, both <code>eventual</code> and <code>strong</code> plans used a table scan. After mock backfill, <code>eventual</code> used <code>Index Scan</code> and <code>strong</code> used a table scan.</p>
+              <pre class="code"><code>eventual: Index Scan using lazy_idx_e2e_status_idx
+strong:   Seq Scan on lazy_idx_e2e</code></pre>
+            </article>
+
+            <article class="test-card">
+              <h3>Staleness Check</h3>
+              <p>After inserting a new row, eventual mode missed it through the stale index while strong mode saw it through the base table. After another mock backfill, eventual mode saw the row.</p>
+              <pre class="code"><code>eventual_before_refresh = 0
+strong_before_refresh   = 1
+eventual_after_refresh  = 1</code></pre>
+            </article>
+
+            <article class="test-card">
+              <h3>Guardrails</h3>
+              <p>Validation rejected serving mode on a normal index and rejected resetting external maintenance after creation.</p>
+              <pre class="code"><code>yb_lazy_index_serving requires yb_external_maintenance
+yb_external_maintenance cannot be changed after index creation</code></pre>
+            </article>
+
+            <article class="test-card">
+              <h3>RF3 Smoke</h3>
+              <p>The RF3 helper's built-in YSQL smoke test passed and cleanup removed cluster-owned processes and data.</p>
+              <div class="pill-row">
+                <span class="pill">start</span>
+                <span class="pill">test</span>
+                <span class="pill">cleanup</span>
+                <span class="pill">no remaining processes</span>
+              </div>
+            </article>
+
+            <article class="test-card">
+              <h3>Plan Cache</h3>
+              <p>Regression coverage exercises generic prepared plans across non-serving to serving, eventual to strong, and serving to non-serving transitions.</p>
+              <div class="pill-row">
+                <span class="pill">force_generic_plan</span>
+                <span class="pill">GUC invalidation</span>
+                <span class="pill">serving invalidation</span>
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="scope" class="section">
+        <div class="section-inner">
+          <p class="eyebrow">Scope</p>
+          <h2>What this prototype is and is not</h2>
+          <div class="risk-grid">
+            <article class="risk-card">
+              <h3>In Scope</h3>
+              <ul class="check-list">
+                <li>YSQL non-unique YB LSM secondary indexes.</li>
+                <li>Planner-level consistency control.</li>
+                <li>Write-path suppression for lazy indexes.</li>
+                <li>Batch materialization for end-to-end testing.</li>
+                <li>Normal index scans and pushdowns in eventual mode.</li>
+                <li>Plan-cache invalidation for consistency and serving-state changes.</li>
+              </ul>
+            </article>
+            <article class="risk-card">
+              <h3>Out Of Scope For This Phase</h3>
+              <ul class="check-list">
+                <li>CDC or streaming maintenance.</li>
+                <li>Unique, primary, constraint, exclusion, and partitioned lazy indexes.</li>
+                <li>Guaranteed freshness in eventual mode.</li>
+                <li>Base-row validation as a safety rule.</li>
+                <li>Deleting stale index entries in the mock materializer.</li>
+                <li>Canceling already-running queries when an index is marked non-serving.</li>
+              </ul>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <footer class="footer">
+        <div class="section-inner">
+          <p>Source branch: <code>jbrazeau/lazy-index-external-maintenance</code></p>
+          <p>Static site path: <code>architecture/design/externally-maintained-lazy-indexes-site/index.html</code></p>
+        </div>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

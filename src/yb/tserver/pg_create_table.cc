@@ -211,6 +211,9 @@ Status PgCreateTable::Exec(
     if (req_.skip_index_backfill()) {
       table_creator->skip_index_backfill(true);
     }
+    if (req_.yb_external_maintenance()) {
+      table_creator->externally_maintained_index(true);
+    }
   }
 
   // If the table was created in the xCluster DDL replication extension.

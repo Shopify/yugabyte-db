@@ -1219,6 +1219,7 @@ YBCCreateIndex(const char *indexName,
 			   Relation rel,
 			   YbOptSplit *split_options,
 			   const bool skip_index_backfill,
+			   bool yb_external_maintenance,
 			   bool is_colocated,
 			   Oid tablegroupId,
 			   Oid colocationId,
@@ -1252,6 +1253,7 @@ YBCCreateIndex(const char *indexName,
 									   is_sys_catalog_index,
 									   indexInfo->ii_Unique,
 									   skip_index_backfill,
+									   yb_external_maintenance,
 									   false,	/* if_not_exists */
 									   MyDatabaseColocated && is_colocated,
 									   tablegroupId,
@@ -1797,6 +1799,10 @@ YBCPrepareAlterTableCmd(AlterTableCmd *cmd, Relation rel, List *handles,
 						continue;
 
 					if (strcmp(def->defname, "yb_presplit") == 0)
+						continue;
+
+					if (strcmp(def->defname, "yb_external_maintenance") == 0 ||
+						strcmp(def->defname, "yb_lazy_index_serving") == 0)
 						continue;
 
 					ereport(NOTICE,

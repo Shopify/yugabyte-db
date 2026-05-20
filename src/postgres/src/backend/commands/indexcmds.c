@@ -579,6 +579,7 @@ DefineIndex(Oid relationId,
 	bool		partitioned;
 	bool		safe_index;
 	Datum		reloptions;
+	bytea	   *parsed_reloptions;
 	int16	   *coloptions;
 	IndexInfo  *indexInfo;
 	bits16		flags;
@@ -603,6 +604,8 @@ DefineIndex(Oid relationId,
 	Oid			colocation_id = InvalidOid;
 	bool		is_colocated = false;
 	bool		yb_skip_index_creation;
+	bool		yb_external_maintenance = false;
+	bool		yb_lazy_index_serving = false;
 
 	root_save_nestlevel = NewGUCNestLevel();
 
@@ -1362,7 +1365,52 @@ DefineIndex(Oid relationId,
 	reloptions = transformRelOptions((Datum) 0, stmt->options,
 									 NULL, NULL, false, false);
 
-	(void) index_reloptions(amoptions, reloptions, true);
+	parsed_reloptions = index_reloptions(amoptions, reloptions, true);
+	if (IsYBRelation(rel) && accessMethodId == LSM_AM_OID && parsed_reloptions)
+	{
+		yb_external_maintenance =
+			YbIndexOptionsAreExternallyMaintained(parsed_reloptions);
+		yb_lazy_index_serving = YbIndexOptionsAreServing(parsed_reloptions);
+	}
+
+	if (yb_lazy_index_serving && !yb_external_maintenance)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("yb_lazy_index_serving requires yb_external_maintenance")));
+
+	if (yb_external_maintenance)
+	{
+		if (yb_lazy_index_serving)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("externally maintained indexes must be created as non-serving"),
+					 errhint("Backfill the index first, then use ALTER INDEX to set "
+							 "yb_lazy_index_serving=true.")));
+
+		if (concurrent)
+		{
+			if (stmt->concurrent == YB_CONCURRENCY_EXPLICIT_ENABLED)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("CREATE INDEX CONCURRENTLY is not supported for externally "
+								"maintained indexes")));
+			concurrent = false;
+			LockRelationOid(relationId, ShareLock);
+		}
+
+		if (partitioned)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("externally maintained indexes on partitioned tables are not "
+							"supported yet")));
+
+		if (stmt->primary || stmt->unique || stmt->isconstraint ||
+			stmt->excludeOpNames != NIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("unique, primary-key, constraint, and exclusion indexes cannot "
+							"be externally maintained")));
+	}
 
 	reloptions = ybExcludeNonPersistentReloptions(reloptions);
 
@@ -1621,6 +1669,8 @@ DefineIndex(Oid relationId,
 		flags |= INDEX_CREATE_ADD_CONSTRAINT;
 	if (skip_build || concurrent || partitioned)
 		flags |= INDEX_CREATE_SKIP_BUILD;
+	if (yb_external_maintenance)
+		flags |= INDEX_CREATE_SKIP_BUILD;
 	if (stmt->if_not_exists)
 		flags |= INDEX_CREATE_IF_NOT_EXISTS;
 	if (concurrent)
@@ -1670,8 +1720,9 @@ DefineIndex(Oid relationId,
 					 flags, constr_flags,
 					 allowSystemTableMods, !check_rights,
 					 &createdConstraintId, stmt->split_options,
-					 !concurrent, is_colocated, tablegroupId, colocation_id,
-					 yb_skip_index_creation);
+					 !concurrent || yb_external_maintenance,
+					 yb_external_maintenance, is_colocated, tablegroupId,
+					 colocation_id, yb_skip_index_creation);
 
 	ObjectAddressSet(address, RelationRelationId, indexRelationId);
 

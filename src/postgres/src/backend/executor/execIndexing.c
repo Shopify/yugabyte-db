@@ -120,6 +120,7 @@
 #include "catalog/pg_am_d.h"
 #include "executor/ybModifyTable.h"
 #include "funcapi.h"
+#include "pg_yb_utils.h"
 #include "utils/relcache.h"
 #include "yb/yql/pggate/ybc_gflags.h"
 
@@ -222,6 +223,11 @@ ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative)
 		IndexInfo  *ii;
 
 		indexDesc = index_open(indexOid, RowExclusiveLock);
+		if (YbIsExternallyMaintainedIndex(indexDesc))
+		{
+			index_close(indexDesc, RowExclusiveLock);
+			continue;
+		}
 
 		/* extract index key information from the index's pg_index info */
 		ii = BuildIndexInfo(indexDesc);
@@ -238,6 +244,7 @@ ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative)
 		i++;
 	}
 
+	resultRelInfo->ri_NumIndices = i;
 	list_free(indexoidlist);
 }
 

@@ -367,6 +367,8 @@ typedef struct StdRdOptions
 	Oid			row_type_oid;
 	int			yb_presplit_offset;	/* Offset to presplit config string */
 	YbAutoAnalyzeOpts yb_auto_analyze;	/* YB auto analyze options */
+	bool		yb_external_maintenance;	/* Index is maintained outside YB's write path */
+	bool		yb_lazy_index_serving;	/* Externally maintained index may be planned */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10

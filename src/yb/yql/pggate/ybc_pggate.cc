@@ -1301,6 +1301,7 @@ YbcStatus YBCPgNewCreateIndex(const char *database_name,
                               bool is_sys_catalog_index,
                               bool is_unique_index,
                               const bool skip_index_backfill,
+                              bool yb_external_maintenance,
                               bool if_not_exist,
                               bool is_colocated_via_database,
                               const YbcPgOid tablegroup_oid,
@@ -1318,10 +1319,11 @@ YbcStatus YBCPgNewCreateIndex(const char *database_name,
 
   return ToYBCStatus(pgapi->NewCreateIndex(database_name, schema_name, index_name, index_id,
                                            table_id, is_shared_index, is_sys_catalog_index,
-                                           is_unique_index, skip_index_backfill, if_not_exist,
-                                           is_colocated_via_database, tablegroup_id,
-                                           colocation_id, tablespace_id, pg_table_id,
-                                           old_relfilenode_id, handle));
+                                           is_unique_index, skip_index_backfill,
+                                           yb_external_maintenance, if_not_exist,
+                                           is_colocated_via_database, tablegroup_id, colocation_id,
+                                           tablespace_id, pg_table_id, old_relfilenode_id,
+                                           handle));
 }
 
 YbcStatus YBCPgCreateIndexAddColumn(YbcPgStatement handle, const char *attr_name, int attr_num,

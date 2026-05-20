@@ -352,7 +352,8 @@ PgCreateIndex::PgCreateIndex(
     bool use_regular_transaction_block,
     const PgObjectId& base_table_id,
     bool is_unique_index,
-    bool skip_index_backfill)
+    bool skip_index_backfill,
+    bool yb_external_maintenance)
     : BaseType(
           pg_session, database_name, schema_name, table_name, table_id, is_shared_table,
           is_sys_catalog_table, if_not_exist, ybrowid_mode, is_colocated_via_database,
@@ -361,6 +362,7 @@ PgCreateIndex::PgCreateIndex(
   base_table_id.ToPB(req_.mutable_base_table_id());
   req_.set_is_unique_index(is_unique_index);
   req_.set_skip_index_backfill(skip_index_backfill);
+  req_.set_yb_external_maintenance(yb_external_maintenance);
 }
 
 //--------------------------------------------------------------------------------------------------

@@ -395,6 +395,7 @@ class PgApiImpl {
                         bool is_sys_catalog_index,
                         bool is_unique_index,
                         const bool skip_index_backfill,
+                        bool yb_external_maintenance,
                         bool if_not_exist,
                         bool is_colocated_via_database,
                         const PgObjectId& tablegroup_oid,

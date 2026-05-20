@@ -12189,6 +12189,12 @@
   proargnames => '{indexrelid,single_snapshot_mode}',
   prosrc => 'yb_index_check'},
 
+{ oid => '8629', descr => 'backfills an externally maintained YB index from its base relation',
+  proname => 'yb_backfill_external_index', provolatile => 'v',
+  prorettype => 'void', proargtypes => 'regclass',
+  proargnames => '{indexrelid}',
+  prosrc => 'yb_backfill_external_index'},
+
 # Statistics Import
 { oid => '8091',
   descr => 'restore statistics on relation',
