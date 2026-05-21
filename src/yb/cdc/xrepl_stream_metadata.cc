@@ -233,6 +233,45 @@ Result<std::optional<uint32_t>> StreamMetadata::GetDbOidToGetSequencesForUnlocke
   return GetPgsqlDatabaseOid(namespace_id);
 }
 
+void StreamMetadata::InitForStreamlessUse(
+    const NamespaceId& namespace_id,
+    CDCRecordType record_type,
+    CDCRecordFormat record_format,
+    const std::vector<TableId>& table_ids) {
+  std::lock_guard l_load(load_mutex_);
+  std::lock_guard l_table(mutex_);
+
+  // Idempotent: callers may reuse a single StreamMetadata across StreamWAL
+  // batches without re-initializing per request.
+  if (loaded_.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  namespace_id_ = namespace_id;
+  record_type_ = record_type;
+  record_format_ = record_format;
+  source_type_ = CDCRequestSource::CDCSDK;
+  checkpoint_type_ = CDCCheckpointType::IMPLICIT;
+  consistent_snapshot_option_.reset();
+  replication_slot_name_.reset();
+  replication_slot_lsn_type_.reset();
+  replication_slot_ordering_mode_.reset();
+  db_oid_to_get_sequences_for_.reset();
+  state_.store(master::SysCDCStreamEntryPB_State_ACTIVE, std::memory_order_release);
+  transactional_.store(StreamModeTransactional::kFalse, std::memory_order_release);
+  consistent_snapshot_time_.store(std::nullopt, std::memory_order_release);
+  stream_creation_time_.store(std::nullopt, std::memory_order_release);
+
+  {
+    std::lock_guard l_table_ids(table_ids_mutex_);
+    table_ids_ = table_ids;
+    unqualified_table_ids_.clear();
+    replica_identitity_map_.clear();
+  }
+
+  loaded_.store(true, std::memory_order_release);
+}
+
 void StreamMetadata::StreamTabletMetadata::ResetOnTermChange(int64_t term) {
   if (term == term_) {
     return;

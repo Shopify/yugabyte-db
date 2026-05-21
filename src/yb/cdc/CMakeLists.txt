@@ -122,3 +122,4 @@ ADD_YB_LIBRARY(
 # Tests
 set(YB_TEST_LINK_LIBS integration-tests ${YB_MIN_TEST_LIBS})
 ADD_YB_TEST(xcluster_producer-test)
+ADD_YB_TEST(stream_wal-test)

@@ -3224,5 +3224,389 @@ Status GetChangesForCDCSDK(
   return Status::OK();
 }  // NOLINT(readability/fn_size)
 
+// ----------------------------------------------------------------------------
+// StreamWAL helpers.
+//
+// Additive callsites layered on top of the existing decoder family. Used by
+// CDCServiceImpl::StreamWAL only. Do not modify the underlying decoder
+// functions; we only invoke them and assemble small envelope records here.
+// ----------------------------------------------------------------------------
+
+namespace {
+
+// Populate the column / table-properties payload of a synthetic bootstrap DDL
+// record from current tablet metadata for a given (table_id, table_name).
+void FillBootstrapDDLRecord(
+    const tablet::Tablet& tablet,
+    const TableId& table_id,
+    const TableName& table_name,
+    SchemaVersion schema_version,
+    const Schema& schema,
+    uint32_t write_id_for_disambiguation,
+    CDCSDKProtoRecordPB* proto_record) {
+  SchemaPB schema_pb;
+  SchemaToPB(schema, &schema_pb);
+
+  auto* row_message = proto_record->mutable_row_message();
+  row_message->set_op(RowMessage_Op_DDL);
+  row_message->set_table(table_name);
+  row_message->set_table_id(table_id);
+  row_message->set_schema_version(schema_version);
+  row_message->set_pgschema_name(schema_pb.deprecated_pgschema_name());
+
+  for (const auto& column : schema_pb.columns()) {
+    SetColumnInfo(column, row_message->mutable_schema()->add_column_info());
+  }
+
+  SetTableProperties(
+      schema_pb.table_properties(), row_message->mutable_schema()->mutable_tab_info());
+
+  // Bootstrap DDLs are not derived from a real WAL OpId. The contract pins the
+  // term/index to 0 and uses write_id as a per-table disambiguator within the
+  // bootstrap batch.
+  auto* op_id_pb = proto_record->mutable_cdc_sdk_op_id();
+  SetCDCSDKOpId(
+      /*term=*/0, /*index=*/0,
+      /*write_id=*/write_id_for_disambiguation, /*write_id_key=*/"",
+      op_id_pb);
+  (void)tablet;  // unused; reserved for future use (e.g. before-image deps)
+}
+
+}  // namespace
+
+Status PopulateSyntheticBootstrapDDLs(
+    const std::shared_ptr<tablet::TabletPeer>& tablet_peer,
+    std::vector<CDCSDKProtoRecordPB>* out) {
+  RSTATUS_DCHECK(out, InvalidArgument, "out vector must be non-null");
+  auto tablet_ptr = VERIFY_RESULT(tablet_peer->shared_tablet());
+
+  // The sys catalog tablet's schemas are resolved per-row by the decoder; we
+  // do not bootstrap them up-front.
+  if (tablet_ptr->metadata()->IsSysCatalog()) {
+    return Status::OK();
+  }
+
+  const auto& meta = *tablet_ptr->metadata();
+  uint32_t write_id = 0;
+
+  for (const auto& table_id : meta.GetAllColocatedTables()) {
+    auto table_info_result = meta.GetTableInfo(table_id);
+    if (!table_info_result.ok()) {
+      // Could happen for a recently-deleted colocated table; just skip.
+      LOG(WARNING) << "StreamWAL bootstrap: skipping table_id=" << table_id
+                   << " on tablet=" << tablet_ptr->tablet_id()
+                   << " -- no TableInfo: " << table_info_result.status();
+      continue;
+    }
+    const auto& table_info = *table_info_result;
+    const auto& table_name = table_info->table_name;
+
+    // Skip tablegroup / colocation parent tables; they are not user-visible.
+    if (boost::ends_with(table_name, kTablegroupParentTableNameSuffix) ||
+        boost::ends_with(table_name, kColocationParentTableNameSuffix)) {
+      continue;
+    }
+
+    auto schema_ptr = meta.schema(table_id);
+    if (!schema_ptr) {
+      LOG(WARNING) << "StreamWAL bootstrap: skipping table_id=" << table_id
+                   << " on tablet=" << tablet_ptr->tablet_id() << " -- no schema";
+      continue;
+    }
+    const SchemaVersion schema_version = meta.schema_version(table_id);
+
+    out->emplace_back();
+    FillBootstrapDDLRecord(
+        *tablet_ptr, table_id, table_name, schema_version, *schema_ptr, write_id,
+        &out->back());
+    ++write_id;
+  }
+
+  return Status::OK();
+}
+
+Status PopulateStreamWalApplyingRecord(
+    const consensus::ReplicateMsgPtr& msg,
+    CDCSDKProtoRecordPB* out) {
+  RSTATUS_DCHECK(out, InvalidArgument, "out record must be non-null");
+  RSTATUS_DCHECK(
+      msg->has_transaction_state(), InvalidArgument,
+      "UPDATE_TRANSACTION_OP message missing transaction_state");
+
+  const auto& txn_state = msg->transaction_state();
+  RSTATUS_DCHECK(
+      txn_state.status() == TransactionStatus::APPLYING, InvalidArgument,
+      "PopulateStreamWalApplyingRecord requires APPLYING status");
+
+  auto* row_message = out->mutable_row_message();
+  row_message->set_op(RowMessage_Op_COMMIT);
+  // Existing CDCSDK consumers (e.g. the Debezium connector) parse
+  // RowMessage.transaction_id as the UUID-string form (mirrors how
+  // GetChangesForCDCSDK emits BEGIN/COMMIT records via FillBeginRecord /
+  // FillCommitRecord at cdcsdk_producer.cc:1712 / 1728). Decode the raw 16
+  // bytes carried on TransactionStatePB and re-encode as UUID-string here.
+  auto txn_id_result = FullyDecodeTransactionId(txn_state.transaction_id());
+  if (!txn_id_result.ok()) {
+    return txn_id_result.status();
+  }
+  row_message->set_transaction_id(txn_id_result->ToString());
+  if (txn_state.has_commit_hybrid_time()) {
+    row_message->set_commit_time(txn_state.commit_hybrid_time());
+  }
+  if (txn_state.has_xrepl_origin_id()) {
+    row_message->set_xrepl_origin_id(txn_state.xrepl_origin_id());
+  }
+
+  auto* op_id_pb = out->mutable_cdc_sdk_op_id();
+  SetCDCSDKOpId(
+      msg->id().term(), msg->id().index(), /*write_id=*/0, /*write_id_key=*/"",
+      op_id_pb);
+
+  if (txn_state.has_aborted()) {
+    // SubtxnSet uses a compressed delta encoding; we mirror the LW pb's set
+    // field verbatim to the regular SubtxnSetPB output so the wire payload
+    // matches the source WAL entry. Decoding back to a SubtxnSet is then the
+    // client's responsibility (matching SubtxnSet::FromPB on the producer
+    // side -- see e.g. cdcsdk_producer.cc usages).
+    //
+    // Note: the LW pb generator emits `set()` as a single accessor returning
+    // `const ArenaVector<uint32_t>&` (not the heavy-pb `set_size()` / `set(i)`
+    // pair). Range-iterate over it directly.
+    auto* aborted_pb = out->mutable_aborted_subtxn_set();
+    for (uint32_t value : txn_state.aborted().set()) {
+      aborted_pb->add_set(value);
+    }
+  }
+
+  return Status::OK();
+}
+
+Status PopulateStreamWalSplitRecord(
+    const consensus::ReplicateMsgPtr& msg,
+    CDCSDKProtoRecordPB* out) {
+  RSTATUS_DCHECK(out, InvalidArgument, "out record must be non-null");
+  RSTATUS_DCHECK(
+      msg->has_split_request(), InvalidArgument,
+      "SPLIT_OP message missing split_request");
+
+  auto* row_message = out->mutable_row_message();
+  // RowMessage has no dedicated SPLIT op; the split payload is carried on the
+  // parent CDCSDKProtoRecordPB.split_tablet_request field. We mark the
+  // RowMessage op as UNKNOWN so existing clients that only inspect row_message.op
+  // know not to interpret this record as a DML / DDL / etc.
+  row_message->set_op(RowMessage_Op_UNKNOWN);
+  row_message->set_commit_time(msg->hybrid_time());
+
+  auto* op_id_pb = out->mutable_cdc_sdk_op_id();
+  SetCDCSDKOpId(
+      msg->id().term(), msg->id().index(), /*write_id=*/0, /*write_id_key=*/"",
+      op_id_pb);
+
+  msg->split_request().ToGoogleProtobuf(out->mutable_split_tablet_request());
+  return Status::OK();
+}
+
+// Transfer all CDCSDKProtoRecordPBs from a GetChangesResponsePB scratchpad to
+// the StreamWAL output vector. Clears the scratchpad afterwards so the next op
+// starts fresh.
+void TransferDecodedRecords(
+    GetChangesResponsePB* scratchpad,
+    std::vector<CDCSDKProtoRecordPB>* out_records) {
+  for (auto& rec : *scratchpad->mutable_cdc_sdk_proto_records()) {
+    out_records->emplace_back();
+    out_records->back().Swap(&rec);
+  }
+  scratchpad->clear_cdc_sdk_proto_records();
+}
+
+// Post-process the records the single-shard WRITE_OP decoder emitted, in place,
+// when the source WAL entry is actually a transactional WRITE_OP. The existing
+// decoder is single-shard-shaped (it emits a BEGIN, per-row DMLs stamped with
+// commit_time = ReplicateMsg.hybrid_time, and a COMMIT). For transactional
+// writes the contract requires the row records to carry transaction_id /
+// subtransaction_id and to NOT carry commit_time (commit_time is supplied by
+// the APPLYING envelope on the same WAL). We also drop the BEGIN/COMMIT
+// envelopes because they describe single-shard commit semantics that don't
+// apply to a partial intent-time batch.
+void PostProcessTransactionalWriteRecords(
+    const yb::docdb::LWKeyValueWriteBatchPB& batch,
+    std::vector<CDCSDKProtoRecordPB>* records) {
+  std::string transaction_id_str;
+  if (batch.has_transaction() && batch.transaction().has_transaction_id()) {
+    auto txn_id_result = FullyDecodeTransactionId(batch.transaction().transaction_id());
+    if (txn_id_result.ok()) {
+      transaction_id_str = txn_id_result->ToString();
+    }
+  }
+
+  std::optional<uint32_t> subtxn_id;
+  if (batch.has_subtransaction() && batch.subtransaction().has_subtransaction_id() &&
+      batch.subtransaction().subtransaction_id() != kMinSubTransactionId) {
+    subtxn_id = batch.subtransaction().subtransaction_id();
+  }
+
+  std::vector<CDCSDKProtoRecordPB> filtered;
+  filtered.reserve(records->size());
+  for (auto& rec : *records) {
+    if (!rec.has_row_message()) {
+      filtered.emplace_back(std::move(rec));
+      continue;
+    }
+    const auto op = rec.row_message().op();
+    if (op == RowMessage_Op_BEGIN || op == RowMessage_Op_COMMIT) {
+      // Single-shard envelope; not applicable to a transactional intent batch.
+      continue;
+    }
+
+    rec.mutable_row_message()->clear_commit_time();
+    if (!transaction_id_str.empty()) {
+      rec.mutable_row_message()->set_transaction_id(transaction_id_str);
+    }
+    if (subtxn_id.has_value()) {
+      // RowMessage doesn't carry subtransaction_id (it's a field on the legacy
+      // CDCRecordPB). We deliberately do not invent a new field here -- clients
+      // that need savepoint-level filtering inspect aborted_subtxn_set on the
+      // APPLYING record and reconcile per-row intent records via IntentsDB
+      // (out of scope for v1 of the StreamWAL contract).
+      (void)subtxn_id;
+    }
+    filtered.emplace_back(std::move(rec));
+  }
+  *records = std::move(filtered);
+}
+
+Result<StreamWalDispatchResult> DispatchWalOpForStreamWAL(
+    const consensus::ReplicateMsgPtr& msg,
+    StreamWalDecodeContext* ctx,
+    std::vector<CDCSDKProtoRecordPB>* out_records) {
+  RSTATUS_DCHECK(ctx, InvalidArgument, "ctx must be non-null");
+  RSTATUS_DCHECK(ctx->tablet_peer, InvalidArgument, "ctx->tablet_peer must be non-null");
+  RSTATUS_DCHECK(ctx->stream_metadata, InvalidArgument, "ctx->stream_metadata must be non-null");
+  RSTATUS_DCHECK(
+      ctx->cached_schema_details, InvalidArgument, "ctx->cached_schema_details must be non-null");
+  RSTATUS_DCHECK(
+      ctx->schema_packing_storages, InvalidArgument,
+      "ctx->schema_packing_storages must be non-null");
+  RSTATUS_DCHECK(ctx->enum_map, InvalidArgument, "ctx->enum_map must be non-null");
+  RSTATUS_DCHECK(
+      ctx->composite_atts_map, InvalidArgument, "ctx->composite_atts_map must be non-null");
+  RSTATUS_DCHECK(out_records, InvalidArgument, "out_records must be non-null");
+
+  auto tablet_ptr = VERIFY_RESULT(ctx->tablet_peer->shared_tablet());
+
+  StreamWalDispatchResult result;
+  CDCThroughputMetrics throughput_metrics;
+  GetChangesResponsePB scratchpad;
+
+  switch (msg->op_type()) {
+    case consensus::OperationType::WRITE_OP: {
+      const auto& batch = msg->write().write_batch();
+      const bool is_transactional = batch.has_transaction();
+      RETURN_NOT_OK(PopulateCDCSDKWriteRecord(
+          msg, *ctx->stream_metadata, ctx->tablet_peer, *ctx->enum_map,
+          *ctx->composite_atts_map, CDCSDKRequestSource::DEBEZIUM,
+          ctx->cached_schema_details, ctx->schema_packing_storages,
+          &scratchpad, ctx->client, &throughput_metrics));
+      TransferDecodedRecords(&scratchpad, out_records);
+      if (is_transactional) {
+        // Decoder is single-shard-shaped; reshape the emitted records to the
+        // contract's transactional WRITE_OP envelope.
+        PostProcessTransactionalWriteRecords(batch, out_records);
+      }
+      result.kind = out_records->empty()
+                        ? StreamWalDispatchResult::Kind::kSilent
+                        : StreamWalDispatchResult::Kind::kRecordsEmitted;
+      break;
+    }
+
+    case consensus::OperationType::UPDATE_TRANSACTION_OP: {
+      if (msg->transaction_state().status() == TransactionStatus::APPLYING) {
+        CDCSDKProtoRecordPB applying_record;
+        RETURN_NOT_OK(PopulateStreamWalApplyingRecord(msg, &applying_record));
+        out_records->emplace_back();
+        out_records->back().Swap(&applying_record);
+        result.kind = StreamWalDispatchResult::Kind::kRecordsEmitted;
+      } else {
+        // PROMOTING and any other UPDATE_TRANSACTION_OP status: silent cursor
+        // advance, no record emitted.
+        result.kind = StreamWalDispatchResult::Kind::kSilent;
+      }
+      break;
+    }
+
+    case consensus::OperationType::CHANGE_METADATA_OP: {
+      Schema new_schema;
+      RETURN_NOT_OK(SchemaFromPB(
+          msg->change_metadata_request().schema().ToGoogleProtobuf(), &new_schema));
+
+      TableId target_table_id = tablet_ptr->metadata()->table_id();
+      TableName target_table_name = tablet_ptr->metadata()->table_name();
+      if (tablet_ptr->metadata()->colocated() &&
+          !msg->change_metadata_request().alter_table_id().empty()) {
+        auto table_info_result = tablet_ptr->metadata()->GetTableInfo(
+            msg->change_metadata_request().alter_table_id().ToBuffer());
+        if (table_info_result.ok()) {
+          target_table_id = (*table_info_result)->table_id;
+          target_table_name = (*table_info_result)->table_name;
+        }
+      }
+
+      RETURN_NOT_OK(PopulateCDCSDKDDLRecord(
+          msg, scratchpad.add_cdc_sdk_proto_records(), target_table_name, target_table_id,
+          new_schema, &throughput_metrics));
+      TransferDecodedRecords(&scratchpad, out_records);
+      result.kind = StreamWalDispatchResult::Kind::kRecordsEmitted;
+      break;
+    }
+
+    case consensus::OperationType::TRUNCATE_OP: {
+      RETURN_NOT_OK(PopulateCDCSDKTruncateRecord(
+          msg, scratchpad.add_cdc_sdk_proto_records(),
+          *tablet_ptr->schema().get(), &throughput_metrics));
+      // The CDCSDK truncate decoder does not stamp row_message.table_id; fill
+      // it here so consumers can route the record to the right Kafka topic.
+      if (scratchpad.cdc_sdk_proto_records_size() > 0) {
+        auto* rm = scratchpad.mutable_cdc_sdk_proto_records(
+                          scratchpad.cdc_sdk_proto_records_size() - 1)
+                       ->mutable_row_message();
+        if (!rm->has_table_id()) {
+          rm->set_table_id(tablet_ptr->metadata()->table_id());
+        }
+      }
+      TransferDecodedRecords(&scratchpad, out_records);
+      result.kind = StreamWalDispatchResult::Kind::kRecordsEmitted;
+      break;
+    }
+
+    case consensus::OperationType::SPLIT_OP: {
+      // Only emit SPLIT_OP for the current tablet. Other SPLIT_OPs are silent.
+      if (msg->has_split_request() &&
+          msg->split_request().tablet_id() == ctx->tablet_peer->tablet_id()) {
+        CDCSDKProtoRecordPB split_record;
+        RETURN_NOT_OK(PopulateStreamWalSplitRecord(msg, &split_record));
+        out_records->emplace_back();
+        out_records->back().Swap(&split_record);
+        result.kind = StreamWalDispatchResult::Kind::kSplitTerminal;
+      } else {
+        result.kind = StreamWalDispatchResult::Kind::kSilent;
+      }
+      break;
+    }
+
+    case consensus::OperationType::NO_OP:
+    case consensus::OperationType::UNKNOWN_OP:
+    case consensus::OperationType::CHANGE_CONFIG_OP:
+    case consensus::OperationType::SNAPSHOT_OP:
+    case consensus::OperationType::HISTORY_CUTOFF_OP:
+    case consensus::OperationType::CHANGE_AUTO_FLAGS_CONFIG_OP:
+    case consensus::OperationType::CLONE_OP:
+      // Silent cursor advance.
+      result.kind = StreamWalDispatchResult::Kind::kSilent;
+      break;
+  }
+
+  return result;
+}
+
 }  // namespace cdc
 }  // namespace yb

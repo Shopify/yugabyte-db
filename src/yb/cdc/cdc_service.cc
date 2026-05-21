@@ -47,10 +47,14 @@
 #include "yb/common/wire_protocol.h"
 #include "yb/common/xcluster_util.h"
 
+#include "yb/consensus/consensus.messages.h"
 #include "yb/consensus/log.h"
+#include "yb/consensus/log_cache.h"
 #include "yb/consensus/log_reader.h"
 #include "yb/consensus/raft_consensus.h"
 #include "yb/consensus/replicate_msgs_holder.h"
+
+#include "yb/dockv/schema_packing.h"
 
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/strings/join.h"
@@ -67,6 +71,7 @@
 
 #include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_peer.h"
+#include "yb/tablet/tablet_types.pb.h"
 #include "yb/tablet/transaction_participant.h"
 
 #include "yb/tserver/service_util.h"
@@ -2117,6 +2122,412 @@ void CDCServiceImpl::GetChanges(
       rate_limiter_->Request(resp->ByteSizeLong(), IOPriority::kHigh);
     };
   }
+  context.RespondSuccess();
+}
+
+namespace {
+
+constexpr int64_t kStreamWalSkipToTipSentinel = -1;
+
+// Construct a CDCSDKOpIdPB sentinel value from (term, index).
+void SetStreamWalCursor(int64_t term, int64_t index, StreamWalCursorPB* cursor) {
+  cursor->set_term(term);
+  cursor->set_index(index);
+}
+
+// Returns true iff the cursor is {-1, -1}, the skip-to-tip sentinel.
+bool IsStreamWalSkipToTip(const StreamWalCursorPB& cursor) {
+  return cursor.has_term() && cursor.has_index() &&
+         cursor.term() == kStreamWalSkipToTipSentinel &&
+         cursor.index() == kStreamWalSkipToTipSentinel;
+}
+
+// Returns true iff the cursor is {0, 0}, the from-start-of-retained-WAL
+// sentinel. {0,0} is the natural "empty" cursor; both fields default to 0 so a
+// client that sets nothing also lands here.
+bool IsStreamWalFromStart(const StreamWalCursorPB& cursor) {
+  return cursor.term() == 0 && cursor.index() == 0;
+}
+
+// Validate the from_op_id field shape. Returns OK iff one of:
+//   {0, 0}                     -> from-start
+//   {-1, -1}                   -> skip-to-tip
+//   {T >= 1, I >= 0}           -> real cursor
+// Anything else is INVALID_REQUEST in the contract's error taxonomy.
+Status ValidateStreamWalFromOpId(const StreamWalCursorPB& cursor) {
+  if (!cursor.has_term() || !cursor.has_index()) {
+    return STATUS(InvalidArgument, "from_op_id must have term and index set");
+  }
+  if (IsStreamWalFromStart(cursor) || IsStreamWalSkipToTip(cursor)) {
+    return Status::OK();
+  }
+  if (cursor.term() < 1 || cursor.index() < 0) {
+    return STATUS_FORMAT(
+        InvalidArgument,
+        "from_op_id must be {0,0}, {-1,-1}, or {T>=1, I>=0}; got {term=$0, index=$1}",
+        cursor.term(), cursor.index());
+  }
+  return Status::OK();
+}
+
+}  // namespace
+
+void CDCServiceImpl::StreamWAL(
+    const StreamWalRequestPB* req, StreamWalResponsePB* resp, RpcContext context) {
+  if (!CheckOnline(req, resp, &context)) {
+    return;
+  }
+  YB_LOG_EVERY_N_SECS_OR_VLOG(INFO, 300, 5)
+      << "Received StreamWAL request " << req->ShortDebugString();
+
+  // ---------------- Request validation (contract Step 3) ----------------
+
+  RPC_CHECK_AND_RETURN_ERROR(
+      req->has_tablet_id() && !req->tablet_id().empty(),
+      STATUS(InvalidArgument, "StreamWAL: tablet_id is required"),
+      resp->mutable_error(), CDCErrorPB::INVALID_REQUEST, context);
+
+  RPC_CHECK_AND_RETURN_ERROR(
+      req->has_from_op_id(),
+      STATUS(InvalidArgument, "StreamWAL: from_op_id is required"),
+      resp->mutable_error(), CDCErrorPB::INVALID_REQUEST, context);
+
+  const auto& from_cursor = req->from_op_id();
+  RPC_STATUS_RETURN_ERROR(
+      ValidateStreamWalFromOpId(from_cursor), resp->mutable_error(),
+      CDCErrorPB::INVALID_REQUEST, context);
+
+  ash::WaitStateInfo::UpdateCurrentTabletId(req->tablet_id());
+
+  auto tablet_peer = context_->LookupTablet(req->tablet_id());
+  RPC_CHECK_NE_AND_RETURN_ERROR(
+      tablet_peer, nullptr,
+      STATUS_FORMAT(NotFound, "Tablet $0 not found", req->tablet_id()),
+      resp->mutable_error(), CDCErrorPB::TABLET_NOT_FOUND, context);
+
+  // Tablet exists; check it is RUNNING (per contract Step 3.e).
+  if (tablet_peer->state() != tablet::RaftGroupStatePB::RUNNING) {
+    SetupErrorAndRespond(
+        resp->mutable_error(),
+        STATUS_FORMAT(
+            IllegalState, "Tablet $0 is not RUNNING (state=$1)",
+            req->tablet_id(), tablet::RaftGroupStatePB_Name(tablet_peer->state())),
+        CDCErrorPB::TABLET_NOT_RUNNING, &context);
+    return;
+  }
+
+  // We treat NOT_LEADER (peer exists but is not the leader) as
+  // LEADER_NOT_READY per the contract, with a populated tablet_consensus_info
+  // hint so the client can avoid round-tripping master.
+  if (tablet_peer->IsNotLeader()) {
+    tserver::FillTabletConsensusInfo(resp, tablet_peer->tablet_id(), tablet_peer);
+    SetupErrorAndRespond(
+        resp->mutable_error(),
+        STATUS_FORMAT(
+            LeaderNotReadyToServe, "Not leader for $0: $1",
+            req->tablet_id(), tablet_peer->LeaderStatus()),
+        CDCErrorPB::LEADER_NOT_READY, &context);
+    return;
+  }
+
+  if (!tablet_peer->IsLeaderAndReady()) {
+    SetupErrorAndRespond(
+        resp->mutable_error(),
+        STATUS(LeaderNotReadyToServe, "Leader not ready to serve StreamWAL"),
+        CDCErrorPB::LEADER_NOT_READY, &context);
+    return;
+  }
+
+  // Resolve a shared tablet pointer and snapshot the leader tip + safe time.
+  auto tablet_ptr_result = tablet_peer->shared_tablet();
+  RPC_CHECK_AND_RETURN_ERROR(
+      tablet_ptr_result.ok(), tablet_ptr_result.status(),
+      resp->mutable_error(), CDCErrorPB::TABLET_NOT_RUNNING, context);
+  const auto& tablet_ptr = *tablet_ptr_result;
+
+  if (tablet_ptr->metadata()->tablet_data_state() == tablet::TABLET_DATA_SPLIT_COMPLETED) {
+    // Tablet has already been split; no more records will ever arrive on this
+    // tablet's stream. Client should have received a SPLIT_OP record on a prior
+    // call.
+    SetupErrorAndRespond(
+        resp->mutable_error(),
+        STATUS_FORMAT(TabletSplit, "Tablet split already complete for $0", req->tablet_id()),
+        CDCErrorPB::TABLET_SPLIT, &context);
+    return;
+  }
+
+  auto consensus_result = tablet_peer->GetRaftConsensus();
+  RPC_CHECK_AND_RETURN_ERROR(
+      consensus_result.ok(), consensus_result.status(),
+      resp->mutable_error(), CDCErrorPB::LEADER_NOT_READY, context);
+  auto& consensus = *consensus_result;
+  const OpId leader_tip_op_id = consensus->GetLastCommittedOpId();
+
+  HybridTime leader_safe_time = HybridTime::kInvalid;
+  {
+    auto safe_time_result = tablet_ptr->SafeTime();
+    if (safe_time_result.ok()) {
+      leader_safe_time = *safe_time_result;
+    } else {
+      YB_LOG_EVERY_N_SECS(WARNING, 10)
+          << "StreamWAL: could not compute safe time for tablet "
+          << tablet_peer->tablet_id() << ": " << safe_time_result.status();
+    }
+  }
+
+  // Resolve the effective start OpId we'll feed into the WAL reader.
+  // (This is internal-only; the response cursor is computed separately below.)
+  OpId read_from_op_id;
+  bool emit_bootstrap = false;
+  bool skip_to_tip = false;
+
+  if (IsStreamWalSkipToTip(from_cursor)) {
+    emit_bootstrap = true;
+    skip_to_tip = true;
+    read_from_op_id = OpId();  // unused on the skip-to-tip path
+  } else if (IsStreamWalFromStart(from_cursor)) {
+    emit_bootstrap = true;
+    read_from_op_id = OpId();  // WAL reader treats {0,0} as "earliest retained"
+  } else {
+    // Real cursor. Apply retention / over-tip validation.
+    const int64_t cdc_min_replicated_index = tablet_peer->get_cdc_min_replicated_index();
+    if (cdc_min_replicated_index != std::numeric_limits<int64_t>::max() &&
+        from_cursor.index() < cdc_min_replicated_index) {
+      SetupErrorAndRespond(
+          resp->mutable_error(),
+          STATUS_FORMAT(
+              IllegalState,
+              "StreamWAL: from_op_id.index ($0) is older than cdc_min_replicated_index ($1)",
+              from_cursor.index(), cdc_min_replicated_index),
+          CDCErrorPB::CHECKPOINT_TOO_OLD, &context);
+      return;
+    }
+    if (from_cursor.index() > leader_tip_op_id.index) {
+      SetupErrorAndRespond(
+          resp->mutable_error(),
+          STATUS_FORMAT(
+              InvalidArgument,
+              "StreamWAL: from_op_id.index ($0) > leader tip index ($1)",
+              from_cursor.index(), leader_tip_op_id.index),
+          CDCErrorPB::INVALID_REQUEST, &context);
+      return;
+    }
+    read_from_op_id = OpId(from_cursor.term(), from_cursor.index());
+  }
+
+  // ---------------- Bootstrap DDLs ----------------
+  // Always emitted at the front of records[] for {0,0} or {-1,-1}.
+  if (emit_bootstrap) {
+    std::vector<CDCSDKProtoRecordPB> bootstrap_records;
+    auto bootstrap_status =
+        PopulateSyntheticBootstrapDDLs(tablet_peer, &bootstrap_records);
+    if (!bootstrap_status.ok()) {
+      SetupErrorAndRespond(
+          resp->mutable_error(), bootstrap_status,
+          CDCErrorPB::INTERNAL_ERROR, &context);
+      return;
+    }
+    for (auto& rec : bootstrap_records) {
+      resp->add_records()->Swap(&rec);
+    }
+  }
+
+  // Skip-to-tip short-circuits: no WAL read.
+  if (skip_to_tip) {
+    leader_tip_op_id.ToPB(resp->mutable_next_op_id());
+    leader_tip_op_id.ToPB(resp->mutable_leader_tip_op_id());
+    if (leader_safe_time.is_valid()) {
+      resp->set_leader_safe_hybrid_time(leader_safe_time.ToUint64());
+    }
+    // Determine has_more: if the leader received new ops between when we read
+    // tip and now, more is available immediately.
+    const auto current_tip = consensus->GetLastCommittedOpId();
+    resp->set_has_more(current_tip.index > leader_tip_op_id.index);
+    context.RespondSuccess();
+    return;
+  }
+
+  // ---------------- WAL read + dispatch ----------------
+
+  // Bound the deadline. v1 default is short-poll (deadline_ms == 0).
+  CoarseTimePoint deadline = CoarseMonoClock::Now();
+  if (req->deadline_ms() > 0) {
+    deadline += std::chrono::milliseconds(req->deadline_ms());
+  } else {
+    // Short-poll: give the WAL reader just enough headroom to consult the cache.
+    deadline += 100ms;
+  }
+
+  // NOTE: `ReadReplicatedMessagesInSegmentForCDC` unconditionally dereferences
+  // its `read_entire_wal` out-param (see consensus_queue.cc:958 / :973 /
+  // :1020). Even though the parameter is defaulted to nullptr in the header,
+  // passing nullptr is a segfault hazard. We supply a local sink and ignore
+  // its value.
+  int64_t last_committed_index = 0;
+  HybridTime consistent_stream_safe_time_footer = HybridTime::kInvalid;
+  bool read_entire_wal_sink = false;
+  auto wal_result = consensus->ReadReplicatedMessagesInSegmentForCDC(
+      read_from_op_id, deadline, /*fetch_single_entry=*/false,
+      &last_committed_index, &consistent_stream_safe_time_footer,
+      &read_entire_wal_sink);
+  if (!wal_result.ok()) {
+    SetupErrorAndRespond(
+        resp->mutable_error(), wal_result.status(),
+        CDCErrorPB::INTERNAL_ERROR, &context);
+    return;
+  }
+
+  const consensus::ReadOpsResult& read_ops = *wal_result;
+  const consensus::ReplicateMsgs& messages = read_ops.messages;
+
+  // Synthesize the minimum-viable StreamMetadata required by the decoder.
+  // This is process-local; no master communication.
+  cdc::StreamMetadata stream_metadata;
+  const auto namespace_id = tablet_ptr->metadata()->namespace_id();
+  stream_metadata.InitForStreamlessUse(
+      namespace_id,
+      CDCRecordType::CHANGE,
+      CDCRecordFormat::PROTO,
+      tablet_ptr->metadata()->GetAllColocatedTables());
+
+  // Per-call decoder scratchpads. Mirrors the GetChanges path but lives only
+  // for the duration of this RPC; we do not cache stream-id-keyed state.
+  SchemaDetailsMap cached_schema_details;
+  TableSchemaPackingStorage schema_packing_storages;
+  {
+    const auto table_type = tablet_ptr->table_type();
+    auto registry = std::make_shared<dockv::SchemaPackingRegistry>("StreamWAL: ");
+    for (const auto& tid : tablet_ptr->metadata()->GetAllColocatedTables()) {
+      schema_packing_storages.emplace(tid, dockv::SchemaPackingStorage(table_type, registry));
+    }
+  }
+
+  // Decoder fan-outs need the enum / composite type caches for the namespace.
+  // We tolerate failure here and fall back to empty maps -- the decoder copes
+  // (the maps are only consulted for actual enum/composite columns; if a row
+  // references one and we miss, the decoder will surface a CacheMissError which
+  // we propagate to the client as INTERNAL_ERROR).
+  EnumOidLabelMap enum_map;
+  CompositeAttsMap composite_atts_map;
+  if (!namespace_id.empty()) {
+    const auto namespace_name = tablet_ptr->metadata()->namespace_name();
+    const bool cql_namespace = tablet_ptr->table_type() == YQL_TABLE_TYPE;
+    auto enum_map_result = GetEnumMapFromCache(namespace_name, cql_namespace);
+    if (enum_map_result.ok()) {
+      enum_map = *enum_map_result;
+    }
+    auto composite_result = GetCompositeAttsMapFromCache(namespace_name, cql_namespace);
+    if (composite_result.ok()) {
+      composite_atts_map = *composite_result;
+    }
+  }
+
+  const uint32_t max_records = req->max_records() > 0 ? req->max_records() : 1000;
+  const uint64_t max_bytes = req->max_bytes() > 0 ? req->max_bytes() : 4_MB;
+
+  StreamWalDecodeContext decode_ctx;
+  decode_ctx.tablet_peer = tablet_peer;
+  decode_ctx.stream_metadata = &stream_metadata;
+  decode_ctx.client = client();
+  decode_ctx.cached_schema_details = &cached_schema_details;
+  decode_ctx.schema_packing_storages = &schema_packing_storages;
+  decode_ctx.enum_map = &enum_map;
+  decode_ctx.composite_atts_map = &composite_atts_map;
+
+  // Track the last OpId we passed through the dispatcher. next_op_id in the
+  // response advances to this when at least one real (non-bootstrap) record is
+  // emitted; for silent-only batches it advances past the last consumed op.
+  OpId last_emitted_op_id = read_from_op_id;
+  bool any_real_emitted = false;
+  bool saw_split_op = false;
+  bool more_messages_pending = read_ops.have_more_messages.get();
+
+  for (const auto& msg : messages) {
+    // Defensive: drop msgs that are at-or-before from_op_id (the WAL reader is
+    // supposed to honor the exclusive lower bound but consistent_records mode
+    // can include the preceding op).
+    if (msg->id().term() < read_from_op_id.term ||
+        (msg->id().term() == read_from_op_id.term &&
+         msg->id().index() <= read_from_op_id.index)) {
+      continue;
+    }
+
+    const OpId msg_op_id(msg->id().term(), msg->id().index());
+    std::vector<CDCSDKProtoRecordPB> emitted_records;
+    auto dispatch_result = DispatchWalOpForStreamWAL(msg, &decode_ctx, &emitted_records);
+    if (!dispatch_result.ok()) {
+      SetupErrorAndRespond(
+          resp->mutable_error(), dispatch_result.status(),
+          CDCErrorPB::INTERNAL_ERROR, &context);
+      return;
+    }
+
+    // The cursor advances past this WAL op regardless of whether it emitted a
+    // record -- silent ops still consume index space, and the next call must
+    // not redeliver them.
+    last_emitted_op_id = msg_op_id;
+
+    if (!emitted_records.empty()) {
+      any_real_emitted = true;
+      for (auto& rec : emitted_records) {
+        // Stamp from_op_id on every emitted record to preserve compat with
+        // existing CDCSDK clients that read the field. (We do not have access
+        // to the anon-namespace SetCDCSDKOpId helper here; inline the field
+        // assignments instead.)
+        auto* from_op_id_pb = rec.mutable_from_op_id();
+        from_op_id_pb->set_term(from_cursor.term());
+        from_op_id_pb->set_index(from_cursor.index());
+        from_op_id_pb->set_write_id(0);
+        from_op_id_pb->set_write_id_key("");
+        resp->add_records()->Swap(&rec);
+      }
+    }
+
+    if (dispatch_result->kind == StreamWalDispatchResult::Kind::kSplitTerminal) {
+      // SPLIT_OP is always the terminal record on this tablet's stream.
+      saw_split_op = true;
+      more_messages_pending = false;
+      break;
+    }
+
+    if (static_cast<uint32_t>(resp->records_size()) >= max_records ||
+        static_cast<uint64_t>(resp->ByteSizeLong()) >= max_bytes) {
+      // More records are available immediately past us.
+      more_messages_pending = true;
+      break;
+    }
+  }
+
+  // ---------------- Cursor advancement ----------------
+  if (any_real_emitted) {
+    last_emitted_op_id.ToPB(resp->mutable_next_op_id());
+  } else if (!messages.empty()) {
+    // We consumed silent ops but emitted nothing -- still advance past the last
+    // consumed message so the client doesn't re-read it.
+    last_emitted_op_id.ToPB(resp->mutable_next_op_id());
+  } else {
+    // Empty batch -- preserve the request's from_op_id verbatim.
+    SetStreamWalCursor(from_cursor.term(), from_cursor.index(), resp->mutable_next_op_id());
+  }
+
+  // Refresh leader tip now that we may have spent time decoding; useful for
+  // accurate has_more / lag computation downstream.
+  const OpId fresh_tip = consensus->GetLastCommittedOpId();
+  fresh_tip.ToPB(resp->mutable_leader_tip_op_id());
+  if (leader_safe_time.is_valid()) {
+    resp->set_leader_safe_hybrid_time(leader_safe_time.ToUint64());
+  }
+
+  // has_more = true if we deferred records OR the leader has new ops past our
+  // cursor that we did not consume.
+  if (saw_split_op) {
+    resp->set_has_more(false);
+  } else {
+    const bool more_in_leader =
+        resp->next_op_id().index() < fresh_tip.index;
+    resp->set_has_more(more_messages_pending || more_in_leader);
+  }
+
   context.RespondSuccess();
 }
 

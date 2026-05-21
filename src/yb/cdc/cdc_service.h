@@ -166,6 +166,13 @@ class CDCServiceImpl : public CDCServiceIf {
       const ListTabletsRequestPB* req, ListTabletsResponsePB* resp, rpc::RpcContext rpc) override;
   void GetChanges(
       const GetChangesRequestPB* req, GetChangesResponsePB* resp, rpc::RpcContext rpc) override;
+
+  // StreamWAL: per-tablet, leader-only WAL pull RPC for the new stream-id-less
+  // CDC architecture. See StreamWAL data contract for details.
+  void StreamWAL(
+      const StreamWalRequestPB* req,
+      StreamWalResponsePB* resp,
+      rpc::RpcContext rpc) override;
   bool IsReplicationPausedForStream(const std::string& stream_id) const EXCLUDES(mutex_);
   void GetCheckpoint(
       const GetCheckpointRequestPB* req,

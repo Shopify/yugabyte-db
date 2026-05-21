@@ -39,6 +39,7 @@ import "yb/common/common.proto";
 import "yb/common/common_net.proto";
 import "yb/common/common_types.proto";
 import "yb/common/opid.proto";
+import "yb/common/transaction.proto";
 import "yb/common/value.proto";
 import "yb/common/wire_protocol.proto";
 import "yb/master/master_client.proto";
@@ -77,6 +78,12 @@ service CDCService {
   rpc UpdateAndPersistLSN (UpdateAndPersistLSNRequestPB) returns (UpdateAndPersistLSNResponsePB);
   rpc UpdatePublicationTableList (UpdatePublicationTableListRequestPB)
       returns (UpdatePublicationTableListResponsePB);
+
+  // StreamWAL: per-tablet, leader-only, unary tserver RPC that delivers decoded
+  // WAL change events as a stream of CDCSDKProtoRecordPB. Does NOT register state
+  // on the server, does NOT use cdc_state, and does NOT require stream IDs.
+  // See StreamWalRequestPB / StreamWalResponsePB for the full contract.
+  rpc StreamWAL (StreamWalRequestPB) returns (StreamWalResponsePB);
 }
 
 message CDCErrorPB {
@@ -565,6 +572,116 @@ message CDCSDKProtoRecordPB {
   optional CDCSDKOpIdPB cdc_sdk_op_id = 2;
 
   optional CDCSDKOpIdPB from_op_id = 3;
+
+  // Populated only on APPLYING records (those where row_message.op == COMMIT and
+  // row_message.transaction_id is set). Mirrors tablet.TransactionStatePB.aborted
+  // from the source WAL entry. Lists subtxn IDs that were rolled back via
+  // ROLLBACK TO SAVEPOINT inside the committing transaction. Empty/unset means
+  // no subtxns were aborted.
+  //
+  // This field describes what is in the WAL. It makes no assumption about how
+  // the client uses it.
+  optional SubtxnSetPB aborted_subtxn_set = 4;
+
+  // Populated only on the terminal SPLIT_OP record emitted by StreamWAL on a
+  // tablet that has been split. Carries the SplitTabletRequestPB payload
+  // (new_tablet1_id / new_tablet2_id, split_partition_key, split_encoded_key)
+  // so the client can resolve and resume on the child tablets.
+  //
+  // NOTE: This field is an addition to the StreamWAL data contract beyond the
+  // single field originally enumerated in the spec's "Proto changes summary".
+  // It is required because the spec also mandates that SPLIT_OP be emitted as
+  // a CDCSDKProtoRecordPB carrying the SplitTabletRequestPB payload, and the
+  // remaining fields on this message have no place to encode it.
+  optional tablet.SplitTabletRequestPB split_tablet_request = 5;
+}
+
+// Resume cursor for StreamWAL. Identifies a unique WAL OpId on the leader.
+//
+// Three meaningful values in a request:
+//   {term: 0,  index: 0}  -> "from start of retained WAL"; server emits
+//                           synthetic bootstrap DDLs before any real records.
+//   {term: -1, index: -1} -> SKIP-TO-TIP sentinel. Server emits synthetic
+//                           bootstrap DDLs only; sets next_op_id to the
+//                           current leader tip. No historical records.
+//   {term: T,  index: I}  -> "records strictly after OpId(T, I)"; no bootstrap.
+//                           Caller must already have schema cache for any
+//                           schema_version active between (0,0) and (T,I).
+//
+// In a response, next_op_id is always a real (T, I) value (never a sentinel).
+message StreamWalCursorPB {
+  optional int64 term = 1;
+  optional int64 index = 2;
+}
+
+message StreamWalRequestPB {
+  // REQUIRED. The tablet to stream from.
+  optional bytes tablet_id = 1;
+
+  // REQUIRED. See StreamWalCursorPB for the three valid forms.
+  optional StreamWalCursorPB from_op_id = 2;
+
+  // Soft cap on records returned in this batch. Default 1000. Server may
+  // return fewer. Server never splits a single WAL op across batches even
+  // if it produces more than max_records RowMessages.
+  optional uint32 max_records = 3 [default = 1000];
+
+  // Soft cap on response bytes (decoded record payload). Default 4 MiB.
+  // Server defers the next record to the next batch if including it would
+  // exceed max_bytes. Records are never truncated.
+  optional uint64 max_bytes = 4 [default = 4194304];
+
+  // Server-side wait budget when no records are immediately available.
+  // 0 -> short-poll: return immediately with an empty batch + unchanged
+  //     cursor + has_more=false.
+  // N -> long-poll: server blocks up to N ms before returning.
+  // Capped server-side by cdcsdk_wal_reads_deadline_buffer_secs.
+  // v1 default: 0.
+  optional uint32 deadline_ms = 5 [default = 0];
+}
+
+message StreamWalResponsePB {
+  // Error envelope. On error, only `error` and (for LEADER_NOT_READY)
+  // `tablet_consensus_info` are populated. All other fields are unset.
+  optional CDCErrorPB error = 1;
+
+  // Decoded records in strict WAL order: monotonically increasing
+  // (cdc_sdk_op_id.term, cdc_sdk_op_id.index, cdc_sdk_op_id.write_id).
+  // Includes synthetic bootstrap DDLs at the front of the batch when
+  // applicable; see the contract's "Synthetic DDL bootstrap" section.
+  repeated CDCSDKProtoRecordPB records = 2;
+
+  // REQUIRED on success (including empty success batches). Cursor to pass
+  // as from_op_id on the next call.
+  //   - If `records` is non-empty and contains any non-synthetic record,
+  //     next_op_id == the (term, index) of the last non-synthetic record.
+  //   - If `records` contains only synthetic bootstrap DDLs (skip-to-tip
+  //     sentinel path), next_op_id == leader_tip_op_id at the time of the
+  //     bootstrap.
+  //   - If `records` is empty, next_op_id == the request's from_op_id
+  //     (no progress).
+  optional StreamWalCursorPB next_op_id = 3;
+
+  // REQUIRED on success. Last replicated OpId on the leader at the moment
+  // this response was generated. Use for:
+  //   - Per-tablet lag computation (e.g. leader_tip.index - next_op_id.index).
+  //   - "Caught up" detection (next_op_id == leader_tip_op_id).
+  optional StreamWalCursorPB leader_tip_op_id = 4;
+
+  // REQUIRED on success. Leader's safe HybridTime at response time. Use
+  // for emitting downstream SAFEPOINT / heartbeat records and for clock
+  // skew monitoring. Equivalent semantics to today's
+  // GetChangesResponsePB.safe_hybrid_time.
+  optional fixed64 leader_safe_hybrid_time = 5;
+
+  // True iff more data is immediately available past next_op_id. When
+  // false, the client should backoff before the next call. (When true,
+  // the client can call again immediately without backoff.)
+  optional bool has_more = 6;
+
+  // Populated only when error.code == LEADER_NOT_READY. Lets the client
+  // refresh its meta-cache without going to master.
+  optional yb.tserver.TabletConsensusInfoPB tablet_consensus_info = 7;
 }
 
 message GetChangesResponsePB {
