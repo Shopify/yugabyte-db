@@ -99,5 +99,101 @@ Status GetChangesForCDCSDK(
 bool IsReplicationSlotStream(const StreamMetadata& stream_metadata);
 
 Status GetChangesForXCluster(const XClusterGetChangesContext& context);
+
+//
+// StreamWAL helpers.
+//
+// These helpers are additive callsites on top of the existing cdcsdk_producer.cc
+// decoder family. They are used exclusively by CDCServiceImpl::StreamWAL (the
+// per-tablet, stream-id-less WAL streaming RPC) and do not change any existing
+// CDC code path.
+//
+
+// Synthesize one DDL CDCSDKProtoRecordPB per active (table_id, schema_version)
+// from the tablet's current metadata. Used by StreamWAL to bootstrap the
+// client's schema cache when from_op_id is {0, 0} or the skip-to-tip sentinel.
+//
+// Each emitted record gets cdc_sdk_op_id = {term: 0, index: 0, write_id: i}
+// where i is the record's position in `out`, which disambiguates across
+// colocated tables.
+//
+// Parent (tablegroup / colocation) tables are skipped. Sys catalog tablets emit
+// no bootstrap DDLs (the decoder resolves their schemas per-row at runtime).
+Status PopulateSyntheticBootstrapDDLs(
+    const std::shared_ptr<tablet::TabletPeer>& tablet_peer,
+    std::vector<CDCSDKProtoRecordPB>* out);
+
+// Build a COMMIT envelope record for an UPDATE_TRANSACTION_OP { APPLYING } WAL
+// entry. Populates:
+//   row_message.op           = COMMIT
+//   row_message.transaction_id
+//   row_message.commit_time  = TransactionStatePB.commit_hybrid_time
+//   row_message.xrepl_origin_id (if set on TransactionStatePB)
+//   cdc_sdk_op_id            = (msg.id.term, msg.id.index, 0)
+//   aborted_subtxn_set       = mirrors TransactionStatePB.aborted (when present)
+//
+// `encoded_start_key` and `encoded_end_key` are populated into the encoded_key
+// fields of the (older) CDCRecordPB only by the legacy XCluster decoder; for
+// CDCSDKProtoRecordPB they are surfaced via row_message.primary_key on the
+// per-row records emitted from PopulateCDCSDKIntentRecord, not here. The COMMIT
+// envelope therefore does not carry partition bounds.
+Status PopulateStreamWalApplyingRecord(
+    const consensus::ReplicateMsgPtr& msg,
+    CDCSDKProtoRecordPB* out);
+
+// Build the terminal SPLIT_OP envelope record for a SPLIT_OP WAL entry.
+// Populates:
+//   row_message.op            = UNKNOWN  (no dedicated SPLIT op in RowMessage)
+//   row_message.commit_time   = msg.hybrid_time
+//   cdc_sdk_op_id             = (msg.id.term, msg.id.index, 0)
+//   split_tablet_request      = msg.split_request  (carries new_tablet1_id,
+//                                                   new_tablet2_id,
+//                                                   split_partition_key,
+//                                                   split_encoded_key)
+Status PopulateStreamWalSplitRecord(
+    const consensus::ReplicateMsgPtr& msg,
+    CDCSDKProtoRecordPB* out);
+
+// Per-call decoder context for StreamWAL. Lives for the duration of one RPC
+// handler invocation; not thread-safe.
+struct StreamWalDecodeContext {
+  std::shared_ptr<tablet::TabletPeer> tablet_peer;
+  const StreamMetadata* stream_metadata = nullptr;
+  client::YBClient* client = nullptr;
+  SchemaDetailsMap* cached_schema_details = nullptr;
+  TableSchemaPackingStorage* schema_packing_storages = nullptr;
+  const EnumOidLabelMap* enum_map = nullptr;
+  const CompositeAttsMap* composite_atts_map = nullptr;
+};
+
+// Outcome of decoding a single ReplicateMsg via the StreamWAL emission rules.
+struct StreamWalDispatchResult {
+  enum class Kind {
+    // SPLIT_OP for this tablet -> emitted a terminal split record. The caller
+    // MUST stop the loop after this op; no further records will arrive on this
+    // tablet's stream.
+    kSplitTerminal,
+    // The op produced one or more CDCSDKProtoRecordPB records appended to the
+    // caller's output container.
+    kRecordsEmitted,
+    // The op was silent (no record emitted). The caller still advances the
+    // cursor past it.
+    kSilent,
+  };
+  Kind kind = Kind::kSilent;
+};
+
+// Decode a single ReplicateMsg per the StreamWAL per-OperationType emission
+// rules in the data contract. Appends 0..N CDCSDKProtoRecordPB messages to
+// *out_records. The decoder may consult / update the schema caches on `ctx`.
+//
+// This is the ONLY entry point cdc_service.cc::StreamWAL uses to invoke the
+// existing decoder family; the decoder functions themselves are private to
+// cdcsdk_producer.cc.
+Result<StreamWalDispatchResult> DispatchWalOpForStreamWAL(
+    const consensus::ReplicateMsgPtr& msg,
+    StreamWalDecodeContext* ctx,
+    std::vector<CDCSDKProtoRecordPB>* out_records);
+
 }  // namespace cdc
 }  // namespace yb

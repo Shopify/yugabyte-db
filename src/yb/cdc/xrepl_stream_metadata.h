@@ -165,6 +165,27 @@ class StreamMetadata {
       const xrepl::StreamId& stream_id, RefreshStreamMapOption opts, client::YBClient* client)
       EXCLUDES(load_mutex_);
 
+  // Initialize a StreamMetadata for stream-less callers (e.g. the StreamWAL
+  // tserver RPC) that have no registered xrepl stream but still want to invoke
+  // the existing cdcsdk_producer.cc decoder family. Populates only the fields
+  // the decoders read:
+  //   - source_type = CDCSDK
+  //   - record_type / record_format from arguments
+  //   - checkpoint_type = IMPLICIT (decoders only read this for unrelated paths)
+  //   - table_ids = all colocated tables on the tablet (so every table is
+  //     considered "qualified for streaming" by the decoder)
+  //   - unqualified_table_ids = empty
+  //   - replication_slot_name unset (so IsReplicationSlotStream() == false and
+  //     the decoder takes the GetRecordType() path rather than the replica
+  //     identity path)
+  //   - transactional = false
+  // Marks the metadata as loaded so the DCHECKs in accessors pass.
+  void InitForStreamlessUse(
+      const NamespaceId& namespace_id,
+      CDCRecordType record_type,
+      CDCRecordFormat record_format,
+      const std::vector<TableId>& table_ids) EXCLUDES(load_mutex_, mutex_, table_ids_mutex_);
+
   std::string ToString() const;
 
  private:
