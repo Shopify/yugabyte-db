@@ -690,6 +690,44 @@ public class AsyncYBClient implements AutoCloseable {
     return d;
   }
 
+  /**
+   * StreamWAL: per-tablet, leader-only RPC that delivers decoded WAL change events.
+   *
+   * <p>Stateless on the server (no streamId, no cdc_state). The {@code fromTerm}/
+   * {@code fromIndex} cursor follows the sentinel rules described on {@link StreamWalRequest}.
+   *
+   * <p>The returned {@link Deferred} completes when the RPC returns. Total client-side time is
+   * bounded by the operation timeout configured on this client (must exceed {@code deadlineMs}
+   * to give the server room for its long-poll budget).
+   *
+   * @param table       table used to anchor the meta-cache lookup for the tablet's leader.
+   * @param tabletId    32-char hex tablet UUID.
+   * @param fromTerm    cursor term (0 / -1 sentinels, or a real term >= 1).
+   * @param fromIndex   cursor index.
+   * @param maxRecords  soft cap on records per batch; 0 to use the server default.
+   * @param maxBytes    soft cap on response bytes; 0 to use the server default.
+   * @param deadlineMs  server-side wait budget in ms; 0 for short-poll.
+   */
+  public Deferred<StreamWalResponse> streamWAL(
+      YBTable table,
+      String tabletId,
+      long fromTerm,
+      long fromIndex,
+      int maxRecords,
+      long maxBytes,
+      int deadlineMs) {
+    checkIsClosed();
+    StreamWalRequest rpc =
+        new StreamWalRequest(table, tabletId, fromTerm, fromIndex, maxRecords, maxBytes, deadlineMs);
+    rpc.maxAttempts = this.maxAttempts;
+    Deferred<StreamWalResponse> d = rpc.getDeferred();
+    // Allow enough wall-clock for the server's long-poll budget plus network jitter. The
+    // socket-read timeout configured on AsyncYBClient is enforced independently.
+    rpc.setTimeoutMillis(defaultOperationTimeoutMs + Math.max(0, deadlineMs));
+    sendRpcToTablet(rpc);
+    return d;
+  }
+
   public Deferred<SetCheckpointResponse> setCheckpoint(
       YBTable table,
       String streamId,
@@ -2735,6 +2773,10 @@ public class AsyncYBClient implements AutoCloseable {
     }
     if (request instanceof GetChangesRequest) {
       String tabletId = ((GetChangesRequest) request).getTabletId();
+      tablet = getTablet(tableId, tabletId);
+    }
+    if (request instanceof StreamWalRequest) {
+      String tabletId = ((StreamWalRequest) request).getTabletId();
       tablet = getTablet(tableId, tabletId);
     }
     if (request instanceof CreateCDCStreamRequest) {
