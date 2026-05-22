@@ -260,6 +260,13 @@ DECLARE_bool(cdcsdk_enable_dynamic_table_addition_with_table_cleanup);
 
 DECLARE_bool(ysql_yb_enable_consistent_replication_from_hash_range);
 
+// Defined in src/yb/consensus/consensus_queue.cc. The WAL reader subtracts this
+// many seconds from its caller-supplied deadline as a safety margin and bails
+// out early if the remaining budget is below it. StreamWAL needs to know the
+// value so its short-poll path doesn't ship the reader a deadline shorter than
+// the buffer (which would cause an instant empty return).
+DECLARE_uint32(cdcsdk_wal_reads_deadline_buffer_secs);
+
 METRIC_DEFINE_entity(xcluster);
 
 METRIC_DEFINE_entity(cdcsdk);
@@ -2350,13 +2357,20 @@ void CDCServiceImpl::StreamWAL(
   // ---------------- WAL read + dispatch ----------------
 
   // Bound the deadline. v1 default is short-poll (deadline_ms == 0).
-  CoarseTimePoint deadline = CoarseMonoClock::Now();
-  if (req->deadline_ms() > 0) {
-    deadline += std::chrono::milliseconds(req->deadline_ms());
-  } else {
-    // Short-poll: give the WAL reader just enough headroom to consult the cache.
-    deadline += 100ms;
-  }
+  //
+  // The WAL reader (ReadReplicatedMessagesInSegmentForCDC) bails out early when
+  // the remaining deadline is below cdcsdk_wal_reads_deadline_buffer_secs (default
+  // 5s) -- that buffer is the safety margin the reader uses to ensure it returns
+  // before the deadline truly expires. So our deadline budget here MUST exceed
+  // that buffer, otherwise the reader returns immediately with an empty message
+  // list before it has even looked at the log cache.
+  //
+  // Short-poll semantics in our contract are "don't WAIT for new data" -- not
+  // "race the buffer". The reader's own "nothing to read" branch already covers
+  // the empty-WAL case correctly when it has enough time to inspect the segment.
+  CoarseTimePoint deadline = CoarseMonoClock::Now() +
+      std::chrono::seconds(FLAGS_cdcsdk_wal_reads_deadline_buffer_secs + 1) +
+      std::chrono::milliseconds(req->deadline_ms());
 
   // NOTE: `ReadReplicatedMessagesInSegmentForCDC` unconditionally dereferences
   // its `read_entire_wal` out-param (see consensus_queue.cc:958 / :973 /
@@ -2505,6 +2519,19 @@ void CDCServiceImpl::StreamWAL(
     // We consumed silent ops but emitted nothing -- still advance past the last
     // consumed message so the client doesn't re-read it.
     last_emitted_op_id.ToPB(resp->mutable_next_op_id());
+  } else if (emit_bootstrap && resp->records_size() > 0) {
+    // FROM_BEGINNING with bootstrap DDLs but no WAL messages to consume yet --
+    // e.g. a brand-new tablet whose only history is its DDL bootstrap. We must
+    // advance the cursor past the bootstrap so the client doesn't re-read it
+    // forever; advancing to leader_tip_op_id mirrors the skip-to-tip semantics
+    // documented on StreamWalResponsePB.next_op_id. The next call comes in with
+    // a "real cursor" (term >= 1, index >= 0), which skips bootstrap emission
+    // and reads from that position onward. For a truly empty tablet,
+    // leader_tip_op_id is the right value because there is nothing past it to
+    // miss; for a tablet that gains a write between this snapshot and the next
+    // call, the next call's read_from_op_id == leader_tip_op_id naturally picks
+    // up the new ops.
+    leader_tip_op_id.ToPB(resp->mutable_next_op_id());
   } else {
     // Empty batch -- preserve the request's from_op_id verbatim.
     SetStreamWalCursor(from_cursor.term(), from_cursor.index(), resp->mutable_next_op_id());
