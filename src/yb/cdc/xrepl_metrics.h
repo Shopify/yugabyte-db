@@ -110,6 +110,42 @@ class CDCSDKTabletMetrics {
   // Lag between last committed record in the WAL and replication slot's restart time.
   scoped_refptr<AtomicGauge<uint64_t>> cdcsdk_flush_lag;
 
+  // Per-phase latency histograms for the GetChanges RPC on the CDCSDK path.
+  // (Total RPC latency is covered by the server-wide handler_latency_yb_cdc_CDCService_GetChanges.)
+  // Time spent before entering GetChangesForCDCSDK: semaphore, validation, stream/tablet/leader
+  // lookup, schema/enum/composite cache.
+  scoped_refptr<EventStats> cdcsdk_get_changes_preflight_latency;
+  // Time spent in GetLastCheckpoint (cdc_state read) when the client sends no from_op_id.
+  scoped_refptr<EventStats> cdcsdk_get_last_checkpoint_latency;
+  // Time spent in UpdateCheckpointAndActiveTime (cdc_state write) on EXPLICIT ack.
+  scoped_refptr<EventStats> cdcsdk_update_checkpoint_latency;
+  // Time spent reading WAL records (GetConsistentWALRecords / GetWALRecords).
+  scoped_refptr<EventStats> cdcsdk_wal_read_latency;
+  // Time in ProcessIntentsWithInvalidSchemaRetry (intent fetch + record population).
+  scoped_refptr<EventStats> cdcsdk_process_intents_latency;
+  // Time in tablet->GetIntentsForCDC alone (the IntentsDB read inside ProcessIntents).
+  scoped_refptr<EventStats> cdcsdk_get_intents_latency;
+  // Time in PopulateCDCSDKWriteRecordWithInvalidSchemaRetry for single-shard writes.
+  scoped_refptr<EventStats> cdcsdk_populate_write_record_latency;
+  // Time in client->GetTableSchemaFromSysCatalog (master round-trips).
+  scoped_refptr<EventStats> cdcsdk_schema_lookup_latency;
+  // Time in GetConsistentStreamSafeTime (waiting for safe time / txn load).
+  scoped_refptr<EventStats> cdcsdk_safe_time_wait_latency;
+
+  // Per-call batch-size histograms (observed once per successful GetChanges).
+  scoped_refptr<EventStats> cdcsdk_wal_records_read;
+  scoped_refptr<EventStats> cdcsdk_wal_bytes_read;
+  scoped_refptr<EventStats> cdcsdk_intents_per_txn;
+  scoped_refptr<EventStats> cdcsdk_response_records;
+  scoped_refptr<EventStats> cdcsdk_response_bytes;
+
+  // Per-optype counters incremented in the GetChangesForCDCSDK main loop.
+  scoped_refptr<Counter> cdcsdk_write_ops_seen;
+  scoped_refptr<Counter> cdcsdk_update_txn_ops_seen;
+  scoped_refptr<Counter> cdcsdk_change_metadata_ops_seen;
+  scoped_refptr<Counter> cdcsdk_truncate_ops_seen;
+  scoped_refptr<Counter> cdcsdk_split_ops_seen;
+
   Result<std::string> TEST_GetAttribute(const std::string& key) const;
 
  private:
