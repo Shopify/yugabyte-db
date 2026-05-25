@@ -1700,7 +1700,8 @@ void CDCServiceImpl::GetChanges(
 
   // Acquire per-tablet CDCSDK metrics so the rest of GetChanges can record per-phase
   // latencies and per-call batch sizes. Skipped for xCluster (different metric class) and for
-  // the sys catalog tablet (same guard used by UpdateTabletMetrics below).
+  // the sys catalog tablet (same guard used by UpdateTabletMetrics below). Total RPC latency
+  // is already covered by the server-wide handler_latency_yb_cdc_CDCService_GetChanges.
   std::shared_ptr<xrepl::CDCSDKTabletMetrics> cdc_sdk_metrics;
   if (record.GetSourceType() == CDCSDK &&
       producer_tablet.tablet_id != master::kSysCatalogTabletId) {
@@ -1709,13 +1710,6 @@ void CDCServiceImpl::GetChanges(
       cdc_sdk_metrics = std::move(metrics_result.get());
     }
   }
-  // Record total RPC latency (per-tablet) on every exit path.
-  auto record_total_latency = ScopeExit([&cdc_sdk_metrics, start_time]() {
-    if (cdc_sdk_metrics) {
-      cdc_sdk_metrics->cdcsdk_get_changes_total_latency->Increment(
-          MonoTime::Now().GetDeltaSince(start_time).ToMicroseconds());
-    }
-  });
 
   // Polling sys catalog tablet is only supported for CDC.
   RPC_CHECK_AND_RETURN_ERROR(

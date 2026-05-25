@@ -111,8 +111,7 @@ class CDCSDKTabletMetrics {
   scoped_refptr<AtomicGauge<uint64_t>> cdcsdk_flush_lag;
 
   // Per-phase latency histograms for the GetChanges RPC on the CDCSDK path.
-  // Total RPC duration (per-tablet view; complements the server-wide handler_latency).
-  scoped_refptr<EventStats> cdcsdk_get_changes_total_latency;
+  // (Total RPC latency is covered by the server-wide handler_latency_yb_cdc_CDCService_GetChanges.)
   // Time spent before entering GetChangesForCDCSDK: semaphore, validation, stream/tablet/leader
   // lookup, schema/enum/composite cache.
   scoped_refptr<EventStats> cdcsdk_get_changes_preflight_latency;

@@ -149,10 +149,7 @@ METRIC_DEFINE_gauge_uint64(cdcsdk, cdcsdk_flush_lag, "CDCSDK flush Lag",
     {0 /* zero means we don't expose it as counter */, yb::AggregationFunction::kMax});
 
 // CDCSDK per-phase latency histograms for the GetChanges RPC.
-METRIC_DEFINE_event_stats(cdcsdk, cdcsdk_get_changes_total_latency,
-    "CDCSDK GetChanges total latency", yb::MetricUnit::kMicroseconds,
-    "Time (microseconds) for the full CDCSDK GetChanges RPC, measured per tablet.");
-
+// (Total RPC latency is covered by the server-wide handler_latency_yb_cdc_CDCService_GetChanges.)
 METRIC_DEFINE_event_stats(cdcsdk, cdcsdk_get_changes_preflight_latency,
     "CDCSDK GetChanges preflight latency", yb::MetricUnit::kMicroseconds,
     "Time (microseconds) spent before entering GetChangesForCDCSDK: semaphore, validation, "
@@ -287,7 +284,6 @@ CDCSDKTabletMetrics::CDCSDKTabletMetrics(const scoped_refptr<MetricEntity>& enti
       GINIT(cdcsdk_expiry_time_ms),
       GINIT(cdcsdk_last_sent_physicaltime),
       GINIT(cdcsdk_flush_lag),
-      MINIT(cdcsdk_get_changes_total_latency),
       MINIT(cdcsdk_get_changes_preflight_latency),
       MINIT(cdcsdk_get_last_checkpoint_latency),
       MINIT(cdcsdk_update_checkpoint_latency),
