@@ -12,6 +12,7 @@
 
 #include "yb/cdc/cdc_producer.h"
 
+#include "yb/cdc/xrepl_metrics.h"
 #include "yb/cdc/xrepl_stream_metadata.h"
 
 #include "yb/client/client.h"
@@ -50,6 +51,7 @@
 #include "yb/tablet/transaction_participant.h"
 
 #include "yb/util/logging.h"
+#include "yb/util/metrics.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/status.h"
 #include "yb/util/status_format.h"
@@ -122,6 +124,27 @@ using dockv::PrimitiveValue;
 using dockv::SchemaPackingStorage;
 
 namespace {
+
+// Returns the latency event-stats pointer if both throughput_metrics and its tablet_metrics
+// are populated, else an empty scoped_refptr (ScopedLatencyMetric handles null as a no-op).
+inline scoped_refptr<EventStats> GetCDCSDKLatency(
+    CDCThroughputMetrics* tm,
+    scoped_refptr<EventStats> xrepl::CDCSDKTabletMetrics::*member) {
+  if (!tm || !tm->tablet_metrics) {
+    return {};
+  }
+  return tm->tablet_metrics->*member;
+}
+
+inline void IncrementCDCSDKCounter(
+    CDCThroughputMetrics* tm,
+    scoped_refptr<Counter> xrepl::CDCSDKTabletMetrics::*member) {
+  if (!tm || !tm->tablet_metrics) {
+    return;
+  }
+  IncrementCounter(tm->tablet_metrics->*member);
+}
+
 YB_DEFINE_ENUM(OpType, (INSERT)(UPDATE)(DELETE));
 
 Result<bool> IsPackedRowUpdate(const dockv::ValueEntryType value_type, Slice value_slice) {
@@ -805,7 +828,11 @@ Result<SchemaDetails> GetOrPopulateRequiredSchemaDetails(
       continue;
     }
 
-    auto result = client->GetTableSchemaFromSysCatalog(cur_table_id, read_hybrid_time);
+    auto result = ([&]() {
+      ScopedLatencyMetric<EventStats> sl(GetCDCSDKLatency(
+          throughput_metrics, &xrepl::CDCSDKTabletMetrics::cdcsdk_schema_lookup_latency));
+      return client->GetTableSchemaFromSysCatalog(cur_table_id, read_hybrid_time);
+    })();
     // Failed to get specific schema version from the system catalog, use the latest
     // schema version for the key-value decoding.
     if (!result.ok()) {
@@ -1840,10 +1867,17 @@ Status ProcessIntents(
     TEST_SYNC_POINT("AddBeginRecord::End");
   }
 
-  RETURN_NOT_OK(tablet->GetIntentsForCDC(transaction_id, aborted, keyValueIntents,
-    stream_state));
+  {
+    ScopedLatencyMetric<EventStats> sl(GetCDCSDKLatency(
+        throughput_metrics, &xrepl::CDCSDKTabletMetrics::cdcsdk_get_intents_latency));
+    RETURN_NOT_OK(tablet->GetIntentsForCDC(transaction_id, aborted, keyValueIntents,
+      stream_state));
+  }
   VLOG(1) << "The size of intentKeyValues for transaction id: " << transaction_id
           << ", with apply record op_id : " << op_id << ", is: " << (*keyValueIntents).size();
+  IncrementStats(GetCDCSDKLatency(
+      throughput_metrics, &xrepl::CDCSDKTabletMetrics::cdcsdk_intents_per_txn),
+      static_cast<int64_t>(keyValueIntents->size()));
 
   const OpId& checkpoint_op_id = tablet_peer->GetLatestCheckPoint();
   if ((*keyValueIntents).size() == 0 && op_id <= checkpoint_op_id) {
@@ -2114,7 +2148,8 @@ Status GetConsistentWALRecords(
     const int64_t& safe_hybrid_time_req, const CoarseTimePoint& deadline,
     std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>* consistent_wal_records,
     std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>* all_checkpoints,
-    HybridTime* last_read_wal_op_record_time, bool* is_entire_wal_read) {
+    HybridTime* last_read_wal_op_record_time, bool* is_entire_wal_read,
+    CDCThroughputMetrics* throughput_metrics) {
   VLOG(2) << "Getting consistent WAL records. safe_hybrid_time_req: " << safe_hybrid_time_req
           << ", consistent_safe_time: " << *consistent_safe_time
           << ", last_seen_op_id: " << last_seen_op_id->ToString()
@@ -2149,6 +2184,10 @@ Status GetConsistentWALRecords(
 
     if (read_ops.read_from_disk_size && mem_tracker) {
       (*consumption) = ScopedTrackedConsumption(mem_tracker, read_ops.read_from_disk_size);
+    }
+    if (throughput_metrics) {
+      throughput_metrics->wal_bytes_read += read_ops.read_from_disk_size;
+      throughput_metrics->wal_records_read += read_ops.messages.size();
     }
 
     for (const auto& msg : read_ops.messages) {
@@ -2250,7 +2289,8 @@ Status GetWALRecords(
     uint64_t consistent_safe_time, OpId* last_seen_op_id, int64_t** last_readable_opid_index,
     const int64_t& safe_hybrid_time, const CoarseTimePoint& deadline, bool skip_intents,
     std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>* wal_records,
-    std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>* all_checkpoints) {
+    std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>* all_checkpoints,
+    CDCThroughputMetrics* throughput_metrics) {
   auto consensus = VERIFY_RESULT(tablet_peer->GetConsensus());
   auto read_ops = VERIFY_RESULT(consensus->ReadReplicatedMessagesForCDC(
       *last_seen_op_id, *last_readable_opid_index, deadline));
@@ -2264,6 +2304,10 @@ Status GetWALRecords(
 
   if (read_ops.read_from_disk_size && mem_tracker) {
     (*consumption) = ScopedTrackedConsumption(mem_tracker, read_ops.read_from_disk_size);
+  }
+  if (throughput_metrics) {
+    throughput_metrics->wal_bytes_read += read_ops.read_from_disk_size;
+    throughput_metrics->wal_records_read += read_ops.messages.size();
   }
 
   for (const auto& msg : read_ops.messages) {
@@ -2680,6 +2724,9 @@ Status GetChangesForCDCSDK(
   auto scope_exit = ScopeExit([&] { docdb::DeleteMemoryContextForCDCWrapper(); });
 
   DCHECK(throughput_metrics);
+  // Per-tablet metric pointer used by the ScopedLatencyMetric wrappers below. May be null on
+  // the xCluster path or when metric acquisition failed; ScopedLatencyMetric handles null.
+  xrepl::CDCSDKTabletMetrics* tm = throughput_metrics->tablet_metrics;
   auto op_id = OpId::FromPB(from_op_id);
   VLOG(1) << "GetChanges request has from_op_id: " << AsString(from_op_id)
           << ", safe_hybrid_time: " << safe_hybrid_time_req
@@ -2703,9 +2750,14 @@ Status GetChangesForCDCSDK(
   } else {
     leader_safe_time = *leader_safe_time_result;
   }
-  uint64_t consistent_stream_safe_time = VERIFY_RESULT(GetConsistentStreamSafeTime(
-      tablet_peer, tablet_ptr, leader_safe_time, safe_hybrid_time_req, deadline,
-      &txn_load_in_progress));
+  uint64_t consistent_stream_safe_time;
+  {
+    ScopedLatencyMetric<EventStats> scoped_safe_time(
+        tm ? tm->cdcsdk_safe_time_wait_latency : scoped_refptr<EventStats>{});
+    consistent_stream_safe_time = VERIFY_RESULT(GetConsistentStreamSafeTime(
+        tablet_peer, tablet_ptr, leader_safe_time, safe_hybrid_time_req, deadline,
+        &txn_load_in_progress));
+  }
   OpId historical_max_op_id = tablet_ptr->transaction_participant()
                                   ? tablet_ptr->transaction_participant()->GetHistoricalMaxOpId()
                                   : OpId::Invalid();
@@ -2739,19 +2791,23 @@ Status GetChangesForCDCSDK(
     std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>> wal_records, all_checkpoints;
 
     DCHECK(last_readable_opid_index);
-    if (FLAGS_cdc_enable_consistent_records)
-      RETURN_NOT_OK(GetConsistentWALRecords(
-          tablet_peer, mem_tracker, msgs_holder, &consumption, &consistent_stream_safe_time,
-          historical_max_op_id, &wait_for_wal_update, &last_seen_op_id, *last_readable_opid_index,
-          safe_hybrid_time_req, deadline, &wal_records, &all_checkpoints,
-          &last_read_wal_op_record_time, &is_entire_wal_read));
-    else
-      // 'skip_intents' is true here because we want the first transaction to be the partially
-      // streamed transaction.
-      RETURN_NOT_OK(GetWALRecords(
-          tablet_peer, mem_tracker, msgs_holder, &consumption, consistent_stream_safe_time,
-          &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time_req, deadline, true,
-          &wal_records, &all_checkpoints));
+    {
+      ScopedLatencyMetric<EventStats> scoped_wal_read(
+          tm ? tm->cdcsdk_wal_read_latency : scoped_refptr<EventStats>{});
+      if (FLAGS_cdc_enable_consistent_records)
+        RETURN_NOT_OK(GetConsistentWALRecords(
+            tablet_peer, mem_tracker, msgs_holder, &consumption, &consistent_stream_safe_time,
+            historical_max_op_id, &wait_for_wal_update, &last_seen_op_id, *last_readable_opid_index,
+            safe_hybrid_time_req, deadline, &wal_records, &all_checkpoints,
+            &last_read_wal_op_record_time, &is_entire_wal_read, throughput_metrics));
+      else
+        // 'skip_intents' is true here because we want the first transaction to be the partially
+        // streamed transaction.
+        RETURN_NOT_OK(GetWALRecords(
+            tablet_peer, mem_tracker, msgs_holder, &consumption, consistent_stream_safe_time,
+            &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time_req, deadline, true,
+            &wal_records, &all_checkpoints, throughput_metrics));
+    }
 
     have_more_messages = HaveMoreMessages(true);
 
@@ -2797,11 +2853,15 @@ Status GetChangesForCDCSDK(
                     wal_records[wal_segment_index]->transaction_state().aborted().set()))
               : SubtxnSet();
 
-      RETURN_NOT_OK(ProcessIntentsWithInvalidSchemaRetry(
-          op_id, transaction_id, xrepl_origin_id, aborted_subtxns, stream_metadata,
-          enum_oid_label_map, composite_atts_map, request_source, resp, &consumption, &checkpoint,
-          tablet_peer, &keyValueIntents, &stream_state, client, cached_schema_details,
-          schema_packing_storages, commit_timestamp, throughput_metrics));
+      {
+        ScopedLatencyMetric<EventStats> sl(GetCDCSDKLatency(
+            throughput_metrics, &xrepl::CDCSDKTabletMetrics::cdcsdk_process_intents_latency));
+        RETURN_NOT_OK(ProcessIntentsWithInvalidSchemaRetry(
+            op_id, transaction_id, xrepl_origin_id, aborted_subtxns, stream_metadata,
+            enum_oid_label_map, composite_atts_map, request_source, resp, &consumption,
+            &checkpoint, tablet_peer, &keyValueIntents, &stream_state, client,
+            cached_schema_details, schema_packing_storages, commit_timestamp, throughput_metrics));
+      }
 
       if (checkpoint.write_id() == 0 && checkpoint.key().empty() && wal_records.size()) {
         AcknowledgeStreamedMultiShardTxn(
@@ -2848,9 +2908,13 @@ Status GetChangesForCDCSDK(
     do {
       size_t next_checkpoint_index = 0;
 
-      consistent_stream_safe_time = VERIFY_RESULT(GetConsistentStreamSafeTime(
-          tablet_peer, tablet_ptr, leader_safe_time, safe_hybrid_time_req, deadline,
-          &txn_load_in_progress));
+      {
+        ScopedLatencyMetric<EventStats> scoped_safe_time(
+            tm ? tm->cdcsdk_safe_time_wait_latency : scoped_refptr<EventStats>{});
+        consistent_stream_safe_time = VERIFY_RESULT(GetConsistentStreamSafeTime(
+            tablet_peer, tablet_ptr, leader_safe_time, safe_hybrid_time_req, deadline,
+            &txn_load_in_progress));
+      }
 
       if (txn_load_in_progress) {
         LOG(INFO) << "Loading of transactions is in progress for tablet: " << tablet_id
@@ -2859,19 +2923,24 @@ Status GetChangesForCDCSDK(
       }
 
       DCHECK(last_readable_opid_index);
-      if (FLAGS_cdc_enable_consistent_records)
-        RETURN_NOT_OK(GetConsistentWALRecords(
-            tablet_peer, mem_tracker, msgs_holder, &consumption, &consistent_stream_safe_time,
-            historical_max_op_id, &wait_for_wal_update, &last_seen_op_id, *last_readable_opid_index,
-            safe_hybrid_time_req, deadline, &wal_records, &all_checkpoints,
-            &last_read_wal_op_record_time, &is_entire_wal_read));
-      else
-        // 'skip_intents' is false otherwise in case the complete wal segment is filled with
-        // intents we will break the loop thinking that WAL has no more records.
-        RETURN_NOT_OK(GetWALRecords(
-            tablet_peer, mem_tracker, msgs_holder, &consumption, consistent_stream_safe_time,
-            &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time_req, deadline, false,
-            &wal_records, &all_checkpoints));
+      {
+        ScopedLatencyMetric<EventStats> scoped_wal_read(
+            tm ? tm->cdcsdk_wal_read_latency : scoped_refptr<EventStats>{});
+        if (FLAGS_cdc_enable_consistent_records)
+          RETURN_NOT_OK(GetConsistentWALRecords(
+              tablet_peer, mem_tracker, msgs_holder, &consumption, &consistent_stream_safe_time,
+              historical_max_op_id, &wait_for_wal_update, &last_seen_op_id,
+              *last_readable_opid_index, safe_hybrid_time_req, deadline, &wal_records,
+              &all_checkpoints, &last_read_wal_op_record_time, &is_entire_wal_read,
+              throughput_metrics));
+        else
+          // 'skip_intents' is false otherwise in case the complete wal segment is filled with
+          // intents we will break the loop thinking that WAL has no more records.
+          RETURN_NOT_OK(GetWALRecords(
+              tablet_peer, mem_tracker, msgs_holder, &consumption, consistent_stream_safe_time,
+              &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time_req, deadline, false,
+              &wal_records, &all_checkpoints, throughput_metrics));
+      }
 
       if (wait_for_wal_update) {
         VLOG_WITH_FUNC(1)
@@ -2957,6 +3026,8 @@ Status GetChangesForCDCSDK(
 
         switch (msg->op_type()) {
           case consensus::OperationType::UPDATE_TRANSACTION_OP:
+            IncrementCDCSDKCounter(
+                throughput_metrics, &xrepl::CDCSDKTabletMetrics::cdcsdk_update_txn_ops_seen);
             // Ignore intents.
             // Read from IntentDB after they have been applied.
             if (msg->transaction_state().status() == TransactionStatus::APPLYING) {
@@ -2995,12 +3066,17 @@ Status GetChangesForCDCSDK(
                       << msg->id().ShortDebugString() << ", tablet_id: " << tablet_id
                       << ", transaction_id: " << txn_id << ", commit_time: " << *commit_timestamp;
 
-              RETURN_NOT_OK(ProcessIntentsWithInvalidSchemaRetry(
-                  op_id, txn_id, xrepl_origin_id, aborted_subtxns, stream_metadata,
-                  enum_oid_label_map, composite_atts_map, request_source, resp, &consumption,
-                  &checkpoint, tablet_peer, &intents, &new_stream_state, client,
-                  cached_schema_details, schema_packing_storages, *commit_timestamp,
-                  throughput_metrics));
+              {
+                ScopedLatencyMetric<EventStats> sl(GetCDCSDKLatency(
+                    throughput_metrics,
+                    &xrepl::CDCSDKTabletMetrics::cdcsdk_process_intents_latency));
+                RETURN_NOT_OK(ProcessIntentsWithInvalidSchemaRetry(
+                    op_id, txn_id, xrepl_origin_id, aborted_subtxns, stream_metadata,
+                    enum_oid_label_map, composite_atts_map, request_source, resp, &consumption,
+                    &checkpoint, tablet_peer, &intents, &new_stream_state, client,
+                    cached_schema_details, schema_packing_storages, *commit_timestamp,
+                    throughput_metrics));
+              }
               streamed_txns.insert(txn_id.ToString());
 
               if (new_stream_state.write_id != 0 && !new_stream_state.key.empty()) {
@@ -3022,6 +3098,8 @@ Status GetChangesForCDCSDK(
             break;
 
           case consensus::OperationType::WRITE_OP: {
+            IncrementCDCSDKCounter(
+                throughput_metrics, &xrepl::CDCSDKTabletMetrics::cdcsdk_write_ops_seen);
             const auto& batch = msg->write().write_batch();
             *commit_timestamp = HybridTime::FromPB(msg->hybrid_time());
 
@@ -3030,6 +3108,9 @@ Status GetChangesForCDCSDK(
                     << ", hybrid_time: " << *commit_timestamp;
 
             if (!batch.has_transaction()) {
+              ScopedLatencyMetric<EventStats> sl(GetCDCSDKLatency(
+                  throughput_metrics,
+                  &xrepl::CDCSDKTabletMetrics::cdcsdk_populate_write_record_latency));
               RETURN_NOT_OK(PopulateCDCSDKWriteRecordWithInvalidSchemaRetry(
                   msg, stream_metadata, tablet_peer, enum_oid_label_map, composite_atts_map,
                   request_source, cached_schema_details, schema_packing_storages, resp, client,
@@ -3044,6 +3125,8 @@ Status GetChangesForCDCSDK(
           } break;
 
           case consensus::OperationType::CHANGE_METADATA_OP: {
+            IncrementCDCSDKCounter(
+                throughput_metrics, &xrepl::CDCSDKTabletMetrics::cdcsdk_change_metadata_ops_seen);
             VLOG(3) << "Will stream a DDL record. " << msg->ShortDebugString();
             RETURN_NOT_OK(SchemaFromPB(
                 msg->change_metadata_request().schema().ToGoogleProtobuf(), &current_schema));
@@ -3070,7 +3153,12 @@ Status GetChangesForCDCSDK(
                 .schema_version = msg->change_metadata_request().schema_version(),
                 .schema = std::make_shared<Schema>(current_schema)};
             changed_schema_version = msg->change_metadata_request().schema_version();
-            auto result = client->GetTableSchemaFromSysCatalog(table_id, msg->hybrid_time());
+            auto result = ([&]() {
+              ScopedLatencyMetric<EventStats> sl(GetCDCSDKLatency(
+                  throughput_metrics,
+                  &xrepl::CDCSDKTabletMetrics::cdcsdk_schema_lookup_latency));
+              return client->GetTableSchemaFromSysCatalog(table_id, msg->hybrid_time());
+            })();
             if (!result.ok()) {
               LOG(WARNING)
                   << "Failed to get the specific schema version from system catalog for table: "
@@ -3119,6 +3207,8 @@ Status GetChangesForCDCSDK(
           } break;
 
           case consensus::OperationType::TRUNCATE_OP: {
+            IncrementCDCSDKCounter(
+                throughput_metrics, &xrepl::CDCSDKTabletMetrics::cdcsdk_truncate_ops_seen);
             if (FLAGS_stream_truncate_record) {
               RETURN_NOT_OK(PopulateCDCSDKTruncateRecord(
                   msg, resp->add_cdc_sdk_proto_records(), current_schema, throughput_metrics));
@@ -3134,6 +3224,8 @@ Status GetChangesForCDCSDK(
           } break;
 
           case yb::consensus::OperationType::SPLIT_OP: {
+            IncrementCDCSDKCounter(
+                throughput_metrics, &xrepl::CDCSDKTabletMetrics::cdcsdk_split_ops_seen);
             const TableId& table_id = tablet_ptr->metadata()->table_id();
             auto op_id = OpId::FromPB(msg->id());
 

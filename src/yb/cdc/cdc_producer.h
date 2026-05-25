@@ -34,6 +34,10 @@ namespace yb {
 
 class MemTracker;
 
+namespace xrepl {
+class CDCSDKTabletMetrics;
+}  // namespace xrepl
+
 namespace cdc {
 
 struct SchemaDetails {
@@ -49,6 +53,14 @@ using consensus::HaveMoreMessages;
 struct CDCThroughputMetrics {
   uint64_t records_sent = 0;
   uint64_t bytes_sent = 0;
+  // Per-tablet metrics for the CDCSDK stream/tablet pair. Non-owning. Null on the xCluster
+  // path or when metrics could not be acquired; observation sites must null-check before use
+  // (ScopedLatencyMetric handles this automatically).
+  xrepl::CDCSDKTabletMetrics* tablet_metrics = nullptr;
+  // Per-call accumulators populated inside the producer and emitted as histograms by the
+  // service layer at the end of the RPC.
+  uint64_t wal_records_read = 0;
+  uint64_t wal_bytes_read = 0;
 };
 
 using UpdateOnSplitOpFunc = std::function<Status(const consensus::ReplicateMsg&)>;
