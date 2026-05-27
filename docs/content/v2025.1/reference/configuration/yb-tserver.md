@@ -1249,6 +1249,19 @@ Default: `28800000` (8 hours)
 
 The time period, in milliseconds, after which the intents will be cleaned up if there is no client polling for the change records.
 
+##### --intents_min_seconds_to_retain
+
+{{% tags/wrap %}}
+{{<tags/feature/t-server>}}
+Default: `0`
+{{% /tags/wrap %}}
+
+Minimum duration, in seconds, to retain a committed transaction's on-disk intents after the transaction has been applied. When set to a non-zero value, the immediate post-apply intent cleanup is deferred until the wall-clock age of the transaction's apply hybrid time exceeds this threshold; the intents are then garbage-collected by the regular intent SST file cleanup path.
+
+Serves as a time-based parallel to [--log_min_seconds_to_retain](#log-min-seconds-to-retain) (which governs WAL segment retention) for the IntentsDB. The default of `0` preserves the historical behavior of cleaning up intents as soon as a transaction's APPLYING record is replicated, when no CDC consumer is pinning a checkpoint barrier via `UpdateCdcReplicatedIndex`.
+
+Intended for CDC consumers that rely on wall-clock retention instead of per-stream lease-based barriers. Operationally, pair with `--log_min_seconds_to_retain` (set both to the same value so the WAL and IntentsDB stay in sync for any consumer that may need to read either).
+
 ##### --cdc_wal_retention_time_secs
 
 {{% tags/wrap %}}

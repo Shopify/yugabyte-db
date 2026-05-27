@@ -117,6 +117,14 @@ DEFINE_RUNTIME_AUTO_bool(cdc_write_post_apply_metadata, kLocalPersisted, false, 
 DEFINE_RUNTIME_bool(cdc_immediate_transaction_cleanup, true,
     "Clean up transactions from memory after apply, even if its changes have not yet been "
     "streamed by CDC.");
+
+DEFINE_RUNTIME_uint32(intents_min_seconds_to_retain, 0,
+    "If > 0, post-apply intent cleanup for a committed transaction is deferred until the "
+    "wall-clock age of the transaction's apply hybrid time exceeds this many seconds. Acts as "
+    "a time-based parallel to --log_min_seconds_to_retain (which governs WAL segment retention) "
+    "for the IntentsDB. Default 0 preserves existing behavior (intents cleaned up immediately "
+    "post-apply when no CDC consumer is pinning a checkpoint barrier via UpdateCdcReplicatedIndex). "
+    "Intended for CDC consumers that rely on wall-clock retention instead of per-stream barriers.");
 DEFINE_test_flag(int32, stopactivetxns_sleep_in_abort_cb_ms, 0,
     "Delays the abort callback in StopActiveTxns to repro GitHub #23399.");
 
@@ -1051,6 +1059,14 @@ class TransactionParticipant::Impl
         data.transaction_id, "apply"s, TransactionLoadFlags{TransactionLoadFlag::kMustExist}));
     if (lock_and_iterator.found()) {
       lock_and_iterator.transaction().SetApplyOpId(data.op_id);
+      // Stamp the apply's hybrid times onto the txn BEFORE the (possibly imminent)
+      // RemoveUnlocked call. The single-batch apply path below jumps straight to
+      // RemoveUnlocked without going through SetApplyData, so apply_data_.log_ht / commit_ht
+      // would otherwise be invalid HTs by the time HandleTransactionCleanup checks the
+      // --intents_min_seconds_to_retain window. SetApplyData (called in the active() branch)
+      // already populates these via apply_data_ = *data, so this stamp is the parallel for
+      // the inactive branch.
+      lock_and_iterator.transaction().SetApplyHybridTimes(data.commit_ht, data.log_ht);
       if (!apply_state.active()) {
         RemoveUnlocked(
             lock_and_iterator.iterator, RemoveReason::kApplied, &min_running_notifier);
@@ -1145,6 +1161,10 @@ class TransactionParticipant::Impl
       }
       CHECK(transactions_.modify(it, [&data](auto& txn) {
         txn->SetApplyOpId(data.op_id);
+        // Mirror UpdateAppliedTransaction: stamp HTs alongside the op_id so that any path
+        // that subsequently leads to RemoveUnlocked sees a valid apply_data_.log_ht and the
+        // intents-retention window is honoured.
+        txn->SetApplyHybridTimes(data.commit_ht, data.log_ht);
       }));
 
       if ((**it).ProcessingApply()) {
@@ -2003,6 +2023,26 @@ class TransactionParticipant::Impl
     std::optional<PostApplyTransactionMetadata> post_apply_metadata_entry;
   };
 
+  // Returns true iff --intents_min_seconds_to_retain is set and the wall-clock age of
+  // `apply_ht` is below the configured threshold. When true, post-apply intent cleanup
+  // should be deferred so a stream-id-less CDC consumer can still read the intents.
+  // A return of false (the default when the flag is 0) preserves the historical
+  // "clean up intents immediately post-apply" behavior.
+  bool IsWithinIntentsRetentionWindow(HybridTime apply_ht) const {
+    const auto retention_secs = GetAtomicFlag(&FLAGS_intents_min_seconds_to_retain);
+    if (retention_secs == 0 || !apply_ht.is_valid()) {
+      return false;
+    }
+    const auto now_micros = participant_context_.Now().GetPhysicalValueMicros();
+    const auto apply_micros = apply_ht.GetPhysicalValueMicros();
+    if (now_micros <= apply_micros) {
+      // Apply HT is in the (logical) future of our clock; treat as within window.
+      return true;
+    }
+    const auto age_micros = now_micros - apply_micros;
+    return age_micros < static_cast<uint64_t>(MonoDelta::FromSeconds(retention_secs).ToMicroseconds());
+  }
+
   TransactionMetaCleanupResult HandleTransactionCleanup(
       const Transactions::iterator& it, RemoveReason reason, const OpId& checkpoint_op_id)
       REQUIRES(mutex_) {
@@ -2019,7 +2059,21 @@ class TransactionParticipant::Impl
     const TransactionId& txn_id = (**it).id();
     const OpId& op_id = (**it).GetApplyOpId();
     if (op_id <= checkpoint_op_id) {
-      if (PREDICT_TRUE(!FLAGS_TEST_no_schedule_remove_intents)) {
+      // intents_min_seconds_to_retain: if the apply is still within the configured retention
+      // window, skip the immediate intent removal. The transaction is still evicted from
+      // `transactions_` (no in-memory growth); the on-disk intents linger and are GC'd later
+      // by the intent SST file cleanup codepath (background compaction filters).
+      //
+      // Trade-off vs. also gating the LockAndFind defense-in-depth cleanup branch: a stale
+      // lookup arriving while the txn sits in `recently_removed_transactions_` and then again
+      // after its 15s TTL expires can re-schedule intent removal before the window elapses.
+      // The two known callers (conflict_resolution.cc, transaction_status_cache.cc) only fire
+      // on the read path for txns the participant doesn't know about, so this is a narrow
+      // race in practice. Hardening that path requires plumbing apply_hybrid_time through
+      // `recently_removed_transactions_`; deliberately deferred for v1 to keep the change
+      // surgical and the patch reviewable as a strictly-additive flag.
+      if (PREDICT_TRUE(!FLAGS_TEST_no_schedule_remove_intents) &&
+          !IsWithinIntentsRetentionWindow((**it).GetApplyHybridTime())) {
         (**it).ScheduleRemoveIntents(*it, reason);
       }
     } else {
