@@ -500,6 +500,20 @@ public class TabletClient extends ReplayingDecoder<Void> {
                                                      CdcService.CDCErrorPB error) {
     WireProtocol.AppStatusPB.ErrorCode code = error.getStatus().getCode();
     CDCErrorException ex = new CDCErrorException(uuid, error);
+    // CDC error codes that must NEVER be retried at the yb-client RPC layer. These represent
+    // either bugs (INVALID_REQUEST), terminal conditions on the tablet (TABLET_SPLIT,
+    // OPERATION_DISALLOWED), or unrecoverable data loss (CHECKPOINT_TOO_OLD,
+    // INTENTS_GC_ERROR). The status-code-driven branches below would otherwise treat the
+    // ILLEGAL_STATE inner status these errors carry as "not leader, retry" -- spending the
+    // whole RPC deadline looping. Fail fast and let the caller decide.
+    if (error.getCode() == CdcService.CDCErrorPB.Code.INTENTS_GC_ERROR ||
+        error.getCode() == CdcService.CDCErrorPB.Code.CHECKPOINT_TOO_OLD ||
+        error.getCode() == CdcService.CDCErrorPB.Code.INVALID_REQUEST ||
+        error.getCode() == CdcService.CDCErrorPB.Code.TABLET_SPLIT ||
+        error.getCode() == CdcService.CDCErrorPB.Code.OPERATION_DISALLOWED ||
+        error.getCode() == CdcService.CDCErrorPB.Code.AUTO_FLAGS_CONFIG_VERSION_MISMATCH) {
+      return ex;
+    }
     if (error.getCode() == CdcService.CDCErrorPB.Code.TABLET_NOT_RUNNING ||
       error.getCode() == CdcService.CDCErrorPB.Code.LEADER_NOT_READY ||
       error.getCode() == CdcService.CDCErrorPB.Code.NOT_LEADER ||

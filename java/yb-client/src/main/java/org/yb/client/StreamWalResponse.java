@@ -13,6 +13,7 @@
 
 package org.yb.client;
 
+import com.google.protobuf.ByteString;
 import java.util.List;
 import org.yb.annotations.InterfaceAudience;
 import org.yb.cdc.CdcService.CDCErrorPB;
@@ -94,6 +95,39 @@ public class StreamWalResponse extends YRpcResponse {
 
   public long getNextOpIdIndex() {
     return resp.getNextOpId().getIndex();
+  }
+
+  /**
+   * @return {@code true} iff {@link #getNextOpId()} carries mid-APPLYING resumption state —
+   *         i.e. the prior batch returned a partial-APPLYING cursor because a transaction's
+   *         intents did not all fit. Callers MUST round-trip both {@code intent_key} and
+   *         {@code intent_write_id} back as the next call's {@code from_op_id}.
+   *
+   * <p>The cursor's {@code (term, index)} are the APPLYING op's own OpId; the cursor has NOT
+   * advanced past the APPLYING.
+   */
+  public boolean nextOpIdIsMidApplying() {
+    StreamWalCursorPB cursor = resp.getNextOpId();
+    return cursor.hasIntentKey() && cursor.hasIntentWriteId();
+  }
+
+  /**
+   * Opaque docdb reverse-index key for resuming a spilled APPLYING. Returns {@code null} when
+   * the cursor is not mid-APPLYING (the common case). Round-trip back as-is on the next call;
+   * do not interpret.
+   */
+  public ByteString getNextOpIdIntentKey() {
+    StreamWalCursorPB cursor = resp.getNextOpId();
+    return cursor.hasIntentKey() ? cursor.getIntentKey() : null;
+  }
+
+  /**
+   * IntraTxnWriteId paired with {@link #getNextOpIdIntentKey()}. Returns {@code null} when the
+   * cursor is not mid-APPLYING.
+   */
+  public Integer getNextOpIdIntentWriteId() {
+    StreamWalCursorPB cursor = resp.getNextOpId();
+    return cursor.hasIntentWriteId() ? cursor.getIntentWriteId() : null;
   }
 
   public boolean hasLeaderTipOpId() {

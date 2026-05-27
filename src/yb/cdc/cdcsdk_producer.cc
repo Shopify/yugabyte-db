@@ -3419,60 +3419,133 @@ void TransferDecodedRecords(
   scratchpad->clear_cdc_sdk_proto_records();
 }
 
-// Post-process the records the single-shard WRITE_OP decoder emitted, in place,
-// when the source WAL entry is actually a transactional WRITE_OP. The existing
-// decoder is single-shard-shaped (it emits a BEGIN, per-row DMLs stamped with
-// commit_time = ReplicateMsg.hybrid_time, and a COMMIT). For transactional
-// writes the contract requires the row records to carry transaction_id /
-// subtransaction_id and to NOT carry commit_time (commit_time is supplied by
-// the APPLYING envelope on the same WAL). We also drop the BEGIN/COMMIT
-// envelopes because they describe single-shard commit semantics that don't
-// apply to a partial intent-time batch.
-void PostProcessTransactionalWriteRecords(
-    const yb::docdb::LWKeyValueWriteBatchPB& batch,
-    std::vector<CDCSDKProtoRecordPB>* records) {
-  std::string transaction_id_str;
-  if (batch.has_transaction() && batch.transaction().has_transaction_id()) {
-    auto txn_id_result = FullyDecodeTransactionId(batch.transaction().transaction_id());
-    if (txn_id_result.ok()) {
-      transaction_id_str = txn_id_result->ToString();
-    }
+// Stamp the aborted-subtxn set from a WAL APPLYING entry onto the COMMIT
+// envelope's CDCSDKProtoRecordPB.aborted_subtxn_set field. Per-row records
+// emitted from PopulateCDCSDKIntentRecord have ALREADY been filtered against
+// this set server-side; this field is preserved purely for observability /
+// debugging on the COMMIT envelope.
+void StampAbortedSubtxnSetOnCommit(
+    const consensus::ReplicateMsgPtr& applying_msg,
+    std::vector<CDCSDKProtoRecordPB>* out_records) {
+  if (out_records->empty()) {
+    return;
+  }
+  if (!applying_msg->has_transaction_state() ||
+      !applying_msg->transaction_state().has_aborted()) {
+    return;
+  }
+  auto& last = out_records->back();
+  if (!last.has_row_message() || last.row_message().op() != RowMessage_Op_COMMIT) {
+    return;
+  }
+  auto* aborted_pb = last.mutable_aborted_subtxn_set();
+  for (uint32_t value : applying_msg->transaction_state().aborted().set()) {
+    aborted_pb->add_set(value);
+  }
+}
+
+Status DispatchApplyingForStreamWALImpl(
+    const consensus::ReplicateMsgPtr& applying_msg,
+    StreamWalDecodeContext* ctx,
+    const StreamWalIntentResumeState* resume_state,
+    std::vector<CDCSDKProtoRecordPB>* out_records,
+    StreamWalDispatchResult* out) {
+  RSTATUS_DCHECK(out_records, InvalidArgument, "out_records must be non-null");
+  RSTATUS_DCHECK(out, InvalidArgument, "out must be non-null");
+  RSTATUS_DCHECK(
+      applying_msg->has_transaction_state(), InvalidArgument,
+      "UPDATE_TRANSACTION_OP message missing transaction_state");
+  RSTATUS_DCHECK(
+      applying_msg->transaction_state().status() == TransactionStatus::APPLYING, InvalidArgument,
+      "DispatchApplyingForStreamWAL requires APPLYING status");
+
+  out->mid_applying_resume.reset();
+
+  const auto& txn_state = applying_msg->transaction_state();
+  auto txn_id = VERIFY_RESULT(FullyDecodeTransactionId(txn_state.transaction_id()));
+
+  uint32_t xrepl_origin_id = 0;
+  if (txn_state.has_xrepl_origin_id()) {
+    xrepl_origin_id = txn_state.xrepl_origin_id();
   }
 
-  std::optional<uint32_t> subtxn_id;
-  if (batch.has_subtransaction() && batch.subtransaction().has_subtransaction_id() &&
-      batch.subtransaction().subtransaction_id() != kMinSubTransactionId) {
-    subtxn_id = batch.subtransaction().subtransaction_id();
+  HybridTime commit_timestamp;
+  if (txn_state.has_commit_hybrid_time()) {
+    commit_timestamp = HybridTime::FromPB(txn_state.commit_hybrid_time());
   }
 
-  std::vector<CDCSDKProtoRecordPB> filtered;
-  filtered.reserve(records->size());
-  for (auto& rec : *records) {
-    if (!rec.has_row_message()) {
-      filtered.emplace_back(std::move(rec));
-      continue;
-    }
-    const auto op = rec.row_message().op();
-    if (op == RowMessage_Op_BEGIN || op == RowMessage_Op_COMMIT) {
-      // Single-shard envelope; not applicable to a transactional intent batch.
-      continue;
-    }
+  // Mirror GetChangesForCDCSDK at cdcsdk_producer.cc:2881 / 2709: re-derive
+  // aborted-subtxns from the WAL APPLYING entry on every call.
+  auto aborted_subtxns =
+      FLAGS_cdc_enable_savepoint_rollback_filtering
+          ? VERIFY_RESULT(SubtxnSet::FromPB(txn_state.aborted().set()))
+          : SubtxnSet();
 
-    rec.mutable_row_message()->clear_commit_time();
-    if (!transaction_id_str.empty()) {
-      rec.mutable_row_message()->set_transaction_id(transaction_id_str);
-    }
-    if (subtxn_id.has_value()) {
-      // RowMessage doesn't carry subtransaction_id (it's a field on the legacy
-      // CDCRecordPB). We deliberately do not invent a new field here -- clients
-      // that need savepoint-level filtering inspect aborted_subtxn_set on the
-      // APPLYING record and reconcile per-row intent records via IntentsDB
-      // (out of scope for v1 of the StreamWAL contract).
-      (void)subtxn_id;
-    }
-    filtered.emplace_back(std::move(rec));
+  // ApplyTransactionState is the docdb-level resume cursor. Empty means
+  // "start of intent scan" (BEGIN will be emitted by ProcessIntents). Non-empty
+  // means "resume one position past (key, write_id)" -- BEGIN is skipped.
+  docdb::ApplyTransactionState stream_state;
+  if (resume_state != nullptr) {
+    stream_state.key = resume_state->intent_key;
+    stream_state.write_id = resume_state->intent_write_id;
   }
-  *records = std::move(filtered);
+
+  // ProcessIntents emits records into a GetChangesResponsePB scratchpad and
+  // writes the resume cursor (if it spilled) into a CDCSDKCheckpointPB out
+  // parameter. We translate both into the StreamWAL surface afterwards.
+  GetChangesResponsePB scratchpad;
+  CDCSDKCheckpointPB checkpoint;
+  ScopedTrackedConsumption consumption;
+  std::vector<docdb::IntentKeyValueForCDC> key_value_intents;
+  CDCThroughputMetrics throughput_metrics;
+
+  const OpId apply_op_id(applying_msg->id().term(), applying_msg->id().index());
+
+  auto status = ProcessIntentsWithInvalidSchemaRetry(
+      apply_op_id, txn_id, xrepl_origin_id, aborted_subtxns, *ctx->stream_metadata,
+      *ctx->enum_map, *ctx->composite_atts_map, CDCSDKRequestSource::DEBEZIUM,
+      &scratchpad, &consumption, &checkpoint, ctx->tablet_peer,
+      &key_value_intents, &stream_state, ctx->client, ctx->cached_schema_details,
+      ctx->schema_packing_storages, commit_timestamp, &throughput_metrics);
+
+  if (!status.ok()) {
+    // The "intents have been GC'd" condition surfaces as an InternalError
+    // whose message starts with "CDCSDK Trying to fetch already GCed intents"
+    // (see ProcessIntents at cdcsdk_producer.cc:1779). Translate to an
+    // IllegalState status the handler can pattern-match into
+    // CDCErrorPB::INTENTS_GC_ERROR.
+    if (status.IsInternalError() &&
+        status.message().ToBuffer().find("already GCed intents") != std::string::npos) {
+      return STATUS_FORMAT(
+          IllegalState,
+          "INTENTS_GC_ERROR: intents for transaction $0 at apply_op_id $1 have been "
+          "garbage-collected; underlying status: $2",
+          txn_id, apply_op_id, status);
+    }
+    return status;
+  }
+
+  TransferDecodedRecords(&scratchpad, out_records);
+
+  // ProcessIntents indicates a spill via a non-empty checkpoint key + non-zero
+  // write_id. (Mirrors GetChangesForCDCSDK at cdcsdk_producer.cc:2728 / 2920.)
+  const bool spilled = !checkpoint.key().empty() && checkpoint.write_id() != 0;
+
+  if (spilled) {
+    StreamWalIntentResumeState resume;
+    resume.intent_key = checkpoint.key();
+    resume.intent_write_id = checkpoint.write_id();
+    out->mid_applying_resume = std::move(resume);
+    out->kind = StreamWalDispatchResult::Kind::kApplyingSpilled;
+  } else {
+    // Drained: COMMIT was emitted as the last record (assuming
+    // FLAGS_cdc_populate_end_markers_transactions is true). Decorate it with
+    // aborted_subtxn_set for the contract.
+    StampAbortedSubtxnSetOnCommit(applying_msg, out_records);
+    out->kind = StreamWalDispatchResult::Kind::kRecordsEmitted;
+  }
+
+  return Status::OK();
 }
 
 Result<StreamWalDispatchResult> DispatchWalOpForStreamWAL(
@@ -3501,18 +3574,21 @@ Result<StreamWalDispatchResult> DispatchWalOpForStreamWAL(
   switch (msg->op_type()) {
     case consensus::OperationType::WRITE_OP: {
       const auto& batch = msg->write().write_batch();
-      const bool is_transactional = batch.has_transaction();
+      if (batch.has_transaction()) {
+        // Transactional WRITE_OP: intents live in IntentsDB and will be
+        // surfaced at the matching APPLYING op via DispatchApplyingForStreamWAL.
+        // Per the StreamWAL contract, the WRITE_OP itself is dropped on the
+        // wire (silent cursor advance). See "Per-OperationType emission rules"
+        // in the contract for WRITE_OP (transactional).
+        result.kind = StreamWalDispatchResult::Kind::kSilent;
+        break;
+      }
       RETURN_NOT_OK(PopulateCDCSDKWriteRecord(
           msg, *ctx->stream_metadata, ctx->tablet_peer, *ctx->enum_map,
           *ctx->composite_atts_map, CDCSDKRequestSource::DEBEZIUM,
           ctx->cached_schema_details, ctx->schema_packing_storages,
           &scratchpad, ctx->client, &throughput_metrics));
       TransferDecodedRecords(&scratchpad, out_records);
-      if (is_transactional) {
-        // Decoder is single-shard-shaped; reshape the emitted records to the
-        // contract's transactional WRITE_OP envelope.
-        PostProcessTransactionalWriteRecords(batch, out_records);
-      }
       result.kind = out_records->empty()
                         ? StreamWalDispatchResult::Kind::kSilent
                         : StreamWalDispatchResult::Kind::kRecordsEmitted;
@@ -3521,11 +3597,11 @@ Result<StreamWalDispatchResult> DispatchWalOpForStreamWAL(
 
     case consensus::OperationType::UPDATE_TRANSACTION_OP: {
       if (msg->transaction_state().status() == TransactionStatus::APPLYING) {
-        CDCSDKProtoRecordPB applying_record;
-        RETURN_NOT_OK(PopulateStreamWalApplyingRecord(msg, &applying_record));
-        out_records->emplace_back();
-        out_records->back().Swap(&applying_record);
-        result.kind = StreamWalDispatchResult::Kind::kRecordsEmitted;
+        // Read the txn's intents from IntentsDB and emit BEGIN + per-row DMLs
+        // + (conditional) COMMIT. May return kApplyingSpilled if the intents
+        // exceeded the per-call intent budget (FLAGS_cdc_max_stream_intent_records).
+        RETURN_NOT_OK(DispatchApplyingForStreamWALImpl(
+            msg, ctx, /*resume_state=*/nullptr, out_records, &result));
       } else {
         // PROMOTING and any other UPDATE_TRANSACTION_OP status: silent cursor
         // advance, no record emitted.
@@ -3606,6 +3682,27 @@ Result<StreamWalDispatchResult> DispatchWalOpForStreamWAL(
   }
 
   return result;
+}
+
+Status DispatchApplyingForStreamWAL(
+    const consensus::ReplicateMsgPtr& applying_msg,
+    StreamWalDecodeContext* ctx,
+    const StreamWalIntentResumeState* resume_state,
+    std::vector<CDCSDKProtoRecordPB>* out_records,
+    StreamWalDispatchResult* out) {
+  RSTATUS_DCHECK(ctx, InvalidArgument, "ctx must be non-null");
+  RSTATUS_DCHECK(ctx->tablet_peer, InvalidArgument, "ctx->tablet_peer must be non-null");
+  RSTATUS_DCHECK(ctx->stream_metadata, InvalidArgument, "ctx->stream_metadata must be non-null");
+  RSTATUS_DCHECK(
+      ctx->cached_schema_details, InvalidArgument, "ctx->cached_schema_details must be non-null");
+  RSTATUS_DCHECK(
+      ctx->schema_packing_storages, InvalidArgument,
+      "ctx->schema_packing_storages must be non-null");
+  RSTATUS_DCHECK(ctx->enum_map, InvalidArgument, "ctx->enum_map must be non-null");
+  RSTATUS_DCHECK(
+      ctx->composite_atts_map, InvalidArgument, "ctx->composite_atts_map must be non-null");
+  return DispatchApplyingForStreamWALImpl(
+      applying_msg, ctx, resume_state, out_records, out);
 }
 
 }  // namespace cdc

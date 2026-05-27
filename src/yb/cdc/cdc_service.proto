@@ -107,6 +107,16 @@ message CDCErrorPB {
     TABLET_SPLIT = 12;
     OPERATION_DISALLOWED = 13;
     AUTO_FLAGS_CONFIG_VERSION_MISMATCH = 14;
+    // Returned by StreamWAL when an APPLYING op's intents have already been
+    // garbage-collected from IntentsDB before the connector could read them.
+    // This is unrecoverable data loss for the affected transaction: the
+    // connector must restart from {0,0} or {-1,-1} (losing all data up to
+    // that point). Operator action: investigate why the IntentsDB retention
+    // barrier (cdc_sdk_min_checkpoint_op_id) was advanced past pending
+    // intents -- typically means UpdateCdcReplicatedIndex heartbeats did not
+    // reach all replicas, or cdc_intent_retention_ms was shorter than the
+    // observed connector lag.
+    INTENTS_GC_ERROR = 15;
   }
 
   // The error code.
@@ -596,22 +606,61 @@ message CDCSDKProtoRecordPB {
   optional tablet.SplitTabletRequestPB split_tablet_request = 5;
 }
 
-// Resume cursor for StreamWAL. Identifies a unique WAL OpId on the leader.
+// Resume cursor for StreamWAL. Identifies a unique resumption point on the
+// leader: a WAL OpId, optionally augmented with a mid-APPLYING continuation
+// position when a single transaction's intents could not fit in one batch.
 //
 // Three meaningful values in a request:
 //   {term: 0,  index: 0}  -> "from start of retained WAL"; server emits
 //                           synthetic bootstrap DDLs before any real records.
+//                           intent_key / intent_write_id MUST be unset.
 //   {term: -1, index: -1} -> SKIP-TO-TIP sentinel. Server emits synthetic
 //                           bootstrap DDLs only; sets next_op_id to the
 //                           current leader tip. No historical records.
+//                           intent_key / intent_write_id MUST be unset.
 //   {term: T,  index: I}  -> "records strictly after OpId(T, I)"; no bootstrap.
 //                           Caller must already have schema cache for any
 //                           schema_version active between (0,0) and (T,I).
 //
 // In a response, next_op_id is always a real (T, I) value (never a sentinel).
+//
+// PARTIAL-APPLYING RESUMPTION:
+//
+//   When a single UPDATE_TRANSACTION_OP { APPLYING } at OpId(T, I) produces
+//   more intent records than fit in one batch, the server returns:
+//
+//     next_op_id = {term: T, index: I,
+//                   intent_key: <docdb reverse-index key of the LAST intent
+//                                already emitted; the next scan resumes one
+//                                position past this key>,
+//                   intent_write_id: <IntraTxnWriteId of that intent>}
+//
+//   The (term, index) are the APPLYING op's own OpId -- the cursor has NOT
+//   advanced past the APPLYING. On the next call the server re-reads the
+//   APPLYING WAL entry (cheap: single op fetch), resumes the IntentsDB scan
+//   one position past (intent_key, intent_write_id), and continues emitting
+//   intent records. When intent_key / intent_write_id are unset (the empty /
+//   zero values), the APPLYING is fully drained and the cursor effectively
+//   means "strictly after (T, I)".
+//
+//   Clients pass `next_op_id` back as `from_op_id` verbatim; they do not
+//   inspect intent_key / intent_write_id. The fields are encoded on the
+//   cursor only so the server can be stateless across calls.
 message StreamWalCursorPB {
   optional int64 term = 1;
   optional int64 index = 2;
+
+  // Mid-APPLYING resume fields. Both MUST be unset together (the common
+  // case) or both MUST be set together (resuming a spilled APPLYING).
+  // Servers reject mixed states with INVALID_REQUEST.
+  //
+  // intent_key is the bytes form of docdb::ApplyTransactionState::key (the
+  // reverse-index key into IntentsDB). intent_write_id is the
+  // IntraTxnWriteId associated with that key. Together they identify the
+  // LAST intent already emitted in the prior batch; the server resumes the
+  // scan one position past this point.
+  optional bytes  intent_key      = 3;
+  optional uint32 intent_write_id = 4;
 }
 
 message StreamWalRequestPB {
