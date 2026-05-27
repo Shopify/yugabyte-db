@@ -2015,23 +2015,6 @@ public class YBClient implements AutoCloseable {
   }
 
   /**
-   * Synchronous wrapper for {@link AsyncYBClient#updateCdcReplicatedIndex}. Per-tablet
-   * retention heartbeat for the stream-id-less StreamWAL flow.
-   *
-   * @see AsyncYBClient#updateCdcReplicatedIndex(YBTable, String, long, long, long)
-   */
-  public UpdateCdcReplicatedIndexResponse updateCdcReplicatedIndex(
-      YBTable table,
-      String tabletId,
-      long term,
-      long index,
-      long leaseExpirationMs) throws Exception {
-    Deferred<UpdateCdcReplicatedIndexResponse> d =
-        asyncClient.updateCdcReplicatedIndex(table, tabletId, term, index, leaseExpirationMs);
-    return d.join(2 * getDefaultOperationTimeoutMs());
-  }
-
-  /**
    * Get the list of child tablets for a given parent tablet.
    *
    * @param table the {@link YBTable} instance of the table
