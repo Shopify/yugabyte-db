@@ -13,6 +13,8 @@
 #pragma once
 
 #include <memory>
+#include <optional>
+#include <string>
 
 #include <boost/functional/hash.hpp>
 #include <boost/unordered_map.hpp>
@@ -21,6 +23,7 @@
 #include "yb/cdc/cdc_types.h"
 #include "yb/client/client_fwd.h"
 #include "yb/common/common_fwd.h"
+#include "yb/common/doc_hybrid_time.h"
 #include "yb/common/opid.h"
 #include "yb/common/transaction.h"
 #include "yb/consensus/consensus_fwd.h"
@@ -166,6 +169,18 @@ struct StreamWalDecodeContext {
   const CompositeAttsMap* composite_atts_map = nullptr;
 };
 
+// Resume state for a mid-APPLYING StreamWAL call. Round-trips through the
+// new StreamWalCursorPB.intent_key / intent_write_id fields.
+//
+// Mirrors docdb::ApplyTransactionState's resumption fields. The aborted-subtxn
+// set is NOT carried here -- it is re-derived from the WAL APPLYING entry on
+// every resuming call, which is cheaper than encoding it on the wire and
+// authoritative regardless of replica.
+struct StreamWalIntentResumeState {
+  std::string intent_key;
+  IntraTxnWriteId intent_write_id = 0;
+};
+
 // Outcome of decoding a single ReplicateMsg via the StreamWAL emission rules.
 struct StreamWalDispatchResult {
   enum class Kind {
@@ -179,8 +194,17 @@ struct StreamWalDispatchResult {
     // The op was silent (no record emitted). The caller still advances the
     // cursor past it.
     kSilent,
+    // Set by DispatchApplyingForStreamWAL when an APPLYING's intents did not
+    // fit in one batch. `mid_applying_resume` is populated with the next
+    // intent's (key, write_id). The caller MUST stop the loop, MUST NOT advance
+    // the cursor past this op, and MUST emit a partial-APPLYING cursor on the
+    // response.
+    kApplyingSpilled,
   };
   Kind kind = Kind::kSilent;
+
+  // Populated iff kind == kApplyingSpilled.
+  std::optional<StreamWalIntentResumeState> mid_applying_resume;
 };
 
 // Decode a single ReplicateMsg per the StreamWAL per-OperationType emission
@@ -190,10 +214,50 @@ struct StreamWalDispatchResult {
 // This is the ONLY entry point cdc_service.cc::StreamWAL uses to invoke the
 // existing decoder family; the decoder functions themselves are private to
 // cdcsdk_producer.cc.
+//
+// Note: when called on an UPDATE_TRANSACTION_OP { APPLYING }, this function
+// internally delegates to DispatchApplyingForStreamWAL with resume_state =
+// nullptr (i.e. start-of-APPLYING) and may return kApplyingSpilled.
 Result<StreamWalDispatchResult> DispatchWalOpForStreamWAL(
     const consensus::ReplicateMsgPtr& msg,
     StreamWalDecodeContext* ctx,
     std::vector<CDCSDKProtoRecordPB>* out_records);
+
+// Emit BEGIN + per-row DMLs + (conditional) COMMIT for an APPLYING WAL entry.
+//
+// Reads the transaction's intents from IntentsDB via Tablet::GetIntentsForCDC
+// (composed inside ProcessIntentsWithInvalidSchemaRetry), filters aborted
+// subtxns server-side, stamps commit_hybrid_time on all envelopes and per-row
+// records, and appends the resulting CDCSDKProtoRecordPB records to
+// *out_records.
+//
+// If resume_state is null, starts at the beginning of the APPLYING's intent
+// scan and emits the BEGIN envelope as the first record.
+//
+// If resume_state is non-null, skips the BEGIN envelope (already emitted on a
+// prior call) and resumes the intent scan one position past
+// (resume_state->intent_key, resume_state->intent_write_id).
+//
+// On a clean drain (intent budget did not spill), the COMMIT envelope is the
+// final record appended; *out is set to kRecordsEmitted and
+// out->mid_applying_resume is cleared.
+//
+// On a spill (intent budget exhausted before COMMIT), the COMMIT envelope is
+// NOT emitted; *out is set to kApplyingSpilled and out->mid_applying_resume is
+// populated with the position of the last intent emitted in this batch (the
+// next call resumes one position past it).
+//
+// On the "intents already GC'd from IntentsDB" condition (i.e. the underlying
+// ProcessIntents detection at cdcsdk_producer.cc:1779), returns a status that
+// .IsIllegalState() and whose message contains "INTENTS_GC_ERROR". The handler
+// maps this to CDCErrorPB::INTENTS_GC_ERROR. All other errors are propagated
+// as-is and surface as CDCErrorPB::INTERNAL_ERROR.
+Status DispatchApplyingForStreamWAL(
+    const consensus::ReplicateMsgPtr& applying_msg,
+    StreamWalDecodeContext* ctx,
+    const StreamWalIntentResumeState* resume_state,
+    std::vector<CDCSDKProtoRecordPB>* out_records,
+    StreamWalDispatchResult* out);
 
 }  // namespace cdc
 }  // namespace yb

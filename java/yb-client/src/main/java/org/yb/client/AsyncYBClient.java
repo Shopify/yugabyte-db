@@ -716,14 +716,77 @@ public class AsyncYBClient implements AutoCloseable {
       int maxRecords,
       long maxBytes,
       int deadlineMs) {
+    return streamWAL(table, tabletId, fromTerm, fromIndex, /*fromIntentKey=*/ null,
+        /*fromIntentWriteId=*/ null, maxRecords, maxBytes, deadlineMs);
+  }
+
+  /**
+   * StreamWAL variant that exposes the mid-APPLYING resume fields. Use this overload when the
+   * prior batch returned a partial-APPLYING cursor (i.e.
+   * {@link StreamWalResponse#nextOpIdIsMidApplying()} was {@code true}). Pass {@code null} for
+   * both fields in the common (non-resuming) case.
+   *
+   * <p>The server rejects mixed states (one set, the other not) with {@code INVALID_REQUEST}.
+   *
+   * @param fromIntentKey      opaque docdb reverse-index key returned by the prior call's
+   *                           {@link StreamWalResponse#getNextOpIdIntentKey()}; {@code null} when
+   *                           not resuming.
+   * @param fromIntentWriteId  IntraTxnWriteId paired with {@code fromIntentKey}; {@code null}
+   *                           when not resuming.
+   */
+  public Deferred<StreamWalResponse> streamWAL(
+      YBTable table,
+      String tabletId,
+      long fromTerm,
+      long fromIndex,
+      com.google.protobuf.ByteString fromIntentKey,
+      Integer fromIntentWriteId,
+      int maxRecords,
+      long maxBytes,
+      int deadlineMs) {
     checkIsClosed();
     StreamWalRequest rpc =
-        new StreamWalRequest(table, tabletId, fromTerm, fromIndex, maxRecords, maxBytes, deadlineMs);
+        new StreamWalRequest(table, tabletId, fromTerm, fromIndex,
+            fromIntentKey, fromIntentWriteId, maxRecords, maxBytes, deadlineMs);
     rpc.maxAttempts = this.maxAttempts;
     Deferred<StreamWalResponse> d = rpc.getDeferred();
     // Allow enough wall-clock for the server's long-poll budget plus network jitter. The
     // socket-read timeout configured on AsyncYBClient is enforced independently.
     rpc.setTimeoutMillis(defaultOperationTimeoutMs + Math.max(0, deadlineMs));
+    sendRpcToTablet(rpc);
+    return d;
+  }
+
+  /**
+   * TEMPORARY: per-tablet retention heartbeat. The StreamWAL design is moving to time-based
+   * retention (server-side flags) with no per-consumer barriers; this method exists only so
+   * the embedded test can exercise the wire end-to-end before that server change ships.
+   *
+   * <p>One call pins both the WAL barrier (so the next StreamWAL call doesn't see
+   * {@code CHECKPOINT_TOO_OLD}) and the IntentsDB barrier (so the server can read intents for
+   * committed transactions at APPLYING time without returning {@code INTENTS_GC_ERROR}).
+   * Leader-only on the current RPC.
+   *
+   * @param table              YBTable used to anchor the meta-cache lookup.
+   * @param tabletId           32-char hex tablet UUID.
+   * @param term               cursor term.
+   * @param index              cursor index.
+   * @param leaseExpirationMs  lease TTL in ms; once this elapses without a refresh, the
+   *                           server's IntentsDB barrier reverts to OpId::Max() (GC everything).
+   */
+  public Deferred<UpdateCdcReplicatedIndexResponse> updateCdcReplicatedIndex(
+      YBTable table,
+      String tabletId,
+      long term,
+      long index,
+      long leaseExpirationMs) {
+    checkIsClosed();
+    UpdateCdcReplicatedIndexRequest rpc =
+        new UpdateCdcReplicatedIndexRequest(
+            table, tabletId, term, index, term, index, leaseExpirationMs);
+    rpc.maxAttempts = this.maxAttempts;
+    Deferred<UpdateCdcReplicatedIndexResponse> d = rpc.getDeferred();
+    rpc.setTimeoutMillis(defaultOperationTimeoutMs);
     sendRpcToTablet(rpc);
     return d;
   }
@@ -2777,6 +2840,10 @@ public class AsyncYBClient implements AutoCloseable {
     }
     if (request instanceof StreamWalRequest) {
       String tabletId = ((StreamWalRequest) request).getTabletId();
+      tablet = getTablet(tableId, tabletId);
+    }
+    if (request instanceof UpdateCdcReplicatedIndexRequest) {
+      String tabletId = ((UpdateCdcReplicatedIndexRequest) request).getTabletId();
       tablet = getTablet(tableId, tabletId);
     }
     if (request instanceof CreateCDCStreamRequest) {

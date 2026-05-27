@@ -2176,6 +2176,18 @@ void SetStreamWalCursor(int64_t term, int64_t index, StreamWalCursorPB* cursor) 
   cursor->set_index(index);
 }
 
+// Construct a partial-APPLYING cursor: (term, index) of the APPLYING op plus
+// the IntentsDB resume position. The cursor has NOT advanced past the APPLYING.
+void SetStreamWalMidApplyingCursor(
+    int64_t term, int64_t index,
+    const std::string& intent_key, uint32_t intent_write_id,
+    StreamWalCursorPB* cursor) {
+  cursor->set_term(term);
+  cursor->set_index(index);
+  cursor->set_intent_key(intent_key);
+  cursor->set_intent_write_id(intent_write_id);
+}
+
 // Returns true iff the cursor is {-1, -1}, the skip-to-tip sentinel.
 bool IsStreamWalSkipToTip(const StreamWalCursorPB& cursor) {
   return cursor.has_term() && cursor.has_index() &&
@@ -2190,16 +2202,45 @@ bool IsStreamWalFromStart(const StreamWalCursorPB& cursor) {
   return cursor.term() == 0 && cursor.index() == 0;
 }
 
+// Returns true iff the cursor carries mid-APPLYING resumption state.
+// The validator ensures both fields are set together (or neither) before this
+// runs, so it is sufficient to test one field.
+bool IsStreamWalMidApplying(const StreamWalCursorPB& cursor) {
+  return cursor.has_intent_key() || cursor.has_intent_write_id();
+}
+
 // Validate the from_op_id field shape. Returns OK iff one of:
-//   {0, 0}                     -> from-start
-//   {-1, -1}                   -> skip-to-tip
-//   {T >= 1, I >= 0}           -> real cursor
+//   {0, 0}                                       -> from-start
+//   {-1, -1}                                     -> skip-to-tip
+//   {T >= 1, I >= 0}                             -> real cursor (no resume)
+//   {T >= 1, I >= 0, intent_key, intent_write_id} -> mid-APPLYING resume
 // Anything else is INVALID_REQUEST in the contract's error taxonomy.
 Status ValidateStreamWalFromOpId(const StreamWalCursorPB& cursor) {
   if (!cursor.has_term() || !cursor.has_index()) {
     return STATUS(InvalidArgument, "from_op_id must have term and index set");
   }
+
+  // Mid-APPLYING fields: both-or-neither. Mixed states are rejected even if
+  // the (term, index) is otherwise valid.
+  const bool has_key = cursor.has_intent_key();
+  const bool has_write_id = cursor.has_intent_write_id();
+  if (has_key != has_write_id) {
+    return STATUS_FORMAT(
+        InvalidArgument,
+        "from_op_id.intent_key and from_op_id.intent_write_id must be both set or both unset; "
+        "got intent_key set=$0, intent_write_id set=$1",
+        has_key, has_write_id);
+  }
+  const bool mid_applying = has_key && has_write_id;
+
   if (IsStreamWalFromStart(cursor) || IsStreamWalSkipToTip(cursor)) {
+    if (mid_applying) {
+      return STATUS_FORMAT(
+          InvalidArgument,
+          "from_op_id may not carry intent_key / intent_write_id with sentinel (term, index) "
+          "$0; mid-APPLYING resumption requires a concrete APPLYING op to resume",
+          OpId(cursor.term(), cursor.index()));
+    }
     return Status::OK();
   }
   if (cursor.term() < 1 || cursor.index() < 0) {
@@ -2209,6 +2250,18 @@ Status ValidateStreamWalFromOpId(const StreamWalCursorPB& cursor) {
         cursor.term(), cursor.index());
   }
   return Status::OK();
+}
+
+// Detect the inner status emitted by DispatchApplyingForStreamWAL on the
+// "intents have been GC'd from IntentsDB" condition. Implementation detail:
+// the helper signals this case by returning IllegalState whose message
+// contains "INTENTS_GC_ERROR" -- pattern-matching keeps the inner code free
+// of CDCErrorPB dependencies.
+bool IsIntentsGcError(const Status& status) {
+  if (!status.IsIllegalState()) {
+    return false;
+  }
+  return status.message().ToBuffer().find("INTENTS_GC_ERROR") != std::string::npos;
 }
 
 }  // namespace
@@ -2322,6 +2375,11 @@ void CDCServiceImpl::StreamWAL(
   bool emit_bootstrap = false;
   bool skip_to_tip = false;
 
+  // Mid-APPLYING resumption state. Populated when the request's cursor carries
+  // intent_key / intent_write_id; consumed by the dispatch loop below.
+  bool resuming_applying = false;
+  StreamWalIntentResumeState applying_resume_state;
+
   if (IsStreamWalSkipToTip(from_cursor)) {
     emit_bootstrap = true;
     skip_to_tip = true;
@@ -2330,7 +2388,8 @@ void CDCServiceImpl::StreamWAL(
     emit_bootstrap = true;
     read_from_op_id = OpId();  // WAL reader treats {0,0} as "earliest retained"
   } else {
-    // Real cursor. Apply retention / over-tip validation.
+    // Real cursor (with or without mid-APPLYING resumption). Apply retention /
+    // over-tip validation regardless -- the (term, index) is a concrete OpId.
     const int64_t cdc_min_replicated_index = tablet_peer->get_cdc_min_replicated_index();
     if (cdc_min_replicated_index != std::numeric_limits<int64_t>::max() &&
         from_cursor.index() < cdc_min_replicated_index) {
@@ -2353,7 +2412,20 @@ void CDCServiceImpl::StreamWAL(
           CDCErrorPB::INVALID_REQUEST, &context);
       return;
     }
-    read_from_op_id = OpId(from_cursor.term(), from_cursor.index());
+    if (IsStreamWalMidApplying(from_cursor)) {
+      // The cursor (term, index) is the APPLYING op's own OpId; we have NOT
+      // advanced past it. Feed (term, index - 1) to the WAL reader so the next
+      // emission is the APPLYING itself, which the dispatch loop will route
+      // through DispatchApplyingForStreamWAL with resume_state populated.
+      resuming_applying = true;
+      applying_resume_state.intent_key = from_cursor.intent_key();
+      applying_resume_state.intent_write_id = from_cursor.intent_write_id();
+      read_from_op_id = OpId(
+          from_cursor.term(),
+          std::max<int64_t>(from_cursor.index() - 1, 0));
+    } else {
+      read_from_op_id = OpId(from_cursor.term(), from_cursor.index());
+    }
   }
 
   // ---------------- Bootstrap DDLs ----------------
@@ -2490,6 +2562,13 @@ void CDCServiceImpl::StreamWAL(
   bool saw_split_op = false;
   bool more_messages_pending = read_ops.have_more_messages.get();
 
+  // Set when the dispatch loop hits a spilled APPLYING. The response cursor
+  // is then a partial-APPLYING cursor pinned to that APPLYING's OpId (the
+  // cursor does NOT advance past it).
+  bool applying_spilled = false;
+  OpId applying_spilled_op_id;
+  StreamWalIntentResumeState applying_spilled_resume_state;
+
   for (const auto& msg : messages) {
     // Defensive: drop msgs that are at-or-before from_op_id (the WAL reader is
     // supposed to honor the exclusive lower bound but consistent_records mode
@@ -2502,18 +2581,70 @@ void CDCServiceImpl::StreamWAL(
 
     const OpId msg_op_id(msg->id().term(), msg->id().index());
     std::vector<CDCSDKProtoRecordPB> emitted_records;
-    auto dispatch_result = DispatchWalOpForStreamWAL(msg, &decode_ctx, &emitted_records);
-    if (!dispatch_result.ok()) {
-      SetupErrorAndRespond(
-          resp->mutable_error(), dispatch_result.status(),
-          CDCErrorPB::INTERNAL_ERROR, &context);
-      return;
-    }
+    StreamWalDispatchResult dispatch_result;
 
-    // The cursor advances past this WAL op regardless of whether it emitted a
-    // record -- silent ops still consume index space, and the next call must
-    // not redeliver them.
-    last_emitted_op_id = msg_op_id;
+    // Mid-APPLYING resumption: the FIRST APPLYING we encounter after the
+    // mid-applying cursor's (term, index - 1) is the one we resume. Route it
+    // through the resume-aware helper; everything else goes through the
+    // normal dispatcher.
+    if (resuming_applying &&
+        msg->op_type() == consensus::OperationType::UPDATE_TRANSACTION_OP &&
+        msg->has_transaction_state() &&
+        msg->transaction_state().status() == TransactionStatus::APPLYING) {
+      // Defensive: the resumed APPLYING must be at the exact (term, index) the
+      // client's cursor pointed to. If we got something else (e.g. leader
+      // changed the WAL out from under us), bail.
+      if (msg_op_id.term != from_cursor.term() || msg_op_id.index != from_cursor.index()) {
+        SetupErrorAndRespond(
+            resp->mutable_error(),
+            STATUS_FORMAT(
+                IllegalState,
+                "StreamWAL: mid-APPLYING resume targeted OpId $0 but encountered APPLYING at $1",
+                OpId(from_cursor.term(), from_cursor.index()), msg_op_id),
+            CDCErrorPB::INTERNAL_ERROR, &context);
+        return;
+      }
+      auto status = DispatchApplyingForStreamWAL(
+          msg, &decode_ctx, &applying_resume_state, &emitted_records, &dispatch_result);
+      if (!status.ok()) {
+        const auto code = IsIntentsGcError(status) ? CDCErrorPB::INTENTS_GC_ERROR
+                                                    : CDCErrorPB::INTERNAL_ERROR;
+        SetupErrorAndRespond(resp->mutable_error(), status, code, &context);
+        return;
+      }
+      resuming_applying = false;
+    } else if (resuming_applying &&
+               msg_op_id.term == from_cursor.term() &&
+               msg_op_id.index == from_cursor.index()) {
+      // The msg sitting at the resume target's exact OpId is not an APPLYING.
+      // The client's mid-applying cursor is misdirected -- either fabricated,
+      // or a Raft re-write replaced the APPLYING op at this index. Fail loud
+      // instead of silently advancing past it (which would skip whatever
+      // records the new op type implies).
+      SetupErrorAndRespond(
+          resp->mutable_error(),
+          STATUS_FORMAT(
+              InvalidArgument,
+              "StreamWAL: mid-APPLYING resume targeted OpId $0 but the op at that index is "
+              "$1 (not UPDATE_TRANSACTION_OP { APPLYING })",
+              OpId(from_cursor.term(), from_cursor.index()),
+              consensus::OperationType_Name(msg->op_type())),
+          CDCErrorPB::INVALID_REQUEST, &context);
+      return;
+    } else {
+      auto status_or = DispatchWalOpForStreamWAL(msg, &decode_ctx, &emitted_records);
+      if (!status_or.ok()) {
+        // DispatchWalOpForStreamWAL routes APPLYING ops through
+        // DispatchApplyingForStreamWALImpl, which is where INTENTS_GC_ERROR
+        // surfaces. Map it here too.
+        const auto code = IsIntentsGcError(status_or.status())
+                              ? CDCErrorPB::INTENTS_GC_ERROR
+                              : CDCErrorPB::INTERNAL_ERROR;
+        SetupErrorAndRespond(resp->mutable_error(), status_or.status(), code, &context);
+        return;
+      }
+      dispatch_result = *status_or;
+    }
 
     if (!emitted_records.empty()) {
       any_real_emitted = true;
@@ -2521,7 +2652,8 @@ void CDCServiceImpl::StreamWAL(
         // Stamp from_op_id on every emitted record to preserve compat with
         // existing CDCSDK clients that read the field. (We do not have access
         // to the anon-namespace SetCDCSDKOpId helper here; inline the field
-        // assignments instead.)
+        // assignments instead.) The mid-APPLYING resume fields are NOT echoed
+        // onto records -- they are cursor-only.
         auto* from_op_id_pb = rec.mutable_from_op_id();
         from_op_id_pb->set_term(from_cursor.term());
         from_op_id_pb->set_index(from_cursor.index());
@@ -2531,7 +2663,25 @@ void CDCServiceImpl::StreamWAL(
       }
     }
 
-    if (dispatch_result->kind == StreamWalDispatchResult::Kind::kSplitTerminal) {
+    if (dispatch_result.kind == StreamWalDispatchResult::Kind::kApplyingSpilled) {
+      // Cursor stays AT this APPLYING's OpId; intent fields are populated. The
+      // next call resumes one position past (intent_key, intent_write_id).
+      // We do NOT advance last_emitted_op_id past this op.
+      applying_spilled = true;
+      applying_spilled_op_id = msg_op_id;
+      DCHECK(dispatch_result.mid_applying_resume.has_value());
+      applying_spilled_resume_state = *dispatch_result.mid_applying_resume;
+      more_messages_pending = true;
+      break;
+    }
+
+    // The cursor advances past this WAL op regardless of whether it emitted a
+    // record -- silent ops still consume index space, and the next call must
+    // not redeliver them. Spilled APPLYINGs (handled above) intentionally skip
+    // this assignment.
+    last_emitted_op_id = msg_op_id;
+
+    if (dispatch_result.kind == StreamWalDispatchResult::Kind::kSplitTerminal) {
       // SPLIT_OP is always the terminal record on this tablet's stream.
       saw_split_op = true;
       more_messages_pending = false;
@@ -2547,7 +2697,15 @@ void CDCServiceImpl::StreamWAL(
   }
 
   // ---------------- Cursor advancement ----------------
-  if (any_real_emitted) {
+  if (applying_spilled) {
+    // Spilled APPLYING: cursor pins to the APPLYING's OpId and carries the
+    // intent-resume position. Skips the normal advancement branches.
+    SetStreamWalMidApplyingCursor(
+        applying_spilled_op_id.term, applying_spilled_op_id.index,
+        applying_spilled_resume_state.intent_key,
+        applying_spilled_resume_state.intent_write_id,
+        resp->mutable_next_op_id());
+  } else if (any_real_emitted) {
     last_emitted_op_id.ToPB(resp->mutable_next_op_id());
   } else if (!messages.empty()) {
     // We consumed silent ops but emitted nothing -- still advance past the last

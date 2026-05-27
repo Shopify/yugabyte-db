@@ -14,11 +14,10 @@
 //
 // These cover the contract's behavior matrix that can be exercised without a
 // YSQL test cluster (request validation, bootstrap shapes, soft caps,
-// single-shard writes, DDL, TRUNCATE, error envelopes). The multi-shard /
-// transactional / SPLIT_OP / xrepl_origin_id scenarios require the
-// CDCSDKYsqlTest harness in src/yb/integration-tests and are deliberately out
-// of scope for this file -- they are covered in the follow-up integration test
-// suite.
+// single-shard writes, DDL, TRUNCATE, error envelopes). A small YSQL-backed
+// fixture at the bottom covers the StreamWAL transactional shape that requires
+// a PostgreSQL frontend (e.g. secondary-index writes). Broader multi-tablet /
+// SPLIT_OP / xrepl_origin_id scenarios remain in the integration test suite.
 
 #include "yb/cdc/cdc_service.h"
 #include "yb/cdc/cdc_service.pb.h"
@@ -41,7 +40,12 @@
 #include "yb/tserver/tablet_server.h"
 
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/flags.h"
 #include "yb/util/test_macros.h"
+
+#include "yb/yql/pgwrapper/pg_mini_test_base.h"
+
+DECLARE_uint64(cdc_max_stream_intent_records);
 
 namespace yb {
 namespace cdc {
@@ -77,6 +81,16 @@ StreamWalCursorPB MakeCursor(int64_t term, int64_t index) {
   StreamWalCursorPB c;
   c.set_term(term);
   c.set_index(index);
+  return c;
+}
+
+StreamWalCursorPB MakeMidApplyingCursor(
+    int64_t term, int64_t index, const std::string& intent_key, uint32_t intent_write_id) {
+  StreamWalCursorPB c;
+  c.set_term(term);
+  c.set_index(index);
+  c.set_intent_key(intent_key);
+  c.set_intent_write_id(intent_write_id);
   return c;
 }
 
@@ -215,6 +229,45 @@ TEST_F(StreamWalTest, InvalidFromOpIdShape) {
 // Request validation: T=0, I=5 is rejected (a "real" cursor must have term>=1).
 TEST_F(StreamWalTest, InvalidFromOpIdTermZeroIndexNonZero) {
   auto resp = ASSERT_RESULT(StreamWal(MakeCursor(0, 5)));
+  ASSERT_TRUE(resp.has_error());
+  ASSERT_EQ(resp.error().code(), CDCErrorPB::INVALID_REQUEST);
+}
+
+// Request validation: mid-APPLYING fields must be both-or-neither.
+TEST_F(StreamWalTest, MidApplyingCursorOnlyIntentKeyIsInvalid) {
+  StreamWalCursorPB c;
+  c.set_term(1);
+  c.set_index(5);
+  c.set_intent_key("some-key");
+  // intent_write_id unset.
+  auto resp = ASSERT_RESULT(StreamWal(c));
+  ASSERT_TRUE(resp.has_error());
+  ASSERT_EQ(resp.error().code(), CDCErrorPB::INVALID_REQUEST);
+}
+
+TEST_F(StreamWalTest, MidApplyingCursorOnlyIntentWriteIdIsInvalid) {
+  StreamWalCursorPB c;
+  c.set_term(1);
+  c.set_index(5);
+  c.set_intent_write_id(7);
+  // intent_key unset.
+  auto resp = ASSERT_RESULT(StreamWal(c));
+  ASSERT_TRUE(resp.has_error());
+  ASSERT_EQ(resp.error().code(), CDCErrorPB::INVALID_REQUEST);
+}
+
+// Request validation: mid-APPLYING fields on the from-start cursor are
+// nonsense (no APPLYING to resume at index 0).
+TEST_F(StreamWalTest, MidApplyingCursorOnFromStartIsInvalid) {
+  auto resp = ASSERT_RESULT(StreamWal(MakeMidApplyingCursor(0, 0, "key", 1)));
+  ASSERT_TRUE(resp.has_error());
+  ASSERT_EQ(resp.error().code(), CDCErrorPB::INVALID_REQUEST);
+}
+
+// Request validation: mid-APPLYING fields on the skip-to-tip sentinel are
+// nonsense.
+TEST_F(StreamWalTest, MidApplyingCursorOnSkipToTipIsInvalid) {
+  auto resp = ASSERT_RESULT(StreamWal(MakeMidApplyingCursor(-1, -1, "key", 1)));
   ASSERT_TRUE(resp.has_error());
   ASSERT_EQ(resp.error().code(), CDCErrorPB::INVALID_REQUEST);
 }
@@ -414,6 +467,332 @@ TEST_F(StreamWalTest, FromOpIdStampedOnEveryRecord) {
     ASSERT_EQ(r.from_op_id().term(), cursor.term());
     ASSERT_EQ(r.from_op_id().index(), cursor.index());
   }
+}
+
+class StreamWalYsqlSecondaryIndexTest : public pgwrapper::PgMiniTestBase {
+ protected:
+  size_t NumTabletServers() override { return 1; }
+
+  Result<StreamWalResponsePB> StreamWalForTablet(
+      const TabletId& tablet_id, const StreamWalCursorPB& from) {
+    CDCServiceProxy cdc_proxy(
+        &client_->proxy_cache(),
+        HostPort::FromBoundEndpoint(cluster_->mini_tablet_server(0)->bound_rpc_addr()));
+
+    StreamWalRequestPB req;
+    req.set_tablet_id(tablet_id);
+    *req.mutable_from_op_id() = from;
+
+    StreamWalResponsePB resp;
+    rpc::RpcController rpc;
+    rpc.set_timeout(MonoDelta::FromSeconds(kRpcTimeoutSec));
+    RETURN_NOT_OK(cdc_proxy.StreamWAL(req, &resp, &rpc));
+    return resp;
+  }
+
+  Result<TabletId> OnlyTabletIdForTable(const TableId& table_id) {
+    auto tablet_ids = ListTabletIdsForTable(cluster_.get(), table_id);
+    SCHECK_EQ(tablet_ids.size(), 1, IllegalState, "Expected exactly one tablet");
+    return *tablet_ids.begin();
+  }
+};
+
+// YSQL can execute single-row auto-commit writes through two different DocDB
+// paths. A relation with no secondary indexes/triggers can use the fast path
+// (covered above by the CQL-shaped single-shard test). A relation with a
+// secondary index is not fast-path eligible: YSQL sends a transactional write
+// batch.
+//
+// Under the StreamWAL contract, transactional WRITE_OPs are NOT emitted on
+// the wire -- they would carry intent-time data. Instead, the server reads
+// the txn's intents from IntentsDB at APPLYING time and emits a complete
+// BEGIN + per-row DML + COMMIT envelope, all stamped with commit_hybrid_time
+// and the same transaction_id. The per-row record's cdc_sdk_op_id should sit
+// at the APPLYING op's (term, index), not at the original WRITE_OP's OpId.
+TEST_F(StreamWalYsqlSecondaryIndexTest, SecondaryIndexWriteEmitsAtApplying) {
+  constexpr auto kYsqlTableName = "stream_wal_secondary_idx_t";
+
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 ("
+      "  id INT PRIMARY KEY,"
+      "  sku TEXT UNIQUE,"
+      "  v INT"
+      ") SPLIT INTO 1 TABLETS",
+      kYsqlTableName));
+
+  const auto table_id = ASSERT_RESULT(GetTableIDFromTableName(kYsqlTableName));
+  const auto tablet_id = ASSERT_RESULT(OnlyTabletIdForTable(table_id));
+
+  // Isolate the INSERT from table/index creation WAL traffic.
+  auto tip = ASSERT_RESULT(StreamWalForTablet(tablet_id, kSkipToTip));
+  ASSERT_FALSE(tip.has_error()) << tip.error().ShortDebugString();
+  ASSERT_TRUE(tip.has_next_op_id());
+  StreamWalCursorPB cursor = tip.next_op_id();
+
+  ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 VALUES (1, 'sku-1', 10)", kYsqlTableName));
+
+  std::vector<CDCSDKProtoRecordPB> seen;
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        auto resp = VERIFY_RESULT(StreamWalForTablet(tablet_id, cursor));
+        SCHECK(!resp.has_error(), IllegalState, resp.error().ShortDebugString());
+        for (const auto& record : resp.records()) {
+          seen.push_back(record);
+        }
+        if (resp.has_next_op_id()) {
+          cursor = resp.next_op_id();
+        }
+
+        // Wait until we've seen the full envelope: BEGIN, an INSERT for our
+        // table, and a matching COMMIT.
+        std::string txn_id;
+        bool saw_begin = false;
+        bool saw_insert = false;
+        bool saw_commit = false;
+        for (const auto& record : seen) {
+          if (!record.has_row_message()) {
+            continue;
+          }
+          const auto& row = record.row_message();
+          if (row.op() == RowMessage_Op_INSERT && row.table_id() == table_id) {
+            saw_insert = true;
+            txn_id = row.transaction_id();
+          }
+        }
+        if (saw_insert && !txn_id.empty()) {
+          for (const auto& record : seen) {
+            const auto& row = record.row_message();
+            if (row.op() == RowMessage_Op_BEGIN && row.has_transaction_id() &&
+                row.transaction_id() == txn_id) {
+              saw_begin = true;
+            }
+            if (row.op() == RowMessage_Op_COMMIT && row.has_transaction_id() &&
+                row.transaction_id() == txn_id && row.has_commit_time()) {
+              saw_commit = true;
+            }
+          }
+        }
+        return saw_begin && saw_insert && saw_commit;
+      },
+      30s * kTimeMultiplier,
+      "wait for StreamWAL transactional secondary-index BEGIN+INSERT+COMMIT envelope"));
+
+  // Walk `seen` and pick the BEGIN / INSERT / COMMIT records for our txn.
+  const CDCSDKProtoRecordPB* begin_record = nullptr;
+  const CDCSDKProtoRecordPB* insert_record = nullptr;
+  const CDCSDKProtoRecordPB* commit_record = nullptr;
+  std::string txn_id;
+  for (const auto& record : seen) {
+    if (!record.has_row_message()) {
+      continue;
+    }
+    const auto& row = record.row_message();
+    if (row.op() == RowMessage_Op_INSERT && row.table_id() == table_id) {
+      insert_record = &record;
+      txn_id = row.transaction_id();
+      break;
+    }
+  }
+  ASSERT_NE(insert_record, nullptr) << "records seen: " << AsString(seen);
+  ASSERT_FALSE(txn_id.empty());
+
+  for (const auto& record : seen) {
+    const auto& row = record.row_message();
+    if (row.op() == RowMessage_Op_BEGIN && row.has_transaction_id() &&
+        row.transaction_id() == txn_id) {
+      begin_record = &record;
+    }
+    if (row.op() == RowMessage_Op_COMMIT && row.has_transaction_id() &&
+        row.transaction_id() == txn_id) {
+      commit_record = &record;
+    }
+  }
+  ASSERT_NE(begin_record, nullptr) << "records seen: " << AsString(seen);
+  ASSERT_NE(commit_record, nullptr) << "records seen: " << AsString(seen);
+
+  // The per-row INSERT must carry transaction_id AND commit_time -- both are
+  // stamped server-side from the matching APPLYING entry's commit_hybrid_time.
+  const auto& insert_row = insert_record->row_message();
+  ASSERT_TRUE(insert_row.has_transaction_id())
+      << "transactional intent row must carry transaction_id";
+  ASSERT_TRUE(insert_row.has_commit_time())
+      << "transactional intent row must carry commit_hybrid_time";
+  ASSERT_GT(insert_row.commit_time(), 0u);
+  ASSERT_TRUE(insert_record->has_cdc_sdk_op_id());
+
+  // The COMMIT envelope carries the same commit_time as the per-row INSERT --
+  // they are all stamped from the same TransactionStatePB.commit_hybrid_time.
+  const auto& commit_row = commit_record->row_message();
+  ASSERT_TRUE(commit_row.has_commit_time());
+  ASSERT_EQ(commit_row.commit_time(), insert_row.commit_time())
+      << "BEGIN/INSERT/COMMIT in a single APPLYING share commit_hybrid_time";
+
+  // The BEGIN, per-row INSERT, and COMMIT records for one transaction are all
+  // emitted at the APPLYING op's (term, index). The per-row INSERT's write_id
+  // is the intent's IntraTxnWriteId (per the contract), while BEGIN/COMMIT
+  // have write_id = 0; the (term, index) component is identical across all
+  // three.
+  ASSERT_TRUE(begin_record->has_cdc_sdk_op_id());
+  ASSERT_TRUE(commit_record->has_cdc_sdk_op_id());
+  ASSERT_EQ(begin_record->cdc_sdk_op_id().term(), insert_record->cdc_sdk_op_id().term());
+  ASSERT_EQ(begin_record->cdc_sdk_op_id().index(), insert_record->cdc_sdk_op_id().index());
+  ASSERT_EQ(commit_record->cdc_sdk_op_id().term(), insert_record->cdc_sdk_op_id().term());
+  ASSERT_EQ(commit_record->cdc_sdk_op_id().index(), insert_record->cdc_sdk_op_id().index());
+  ASSERT_EQ(begin_record->cdc_sdk_op_id().write_id(), 0u);
+  ASSERT_EQ(commit_record->cdc_sdk_op_id().write_id(), 0u);
+
+  // The order across the seen records must be BEGIN <= INSERT <= COMMIT.
+  size_t begin_idx = 0, insert_idx = 0, commit_idx = 0;
+  for (size_t i = 0; i < seen.size(); ++i) {
+    if (&seen[i] == begin_record) begin_idx = i;
+    if (&seen[i] == insert_record) insert_idx = i;
+    if (&seen[i] == commit_record) commit_idx = i;
+  }
+  ASSERT_LE(begin_idx, insert_idx);
+  ASSERT_LE(insert_idx, commit_idx);
+}
+
+// A multi-row transaction whose intent count exceeds
+// FLAGS_cdc_max_stream_intent_records must spill across multiple StreamWAL
+// batches. Each spilled response carries a partial-APPLYING cursor
+// (intent_key + intent_write_id) that the client round-trips back as
+// from_op_id. The final batch emits the COMMIT envelope and clears the
+// intent fields.
+TEST_F(StreamWalYsqlSecondaryIndexTest, MultiRowTxnSpillsAndResumes) {
+  constexpr auto kYsqlTableName = "stream_wal_spill_t";
+  constexpr int kRowCount = 20;
+
+  // Force ProcessIntents to spill after a handful of intent records. The exact
+  // value is below kRowCount so we are guaranteed at least one spill; on the
+  // YSQL secondary-index path each row produces 2 intents (table + index) so
+  // we'll see roughly kRowCount * 2 / kIntentBudget batches.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cdc_max_stream_intent_records) = 3;
+
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 ("
+      "  id INT PRIMARY KEY,"
+      "  sku TEXT UNIQUE,"
+      "  v INT"
+      ") SPLIT INTO 1 TABLETS",
+      kYsqlTableName));
+
+  const auto table_id = ASSERT_RESULT(GetTableIDFromTableName(kYsqlTableName));
+  const auto tablet_id = ASSERT_RESULT(OnlyTabletIdForTable(table_id));
+
+  // Isolate from CREATE TABLE WAL traffic.
+  auto tip = ASSERT_RESULT(StreamWalForTablet(tablet_id, kSkipToTip));
+  ASSERT_FALSE(tip.has_error()) << tip.error().ShortDebugString();
+  StreamWalCursorPB cursor = tip.next_op_id();
+
+  // Run a multi-row txn so the APPLYING produces many intents.
+  ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+  for (int i = 0; i < kRowCount; ++i) {
+    ASSERT_OK(conn.ExecuteFormat(
+        "INSERT INTO $0 VALUES ($1, 'sku-$1', $1)", kYsqlTableName, i));
+  }
+  ASSERT_OK(conn.CommitTransaction());
+
+  // Drive StreamWAL to completion, accumulating records and observing at least
+  // one spill (cursor with intent_key set).
+  std::vector<CDCSDKProtoRecordPB> seen;
+  bool saw_spilled_cursor = false;
+  std::string spill_txn_id;
+  int spill_batches = 0;
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        auto resp = VERIFY_RESULT(StreamWalForTablet(tablet_id, cursor));
+        SCHECK(!resp.has_error(), IllegalState, resp.error().ShortDebugString());
+        for (const auto& record : resp.records()) {
+          seen.push_back(record);
+        }
+
+        const auto& next_cursor = resp.next_op_id();
+        if (next_cursor.has_intent_key() && next_cursor.has_intent_write_id()) {
+          saw_spilled_cursor = true;
+          ++spill_batches;
+          // While spilled, has_more MUST be true (more intents pending).
+          SCHECK(resp.has_more(), IllegalState,
+                 "spilled APPLYING must have has_more=true");
+          // BEGIN appears only on the first spill batch; subsequent spill
+          // batches MUST NOT re-emit BEGIN for the same transaction. Verify
+          // this once we have a transaction_id from the records so far.
+          for (const auto& record : resp.records()) {
+            if (!record.has_row_message()) continue;
+            const auto& row = record.row_message();
+            if (row.op() == RowMessage_Op_BEGIN && row.has_transaction_id()) {
+              if (spill_txn_id.empty()) {
+                spill_txn_id = row.transaction_id();
+              } else if (row.transaction_id() == spill_txn_id) {
+                return STATUS(
+                    IllegalState,
+                    "BEGIN must be emitted only once per APPLYING across spill batches");
+              }
+            }
+          }
+        }
+
+        cursor = next_cursor;
+
+        // Stop once we have observed a COMMIT for the spilled transaction.
+        if (!spill_txn_id.empty()) {
+          for (const auto& record : seen) {
+            if (!record.has_row_message()) continue;
+            const auto& row = record.row_message();
+            if (row.op() == RowMessage_Op_COMMIT && row.has_transaction_id() &&
+                row.transaction_id() == spill_txn_id) {
+              return true;
+            }
+          }
+        }
+        return false;
+      },
+      60s * kTimeMultiplier,
+      "wait for spilled APPLYING to fully drain across multiple batches"));
+
+  ASSERT_TRUE(saw_spilled_cursor)
+      << "expected at least one batch with a partial-APPLYING cursor; spill_batches="
+      << spill_batches;
+  ASSERT_GE(spill_batches, 1);
+
+  // Now reconcile the full envelope: exactly one BEGIN and one COMMIT for the
+  // txn, kRowCount table-row INSERTs, all carrying the same commit_time.
+  int begin_count = 0;
+  int commit_count = 0;
+  int table_insert_count = 0;
+  uint64_t commit_time = 0;
+  for (const auto& record : seen) {
+    if (!record.has_row_message()) continue;
+    const auto& row = record.row_message();
+    if (!row.has_transaction_id() || row.transaction_id() != spill_txn_id) {
+      continue;
+    }
+    switch (row.op()) {
+      case RowMessage_Op_BEGIN:
+        ++begin_count;
+        commit_time = row.commit_time();
+        break;
+      case RowMessage_Op_COMMIT:
+        ++commit_count;
+        ASSERT_EQ(row.commit_time(), commit_time)
+            << "COMMIT must share commit_time with BEGIN";
+        break;
+      case RowMessage_Op_INSERT:
+        if (row.table_id() == table_id) {
+          ++table_insert_count;
+          ASSERT_EQ(row.commit_time(), commit_time)
+              << "per-row INSERT must share commit_time with BEGIN/COMMIT";
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  ASSERT_EQ(begin_count, 1) << "exactly one BEGIN per APPLYING, even with spills";
+  ASSERT_EQ(commit_count, 1) << "exactly one COMMIT per APPLYING, only on final batch";
+  ASSERT_EQ(table_insert_count, kRowCount)
+      << "every committed row must be emitted exactly once";
 }
 
 }  // namespace cdc
