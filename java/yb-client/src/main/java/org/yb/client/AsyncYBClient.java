@@ -120,6 +120,7 @@ import org.yb.Schema;
 import org.yb.annotations.InterfaceAudience;
 import org.yb.annotations.InterfaceStability;
 import org.yb.cdc.CdcConsumer.XClusterRole;
+import org.yb.consensus.Metadata.ConsensusStatePB;
 import org.yb.master.CatalogEntityInfo;
 import org.yb.master.MasterClientOuterClass;
 import org.yb.master.MasterClientOuterClass.GetTableLocationsResponsePB;
@@ -128,6 +129,7 @@ import org.yb.master.MasterReplicationOuterClass;
 import org.yb.master.MasterReplicationOuterClass.GetXClusterSafeTimeResponsePB.NamespaceSafeTimePB;
 import org.yb.master.MasterReplicationOuterClass.ReplicationStatusPB;
 import org.yb.master.MasterTypes.MasterErrorPB;
+import org.yb.tserver.Tserver.TabletConsensusInfoPB;
 import org.yb.util.AsyncUtil;
 import org.yb.util.NetUtil;
 import org.yb.util.Pair;
@@ -3045,6 +3047,60 @@ public class AsyncYBClient implements AutoCloseable {
   }
 
   /**
+   * Test-only: register a {@link RemoteTablet} directly under {@code tabletId} in the meta-cache,
+   * bypassing {@code discoverTablets} (which would require a real master lookup or fully-faked
+   * {@link MasterClientOuterClass.TabletLocationsPB}). Used by unit tests for the consensus
+   * leader-hint path.
+   */
+  @VisibleForTesting
+  void putTabletForTest(String tabletId, RemoteTablet rt) {
+    tablet2client.put(new Slice(tabletId.getBytes()), rt);
+  }
+
+  /**
+   * Apply a {@code TabletConsensusInfoPB} hint piggybacked on a CDC error response to refresh
+   * the in-memory meta-cache's leader pointer for {@code tabletId}. Lets a caller short-circuit
+   * the linear demote-walk in {@link #handleNotLeader} when the server told us exactly which
+   * peer is the new leader.
+   *
+   * <p>This is the Java analog of C++'s {@code MetaCache::RefreshTabletInfoWithConsensusInfo}
+   * (see {@code src/yb/client/meta_cache.cc}). The Java client's {@link RemoteTablet} does not
+   * track {@code raft_config_opid_index}, so the staleness guard the C++ side implements is
+   * not enforced here; {@link RemoteTablet#applyLeaderHint} is idempotent on the same leader
+   * UUID which covers the common loop case.
+   *
+   * <p>The currently-known invocation site is {@code TabletClient.decode} when a StreamWAL
+   * response carries a {@code tablet_consensus_info} field (server populates this on
+   * {@code LEADER_NOT_READY}; see {@code cdc_service.cc} {@code FillTabletConsensusInfo}). Pure
+   * in-memory; safe to call from the Netty decode thread. Never synthesizes a new
+   * {@link TabletClient} for an unknown peer — that path would require a blocking DNS lookup
+   * via {@link #getIP}, which we explicitly want to avoid on the Netty event loop. Callers
+   * fall back to the existing demote-walk + master-lookup recovery when this returns
+   * {@code false}.
+   *
+   * @param tabletId 32-char hex tablet UUID, matching how every CDC RPC encodes tablet ids.
+   * @param info     consensus info as returned in the StreamWAL error envelope.
+   * @return {@code true} when the meta-cache was updated (or was already pointing at the
+   *         hinted leader — idempotent); {@code false} when the hint could not be applied
+   *         (no consensus_state, missing leader_uuid, tablet absent from the cache, or hinted
+   *         peer not yet in our {@code tabletServers} list).
+   */
+  public boolean refreshTabletLeaderFromConsensus(String tabletId, TabletConsensusInfoPB info) {
+    if (info == null || !info.hasConsensusState()) {
+      return false;
+    }
+    ConsensusStatePB cs = info.getConsensusState();
+    if (!cs.hasLeaderUuid() || cs.getLeaderUuid().isEmpty()) {
+      return false;
+    }
+    RemoteTablet rt = tablet2client.get(new Slice(tabletId.getBytes()));
+    if (rt == null) {
+      return false;
+    }
+    return rt.applyLeaderHint(cs.getLeaderUuid());
+  }
+
+  /**
    * Checks whether or not an RPC can be retried once more.
    *
    * @param rpc The RPC we're going to attempt to execute.
@@ -4254,6 +4310,84 @@ public class AsyncYBClient implements AutoCloseable {
             leaderIndex++;
           }
         }
+      }
+    }
+
+    /**
+     * Apply a leader-UUID hint returned by a tserver on a CDC {@code LEADER_NOT_READY}
+     * response (via {@code TabletConsensusInfoPB.consensus_state.leader_uuid}). Moves
+     * {@link #leaderIndex} to the matching {@link TabletClient} so the next routing decision
+     * via {@code clientFor(this)} targets the hinted leader directly, skipping the linear
+     * demote-walk in {@link #handleNotLeader}.
+     *
+     * <p>This method is intentionally narrow: it only promotes a peer that we already have a
+     * {@link TabletClient} for. If the hinted UUID is not in {@link #tabletServers} (the new
+     * leader is a peer we have never connected to), we return {@code false} and let the
+     * caller fall back to the existing demote-walk + master-lookup path. Synthesizing a new
+     * {@link TabletClient} here would require DNS resolution via {@link AsyncYBClient#newClient},
+     * which can block for seconds; this method is called from the Netty decode thread and must
+     * stay non-blocking.
+     *
+     * <p>Idempotent: re-applying a hint that already matches the current leader is a no-op
+     * and returns {@code true}.
+     *
+     * @param newLeaderUuid permanent_uuid of the new leader as reported in
+     *                      {@code ConsensusStatePB.leader_uuid}.
+     * @return {@code true} when {@link #leaderIndex} was either updated or already pointed at
+     *         the hinted peer; {@code false} when the hint could not be applied (unknown peer,
+     *         empty {@code tabletServers}). A {@code false} return is not an error: it just
+     *         means the caller's normal retry path runs unchanged.
+     */
+    boolean applyLeaderHint(String newLeaderUuid) {
+      if (newLeaderUuid == null || newLeaderUuid.isEmpty()) {
+        return false;
+      }
+      synchronized (tabletServers) {
+        if (tabletServers.isEmpty()) {
+          return false;
+        }
+        // Fast path: cache already points at the right server. Common when the same hint is
+        // re-emitted by another follower in the same failover window.
+        if (leaderIndex != NO_LEADER_INDEX
+            && newLeaderUuid.equals(tabletServers.get(leaderIndex).getUuid())) {
+          return true;
+        }
+        for (int i = 0; i < tabletServers.size(); i++) {
+          if (newLeaderUuid.equals(tabletServers.get(i).getUuid())) {
+            leaderIndex = i;
+            return true;
+          }
+        }
+        // Hinted peer is not in our connected set. The caller (decode path) will fall through
+        // to dispatchCDCErrorOrReturnException -> handleNotLeader, which will demote-walk
+        // (and, if the new leader is genuinely a new node, eventually fall through to master).
+        return false;
+      }
+    }
+
+    /**
+     * Test-only helper that seeds {@link #tabletServers} and {@link #leaderIndex} directly,
+     * bypassing {@link #addTabletClient}'s DNS resolution and Netty bootstrap. Lets unit
+     * tests exercise {@link #applyLeaderHint} against a known set of UUIDs without spinning
+     * up a live cluster. Not for production use.
+     *
+     * @param clients     ordered list of {@link TabletClient}s to install as the replica set
+     * @param leaderIdx   index into {@code clients} to set as {@link #leaderIndex}, or
+     *                    {@link #NO_LEADER_INDEX} for no current leader
+     */
+    @VisibleForTesting
+    void setTabletClientsForTest(java.util.List<TabletClient> clients, int leaderIdx) {
+      synchronized (tabletServers) {
+        tabletServers.clear();
+        tabletServers.addAll(clients);
+        leaderIndex = leaderIdx;
+      }
+    }
+
+    @VisibleForTesting
+    int leaderIndexForTest() {
+      synchronized (tabletServers) {
+        return leaderIndex;
       }
     }
 
