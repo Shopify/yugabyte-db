@@ -387,6 +387,20 @@ typedef struct {
 } YbcWaitEventInfoPtr;
 
 typedef struct {
+  uint64_t read;
+  uint64_t local_limit;
+  uint64_t global_limit;
+  uint64_t in_txn_limit;
+  int64_t serial_no;
+} YbcReadHybridTime;
+
+typedef struct {
+  uint64_t version;
+  YbcReadHybridTime version_read_time;
+  bool is_db_catalog_version_mode;
+} YbcPgLastKnownCatalogVersionInfo;
+
+typedef struct {
   YbcPgMemctx (*GetCurrentYbMemctx)();
   const char* (*GetDebugQueryString)();
   void (*WriteExecOutParam)(struct YbPgExecOutParam *, const struct YbcPgExecOutParamValue *);
@@ -398,6 +412,7 @@ typedef struct {
   /* pgstat.h */
   YbcWaitEventInfo (*PgstatReportWaitStart)(YbcWaitEventInfo);
   YbcReadPointHandle (*GetCatalogSnapshotReadPoint)(YbcPgOid table_oid, bool create_if_not_exists);
+  YbcPgLastKnownCatalogVersionInfo (*GetCatalogVersionForResponseCache)();
   /* replication origin */
   uint16_t (*GetSessionReplicationOriginId)();
   /* CHECK_FOR_INTERRUPTS */
@@ -602,20 +617,6 @@ typedef enum {
   YB_YQL_PREFETCHER_RENEW_CACHE_SOFT,
   YB_YQL_PREFETCHER_RENEW_CACHE_HARD
 } YbcPgSysTablePrefetcherCacheMode;
-
-typedef struct {
-  uint64_t read;
-  uint64_t local_limit;
-  uint64_t global_limit;
-  uint64_t in_txn_limit;
-  int64_t serial_no;
-} YbcReadHybridTime;
-
-typedef struct {
-  uint64_t version;
-  YbcReadHybridTime version_read_time;
-  bool is_db_catalog_version_mode;
-} YbcPgLastKnownCatalogVersionInfo;
 
 typedef enum {
   // Single shard transactions can use a fast path to give full ACID guarantees without the overhead

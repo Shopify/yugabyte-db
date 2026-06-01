@@ -86,6 +86,13 @@ YbcReadPointHandle GetCatalogSnapshotReadPoint(YbcPgOid table_oid, bool create_i
   return 0;
 }
 
+YbcPgLastKnownCatalogVersionInfo GetCatalogVersionForResponseCache() {
+  return {
+      .version = 1,
+      .version_read_time = {},
+      .is_db_catalog_version_mode = true};
+}
+
 uint16_t GetSessionReplicationOriginId() {
   return 0;
 }
@@ -179,7 +186,7 @@ Status PggateTest::Init(
                            PggateTestSwitchMemoryContext, PggateTestCreateMemContext,
                            PggateTestDeleteMemContext));
 
-  YbcPgCallbacks callbacks;
+  YbcPgCallbacks callbacks = {};
 
   auto* session_stats =
       static_cast<YbcPgExecStatsState*>(PggateTestAlloc(sizeof(YbcPgExecStatsState)));
@@ -188,6 +195,7 @@ Status PggateTest::Init(
   callbacks.GetDebugQueryString = &GetDebugQueryStringStub;
   callbacks.PgstatReportWaitStart = &PgstatReportWaitStartNoOp;
   callbacks.GetCatalogSnapshotReadPoint = &GetCatalogSnapshotReadPoint;
+  callbacks.GetCatalogVersionForResponseCache = &GetCatalogVersionForResponseCache;
   callbacks.GetSessionReplicationOriginId = &GetSessionReplicationOriginId;
   callbacks.CheckForInterrupts = &CheckForInterruptsNoOp;
   callbacks.IsInParallelMode = &IsInParallelModeNoOp;

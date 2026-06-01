@@ -17,7 +17,6 @@
 
 #include <algorithm>
 #include <functional>
-#include <limits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -27,14 +26,11 @@
 #include "yb/common/pgsql_protocol.pb.h"
 #include "yb/common/schema.h"
 
-#include "yb/gutil/casts.h"
-
 #include "yb/rpc/outbound_call.h"
 
 #include "yb/util/flags/flag_tags.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
-#include "yb/util/scope_exit.h"
 #include "yb/util/status.h"
 #include "yb/util/status_fwd.h"
 #include "yb/util/tostring.h"
@@ -42,6 +38,7 @@
 #include "yb/yql/pggate/pg_column.h"
 #include "yb/yql/pggate/pg_doc_op.h"
 #include "yb/yql/pggate/pg_op.h"
+#include "yb/yql/pggate/pg_response_cache_key.h"
 #include "yb/yql/pggate/pg_session.h"
 #include "yb/yql/pggate/pg_table.h"
 #include "yb/yql/pggate/pg_tabledesc.h"
@@ -209,86 +206,6 @@ void AddTargetColumn(LWPgsqlReadRequestPB* req, const PgColumn& column) {
   }
 }
 
-auto TemporaryClearInsignificantFields(LWPgsqlReadRequestPB& req) {
-  const auto stmt_id = req.has_stmt_id() ? std::optional(req.stmt_id()) : std::nullopt;
-  req.clear_stmt_id();
-  const auto metrics_capture =
-    req.has_metrics_capture() ? std::optional(req.metrics_capture()) : std::nullopt;
-  req.clear_metrics_capture();
-  return ScopeExit([&req, stmt_id, metrics_capture] () {
-    if (stmt_id) {
-      req.set_stmt_id(*stmt_id);
-    }
-    if (metrics_capture) {
-      req.set_metrics_capture(*metrics_capture);
-    }
-  });
-}
-
-using google::protobuf::io::CodedOutputStream;
-
-template<class PB>
-uint8_t* WritePBWithSize(uint8_t* out, const PB* pb) {
-  if (!pb) {
-    return CodedOutputStream::WriteVarint32ToArray(0U, out);
-  }
-  out = CodedOutputStream::WriteVarint32ToArray(narrow_cast<uint32_t>(pb->SerializedSize()), out);
-  return pb->SerializeToArray(out);
-}
-
-class VersionInfoWriter {
- public:
-  explicit VersionInfoWriter(PrefetcherOptions::VersionInfo version_info)
-      : version_info_(version_info) {}
-
-  [[nodiscard]] size_t GetSize() const {
-    return CodedOutputStream::VarintSize64(version_info_.version) + 1;
-  }
-
-  uint8_t* Write(uint8_t* out) const {
-    constexpr auto kTrue = '1';
-    constexpr auto kFalse = '0';
-    out = CodedOutputStream::WriteRawToArray(
-        version_info_.is_db_catalog_version_mode ? &kTrue : &kFalse, 1, out);
-    return CodedOutputStream::WriteVarint64ToArray(version_info_.version, out);
-  }
-
- private:
-  PrefetcherOptions::VersionInfo version_info_;
-};
-
-[[nodiscard]] std::string BuildCacheKey(
-    yb::ThreadSafeArena* arena, const ReadHybridTime& catalog_read_time,
-    const std::vector<OperationInfo>& ops, PrefetcherOptions::VersionInfo version_info) {
-  constexpr auto kMaxFieldSize =
-      CodedOutputStream::StaticVarintSize32<std::numeric_limits<uint32_t>::max()>::value;
-  const VersionInfoWriter version_writer(version_info);
-  auto total_size = version_writer.GetSize() + (ops.size() + 1) * kMaxFieldSize;
-  std::optional<LWReadHybridTimePB> read_time_pb;
-  if (catalog_read_time) {
-    read_time_pb.emplace(arena);
-    catalog_read_time.ToPB(&*read_time_pb);
-    total_size += read_time_pb->SerializedSize();
-  }
-  for (const auto& o : ops) {
-    total_size += o.operation->read_request().SerializedSize();
-  }
-  std::string result;
-  result.resize(total_size);
-  auto* start = pointer_cast<uint8_t*>(result.data());
-  auto* out = version_writer.Write(start);
-  out = WritePBWithSize(out, read_time_pb ? &*read_time_pb : nullptr);
-  for (const auto& o : ops) {
-    auto& req = o.operation->read_request();
-    auto fields_restorer = TemporaryClearInsignificantFields(req);
-    out = WritePBWithSize(out, &req);
-  }
-  const auto actual_size = out - start;
-  DCHECK_LE(actual_size, total_size);
-  result.resize(actual_size);
-  return result;
-}
-
 [[nodiscard]] std::optional<uint32_t> GetCacheLifetimeThreshold(PrefetchingCacheMode mode) {
   switch(mode) {
     case PrefetchingCacheMode::TRUST_CACHE_AUTH:
@@ -306,9 +223,16 @@ class VersionInfoWriter {
 [[nodiscard]] PgSession::CacheOptions BuildCacheOptions(
     yb::ThreadSafeArena* arena, const ReadHybridTime& catalog_read_time,
     const std::vector<OperationInfo>& ops, const PrefetcherOptions::CachingInfo& caching_info) {
+  auto read_request_provider_lambda = [&ops](size_t idx) -> LWPgsqlReadRequestPB& {
+    return ops[idx].operation->read_request();
+  };
+  auto read_request_provider = make_lw_function(read_request_provider_lambda);
   return {
       .key_group = caching_info.db_oid,
-      .key_value = BuildCacheKey(arena, catalog_read_time, ops, caching_info.version_info),
+      .key_value = BuildCatalogReadCacheKey(
+          arena, catalog_read_time, ops.size(), read_request_provider,
+          {.version = caching_info.version_info.version,
+           .is_db_catalog_version_mode = caching_info.version_info.is_db_catalog_version_mode}),
       .lifetime_threshold_ms = GetCacheLifetimeThreshold(caching_info.mode)
   };
 }

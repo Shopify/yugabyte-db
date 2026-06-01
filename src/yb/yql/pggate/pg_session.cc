@@ -25,6 +25,7 @@
 
 #include "yb/client/table_info.h"
 
+#include "yb/common/entity_ids.h"
 #include "yb/common/pg_types.h"
 #include "yb/common/read_hybrid_time.h"
 #include "yb/common/row_mark.h"
@@ -48,6 +49,7 @@
 #include "yb/yql/pggate/pg_client.h"
 #include "yb/yql/pggate/pg_flush_debug_context.h"
 #include "yb/yql/pggate/pg_op.h"
+#include "yb/yql/pggate/pg_response_cache_key.h"
 #include "yb/yql/pggate/pggate_flags.h"
 #include "yb/yql/pggate/util/ybc_util.h"
 #include "yb/yql/pggate/ybc_pggate.h"
@@ -248,6 +250,78 @@ Result<ReadHybridTime> GetReadTime(const PgsqlOps& operations) {
     }
   }
   return read_time;
+}
+
+bool HasPagingState(const LWPgsqlReadRequestPB& req) {
+  return req.has_paging_state() ||
+         (req.has_index_request() && HasPagingState(req.index_request()));
+}
+
+Result<std::optional<PgOid>> GetBackendCatalogReadCacheKeyGroup(
+    const BufferableOperations& ops,
+    const PgTxnManager& txn_manager,
+    const tserver::PgPerformOptionsPB& options,
+    const ReadHybridTime& effective_catalog_read_time,
+    const YbcPgLastKnownCatalogVersionInfo& version_info,
+    bool is_major_pg_version_upgrade) {
+  if (!FLAGS_ysql_enable_read_request_caching ||
+      !options.use_catalog_session() ||
+      txn_manager.IsDdlMode() ||
+      yb_non_ddl_txn_for_sys_tables_allowed ||
+      is_major_pg_version_upgrade ||
+      yb_read_time != 0 ||
+      !effective_catalog_read_time ||
+      version_info.version == 0 ||
+      options.namespace_id().empty()) {
+    return std::nullopt;
+  }
+
+  const auto db_oid = GetPgsqlDatabaseOid(options.namespace_id());
+  if (!db_oid.ok() || *db_oid == kTemplate1Oid) {
+    return std::nullopt;
+  }
+
+  for (const auto& op : ops.operations()) {
+    if (!op->is_read() || !IsReadOnly(*op)) {
+      return std::nullopt;
+    }
+    const auto& read_req = down_cast<const PgsqlReadOp&>(*op).read_request();
+    if (HasPagingState(read_req)) {
+      // Multi-page backend catalog-cache-miss response caching is intentionally out of scope for
+      // the design note yb_pg_backend_catalog_cache_through_tserver.
+      return std::nullopt;
+    }
+  }
+
+  return *db_oid;
+}
+
+Result<std::optional<PgSession::CacheOptions>> BuildBackendCatalogReadCacheOptions(
+    yb::ThreadSafeArena* arena,
+    BufferableOperations& ops,
+    const PgTxnManager& txn_manager,
+    const tserver::PgPerformOptionsPB& options,
+    const ReadHybridTime& effective_catalog_read_time,
+    const YbcPgLastKnownCatalogVersionInfo& version_info,
+    bool is_major_pg_version_upgrade) {
+  const auto key_group = VERIFY_RESULT(GetBackendCatalogReadCacheKeyGroup(
+      ops, txn_manager, options, effective_catalog_read_time, version_info,
+      is_major_pg_version_upgrade));
+  if (!key_group) {
+    return std::nullopt;
+  }
+
+  auto read_request_provider_lambda = [&ops](size_t idx) -> LWPgsqlReadRequestPB& {
+    return down_cast<PgsqlReadOp&>(*ops.operations()[idx]).read_request();
+  };
+  auto read_request_provider = make_lw_function(read_request_provider_lambda);
+  return PgSession::CacheOptions{
+      .key_group = *key_group,
+      .key_value = BuildCatalogReadCacheKey(
+          arena, effective_catalog_read_time, ops.Size(), read_request_provider,
+          {.version = version_info.version,
+           .is_db_catalog_version_mode = version_info.is_db_catalog_version_mode}),
+      .lifetime_threshold_ms = std::nullopt};
 }
 
 // Helper function to chose read time with in_txn_limit from pair of read time.
@@ -817,11 +891,12 @@ Result<PerformFuture> PgSession::Perform(BufferableOperations&& ops, PerformOpti
   DCHECK(!ops.Empty());
   tserver::PgPerformOptionsPB options;
   const auto ops_read_time = VERIFY_RESULT(GetReadTime(ops.operations()));
+  const auto effective_catalog_read_time = ops_read_time ? ops_read_time : catalog_read_time_;
   if (ops_options.use_catalog_session) {
     VLOG(2) << "Perform - catalog_read_time: " << catalog_read_time_
             << " ops_read_time: " << ops_read_time.ToString();
-    if (const auto read_time = ops_read_time ? ops_read_time : catalog_read_time_; read_time) {
-      read_time.ToPB(options.mutable_read_time());
+    if (effective_catalog_read_time) {
+      effective_catalog_read_time.ToPB(options.mutable_read_time());
     }
     options.set_use_catalog_session(true);
   } else {
@@ -913,13 +988,20 @@ Result<PerformFuture> PgSession::Perform(BufferableOperations&& ops, PerformOpti
   }
   options.set_trace_requested(pg_txn_manager_->ShouldEnableTracing());
 
-  if (ops_options.cache_options) {
-    auto& cache_options = *ops_options.cache_options;
+  auto cache_options = std::move(ops_options.cache_options);
+  if (!cache_options && options.use_catalog_session() && pg_callbacks_.GetCatalogVersionForResponseCache) {
+    cache_options = VERIFY_RESULT(BuildBackendCatalogReadCacheOptions(
+        &ops.operations().front()->arena(), ops, *pg_txn_manager_, options,
+        effective_catalog_read_time, pg_callbacks_.GetCatalogVersionForResponseCache(),
+        is_major_pg_version_upgrade_));
+  }
+
+  if (cache_options) {
     auto& caching_info = *options.mutable_caching_info();
-    caching_info.set_key_group(cache_options.key_group);
-    caching_info.set_key_value(std::move(cache_options.key_value));
-    if (cache_options.lifetime_threshold_ms) {
-      caching_info.mutable_lifetime_threshold_ms()->set_value(*cache_options.lifetime_threshold_ms);
+    caching_info.set_key_group(cache_options->key_group);
+    caching_info.set_key_value(std::move(cache_options->key_value));
+    if (cache_options->lifetime_threshold_ms) {
+      caching_info.mutable_lifetime_threshold_ms()->set_value(*cache_options->lifetime_threshold_ms);
     }
   }
 

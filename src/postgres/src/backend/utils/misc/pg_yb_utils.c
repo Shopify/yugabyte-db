@@ -266,6 +266,24 @@ YbGetCatalogCacheVersionForTablePrefetching()
 	};
 }
 
+YbcPgLastKnownCatalogVersionInfo
+YbGetCatalogCacheVersionForResponseCache()
+{
+	/*
+	 * This helper is used while building PgResponseCache keys for ordinary backend
+	 * catalog-cache misses. It must only consult local backend state: do not call
+	 * YbGetMasterCatalogVersion, YbInvalidateCatalogSnapshot, or any helper that
+	 * performs a master RPC. The integration tests corroborate this by requiring
+	 * master_read_rpc == 0 when the tserver response cache hits.
+	 */
+	return (YbcPgLastKnownCatalogVersionInfo)
+	{
+		.version = yb_catalog_cache_version,
+		.version_read_time = YBCGetPgCatalogReadTime(),
+		.is_db_catalog_version_mode = YBIsDBCatalogVersionMode(),
+	};
+}
+
 void
 YbUpdateCatalogCacheVersionNoPgStat(uint64_t catalog_cache_version)
 {
@@ -1128,6 +1146,7 @@ YBInitPostgresBackend(const char *program_name, const YbcPgInitPostgresInfo *ini
 			.CheckUserMap = &check_usermap,
 			.PgstatReportWaitStart = &yb_pgstat_report_wait_start,
 			.GetCatalogSnapshotReadPoint = &YbGetCatalogSnapshotReadPoint,
+			.GetCatalogVersionForResponseCache = &YbGetCatalogCacheVersionForResponseCache,
 			.GetSessionReplicationOriginId = &YbGetSessionReplicationOriginId,
 			.CheckForInterrupts = &YBCheckForInterrupts,
 			.IsInParallelMode = &IsInParallelMode,

@@ -244,6 +244,18 @@ class PgCatalogPerfTestBase : public PgMiniTestBase {
     return yb::Format("SET yb_pg_stat_plans_track TO $0", (qpmEnabled ? "top" : "none"));
   }
 
+  Status DrainConnectionStartup(PGConn* conn) {
+    VERIFY_RESULT(conn->Fetch("SELECT 1"));
+    return Status::OK();
+  }
+
+  Result<MetricCounters> RunMeasuredStatement(PGConn* conn, const std::string& statement) {
+    return metrics_->Delta([conn, &statement] {
+      VERIFY_RESULT(conn->Fetch(statement));
+      return static_cast<Status>(Status::OK());
+    });
+  }
+
   std::optional<MetricWatcher<MetricCountersDescriber>> metrics_;
 
  private:
@@ -359,6 +371,101 @@ using PgPredictableMemoryUsageTest =
     ConfigurableTest<PgCatalogPerfTestBase, kConfigPredictableMemoryUsage>;
 using PgSmallPreloadTest =
     ConfigurableTest<PgCatalogPerfTestBase, kConfigSmallPreload>;
+
+TEST_F_EX(PgCatalogPerfTest,
+          BackendCatcacheMissHitsResponseCache,
+          PgCatalogWithLimitedCachePerfTest) {
+  auto setup_conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(setup_conn.Execute("CREATE TABLE backend_catcache_hit_t(k INT PRIMARY KEY)"));
+
+  auto conn_a = ASSERT_RESULT(Connect());
+  ASSERT_OK(DrainConnectionStartup(&conn_a));
+  const auto warm_metrics = ASSERT_RESULT(
+      RunMeasuredStatement(&conn_a, "SELECT * FROM backend_catcache_hit_t"));
+  ASSERT_GT(warm_metrics.cache.queries, 0);
+
+  auto conn_b = ASSERT_RESULT(Connect());
+  ASSERT_OK(DrainConnectionStartup(&conn_b));
+  const auto hit_metrics = ASSERT_RESULT(
+      RunMeasuredStatement(&conn_b, "SELECT * FROM backend_catcache_hit_t"));
+  ASSERT_GT(hit_metrics.cache.hits, 0);
+  ASSERT_EQ(hit_metrics.master_read_rpc, 0);
+}
+
+TEST_F(PgCatalogPerfTest, BackendCatcacheFlagDisabledNoCaching) {
+  auto setup_conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(setup_conn.Execute("CREATE TABLE backend_catcache_disabled_t(k INT PRIMARY KEY)"));
+
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(DrainConnectionStartup(&conn));
+  const auto metrics = ASSERT_RESULT(
+      RunMeasuredStatement(&conn, "SELECT * FROM backend_catcache_disabled_t"));
+  ASSERT_EQ(metrics.cache.queries, 0);
+}
+
+TEST_F_EX(PgCatalogPerfTest,
+          BackendCatcacheSkipsInDdl,
+          PgCatalogWithLimitedCachePerfTest) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(DrainConnectionStartup(&conn));
+  const auto metrics = ASSERT_RESULT(metrics_->Delta([&conn] {
+    return conn.Execute("CREATE TABLE backend_catcache_ddl_t(k INT PRIMARY KEY)");
+  }));
+  ASSERT_EQ(metrics.cache.queries, 0);
+}
+
+TEST_F_EX(PgCatalogPerfTest,
+          BackendCatcacheSkipsWithYbReadTime,
+          PgCatalogWithLimitedCachePerfTest) {
+  auto setup_conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(setup_conn.Execute("CREATE TABLE backend_catcache_read_time_t(k INT PRIMARY KEY)"));
+  const auto read_time = ASSERT_RESULT(setup_conn.FetchRow<PGUint64>(
+      "SELECT ((EXTRACT (EPOCH FROM CURRENT_TIMESTAMP))*1000000)::bigint"));
+
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(DrainConnectionStartup(&conn));
+  ASSERT_OK(conn.ExecuteFormat("SET yb_read_time TO $0", read_time));
+  const auto metrics = ASSERT_RESULT(
+      RunMeasuredStatement(&conn, "SELECT * FROM backend_catcache_read_time_t"));
+  ASSERT_EQ(metrics.cache.queries, 0);
+}
+
+TEST_F_EX(PgCatalogPerfTest,
+          BackendCatcacheSkipsWithNonDdlTxnSysTablesAllowed,
+          PgCatalogWithLimitedCachePerfTest) {
+  auto setup_conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(setup_conn.Execute("CREATE TABLE backend_catcache_nonddl_t(k INT PRIMARY KEY)"));
+
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(DrainConnectionStartup(&conn));
+  ASSERT_OK(conn.Execute("SET yb_non_ddl_txn_for_sys_tables_allowed = true"));
+  const auto metrics = ASSERT_RESULT(
+      RunMeasuredStatement(&conn, "SELECT * FROM backend_catcache_nonddl_t"));
+  ASSERT_EQ(metrics.cache.queries, 0);
+}
+
+TEST_F_EX(PgCatalogPerfTest,
+          BackendCatcacheInvalidatedOnCatalogVersionBump,
+          PgCatalogWithLimitedCachePerfTest) {
+  auto setup_conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(setup_conn.Execute("CREATE TABLE backend_catcache_inval_t(k INT PRIMARY KEY)"));
+
+  auto conn_a = ASSERT_RESULT(Connect());
+  ASSERT_OK(DrainConnectionStartup(&conn_a));
+  const auto warm_metrics = ASSERT_RESULT(
+      RunMeasuredStatement(&conn_a, "SELECT * FROM backend_catcache_inval_t"));
+  ASSERT_GT(warm_metrics.cache.queries, 0);
+
+  auto ddl_conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(ddl_conn.Execute("ALTER TABLE backend_catcache_inval_t ADD COLUMN v INT"));
+
+  auto conn_b = ASSERT_RESULT(Connect());
+  ASSERT_OK(DrainConnectionStartup(&conn_b));
+  const auto miss_metrics = ASSERT_RESULT(
+      RunMeasuredStatement(&conn_b, "SELECT * FROM backend_catcache_inval_t"));
+  ASSERT_EQ(miss_metrics.cache.hits, 0);
+  ASSERT_GT(miss_metrics.master_read_rpc, 0);
+}
 
 class PgCatalogWithStaleResponseCacheTest : public PgCatalogWithUnlimitedCachePerfTest {
  protected:

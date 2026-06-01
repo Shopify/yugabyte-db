@@ -14,13 +14,26 @@
 //--------------------------------------------------------------------------------------------------
 
 #include <chrono>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <vector>
+
+#include <google/protobuf/io/coded_stream.h>
 
 #include "yb/common/constants.h"
+#include "yb/common/pgsql_protocol.messages.h"
+#include "yb/common/pgsql_protocol.pb.h"
+#include "yb/common/read_hybrid_time.h"
 
 #include "yb/gutil/casts.h"
 
+#include "yb/util/format.h"
+#include "yb/util/memory/arena.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/status_log.h"
 
+#include "yb/yql/pggate/pg_response_cache_key.h"
 #include "yb/yql/pggate/test/pggate_test.h"
 #include "yb/yql/pggate/util/ybc-internal.h"
 #include "yb/yql/pggate/ybc_pggate.h"
@@ -34,6 +47,124 @@ namespace pggate {
 
 class PggateTestCatalog : public PggateTest {
 };
+
+namespace {
+
+using google::protobuf::io::CodedOutputStream;
+
+auto ReferenceTemporaryClearInsignificantFields(LWPgsqlReadRequestPB& req) {
+  const auto stmt_id = req.has_stmt_id() ? std::optional(req.stmt_id()) : std::nullopt;
+  req.clear_stmt_id();
+  const auto metrics_capture =
+      req.has_metrics_capture() ? std::optional(req.metrics_capture()) : std::nullopt;
+  req.clear_metrics_capture();
+  return ScopeExit([&req, stmt_id, metrics_capture] {
+    if (stmt_id) {
+      req.set_stmt_id(*stmt_id);
+    }
+    if (metrics_capture) {
+      req.set_metrics_capture(*metrics_capture);
+    }
+  });
+}
+
+template<class PB>
+uint8_t* ReferenceWritePBWithSize(uint8_t* out, const PB* pb) {
+  if (!pb) {
+    return CodedOutputStream::WriteVarint32ToArray(0U, out);
+  }
+  out = CodedOutputStream::WriteVarint32ToArray(narrow_cast<uint32_t>(pb->SerializedSize()), out);
+  return pb->SerializeToArray(out);
+}
+
+std::string ReferenceBuildCatalogReadCacheKey(
+    ThreadSafeArena* arena,
+    const ReadHybridTime& catalog_read_time,
+    const std::vector<std::unique_ptr<LWPgsqlReadRequestPB>>& requests,
+    PgCatalogReadCacheKeyVersionInfo version_info) {
+  constexpr auto kMaxFieldSize =
+      CodedOutputStream::StaticVarintSize32<std::numeric_limits<uint32_t>::max()>::value;
+  auto total_size = CodedOutputStream::VarintSize64(version_info.version) + 1 +
+                    (requests.size() + 1) * kMaxFieldSize;
+  std::optional<LWReadHybridTimePB> read_time_pb;
+  if (catalog_read_time) {
+    read_time_pb.emplace(arena);
+    catalog_read_time.ToPB(&*read_time_pb);
+    total_size += read_time_pb->SerializedSize();
+  }
+  for (const auto& req : requests) {
+    total_size += req->SerializedSize();
+  }
+
+  std::string result;
+  result.resize(total_size);
+  auto* start = pointer_cast<uint8_t*>(result.data());
+  auto* out = CodedOutputStream::WriteRawToArray(
+      version_info.is_db_catalog_version_mode ? "1" : "0", 1, start);
+  out = CodedOutputStream::WriteVarint64ToArray(version_info.version, out);
+  out = ReferenceWritePBWithSize(out, read_time_pb ? &*read_time_pb : nullptr);
+  for (const auto& req : requests) {
+    auto fields_restorer = ReferenceTemporaryClearInsignificantFields(*req);
+    out = ReferenceWritePBWithSize(out, req.get());
+  }
+  result.resize(out - start);
+  return result;
+}
+
+std::unique_ptr<LWPgsqlReadRequestPB> MakeReadRequest(
+    ThreadSafeArena* arena, int index, bool with_index_request, bool with_filter) {
+  auto req = std::make_unique<LWPgsqlReadRequestPB>(arena);
+  req->set_client(YQL_CLIENT_PGSQL);
+  req->dup_table_id(Format("0000000000000000000000000000$0", index));
+  req->set_schema_version(10 + index);
+  req->set_stmt_id(1000 + index);
+  req->set_metrics_capture(PGSQL_METRICS_CAPTURE_ALL);
+  auto* target = req->add_targets();
+  target->set_column_id(1 + index);
+  req->mutable_column_refs()->mutable_ids()->push_back(1 + index);
+  if (with_filter) {
+    auto* expr = req->add_partition_column_values();
+    expr->mutable_value()->set_uint32_value(100 + index);
+  }
+  if (with_index_request) {
+    auto& index_req = *req->mutable_index_request();
+    index_req.dup_table_id(Format("0000000000000000000000001000$0", index));
+    auto* index_target = index_req.add_targets();
+    index_target->set_column_id(20 + index);
+  }
+  return req;
+}
+
+} // namespace
+
+TEST(PgCatalogReadCacheKeyTest, MatchesReferenceEncoder) {
+  for (const size_t num_ops : {0, 1, 2, 4}) {
+    for (const bool has_read_time : {false, true}) {
+      for (const bool is_db_catalog_version_mode : {false, true}) {
+        ThreadSafeArena arena;
+        std::vector<std::unique_ptr<LWPgsqlReadRequestPB>> requests;
+        requests.reserve(num_ops);
+        for (size_t i = 0; i != num_ops; ++i) {
+          requests.push_back(MakeReadRequest(
+              &arena, narrow_cast<int>(i), i % 2 == 0, i % 3 == 0));
+        }
+        const auto read_time = has_read_time
+            ? ReadHybridTime::SingleTime(HybridTime::FromMicros(123456 + num_ops))
+            : ReadHybridTime();
+        const PgCatalogReadCacheKeyVersionInfo version_info{
+            .version = 42 + num_ops,
+            .is_db_catalog_version_mode = is_db_catalog_version_mode};
+        auto provider_lambda = [&requests](size_t idx) -> LWPgsqlReadRequestPB& {
+          return *requests[idx];
+        };
+        auto provider = make_lw_function(provider_lambda);
+        ASSERT_EQ(
+            BuildCatalogReadCacheKey(&arena, read_time, requests.size(), provider, version_info),
+            ReferenceBuildCatalogReadCacheKey(&arena, read_time, requests, version_info));
+      }
+    }
+  }
+}
 
 TEST_F(PggateTestCatalog, TestDml) {
   CHECK_OK(Init("TestDml"));

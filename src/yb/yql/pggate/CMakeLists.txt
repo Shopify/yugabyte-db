@@ -51,6 +51,7 @@ set(PGGATE_SRCS
     pg_operation_buffer.cc
     pg_perform_future.cc
     pg_read_range.cc
+    pg_response_cache_key.cc
     pg_sample.cc
     pg_select.cc
     pg_select_index.cc

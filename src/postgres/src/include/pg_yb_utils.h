@@ -120,6 +120,7 @@ extern void YbSendMasterLogicalClientVersionToFrontend();
 extern void YbResetCatalogCacheVersion();
 
 extern YbcPgLastKnownCatalogVersionInfo YbGetCatalogCacheVersionForTablePrefetching();
+extern YbcPgLastKnownCatalogVersionInfo YbGetCatalogCacheVersionForResponseCache();
 
 extern void YbUpdateLastKnownCatalogCacheVersion(uint64_t catalog_cache_version);
 
