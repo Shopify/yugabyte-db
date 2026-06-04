@@ -117,6 +117,10 @@ DEFINE_RUNTIME_AUTO_bool(cdc_write_post_apply_metadata, kLocalPersisted, false, 
 DEFINE_RUNTIME_bool(cdc_immediate_transaction_cleanup, true,
     "Clean up transactions from memory after apply, even if its changes have not yet been "
     "streamed by CDC.");
+DEFINE_RUNTIME_uint32(tablet_change_feed_intents_retention_secs, 0,
+    "If non-zero, defer immediate post-apply intent cleanup until the APPLYING op's wall-clock "
+    "age is at least this many seconds. This supports streamless tablet change-feed consumers "
+    "that use static retention and external checkpoints instead of cdc_state barriers.");
 DEFINE_test_flag(int32, stopactivetxns_sleep_in_abort_cb_ms, 0,
     "Delays the abort callback in StopActiveTxns to repro GitHub #23399.");
 
@@ -1040,6 +1044,7 @@ class TransactionParticipant::Impl
         data.transaction_id, "apply"s, TransactionLoadFlags{TransactionLoadFlag::kMustExist}));
     if (lock_and_iterator.found()) {
       lock_and_iterator.transaction().SetApplyOpId(data.op_id);
+      lock_and_iterator.transaction().SetApplyHybridTimes(data.commit_ht, data.log_ht);
       if (!apply_state.active()) {
         RemoveUnlocked(
             lock_and_iterator.iterator, RemoveReason::kApplied, &min_running_notifier);
@@ -1134,6 +1139,7 @@ class TransactionParticipant::Impl
       }
       CHECK(transactions_.modify(it, [&data](auto& txn) {
         txn->SetApplyOpId(data.op_id);
+        txn->SetApplyHybridTimes(data.commit_ht, data.log_ht);
       }));
 
       if ((**it).ProcessingApply()) {
@@ -1991,6 +1997,20 @@ class TransactionParticipant::Impl
     std::optional<PostApplyTransactionMetadata> post_apply_metadata_entry;
   };
 
+  bool IsWithinTabletChangeFeedRetentionWindow(HybridTime apply_ht) const {
+    const auto retention_secs = FLAGS_tablet_change_feed_intents_retention_secs;
+    if (retention_secs == 0 || !apply_ht.is_valid()) {
+      return false;
+    }
+    const auto now_micros = participant_context_.Now().GetPhysicalValueMicros();
+    const auto apply_micros = apply_ht.GetPhysicalValueMicros();
+    if (now_micros <= apply_micros) {
+      return true;
+    }
+    return now_micros - apply_micros <
+           static_cast<uint64_t>(MonoDelta::FromSeconds(retention_secs).ToMicroseconds());
+  }
+
   TransactionMetaCleanupResult HandleTransactionCleanup(
       const Transactions::iterator& it, RemoveReason reason, const OpId& checkpoint_op_id)
       REQUIRES(mutex_) {
@@ -2007,7 +2027,8 @@ class TransactionParticipant::Impl
     const TransactionId& txn_id = (**it).id();
     const OpId& op_id = (**it).GetApplyOpId();
     if (op_id <= checkpoint_op_id) {
-      if (PREDICT_TRUE(!FLAGS_TEST_no_schedule_remove_intents)) {
+      if (PREDICT_TRUE(!FLAGS_TEST_no_schedule_remove_intents) &&
+          !IsWithinTabletChangeFeedRetentionWindow((**it).GetApplyHybridTime())) {
         (**it).ScheduleRemoveIntents(*it, reason);
       }
     } else {

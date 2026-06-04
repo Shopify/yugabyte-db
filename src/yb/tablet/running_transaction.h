@@ -135,6 +135,8 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
 
   void SetApplyOpId(const OpId& id);
 
+  void SetApplyHybridTimes(HybridTime commit_ht, HybridTime log_ht);
+
   const OpId& GetApplyOpId() const {
     return apply_record_op_id_;
   }

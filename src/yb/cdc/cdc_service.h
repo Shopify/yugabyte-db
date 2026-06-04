@@ -168,6 +168,10 @@ class CDCServiceImpl : public CDCServiceIf {
       const ListTabletsRequestPB* req, ListTabletsResponsePB* resp, rpc::RpcContext rpc) override;
   void GetChanges(
       const GetChangesRequestPB* req, GetChangesResponsePB* resp, rpc::RpcContext rpc) override;
+  void ReadTabletChanges(
+      const ReadTabletChangesRequestPB* req,
+      ReadTabletChangesResponsePB* resp,
+      rpc::RpcContext rpc) override;
   bool IsReplicationPausedForStream(const std::string& stream_id) const EXCLUDES(mutex_);
   void GetCheckpoint(
       const GetCheckpointRequestPB* req,

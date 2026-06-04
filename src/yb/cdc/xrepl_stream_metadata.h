@@ -165,6 +165,12 @@ class StreamMetadata {
       const xrepl::StreamId& stream_id, RefreshStreamMapOption opts, client::YBClient* client)
       EXCLUDES(load_mutex_);
 
+  // Initializes just enough metadata for streamless, tablet-local decoding
+  // paths. This is intentionally not backed by a master CDC stream.
+  void InitForTabletChangeFeed(
+      const NamespaceId& namespace_id,
+      const std::vector<TableId>& table_ids) EXCLUDES(load_mutex_, mutex_, table_ids_mutex_);
+
   std::string ToString() const;
 
  private:
