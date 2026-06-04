@@ -107,6 +107,43 @@ Status StreamMetadata::InitOrReloadIfNeeded(
   return Status::OK();
 }
 
+void StreamMetadata::InitForTabletChangeFeed(
+    const NamespaceId& namespace_id,
+    const std::vector<TableId>& table_ids) {
+  std::lock_guard l_load(load_mutex_);
+  std::lock_guard l_table(mutex_);
+
+  if (loaded_.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  stream_id_ = xrepl::StreamId::Nil();
+  namespace_id_ = namespace_id;
+  record_type_ = CDCRecordType::CHANGE;
+  record_format_ = CDCRecordFormat::PROTO;
+  source_type_ = CDCRequestSource::CDCSDK;
+  checkpoint_type_ = CDCCheckpointType::EXPLICIT;
+  consistent_snapshot_option_.reset();
+  replication_slot_lsn_type_.reset();
+  replication_slot_ordering_mode_.reset();
+  replication_slot_name_.reset();
+  db_oid_to_get_sequences_for_.reset();
+
+  state_.store(master::SysCDCStreamEntryPB_State_ACTIVE, std::memory_order_release);
+  transactional_.store(StreamModeTransactional::kFalse, std::memory_order_release);
+  consistent_snapshot_time_.store(std::nullopt, std::memory_order_release);
+  stream_creation_time_.store(std::nullopt, std::memory_order_release);
+
+  {
+    std::lock_guard l_table_ids(table_ids_mutex_);
+    table_ids_ = table_ids;
+    unqualified_table_ids_.clear();
+    replica_identitity_map_.clear();
+  }
+
+  loaded_.store(true, std::memory_order_release);
+}
+
 Status StreamMetadata::GetStreamInfoFromMaster(
     const xrepl::StreamId& stream_id, client::YBClient* client) {
   std::lock_guard l_table(mutex_);

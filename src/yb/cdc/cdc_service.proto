@@ -77,6 +77,7 @@ service CDCService {
   rpc UpdateAndPersistLSN (UpdateAndPersistLSNRequestPB) returns (UpdateAndPersistLSNResponsePB);
   rpc UpdatePublicationTableList (UpdatePublicationTableListRequestPB)
       returns (UpdatePublicationTableListResponsePB);
+  rpc ReadTabletChanges (ReadTabletChangesRequestPB) returns (ReadTabletChangesResponsePB);
 }
 
 message CDCErrorPB {
@@ -100,6 +101,7 @@ message CDCErrorPB {
     TABLET_SPLIT = 12;
     OPERATION_DISALLOWED = 13;
     AUTO_FLAGS_CONFIG_VERSION_MISMATCH = 14;
+    CHANGE_FEED_CURSOR_TOO_OLD = 15;
   }
 
   // The error code.
@@ -565,6 +567,65 @@ message CDCSDKProtoRecordPB {
   optional CDCSDKOpIdPB cdc_sdk_op_id = 2;
 
   optional CDCSDKOpIdPB from_op_id = 3;
+}
+
+// Narrow, streamless tablet-local change feed for internal consumers that only
+// need committed row changes. The service does not create CDC streams, does not
+// write cdc_state, and does not install per-consumer retention barriers.
+message TabletChangeCursorPB {
+  // Empty or unset in a request means "start at the current leader tip". This
+  // avoids backfilling the static retention window for newly assigned tablets.
+  optional bytes token = 1;
+}
+
+message TabletChangeRecordPB {
+  enum Op {
+    UNKNOWN = 0;
+    INSERT = 1;
+    UPDATE = 2;
+    DELETE = 3;
+  }
+
+  optional bytes tablet_id = 1;
+  optional string table_id = 2;
+  optional uint32 schema_version = 3;
+  optional fixed64 commit_hybrid_time = 4;
+  optional Op op = 5 [default = UNKNOWN];
+  optional bytes primary_key = 6;
+  repeated DatumMessagePB changed_columns = 7;
+
+  // Stable duplicate key for at-least-once consumers. It is scoped to this
+  // feed contract, not the full CDCSDK envelope.
+  optional bytes dedupe_key = 8;
+}
+
+message ReadTabletChangesRequestPB {
+  optional bytes tablet_id = 1;
+  optional TabletChangeCursorPB cursor = 2;
+
+  // Soft caps. The server may return fewer records and never waits to fill.
+  // The prototype implementation enforces max_bytes in the shared decoder path;
+  // max_records is advisory until the row-change decoder has a lower cutpoint.
+  optional uint32 max_records = 3 [default = 1024];
+  optional uint64 max_bytes = 4 [default = 4194304];
+
+  // If no records are immediately available, wait up to this many milliseconds
+  // for the tablet to commit new changes. Small values (1-5ms) keep tail latency
+  // low while avoiding empty-poll storms.
+  optional uint32 max_wait_ms = 5 [default = 0];
+}
+
+message ReadTabletChangesResponsePB {
+  optional CDCErrorPB error = 1;
+  repeated TabletChangeRecordPB records = 2;
+  optional TabletChangeCursorPB next_cursor = 3;
+
+  // Last committed op id on the leader when the response was generated.
+  optional CDCSDKOpIdPB leader_tip_op_id = 4;
+  optional bool has_more = 5;
+
+  // Populated only when error.code == LEADER_NOT_READY.
+  optional yb.tserver.TabletConsensusInfoPB tablet_consensus_info = 6;
 }
 
 message GetChangesResponsePB {

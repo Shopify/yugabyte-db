@@ -661,6 +661,11 @@ void RunningTransaction::SetApplyOpId(const OpId& op_id) {
   apply_record_op_id_ = op_id;
 }
 
+void RunningTransaction::SetApplyHybridTimes(HybridTime commit_ht, HybridTime log_ht) {
+  apply_data_.commit_ht = commit_ht;
+  apply_data_.log_ht = log_ht;
+}
+
 bool RunningTransaction::ProcessingApply() const {
   return processing_apply_.load(std::memory_order_acquire);
 }

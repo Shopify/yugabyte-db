@@ -52,6 +52,8 @@
 #include "yb/consensus/raft_consensus.h"
 #include "yb/consensus/replicate_msgs_holder.h"
 
+#include "yb/dockv/schema_packing.h"
+
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/strings/join.h"
 
@@ -67,6 +69,7 @@
 
 #include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_peer.h"
+#include "yb/tablet/tablet_types.pb.h"
 #include "yb/tablet/transaction_participant.h"
 
 #include "yb/tserver/service_util.h"
@@ -97,6 +100,7 @@ using std::vector;
 constexpr uint32_t kUpdateIntervalMs = 15 * 1000;
 
 DECLARE_int32(cdc_read_rpc_timeout_ms);
+DECLARE_uint64(cdc_stream_records_threshold_size_bytes);
 
 DEFINE_NON_RUNTIME_int32(cdc_write_rpc_timeout_ms, 30 * 1000,
     "Timeout used for CDC write rpc calls.  Writes normally occur intra-cluster.");
@@ -2117,6 +2121,261 @@ void CDCServiceImpl::GetChanges(
       rate_limiter_->Request(resp->ByteSizeLong(), IOPriority::kHigh);
     };
   }
+  context.RespondSuccess();
+}
+
+namespace {
+
+constexpr uint32_t kTabletChangeCursorVersion = 1;
+
+bool IsTabletChangeDmlOp(RowMessage_Op op) {
+  return op == RowMessage_Op_INSERT || op == RowMessage_Op_UPDATE || op == RowMessage_Op_DELETE;
+}
+
+TabletChangeRecordPB_Op ToTabletChangeOp(RowMessage_Op op) {
+  switch (op) {
+    case RowMessage_Op_INSERT:
+      return TabletChangeRecordPB_Op_INSERT;
+    case RowMessage_Op_UPDATE:
+      return TabletChangeRecordPB_Op_UPDATE;
+    case RowMessage_Op_DELETE:
+      return TabletChangeRecordPB_Op_DELETE;
+    default:
+      return TabletChangeRecordPB_Op_UNKNOWN;
+  }
+}
+
+Status DecodeTabletChangeCursor(
+    const ReadTabletChangesRequestPB& req, CDCSDKCheckpointPB* checkpoint) {
+  RSTATUS_DCHECK(checkpoint, InvalidArgument, "checkpoint must be non-null");
+  checkpoint->Clear();
+
+  if (!req.has_cursor() || req.cursor().token().empty()) {
+    return Status::OK();
+  }
+
+  if (!checkpoint->ParseFromString(req.cursor().token())) {
+    return STATUS(InvalidArgument, "Invalid tablet change cursor token");
+  }
+
+  SCHECK_EQ(
+      checkpoint->snapshot_time(), kTabletChangeCursorVersion, InvalidArgument,
+      "Unsupported tablet change cursor version");
+  return Status::OK();
+}
+
+void EncodeTabletChangeCursor(
+    const CDCSDKCheckpointPB& checkpoint, TabletChangeCursorPB* cursor) {
+  auto encoded = checkpoint;
+  encoded.set_snapshot_time(kTabletChangeCursorVersion);
+  cursor->set_token(encoded.SerializeAsString());
+}
+
+std::string DedupeKeyForRecord(const TabletId& tablet_id, const CDCSDKProtoRecordPB& record) {
+  std::string key = tablet_id;
+  key.push_back('|');
+
+  if (record.has_row_message()) {
+    key.append(record.row_message().table_id());
+    key.push_back('|');
+    key.append(record.row_message().primary_key());
+    key.push_back('|');
+  }
+
+  if (record.has_cdc_sdk_op_id()) {
+    const auto& op_id = record.cdc_sdk_op_id();
+    key.append(std::to_string(op_id.term()));
+    key.push_back('.');
+    key.append(std::to_string(op_id.index()));
+    key.push_back('.');
+    key.append(std::to_string(op_id.write_id()));
+    key.push_back('|');
+    key.append(op_id.write_id_key());
+  }
+
+  return key;
+}
+
+void ProjectCDCSDKRecordsToTabletChanges(
+    const TabletId& tablet_id,
+    const GetChangesResponsePB& source,
+    ReadTabletChangesResponsePB* dest) {
+  for (const auto& cdc_record : source.cdc_sdk_proto_records()) {
+    if (!cdc_record.has_row_message()) {
+      continue;
+    }
+
+    const auto& row = cdc_record.row_message();
+    if (!IsTabletChangeDmlOp(row.op())) {
+      continue;
+    }
+
+    auto* out = dest->add_records();
+    out->set_tablet_id(tablet_id);
+    out->set_table_id(row.table_id());
+    if (row.has_schema_version()) {
+      out->set_schema_version(row.schema_version());
+    }
+    if (row.has_commit_time()) {
+      out->set_commit_hybrid_time(row.commit_time());
+    }
+    out->set_op(ToTabletChangeOp(row.op()));
+    out->set_primary_key(row.primary_key());
+    for (const auto& datum : row.new_tuple()) {
+      out->add_changed_columns()->CopyFrom(datum);
+    }
+    out->set_dedupe_key(DedupeKeyForRecord(tablet_id, cdc_record));
+  }
+}
+
+CDCErrorPB::Code TabletChangeErrorCodeFromStatus(const Status& status) {
+  if (status.IsNotFound()) {
+    return CDCErrorPB::CHANGE_FEED_CURSOR_TOO_OLD;
+  }
+  if (status.IsInternalError() &&
+      status.message().ToBuffer().find("already GCed intents") != std::string::npos) {
+    return CDCErrorPB::CHANGE_FEED_CURSOR_TOO_OLD;
+  }
+  if (status.IsTabletSplit()) {
+    return CDCErrorPB::TABLET_SPLIT;
+  }
+  return CDCError::ValueFromStatus(status).value_or(CDCErrorPB::INTERNAL_ERROR);
+}
+
+}  // namespace
+
+void CDCServiceImpl::ReadTabletChanges(
+    const ReadTabletChangesRequestPB* req, ReadTabletChangesResponsePB* resp, RpcContext context) {
+  RPC_CHECK_AND_RETURN_ERROR(
+      get_changes_rpc_sem_.TryAcquire(), STATUS(LeaderNotReadyToServe, "Not ready to serve"),
+      resp->mutable_error(), CDCErrorPB::LEADER_NOT_READY, context);
+
+  auto scope_exit = ScopeExit([this] { get_changes_rpc_sem_.Release(); });
+
+  if (!CheckOnline(req, resp, &context)) {
+    return;
+  }
+
+  RPC_CHECK_AND_RETURN_ERROR(
+      req->has_tablet_id() && !req->tablet_id().empty(),
+      STATUS(InvalidArgument, "Tablet ID is required to read tablet changes"),
+      resp->mutable_error(), CDCErrorPB::INVALID_REQUEST, context);
+
+  CDCSDKCheckpointPB from_checkpoint;
+  RPC_STATUS_RETURN_ERROR(
+      DecodeTabletChangeCursor(*req, &from_checkpoint),
+      resp->mutable_error(), CDCErrorPB::INVALID_REQUEST, context);
+
+  ash::WaitStateInfo::UpdateCurrentTabletId(req->tablet_id());
+
+  auto tablet_peer = context_->LookupTablet(req->tablet_id());
+  RPC_CHECK_NE_AND_RETURN_ERROR(
+      tablet_peer, nullptr,
+      STATUS_FORMAT(NotFound, "Tablet $0 not found", req->tablet_id()),
+      resp->mutable_error(), CDCErrorPB::TABLET_NOT_FOUND, context);
+
+  if (tablet_peer->IsNotLeader()) {
+    tserver::FillTabletConsensusInfo(resp, tablet_peer->tablet_id(), tablet_peer);
+    SetupErrorAndRespond(
+        resp->mutable_error(),
+        STATUS_FORMAT(NotFound, "Not leader for $0 $1", req->tablet_id(), tablet_peer->LeaderStatus()),
+        CDCErrorPB::LEADER_NOT_READY, &context);
+    return;
+  }
+
+  RPC_CHECK_AND_RETURN_ERROR(
+      tablet_peer->IsLeaderAndReady(),
+      STATUS(LeaderNotReadyToServe, "Not ready to serve tablet changes"),
+      resp->mutable_error(), CDCErrorPB::LEADER_NOT_READY, context);
+
+  auto tablet_ptr = RPC_VERIFY_RESULT(
+      tablet_peer->shared_tablet(), resp->mutable_error(), CDCErrorPB::TABLET_NOT_RUNNING, context);
+
+  auto consensus = RPC_VERIFY_RESULT(
+      tablet_peer->GetRaftConsensus(), resp->mutable_error(), CDCErrorPB::LEADER_NOT_READY,
+      context);
+
+  const auto leader_tip = consensus->GetLastCommittedOpId();
+  leader_tip.ToPB(resp->mutable_leader_tip_op_id());
+
+  if (!from_checkpoint.has_term() || !from_checkpoint.has_index()) {
+    // First assignment starts at tip. The consumer can persist the returned
+    // token before issuing the next call; no retention-window backfill occurs.
+    leader_tip.ToPB(&from_checkpoint);
+    EncodeTabletChangeCursor(from_checkpoint, resp->mutable_next_cursor());
+    resp->set_has_more(false);
+    context.RespondSuccess();
+    return;
+  }
+
+  if (from_checkpoint.index() > leader_tip.index) {
+    SetupErrorAndRespond(
+        resp->mutable_error(),
+        STATUS_FORMAT(
+            InvalidArgument, "Requested cursor index $0 is beyond leader tip $1",
+            from_checkpoint.index(), leader_tip.index),
+        CDCErrorPB::INVALID_REQUEST, &context);
+    return;
+  }
+
+  cdc::StreamMetadata stream_metadata;
+  stream_metadata.InitForTabletChangeFeed(
+      tablet_ptr->metadata()->namespace_id(), tablet_ptr->metadata()->GetAllColocatedTables());
+
+  SchemaDetailsMap cached_schema_details;
+  TableSchemaPackingStorage schema_packing_storages;
+  {
+    auto registry = std::make_shared<dockv::SchemaPackingRegistry>("ReadTabletChanges: ");
+    for (const auto& table_id : tablet_ptr->metadata()->GetAllColocatedTables()) {
+      schema_packing_storages.emplace(
+          table_id, dockv::SchemaPackingStorage(tablet_ptr->table_type(), registry));
+    }
+  }
+
+  const auto namespace_name = tablet_ptr->metadata()->namespace_name();
+  const bool cql_namespace = tablet_ptr->table_type() == YQL_TABLE_TYPE;
+  auto enum_map = RPC_VERIFY_RESULT(
+      GetEnumMapFromCache(namespace_name, cql_namespace), resp->mutable_error(),
+      CDCErrorPB::INTERNAL_ERROR, context);
+  auto composite_atts_map = RPC_VERIFY_RESULT(
+      GetCompositeAttsMapFromCache(namespace_name, cql_namespace), resp->mutable_error(),
+      CDCErrorPB::INTERNAL_ERROR, context);
+
+  GetChangesResponsePB scratch_resp;
+  HybridTime commit_timestamp;
+  OpId last_streamed_op_id;
+  int64_t last_readable_index = leader_tip.index;
+  consensus::ReplicateMsgsHolder msgs_holder;
+  CDCThroughputMetrics throughput_metrics;
+  TabletStreamInfo tablet_stream_info;
+  tablet_stream_info.stream_id = xrepl::StreamId::Nil();
+  tablet_stream_info.tablet_id = req->tablet_id();
+  MemTrackerPtr mem_tracker = impl_->GetMemTracker(tablet_peer, tablet_stream_info);
+
+  CoarseTimePoint deadline = CoarseMonoClock::Now() + std::chrono::milliseconds(req->max_wait_ms());
+  const auto max_bytes =
+      req->max_bytes() > 0 ? req->max_bytes() : FLAGS_cdc_stream_records_threshold_size_bytes;
+  const auto colocated_table_id = std::string();
+
+  auto status = GetChangesForCDCSDK(
+      xrepl::StreamId::Nil(), req->tablet_id(), from_checkpoint, stream_metadata, tablet_peer,
+      mem_tracker, enum_map, composite_atts_map, CDCSDKRequestSource::DEBEZIUM, client(),
+      &msgs_holder, &scratch_resp, &commit_timestamp, &cached_schema_details,
+      &schema_packing_storages, &last_streamed_op_id, /*safe_hybrid_time_req=*/0,
+      /*consistent_snapshot_time=*/std::nullopt, /*wal_segment_index_req=*/0,
+      &last_readable_index, colocated_table_id,
+      deadline, max_bytes, &throughput_metrics);
+
+  if (!status.ok()) {
+    SetupErrorAndRespond(
+        resp->mutable_error(), status, TabletChangeErrorCodeFromStatus(status), &context);
+    return;
+  }
+
+  ProjectCDCSDKRecordsToTabletChanges(req->tablet_id(), scratch_resp, resp);
+  EncodeTabletChangeCursor(scratch_resp.cdc_sdk_checkpoint(), resp->mutable_next_cursor());
+  resp->set_has_more(scratch_resp.cdc_sdk_checkpoint().index() < leader_tip.index);
+
   context.RespondSuccess();
 }
 
