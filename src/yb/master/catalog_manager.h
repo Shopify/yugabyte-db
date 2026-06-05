@@ -821,6 +821,23 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   Status HandleDroppedTablesForCDCSDKStreams(const std::unordered_set<TableId>& table_ids)
       EXCLUDES(mutex_);
 
+  // Best-effort fast path for drop-table cleanup. A dropped table loses its tablet associations
+  // (FindTableById still resolves the table, but GetTabletsIncludeInactive() returns empty), so
+  // CleanUpCDCSDKStreamsMetadata otherwise has to scan the entire cdc_state table to find the
+  // orphaned (stream, tablet) rows -- there is no stream_id index. We capture the dropped table's
+  // tablet_ids here, while they are still resolvable (DeleteTableInternal calls this before the
+  // tablets are detached), so cleanup can target exact keys instead of scanning. Leader-local and
+  // lossy on failover; the full scan in CleanUpCDCSDKStreamsMetadata is the correctness fallback
+  // whenever a hint is missing.
+  void RecordCDCSDKDroppedTableTabletsHint(const std::set<TableId>& table_ids)
+      EXCLUDES(cdcsdk_dropped_table_tablets_mutex_);
+  // Returns the hinted tablet_ids for table_id, or nullopt if no hint exists (caller must scan).
+  std::optional<std::vector<TabletId>> GetCDCSDKDroppedTableTabletsHint(const TableId& table_id)
+      EXCLUDES(cdcsdk_dropped_table_tablets_mutex_);
+  void EraseCDCSDKDroppedTableTabletsHint(const std::set<TableId>& table_ids)
+      EXCLUDES(cdcsdk_dropped_table_tablets_mutex_);
+  void ClearCDCSDKDroppedTableTabletsHint() EXCLUDES(cdcsdk_dropped_table_tablets_mutex_);
+
   // Delete all the CDCSDK streams on a namespace.
   Status DropAllCDCSDKStreams(const NamespaceId& ns_id) EXCLUDES(mutex_);
 
@@ -2484,6 +2501,14 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   // dynamic table addition / removal), kept off the single catalog-manager bg-tasks thread.
   std::atomic<bool> cdcsdk_metadata_bg_task_running_{false};
   std::unique_ptr<rpc::ScheduledTaskTracker> cdcsdk_metadata_bg_task_;
+
+  // Leader-local, best-effort map of dropped CDCSDK table -> its tablet_ids, captured at drop time
+  // so CleanUpCDCSDKStreamsMetadata can target exact cdc_state keys instead of scanning the whole
+  // table. Lossy on failover; the full scan remains the correctness fallback. See
+  // RecordCDCSDKDroppedTableTabletsHint.
+  std::mutex cdcsdk_dropped_table_tablets_mutex_;
+  std::unordered_map<TableId, std::vector<TabletId>> cdcsdk_dropped_table_tablets_
+      GUARDED_BY(cdcsdk_dropped_table_tablets_mutex_);
 
   // Namespace maps: namespace-id -> NamespaceInfo and namespace-name -> NamespaceInfo
   NamespaceInfoMap namespace_ids_map_ GUARDED_BY(mutex_);

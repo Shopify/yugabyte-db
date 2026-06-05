@@ -133,6 +133,7 @@ DECLARE_bool(TEST_cdcsdk_add_indexes_to_stream);
 DECLARE_bool(TEST_cdcsdk_skip_stream_active_check);
 DECLARE_bool(TEST_cdcsdk_disable_drop_table_cleanup);
 DECLARE_bool(cdcsdk_use_dropped_table_list_for_cleanup);
+DECLARE_bool(cdcsdk_enable_dropped_table_cleanup_hint);
 DECLARE_bool(TEST_cdcsdk_disable_deleted_stream_cleanup);
 DECLARE_bool(cdcsdk_enable_cleanup_of_expired_table_entries);
 DECLARE_bool(TEST_cdcsdk_skip_processing_unqualified_tables);

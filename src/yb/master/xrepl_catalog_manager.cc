@@ -98,6 +98,14 @@ DEFINE_RUNTIME_int32(cdcsdk_metadata_bg_task_interval_ms, 1000,
     "match the previous effective cadence; may be raised to shed master load now that it is off "
     "the critical path. A value <= 0 disables the task.");
 
+DEFINE_RUNTIME_bool(cdcsdk_enable_dropped_table_cleanup_hint, true,
+    "When true, CleanUpCDCSDKStreamsMetadata uses a leader-local hint -- the tablet_ids of each "
+    "dropped table, captured at drop time -- to delete the exact orphaned cdc_state entries, "
+    "instead of scanning the entire cdc_state table to find them (there is no stream_id index on "
+    "cdc_state). The full scan is still used as a fallback whenever the hint is missing (e.g. "
+    "after a leadership change, or for tables dropped before this leader recorded a hint), so "
+    "correctness does not depend on the hint. Set to false to always use the full scan.");
+
 DEFINE_test_flag(bool, hang_wait_replication_drain, false,
     "Used in tests to temporarily block WaitForReplicationDrain.");
 
@@ -701,6 +709,18 @@ Status CatalogManager::HandleDroppedTablesForCDCSDKStreams(
   }
 
   if (!stream_with_dropped_tables.empty()) {
+    // Capture the dropped tables' tablet_ids now, while they are still resolvable (the DeleteTablet
+    // RPCs that detach them are sent later in DeleteTableInternal). This lets the cleanup bg task
+    // target the exact orphaned cdc_state entries instead of scanning the whole table. Best-effort;
+    // the scan remains the fallback. See RecordCDCSDKDroppedTableTabletsHint.
+    if (FLAGS_cdcsdk_enable_dropped_table_cleanup_hint) {
+      std::set<TableId> dropped_tables;
+      for (const auto& entry : stream_with_dropped_tables) {
+        dropped_tables.insert(entry.tables_to_add.begin(), entry.tables_to_add.end());
+      }
+      RecordCDCSDKDroppedTableTabletsHint(dropped_tables);
+    }
+
     std::sort(
         stream_with_dropped_tables.begin(), stream_with_dropped_tables.end(),
         [](const auto& lhs, const auto& rhs) {
@@ -3101,6 +3121,63 @@ Status CatalogManager::GetTabletsForNonDroppedTables(
   return Status::OK();
 }
 
+void CatalogManager::RecordCDCSDKDroppedTableTabletsHint(const std::set<TableId>& table_ids) {
+  // Resolve each table's tablets while they are still associated. The caller invokes this from the
+  // drop path before the DeleteTablet RPCs detach the tablets, so GetTabletsIncludeInactive() still
+  // returns them here (it returns empty once the table is fully dropped). We only store non-empty
+  // results -- an empty list carries no information and would just force a scan anyway.
+  std::unordered_map<TableId, std::vector<TabletId>> resolved;
+  for (const auto& table_id : table_ids) {
+    auto table_result = FindTableById(table_id);
+    if (!table_result.ok()) {
+      continue;
+    }
+    auto tablets_result = (*table_result)->GetTabletsIncludeInactive();
+    if (!tablets_result.ok()) {
+      continue;
+    }
+    std::vector<TabletId> tablet_ids;
+    tablet_ids.reserve(tablets_result->size());
+    for (const auto& tablet : *tablets_result) {
+      tablet_ids.push_back(tablet->tablet_id());
+    }
+    if (!tablet_ids.empty()) {
+      resolved.emplace(table_id, std::move(tablet_ids));
+    }
+  }
+
+  if (resolved.empty()) {
+    return;
+  }
+
+  std::lock_guard l(cdcsdk_dropped_table_tablets_mutex_);
+  for (auto& [table_id, tablet_ids] : resolved) {
+    cdcsdk_dropped_table_tablets_[table_id] = std::move(tablet_ids);
+  }
+}
+
+std::optional<std::vector<TabletId>> CatalogManager::GetCDCSDKDroppedTableTabletsHint(
+    const TableId& table_id) {
+  std::lock_guard l(cdcsdk_dropped_table_tablets_mutex_);
+  auto it = cdcsdk_dropped_table_tablets_.find(table_id);
+  if (it == cdcsdk_dropped_table_tablets_.end()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
+
+void CatalogManager::EraseCDCSDKDroppedTableTabletsHint(const std::set<TableId>& table_ids) {
+  std::lock_guard l(cdcsdk_dropped_table_tablets_mutex_);
+  for (const auto& table_id : table_ids) {
+    cdcsdk_dropped_table_tablets_.erase(table_id);
+  }
+}
+
+void CatalogManager::ClearCDCSDKDroppedTableTabletsHint() {
+  std::lock_guard l(cdcsdk_dropped_table_tablets_mutex_);
+  cdcsdk_dropped_table_tablets_.clear();
+}
+
 Status CatalogManager::GetValidTabletsAndDroppedTablesForStream(
     const CDCStreamInfoPtr stream, std::set<TabletId>* tablets_with_streams,
     std::set<TableId>* dropped_tables) {
@@ -3339,52 +3416,104 @@ Status CatalogManager::CleanUpCDCSDKStreamsMetadata(const LeaderEpoch& epoch) {
     return Status::OK();
   }
 
-  TEST_SYNC_POINT("CleanUpCDCStreamMetadata::StartStep1");
   // for efficient filtering of cdc_state table entries to only the list received in streams.
   std::unordered_set<xrepl::StreamId> stream_ids_metadata_to_be_cleaned_up;
   for(const auto& stream : streams) {
     stream_ids_metadata_to_be_cleaned_up.insert(stream->StreamId());
   }
 
-  // Step-1: Get entries from cdc_state table.
-  std::vector<cdc::CDCStateTableKey> cdc_state_entries;
-  Status iteration_status;
-  auto all_entry_keys =
-      VERIFY_RESULT(cdc_state_table_->GetTableRange({} /* just key columns */, &iteration_status));
-  for (const auto& entry_result : all_entry_keys) {
-    RETURN_NOT_OK(entry_result);
-    const auto& entry = *entry_result;
-    // Only add those entries that belong to the received list of streams and does not represent the
-    // replication slot's state table entry. Replication slot's entry is skipped in order to avoid
-    // its deletion since it does not represent a real tablet_id and the cleanup algorithm works
-    // under the assumption that all cdc state entires are representing real tablet_ids.
-    //
-    // Also skip processing the entries corresponding to sys catalog tablet, since it will never be
-    // deleted.
-    if (entry.key.tablet_id != kCDCSDKSlotEntryTabletId &&
-        entry.key.tablet_id != kSysCatalogTabletId &&
-        stream_ids_metadata_to_be_cleaned_up.contains(entry.key.stream_id)) {
-      cdc_state_entries.emplace_back(entry.key);
-    }
-  }
-  RETURN_NOT_OK(iteration_status);
-  TEST_SYNC_POINT("CleanUpCDCStreamMetadata::CompletedStep1");
-
-  TEST_SYNC_POINT("CleanUpCDCStreamMetadata::StartStep2");
-  // Step-2: Get list of tablets to keep for each stream.
-  // Map of valid tablets to keep for each stream.
+  // Get the list of tablets to keep and the list of dropped tables for each stream. This reads
+  // catalog state only (no cdc_state access) and is needed both to decide which cdc_state entries
+  // to delete and to look up the drop-time tablet hint below.
+  // - tablets_to_keep_per_stream: tablets still associated with the stream; their cdc_state entries
+  //   must NOT be deleted.
+  // - drop_stream_table_list: tables that were associated with the stream but have been dropped.
   std::unordered_map<xrepl::StreamId, std::set<TabletId>> tablets_to_keep_per_stream;
-  // Map to identify the list of dropped tables for the stream.
   StreamTablesMap drop_stream_table_list;
   for (const auto& stream : streams) {
     const auto& stream_id = stream->StreamId();
-    // Get the set of all tablets not associated with the table dropped. Tablets belonging to this
-    // set will not be deleted from cdc_state.
-    // The second set consists of all the tables that were associated with the stream, but dropped.
     RETURN_NOT_OK(GetValidTabletsAndDroppedTablesForStream(
         stream, &tablets_to_keep_per_stream[stream_id], &drop_stream_table_list[stream_id]));
   }
 
+  // Collect the union of dropped tables so we can drop their (now-stale) hints once we are done.
+  std::set<TableId> all_dropped_tables;
+  for (const auto& [_, dropped_tables] : drop_stream_table_list) {
+    all_dropped_tables.insert(dropped_tables.begin(), dropped_tables.end());
+  }
+
+  // Gather the candidate cdc_state entries (keys only) that might need deletion.
+  //
+  // Fast path: if every dropped table has a drop-time tablet hint, build the exact candidate
+  // (tablet_id, stream_id) keys from the hint and skip the full cdc_state scan. A dropped table
+  // loses its tablet associations, and cdc_state has no stream_id index, so without the hint the
+  // only way to find the orphaned rows is to scan the whole table.
+  //
+  // Slow path (any hint missing -- e.g. after a leadership change, or for tables dropped before
+  // this leader recorded a hint): scan cdc_state and filter to the streams being cleaned. This is
+  // the correctness fallback, so cleanup never depends on the hint being present or complete.
+  std::vector<cdc::CDCStateTableKey> cdc_state_entries;
+  bool used_hint = false;
+  if (FLAGS_cdcsdk_enable_dropped_table_cleanup_hint) {
+    bool have_all_hints = true;
+    std::vector<cdc::CDCStateTableKey> hinted_entries;
+    for (const auto& [stream_id, dropped_tables] : drop_stream_table_list) {
+      for (const auto& table_id : dropped_tables) {
+        auto hint = GetCDCSDKDroppedTableTabletsHint(table_id);
+        if (!hint) {
+          have_all_hints = false;
+          break;
+        }
+        for (const auto& tablet_id : *hint) {
+          hinted_entries.emplace_back(tablet_id, stream_id);
+        }
+      }
+      if (!have_all_hints) {
+        break;
+      }
+    }
+
+    if (have_all_hints) {
+      cdc_state_entries = std::move(hinted_entries);
+      used_hint = true;
+      LOG(INFO) << "Using drop-time tablet hint for CDCSDK metadata cleanup of "
+                << all_dropped_tables.size() << " dropped table(s) across "
+                << stream_ids_metadata_to_be_cleaned_up.size()
+                << " stream(s); " << cdc_state_entries.size()
+                << " candidate cdc_state key(s), skipping full cdc_state scan";
+    }
+  }
+
+  if (!used_hint) {
+    TEST_SYNC_POINT("CleanUpCDCStreamMetadata::StartStep1");
+    // Step-1: Get entries from cdc_state table.
+    Status iteration_status;
+    auto all_entry_keys = VERIFY_RESULT(
+        cdc_state_table_->GetTableRange({} /* just key columns */, &iteration_status));
+    for (const auto& entry_result : all_entry_keys) {
+      RETURN_NOT_OK(entry_result);
+      const auto& entry = *entry_result;
+      // Only add those entries that belong to the received list of streams and does not represent
+      // the replication slot's state table entry. Replication slot's entry is skipped in order to
+      // avoid its deletion since it does not represent a real tablet_id and the cleanup algorithm
+      // works under the assumption that all cdc state entires are representing real tablet_ids.
+      //
+      // Also skip processing the entries corresponding to sys catalog tablet, since it will never
+      // be deleted.
+      if (entry.key.tablet_id != kCDCSDKSlotEntryTabletId &&
+          entry.key.tablet_id != kSysCatalogTabletId &&
+          stream_ids_metadata_to_be_cleaned_up.contains(entry.key.stream_id)) {
+        cdc_state_entries.emplace_back(entry.key);
+      }
+    }
+    RETURN_NOT_OK(iteration_status);
+    TEST_SYNC_POINT("CleanUpCDCStreamMetadata::CompletedStep1");
+  }
+
+  TEST_SYNC_POINT("CleanUpCDCStreamMetadata::StartStep2");
+  // Step-2: Decide which candidate entries to delete. Entries whose tablet is still associated with
+  // the stream are kept; the rest are deleted only if the tablet (all tables on a colocated tablet)
+  // has actually been dropped. This decision is identical for the fast and slow paths.
   std::vector<cdc::CDCStateTableKey> keys_to_delete;
   for (const auto& entry : cdc_state_entries) {
     const auto tablets = FindOrNull(tablets_to_keep_per_stream, entry.stream_id);
@@ -3445,7 +3574,13 @@ Status CatalogManager::CleanUpCDCSDKStreamsMetadata(const LeaderEpoch& epoch) {
   }
 
   // Cleanup the streams from system catalog and from internal maps.
-  return CleanupCDCSDKDroppedTablesFromStreamInfo(epoch, drop_stream_table_list);
+  RETURN_NOT_OK(CleanupCDCSDKDroppedTablesFromStreamInfo(epoch, drop_stream_table_list));
+
+  // The dropped tables have now been processed; any tablet hints we held for them are stale. Drop
+  // them so the leader-local hint map does not grow without bound over a long leadership. This is a
+  // no-op for tables that never had a hint (the slow path).
+  EraseCDCSDKDroppedTableTabletsHint(all_dropped_tables);
+  return Status::OK();
 }
 
 Status CatalogManager::CleanUpDeletedXReplStreams(const LeaderEpoch& epoch) {
@@ -5696,7 +5831,10 @@ void CatalogManager::ScheduleCDCSDKMetadataBgTask() {
 void CatalogManager::RunCDCSDKMetadataBgTaskPeriodically() {
   if (!CheckIsLeaderAndReady().ok()) {
     // Lost leadership; stop rescheduling. RunXReplBgTasks re-arms the task the next time this
-    // master runs as leader.
+    // master runs as leader. Drop the drop-table tablet hints -- they are leader-local and a new
+    // leader (or this master on regaining leadership) must rebuild them from drop events; until
+    // then cleanup correctly falls back to the full cdc_state scan.
+    ClearCDCSDKDroppedTableTabletsHint();
     cdcsdk_metadata_bg_task_running_ = false;
     return;
   }

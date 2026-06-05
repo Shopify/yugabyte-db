@@ -162,3 +162,45 @@ they are; they are a separate concern and out of scope for this CDC-focused chan
   task. Setting it `<= 0` disables the task. Defaulted to the old effective cadence so
   behavior is preserved; operators may raise it to shed master load now that it is
   off the critical path.
+
+## Second step: targeted drop-table cleanup (Commit 2)
+
+### The cost being addressed
+
+`CleanUpCDCSDKStreamsMetadata` finds the orphaned `cdc_state` rows for a dropped table
+by scanning the *entire* `cdc_state` table (`GetTableRange` over all rows) and filtering
+to the streams being cleaned. It does this because there is **no `stream_id` index** on
+`cdc_state` (it is keyed by `tablet_id` hash, then `stream_id` range), and because a
+dropped table loses its tablet associations — `FindTableById` still resolves the table,
+but `GetTabletsIncludeInactive()` returns empty — so after the drop, `cdc_state` is the
+only remaining record of which `(stream, tablet)` rows exist for that table.
+
+This is **not** a per-tick cost: the scan only runs while some stream has a non-empty
+`dropped_table_id` list, and a successful cleanup pass clears that list. So it is a
+*per-drop* spike (one ~`#streams x #tablets`-row scan when a table is dropped), not a
+steady tax. On a ~16K-tablet, ~30-stream cluster that is a ~480K-row scan per drop event.
+Post-Commit-1 it no longer blocks the load balancer, but it still spikes the CDC task.
+
+### The narrowing
+
+Capture the dropped table's tablet_ids at the moment the drop is recorded
+(`HandleDroppedTablesForCDCSDKStreams`, called from `DeleteTableInternal` *before* the
+`DeleteTablet` RPCs detach the tablets — so the tablets are still resolvable). Cleanup
+then constructs the exact `(stream_id, tablet_id)` candidate keys from this hint and runs
+the *same* delete-decision logic on them, skipping the full scan.
+
+- The hint is **leader-local and best-effort** (an in-memory map, lossy on failover);
+  there is no schema change and no upgrade/downgrade concern.
+- The full scan remains the **correctness fallback**: cleanup uses the hint only when
+  *every* dropped table being cleaned has one, and otherwise scans exactly as before
+  (e.g. after a leadership change, or for tables dropped before this leader recorded a
+  hint). The delete decision itself (`tablets_to_keep`, the colocated
+  all-tables-dropped check) is identical on both paths, so the hint can never cause a
+  wrong deletion — it only narrows which keys are examined.
+- Gated by `cdcsdk_enable_dropped_table_cleanup_hint` (runtime, default true) so it can
+  be measured against, or reverted to, the full-scan behavior independently of Commit 1.
+
+This is deliberately a separate commit: Commit 1 should flatten catalog-manager latency
+spikes even if the scan stays exactly as expensive, and Commit 2 then removes the scan
+cost on the common (no-failover) path. Whether the scan was "bad enough" to warrant this
+is measurable independently because the two changes are independent.

@@ -2104,6 +2104,10 @@ CDCSDK_TESTS_FOR_ALL_CHECKPOINT_OPTIONS(CDCSDKTabletSplitTest,
 
 void CDCSDKTabletSplitTest::TestCleanUpCDCStreamsMetadataDuringTabletSplit(
     CDCCheckpointType checkpoint_type) {
+  // This test exercises the full cdc_state scan racing with a tablet split. Disable the drop-time
+  // tablet hint fast path so cleanup takes the scan path and the StartStep1/CompletedStep1 sync
+  // points below fire.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cdcsdk_enable_dropped_table_cleanup_hint) = false;
   SyncPoint::GetInstance()->LoadDependency(
       {{"Test::AfterTableDrop", "CleanUpCDCStreamMetadata::StartStep1"},
       {"CleanUpCDCStreamMetadata::CompletedStep1", "Test::InitiateTabletSplit"},
