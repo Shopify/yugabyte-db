@@ -32,6 +32,7 @@
 #include "yb/master/catalog_entity_info.h"
 #include "yb/master/catalog_manager-internal.h"
 #include "yb/master/catalog_manager.h"
+#include "yb/master/cdcsdk_manager.h"
 #include "yb/master/master_ddl.pb.h"
 #include "yb/master/master_heartbeat.pb.h"
 #include "yb/master/master_replication.pb.h"
@@ -87,6 +88,15 @@ DEFINE_RUNTIME_bool(disable_universe_gc, false, "Whether to run the GC on univer
 DEFINE_RUNTIME_int32(cdc_parent_tablet_deletion_task_retry_secs, 30,
     "Frequency at which the background task will verify parent tablets retained for xCluster or "
     "CDCSDK replication and determine if they can be cleaned up.");
+
+DEFINE_RUNTIME_int32(cdcsdk_metadata_bg_task_interval_ms, 1000,
+    "Cadence, in milliseconds, of the dedicated background task that runs CDCSDK metadata "
+    "reconciliation (drop-table cdc_state cleanup and dynamic table addition / removal). This "
+    "work used to run inline on the single catalog-manager background-tasks thread, where it "
+    "serialized with -- and could starve -- load balancing, tablet assignment and leader "
+    "affinity. It now runs on its own scheduled task on the background thread pool. Defaulted to "
+    "match the previous effective cadence; may be raised to shed master load now that it is off "
+    "the critical path. A value <= 0 disables the task.");
 
 DEFINE_test_flag(bool, hang_wait_replication_drain, false,
     "Used in tests to temporarily block WaitForReplicationDrain.");
@@ -5423,9 +5433,12 @@ void CatalogManager::RunXReplBgTasks(const LeaderEpoch& epoch) {
   // Clean up Failed Replication Bootstrap on the Consumer.
   WARN_NOT_OK(ClearFailedReplicationBootstrap(), "Failed Clearing Failed Replication Bootstrap");
 
-  if (!FLAGS_TEST_cdcsdk_disable_drop_table_cleanup) {
-    WARN_NOT_OK(CleanUpCDCSDKStreamsMetadata(epoch), "Failed Cleanup CDCSDK Streams Metadata");
-  }
+  // CDCSDK metadata reconciliation (drop-table cdc_state cleanup + dynamic table addition /
+  // removal) runs on a dedicated scheduled task, off this critical catalog-manager background
+  // thread that also runs load balancing / tablet assignment / leader affinity. (Re)arm that
+  // task here while we are leader; it self-reschedules and stops itself on leadership loss. See
+  // ScheduleCDCSDKMetadataBgTask / RunCDCSDKMetadataBgTaskPeriodically.
+  StartCDCSDKMetadataBgTaskIfStopped();
 
   // Restart xCluster and CDCSDK parent tablet deletion bg task.
   StartXReplParentTabletDeletionTaskIfStopped();
@@ -5642,6 +5655,65 @@ void CatalogManager::StartXReplParentTabletDeletionTaskIfStopped() {
   if (!is_already_running) {
     ScheduleXReplParentTabletDeletionTask();
   }
+}
+
+void CatalogManager::StartCDCSDKMetadataBgTaskIfStopped() {
+  if (FLAGS_cdcsdk_metadata_bg_task_interval_ms <= 0) {
+    // Task is disabled.
+    return;
+  }
+  const bool is_already_running = cdcsdk_metadata_bg_task_running_.exchange(true);
+  if (!is_already_running) {
+    ScheduleCDCSDKMetadataBgTask();
+  }
+}
+
+void CatalogManager::ScheduleCDCSDKMetadataBgTask() {
+  int interval_ms = FLAGS_cdcsdk_metadata_bg_task_interval_ms;
+  if (interval_ms <= 0) {
+    // Task has been disabled at runtime.
+    cdcsdk_metadata_bg_task_running_ = false;
+    return;
+  }
+
+  // Submit to run async on the background thread pool. This work scans streams and accesses
+  // cdc_state, so it deliberately does not share the single catalog-manager bg-tasks thread with
+  // load balancing / tablet assignment / leader affinity.
+  cdcsdk_metadata_bg_task_->Schedule(
+      [this](const Status& status) {
+        Status s = background_tasks_thread_pool_->SubmitFunc(
+            [this] { RunCDCSDKMetadataBgTaskPeriodically(); });
+        if (!s.ok()) {
+          // Failed to submit to the thread pool. Mark the task as no longer running so the next
+          // leader-only RunXReplBgTasks tick re-arms it.
+          LOG(WARNING) << "Failed to schedule: RunCDCSDKMetadataBgTaskPeriodically";
+          cdcsdk_metadata_bg_task_running_ = false;
+        }
+      },
+      interval_ms * 1ms);
+}
+
+void CatalogManager::RunCDCSDKMetadataBgTaskPeriodically() {
+  if (!CheckIsLeaderAndReady().ok()) {
+    // Lost leadership; stop rescheduling. RunXReplBgTasks re-arms the task the next time this
+    // master runs as leader.
+    cdcsdk_metadata_bg_task_running_ = false;
+    return;
+  }
+
+  const LeaderEpoch epoch = GetLeaderEpochInternal();
+
+  // Drop-table cdc_state / stream-metadata cleanup. (Moved off the critical bg-tasks thread.)
+  if (!FLAGS_TEST_cdcsdk_disable_drop_table_cleanup) {
+    WARN_NOT_OK(CleanUpCDCSDKStreamsMetadata(epoch), "Failed Cleanup CDCSDK Streams Metadata");
+  }
+
+  // Dynamic table addition + non-eligible / unqualified / ineligible table cleanup. (Moved off
+  // the critical bg-tasks thread; previously invoked directly from RunOnceAsLeader.)
+  cdcsdk_manager_->RunBgTasks(epoch);
+
+  // Schedule the next iteration.
+  ScheduleCDCSDKMetadataBgTask();
 }
 
 void CatalogManager::ScheduleXReplParentTabletDeletionTask() {

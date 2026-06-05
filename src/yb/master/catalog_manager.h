@@ -1756,6 +1756,14 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
 
   void ScheduleXReplParentTabletDeletionTask();
 
+  // CDCSDK metadata reconciliation runs on its own scheduled task (on background_tasks_thread_pool_)
+  // rather than inline on the single catalog-manager background-tasks thread, so it cannot starve
+  // load balancing / tablet assignment / leader affinity. (Re)armed from RunXReplBgTasks while
+  // leader; self-reschedules and stops itself on leadership loss.
+  void StartCDCSDKMetadataBgTaskIfStopped();
+  void ScheduleCDCSDKMetadataBgTask();
+  void RunCDCSDKMetadataBgTaskPeriodically();
+
   Result<scoped_refptr<TableInfo>> GetTableById(const TableId& table_id) const override;
 
   void AddPendingBackFill(const TableId& id) override {
@@ -2471,6 +2479,11 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   // Background task for deleting parent split tablets retained by xCluster streams.
   std::atomic<bool> xrepl_parent_tablet_deletion_task_running_{false};
   std::unique_ptr<rpc::ScheduledTaskTracker> xrepl_parent_tablet_deletion_task_;
+
+  // Dedicated scheduled task for CDCSDK metadata reconciliation (drop-table cdc_state cleanup +
+  // dynamic table addition / removal), kept off the single catalog-manager bg-tasks thread.
+  std::atomic<bool> cdcsdk_metadata_bg_task_running_{false};
+  std::unique_ptr<rpc::ScheduledTaskTracker> cdcsdk_metadata_bg_task_;
 
   // Namespace maps: namespace-id -> NamespaceInfo and namespace-name -> NamespaceInfo
   NamespaceInfoMap namespace_ids_map_ GUARDED_BY(mutex_);

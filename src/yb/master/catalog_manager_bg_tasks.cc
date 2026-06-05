@@ -35,7 +35,6 @@
 
 #include "yb/master/catalog_entity_info.h"
 #include "yb/master/catalog_manager_util.h"
-#include "yb/master/cdcsdk_manager.h"
 #include "yb/master/clone/clone_state_manager.h"
 #include "yb/master/cluster_balance.h"
 #include "yb/master/master.h"
@@ -302,9 +301,14 @@ void CatalogManagerBgTasks::RunOnceAsLeader(const LeaderEpoch& epoch) {
       catalog_manager_->SetUniverseUuidIfNeeded(epoch), "Failed SetUniverseUuidIfNeeded Task");
 
   // Run background tasks related to XCluster & CDC Schema.
+  //
+  // NOTE: CDCSDK metadata reconciliation (cdcsdk_manager_->RunBgTasks and the drop-table
+  // CleanUpCDCSDKStreamsMetadata inside RunXReplBgTasks) no longer runs inline here. It scales
+  // with (#streams x #tablets) and with DDL activity, and running it on this single, serial bg
+  // thread let it starve load balancing / tablet assignment / leader affinity. RunXReplBgTasks
+  // now only (re)arms a dedicated scheduled task for that work. See
+  // CatalogManager::StartCDCSDKMetadataBgTaskIfStopped.
   catalog_manager_->RunXReplBgTasks(epoch);
-
-  catalog_manager_->cdcsdk_manager_->RunBgTasks(epoch);
 
   catalog_manager_->GetXClusterManager()->RunBgTasks(epoch);
 

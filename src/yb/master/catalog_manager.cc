@@ -2287,6 +2287,10 @@ bool CatalogManager::StartShutdown() {
     xrepl_parent_tablet_deletion_task_->StartShutdown();
   }
 
+  if (cdcsdk_metadata_bg_task_) {
+    cdcsdk_metadata_bg_task_->StartShutdown();
+  }
+
   xcluster_manager_->StartShutdown();
 
   ysql_manager_->StartShutdown();
@@ -2304,6 +2308,9 @@ void CatalogManager::CompleteShutdown() {
   }
   if (xrepl_parent_tablet_deletion_task_) {
     xrepl_parent_tablet_deletion_task_->CompleteShutdown();
+  }
+  if (cdcsdk_metadata_bg_task_) {
+    cdcsdk_metadata_bg_task_->CompleteShutdown();
   }
 
   xcluster_manager_->CompleteShutdown();
@@ -11147,6 +11154,9 @@ Status CatalogManager::EnableBgTasks() {
 
   xrepl_parent_tablet_deletion_task_ = std::make_unique<rpc::ScheduledTaskTracker>();
   xrepl_parent_tablet_deletion_task_->Bind(&master_->messenger()->scheduler());
+
+  cdcsdk_metadata_bg_task_ = std::make_unique<rpc::ScheduledTaskTracker>();
+  cdcsdk_metadata_bg_task_->Bind(&master_->messenger()->scheduler());
 
   return Status::OK();
 }
