@@ -317,7 +317,7 @@ Shared library .* loaded at address 0x[0-9a-f]+$" || true ) \
     exit 1
   fi
 
-  rm -f "$gtest_list_stderr_path"
+  rm -f "$gtest_list_stderr_path" "$gtest_list_stderr_path.filtered"
 
   if [ "$gtest_list_tests_exit_code" -ne 0 ]; then
     echo "'$rel_test_binary' does not seem to be a gtest test (--gtest_list_tests failed)" >&2
@@ -686,7 +686,7 @@ process_core_file() {
 stop_process_tree_supervisor() {
   process_supervisor_success=true
   if [[ ${process_tree_supervisor_pid:-0} -eq 0 ]]; then
-    return
+    return 0
   fi
 
   # process_supervisor_log_path should be set in case process_tree_supervisor_pid is set.
