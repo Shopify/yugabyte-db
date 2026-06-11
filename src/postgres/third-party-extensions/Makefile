@@ -1,6 +1,6 @@
 DIRS = \
 	mage \
-	documentdb \
+	$(if $(filter 1,$(YB_SKIP_YSQL_DOCUMENTDB_EXT)),,documentdb) \
 	hypopg \
 	orafce \
 	pg_cron \

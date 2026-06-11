@@ -31,7 +31,7 @@ import time
 
 from contextlib import contextmanager
 from overrides import overrides
-from sys_detection import local_sys_conf
+from sys_detection import SysConfiguration, local_sys_conf
 
 from typing import List, Dict, Optional, Any, Set, Callable, Generator
 
@@ -594,7 +594,9 @@ class PostgresBuilder(YbBuildToolBase):
                 '--with-extra-version=-YB-' + self.get_yb_version(),
                 '--enable-depend'
         ]
-        if (not re.search(r'ubuntu2[23]\.04', local_sys_conf().short_os_name_and_version()) or
+        sys_conf = SysConfiguration.from_local_system(
+            base_dir=os.environ.get('YB_SYS_DETECTION_BASE_DIR', '/'))
+        if (not re.search(r'ubuntu2[23]\.04', sys_conf.short_os_name_and_version()) or
                 shutil.which('msgfmt')):
             # With GCC 13 build on Ubuntu 23.04, we run into an error where Postgres configure
             # complains about not finding the msgfmt tool if we try to build Postgres with NLS.

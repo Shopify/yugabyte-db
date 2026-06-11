@@ -299,7 +299,8 @@ else()
 endif()
 
 # DocumentDB extension is not available in aarch64 and arm64(#26954) builds.
-if(NOT APPLE AND NOT "${CMAKE_SYSTEM_PROCESSOR}" MATCHES "^(aarch64|arm64)$" )
+if(NOT "$ENV{YB_SKIP_YSQL_DOCUMENTDB_EXT}" STREQUAL "1" AND
+   NOT APPLE AND NOT "${CMAKE_SYSTEM_PROCESSOR}" MATCHES "^(aarch64|arm64)$" )
   set(YB_ENABLE_YSQL_DOCUMENTDB_EXT TRUE)
   ADD_CXX_FLAGS("-DYB_ENABLE_YSQL_DOCUMENTDB_EXT")
 endif()

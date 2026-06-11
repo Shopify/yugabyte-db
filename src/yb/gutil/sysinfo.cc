@@ -168,9 +168,11 @@ static bool ReadIntFromFile(const char *file, int *value) {
   return false;
 }
 
-static int ReadMaxCPUIndex() {
+static int ReadMaxCPUIndex(int fallback_cpu_index) {
   char buf[1024];
-  CHECK(SlurpSmallTextFile("/sys/devices/system/cpu/present", buf, arraysize(buf)));
+  if (!SlurpSmallTextFile("/sys/devices/system/cpu/present", buf, arraysize(buf))) {
+    return fallback_cpu_index;
+  }
 
   // On a single-core machine, 'buf' will contain the string '0' with a newline.
   if (strcmp(buf, "0\n") == 0) {
@@ -325,7 +327,7 @@ static void InitializeSystemInfo() {
   if (num_cpus > 0) {
     cpuinfo_num_cpus = num_cpus;
   }
-  cpuinfo_max_cpu_index = ReadMaxCPUIndex();
+  cpuinfo_max_cpu_index = ReadMaxCPUIndex(num_cpus > 0 ? num_cpus - 1 : 0);
 
 #elif defined __FreeBSD__
   // For this sysctl to work, the machine must be configured without

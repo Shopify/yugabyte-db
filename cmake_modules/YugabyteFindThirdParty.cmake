@@ -334,6 +334,7 @@ macro(yb_find_third_party_dependencies)
   show_found_boost_details("static")
 
   set(BOOST_STATIC_LIBS ${Boost_LIBRARIES})
+  list(FILTER BOOST_STATIC_LIBS EXCLUDE REGEX "^-")
   list(LENGTH BOOST_STATIC_LIBS BOOST_STATIC_LIBS_LEN)
   list(SORT BOOST_STATIC_LIBS)
 
@@ -342,6 +343,7 @@ macro(yb_find_third_party_dependencies)
   find_package(Boost COMPONENTS system thread atomic REQUIRED)
   show_found_boost_details("shared")
   set(BOOST_SHARED_LIBS ${Boost_LIBRARIES})
+  list(FILTER BOOST_SHARED_LIBS EXCLUDE REGEX "^-")
   list(LENGTH BOOST_SHARED_LIBS BOOST_SHARED_LIBS_LEN)
   list(SORT BOOST_SHARED_LIBS)
 
