@@ -412,6 +412,8 @@ class PostgresBuilder(YbBuildToolBase):
         self.set_env_var('YB_PG_BUILD_STEP', step)
         self.set_env_var('YB_THIRDPARTY_DIR', self.thirdparty_dir)
         self.set_env_var('YB_SRC_ROOT', YB_SRC_ROOT)
+        if os.environ.get('YB_PRESERVE_LD_LIBRARY_PATH') == '1':
+            self.set_env_var('LD_LIBRARY_PATH', os.environ.get('LD_LIBRARY_PATH'))
 
         # src/common/Makefile uses this command to strip build-machine-private switches from the
         # flags it bakes into the pg_config binary so that an installed package does not hand them
