@@ -703,29 +703,46 @@ class PostgresBuilder(YbBuildToolBase):
                 'src/postgres',
                 'src/yb/yql/pggate',
             ]
-            git_version = self.get_git_version()
-            if git_version and git_version >= semantic_version.Version('1.9.0'):
-                # Git version 1.8.5 allows specifying glob pathspec, and Git version 1.9.0 allows
-                # specifying negative pathspec.  Use them to exclude changes to regress test files
-                # not needed for build.
-                pathspec.extend(map(lambda path: ':(glob,exclude)' + path, [
-                    'src/postgres/**/*_schedule',
-                    'src/postgres/**/README',
-                    'src/postgres/**/data/*.csv',
-                    'src/postgres/**/data/*.data',
-                    'src/postgres/**/expected/*.out',
-                    'src/postgres/**/specs/*.spec',
-                    'src/postgres/**/sql/*.sql',
-                    'src/postgres/**/yb_commands/*.sql',
-                    'src/postgres/.clang-format',
-                    'src/yb/yql/pggate/**/README',
-                ]))
-            # Get the most recent commit that touched postgres files.
-            git_hash = subprocess.check_output(
-                ['git', '--no-pager', 'log', '-n', '1', '--format=%H', '--'] + pathspec
-            ).decode('utf-8').strip()
-            # Get uncommitted changes to tracked postgres files.
-            git_diff = subprocess.check_output(['git', 'diff', 'HEAD', '--'] + pathspec)
+            if get_bool_env_var('YB_ALLOW_SOURCE_SNAPSHOT') and not os.path.isdir('.git'):
+                git_hash = os.environ.get('YB_VERSION_INFO_GIT_SHA1', '0' * 40)
+                sha256_parts = []
+                for path in pathspec:
+                    if not os.path.exists(path):
+                        continue
+                    if os.path.isdir(path):
+                        for root, _, files in os.walk(path):
+                            for file_name in sorted(files):
+                                file_path = os.path.join(root, file_name)
+                                with open(file_path, 'rb') as input_file:
+                                    sha256_parts.append(compute_sha256(input_file.read()))
+                    else:
+                        with open(path, 'rb') as input_file:
+                            sha256_parts.append(compute_sha256(input_file.read()))
+                git_diff = '\n'.join(sorted(sha256_parts)).encode('utf-8')
+            else:
+                git_version = self.get_git_version()
+                if git_version and git_version >= semantic_version.Version('1.9.0'):
+                    # Git version 1.8.5 allows specifying glob pathspec, and Git version 1.9.0 allows
+                    # specifying negative pathspec.  Use them to exclude changes to regress test files
+                    # not needed for build.
+                    pathspec.extend(map(lambda path: ':(glob,exclude)' + path, [
+                        'src/postgres/**/*_schedule',
+                        'src/postgres/**/README',
+                        'src/postgres/**/data/*.csv',
+                        'src/postgres/**/data/*.data',
+                        'src/postgres/**/expected/*.out',
+                        'src/postgres/**/specs/*.spec',
+                        'src/postgres/**/sql/*.sql',
+                        'src/postgres/**/yb_commands/*.sql',
+                        'src/postgres/.clang-format',
+                        'src/yb/yql/pggate/**/README',
+                    ]))
+                # Get the most recent commit that touched postgres files.
+                git_hash = subprocess.check_output(
+                    ['git', '--no-pager', 'log', '-n', '1', '--format=%H', '--'] + pathspec
+                ).decode('utf-8').strip()
+                # Get uncommitted changes to tracked postgres files.
+                git_diff = subprocess.check_output(['git', 'diff', 'HEAD', '--'] + pathspec)
 
         env_vars_str = self.get_env_vars_str(self.env_vars_for_build_stamp)
         build_stamp = "\n".join([

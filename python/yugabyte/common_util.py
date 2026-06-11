@@ -257,7 +257,10 @@ def get_bool_env_var(env_var_name: str) -> bool:
 
 
 def is_yb_src_root(candidate_dir_path: str) -> bool:
-    for subdir in ['.git', 'src', 'java', 'bin', 'build-support']:
+    required_subdirs = ['src', 'java', 'bin', 'build-support']
+    if not get_bool_env_var('YB_ALLOW_SOURCE_SNAPSHOT'):
+        required_subdirs.append('.git')
+    for subdir in required_subdirs:
         if not os.path.exists(os.path.join(candidate_dir_path, subdir)):
             return False
     return True

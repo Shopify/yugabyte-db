@@ -97,7 +97,11 @@ set_yb_src_root() {
 # Puts the current Git SHA1 in the current directory into the current_sha1 variable.
 # Remember, this variable could also be local to the calling function.
 get_current_sha1() {
-  current_sha1=$( git rev-parse HEAD )
+  if [[ -n ${YB_ALLOW_SOURCE_SNAPSHOT:-} && -n ${YB_VERSION_INFO_GIT_SHA1:-} ]]; then
+    current_sha1=$YB_VERSION_INFO_GIT_SHA1
+  else
+    current_sha1=$( git rev-parse HEAD )
+  fi
   if [[ ! $current_sha1 =~ ^[0-9a-f]{40}$ ]]; then
     # We can't use the "fatal" function yet.
     echo >&2 "Could not get current Git SHA1 in $PWD"
@@ -113,8 +117,10 @@ initialize_yugabyte_bash_common() {
     exit 1
   fi
 
-  # Put this submodule-like directory under "build".
-  YB_BASH_COMMON_DIR=$YB_SRC_ROOT/build/yugabyte-bash-common
+  # Put this submodule-like directory under "build" unless the caller supplied
+  # a pre-populated checkout/snapshot. This is useful for hermetic build systems
+  # that cannot clone from GitHub during the build.
+  YB_BASH_COMMON_DIR=${YB_BASH_COMMON_DIR:-$YB_SRC_ROOT/build/yugabyte-bash-common}
 
   if [[ ! -d $YB_BASH_COMMON_DIR ]]; then
     mkdir -p "$YB_SRC_ROOT/build"
@@ -123,7 +129,11 @@ initialize_yugabyte_bash_common() {
 
   pushd "$YB_BASH_COMMON_DIR" >/dev/null
   local current_sha1
-  get_current_sha1
+  if [[ ${YB_ALLOW_SOURCE_SNAPSHOT:-} == "1" && ! -d .git ]]; then
+    current_sha1=$target_sha1
+  else
+    get_current_sha1
+  fi
   if [[ $current_sha1 != "$target_sha1" ]]; then
     if ! ( set -x; git checkout "$target_sha1" ); then
       (
@@ -2109,6 +2119,12 @@ find_or_download_thirdparty() {
 }
 
 find_or_download_ysql_snapshots() {
+  if [[ ${YB_SKIP_INITIAL_SYS_CATALOG_SNAPSHOT_DOWNLOAD:-0} == "1" ]]; then
+    log "Skipping YSQL catalog snapshot download because " \
+        "YB_SKIP_INITIAL_SYS_CATALOG_SNAPSHOT_DOWNLOAD=1"
+    return
+  fi
+
   local repo_url="https://github.com/yugabyte/yugabyte-db-ysql-catalog-snapshots"
   local prefix="initial_sys_catalog_snapshot"
 
@@ -2392,11 +2408,19 @@ check_python_script_syntax() {
   pushd "$YB_SRC_ROOT"
   local IFS=$'\n'
   # Get all .py files in git, ignoring files with skip-worktree bit set (e.g.
-  # through git sparse-checkout), and check their syntax.
-  git ls-files -t '*.py' \
-    | grep -v '^S' \
-    | sed 's/^[[:alpha:]] //' \
-    | xargs -P 8 -n 1 "$YB_SCRIPT_PATH_CHECK_PYTHON_SYNTAX"
+  # through git sparse-checkout), and check their syntax. Source snapshots used
+  # by hermetic build systems might not have a .git directory, so fall back to
+  # find in that case.
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git ls-files -t '*.py' \
+      | grep -v '^S' \
+      | sed 's/^[[:alpha:]] //'
+  elif [[ ${YB_ALLOW_SOURCE_SNAPSHOT:-} == "1" ]]; then
+    find . -name '*.py' -type f | sed 's#^./##'
+  else
+    fatal "Cannot list Python files because $YB_SRC_ROOT is not a Git worktree. Set " \
+          "YB_ALLOW_SOURCE_SNAPSHOT=1 to allow building from a source snapshot."
+  fi | xargs -P 8 -n 1 "$YB_SCRIPT_PATH_CHECK_PYTHON_SYNTAX"
   popd +0
 }
 
@@ -2449,7 +2473,14 @@ activate_virtualenv() {
   [[ -f "${YB_SRC_ROOT}/build/requirements_frozen.txt" ]] \
     || ln -sf "${YB_SRC_ROOT}/requirements_frozen.txt" "${YB_SRC_ROOT}/build/"
 
-  yb_activate_virtualenv "${virtualenv_parent_dir}"
+  if [[ ${YB_SKIP_VIRTUALENV:-0} == "1" ]]; then
+    if [[ -z ${VIRTUAL_ENV:-} ]]; then
+      VIRTUAL_ENV=${YB_EXTERNAL_PYTHON_ENV:-}
+    fi
+    log "Skipping python virtual env activation because YB_SKIP_VIRTUALENV=1"
+  else
+    yb_activate_virtualenv "${virtualenv_parent_dir}"
+  fi
 
 
   if [[ ${YB_DEBUG_VIRTUALENV:-0} == "1" ]]; then
@@ -2516,7 +2547,11 @@ is_valid_git_sha1() {
 
 # Returns current git SHA1 in the variable current_git_sha1.
 get_current_git_sha1() {
-  current_git_sha1=$( git rev-parse HEAD )
+  if [[ -n ${YB_ALLOW_SOURCE_SNAPSHOT:-} && -n ${YB_VERSION_INFO_GIT_SHA1:-} ]]; then
+    current_git_sha1=$YB_VERSION_INFO_GIT_SHA1
+  else
+    current_git_sha1=$( git rev-parse HEAD )
+  fi
   if ! is_valid_git_sha1 "$current_git_sha1"; then
     fatal "Could not get current git SHA1 in $PWD, got: $current_git_sha1"
   fi
