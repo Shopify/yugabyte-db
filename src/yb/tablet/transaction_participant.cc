@@ -884,12 +884,32 @@ class TransactionParticipant::Impl
     TransactionIdSet set;
     {
       std::lock_guard lock(mutex_);
+      const bool cdc_wall_clock_retention =
+          GetAtomicFlag(&FLAGS_intents_min_seconds_to_retain) > 0;
       const OpId& cdcsdk_checkpoint_op_id = GetLatestCheckPointUnlocked();
 
-      if (cdcsdk_checkpoint_op_id != OpId::Max()) {
-        for (const auto& [transaction_id, apply_op_id] : txns) {
-          const OpId* apply_record_op_id = &apply_op_id;
-          if (!apply_op_id.valid()) {
+      if (cdc_wall_clock_retention) {
+        // Checkpoint-less (StreamWAL) CDC. There is no op_id checkpoint barrier; instead a
+        // committed transaction's intents must survive --intents_min_seconds_to_retain seconds
+        // past its commit_ht. commit_ht is surfaced from the on-disk PostApplyTransactionMetadata
+        // by the IntentsDB compaction filter. A transaction with an invalid commit_ht (no
+        // post-apply metadata was seen: an aborted transaction, or a committed one predating this
+        // feature) falls through to CleanupAbortsTask, which independently verifies abort status
+        // against the coordinator before removing any intents -- so committed-but-still-known
+        // transactions are not over-cleaned.
+        for (const auto& [transaction_id, info] : txns) {
+          if (info.commit_ht.is_valid() && IsWithinIntentsRetentionWindow(info.commit_ht)) {
+            VLOG_WITH_PREFIX(2)
+                << "Transaction within CDC intent-retention window, should not cleanup. "
+                << "TransactionId: " << transaction_id << ", commit_ht: " << info.commit_ht;
+            continue;
+          }
+          set.insert(transaction_id);
+        }
+      } else if (cdcsdk_checkpoint_op_id != OpId::Max()) {
+        for (const auto& [transaction_id, info] : txns) {
+          const OpId* apply_record_op_id = &info.apply_op_id;
+          if (!info.apply_op_id.valid()) {
             // Apply op id is unknown -- may be from before upgrade to version that writes
             // apply op id to metadata. If cdc_immediate_transaction_cleanup is not false, it has
             // been removed from memory already, but we don't know if CDC still needs it, so we
@@ -1977,23 +1997,25 @@ class TransactionParticipant::Impl
     std::optional<PostApplyTransactionMetadata> post_apply_metadata_entry;
   };
 
-  // Returns true iff --intents_min_seconds_to_retain is set and the wall-clock age of
-  // `apply_ht` is below the configured threshold. When true, post-apply intent cleanup
-  // should be deferred so a stream-id-less CDC consumer can still read the intents.
-  // A return of false (the default when the flag is 0) preserves the historical
+  // Returns true iff --intents_min_seconds_to_retain is set and the wall-clock age of `ht`
+  // (a transaction's commit / apply hybrid time) is below the configured threshold. When true,
+  // the transaction's intents are still inside the CDC retention window and must not be garbage
+  // collected, so a stream-id-less CDC consumer can still read them at APPLYING time. Used both
+  // by the IntentsDB compaction GC path (Cleanup) and to reason about the retention window in
+  // general. A return of false (the default when the flag is 0) preserves the historical
   // "clean up intents immediately post-apply" behavior.
-  bool IsWithinIntentsRetentionWindow(HybridTime apply_ht) const {
+  bool IsWithinIntentsRetentionWindow(HybridTime ht) const {
     const auto retention_secs = GetAtomicFlag(&FLAGS_intents_min_seconds_to_retain);
-    if (retention_secs == 0 || !apply_ht.is_valid()) {
+    if (retention_secs == 0 || !ht.is_valid()) {
       return false;
     }
     const auto now_micros = participant_context_.Now().GetPhysicalValueMicros();
-    const auto apply_micros = apply_ht.GetPhysicalValueMicros();
-    if (now_micros <= apply_micros) {
-      // Apply HT is in the (logical) future of our clock; treat as within window.
+    const auto ht_micros = ht.GetPhysicalValueMicros();
+    if (now_micros <= ht_micros) {
+      // HT is in the (logical) future of our clock; treat as within window.
       return true;
     }
-    const auto age_micros = now_micros - apply_micros;
+    const auto age_micros = now_micros - ht_micros;
     return age_micros < static_cast<uint64_t>(MonoDelta::FromSeconds(retention_secs).ToMicroseconds());
   }
 
@@ -2012,22 +2034,37 @@ class TransactionParticipant::Impl
 
     const TransactionId& txn_id = (**it).id();
     const OpId& op_id = (**it).GetApplyOpId();
+
+    // Checkpoint-less (StreamWAL) CDC intent retention. When --intents_min_seconds_to_retain is
+    // set there is no per-stream checkpoint barrier (GetLatestCheckPoint() is permanently
+    // OpId::Max()); instead a committed transaction's intents must survive a wall-clock window.
+    // Rather than removing intents eagerly at apply, persist a PostApplyTransactionMetadata
+    // record carrying commit_ht so the IntentsDB compaction-filter GC path (Cleanup) can decide,
+    // purely from wall-clock age, when the retention window has elapsed. This is the SAME
+    // mechanism lease-based CDC uses to evict a txn from memory while deferring intent GC -- we
+    // just swap the op_id checkpoint barrier for a wall-clock one. The transaction is still
+    // evicted from `transactions_` (should_remove_transaction stays true; no in-memory growth).
+    //
+    // Only committed (applied) transactions qualify: an invalid commit_ht means the txn was not
+    // applied (e.g. aborted), in which case there is nothing to retain and we fall through to the
+    // normal cleanup path below. Loaded-with-CDC txns short-circuit earlier (see above) and rely
+    // on the post-apply metadata persisted before restart.
+    //
+    // The post-apply metadata is the retention mechanism here, so we write it unconditionally (it
+    // does not depend on --cdc_write_post_apply_metadata, which gates the lease-based CDC path).
+    if (GetAtomicFlag(&FLAGS_intents_min_seconds_to_retain) > 0 &&
+        (**it).GetCommitHybridTime().is_valid()) {
+      post_apply_metadata_entry = PostApplyTransactionMetadata{
+          .transaction_id = txn_id,
+          .apply_op_id = op_id,
+          .commit_ht = (**it).GetCommitHybridTime(),
+          .log_ht = (**it).GetApplyHybridTime(),
+      };
+      return {should_remove_transaction, post_apply_metadata_entry};
+    }
+
     if (op_id <= checkpoint_op_id) {
-      // intents_min_seconds_to_retain: if the apply is still within the configured retention
-      // window, skip the immediate intent removal. The transaction is still evicted from
-      // `transactions_` (no in-memory growth); the on-disk intents linger and are GC'd later
-      // by the intent SST file cleanup codepath (background compaction filters).
-      //
-      // Trade-off vs. also gating the LockAndFind defense-in-depth cleanup branch: a stale
-      // lookup arriving while the txn sits in `recently_removed_transactions_` and then again
-      // after its 15s TTL expires can re-schedule intent removal before the window elapses.
-      // The two known callers (conflict_resolution.cc, transaction_status_cache.cc) only fire
-      // on the read path for txns the participant doesn't know about, so this is a narrow
-      // race in practice. Hardening that path requires plumbing apply_hybrid_time through
-      // `recently_removed_transactions_`; deliberately deferred for v1 to keep the change
-      // surgical and the patch reviewable as a strictly-additive flag.
-      if (PREDICT_TRUE(!GetAtomicFlag(&FLAGS_TEST_no_schedule_remove_intents)) &&
-          !IsWithinIntentsRetentionWindow((**it).GetApplyHybridTime())) {
+      if (PREDICT_TRUE(!GetAtomicFlag(&FLAGS_TEST_no_schedule_remove_intents))) {
         (**it).ScheduleRemoveIntents(*it, reason);
       }
     } else {
@@ -2163,8 +2200,19 @@ class TransactionParticipant::Impl
     }
     // Skip this cleanup if CDC is active on this tablet; we defer to full SST file deletion
     // triggered when CDC checkpoint moves.
-    if (!GetAtomicFlag(&FLAGS_cdc_immediate_transaction_cleanup) ||
-        latest_checkpoint == OpId::Max()) {
+    //
+    // Checkpoint-less (StreamWAL) CDC: --intents_min_seconds_to_retain is a first-class
+    // "CDC active" signal. Without it, a committed-but-evicted transaction surfaced by a
+    // read-path / conflict-resolution status lookup (with kCleanup) after its 15s
+    // recently_removed_transactions_ TTL expires would have its intents deleted here, inside
+    // the retention window. This is a purely eager defense-in-depth path: deferring it is
+    // safe because the wall-clock-gated compaction GC path (Cleanup) still reclaims the intents
+    // once the window elapses.
+    const bool cdc_wall_clock_retention =
+        GetAtomicFlag(&FLAGS_intents_min_seconds_to_retain) > 0;
+    if (!cdc_wall_clock_retention &&
+        (!GetAtomicFlag(&FLAGS_cdc_immediate_transaction_cleanup) ||
+         latest_checkpoint == OpId::Max())) {
       if (flags.Test(TransactionLoadFlag::kCleanup)) {
         VLOG_WITH_PREFIX(2) << "Schedule cleanup for: " << id;
         auto cleanup_task = std::make_shared<CleanupIntentsTask>(
@@ -2211,7 +2259,16 @@ class TransactionParticipant::Impl
     // be checked when we remove the txn from 'transactions_' and trigger cleanup of intents. Once
     // CDC stream these txns, their intents will be cleaned up by the intent SST file cleanup
     // codepath.
-    if (GetLatestCheckPointUnlocked() != OpId::Max()) {
+    //
+    // Checkpoint-less (StreamWAL) CDC: GetLatestCheckPoint() is permanently OpId::Max(), so the
+    // marker would never be set and a committed transaction replayed after a restart / leader
+    // change would have its intents deleted eagerly on eviction (HandleTransactionCleanup) inside
+    // the retention window -- loaded txns have no in-memory commit_ht, so the wall-clock window
+    // gate there cannot protect them. Treat --intents_min_seconds_to_retain > 0 as the equivalent
+    // "CDC active" signal. Their intents are reclaimed later by the wall-clock-gated compaction GC
+    // path using the commit_ht persisted in PostApplyTransactionMetadata before the restart.
+    if (GetLatestCheckPointUnlocked() != OpId::Max() ||
+        GetAtomicFlag(&FLAGS_intents_min_seconds_to_retain) > 0) {
       txn->SetTxnLoadedWithCDC();
     }
     if (last_batch_data.hybrid_time) {

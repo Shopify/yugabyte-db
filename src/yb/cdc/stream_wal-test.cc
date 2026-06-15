@@ -972,5 +972,88 @@ TEST_F(StreamWalYsqlSecondaryIndexTest, MultiRowTxnSpillsAndResumes) {
       << "every committed row must be emitted exactly once";
 }
 
+// Regression test for the checkpoint-less intent-retention fix.
+//
+// In the StreamWAL design GetLatestCheckPoint() is permanently OpId::Max(), so
+// the IntentsDB compaction-filter GC path (DocDBIntentsCompactionFilter ->
+// TransactionParticipant::Cleanup -> CleanupAbortsTask) treated CDC as inactive
+// and reclaimed a committed transaction's intents as soon as its metadata aged
+// past --aborted_intent_cleanup_ms -- bypassing the --intents_min_seconds_to_retain
+// wall-clock window entirely.
+//
+// The fix persists PostApplyTransactionMetadata (carrying commit_ht) at apply and
+// gates Cleanup on the wall-clock window, so a committed txn's intents survive an
+// IntentsDB compaction while inside the retention window even with
+// aborted_intent_cleanup_ms forced to 0 (i.e. the compaction filter surfaces the
+// txn on every pass; only the retention window protects the intents).
+TEST_F(StreamWalYsqlSecondaryIndexTest, CommittedIntentsSurviveCompactionWithinRetentionWindow) {
+  constexpr int kRowCount = 20;
+  // Surface the committed txn to the compaction filter immediately, so the
+  // 1-hour retention window (set by the fixture) is the *only* thing that can
+  // keep the intents from being GC'd.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_aborted_intent_cleanup_ms) = 0;
+
+  constexpr auto kYsqlTableName = "stream_wal_retention_t";
+  auto conn = ASSERT_RESULT(Connect());
+  // UNIQUE secondary index forces the writes down the transactional path, so the
+  // commit produces committed intents (an APPLYING op).
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 (id INT PRIMARY KEY, sku TEXT UNIQUE, v INT) SPLIT INTO 1 TABLETS",
+      kYsqlTableName));
+  const auto table_id = ASSERT_RESULT(GetTableIDFromTableName(kYsqlTableName));
+  const auto tablet_id = ASSERT_RESULT(OnlyTabletIdForTable(table_id));
+
+  auto tip = ASSERT_RESULT(StreamWalForTablet(tablet_id, kSkipToTip));
+  ASSERT_FALSE(tip.has_error()) << tip.error().ShortDebugString();
+
+  // Explicit multi-row transaction (mirrors MultiRowTxnSpillsAndResumes, which is
+  // the reliable committed-intents-at-APPLYING path in this fixture).
+  ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+  for (int i = 0; i < kRowCount; ++i) {
+    ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 VALUES ($1, 'sku-$1', $1)", kYsqlTableName, i));
+  }
+  ASSERT_OK(conn.CommitTransaction());
+
+  // Drain to COMMIT so we know the APPLYING has been processed and the committed
+  // transaction has been evicted from the in-memory participant (the regime where
+  // the bug bit: LocalCommitTime() can no longer vouch for it). This also forces
+  // the server to read the intents at APPLYING, proving they are present.
+  ASSERT_RESULT(DrainUntilCommit(tablet_id, tip.next_op_id(), 60s * kTimeMultiplier));
+
+  auto peers = ASSERT_RESULT(ListTabletActivePeers(cluster_.get(), tablet_id));
+  ASSERT_FALSE(peers.empty());
+  auto tablet = ASSERT_RESULT(peers.front()->shared_tablet());
+  ASSERT_GT(ASSERT_RESULT(tablet->CountIntents()), 0)
+      << "precondition: committed intents present in IntentsDB";
+
+  // Force IntentsDB flush + compaction repeatedly. With aborted_intent_cleanup_ms
+  // == 0 the compaction filter surfaces the committed txn on every pass; pre-fix
+  // this fed the blanket-add cleanup path and reclaimed the intents. Post-fix, the
+  // wall-clock gate in TransactionParticipant::Cleanup keeps them (commit_ht is
+  // inside the 1h retention window).
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(tablet->ForceManualRocksDBCompact());
+  }
+
+  ASSERT_GT(ASSERT_RESULT(tablet->CountIntents()), 0)
+      << "committed-txn intents were GC'd inside the --intents_min_seconds_to_retain window";
+  ASSERT_NO_FATALS(ExpectIntentsPresentAndCheckpointUnpinned(tablet_id));
+
+  // StreamWAL can still replay the committed rows from the original cursor
+  // (no INTENTS_GC_ERROR). DrainUntilCommit fails if the server returns an error.
+  auto replay =
+      ASSERT_RESULT(DrainUntilCommit(tablet_id, tip.next_op_id(), 60s * kTimeMultiplier));
+  int insert_count = 0;
+  for (const auto& record : replay) {
+    if (record.has_row_message() &&
+        record.row_message().op() == RowMessage_Op_INSERT &&
+        record.row_message().table_id() == table_id) {
+      ++insert_count;
+    }
+  }
+  ASSERT_EQ(insert_count, kRowCount)
+      << "StreamWAL must still replay every committed row after compaction within the window";
+}
+
 }  // namespace cdc
 }  // namespace yb
