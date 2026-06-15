@@ -1256,11 +1256,11 @@ The time period, in milliseconds, after which the intents will be cleaned up if 
 Default: `0`
 {{% /tags/wrap %}}
 
-Minimum duration, in seconds, to retain a committed transaction's on-disk intents after the transaction has been applied. When set to a non-zero value, the immediate post-apply intent cleanup is deferred until the wall-clock age of the transaction's apply hybrid time exceeds this threshold; the intents are then garbage-collected by the regular intent SST file cleanup path.
+Minimum duration, in seconds, to retain a committed transaction's on-disk intents after the transaction has been applied. When set to a non-zero value, every intent-cleanup path treats it as a "CDC active" signal: the immediate post-apply intent removal is deferred, and the transaction's intents are reclaimed only after the wall-clock age of its commit hybrid time exceeds this threshold. At apply time a `PostApplyTransactionMetadata` record (carrying the commit hybrid time) is persisted so the IntentsDB compaction-filter garbage-collection path can make the wall-clock retention decision without any in-memory state.
 
 Serves as a time-based parallel to [--log_min_seconds_to_retain](#log-min-seconds-to-retain) (which governs WAL segment retention) for the IntentsDB. The default of `0` preserves the historical behavior of cleaning up intents as soon as a transaction's APPLYING record is replicated, when no CDC consumer is pinning a checkpoint barrier via `UpdateCdcReplicatedIndex`.
 
-Intended for CDC consumers that rely on wall-clock retention instead of per-stream lease-based barriers. Operationally, pair with `--log_min_seconds_to_retain` (set both to the same value so the WAL and IntentsDB stay in sync for any consumer that may need to read either).
+Intended for CDC consumers that rely on wall-clock retention instead of per-stream lease-based barriers. Operationally, pair with `--log_min_seconds_to_retain` (set both to the same value so the WAL and IntentsDB stay in sync for any consumer that may need to read either). You do not need to also raise `--aborted_intent_cleanup_ms`: the retention window is enforced by the wall-clock gate in the compaction garbage-collection path, so a committed transaction's intents are retained for the full window regardless of how soon the compaction filter surfaces the transaction.
 
 ##### --cdc_wal_retention_time_secs
 
