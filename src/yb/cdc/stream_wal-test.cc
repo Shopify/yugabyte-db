@@ -36,8 +36,14 @@
 #include "yb/integration-tests/mini_cluster.h"
 #include "yb/integration-tests/yb_mini_cluster_test_base.h"
 
+#include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_peer.h"
+#include "yb/tablet/transaction_participant.h"
+
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
+
+#include "yb/common/opid.h"
 
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/flags.h"
@@ -46,6 +52,8 @@
 #include "yb/yql/pgwrapper/pg_mini_test_base.h"
 
 DECLARE_uint64(cdc_max_stream_intent_records);
+DECLARE_uint32(intents_min_seconds_to_retain);
+DECLARE_uint64(aborted_intent_cleanup_ms);
 
 namespace yb {
 namespace cdc {
@@ -473,6 +481,19 @@ class StreamWalYsqlSecondaryIndexTest : public pgwrapper::PgMiniTestBase {
  protected:
   size_t NumTabletServers() override { return 1; }
 
+  void SetUp() override {
+    // StreamWAL reads a committed transaction's intents from IntentsDB at
+    // APPLYING time. Without a wall-clock retention window the normal
+    // post-apply cleanup tombstones those intents asynchronously, racing the
+    // stream read -- so these tests must pin intents the way a real connector
+    // does (intents_min_seconds_to_retain). Set it once for the whole fixture
+    // before the cluster starts. aborted_intent_cleanup_ms is raised in tandem
+    // so the compaction-filter cleanup path can't reclaim them mid-test.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_intents_min_seconds_to_retain) = 3600;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_aborted_intent_cleanup_ms) = 3600u * 1000u;
+    pgwrapper::PgMiniTestBase::SetUp();
+  }
+
   Result<StreamWalResponsePB> StreamWalForTablet(
       const TabletId& tablet_id, const StreamWalCursorPB& from) {
     CDCServiceProxy cdc_proxy(
@@ -495,7 +516,163 @@ class StreamWalYsqlSecondaryIndexTest : public pgwrapper::PgMiniTestBase {
     SCHECK_EQ(tablet_ids.size(), 1, IllegalState, "Expected exactly one tablet");
     return *tablet_ids.begin();
   }
+
+  // Proves a zero-intent StreamWAL result is NOT caused by garbage collection:
+  //   - the tablet's IntentsDB still physically holds intents, and
+  //   - no CDC checkpoint is pinned, so GetLatestCheckPoint() == OpId::Max(),
+  //     which is the always-true side of the ProcessIntents guard
+  //     (op_id <= checkpoint_op_id) that misclassifies the batch as a GC error.
+  void ExpectIntentsPresentAndCheckpointUnpinned(const TabletId& tablet_id) {
+    auto peers = ASSERT_RESULT(ListTabletActivePeers(cluster_.get(), tablet_id));
+    ASSERT_FALSE(peers.empty());
+    auto tablet = ASSERT_RESULT(peers.front()->shared_tablet());
+    ASSERT_GT(ASSERT_RESULT(tablet->CountIntents()), 0)
+        << "intents must still be physically present in IntentsDB -- the zero-intent "
+        << "result is not a retention GC";
+    ASSERT_EQ(tablet->transaction_participant()->GetLatestCheckPoint(), OpId::Max())
+        << "no checkpoint is pinned in the StreamWAL design; the ProcessIntents guard "
+        << "(op_id <= checkpoint) is therefore always true";
+  }
+
+  // Drives StreamWAL forward from `cursor`, accumulating records, until a COMMIT
+  // is observed or `timeout` elapses. Fails if the server ever returns an error.
+  Result<std::vector<CDCSDKProtoRecordPB>> DrainUntilCommit(
+      const TabletId& tablet_id, StreamWalCursorPB cursor, MonoDelta timeout) {
+    std::vector<CDCSDKProtoRecordPB> seen;
+    RETURN_NOT_OK(WaitFor(
+        [&]() -> Result<bool> {
+          auto resp = VERIFY_RESULT(StreamWalForTablet(tablet_id, cursor));
+          SCHECK(!resp.has_error(), IllegalState, resp.error().ShortDebugString());
+          for (const auto& record : resp.records()) {
+            seen.push_back(record);
+          }
+          if (resp.has_next_op_id()) {
+            cursor = resp.next_op_id();
+          }
+          for (const auto& record : seen) {
+            if (record.has_row_message() &&
+                record.row_message().op() == RowMessage_Op_COMMIT) {
+              return true;
+            }
+          }
+          return false;
+        },
+        timeout, "wait for StreamWAL to emit the empty BEGIN/COMMIT envelope"));
+    return seen;
+  }
+
+  // Asserts the drained records are exactly an empty transaction envelope:
+  // one BEGIN and one COMMIT sharing a transaction_id, and no DML rows.
+  void ExpectEmptyTransactionEnvelope(const std::vector<CDCSDKProtoRecordPB>& records) {
+    int begin_count = 0;
+    int commit_count = 0;
+    int dml_count = 0;
+    std::string begin_txn_id;
+    std::string commit_txn_id;
+    for (const auto& record : records) {
+      if (!record.has_row_message()) {
+        continue;
+      }
+      switch (record.row_message().op()) {
+        case RowMessage_Op_BEGIN:
+          ++begin_count;
+          begin_txn_id = record.row_message().transaction_id();
+          break;
+        case RowMessage_Op_COMMIT:
+          ++commit_count;
+          commit_txn_id = record.row_message().transaction_id();
+          break;
+        case RowMessage_Op_INSERT:
+        case RowMessage_Op_UPDATE:
+        case RowMessage_Op_DELETE:
+          ++dml_count;
+          break;
+        default:
+          break;
+      }
+    }
+    ASSERT_EQ(begin_count, 1) << "records seen: " << AsString(records);
+    ASSERT_EQ(commit_count, 1) << "records seen: " << AsString(records);
+    ASSERT_EQ(dml_count, 0)
+        << "a committed txn with no streamable intents must emit no DML rows; records seen: "
+        << AsString(records);
+    ASSERT_FALSE(begin_txn_id.empty());
+    ASSERT_EQ(begin_txn_id, commit_txn_id);
+  }
 };
+
+// A committed transaction whose only docdb effect is a row lock
+// (SELECT ... FOR UPDATE) replicates an APPLYING op, but GetIntentsForCDC
+// returns ZERO streamable intents because row-lock intents (kRowLock value)
+// are skipped by the decoder.
+//
+// In the checkpoint-less StreamWAL design GetLatestCheckPoint() is permanently
+// OpId::Max(), so the shared ProcessIntents guard `op_id <= checkpoint_op_id`
+// is always true. Before the fix this misreported the empty batch as
+// INTENTS_GC_ERROR even though nothing was garbage-collected. The fix probes
+// the transaction's reverse index: because intents are still present (the apply
+// never deletes them and intents_min_seconds_to_retain is one hour), StreamWAL
+// now emits an empty BEGIN/COMMIT envelope -- matching GetChangesForCDCSDK's
+// shape for an empty committed transaction -- instead of erroring.
+//
+// ExpectIntentsPresentAndCheckpointUnpinned confirms we exercised exactly the
+// would-have-errored regime: intents on disk, checkpoint unpinned.
+TEST_F(StreamWalYsqlSecondaryIndexTest, RowLockOnlyTxnEmitsEmptyEnvelope) {
+  constexpr auto kYsqlTableName = "stream_wal_rowlock_t";
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 (id INT PRIMARY KEY, v INT) SPLIT INTO 1 TABLETS", kYsqlTableName));
+  const auto table_id = ASSERT_RESULT(GetTableIDFromTableName(kYsqlTableName));
+  const auto tablet_id = ASSERT_RESULT(OnlyTabletIdForTable(table_id));
+
+  // Seed one row via an autocommit (single-shard) write -- no APPLYING, no intents.
+  ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 VALUES (1, 10)", kYsqlTableName));
+
+  // Isolate from CREATE TABLE + seed-INSERT WAL traffic.
+  auto tip = ASSERT_RESULT(StreamWalForTablet(tablet_id, kSkipToTip));
+  ASSERT_FALSE(tip.has_error()) << tip.error().ShortDebugString();
+
+  // Pure row-lock transaction.
+  ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+  ASSERT_RESULT(conn.FetchFormat("SELECT * FROM $0 WHERE id = 1 FOR UPDATE", kYsqlTableName));
+  ASSERT_OK(conn.CommitTransaction());
+
+  auto records =
+      ASSERT_RESULT(DrainUntilCommit(tablet_id, tip.next_op_id(), 60s * kTimeMultiplier));
+  ASSERT_NO_FATALS(ExpectEmptyTransactionEnvelope(records));
+  ASSERT_NO_FATALS(ExpectIntentsPresentAndCheckpointUnpinned(tablet_id));
+}
+
+// A transaction whose every write was rolled back via a savepoint:
+// BEGIN; SAVEPOINT; INSERT; ROLLBACK TO SAVEPOINT; COMMIT; commits with every
+// intent belonging to an aborted subtransaction. GetIntentsBatchForCDC filters
+// aborted-subtxn intents, so the APPLYING yields zero streamable intents and
+// trips the same always-true guard. The fix emits an empty BEGIN/COMMIT
+// envelope rather than INTENTS_GC_ERROR.
+TEST_F(StreamWalYsqlSecondaryIndexTest, AllWritesRolledBackEmitsEmptyEnvelope) {
+  constexpr auto kYsqlTableName = "stream_wal_rolledback_t";
+  auto conn = ASSERT_RESULT(Connect());
+  // A UNIQUE secondary index forces the INSERT down the transactional path.
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 (id INT PRIMARY KEY, sku TEXT UNIQUE, v INT) SPLIT INTO 1 TABLETS",
+      kYsqlTableName));
+  const auto table_id = ASSERT_RESULT(GetTableIDFromTableName(kYsqlTableName));
+  const auto tablet_id = ASSERT_RESULT(OnlyTabletIdForTable(table_id));
+
+  auto tip = ASSERT_RESULT(StreamWalForTablet(tablet_id, kSkipToTip));
+  ASSERT_FALSE(tip.has_error()) << tip.error().ShortDebugString();
+
+  ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+  ASSERT_OK(conn.Execute("SAVEPOINT sp"));
+  ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 VALUES (1, 'sku-1', 10)", kYsqlTableName));
+  ASSERT_OK(conn.Execute("ROLLBACK TO sp"));
+  ASSERT_OK(conn.CommitTransaction());
+
+  auto records =
+      ASSERT_RESULT(DrainUntilCommit(tablet_id, tip.next_op_id(), 60s * kTimeMultiplier));
+  ASSERT_NO_FATALS(ExpectEmptyTransactionEnvelope(records));
+  ASSERT_NO_FATALS(ExpectIntentsPresentAndCheckpointUnpinned(tablet_id));
+}
 
 // YSQL can execute single-row auto-commit writes through two different DocDB
 // paths. A relation with no secondary indexes/triggers can use the fast path

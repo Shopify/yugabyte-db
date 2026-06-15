@@ -2656,6 +2656,13 @@ Status Tablet::GetIntentsForCDC(
   return Status::OK();
 }
 
+Result<size_t> Tablet::CountTxnReverseIndexEntriesForCDC(const TransactionId& id) {
+  auto scoped_read_operation = CreateScopedRWOperationNotBlockingRocksDbShutdownStart();
+  RETURN_NOT_OK(scoped_read_operation);
+
+  return docdb::CountTxnReverseIndexEntriesForCDC(id, intents_db_.get());
+}
+
 HybridTime Tablet::ApplierSafeTime(HybridTime min_allowed, CoarseTimePoint deadline) {
   // We could not use mvcc_ directly, because correct lease should be passed to it.
   return mvcc_.SafeTimeForFollower(min_allowed, deadline);

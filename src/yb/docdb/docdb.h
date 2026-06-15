@@ -237,6 +237,16 @@ Result<ApplyTransactionState> GetIntentsBatchForCDC(
     rocksdb::DB* intents_db,
     std::vector<IntentKeyValueForCDC>* keyValueIntents);
 
+// Counts the per-write reverse-index entries for `transaction_id` currently
+// present in IntentsDB (excludes transaction-metadata / post-apply-metadata
+// records). A return of 0 means the transaction's intents are physically gone
+// (garbage-collected); a return > 0 means intents are present even if none are
+// streamable to CDC (e.g. row locks, aborted-subtxn writes, weak intents).
+// Used by the StreamWAL APPLYING path to tell a real intent-GC apart from a
+// transaction that legitimately has no streamable intents.
+Result<size_t> CountTxnReverseIndexEntriesForCDC(
+    const TransactionId& transaction_id, rocksdb::DB* intents_db);
+
 void AppendTransactionKeyPrefix(const TransactionId& transaction_id, dockv::KeyBytes* out);
 
 } // namespace docdb

@@ -498,6 +498,48 @@ Result<ApplyTransactionState> GetIntentsBatchForCDC(
   return ApplyTransactionState{};
 }
 
+Result<size_t> CountTxnReverseIndexEntriesForCDC(
+    const TransactionId& transaction_id, rocksdb::DB* intents_db) {
+  if (intents_db == nullptr) {
+    return 0;
+  }
+
+  // Mirror the reverse-index prefix construction in GetIntentsBatchForCDC: the
+  // prefix is [kTransactionId][txn_id][kMaxByte]; key_prefix drops the trailing
+  // kMaxByte so it matches every key belonging to this transaction.
+  KeyBytes txn_reverse_index_prefix;
+  AppendTransactionKeyPrefix(transaction_id, &txn_reverse_index_prefix);
+  txn_reverse_index_prefix.AppendKeyEntryType(KeyEntryType::kMaxByte);
+  Slice key_prefix = txn_reverse_index_prefix.AsSlice();
+  key_prefix.remove_suffix(1);
+  const Slice reverse_index_upperbound = txn_reverse_index_prefix.AsSlice();
+
+  auto reverse_index_iter = CreateRocksDBIterator(
+      intents_db, &KeyBounds::kNoBounds, BloomFilterOptions::Inactive(),
+      !FLAGS_cdc_enable_caching_db_block ? rocksdb::kNoCacheQueryId : rocksdb::kDefaultQueryId,
+      /* file_filter = */ nullptr, &reverse_index_upperbound,
+      rocksdb::CacheRestartBlockKeys::kFalse);
+
+  size_t count = 0;
+  for (reverse_index_iter.Seek(key_prefix); reverse_index_iter.Valid();
+       reverse_index_iter.Next()) {
+    const Slice key_slice(reverse_index_iter.key());
+    if (!key_slice.starts_with(key_prefix)) {
+      break;
+    }
+    // Keys whose size is <= the prefix size are the transaction-metadata and
+    // post-apply-metadata records, not per-write reverse-index entries. Skip
+    // them so we count only the txn's actual intent writes (this is the same
+    // size discriminator GetIntentsBatchForCDC uses to skip metadata).
+    if (key_slice.size() > txn_reverse_index_prefix.size()) {
+      ++count;
+    }
+  }
+  RETURN_NOT_OK(reverse_index_iter.status());
+
+  return count;
+}
+
 std::string ApplyTransactionState::ToString() const {
   return Format(
       "{ key: $0 write_id: $1 aborted: $2 }", Slice(key).ToDebugString(), write_id, aborted);

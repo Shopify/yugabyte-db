@@ -3509,18 +3509,55 @@ Status DispatchApplyingForStreamWALImpl(
       ctx->schema_packing_storages, commit_timestamp, &throughput_metrics);
 
   if (!status.ok()) {
-    // The "intents have been GC'd" condition surfaces as an InternalError
-    // whose message starts with "CDCSDK Trying to fetch already GCed intents"
-    // (see ProcessIntents at cdcsdk_producer.cc:1779). Translate to an
-    // IllegalState status the handler can pattern-match into
-    // CDCErrorPB::INTENTS_GC_ERROR.
+    // The "intents have been GC'd" condition surfaces as an InternalError whose
+    // message starts with "CDCSDK Trying to fetch already GCed intents" (see
+    // ProcessIntents at cdcsdk_producer.cc:1779). That guard fires whenever
+    // GetIntentsForCDC returns zero intents AND apply_op_id <=
+    // tablet->GetLatestCheckPoint(). In the checkpoint-less StreamWAL design
+    // GetLatestCheckPoint() is permanently OpId::Max(), so the guard collapses
+    // to "zero intents" -- which is ALSO true for committed transactions that
+    // have no streamable intents at all: row-lock-only txns
+    // (SELECT ... FOR UPDATE), txns whose every write was in a rolled-back
+    // savepoint, weak-intent-only txns, etc. Those are NOT data loss.
+    //
+    // Distinguish the two by probing the transaction's reverse index in
+    // IntentsDB. The apply itself never deletes intents (Tablet::ApplyIntents
+    // only writes RegularDB), so:
+    //   - reverse index empty   -> intents physically gone -> real GC error.
+    //   - reverse index present -> legitimately-empty txn  -> emit an empty
+    //     BEGIN/COMMIT envelope, exactly as GetChangesForCDCSDK does for an
+    //     empty committed transaction, and advance the cursor past the APPLYING.
     if (status.IsInternalError() &&
         status.message().ToBuffer().find("already GCed intents") != std::string::npos) {
-      return STATUS_FORMAT(
-          IllegalState,
-          "INTENTS_GC_ERROR: intents for transaction $0 at apply_op_id $1 have been "
-          "garbage-collected; underlying status: $2",
-          txn_id, apply_op_id, status);
+      auto tablet = VERIFY_RESULT(ctx->tablet_peer->shared_tablet());
+      const auto reverse_index_entries =
+          VERIFY_RESULT(tablet->CountTxnReverseIndexEntriesForCDC(txn_id));
+      if (reverse_index_entries == 0) {
+        return STATUS_FORMAT(
+            IllegalState,
+            "INTENTS_GC_ERROR: intents for transaction $0 at apply_op_id $1 have been "
+            "garbage-collected; underlying status: $2",
+            txn_id, apply_op_id, status);
+      }
+
+      VLOG(1) << "StreamWAL: transaction " << txn_id << " at apply_op_id " << apply_op_id
+              << " has " << reverse_index_entries << " reverse-index entries but no streamable "
+              << "intents (row locks / aborted subtxns / weak intents); emitting an empty "
+              << "BEGIN/COMMIT envelope instead of INTENTS_GC_ERROR";
+
+      GetChangesResponsePB empty_scratchpad;
+      CDCSDKCheckpointPB empty_checkpoint;
+      CDCThroughputMetrics empty_metrics;
+      if (FLAGS_cdc_populate_end_markers_transactions) {
+        FillBeginRecord(txn_id, commit_timestamp.ToUint64(), &empty_scratchpad, &empty_metrics);
+        FillCommitRecord(
+            apply_op_id, txn_id, xrepl_origin_id, commit_timestamp.ToUint64(), &empty_checkpoint,
+            &empty_scratchpad, &empty_metrics);
+        TransferDecodedRecords(&empty_scratchpad, out_records);
+        StampAbortedSubtxnSetOnCommit(applying_msg, out_records);
+      }
+      out->kind = StreamWalDispatchResult::Kind::kRecordsEmitted;
+      return Status::OK();
     }
     return status;
   }
