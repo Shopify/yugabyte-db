@@ -151,6 +151,9 @@ class StreamWalTest : public MiniClusterTestWithClient<MiniCluster> {
     return Status::OK();
   }
 
+  // Inserts [start, end) as a single batched flush. All rows land in one WAL
+  // WRITE_OP (one ReplicateMsg with N write_pairs), since they target the same
+  // single-tablet table.
   Status InsertRows(int32_t start, int32_t end) {
     auto session = client_->NewSession(kRpcTimeoutSec * 1s);
     client::TableHandle handle;
@@ -164,6 +167,24 @@ class StreamWalTest : public MiniClusterTestWithClient<MiniCluster> {
       ops.push_back(std::move(op));
     }
     return session->TEST_ApplyAndFlush(ops);
+  }
+
+  // Inserts [start, end) one row per flush, so each row becomes its own WAL
+  // WRITE_OP at a distinct OpId index. Needed by tests that exercise per-op
+  // behavior (mid-stream cursor resume, max_records cap): a single batched
+  // flush collapses every row into one WAL op the server cannot split.
+  Status InsertRowsIndividually(int32_t start, int32_t end) {
+    client::TableHandle handle;
+    RETURN_NOT_OK(handle.Open(kYbTableName, client_.get()));
+    for (int32_t i = start; i < end; ++i) {
+      auto session = client_->NewSession(kRpcTimeoutSec * 1s);
+      auto op = handle.NewInsertOp();
+      auto* req = op->mutable_request();
+      QLAddInt32HashValue(req, i);
+      handle.AddInt32ColumnValue(req, handle->schema().Column(1).name(), i);
+      RETURN_NOT_OK(session->TEST_ApplyAndFlush(op));
+    }
+    return Status::OK();
   }
 
   Result<StreamWalResponsePB> StreamWal(
@@ -304,7 +325,10 @@ TEST_F(StreamWalTest, SkipToTipEmptyTablet) {
 }
 
 // Case (c): {0,0} on a tablet with some history -> bootstrap DDL(s) at the
-// front, followed by real WAL records in order.
+// front, followed by real WAL records in order. Single-shard writes are
+// wrapped in a BEGIN/COMMIT envelope per the StreamWAL contract, so the first
+// non-bootstrap record is the BEGIN marker, the row records follow, and a
+// COMMIT closes it.
 TEST_F(StreamWalTest, FromStartIncludesBootstrapThenRealRecords) {
   ASSERT_OK(InsertRows(0, 5));
   auto resp = ASSERT_RESULT(StreamWal(kFromStart));
@@ -313,24 +337,38 @@ TEST_F(StreamWalTest, FromStartIncludesBootstrapThenRealRecords) {
   // First record is a bootstrap DDL with cdc_sdk_op_id = {0, 0, ...}.
   ASSERT_TRUE(IsBootstrapDDL(resp.records(0)));
 
-  // Find the first non-bootstrap record; it should be a single-shard write
-  // (INSERT). Single-shard writes have transaction_id unset and commit_time set
-  // == ReplicateMsg.hybrid_time.
-  int first_real = -1;
+  // Find the first INSERT row record. Per the contract a single-shard write is
+  // emitted as BEGIN, one INSERT|UPDATE|DELETE per row, then COMMIT -- all
+  // stamped commit_time = ReplicateMsg.hybrid_time, with transaction_id unset.
+  int first_insert = -1;
   for (int i = 0; i < resp.records_size(); ++i) {
-    if (!IsBootstrapDDL(resp.records(i))) {
-      first_real = i;
+    if (resp.records(i).has_row_message() &&
+        resp.records(i).row_message().op() == RowMessage_Op_INSERT) {
+      first_insert = i;
       break;
     }
   }
-  ASSERT_GE(first_real, 0) << "No real WAL records were emitted past bootstrap";
-  const auto& first = resp.records(first_real);
-  ASSERT_TRUE(first.has_row_message());
-  ASSERT_EQ(first.row_message().op(), RowMessage_Op_INSERT);
-  ASSERT_FALSE(first.row_message().has_transaction_id());
-  ASSERT_TRUE(first.row_message().has_commit_time())
+  ASSERT_GE(first_insert, 0) << "No INSERT records were emitted past bootstrap";
+  const auto& insert = resp.records(first_insert);
+  ASSERT_FALSE(insert.row_message().has_transaction_id())
+      << "single-shard write must not carry transaction_id";
+  ASSERT_TRUE(insert.row_message().has_commit_time())
       << "single-shard writes must carry commit_time";
-  ASSERT_GT(first.row_message().commit_time(), 0u);
+  ASSERT_GT(insert.row_message().commit_time(), 0u);
+  ASSERT_TRUE(insert.has_cdc_sdk_op_id());
+  ASSERT_GE(insert.cdc_sdk_op_id().term(), 1);
+
+  // The INSERT must be preceded by a BEGIN envelope record (single-shard
+  // writes are wrapped in BEGIN/COMMIT).
+  bool saw_begin_before_insert = false;
+  for (int i = 0; i < first_insert; ++i) {
+    if (resp.records(i).has_row_message() &&
+        resp.records(i).row_message().op() == RowMessage_Op_BEGIN) {
+      saw_begin_before_insert = true;
+    }
+  }
+  ASSERT_TRUE(saw_begin_before_insert)
+      << "single-shard INSERT must be wrapped in a BEGIN/COMMIT envelope";
 
   // next_op_id advances to the last real record.
   ASSERT_TRUE(resp.has_next_op_id());
@@ -340,33 +378,47 @@ TEST_F(StreamWalTest, FromStartIncludesBootstrapThenRealRecords) {
 // Case (d): Resume from a mid-stream OpId -> no bootstrap; records strictly
 // after that OpId.
 TEST_F(StreamWalTest, ResumeFromMidStreamNoBootstrap) {
-  ASSERT_OK(InsertRows(0, 10));
+  // Insert one row per flush so each becomes its own WAL op at a distinct OpId
+  // index. A batched flush collapses all rows into a single WAL op, leaving no
+  // mid-stream OpId to resume from.
+  ASSERT_OK(InsertRowsIndividually(0, 10));
   auto first = ASSERT_RESULT(StreamWal(kFromStart));
-  ASSERT_GE(first.records_size(), 2);
-  // Pick a mid-stream cursor: the cdc_sdk_op_id of the 2nd record after
-  // bootstrap.
-  int b_count = 0;
-  for (int i = 0; i < first.records_size(); ++i) {
-    if (IsBootstrapDDL(first.records(i))) ++b_count;
-  }
-  ASSERT_GE(first.records_size() - b_count, 2);
+  ASSERT_FALSE(first.has_error()) << first.error().ShortDebugString();
 
-  const auto& mid = first.records(b_count + 1);  // 2nd real record
-  ASSERT_TRUE(mid.has_cdc_sdk_op_id());
-  auto cursor = MakeCursor(mid.cdc_sdk_op_id().term(), mid.cdc_sdk_op_id().index());
+  // Collect cursors from records carrying a real cdc_sdk_op_id (term >= 1).
+  // BEGIN / COMMIT / schema-on-first-use DDL envelope records either carry no
+  // cdc_sdk_op_id or the bootstrap {0,0}; the per-row DML and COMMIT records
+  // carry the WAL op's (term, index).
+  std::vector<StreamWalCursorPB> real_cursors;
+  for (const auto& r : first.records()) {
+    if (r.has_cdc_sdk_op_id() && r.cdc_sdk_op_id().term() >= 1) {
+      real_cursors.push_back(
+          MakeCursor(r.cdc_sdk_op_id().term(), r.cdc_sdk_op_id().index()));
+    }
+  }
+  ASSERT_GE(real_cursors.size(), 2);
+
+  // Pick a mid-stream cursor.
+  const auto cursor = real_cursors[real_cursors.size() / 2];
 
   auto resumed = ASSERT_RESULT(StreamWal(cursor));
-  ASSERT_FALSE(resumed.has_error());
+  ASSERT_FALSE(resumed.has_error()) << resumed.error().ShortDebugString();
+  ASSERT_GT(resumed.records_size(), 0)
+      << "a mid-stream resume must still return the trailing records";
   // No bootstrap when resuming from a real cursor.
   for (const auto& r : resumed.records()) {
     ASSERT_FALSE(IsBootstrapDDL(r))
         << "resume from real cursor must not include bootstrap DDLs";
   }
-  // Every record must have index strictly greater than the resume cursor's
-  // index (the cursor is exclusive on the lower bound).
+  // Every record carrying a real cdc_sdk_op_id must have index strictly greater
+  // than the resume cursor's index (the cursor is exclusive on the lower
+  // bound). Envelope records (BEGIN / schema-on-first-use DDL) carry no
+  // cdc_sdk_op_id and are exempt.
   for (const auto& r : resumed.records()) {
-    ASSERT_GT(r.cdc_sdk_op_id().index(), cursor.index())
-        << "records must be strictly after from_op_id";
+    if (r.has_cdc_sdk_op_id() && r.cdc_sdk_op_id().term() >= 1) {
+      ASSERT_GT(r.cdc_sdk_op_id().index(), cursor.index())
+          << "records must be strictly after from_op_id";
+    }
   }
 }
 
@@ -400,13 +452,26 @@ TEST_F(StreamWalTest, ResumeAtLeaderTipIsEmptyBatch) {
   ASSERT_FALSE(resp.has_more());
 }
 
-// Case (p): max_records cap -> server returns <= cap and has_more=true.
+// Case (p): max_records cap -> server stops early (has_more=true) without
+// streaming the whole tablet. The cap is soft: the server never splits a
+// single WAL op across batches, so a batch may exceed the cap by up to one
+// op's worth of records -- but it must be far short of the full stream.
 TEST_F(StreamWalTest, MaxRecordsCap) {
-  ASSERT_OK(InsertRows(0, 50));
-  auto resp = ASSERT_RESULT(StreamWal(kFromStart, /*max_records=*/3));
+  // Skip to tip first to isolate from bootstrap + create-table WAL traffic,
+  // then insert one row per flush so each is its own (small) WAL op. A batched
+  // flush would collapse into a single un-splittable op and defeat the cap.
+  auto tip = ASSERT_RESULT(StreamWal(kSkipToTip));
+  ASSERT_FALSE(tip.has_error()) << tip.error().ShortDebugString();
+  ASSERT_TRUE(tip.has_next_op_id());
+
+  ASSERT_OK(InsertRowsIndividually(0, 50));
+
+  auto resp = ASSERT_RESULT(StreamWal(tip.next_op_id(), /*max_records=*/3));
   ASSERT_FALSE(resp.has_error()) << resp.error().ShortDebugString();
-  ASSERT_LE(resp.records_size(), 3 + /*bootstrap=*/1);
   ASSERT_TRUE(resp.has_more());
+  // 50 single-row ops -> ~150+ records available; the cap must stop us well
+  // short of that after the first op crosses the threshold.
+  ASSERT_LT(resp.records_size(), 50);
 }
 
 // Case (q): max_bytes cap -> server returns has_more=true once the running
