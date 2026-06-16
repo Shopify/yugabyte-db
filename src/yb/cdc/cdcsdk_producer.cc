@@ -3444,6 +3444,31 @@ void StampAbortedSubtxnSetOnCommit(
   }
 }
 
+// Stamp the APPLYING op's OpId onto the leading BEGIN envelope record emitted
+// for a committed transaction. The shared decoder (FillBeginRecord) leaves the
+// BEGIN record's cdc_sdk_op_id unset -- GetChangesForCDCSDK clients do not rely
+// on it -- but the StreamWAL contract requires cdc_sdk_op_id on EVERY emitted
+// record: BEGIN/COMMIT envelope records emitted at an APPLYING op carry that
+// APPLYING's (term, index) with write_id = 0. The COMMIT is already stamped by
+// FillCommitRecord; this fills the matching gap on BEGIN without modifying the
+// shared GetChanges codepath. No-op when the leading record is not an unstamped
+// BEGIN (e.g. a spilled-APPLYING continuation batch, which does not re-emit
+// BEGIN).
+void StampOpIdOnLeadingBeginForStreamWAL(
+    const OpId& apply_op_id, std::vector<CDCSDKProtoRecordPB>* out_records) {
+  if (out_records->empty()) {
+    return;
+  }
+  auto& first = out_records->front();
+  if (!first.has_row_message() || first.row_message().op() != RowMessage_Op_BEGIN ||
+      first.has_cdc_sdk_op_id()) {
+    return;
+  }
+  SetCDCSDKOpId(
+      apply_op_id.term, apply_op_id.index, /*write_id=*/0, /*key=*/"",
+      first.mutable_cdc_sdk_op_id());
+}
+
 Status DispatchApplyingForStreamWALImpl(
     const consensus::ReplicateMsgPtr& applying_msg,
     StreamWalDecodeContext* ctx,
@@ -3554,6 +3579,7 @@ Status DispatchApplyingForStreamWALImpl(
             apply_op_id, txn_id, xrepl_origin_id, commit_timestamp.ToUint64(), &empty_checkpoint,
             &empty_scratchpad, &empty_metrics);
         TransferDecodedRecords(&empty_scratchpad, out_records);
+        StampOpIdOnLeadingBeginForStreamWAL(apply_op_id, out_records);
         StampAbortedSubtxnSetOnCommit(applying_msg, out_records);
       }
       out->kind = StreamWalDispatchResult::Kind::kRecordsEmitted;
@@ -3563,6 +3589,12 @@ Status DispatchApplyingForStreamWALImpl(
   }
 
   TransferDecodedRecords(&scratchpad, out_records);
+
+  // The shared decoder leaves the BEGIN envelope record's cdc_sdk_op_id unset;
+  // the StreamWAL contract requires it. Stamp the APPLYING op's OpId here
+  // (write_id = 0). On a spilled-APPLYING continuation batch there is no BEGIN,
+  // so this is a no-op.
+  StampOpIdOnLeadingBeginForStreamWAL(apply_op_id, out_records);
 
   // ProcessIntents indicates a spill via a non-empty checkpoint key + non-zero
   // write_id. (Mirrors GetChangesForCDCSDK at cdcsdk_producer.cc:2728 / 2920.)
