@@ -3663,7 +3663,9 @@ Status DispatchApplyingForStreamWALImpl(
       CDCSDKCheckpointPB empty_checkpoint;
       CDCThroughputMetrics empty_metrics;
       if (FLAGS_cdc_populate_end_markers_transactions) {
-        FillBeginRecord(txn_id, commit_timestamp.ToUint64(), &empty_scratchpad, &empty_metrics);
+        FillBeginRecord(
+            txn_id, commit_timestamp.ToUint64(), xrepl_origin_id, &empty_scratchpad,
+            &empty_metrics);
         FillCommitRecord(
             apply_op_id, txn_id, xrepl_origin_id, commit_timestamp.ToUint64(), &empty_checkpoint,
             &empty_scratchpad, &empty_metrics);

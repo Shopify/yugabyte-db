@@ -160,7 +160,7 @@ class StreamWalTest : public MiniClusterTestWithClient<MiniCluster> {
     RETURN_NOT_OK(handle.Open(kYbTableName, client_.get()));
     std::vector<client::YBOperationPtr> ops;
     for (int32_t i = start; i < end; ++i) {
-      auto op = handle.NewInsertOp();
+      auto op = handle.NewInsertOp(session->arena());
       auto* req = op->mutable_request();
       QLAddInt32HashValue(req, i);
       handle.AddInt32ColumnValue(req, handle->schema().Column(1).name(), i);
@@ -178,7 +178,7 @@ class StreamWalTest : public MiniClusterTestWithClient<MiniCluster> {
     RETURN_NOT_OK(handle.Open(kYbTableName, client_.get()));
     for (int32_t i = start; i < end; ++i) {
       auto session = client_->NewSession(kRpcTimeoutSec * 1s);
-      auto op = handle.NewInsertOp();
+      auto op = handle.NewInsertOp(session->arena());
       auto* req = op->mutable_request();
       QLAddInt32HashValue(req, i);
       handle.AddInt32ColumnValue(req, handle->schema().Column(1).name(), i);

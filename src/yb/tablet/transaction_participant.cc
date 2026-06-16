@@ -919,7 +919,7 @@ class TransactionParticipant::Impl
     {
       std::lock_guard lock(mutex_);
       const bool cdc_wall_clock_retention =
-          GetAtomicFlag(&FLAGS_intents_min_seconds_to_retain) > 0;
+          FLAGS_intents_min_seconds_to_retain > 0;
       const OpId& cdcsdk_checkpoint_op_id = GetLatestCheckPointUnlocked();
 
       if (cdc_wall_clock_retention) {
@@ -2051,7 +2051,7 @@ class TransactionParticipant::Impl
   // general. A return of false (the default when the flag is 0) preserves the historical
   // "clean up intents immediately post-apply" behavior.
   bool IsWithinIntentsRetentionWindow(HybridTime ht) const {
-    const auto retention_secs = GetAtomicFlag(&FLAGS_intents_min_seconds_to_retain);
+    const auto retention_secs = FLAGS_intents_min_seconds_to_retain;
     if (retention_secs == 0 || !ht.is_valid()) {
       return false;
     }
@@ -2098,7 +2098,7 @@ class TransactionParticipant::Impl
     //
     // The post-apply metadata is the retention mechanism here, so we write it unconditionally (it
     // does not depend on --cdc_write_post_apply_metadata, which gates the lease-based CDC path).
-    if (GetAtomicFlag(&FLAGS_intents_min_seconds_to_retain) > 0 &&
+    if (FLAGS_intents_min_seconds_to_retain > 0 &&
         (**it).GetCommitHybridTime().is_valid()) {
       post_apply_metadata_entry = PostApplyTransactionMetadata{
           .transaction_id = txn_id,
@@ -2255,7 +2255,7 @@ class TransactionParticipant::Impl
     // safe because the wall-clock-gated compaction GC path (Cleanup) still reclaims the intents
     // once the window elapses.
     const bool cdc_wall_clock_retention =
-        GetAtomicFlag(&FLAGS_intents_min_seconds_to_retain) > 0;
+        FLAGS_intents_min_seconds_to_retain > 0;
     if (!cdc_wall_clock_retention &&
         (!FLAGS_cdc_immediate_transaction_cleanup ||
          latest_checkpoint == OpId::Max())) {
@@ -2314,7 +2314,7 @@ class TransactionParticipant::Impl
     // "CDC active" signal. Their intents are reclaimed later by the wall-clock-gated compaction GC
     // path using the commit_ht persisted in PostApplyTransactionMetadata before the restart.
     if (GetLatestCheckPointUnlocked() != OpId::Max() ||
-        GetAtomicFlag(&FLAGS_intents_min_seconds_to_retain) > 0) {
+        FLAGS_intents_min_seconds_to_retain > 0) {
       txn->SetTxnLoadedWithCDC();
     }
     if (last_batch_data.hybrid_time) {

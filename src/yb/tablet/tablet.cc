@@ -1508,7 +1508,7 @@ void Tablet::DoCleanupIntentFiles() {
     // still inside the --intents_min_seconds_to_retain wall-clock window so a checkpoint-less CDC
     // consumer can read the committed intents at APPLYING time. best_file is the oldest live
     // intents file, so once it is within the window every newer file is too: break.
-    const auto cdc_intents_retain_secs = GetAtomicFlag(&FLAGS_intents_min_seconds_to_retain);
+    const auto cdc_intents_retain_secs = FLAGS_intents_min_seconds_to_retain;
     if (cdc_intents_retain_secs > 0 && best_file_max_ht.is_valid() &&
         best_file_max_ht != HybridTime::kMax) {
       const auto now_micros = clock_->Now().GetPhysicalValueMicros();
