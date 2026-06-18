@@ -114,7 +114,7 @@ Status GetChangesForXCluster(const XClusterGetChangesContext& context);
 
 // Synthesize one DDL CDCSDKProtoRecordPB per active (table_id, schema_version)
 // from the tablet's current metadata. Used by StreamWAL to bootstrap the
-// client's schema cache when from_op_id is {0, 0} or the skip-to-tip sentinel.
+// client's schema cache when from_op_id is {0, 0} or the skip-to-latest sentinel.
 //
 // Each emitted record gets cdc_sdk_op_id = {term: 0, index: 0, write_id: i}
 // where i is the record's position in `out`, which disambiguates across

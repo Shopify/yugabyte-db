@@ -622,7 +622,7 @@ message CDCSDKProtoRecordPB {
 //   {term: 0,  index: 0}  -> "from start of retained WAL"; server emits
 //                           synthetic bootstrap DDLs before any real records.
 //                           intent_key / intent_write_id MUST be unset.
-//   {term: -1, index: -1} -> SKIP-TO-TIP sentinel. Server emits synthetic
+//   {term: -1, index: -1} -> SKIP-TO-LATEST sentinel. Server emits synthetic
 //                           bootstrap DDLs only; sets next_op_id to the
 //                           current leader tip. No historical records.
 //                           intent_key / intent_write_id MUST be unset.
@@ -712,7 +712,7 @@ message StreamWalResponsePB {
   // as from_op_id on the next call.
   //   - If `records` is non-empty and contains any non-synthetic record,
   //     next_op_id == the (term, index) of the last non-synthetic record.
-  //   - If `records` contains only synthetic bootstrap DDLs (skip-to-tip
+  //   - If `records` contains only synthetic bootstrap DDLs (skip-to-latest
   //     sentinel path), next_op_id == leader_tip_op_id at the time of the
   //     bootstrap.
   //   - If `records` is empty, next_op_id == the request's from_op_id

@@ -82,7 +82,7 @@ linear stream of committed events.
 //   {term: 0,  index: 0}  -> "from start of retained WAL"; server emits
 //                            synthetic bootstrap DDLs before any real records.
 //                            intent_key / intent_write_id MUST be unset.
-//   {term: -1, index: -1} -> SKIP-TO-TIP sentinel. Server emits synthetic
+//   {term: -1, index: -1} -> SKIP-TO-LATEST sentinel. Server emits synthetic
 //                            bootstrap DDLs only; sets next_op_id to the
 //                            current leader tip. No historical records.
 //                            intent_key / intent_write_id MUST be unset.
@@ -220,7 +220,7 @@ message StreamWalResponsePB {
   //                       intent_key = <last intent emitted's reverse-index key>,
   //                       intent_write_id = <last intent emitted's write_id>).
   //   - If `records` contains only synthetic bootstrap DDLs (either the
-  //     skip-to-tip sentinel path OR a from-start request whose tablet had
+  //     skip-to-latest sentinel path OR a from-start request whose tablet had
   //     no consumable WAL traffic yet),
   //         next_op_id = leader_tip_op_id at the time of the bootstrap;
   //         intent_key / intent_write_id unset.
@@ -348,7 +348,7 @@ records as follows:
 | `from_op_id` value | Server emits bootstrap? | Server emits real WAL records? |
 |---|---|---|
 | `{0, 0}` | Yes | Yes (starting at earliest retained OpId) |
-| `{-1, -1}` (skip-to-tip) | Yes | **No** |
+| `{-1, -1}` (skip-to-latest) | Yes | **No** |
 | `{T, I, ...}` (T ≥ 1, I ≥ 0) | No | Yes |
 
 ### What bootstrap records look like
@@ -373,7 +373,7 @@ decoder at runtime.
 Bootstrap records appear at the **front** of `records[]`, before any real WAL
 records in the same batch.
 
-### Skip-to-tip response shape
+### Skip-to-latest response shape
 
 For `from_op_id = {-1, -1}`:
 
@@ -390,7 +390,7 @@ For `from_op_id = {0, 0}` against a tablet whose retained WAL contains only
 silent ops (or is otherwise empty after bootstrap synthesis):
 
 - `records[]` contains only synthetic bootstrap DDLs.
-- `next_op_id = leader_tip_op_id` at call time (parallel to the skip-to-tip
+- `next_op_id = leader_tip_op_id` at call time (parallel to the skip-to-latest
   path — the client must not re-issue `{0,0}` against the same tablet, or
   bootstrap will be re-synthesized).
 

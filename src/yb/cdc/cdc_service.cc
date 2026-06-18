@@ -2168,7 +2168,7 @@ void CDCServiceImpl::GetChanges(
 
 namespace {
 
-constexpr int64_t kStreamWalSkipToTipSentinel = -1;
+constexpr int64_t kStreamWalSkipToLatestSentinel = -1;
 
 // Construct a CDCSDKOpIdPB sentinel value from (term, index).
 void SetStreamWalCursor(int64_t term, int64_t index, StreamWalCursorPB* cursor) {
@@ -2188,11 +2188,11 @@ void SetStreamWalMidApplyingCursor(
   cursor->set_intent_write_id(intent_write_id);
 }
 
-// Returns true iff the cursor is {-1, -1}, the skip-to-tip sentinel.
-bool IsStreamWalSkipToTip(const StreamWalCursorPB& cursor) {
+// Returns true iff the cursor is {-1, -1}, the skip-to-latest sentinel.
+bool IsStreamWalSkipToLatest(const StreamWalCursorPB& cursor) {
   return cursor.has_term() && cursor.has_index() &&
-         cursor.term() == kStreamWalSkipToTipSentinel &&
-         cursor.index() == kStreamWalSkipToTipSentinel;
+         cursor.term() == kStreamWalSkipToLatestSentinel &&
+         cursor.index() == kStreamWalSkipToLatestSentinel;
 }
 
 // Returns true iff the cursor is {0, 0}, the from-start-of-retained-WAL
@@ -2211,7 +2211,7 @@ bool IsStreamWalMidApplying(const StreamWalCursorPB& cursor) {
 
 // Validate the from_op_id field shape. Returns OK iff one of:
 //   {0, 0}                                       -> from-start
-//   {-1, -1}                                     -> skip-to-tip
+//   {-1, -1}                                     -> skip-to-latest
 //   {T >= 1, I >= 0}                             -> real cursor (no resume)
 //   {T >= 1, I >= 0, intent_key, intent_write_id} -> mid-APPLYING resume
 // Anything else is INVALID_REQUEST in the contract's error taxonomy.
@@ -2233,7 +2233,7 @@ Status ValidateStreamWalFromOpId(const StreamWalCursorPB& cursor) {
   }
   const bool mid_applying = has_key && has_write_id;
 
-  if (IsStreamWalFromStart(cursor) || IsStreamWalSkipToTip(cursor)) {
+  if (IsStreamWalFromStart(cursor) || IsStreamWalSkipToLatest(cursor)) {
     if (mid_applying) {
       return STATUS_FORMAT(
           InvalidArgument,
@@ -2373,17 +2373,17 @@ void CDCServiceImpl::StreamWAL(
   // (This is internal-only; the response cursor is computed separately below.)
   OpId read_from_op_id;
   bool emit_bootstrap = false;
-  bool skip_to_tip = false;
+  bool skip_to_latest = false;
 
   // Mid-APPLYING resumption state. Populated when the request's cursor carries
   // intent_key / intent_write_id; consumed by the dispatch loop below.
   bool resuming_applying = false;
   StreamWalIntentResumeState applying_resume_state;
 
-  if (IsStreamWalSkipToTip(from_cursor)) {
+  if (IsStreamWalSkipToLatest(from_cursor)) {
     emit_bootstrap = true;
-    skip_to_tip = true;
-    read_from_op_id = OpId();  // unused on the skip-to-tip path
+    skip_to_latest = true;
+    read_from_op_id = OpId();  // unused on the skip-to-latest path
   } else if (IsStreamWalFromStart(from_cursor)) {
     emit_bootstrap = true;
     read_from_op_id = OpId();  // WAL reader treats {0,0} as "earliest retained"
@@ -2445,8 +2445,8 @@ void CDCServiceImpl::StreamWAL(
     }
   }
 
-  // Skip-to-tip short-circuits: no WAL read.
-  if (skip_to_tip) {
+  // Skip-to-latest short-circuits: no WAL read.
+  if (skip_to_latest) {
     leader_tip_op_id.ToPB(resp->mutable_next_op_id());
     leader_tip_op_id.ToPB(resp->mutable_leader_tip_op_id());
     if (leader_safe_time.is_valid()) {
@@ -2715,7 +2715,7 @@ void CDCServiceImpl::StreamWAL(
     // FROM_BEGINNING with bootstrap DDLs but no WAL messages to consume yet --
     // e.g. a brand-new tablet whose only history is its DDL bootstrap. We must
     // advance the cursor past the bootstrap so the client doesn't re-read it
-    // forever; advancing to leader_tip_op_id mirrors the skip-to-tip semantics
+    // forever; advancing to leader_tip_op_id mirrors the skip-to-latest semantics
     // documented on StreamWalResponsePB.next_op_id. The next call comes in with
     // a "real cursor" (term >= 1, index >= 0), which skips bootstrap emission
     // and reads from that position onward. For a truly empty tablet,

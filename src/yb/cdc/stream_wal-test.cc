@@ -78,7 +78,7 @@ const StreamWalCursorPB kFromStart = [] {
   return c;
 }();
 
-const StreamWalCursorPB kSkipToTip = [] {
+const StreamWalCursorPB kSkipToLatest = [] {
   StreamWalCursorPB c;
   c.set_term(-1);
   c.set_index(-1);
@@ -248,7 +248,7 @@ TEST_F(StreamWalTest, MissingFromOpId) {
 }
 
 // Request validation: from_op_id with invalid shape -- term < 0 but not the
-// skip-to-tip sentinel.
+// skip-to-latest sentinel.
 TEST_F(StreamWalTest, InvalidFromOpIdShape) {
   auto resp = ASSERT_RESULT(StreamWal(MakeCursor(-5, 10)));
   ASSERT_TRUE(resp.has_error());
@@ -293,18 +293,18 @@ TEST_F(StreamWalTest, MidApplyingCursorOnFromStartIsInvalid) {
   ASSERT_EQ(resp.error().code(), CDCErrorPB::INVALID_REQUEST);
 }
 
-// Request validation: mid-APPLYING fields on the skip-to-tip sentinel are
+// Request validation: mid-APPLYING fields on the skip-to-latest sentinel are
 // nonsense.
-TEST_F(StreamWalTest, MidApplyingCursorOnSkipToTipIsInvalid) {
+TEST_F(StreamWalTest, MidApplyingCursorOnSkipToLatestIsInvalid) {
   auto resp = ASSERT_RESULT(StreamWal(MakeMidApplyingCursor(-1, -1, "key", 1)));
   ASSERT_TRUE(resp.has_error());
   ASSERT_EQ(resp.error().code(), CDCErrorPB::INVALID_REQUEST);
 }
 
-// Case (a): skip-to-tip on an empty tablet -> bootstrap DDLs only, next_op_id
+// Case (a): skip-to-latest on an empty tablet -> bootstrap DDLs only, next_op_id
 // == leader_tip, no real records.
-TEST_F(StreamWalTest, SkipToTipEmptyTablet) {
-  auto resp = ASSERT_RESULT(StreamWal(kSkipToTip));
+TEST_F(StreamWalTest, SkipToLatestEmptyTablet) {
+  auto resp = ASSERT_RESULT(StreamWal(kSkipToLatest));
   ASSERT_FALSE(resp.has_error()) << resp.error().ShortDebugString();
   // One DDL per user table (we created one). Bootstrap records have
   // cdc_sdk_op_id.term = 0, cdc_sdk_op_id.index = 0.
@@ -314,7 +314,7 @@ TEST_F(StreamWalTest, SkipToTipEmptyTablet) {
   ASSERT_EQ(resp.records(0).row_message().table_id(), table_->id());
   ASSERT_GT(resp.records(0).row_message().schema().column_info_size(), 0);
 
-  // next_op_id == leader_tip_op_id on the skip-to-tip path.
+  // next_op_id == leader_tip_op_id on the skip-to-latest path.
   ASSERT_TRUE(resp.has_next_op_id());
   ASSERT_TRUE(resp.has_leader_tip_op_id());
   ASSERT_EQ(resp.next_op_id().term(), resp.leader_tip_op_id().term());
@@ -425,7 +425,7 @@ TEST_F(StreamWalTest, ResumeFromMidStreamNoBootstrap) {
 // Case (f): Resume from an OpId past leader tip -> INVALID_REQUEST.
 TEST_F(StreamWalTest, ResumePastLeaderTip) {
   ASSERT_OK(InsertRows(0, 3));
-  auto tip = ASSERT_RESULT(StreamWal(kSkipToTip));
+  auto tip = ASSERT_RESULT(StreamWal(kSkipToLatest));
   ASSERT_TRUE(tip.has_leader_tip_op_id());
   auto bogus = MakeCursor(tip.leader_tip_op_id().term(),
                           tip.leader_tip_op_id().index() + 1000000);
@@ -439,7 +439,7 @@ TEST_F(StreamWalTest, ResumePastLeaderTip) {
 // next_op_id == from_op_id, has_more = false.
 TEST_F(StreamWalTest, ResumeAtLeaderTipIsEmptyBatch) {
   ASSERT_OK(InsertRows(0, 3));
-  auto tip = ASSERT_RESULT(StreamWal(kSkipToTip));
+  auto tip = ASSERT_RESULT(StreamWal(kSkipToLatest));
   ASSERT_TRUE(tip.has_leader_tip_op_id());
   auto cursor = MakeCursor(tip.leader_tip_op_id().term(), tip.leader_tip_op_id().index());
 
@@ -457,10 +457,10 @@ TEST_F(StreamWalTest, ResumeAtLeaderTipIsEmptyBatch) {
 // single WAL op across batches, so a batch may exceed the cap by up to one
 // op's worth of records -- but it must be far short of the full stream.
 TEST_F(StreamWalTest, MaxRecordsCap) {
-  // Skip to tip first to isolate from bootstrap + create-table WAL traffic,
+  // Skip to latest first to isolate from bootstrap + create-table WAL traffic,
   // then insert one row per flush so each is its own (small) WAL op. A batched
   // flush would collapse into a single un-splittable op and defeat the cap.
-  auto tip = ASSERT_RESULT(StreamWal(kSkipToTip));
+  auto tip = ASSERT_RESULT(StreamWal(kSkipToLatest));
   ASSERT_FALSE(tip.has_error()) << tip.error().ShortDebugString();
   ASSERT_TRUE(tip.has_next_op_id());
 
@@ -506,11 +506,11 @@ TEST_F(StreamWalTest, SingleShardWriteShape) {
   ASSERT_TRUE(saw_insert);
 }
 
-// Skip-to-tip is idempotent within the contract: repeated calls re-emit
+// Skip-to-latest is idempotent within the contract: repeated calls re-emit
 // bootstrap and pin next_op_id to the current leader tip.
-TEST_F(StreamWalTest, SkipToTipIsIdempotent) {
-  auto r1 = ASSERT_RESULT(StreamWal(kSkipToTip));
-  auto r2 = ASSERT_RESULT(StreamWal(kSkipToTip));
+TEST_F(StreamWalTest, SkipToLatestIsIdempotent) {
+  auto r1 = ASSERT_RESULT(StreamWal(kSkipToLatest));
+  auto r2 = ASSERT_RESULT(StreamWal(kSkipToLatest));
   ASSERT_EQ(r1.records_size(), r2.records_size());
   // Both responses bootstrap from the same metadata.
   ASSERT_EQ(r1.records(0).row_message().table_id(),
@@ -694,7 +694,7 @@ TEST_F(StreamWalYsqlSecondaryIndexTest, RowLockOnlyTxnEmitsEmptyEnvelope) {
   ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 VALUES (1, 10)", kYsqlTableName));
 
   // Isolate from CREATE TABLE + seed-INSERT WAL traffic.
-  auto tip = ASSERT_RESULT(StreamWalForTablet(tablet_id, kSkipToTip));
+  auto tip = ASSERT_RESULT(StreamWalForTablet(tablet_id, kSkipToLatest));
   ASSERT_FALSE(tip.has_error()) << tip.error().ShortDebugString();
 
   // Pure row-lock transaction.
@@ -724,7 +724,7 @@ TEST_F(StreamWalYsqlSecondaryIndexTest, AllWritesRolledBackEmitsEmptyEnvelope) {
   const auto table_id = ASSERT_RESULT(GetTableIDFromTableName(kYsqlTableName));
   const auto tablet_id = ASSERT_RESULT(OnlyTabletIdForTable(table_id));
 
-  auto tip = ASSERT_RESULT(StreamWalForTablet(tablet_id, kSkipToTip));
+  auto tip = ASSERT_RESULT(StreamWalForTablet(tablet_id, kSkipToLatest));
   ASSERT_FALSE(tip.has_error()) << tip.error().ShortDebugString();
 
   ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
@@ -767,7 +767,7 @@ TEST_F(StreamWalYsqlSecondaryIndexTest, SecondaryIndexWriteEmitsAtApplying) {
   const auto tablet_id = ASSERT_RESULT(OnlyTabletIdForTable(table_id));
 
   // Isolate the INSERT from table/index creation WAL traffic.
-  auto tip = ASSERT_RESULT(StreamWalForTablet(tablet_id, kSkipToTip));
+  auto tip = ASSERT_RESULT(StreamWalForTablet(tablet_id, kSkipToLatest));
   ASSERT_FALSE(tip.has_error()) << tip.error().ShortDebugString();
   ASSERT_TRUE(tip.has_next_op_id());
   StreamWalCursorPB cursor = tip.next_op_id();
@@ -924,7 +924,7 @@ TEST_F(StreamWalYsqlSecondaryIndexTest, MultiRowTxnSpillsAndResumes) {
   const auto tablet_id = ASSERT_RESULT(OnlyTabletIdForTable(table_id));
 
   // Isolate from CREATE TABLE WAL traffic.
-  auto tip = ASSERT_RESULT(StreamWalForTablet(tablet_id, kSkipToTip));
+  auto tip = ASSERT_RESULT(StreamWalForTablet(tablet_id, kSkipToLatest));
   ASSERT_FALSE(tip.has_error()) << tip.error().ShortDebugString();
   StreamWalCursorPB cursor = tip.next_op_id();
 
@@ -1068,7 +1068,7 @@ TEST_F(StreamWalYsqlSecondaryIndexTest, CommittedIntentsSurviveCompactionWithinR
   const auto table_id = ASSERT_RESULT(GetTableIDFromTableName(kYsqlTableName));
   const auto tablet_id = ASSERT_RESULT(OnlyTabletIdForTable(table_id));
 
-  auto tip = ASSERT_RESULT(StreamWalForTablet(tablet_id, kSkipToTip));
+  auto tip = ASSERT_RESULT(StreamWalForTablet(tablet_id, kSkipToLatest));
   ASSERT_FALSE(tip.has_error()) << tip.error().ShortDebugString();
 
   // Explicit multi-row transaction (mirrors MultiRowTxnSpillsAndResumes, which is
