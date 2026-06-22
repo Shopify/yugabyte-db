@@ -148,6 +148,40 @@ METRIC_DEFINE_gauge_uint64(cdcsdk, cdcsdk_flush_lag, "CDCSDK flush Lag",
     "Lag between last committed record in the WAL and the replication slot's restart time.",
     {0 /* zero means we don't expose it as counter */, yb::AggregationFunction::kMax});
 
+// StreamWAL per-tablet metrics. Defined against the `tablet` entity so they
+// attach to each tablet's existing metric entity (Option A) and aggregate at
+// the table level, exactly like the other per-tablet metrics.
+METRIC_DEFINE_counter(tablet, streamwal_records_sent,
+    "StreamWAL Records Sent", yb::MetricUnit::kUnits,
+    "Total number of decoded change records sent over StreamWAL for this tablet.");
+
+METRIC_DEFINE_counter(tablet, streamwal_traffic_sent,
+    "StreamWAL Traffic Sent", yb::MetricUnit::kBytes,
+    "Total decoded record payload bytes sent over StreamWAL for this tablet.");
+
+METRIC_DEFINE_gauge_int64(tablet, streamwal_sent_lag_micros,
+    "StreamWAL Sent Lag", yb::MetricUnit::kMicroseconds,
+    "Lag between the leader's safe time and the commit time of the last record sent over "
+    "StreamWAL.",
+    {0 /* zero means we don't expose it as counter */, yb::AggregationFunction::kMax});
+
+METRIC_DEFINE_gauge_int64(tablet, streamwal_wal_lag_index,
+    "StreamWAL WAL Lag (Index)", yb::MetricUnit::kOperations,
+    "Number of WAL ops between the leader tip and the StreamWAL read cursor "
+    "(leader_tip.index - next_op_id.index).",
+    {0 /* zero means we don't expose it as counter */, yb::AggregationFunction::kMax});
+
+METRIC_DEFINE_gauge_uint64(tablet, streamwal_intent_retention_window_secs,
+    "StreamWAL Intent Retention Window", yb::MetricUnit::kSeconds,
+    "Current value of --intents_min_seconds_to_retain; intent-retention headroom is "
+    "(window - sent lag).",
+    {0 /* zero means we don't expose it as counter */, yb::AggregationFunction::kMax});
+
+METRIC_DEFINE_counter(tablet, streamwal_intents_gc_errors,
+    "StreamWAL Intents GC Errors", yb::MetricUnit::kUnits,
+    "Count of INTENTS_GC_ERROR responses (intents GC'd before StreamWAL could read them). "
+    "Should always be zero; non-zero indicates data loss.");
+
 // CDC Server Metrics
 METRIC_DEFINE_counter(server, cdc_rpc_proxy_count, "CDC Rpc Proxy Count", yb::MetricUnit::kRequests,
   "Number of CDC GetChanges requests that required proxy forwarding");
@@ -211,6 +245,24 @@ void CDCSDKTabletMetrics::ClearMetrics() {
 
 Result<std::string> CDCSDKTabletMetrics::TEST_GetAttribute(const std::string& key) const {
   return entity_->TEST_GetAttributeFromMap(key);
+}
+
+StreamWALTabletMetrics::StreamWALTabletMetrics(const scoped_refptr<MetricEntity>& entity)
+    : MINIT(streamwal_records_sent),
+      MINIT(streamwal_traffic_sent),
+      GINIT(streamwal_sent_lag_micros),
+      GINIT(streamwal_wal_lag_index),
+      GINIT(streamwal_intent_retention_window_secs),
+      MINIT(streamwal_intents_gc_errors),
+      entity_(entity) {}
+
+void StreamWALTabletMetrics::ClearMetrics() {
+  streamwal_records_sent.reset();
+  streamwal_traffic_sent.reset();
+  streamwal_sent_lag_micros->set_value(0);
+  streamwal_wal_lag_index->set_value(0);
+  streamwal_intent_retention_window_secs->set_value(0);
+  streamwal_intents_gc_errors.reset();
 }
 
 CDCServerMetrics::CDCServerMetrics(const scoped_refptr<MetricEntity>& entity)

@@ -106,6 +106,10 @@ constexpr uint32_t kUpdateIntervalMs = 15 * 1000;
 
 DECLARE_int32(cdc_read_rpc_timeout_ms);
 
+// Wall-clock intent retention window for checkpoint-less (StreamWAL) CDC. Read
+// here only to surface it as the streamwal_intent_retention_window_secs metric.
+DECLARE_uint32(intents_min_seconds_to_retain);
+
 DEFINE_NON_RUNTIME_int32(cdc_write_rpc_timeout_ms, 30 * 1000,
     "Timeout used for CDC write rpc calls.  Writes normally occur intra-cluster.");
 TAG_FLAG(cdc_write_rpc_timeout_ms, advanced);
@@ -392,6 +396,19 @@ std::optional<MicrosTime> GetCDCSDKLastSendRecordTime(const GetChangesResponsePB
   return std::nullopt;
 }
 
+// StreamWAL variant of GetCDCSDKLastSendRecordTime: returns the physical commit
+// time of the right-most record in a StreamWalResponsePB that carries a valid
+// DML op, used to compute streamwal_sent_lag_micros.
+std::optional<MicrosTime> GetStreamWalLastSendRecordTime(const StreamWalResponsePB& resp) {
+  for (int cur_idx = resp.records_size() - 1; cur_idx >= 0; --cur_idx) {
+    const auto& each_record = resp.records(cur_idx);
+    if (RecordHasValidOp(each_record)) {
+      return HybridTime(each_record.row_message().commit_time()).GetPhysicalValueMicros();
+    }
+  }
+  return std::nullopt;
+}
+
 const std::string GetXreplMetricsKey(const xrepl::StreamId& stream_id) {
   return Format("XreplMetrics::$0", stream_id);
 }
@@ -440,6 +457,27 @@ Result<std::shared_ptr<T>> GetOrCreateXreplTabletMetrics(
   SCHECK(
       metrics_raw, NotFound, Format("Xrepl Tablet Metric not found for Tablet id $0", tablet_id));
   return std::static_pointer_cast<T>(metrics_raw);
+}
+
+// StreamWAL per-tablet metrics. Unlike GetOrCreateXreplTabletMetrics
+// there is no stream_id keying -- one tablet has exactly one StreamWAL stream --
+// so the container is stored under a single fixed additional-metadata key and the
+// metrics aggregate at the table level like every other tablet metric.
+Result<std::shared_ptr<xrepl::StreamWALTabletMetrics>> GetStreamWALTabletMetrics(
+    const tablet::TabletPeer& tablet_peer) {
+  static const std::string kStreamWALMetricsKey = "StreamWALMetrics";
+  auto tablet = VERIFY_RESULT(tablet_peer.shared_tablet());
+
+  auto metrics_raw = tablet->GetAdditionalMetadata(kStreamWALMetricsKey);
+  if (!metrics_raw) {
+    const auto& entity = tablet->GetTabletMetricsEntity();
+    SCHECK(
+        entity, IllegalState,
+        Format("Tablet metric entity not available for tablet $0", tablet_peer.tablet_id()));
+    metrics_raw = tablet->AddAdditionalMetadata(
+        kStreamWALMetricsKey, std::make_shared<xrepl::StreamWALTabletMetrics>(entity));
+  }
+  return std::static_pointer_cast<xrepl::StreamWALTabletMetrics>(metrics_raw);
 }
 
 }  // namespace
@@ -2554,6 +2592,22 @@ void CDCServiceImpl::StreamWAL(
   decode_ctx.enum_map = &enum_map;
   decode_ctx.composite_atts_map = &composite_atts_map;
 
+  // Per-tablet StreamWAL observability metrics (Option A: attached to the
+  // tablet's own metric entity, aggregated at the table level). Best-effort:
+  // if the metric entity is unavailable we simply skip instrumentation rather
+  // than failing the RPC.
+  std::shared_ptr<xrepl::StreamWALTabletMetrics> streamwal_metrics;
+  {
+    auto metrics_result = GetStreamWALTabletMetrics(*tablet_peer);
+    if (metrics_result.ok()) {
+      streamwal_metrics = *metrics_result;
+    } else {
+      YB_LOG_EVERY_N_SECS(WARNING, 60)
+          << "StreamWAL: could not resolve tablet metrics for " << req->tablet_id() << ": "
+          << metrics_result.status();
+    }
+  }
+
   // Track the last OpId we passed through the dispatcher. next_op_id in the
   // response advances to this when at least one real (non-bootstrap) record is
   // emitted; for silent-only batches it advances past the last consumed op.
@@ -2609,6 +2663,9 @@ void CDCServiceImpl::StreamWAL(
       if (!status.ok()) {
         const auto code = IsIntentsGcError(status) ? CDCErrorPB::INTENTS_GC_ERROR
                                                     : CDCErrorPB::INTERNAL_ERROR;
+        if (streamwal_metrics && code == CDCErrorPB::INTENTS_GC_ERROR) {
+          streamwal_metrics->streamwal_intents_gc_errors->Increment();
+        }
         SetupErrorAndRespond(resp->mutable_error(), status, code, &context);
         return;
       }
@@ -2640,6 +2697,9 @@ void CDCServiceImpl::StreamWAL(
         const auto code = IsIntentsGcError(status_or.status())
                               ? CDCErrorPB::INTENTS_GC_ERROR
                               : CDCErrorPB::INTERNAL_ERROR;
+        if (streamwal_metrics && code == CDCErrorPB::INTENTS_GC_ERROR) {
+          streamwal_metrics->streamwal_intents_gc_errors->Increment();
+        }
         SetupErrorAndRespond(resp->mutable_error(), status_or.status(), code, &context);
         return;
       }
@@ -2745,6 +2805,40 @@ void CDCServiceImpl::StreamWAL(
     const bool more_in_leader =
         resp->next_op_id().index() < fresh_tip.index;
     resp->set_has_more(more_messages_pending || more_in_leader);
+  }
+
+  // ---------------- Observability metrics ----------------
+  // Updated on every successful response (including empty / caught-up batches)
+  // so the lag gauges reflect "caught up" (lag -> 0) rather than going stale.
+  if (streamwal_metrics) {
+    const auto records_count = resp->records_size();
+    if (records_count > 0) {
+      streamwal_metrics->streamwal_records_sent->IncrementBy(records_count);
+      streamwal_metrics->streamwal_traffic_sent->IncrementBy(
+          static_cast<int64_t>(resp->ByteSizeLong()));
+    }
+
+    // Time lag: leader safe time minus the commit time of the last sent record.
+    // No valid-op record in the batch (empty / bootstrap-only / caught up) -> 0.
+    int64_t sent_lag_micros = 0;
+    if (leader_safe_time.is_valid()) {
+      const auto last_record_micros = GetStreamWalLastSendRecordTime(*resp);
+      if (last_record_micros) {
+        const int64_t lag = static_cast<int64_t>(leader_safe_time.GetPhysicalValueMicros()) -
+                            static_cast<int64_t>(*last_record_micros);
+        sent_lag_micros = std::max<int64_t>(lag, 0);
+      }
+    }
+    streamwal_metrics->streamwal_sent_lag_micros->set_value(sent_lag_micros);
+
+    // Index lag: WAL ops between the leader tip and our advanced cursor.
+    const int64_t wal_lag_index = fresh_tip.index - resp->next_op_id().index();
+    streamwal_metrics->streamwal_wal_lag_index->set_value(std::max<int64_t>(wal_lag_index, 0));
+
+    // Expose the retention window so dashboards can derive headroom as
+    // (window - sent_lag) without hardcoding the flag.
+    streamwal_metrics->streamwal_intent_retention_window_secs->set_value(
+        FLAGS_intents_min_seconds_to_retain);
   }
 
   context.RespondSuccess();

@@ -42,6 +42,7 @@
 
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
+#include "yb/tserver/ts_tablet_manager.h"
 
 #include "yb/common/opid.h"
 
@@ -206,6 +207,19 @@ class StreamWalTest : public MiniClusterTestWithClient<MiniCluster> {
     rpc.set_timeout(MonoDelta::FromSeconds(kRpcTimeoutSec));
     RETURN_NOT_OK(cdc_proxy_->StreamWAL(req, &resp, &rpc));
     return resp;
+  }
+
+  // Fetches the StreamWALTabletMetrics container attached to the (single,
+  // leader) tablet's metric entity. Returns NotFound if no StreamWAL call has
+  // instantiated it yet. The key must match kStreamWALMetricsKey in
+  // cdc_service.cc.
+  Result<std::shared_ptr<xrepl::StreamWALTabletMetrics>> GetStreamWalMetrics() {
+    auto peer = VERIFY_RESULT(
+        tablet_server_->server()->tablet_manager()->GetServingTablet(tablet_id_));
+    auto tablet = VERIFY_RESULT(peer->shared_tablet());
+    auto raw = tablet->GetAdditionalMetadata("StreamWALMetrics");
+    SCHECK(raw, NotFound, "StreamWAL metrics not yet instantiated for tablet");
+    return std::static_pointer_cast<xrepl::StreamWALTabletMetrics>(raw);
   }
 
   tserver::MiniTabletServer* tablet_server_ = nullptr;
@@ -540,6 +554,42 @@ TEST_F(StreamWalTest, FromOpIdStampedOnEveryRecord) {
     ASSERT_EQ(r.from_op_id().term(), cursor.term());
     ASSERT_EQ(r.from_op_id().index(), cursor.index());
   }
+}
+
+// Phase 1 observability: a successful StreamWAL drain populates the per-tablet
+// StreamWALTabletMetrics attached to the tablet's own metric entity (Option A).
+TEST_F(StreamWalTest, MetricsPopulatedOnSuccess) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_intents_min_seconds_to_retain) = 3600;
+
+  ASSERT_OK(InsertRows(0, 5));
+
+  // Drain from the start through to the leader tip.
+  int64_t total_records = 0;
+  auto cursor = kFromStart;
+  StreamWalResponsePB resp;
+  do {
+    resp = ASSERT_RESULT(StreamWal(cursor));
+    ASSERT_FALSE(resp.has_error()) << resp.error().ShortDebugString();
+    total_records += resp.records_size();
+    cursor = resp.next_op_id();
+  } while (resp.has_more());
+  ASSERT_GT(total_records, 0);
+
+  auto metrics = ASSERT_RESULT(GetStreamWalMetrics());
+
+  // Counters accumulated across the drain.
+  ASSERT_GT(metrics->streamwal_records_sent->value(), 0);
+  ASSERT_GT(metrics->streamwal_traffic_sent->value(), 0);
+
+  // Happy path: no intents-GC data-loss events.
+  ASSERT_EQ(metrics->streamwal_intents_gc_errors->value(), 0);
+
+  // Retention window gauge mirrors --intents_min_seconds_to_retain.
+  ASSERT_EQ(metrics->streamwal_intent_retention_window_secs->value(), 3600u);
+
+  // Fully drained to the leader tip -> zero WAL index lag; time lag >= 0.
+  ASSERT_EQ(metrics->streamwal_wal_lag_index->value(), 0);
+  ASSERT_GE(metrics->streamwal_sent_lag_micros->value(), 0);
 }
 
 class StreamWalYsqlSecondaryIndexTest : public pgwrapper::PgMiniTestBase {
