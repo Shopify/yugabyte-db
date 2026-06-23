@@ -36,10 +36,17 @@
 #include <unordered_set>
 
 #include "yb/gutil/macros.h"
+#include "yb/gutil/ref_counted.h"
 #include "yb/gutil/thread_annotations.h"
 #include "yb/util/locks.h"
 
 namespace yb {
+
+class MetricEntity;
+
+// Registers the rwmutex_contention_time metric (total microseconds spent waiting to acquire
+// yb::RWMutex locks, readers and writers) on the given entity.
+void RegisterRWMutexContentionMetric(const scoped_refptr<MetricEntity>& entity);
 
 // Read/write mutex. Implemented as a thin wrapper around pthread_rwlock_t.
 //

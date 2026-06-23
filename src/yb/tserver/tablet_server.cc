@@ -50,7 +50,9 @@
 #include "yb/common/wire_protocol.h"
 #include "yb/common/ysql_operation_lease.h"
 
+#include "yb/docdb/doc_rowwise_iterator.h"
 #include "yb/docdb/object_lock_shared_state_manager.h"
+#include "yb/docdb/pgsql_operation.h"
 
 #include "yb/encryption/encrypted_file_factory.h"
 #include "yb/encryption/header_manager_impl.h"
@@ -496,6 +498,13 @@ Status TabletServer::Init() {
   RETURN_NOT_OK(ValidateMasterAddressResolution());
 
   RETURN_NOT_OK(DbServerBase::Init());
+
+  // Wire the server metric entity into the docdb scan path so FetchNext latency
+  // is recorded as a single server-level histogram (see doc_rowwise_iterator.cc).
+  docdb::InitDocDbFetchNextMetric(metric_entity());
+  // Same for the per-row pushed-down filter (WHERE) eval latency, the cost a seq
+  // scan pays above FetchNext per scanned row (see pgsql_operation.cc).
+  docdb::InitDocDbFilterEvalMetric(metric_entity());
 
   RETURN_NOT_OK(path_handlers_->Register(web_server_.get()));
 

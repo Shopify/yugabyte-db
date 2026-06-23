@@ -11,11 +11,44 @@
 // under the License.
 //
 
+#include <atomic>
+
 #include "yb/util/thread.h"
 
 #include "yb/util/rw_semaphore.h"
 
+#include "yb/gutil/bind.h"
+#include "yb/util/metrics.h"
+
+METRIC_DEFINE_gauge_uint64(server, rw_semaphore_contention_time, "RWSemaphore Contention Time",
+    yb::MetricUnit::kMicroseconds,
+    "Amount of time (microseconds) spent waiting to acquire yb::rw_semaphore locks, for both "
+    "readers and writers, since the server started. If this increases rapidly, it may indicate a "
+    "performance issue in YB internals triggered by a particular workload and warrant "
+    "investigation.",
+    yb::EXPOSE_AS_COUNTER);
+
 namespace yb {
+
+namespace {
+
+std::atomic<int64_t> g_rw_semaphore_contention_micros{0};
+
+uint64_t GetRWSemaphoreContentionMicros() {
+  return g_rw_semaphore_contention_micros.load(std::memory_order_relaxed);
+}
+
+}  // namespace
+
+void SubmitRWSemaphoreContentionMicros(int64_t micros) {
+  g_rw_semaphore_contention_micros.fetch_add(micros, std::memory_order_relaxed);
+}
+
+void RegisterRWSemaphoreContentionMetric(const scoped_refptr<MetricEntity>& entity) {
+  entity->NeverRetire(
+      METRIC_rw_semaphore_contention_time.InstantiateFunctionGauge(
+          entity, Bind(&GetRWSemaphoreContentionMicros)));
+}
 
 #ifndef NDEBUG
 void rw_semaphore::AssignWriterTid() {

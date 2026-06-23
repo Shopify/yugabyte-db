@@ -39,11 +39,17 @@
 #include "yb/util/logging.h"
 
 #include "yb/gutil/macros.h"
+#include "yb/gutil/ref_counted.h"
 #include "yb/gutil/thread_annotations.h"
 
 namespace yb {
 
+class MetricEntity;
 class StackTrace;
+
+// Registers the mutex_contention_time metric (total microseconds spent waiting to acquire
+// yb::Mutex locks) on the given entity.
+void RegisterMutexContentionMetric(const scoped_refptr<MetricEntity>& entity);
 
 // A lock built around pthread_mutex_t. Does not allow recursion.
 //

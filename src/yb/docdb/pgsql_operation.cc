@@ -73,6 +73,8 @@
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
 #include "yb/util/result.h"
+#include "yb/util/metrics.h"
+#include "yb/util/monotime.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/status_format.h"
 #include "yb/util/trace.h"
@@ -149,6 +151,19 @@ DECLARE_uint64(rpc_max_message_size);
 DECLARE_double(max_buffer_size_to_rpc_limit_ratio);
 DECLARE_bool(vector_index_dump_stats);
 
+// Per-row pushed-down filter (WHERE clause) evaluation latency. Sibling of
+// docdb_fetch_next_ns: where that times the raw row fetch, this times the
+// DocPgExprExecutor::Exec that runs immediately after, once per scanned row.
+// Subtracting fetch from filter+fetch isolates the per-row filtering cost that
+// a seq scan pays above the storage read. Nanosecond resolution because a
+// single-predicate Exec is sub-microsecond; same bucketing as the fetch metric
+// (max 60s in ns, 2 significant digits).
+METRIC_DEFINE_histogram(server, docdb_filter_eval_ns,
+    "DocDB Pushed-Down Filter Eval Latency", yb::MetricUnit::kNanoseconds,
+    "Time (nanoseconds) spent evaluating the pushed-down filter (WHERE clause) "
+    "for one row (one observation per row that reaches the filter during a scan).",
+    60000000000LU, 2);
+
 namespace yb::docdb {
 
 bool TEST_vector_index_filter_allowed = true;
@@ -160,6 +175,29 @@ using dockv::KeyEntryValue;
 using dockv::SubDocKey;
 using qlexpr::QLExprResult;
 using qlexpr::QLTableRow;
+
+namespace {
+
+// Process-global handle to the server-level filter-eval histogram, set once by
+// InitDocDbFilterEvalMetric() at tserver startup. Mirrors g_fetch_next_ns in
+// doc_rowwise_iterator.cc: the Histogram is owned (kept alive) by the server
+// metric entity for the process lifetime via NeverRetire(); we hold only a raw
+// pointer, and the atomic makes the concurrent scan-thread reads well-defined
+// (a plain load on the hot path). Null until wired up.
+std::atomic<Histogram*> g_filter_eval_ns{nullptr};
+
+}  // namespace
+
+void InitDocDbFilterEvalMetric(const MetricEntityPtr& server_entity) {
+  auto histogram = METRIC_docdb_filter_eval_ns.Instantiate(server_entity);
+  // Pin the metric so the entity's retirement scan never frees it. Without this,
+  // after FLAGS_metrics_retirement_age_ms (120s) of being otherwise un-referenced
+  // -- e.g. an idle gap between sweep checkpoints -- RetireOldMetrics() would
+  // erase and delete it, leaving g_filter_eval_ns dangling and crashing the next
+  // filter eval. NeverRetire() parks an extra ref to prevent that.
+  server_entity->NeverRetire(histogram);
+  g_filter_eval_ns.store(histogram.get(), std::memory_order_release);
+}
 
 bool ShouldYsqlPackRow(bool is_colocated) {
   return FLAGS_ysql_enable_packed_row &&
@@ -648,7 +686,20 @@ class FilteringIterator {
   }
 
   Result<bool> MatchFilter(const dockv::PgTableRow& row) {
-    return !filter_ || VERIFY_RESULT(filter_->Exec(row));
+    if (!filter_) {
+      return true;
+    }
+    // Time the pushed-down filter evaluation for this row into the server-level
+    // histogram, on every return path. One observation per row that reaches the
+    // filter (see docdb_filter_eval_ns). Skipped cheaply if not wired up yet.
+    const auto filter_eval_start = MonoTime::Now();
+    auto record_filter_eval_ns = ScopeExit([filter_eval_start] {
+      auto* stats = g_filter_eval_ns.load(std::memory_order_acquire);
+      if (stats) {
+        stats->Increment((MonoTime::Now() - filter_eval_start).ToNanoseconds());
+      }
+    });
+    return VERIFY_RESULT(filter_->Exec(row));
   }
 
   Result<FetchResult> CheckFilter(const dockv::PgTableRow& row) {

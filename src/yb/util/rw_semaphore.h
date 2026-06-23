@@ -36,8 +36,20 @@
 
 #include "yb/gutil/atomicops.h"
 #include "yb/gutil/port.h"
+#include "yb/gutil/ref_counted.h"
+#include "yb/gutil/walltime.h"
 
 namespace yb {
+
+class MetricEntity;
+
+// Adds the given number of microseconds to the rw_semaphore_contention_time counter. Called from
+// the inlined acquire paths below; the body (and the metric) live in rw_semaphore.cc to keep the
+// metrics machinery out of this widely-included header.
+void SubmitRWSemaphoreContentionMicros(int64_t micros);
+
+// Registers the rw_semaphore_contention_time metric on the given entity.
+void RegisterRWSemaphoreContentionMetric(const scoped_refptr<MetricEntity>& entity);
 
 // Read-Write semaphore. 32bit uint that contains the number of readers.
 // When someone wants to write, tries to set the 32bit, and waits until
@@ -68,6 +80,7 @@ class rw_semaphore {
   ~rw_semaphore() {}
 
   void lock_shared() {
+    auto start_micros = GetMonoTimeMicros();
     int loop_count = 0;
     Atomic32 cur_state = base::subtle::NoBarrier_Load(&state_);
     while (true) {
@@ -79,6 +92,7 @@ class rw_semaphore {
       // Either was already locked by someone else, or CAS failed.
       boost::detail::yield(loop_count++);
     }
+    SubmitRWSemaphoreContentionMicros(GetMonoTimeMicros() - start_micros);
   }
 
   void unlock_shared() {
@@ -122,6 +136,7 @@ class rw_semaphore {
   }
 
   void lock() {
+    auto start_micros = GetMonoTimeMicros();
     int loop_count = 0;
     Atomic32 cur_state = base::subtle::NoBarrier_Load(&state_);
     while (true) {
@@ -142,6 +157,7 @@ class rw_semaphore {
     AssignWriterTid();
 #endif // NDEBUG
     RecordLockHolderStack();
+    SubmitRWSemaphoreContentionMicros(GetMonoTimeMicros() - start_micros);
   }
 
   void unlock() {

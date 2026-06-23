@@ -82,6 +82,9 @@
 #include "yb/util/pb_util.h"
 #include "yb/util/rolling_log.h"
 #include "yb/util/size_literals.h"
+#include "yb/util/mutex.h"
+#include "yb/util/rw_mutex.h"
+#include "yb/util/rw_semaphore.h"
 #include "yb/util/spinlock_profiling.h"
 #include "yb/util/status.h"
 #include "yb/util/status_log.h"
@@ -302,6 +305,9 @@ Status RpcServerBase::Init() {
   glog_metrics_.reset(new ScopedGLogMetrics(metric_entity_));
   tcmalloc::RegisterMetrics(metric_entity_);
   RegisterSpinLockContentionMetrics(metric_entity_);
+  RegisterMutexContentionMetric(metric_entity_);
+  RegisterRWMutexContentionMetric(metric_entity_);
+  RegisterRWSemaphoreContentionMetric(metric_entity_);
 
   InitSpinLockContentionProfiling();
 

@@ -42,6 +42,7 @@
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
 #include "yb/util/metrics.h"
+#include "yb/util/monotime.h"
 #include "yb/util/result.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/status.h"
@@ -62,9 +63,44 @@ DEPRECATE_FLAG(bool, use_offset_based_key_decoding, "02_2024");
 DEFINE_RUNTIME_bool(enable_colocated_table_tombstone_cache, true,
     "When set, colocated reads will cache table tombstones to avoid repeated tombstone checks.");
 
+// Server-level histogram of per-call DocRowwiseIterator::FetchNextImpl() latency.
+// Defined on the "server" entity (not per-tablet) so it surfaces as a single
+// series in the tserver /metrics output, independent of table/tablet identity.
+// Uses METRIC_DEFINE_histogram (not event_stats) so it exposes percentiles
+// (p50/p95/p99/...), matching handler_latency_*. Nanosecond resolution: a row
+// fetch from the memtable is sub-microsecond, so integer-microsecond timing would
+// truncate most observations to 0. Bucketing: max 60s (in ns), 2 sig digits.
+METRIC_DEFINE_histogram(server, docdb_fetch_next_ns,
+    "DocDB FetchNext Latency", yb::MetricUnit::kNanoseconds,
+    "Time (nanoseconds) spent in each DocRowwiseIterator::FetchNext() call "
+    "(one observation per row fetched during a scan).",
+    60000000000LU, 2);
+
 using namespace std::chrono_literals;
 
 namespace yb::docdb {
+
+namespace {
+
+// Process-global handle to the server-level FetchNext histogram, set once by
+// InitDocDbFetchNextMetric() at tserver startup. The Histogram itself is owned
+// (kept alive) by the server metric entity for the process lifetime; we only need
+// a raw pointer here, and the atomic makes the concurrent scan-thread reads
+// well-defined (and is a plain load on the hot path). Null until wired up.
+std::atomic<Histogram*> g_fetch_next_ns{nullptr};
+
+}  // namespace
+
+void InitDocDbFetchNextMetric(const MetricEntityPtr& server_entity) {
+  auto histogram = METRIC_docdb_fetch_next_ns.Instantiate(server_entity);
+  // Pin the metric so the entity's retirement scan never frees it. Without this,
+  // the histogram is referenced only by the entity's metric map; after
+  // FLAGS_metrics_retirement_age_ms (120s) of being otherwise un-referenced,
+  // RetireOldMetrics() erases and deletes it, leaving g_fetch_next_ns dangling and
+  // crashing the next FetchNext(). NeverRetire() parks an extra ref to prevent that.
+  server_entity->NeverRetire(histogram);
+  g_fetch_next_ns.store(histogram.get(), std::memory_order_release);
+}
 
 using dockv::DocKey;
 
@@ -682,6 +718,16 @@ Result<bool> DocRowwiseIterator::FetchNextImpl(TableRow table_row) {
   if (done_) {
     return false;
   }
+
+  // Record this call's wall-clock duration into the server-level histogram on
+  // every return path. Skipped cheaply if the metric isn't wired up yet.
+  const auto fetch_next_start = MonoTime::Now();
+  auto record_fetch_next_ns = ScopeExit([fetch_next_start] {
+    auto* stats = g_fetch_next_ns.load(std::memory_order_acquire);
+    if (stats) {
+      stats->Increment((MonoTime::Now() - fetch_next_start).ToNanoseconds());
+    }
+  });
 
   if (prev_doc_found_ != DocReaderResult::kNotFound) {
     RETURN_NOT_OK(AdvanceIteratorToNextDesiredRow(

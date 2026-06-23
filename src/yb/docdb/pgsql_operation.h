@@ -29,6 +29,7 @@
 #include "yb/dockv/pg_row.h"
 #include "yb/dockv/reader_projection.h"
 
+#include "yb/util/metrics_fwd.h"
 #include "yb/util/operation_counter.h"
 #include "yb/util/strongly_typed_bool.h"
 #include "yb/util/write_buffer.h"
@@ -38,6 +39,12 @@ namespace yb::docdb {
 YB_STRONGLY_TYPED_BOOL(IsUpsert);
 
 bool ShouldYsqlPackRow(bool has_cotable_id);
+
+// Wire up the server-level docdb_filter_eval_ns histogram (pushed-down WHERE
+// evaluation latency, one observation per scanned row). Call once at tserver
+// startup, alongside InitDocDbFetchNextMetric. Pins the histogram via
+// NeverRetire so it survives idle gaps between scans.
+void InitDocDbFilterEvalMetric(const MetricEntityPtr& server_entity);
 
 class PgsqlWriteOperation :
     public DocOperationBase<DocOperationType::PGSQL_WRITE_OPERATION, PgsqlWriteRequestPB>,

@@ -38,10 +38,17 @@
 
 #include "yb/rocksdb/db.h"
 
+#include "yb/util/metrics_fwd.h"
 #include "yb/util/operation_counter.h"
 #include "yb/util/status_fwd.h"
 
 namespace yb::docdb {
+
+// Wires up the process-global server-level histogram that records per-call
+// DocRowwiseIterator::FetchNextImpl() latency. Called once from tserver startup
+// with the server metric entity. Until called (and in processes that never call
+// it, e.g. the master), FetchNext timing is silently skipped.
+void InitDocDbFetchNextMetric(const MetricEntityPtr& server_entity);
 
 YB_STRONGLY_TYPED_BOOL(AddTablePrefixToKey);
 

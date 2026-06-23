@@ -32,14 +32,26 @@
 
 #include "yb/util/rw_mutex.h"
 
+#include <atomic>
 #include <mutex>
 
 #include "yb/util/logging.h"
 
+#include "yb/gutil/bind.h"
 #include "yb/gutil/map-util.h"
+#include "yb/gutil/walltime.h"
 #include "yb/util/env.h"
+#include "yb/util/metrics.h"
 
 using std::lock_guard;
+
+METRIC_DEFINE_gauge_uint64(server, rwmutex_contention_time, "RWMutex Contention Time",
+    yb::MetricUnit::kMicroseconds,
+    "Amount of time (microseconds) spent waiting to acquire yb::RWMutex (pthread_rwlock) locks, "
+    "for both readers and writers, since the server started. If this increases rapidly, it may "
+    "indicate a performance issue in YB internals triggered by a particular workload and warrant "
+    "investigation.",
+    yb::EXPOSE_AS_COUNTER);
 
 namespace {
 
@@ -48,9 +60,21 @@ void unlock_rwlock(pthread_rwlock_t* rwlock) {
   DCHECK_EQ(0, rv) << strerror(rv);
 }
 
+std::atomic<int64_t> g_rwmutex_contention_micros{0};
+
+uint64_t GetRWMutexContentionMicros() {
+  return g_rwmutex_contention_micros.load(std::memory_order_relaxed);
+}
+
 } // anonymous namespace
 
 namespace yb {
+
+void RegisterRWMutexContentionMetric(const scoped_refptr<MetricEntity>& entity) {
+  entity->NeverRetire(
+      METRIC_rwmutex_contention_time.InstantiateFunctionGauge(
+          entity, Bind(&GetRWMutexContentionMicros)));
+}
 
 RWMutex::RWMutex()
 #ifndef NDEBUG
@@ -104,7 +128,10 @@ RWMutex::~RWMutex() {
 
 void RWMutex::ReadLock() {
   CheckLockState(LockState::NEITHER);
+  auto start_micros = GetMonoTimeMicros();
   int rv = pthread_rwlock_rdlock(&native_handle_);
+  g_rwmutex_contention_micros.fetch_add(
+      GetMonoTimeMicros() - start_micros, std::memory_order_relaxed);
   DCHECK_EQ(0, rv) << strerror(rv);
   MarkForReading();
 }
@@ -133,7 +160,10 @@ void RWMutex::WriteLock() {
   }
 #endif
   CheckLockState(LockState::NEITHER);
+  auto start_micros = GetMonoTimeMicros();
   int rv = pthread_rwlock_wrlock(&native_handle_);
+  g_rwmutex_contention_micros.fetch_add(
+      GetMonoTimeMicros() - start_micros, std::memory_order_relaxed);
   DCHECK_EQ(0, rv) << strerror(rv);
   MarkForWriting();
 }

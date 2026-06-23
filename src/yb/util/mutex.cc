@@ -33,12 +33,41 @@
 
 #include "yb/util/mutex.h"
 
+#include <atomic>
+
+#include "yb/gutil/bind.h"
+#include "yb/gutil/walltime.h"
+
 #include "yb/util/logging.h"
 
+#include "yb/util/metrics.h"
 #include "yb/util/stack_trace.h"
 #include "yb/util/env.h"
 
+METRIC_DEFINE_gauge_uint64(server, mutex_contention_time, "Mutex Contention Time",
+    yb::MetricUnit::kMicroseconds,
+    "Amount of time (microseconds) spent waiting to acquire yb::Mutex (pthread_mutex) locks "
+    "since the server started. If this increases rapidly, it may indicate a performance issue "
+    "in YB internals triggered by a particular workload and warrant investigation.",
+    yb::EXPOSE_AS_COUNTER);
+
 namespace yb {
+
+namespace {
+
+std::atomic<int64_t> g_mutex_contention_micros{0};
+
+uint64_t GetMutexContentionMicros() {
+  return g_mutex_contention_micros.load(std::memory_order_relaxed);
+}
+
+}  // namespace
+
+void RegisterMutexContentionMetric(const scoped_refptr<MetricEntity>& entity) {
+  entity->NeverRetire(
+      METRIC_mutex_contention_time.InstantiateFunctionGauge(
+          entity, Bind(&GetMutexContentionMicros)));
+}
 
 Mutex::Mutex()
 #ifndef NDEBUG
@@ -82,7 +111,10 @@ bool Mutex::TryAcquire() {
 }
 
 void Mutex::Acquire() {
+  auto start_micros = GetMonoTimeMicros();
   int rv = pthread_mutex_lock(&native_handle_);
+  g_mutex_contention_micros.fetch_add(
+      GetMonoTimeMicros() - start_micros, std::memory_order_relaxed);
 #ifndef NDEBUG
   DCHECK_EQ(0, rv) << ". " << strerror(rv)
       << ". Owner tid: " << owning_tid_ << "; Self tid: " << Env::Default()->gettid()
