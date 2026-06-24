@@ -2407,6 +2407,14 @@ void CDCServiceImpl::StreamWAL(
     }
   }
 
+  // Consistent-commit-order mode forks here, before any of the WAL-order
+  // machinery below. The default (false) path is left entirely unchanged.
+  if (req->consistent_commit_order()) {
+    HandleStreamWALConsistentCommitOrder(
+        req, resp, &context, tablet_peer, tablet_ptr, leader_tip_op_id, leader_safe_time);
+    return;
+  }
+
   // Resolve the effective start OpId we'll feed into the WAL reader.
   // (This is internal-only; the response cursor is computed separately below.)
   OpId read_from_op_id;
@@ -2842,6 +2850,278 @@ void CDCServiceImpl::StreamWAL(
   }
 
   context.RespondSuccess();
+}
+
+void CDCServiceImpl::HandleStreamWALConsistentCommitOrder(
+    const StreamWalRequestPB* req, StreamWalResponsePB* resp, RpcContext* context,
+    const std::shared_ptr<tablet::TabletPeer>& tablet_peer,
+    const tablet::TabletPtr& tablet_ptr, const OpId& leader_tip_op_id,
+    HybridTime leader_safe_time) {
+  const auto& from_cursor = req->from_op_id();
+
+  // consistent_commit_order is a TRUE per-request mode: the driver reuses only
+  // the GetChanges helpers that are independent of the global
+  // FLAGS_cdc_enable_consistent_records gflag and reimplements the flag-gated
+  // floor / frontier advance locally. So there is no global-flag precondition
+  // to check here.
+  auto consensus_result = tablet_peer->GetRaftConsensus();
+  RPC_CHECK_AND_RETURN_ERROR(
+      consensus_result.ok(), consensus_result.status(), resp->mutable_error(),
+      CDCErrorPB::LEADER_NOT_READY, *context);
+  auto& consensus = *consensus_result;
+
+  const bool emit_bootstrap =
+      IsStreamWalFromStart(from_cursor) || IsStreamWalSkipToLatest(from_cursor);
+  const bool skip_to_latest = IsStreamWalSkipToLatest(from_cursor);
+
+  // Bootstrap DDLs always go at the FRONT of records[], before any commit-ordered
+  // records (identical to the WAL-order path).
+  if (emit_bootstrap) {
+    std::vector<CDCSDKProtoRecordPB> bootstrap_records;
+    auto bootstrap_status = cdc::PopulateSyntheticBootstrapDDLs(tablet_peer, &bootstrap_records);
+    if (!bootstrap_status.ok()) {
+      SetupErrorAndRespond(
+          resp->mutable_error(), bootstrap_status, CDCErrorPB::INTERNAL_ERROR, context);
+      return;
+    }
+    for (auto& rec : bootstrap_records) {
+      resp->add_records()->Swap(&rec);
+    }
+  }
+
+  // Skip-to-latest: emit bootstrap only, pin the cursor to the leader tip, and
+  // stamp commit_ht = the current resolution safe time so that any historical
+  // record (including a late low-commit_time APPLYING that materializes above
+  // the tip) is skipped on resume.
+  if (skip_to_latest) {
+    auto* next = resp->mutable_next_op_id();
+    leader_tip_op_id.ToPB(next);
+    if (leader_safe_time.is_valid()) {
+      next->set_commit_ht(leader_safe_time.ToUint64());
+      resp->set_resolution_safe_time(leader_safe_time.ToUint64());
+      resp->set_leader_safe_hybrid_time(leader_safe_time.ToUint64());
+    }
+    leader_tip_op_id.ToPB(resp->mutable_leader_tip_op_id());
+    const auto current_tip = consensus->GetLastCommittedOpId();
+    resp->set_has_more(current_tip.index > leader_tip_op_id.index);
+    context->RespondSuccess();
+    return;
+  }
+
+  // Resolve the composite cursor inputs (floor + commit_ht + optional spill).
+  cdc::StreamWalConsistentInput input;
+  if (IsStreamWalFromStart(from_cursor)) {
+    input.floor = OpId();  // {0,0}: earliest retained WAL.
+    input.commit_ht_skip = 0;
+  } else {
+    // Real cursor (term >= 1). Apply the same retention / over-tip checks as the
+    // WAL-order path.
+    const int64_t cdc_min_replicated_index = tablet_peer->get_cdc_min_replicated_index();
+    if (cdc_min_replicated_index != std::numeric_limits<int64_t>::max() &&
+        from_cursor.index() < cdc_min_replicated_index) {
+      SetupErrorAndRespond(
+          resp->mutable_error(),
+          STATUS_FORMAT(
+              IllegalState,
+              "StreamWAL: from_op_id.index ($0) is older than cdc_min_replicated_index ($1)",
+              from_cursor.index(), cdc_min_replicated_index),
+          CDCErrorPB::CHECKPOINT_TOO_OLD, context);
+      return;
+    }
+    if (from_cursor.index() > leader_tip_op_id.index) {
+      SetupErrorAndRespond(
+          resp->mutable_error(),
+          STATUS_FORMAT(
+              InvalidArgument,
+              "StreamWAL: from_op_id.index ($0) > leader tip index ($1)",
+              from_cursor.index(), leader_tip_op_id.index),
+          CDCErrorPB::INVALID_REQUEST, context);
+      return;
+    }
+    input.floor = OpId(from_cursor.term(), from_cursor.index());
+    input.commit_ht_skip = from_cursor.has_commit_ht() ? from_cursor.commit_ht() : 0;
+    if (IsStreamWalMidApplying(from_cursor)) {
+      input.resuming_spilled = true;
+      input.resume_intent_key = from_cursor.intent_key();
+      input.resume_intent_write_id = from_cursor.intent_write_id();
+    }
+  }
+
+  // Synthesize the minimum-viable StreamMetadata required by the decoder
+  // (process-local; no master communication). Mirrors the WAL-order path.
+  cdc::StreamMetadata stream_metadata;
+  const auto namespace_id = tablet_ptr->metadata()->namespace_id();
+  stream_metadata.InitForStreamlessUse(
+      namespace_id, CDCRecordType::CHANGE, CDCRecordFormat::PROTO,
+      tablet_ptr->metadata()->GetAllColocatedTables());
+
+  SchemaDetailsMap cached_schema_details;
+  TableSchemaPackingStorage schema_packing_storages;
+  {
+    const auto table_type = tablet_ptr->table_type();
+    auto registry = std::make_shared<dockv::SchemaPackingRegistry>("StreamWAL: ");
+    for (const auto& tid : tablet_ptr->metadata()->GetAllColocatedTables()) {
+      schema_packing_storages.emplace(tid, dockv::SchemaPackingStorage(table_type, registry));
+    }
+  }
+
+  EnumOidLabelMap enum_map;
+  CompositeAttsMap composite_atts_map;
+  if (!namespace_id.empty()) {
+    const auto namespace_name = tablet_ptr->metadata()->namespace_name();
+    const bool cql_namespace = tablet_ptr->table_type() == YQL_TABLE_TYPE;
+    auto enum_map_result = GetEnumMapFromCache(namespace_name, cql_namespace);
+    if (enum_map_result.ok()) {
+      enum_map = *enum_map_result;
+    }
+    auto composite_result = GetCompositeAttsMapFromCache(namespace_name, cql_namespace);
+    if (composite_result.ok()) {
+      composite_atts_map = *composite_result;
+    }
+  }
+
+  StreamWalDecodeContext decode_ctx;
+  decode_ctx.tablet_peer = tablet_peer;
+  decode_ctx.stream_metadata = &stream_metadata;
+  decode_ctx.client = client();
+  decode_ctx.cached_schema_details = &cached_schema_details;
+  decode_ctx.schema_packing_storages = &schema_packing_storages;
+  decode_ctx.enum_map = &enum_map;
+  decode_ctx.composite_atts_map = &composite_atts_map;
+
+  input.max_records = req->max_records() > 0 ? req->max_records() : 1000;
+  input.max_bytes = req->max_bytes() > 0 ? req->max_bytes() : 4_MB;
+  input.leader_safe_time = leader_safe_time;
+  // Same deadline budget as the WAL-order path: must exceed the reader's
+  // deadline buffer so the segment can actually be inspected.
+  input.deadline = CoarseMonoClock::Now() +
+                   std::chrono::seconds(FLAGS_cdcsdk_wal_reads_deadline_buffer_secs + 1) +
+                   std::chrono::milliseconds(req->deadline_ms());
+
+  cdc::StreamWalConsistentOutput output;
+  auto status = cdc::GetConsistentChangesForStreamWAL(input, &decode_ctx, &output);
+
+  std::shared_ptr<xrepl::StreamWALTabletMetrics> streamwal_metrics;
+  {
+    auto metrics_result = GetStreamWALTabletMetrics(*tablet_peer);
+    if (metrics_result.ok()) {
+      streamwal_metrics = *metrics_result;
+    } else {
+      YB_LOG_EVERY_N_SECS(WARNING, 60)
+          << "StreamWAL: could not resolve tablet metrics for " << req->tablet_id() << ": "
+          << metrics_result.status();
+    }
+  }
+
+  if (!status.ok()) {
+    CDCErrorPB::Code code;
+    if (IsIntentsGcError(status)) {
+      code = CDCErrorPB::INTENTS_GC_ERROR;
+      if (streamwal_metrics) {
+        streamwal_metrics->streamwal_intents_gc_errors->Increment();
+      }
+    } else if (status.IsTabletSplit()) {
+      code = CDCErrorPB::TABLET_SPLIT;
+    } else {
+      code = CDCError::ValueFromStatus(status).value_or(CDCErrorPB::INTERNAL_ERROR);
+    }
+    SetupErrorAndRespond(resp->mutable_error(), status, code, context);
+    return;
+  }
+
+  // Brand-new / fully-GC'd tablet on a {0,0} from-start request: only bootstrap
+  // DDLs, nothing in the WAL. Advance the cursor to the leader tip (with
+  // commit_ht = the resolution safe time) so the next call resumes at the tip
+  // instead of re-bootstrapping forever -- mirrors the WAL-order path's
+  // bootstrap-only handling and the skip-to-latest semantics.
+  if (IsStreamWalFromStart(from_cursor) && output.read_window_empty) {
+    output.next_floor = leader_tip_op_id;
+    if (output.resolution_safe_time_set && output.next_commit_ht == 0) {
+      output.next_commit_ht = output.resolution_safe_time;
+    }
+  }
+
+  // Append the commit-ordered records, stamping from_op_id on each (compat with
+  // existing CDCSDK decoder callsites; not load-bearing for clients).
+  for (auto& rec : output.records) {
+    auto* from_op_id_pb = rec.mutable_from_op_id();
+    from_op_id_pb->set_term(from_cursor.term());
+    from_op_id_pb->set_index(from_cursor.index());
+    from_op_id_pb->set_write_id(0);
+    from_op_id_pb->set_write_id_key("");
+    resp->add_records()->Swap(&rec);
+  }
+
+  // Build the composite cursor.
+  auto* next = resp->mutable_next_op_id();
+  next->set_term(output.next_floor.term);
+  next->set_index(output.next_floor.index);
+  if (output.next_commit_ht > 0) {
+    next->set_commit_ht(output.next_commit_ht);
+  }
+  if (output.mid_applying) {
+    next->set_intent_key(output.next_intent_key);
+    next->set_intent_write_id(output.next_intent_write_id);
+  }
+
+  const OpId fresh_tip = consensus->GetLastCommittedOpId();
+  fresh_tip.ToPB(resp->mutable_leader_tip_op_id());
+  if (leader_safe_time.is_valid()) {
+    resp->set_leader_safe_hybrid_time(leader_safe_time.ToUint64());
+  }
+  if (output.resolution_safe_time_set) {
+    resp->set_resolution_safe_time(output.resolution_safe_time);
+  }
+
+  // has_more: true if the driver knows more is immediately available (size cap
+  // or spill), or -- when the batch did NOT stop on the watermark -- if the
+  // leader has unconsumed ops past our floor. We do NOT claim has_more when the
+  // only remaining records are watermark-gated (the consumer should back off).
+  bool has_more = output.has_more;
+  if (!output.saw_split && !output.stopped_on_watermark && !output.mid_applying &&
+      output.resolution_safe_time_set && next->index() < fresh_tip.index) {
+    has_more = true;
+  }
+  if (output.saw_split) {
+    has_more = false;
+  }
+  // A cursor carrying a mid-APPLYING spill position has more to deliver (the rest
+  // of the transaction) by definition -- even when this particular batch made no
+  // progress (e.g. a transient wait-for-WAL while resuming the spill). Enforce
+  // the contract invariant: intent_key present => has_more.
+  if (output.mid_applying) {
+    has_more = true;
+  }
+  resp->set_has_more(has_more);
+
+  // Observability metrics (best-effort; identical gauges to the WAL-order path).
+  if (streamwal_metrics) {
+    const auto records_count = resp->records_size();
+    if (records_count > 0) {
+      streamwal_metrics->streamwal_records_sent->IncrementBy(records_count);
+      streamwal_metrics->streamwal_traffic_sent->IncrementBy(
+          static_cast<int64_t>(resp->ByteSizeLong()));
+    }
+
+    int64_t sent_lag_micros = 0;
+    if (leader_safe_time.is_valid()) {
+      const auto last_record_micros = GetStreamWalLastSendRecordTime(*resp);
+      if (last_record_micros) {
+        const int64_t lag = static_cast<int64_t>(leader_safe_time.GetPhysicalValueMicros()) -
+                            static_cast<int64_t>(*last_record_micros);
+        sent_lag_micros = std::max<int64_t>(lag, 0);
+      }
+    }
+    streamwal_metrics->streamwal_sent_lag_micros->set_value(sent_lag_micros);
+
+    const int64_t wal_lag_index = fresh_tip.index - resp->next_op_id().index();
+    streamwal_metrics->streamwal_wal_lag_index->set_value(std::max<int64_t>(wal_lag_index, 0));
+
+    streamwal_metrics->streamwal_intent_retention_window_secs->set_value(
+        FLAGS_intents_min_seconds_to_retain);
+  }
+
+  context->RespondSuccess();
 }
 
 Status CDCServiceImpl::UpdatePeersCdcMinReplicatedIndex(

@@ -581,6 +581,65 @@ breaking existing clients.
 
 ---
 
+## Consistent-commit-order mode (`consistent_commit_order = true`)
+
+The default StreamWAL delivers committed records in **WAL (apply) order**.
+Single-shard writes therefore arrive in commit order, but a multi-shard
+transaction's records are emitted at its `APPLYING` WAL entry, which can
+materialize arbitrarily later than the commit — so `commit_time` can move
+*backwards* across consecutive records on a single tablet. That is fine for a
+consumer that dedups/reorders client-side, but not for a blind, idempotent,
+last-write-wins consumer (e.g. reverse replication).
+
+Setting `StreamWalRequestPB.consistent_commit_order = true` switches a single
+request to **commit-time-ordered, watermark-gated** delivery:
+
+- Records in `records[]` are in non-decreasing `commit_time` order (the
+  `cdc_sdk_op_id` of each record is still its real WAL op, but is **not**
+  monotonic across the batch).
+- Only records with `commit_time <= resolution_safe_time` (the per-tablet
+  consistent-stream watermark) are shipped; nothing is ever shipped ahead of an
+  unresolved transaction.
+- The cursor becomes a **composite**: `StreamWalCursorPB.{term,index}` is the
+  WAL re-read **floor** (and the retention point), and
+  `StreamWalCursorPB.commit_ht` is the commit-time **frontier** — the server has
+  delivered every record with `commit_time <= commit_ht`. On resume the server
+  re-reads from the floor and skips anything `<= commit_ht`, so a consumer needs
+  **no reorder buffer and no dedup state**.
+
+This is "Option A": the floor guarantees no committed op is skipped over, and
+`commit_ht` guarantees no already-delivered op is re-sent — even a late-applying
+multi-shard txn whose `APPLYING` lands above the floor but whose `commit_time`
+is below the frontier.
+
+**Default (false) is byte-for-byte unchanged.** A request that omits the field
+behaves exactly as before: WAL-order delivery, single-op-id cursor,
+`commit_ht` / `resolution_safe_time` never set. A stray `from_op_id.commit_ht`
+on a false-mode request is ignored.
+
+**Per-request, not a gflag.** `consistent_commit_order` is independent of the
+global `FLAGS_cdc_enable_consistent_records` that governs the legacy
+`GetChanges` path. The implementation reuses only the consistent-streaming
+helpers that do not consult that gflag (`GetConsistentStreamSafeTime`,
+`GetConsistentWALRecords`, `SortConsistentWALRecords`, `ShouldUpdateSafeTime`)
+and reimplements the flag-gated WAL-floor / commit-frontier advance locally, so
+the mode works regardless of the gflag's value. `GetChanges` is untouched.
+
+**Watermark / liveness.** Delivery may stall (empty batches, unchanged cursor)
+while an open transaction pins the watermark, or while transactions are still
+loading on the tablet (in which case `resolution_safe_time` is left unset). The
+server makes progress once the transaction resolves; there is no upper bound on
+delivery latency, only a bound on the stall.
+
+**Spilled `APPLYING`.** A transaction larger than one batch still paginates via
+`intent_key` / `intent_write_id`; `commit_ht` does **not** advance past that
+transaction's `commit_time` until its `COMMIT` envelope has been delivered.
+
+See the separate "StreamWAL Consistent Mode — Data Contract" for the full
+guarantee/obligation matrix (G1–G12 / O1–O9).
+
+---
+
 ## Proto changes summary
 
 **File: `src/yb/cdc/cdc_service.proto`**
@@ -605,6 +664,20 @@ breaking existing clients.
 
    ```protobuf
    INTENTS_GC_ERROR = 15;
+   ```
+
+5. Consistent-commit-order mode additions (all optional / additive, default
+   path unchanged):
+
+   ```protobuf
+   // StreamWalRequestPB
+   optional bool consistent_commit_order = 6 [default = false];
+
+   // StreamWalCursorPB
+   optional fixed64 commit_ht = 5;          // commit-time frontier
+
+   // StreamWalResponsePB
+   optional fixed64 resolution_safe_time = 8;  // the watermark gated on
    ```
 
 ---

@@ -130,6 +130,35 @@ public class StreamWalResponse extends YRpcResponse {
     return cursor.hasIntentWriteId() ? cursor.getIntentWriteId() : null;
   }
 
+  /**
+   * Consistent-commit-order mode: whether {@code next_op_id} carries a commit-time frontier
+   * ({@code commit_ht}). Always {@code false} in WAL-order mode.
+   */
+  public boolean nextOpIdHasCommitHt() {
+    return resp.hasNextOpId() && resp.getNextOpId().hasCommitHt();
+  }
+
+  /**
+   * Consistent-commit-order mode: the commit-time frontier on {@code next_op_id}. Opaque; the
+   * caller MUST round-trip it verbatim on the next request. Returns 0 when unset.
+   */
+  public long getNextOpIdCommitHt() {
+    return resp.hasNextOpId() ? resp.getNextOpId().getCommitHt() : 0L;
+  }
+
+  /** Consistent-commit-order mode: whether the response carries a resolution watermark. */
+  public boolean hasResolutionSafeTime() {
+    return resp.hasResolutionSafeTime();
+  }
+
+  /**
+   * Consistent-commit-order mode: the per-tablet resolution watermark this batch gated on
+   * (informational; useful for convergence-lag monitoring). Unset while transactions are loading.
+   */
+  public long getResolutionSafeTime() {
+    return resp.getResolutionSafeTime();
+  }
+
   public boolean hasLeaderTipOpId() {
     return resp.hasLeaderTipOpId();
   }

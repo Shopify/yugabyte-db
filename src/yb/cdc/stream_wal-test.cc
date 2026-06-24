@@ -50,11 +50,16 @@
 #include "yb/util/flags.h"
 #include "yb/util/test_macros.h"
 
+#include <atomic>
+#include <mutex>
+#include <thread>
+
 #include "yb/yql/pgwrapper/pg_mini_test_base.h"
 
 DECLARE_uint64(cdc_max_stream_intent_records);
 DECLARE_uint32(intents_min_seconds_to_retain);
 DECLARE_uint64(aborted_intent_cleanup_ms);
+DECLARE_bool(TEST_simulate_load_txn_for_cdc);
 
 namespace yb {
 namespace cdc {
@@ -610,7 +615,8 @@ class StreamWalYsqlSecondaryIndexTest : public pgwrapper::PgMiniTestBase {
   }
 
   Result<StreamWalResponsePB> StreamWalForTablet(
-      const TabletId& tablet_id, const StreamWalCursorPB& from) {
+      const TabletId& tablet_id, const StreamWalCursorPB& from,
+      bool consistent_commit_order = false, uint32_t max_records = 0) {
     CDCServiceProxy cdc_proxy(
         &client_->proxy_cache(),
         HostPort::FromBoundEndpoint(cluster_->mini_tablet_server(0)->bound_rpc_addr()));
@@ -618,12 +624,89 @@ class StreamWalYsqlSecondaryIndexTest : public pgwrapper::PgMiniTestBase {
     StreamWalRequestPB req;
     req.set_tablet_id(tablet_id);
     *req.mutable_from_op_id() = from;
+    if (consistent_commit_order) {
+      req.set_consistent_commit_order(true);
+    }
+    if (max_records > 0) {
+      req.set_max_records(max_records);
+    }
 
     StreamWalResponsePB resp;
     rpc::RpcController rpc;
     rpc.set_timeout(MonoDelta::FromSeconds(kRpcTimeoutSec));
     RETURN_NOT_OK(cdc_proxy.StreamWAL(req, &resp, &rpc));
     return resp;
+  }
+
+  // Returns a bad Status iff the DML / BEGIN / COMMIT records are NOT in
+  // non-decreasing commit_time order -- the core consistent-commit-order
+  // guarantee (G1). Bootstrap and other non-commit-bearing records
+  // (commit_time == 0) are ignored, mirroring CDCSDKYsqlTest::CheckRecordsConsistency.
+  static Status CheckCommitTimeNonDecreasing(
+      const std::vector<CDCSDKProtoRecordPB>& records) {
+    uint64_t prev_commit_time = 0;
+    for (const auto& record : records) {
+      if (!record.has_row_message()) continue;
+      const auto& row = record.row_message();
+      switch (row.op()) {
+        case RowMessage_Op_BEGIN:
+        case RowMessage_Op_COMMIT:
+        case RowMessage_Op_INSERT:
+        case RowMessage_Op_UPDATE:
+        case RowMessage_Op_DELETE:
+          SCHECK_GE(
+              row.commit_time(), prev_commit_time, IllegalState,
+              Format(
+                  "consistent_commit_order delivered out-of-order commit_time; record: $0",
+                  record.ShortDebugString()));
+          prev_commit_time = row.commit_time();
+          break;
+        default:
+          break;
+      }
+    }
+    return Status::OK();
+  }
+
+  // Drains a tablet in consistent-commit-order mode from `cursor` until at least
+  // `expected_inserts` base-table INSERT records (matching `table_id`) have been
+  // seen. Accumulates all records, checking the per-batch and cross-batch
+  // commit_time monotonicity invariant as it goes (a violation aborts the drain
+  // with a bad Status rather than hanging). A count-driven stop is required
+  // because, immediately after writers commit, the server legitimately returns
+  // transient empty batches while a committed txn's APPLYING has not yet
+  // materialized in the WAL (the wait_for_wal_update window) -- a "caught up"
+  // stop would race that and miss rows. Returns {all_records, final_cursor}.
+  Result<std::pair<std::vector<CDCSDKProtoRecordPB>, StreamWalCursorPB>>
+  DrainConsistentUntilInserts(
+      const TabletId& tablet_id, StreamWalCursorPB cursor, const TableId& table_id,
+      int expected_inserts, MonoDelta timeout, uint32_t max_records = 0) {
+    std::vector<CDCSDKProtoRecordPB> all;
+    int inserts = 0;
+    RETURN_NOT_OK(WaitFor(
+        [&]() -> Result<bool> {
+          auto resp = VERIFY_RESULT(
+              StreamWalForTablet(tablet_id, cursor, /*consistent_commit_order=*/true, max_records));
+          SCHECK(!resp.has_error(), IllegalState, resp.error().ShortDebugString());
+          std::vector<CDCSDKProtoRecordPB> batch(resp.records().begin(), resp.records().end());
+          RETURN_NOT_OK(CheckCommitTimeNonDecreasing(batch));
+          for (auto& record : batch) {
+            if (record.has_row_message() &&
+                record.row_message().op() == RowMessage_Op_INSERT &&
+                record.row_message().table_id() == table_id) {
+              ++inserts;
+            }
+            all.push_back(std::move(record));
+          }
+          if (resp.has_next_op_id()) {
+            cursor = resp.next_op_id();
+          }
+          return inserts >= expected_inserts;
+        },
+        timeout, "drain StreamWAL in consistent_commit_order mode until N inserts"));
+    // Validate the full concatenated stream is monotonic too.
+    RETURN_NOT_OK(CheckCommitTimeNonDecreasing(all));
+    return std::make_pair(all, cursor);
   }
 
   Result<TabletId> OnlyTabletIdForTable(const TableId& table_id) {
@@ -1168,6 +1251,352 @@ TEST_F(StreamWalYsqlSecondaryIndexTest, CommittedIntentsSurviveCompactionWithinR
   }
   ASSERT_EQ(insert_count, kRowCount)
       << "StreamWAL must still replay every committed row after compaction within the window";
+}
+
+// ---------------------------------------------------------------------------
+// consistent_commit_order mode.
+// ---------------------------------------------------------------------------
+
+// consistent_commit_order populates the commit-time frontier (cursor.commit_ht)
+// and the resolution_safe_time watermark; the DEFAULT (false) mode leaves both
+// unset -- byte-compatible with a pre-feature client.
+TEST_F(StreamWalYsqlSecondaryIndexTest, ConsistentModeSetsCursorAndResolutionFields) {
+  constexpr auto kYsqlTableName = "stream_wal_cc_fields_t";
+  auto conn = ASSERT_RESULT(Connect());
+  // No secondary index -> single-shard (WRITE_OP) autocommit writes.
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 (id INT PRIMARY KEY, v INT) SPLIT INTO 1 TABLETS", kYsqlTableName));
+  const auto table_id = ASSERT_RESULT(GetTableIDFromTableName(kYsqlTableName));
+  const auto tablet_id = ASSERT_RESULT(OnlyTabletIdForTable(table_id));
+
+  // Default (false) skip-to-latest: neither commit_ht nor resolution_safe_time.
+  auto false_tip = ASSERT_RESULT(StreamWalForTablet(tablet_id, kSkipToLatest));
+  ASSERT_FALSE(false_tip.has_error()) << false_tip.error().ShortDebugString();
+  ASSERT_TRUE(false_tip.has_next_op_id());
+  ASSERT_FALSE(false_tip.next_op_id().has_commit_ht())
+      << "false mode must not set commit_ht on the cursor";
+  ASSERT_FALSE(false_tip.has_resolution_safe_time())
+      << "false mode must not set resolution_safe_time";
+
+  // Consistent skip-to-latest: both set.
+  auto cc_tip = ASSERT_RESULT(
+      StreamWalForTablet(tablet_id, kSkipToLatest, /*consistent_commit_order=*/true));
+  ASSERT_FALSE(cc_tip.has_error()) << cc_tip.error().ShortDebugString();
+  ASSERT_TRUE(cc_tip.has_next_op_id());
+  ASSERT_TRUE(cc_tip.next_op_id().has_commit_ht())
+      << "consistent skip-to-latest must stamp the commit_ht frontier";
+  ASSERT_TRUE(cc_tip.has_resolution_safe_time());
+  StreamWalCursorPB cc_cursor = cc_tip.next_op_id();
+
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 VALUES ($1, $1)", kYsqlTableName, i));
+  }
+
+  std::vector<CDCSDKProtoRecordPB> seen;
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        auto resp = VERIFY_RESULT(
+            StreamWalForTablet(tablet_id, cc_cursor, /*consistent_commit_order=*/true));
+        SCHECK(!resp.has_error(), IllegalState, resp.error().ShortDebugString());
+        SCHECK(
+            resp.has_resolution_safe_time(), IllegalState,
+            "every consistent batch must advertise resolution_safe_time");
+        for (const auto& record : resp.records()) {
+          seen.push_back(record);
+        }
+        if (resp.has_next_op_id()) {
+          cc_cursor = resp.next_op_id();
+        }
+        int inserts = 0;
+        for (const auto& r : seen) {
+          if (r.has_row_message() && r.row_message().op() == RowMessage_Op_INSERT) {
+            ++inserts;
+          }
+        }
+        return inserts >= 5;
+      },
+      60s * kTimeMultiplier, "consistent drain of single-shard writes"));
+  ASSERT_OK(CheckCommitTimeNonDecreasing(seen));
+  ASSERT_TRUE(cc_cursor.has_commit_ht())
+      << "commit_ht must advance once records have been delivered";
+
+  // The default-mode path is still byte-clean after consistent traffic: a fresh
+  // false-mode skip-to-latest still sets neither field.
+  auto false_after = ASSERT_RESULT(StreamWalForTablet(tablet_id, kSkipToLatest));
+  ASSERT_FALSE(false_after.has_error()) << false_after.error().ShortDebugString();
+  ASSERT_FALSE(false_after.next_op_id().has_commit_ht());
+  ASSERT_FALSE(false_after.has_resolution_safe_time());
+}
+
+// Concurrent multi-row transactions on an indexed table interleave their
+// APPLYINGs on the base tablet, so WAL order diverges from commit order. The
+// consistent stream must still be non-decreasing in commit_time and deliver
+// every committed row exactly once.
+TEST_F(StreamWalYsqlSecondaryIndexTest, ConsistentModeMonotonicCommitTimeUnderConcurrency) {
+  constexpr auto kYsqlTableName = "stream_wal_cc_concurrent_t";
+  constexpr int kThreads = 3;
+  constexpr int kTxnsPerThread = 10;
+  constexpr int kRowsPerTxn = 3;
+
+  auto setup = ASSERT_RESULT(Connect());
+  ASSERT_OK(setup.ExecuteFormat(
+      "CREATE TABLE $0 (id INT PRIMARY KEY, sku TEXT UNIQUE, v INT) SPLIT INTO 1 TABLETS",
+      kYsqlTableName));
+  const auto table_id = ASSERT_RESULT(GetTableIDFromTableName(kYsqlTableName));
+  const auto tablet_id = ASSERT_RESULT(OnlyTabletIdForTable(table_id));
+
+  auto tip = ASSERT_RESULT(
+      StreamWalForTablet(tablet_id, kSkipToLatest, /*consistent_commit_order=*/true));
+  ASSERT_FALSE(tip.has_error()) << tip.error().ShortDebugString();
+  const StreamWalCursorPB start = tip.next_op_id();
+
+  std::atomic<int> next_id{0};
+  std::mutex err_mu;
+  std::vector<std::string> errors;
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&]() {
+      auto conn_res = Connect();
+      if (!conn_res.ok()) {
+        std::lock_guard<std::mutex> l(err_mu);
+        errors.push_back(conn_res.status().ToString());
+        return;
+      }
+      auto conn = std::move(*conn_res);
+      for (int n = 0; n < kTxnsPerThread; ++n) {
+        Status s = conn.Execute("BEGIN");
+        for (int r = 0; r < kRowsPerTxn && s.ok(); ++r) {
+          const int id = next_id.fetch_add(1);
+          s = conn.ExecuteFormat(
+              "INSERT INTO $0 VALUES ($1, 'sku-$1', $1)", kYsqlTableName, id);
+        }
+        if (s.ok()) {
+          s = conn.Execute("COMMIT");
+        } else {
+          auto rollback_status = conn.Execute("ROLLBACK");
+          (void)rollback_status;
+        }
+        if (!s.ok()) {
+          std::lock_guard<std::mutex> l(err_mu);
+          errors.push_back(s.ToString());
+        }
+      }
+    });
+  }
+  for (auto& th : threads) {
+    th.join();
+  }
+  {
+    std::lock_guard<std::mutex> l(err_mu);
+    ASSERT_TRUE(errors.empty()) << "first writer error: " << errors.front();
+  }
+
+  const int expected_rows = kThreads * kTxnsPerThread * kRowsPerTxn;
+  auto drained = ASSERT_RESULT(DrainConsistentUntilInserts(
+      tablet_id, start, table_id, expected_rows, 120s * kTimeMultiplier));
+  // DrainConsistentUntilInserts already validated commit_time monotonicity
+  // per-batch + overall. Assert exactly-once: the drain stops at the first batch
+  // that reaches expected_rows, so seeing strictly more would mean a duplicate.
+  int inserts = 0;
+  for (const auto& r : drained.first) {
+    if (r.has_row_message() && r.row_message().op() == RowMessage_Op_INSERT &&
+        r.row_message().table_id() == table_id) {
+      ++inserts;
+    }
+  }
+  ASSERT_EQ(inserts, expected_rows)
+      << "every committed row must be delivered exactly once, in commit order";
+}
+
+// Crash/replay: a consumer that persists a mid-stream cursor and resumes must
+// never be re-sent a record at/below that cursor's commit_ht frontier (G5), and
+// the union of what it saw before and after the resume must cover every row
+// exactly once (convergence).
+TEST_F(StreamWalYsqlSecondaryIndexTest, ConsistentModeNoRedeliveryAcrossResume) {
+  constexpr auto kYsqlTableName = "stream_wal_cc_resume_t";
+  constexpr int kRowCount = 30;
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 (id INT PRIMARY KEY, sku TEXT UNIQUE, v INT) SPLIT INTO 1 TABLETS",
+      kYsqlTableName));
+  const auto table_id = ASSERT_RESULT(GetTableIDFromTableName(kYsqlTableName));
+  const auto tablet_id = ASSERT_RESULT(OnlyTabletIdForTable(table_id));
+
+  auto tip = ASSERT_RESULT(
+      StreamWalForTablet(tablet_id, kSkipToLatest, /*consistent_commit_order=*/true));
+  ASSERT_FALSE(tip.has_error()) << tip.error().ShortDebugString();
+  const StreamWalCursorPB start = tip.next_op_id();
+
+  // Many small autocommit transactions (indexed table -> one APPLYING each).
+  for (int i = 0; i < kRowCount; ++i) {
+    ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 VALUES ($1, 'sku-$1', $1)", kYsqlTableName, i));
+  }
+
+  auto count_table_inserts = [&](const std::vector<CDCSDKProtoRecordPB>& recs) {
+    int c = 0;
+    for (const auto& r : recs) {
+      if (r.has_row_message() && r.row_message().op() == RowMessage_Op_INSERT &&
+          r.row_message().table_id() == table_id) {
+        ++c;
+      }
+    }
+    return c;
+  };
+
+  // Phase 1: take one small batch and persist its cursor (consumer applied this
+  // batch durably, then "crashed").
+  StreamWalResponsePB phase1;
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        phase1 = VERIFY_RESULT(StreamWalForTablet(
+            tablet_id, start, /*consistent_commit_order=*/true, /*max_records=*/3));
+        SCHECK(!phase1.has_error(), IllegalState, phase1.error().ShortDebugString());
+        return phase1.records_size() > 0;
+      },
+      60s * kTimeMultiplier, "consistent phase-1 batch"));
+  std::vector<CDCSDKProtoRecordPB> phase1_recs(phase1.records().begin(), phase1.records().end());
+  ASSERT_OK(CheckCommitTimeNonDecreasing(phase1_recs));
+  ASSERT_TRUE(phase1.has_next_op_id());
+  const StreamWalCursorPB persisted = phase1.next_op_id();
+  const uint64_t persisted_commit_ht = persisted.has_commit_ht() ? persisted.commit_ht() : 0;
+  ASSERT_GT(persisted_commit_ht, 0u) << "phase-1 cursor must carry a commit_ht frontier";
+  const int phase1_inserts = count_table_inserts(phase1_recs);
+
+  // Phase 2: resume from the persisted cursor and drain the remaining rows.
+  auto phase2 = ASSERT_RESULT(DrainConsistentUntilInserts(
+      tablet_id, persisted, table_id, kRowCount - phase1_inserts, 90s * kTimeMultiplier));
+  const auto& phase2_recs = phase2.first;
+
+  // G5: nothing at/below the persisted frontier is re-delivered.
+  for (const auto& r : phase2_recs) {
+    if (!r.has_row_message()) continue;
+    const auto& row = r.row_message();
+    if (row.op() == RowMessage_Op_BEGIN || row.op() == RowMessage_Op_COMMIT ||
+        row.op() == RowMessage_Op_INSERT) {
+      ASSERT_GT(row.commit_time(), persisted_commit_ht)
+          << "resume re-delivered a record at/below the persisted commit_ht frontier: "
+          << r.ShortDebugString();
+    }
+  }
+
+  // Convergence: phase1 + phase2 cover every row exactly once (no loss, no dup).
+  ASSERT_EQ(phase1_inserts + count_table_inserts(phase2_recs), kRowCount)
+      << "the union across the resume boundary must contain every row exactly once";
+}
+
+// While transactions are still loading on the tablet the watermark is invalid:
+// consistent mode returns an empty, non-advancing batch with resolution_safe_time
+// unset.
+TEST_F(StreamWalYsqlSecondaryIndexTest, ConsistentModeLoadingReturnsEmpty) {
+  constexpr auto kYsqlTableName = "stream_wal_cc_load_t";
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 (id INT PRIMARY KEY, sku TEXT UNIQUE, v INT) SPLIT INTO 1 TABLETS",
+      kYsqlTableName));
+  const auto table_id = ASSERT_RESULT(GetTableIDFromTableName(kYsqlTableName));
+  const auto tablet_id = ASSERT_RESULT(OnlyTabletIdForTable(table_id));
+
+  auto tip = ASSERT_RESULT(
+      StreamWalForTablet(tablet_id, kSkipToLatest, /*consistent_commit_order=*/true));
+  ASSERT_FALSE(tip.has_error()) << tip.error().ShortDebugString();
+  const StreamWalCursorPB cursor = tip.next_op_id();
+
+  ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 VALUES (1, 'sku-1', 1)", kYsqlTableName));
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_simulate_load_txn_for_cdc) = true;
+  auto resp = ASSERT_RESULT(
+      StreamWalForTablet(tablet_id, cursor, /*consistent_commit_order=*/true));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_simulate_load_txn_for_cdc) = false;
+
+  ASSERT_FALSE(resp.has_error()) << resp.error().ShortDebugString();
+  ASSERT_EQ(resp.records_size(), 0) << "loading must yield an empty batch";
+  ASSERT_FALSE(resp.has_more());
+  ASSERT_FALSE(resp.has_resolution_safe_time())
+      << "resolution_safe_time must be unset while transactions are loading";
+  // Cursor unchanged (no progress).
+  ASSERT_EQ(resp.next_op_id().term(), cursor.term());
+  ASSERT_EQ(resp.next_op_id().index(), cursor.index());
+}
+
+// A transaction whose intents exceed the per-call intent budget spills across
+// batches in consistent mode too: the cursor carries intent_key/intent_write_id,
+// and -- crucially -- commit_ht must NOT advance past the spilling txn's
+// commit_time until its COMMIT envelope has been delivered (G8).
+TEST_F(StreamWalYsqlSecondaryIndexTest, ConsistentModeSpilledApplyingHoldsCommitHtUntilCommit) {
+  constexpr auto kYsqlTableName = "stream_wal_cc_spill_t";
+  constexpr int kRowCount = 20;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cdc_max_stream_intent_records) = 3;
+
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 (id INT PRIMARY KEY, sku TEXT UNIQUE, v INT) SPLIT INTO 1 TABLETS",
+      kYsqlTableName));
+  const auto table_id = ASSERT_RESULT(GetTableIDFromTableName(kYsqlTableName));
+  const auto tablet_id = ASSERT_RESULT(OnlyTabletIdForTable(table_id));
+
+  auto tip = ASSERT_RESULT(
+      StreamWalForTablet(tablet_id, kSkipToLatest, /*consistent_commit_order=*/true));
+  ASSERT_FALSE(tip.has_error()) << tip.error().ShortDebugString();
+  StreamWalCursorPB cursor = tip.next_op_id();
+
+  // One big multi-row transaction -> APPLYING with many intents -> spills.
+  ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+  for (int i = 0; i < kRowCount; ++i) {
+    ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 VALUES ($1, 'sku-$1', $1)", kYsqlTableName, i));
+  }
+  ASSERT_OK(conn.CommitTransaction());
+
+  std::vector<CDCSDKProtoRecordPB> seen;
+  bool saw_spill = false;
+  uint64_t txn_commit_time = 0;
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        auto resp = VERIFY_RESULT(
+            StreamWalForTablet(tablet_id, cursor, /*consistent_commit_order=*/true));
+        SCHECK(!resp.has_error(), IllegalState, resp.error().ShortDebugString());
+        std::vector<CDCSDKProtoRecordPB> batch(resp.records().begin(), resp.records().end());
+        RETURN_NOT_OK(CheckCommitTimeNonDecreasing(batch));
+
+        bool batch_has_commit = false;
+        for (auto& r : batch) {
+          if (r.has_row_message() && r.row_message().op() == RowMessage_Op_BEGIN) {
+            txn_commit_time = r.row_message().commit_time();
+          }
+          if (r.has_row_message() && r.row_message().op() == RowMessage_Op_COMMIT) {
+            batch_has_commit = true;
+          }
+          seen.push_back(std::move(r));
+        }
+
+        const auto& next = resp.next_op_id();
+        if (next.has_intent_key() && next.has_intent_write_id()) {
+          saw_spill = true;
+          SCHECK(resp.has_more(), IllegalState, "a spilled APPLYING must set has_more=true");
+          if (next.has_commit_ht() && txn_commit_time > 0) {
+            SCHECK(
+                next.commit_ht() < txn_commit_time, IllegalState,
+                "commit_ht must not advance past a spilling txn before its COMMIT");
+          }
+        }
+        cursor = next;
+        return batch_has_commit;  // the only txn here is the big spilling one.
+      },
+      90s * kTimeMultiplier, "drain spilled APPLYING in consistent mode"));
+
+  ASSERT_TRUE(saw_spill) << "expected the large txn to spill across batches";
+  ASSERT_GT(txn_commit_time, 0u);
+  ASSERT_TRUE(cursor.has_commit_ht());
+  ASSERT_GE(cursor.commit_ht(), txn_commit_time)
+      << "commit_ht must advance to the txn's commit_time once COMMIT is delivered";
+
+  int inserts = 0;
+  for (const auto& r : seen) {
+    if (r.has_row_message() && r.row_message().op() == RowMessage_Op_INSERT &&
+        r.row_message().table_id() == table_id) {
+      ++inserts;
+    }
+  }
+  ASSERT_EQ(inserts, kRowCount) << "every committed row must be delivered exactly once";
 }
 
 }  // namespace cdc

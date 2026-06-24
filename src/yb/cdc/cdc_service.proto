@@ -669,6 +669,29 @@ message StreamWalCursorPB {
   // scan one position past this point.
   optional bytes  intent_key      = 3;
   optional uint32 intent_write_id = 4;
+
+  // CONSISTENT-COMMIT-ORDER MODE ONLY (StreamWalRequestPB.consistent_commit_order
+  // == true). Commit-time frontier: the server has delivered every record on
+  // this tablet with commit_time <= commit_ht. On resume the server SKIPS any
+  // record whose commit_time <= commit_ht (already delivered) and only ships
+  // records with a strictly greater commit_time, in commit-time order.
+  //
+  // This field, paired with (term, index), forms the COMPOSITE cursor that lets
+  // a consumer apply records on arrival with no client-side reorder buffer and
+  // no dedup state:
+  //   - (term, index) is the WAL re-read FLOOR (where the server resumes the
+  //     WAL scan) and the retention point.
+  //   - commit_ht is the dedup FRONTIER (what has been durably delivered).
+  //
+  // The frontier never advances across a same-commit_time tie group: commit_ht
+  // only moves past a given commit_time value once ALL records at that value
+  // have been delivered (so multi-shard transactions are never split).
+  //
+  // Opaque to clients: echo next_op_id verbatim; never construct, compare, or
+  // interpret commit_ht. Unset / 0 when consistent_commit_order is false and at
+  // bootstrap ({0,0} / {-1,-1}). Composes with intent_key / intent_write_id for
+  // a spilled APPLYING that straddles batches.
+  optional fixed64 commit_ht = 5;
 }
 
 message StreamWalRequestPB {
@@ -695,6 +718,30 @@ message StreamWalRequestPB {
   // Capped server-side by cdcsdk_wal_reads_deadline_buffer_secs.
   // v1 default: 0.
   optional uint32 deadline_ms = 5 [default = 0];
+
+  // OPTIONAL, per-request consistent-commit-order mode.
+  //
+  // false (DEFAULT) -> the server delivers committed records in WAL (apply)
+  //   order, exactly as it always has. commit_ht on the cursor is ignored,
+  //   next_op_id.commit_ht is never set, and resolution_safe_time is never set.
+  //   The wire behavior is byte-for-byte identical to a request that omits this
+  //   field. A stray from_op_id.commit_ht on a false-mode request is IGNORED
+  //   (not an error).
+  //
+  // true -> the server delivers committed records in COMMIT-TIME order, gated
+  //   behind the per-tablet resolution watermark (resolution_safe_time), using
+  //   the COMPOSITE cursor (WAL floor + commit_ht; see StreamWalCursorPB). This
+  //   lets a blind / idempotent consumer (e.g. last-write-wins reverse
+  //   replication) apply records on arrival with no reorder buffer and no dedup
+  //   state. Per-tablet ordering only; cross-tablet ordering is NOT provided.
+  //
+  // NOTE: This is intentionally NOT named after the global gflag
+  // FLAGS_cdc_enable_consistent_records. It is a per-REQUEST toggle, fully
+  // independent of that gflag: the consistent-order codepath reuses only the
+  // GetChanges helpers that do not consult it, and reimplements the flag-gated
+  // floor / frontier advance locally. (The legacy GetChanges path continues to
+  // use the gflag; this RPC neither reads nor changes it.)
+  optional bool consistent_commit_order = 6 [default = false];
 }
 
 message StreamWalResponsePB {
@@ -702,10 +749,13 @@ message StreamWalResponsePB {
   // `tablet_consensus_info` are populated. All other fields are unset.
   optional CDCErrorPB error = 1;
 
-  // Decoded records in strict WAL order: monotonically increasing
-  // (cdc_sdk_op_id.term, cdc_sdk_op_id.index, cdc_sdk_op_id.write_id).
-  // Includes synthetic bootstrap DDLs at the front of the batch when
-  // applicable; see the contract's "Synthetic DDL bootstrap" section.
+  // Decoded records. In the DEFAULT mode (consistent_commit_order == false)
+  // these are in strict WAL order: monotonically increasing
+  // (cdc_sdk_op_id.term, cdc_sdk_op_id.index, cdc_sdk_op_id.write_id). In
+  // consistent-commit-order mode they are in non-decreasing commit_time order
+  // (cdc_sdk_op_id is still populated per record, but is NOT monotonic across
+  // the batch). Either way, synthetic bootstrap DDLs appear at the front of the
+  // batch when applicable; see the contract's "Synthetic DDL bootstrap" section.
   repeated CDCSDKProtoRecordPB records = 2;
 
   // REQUIRED on success (including empty success batches). Cursor to pass
@@ -717,6 +767,9 @@ message StreamWalResponsePB {
   //     bootstrap.
   //   - If `records` is empty, next_op_id == the request's from_op_id
   //     (no progress).
+  // In consistent-commit-order mode next_op_id is the COMPOSITE cursor: its
+  // (term, index) is the WAL re-read floor and commit_ht is the advanced
+  // commit-time frontier (see StreamWalCursorPB.commit_ht).
   optional StreamWalCursorPB next_op_id = 3;
 
   // REQUIRED on success. Last replicated OpId on the leader at the moment
@@ -739,6 +792,18 @@ message StreamWalResponsePB {
   // Populated only when error.code == LEADER_NOT_READY. Lets the client
   // refresh its meta-cache without going to master.
   optional yb.tserver.TabletConsensusInfoPB tablet_consensus_info = 7;
+
+  // CONSISTENT-COMMIT-ORDER MODE ONLY. The per-tablet resolution watermark
+  // (HybridTime) the server gated this batch on -- equivalent to the consistent
+  // stream safe time used by GetChangesForCDCSDK. Every committed record with
+  // commit_time <= resolution_safe_time has been delivered at or before this
+  // response; no record with commit_time <= resolution_safe_time will ever be
+  // delivered after the cursor advances past it.
+  //
+  // Informational to the consumer in this mode (the server has already withheld
+  // unsafe records); useful for convergence-lag monitoring. Left UNSET in
+  // non-consistent mode and while transactions are still loading on the tablet.
+  optional fixed64 resolution_safe_time = 8;
 }
 
 message GetChangesResponsePB {

@@ -3865,4 +3865,373 @@ Status DispatchApplyingForStreamWAL(
       applying_msg, ctx, resume_state, out_records, out);
 }
 
+// ----------------------------------------------------------------------------
+// StreamWAL consistent-commit-order driver.
+//
+// Produces a batch of committed records in non-decreasing commit_time order,
+// gated behind the per-tablet resolution watermark, plus the composite resume
+// cursor (WAL floor + commit_ht + optional mid-APPLYING spill). It mirrors the
+// consistent branch of GetChangesForCDCSDK but emits via the StreamWAL decoder
+// dispatch and packages a StreamWalCursorPB-shaped cursor. It REUSES the
+// existing consistent-streaming helpers verbatim; it does not modify them.
+// ----------------------------------------------------------------------------
+namespace {
+
+// Find the position of the WAL op with the given (term, index) inside the
+// commit-sorted window. Returns wal_records.size() if not present.
+size_t FindOpIndexInSortedWindow(
+    const std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& wal_records,
+    const OpId& op_id) {
+  for (size_t i = 0; i < wal_records.size(); ++i) {
+    if (wal_records[i]->id().term() == op_id.term &&
+        wal_records[i]->id().index() == op_id.index) {
+      return i;
+    }
+  }
+  return wal_records.size();
+}
+
+// StreamWAL-local commit-time frontier advance.
+//
+// Mirrors the consistent branch of UpdateSafetimeForResponse, intentionally
+// WITHOUT the FLAGS_cdc_enable_consistent_records dependency: StreamWAL's
+// consistent_commit_order is a PER-REQUEST mode and must not consult the global
+// gflag. `should_advance` comes from ShouldUpdateSafeTime (the tie-group guard,
+// which is itself flag-independent and reused as-is) -- it is false when
+// advancing the frontier to this record's commit_time would split a group of
+// records sharing that commit_time. `skip_frontier` is the request cursor's
+// commit_ht (records at/below it are already delivered).
+void StreamWalAdvanceFrontier(
+    const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg, bool should_advance,
+    uint64_t skip_frontier, HybridTime* frontier) {
+  if (!should_advance) {
+    return;
+  }
+  const uint64_t commit_time = GetTransactionCommitTime(msg);
+  if (commit_time >= skip_frontier &&
+      (!frontier->is_valid() || frontier->ToUint64() < commit_time)) {
+    *frontier = HybridTime(commit_time);
+  }
+}
+
+// StreamWAL-local WAL floor advance.
+//
+// Mirrors the consistent branch of CanUpdateCheckpointOpId, intentionally
+// WITHOUT the FLAGS_cdc_enable_consistent_records dependency and WITHOUT the
+// GetChanges wal_segment_index bookkeeping. Advances `next_checkpoint_index`
+// through the WAL-ordered `all_checkpoints` past every op whose commit_time is
+// below `msg`'s (already delivered, since we walk records in commit order) or
+// whose WAL index equals `msg`'s, then pins `floor` to the last such op. The
+// floor is therefore the largest WAL op all of whose commit-time predecessors
+// have been delivered -- the safe WAL re-read point. Called for both shipped and
+// skipped (already-delivered) records, exactly as GetChangesForCDCSDK calls
+// AcknowledgeStreamedMsg in both cases.
+void StreamWalAdvanceFloor(
+    const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg, size_t* next_checkpoint_index,
+    const std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& all_checkpoints,
+    OpId* floor) {
+  const uint64_t msg_commit_time = GetTransactionCommitTime(msg);
+  while (*next_checkpoint_index < all_checkpoints.size() &&
+         ((GetTransactionCommitTime(all_checkpoints[*next_checkpoint_index]) < msg_commit_time) ||
+          (all_checkpoints[*next_checkpoint_index]->id().index() == msg->id().index()))) {
+    ++(*next_checkpoint_index);
+  }
+  if (*next_checkpoint_index > 0) {
+    const auto& cp = all_checkpoints[*next_checkpoint_index - 1];
+    *floor = OpId(cp->id().term(), cp->id().index());
+  }
+}
+
+}  // namespace
+
+Status GetConsistentChangesForStreamWAL(
+    const StreamWalConsistentInput& input,
+    StreamWalDecodeContext* ctx,
+    StreamWalConsistentOutput* output) {
+  // Mirror GetChangesForCDCSDK: free the per-call QLValuePB decode arena on exit.
+  auto scope_exit = ScopeExit([&] { docdb::DeleteMemoryContextForCDCWrapper(); });
+
+  RSTATUS_DCHECK(ctx, InvalidArgument, "ctx must be non-null");
+  RSTATUS_DCHECK(ctx->tablet_peer, InvalidArgument, "ctx->tablet_peer must be non-null");
+  RSTATUS_DCHECK(ctx->stream_metadata, InvalidArgument, "ctx->stream_metadata must be non-null");
+  RSTATUS_DCHECK(output, InvalidArgument, "output must be non-null");
+
+  auto& tablet_peer = ctx->tablet_peer;
+  auto tablet_ptr = VERIFY_RESULT(tablet_peer->shared_tablet());
+
+  // The request cursor's commit_ht is the skip frontier: every record with
+  // commit_time <= it is already delivered. It also feeds GetConsistentStreamSafeTime
+  // / GetConsistentWALRecords as their 'safe_hybrid_time_req' input. NOTE: those
+  // reused helpers, GetConsistentStreamSafeTime, SortConsistentWALRecords and
+  // ShouldUpdateSafeTime are all INDEPENDENT of FLAGS_cdc_enable_consistent_records;
+  // the floor / frontier advance (the only flag-gated logic in GetChanges) is
+  // reimplemented locally above (StreamWalAdvanceFloor / StreamWalAdvanceFrontier),
+  // so consistent_commit_order is a true per-request mode with no global-flag
+  // coupling.
+  const int64_t safe_hybrid_time_req = static_cast<int64_t>(input.commit_ht_skip);
+
+  // StreamWAL does not key memory tracking by stream id; the msgs_holder keeps
+  // the decoded messages alive for the duration of this call.
+  const MemTrackerPtr mem_tracker = nullptr;
+
+  // Default the cursor to "no progress" (round-trip the request cursor). The
+  // branches below overwrite these when the batch makes progress.
+  output->next_floor = input.floor;
+  output->next_commit_ht = input.commit_ht_skip;
+  output->mid_applying = input.resuming_spilled;
+  output->next_intent_key = input.resume_intent_key;
+  output->next_intent_write_id = input.resume_intent_write_id;
+
+  // ---- Step 1: resolution watermark W. ----
+  bool txn_load_in_progress = false;
+  uint64_t consistent_stream_safe_time = VERIFY_RESULT(GetConsistentStreamSafeTime(
+      tablet_peer, tablet_ptr, input.leader_safe_time, safe_hybrid_time_req, input.deadline,
+      &txn_load_in_progress));
+
+  if (txn_load_in_progress) {
+    // W is invalid; do not advance, do not set resolution_safe_time.
+    output->txn_load_in_progress = true;
+    output->resolution_safe_time_set = false;
+    output->has_more = false;
+    return Status::OK();
+  }
+
+  const OpId historical_max_op_id =
+      tablet_ptr->transaction_participant()
+          ? tablet_ptr->transaction_participant()->GetHistoricalMaxOpId()
+          : OpId::Invalid();
+
+  // ---- Step 2: bounded WAL read starting at the floor. ----
+  consensus::ReplicateMsgsHolder msgs_holder;
+  ScopedTrackedConsumption consumption;
+  std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>> wal_records, all_checkpoints;
+  bool wait_for_wal_update = false;
+  bool is_entire_wal_read = false;
+  HybridTime last_read_wal_op_record_time = HybridTime::kInvalid;
+  int64_t last_readable_opid_index = 0;
+  // The WAL reader returns ops strictly after last_seen_op_id. To re-fetch a
+  // spilled APPLYING (whose own op-id IS the floor) we must read from one index
+  // earlier, exactly as the WAL-order StreamWAL resume does. For a normal read
+  // the floor is the last delivered op, so reading strictly after it is correct.
+  OpId last_seen_op_id = input.resuming_spilled
+                             ? OpId(input.floor.term, std::max<int64_t>(input.floor.index - 1, 0))
+                             : input.floor;
+
+  RETURN_NOT_OK(GetConsistentWALRecords(
+      tablet_peer, mem_tracker, &msgs_holder, &consumption, &consistent_stream_safe_time,
+      historical_max_op_id, &wait_for_wal_update, &last_seen_op_id, last_readable_opid_index,
+      safe_hybrid_time_req, input.deadline, &wal_records, &all_checkpoints,
+      &last_read_wal_op_record_time, &is_entire_wal_read));
+
+  // W is valid from here on; advertise it.
+  output->resolution_safe_time = consistent_stream_safe_time;
+  output->resolution_safe_time_set = true;
+
+  if (wait_for_wal_update || wal_records.empty()) {
+    // The WAL is not yet up to date with all committed transactions (an open
+    // txn pins the watermark, or there are replicated-but-not-committed ops), or
+    // there is simply nothing to read. Return an empty, non-advancing batch.
+    // read_window_empty distinguishes "genuinely nothing in the WAL" (so a
+    // {0,0} caller can be advanced to the tip) from "waiting on a pending txn"
+    // (where the cursor must stay put).
+    output->read_window_empty = !wait_for_wal_update;
+    output->has_more = false;
+    return Status::OK();
+  }
+
+  // No snapshot concept in StreamWAL: the skip threshold is exactly the request
+  // frontier (GetCommitTimeThreshold(nullopt, req) would return the same value).
+  const uint64_t commit_time_threshold = input.commit_ht_skip;
+
+  // Composite-cursor bookkeeping, computed via the StreamWAL-local advance
+  // helpers (no global-flag dependency, no GetChanges wal_segment_index).
+  //   cursor_floor  -> next_op_id.{term,index} (the WAL re-read point)
+  //   frontier      -> the highest commit_time C such that every record with
+  //                    commit_time <= C has been delivered (a clean tie boundary)
+  OpId cursor_floor = input.floor;
+  size_t next_checkpoint_index = 0;
+  HybridTime frontier = HybridTime::kInvalid;
+
+  uint64_t current_bytes = 0;
+  bool broke_on_size_cap = false;
+  bool stopped_on_watermark = false;
+  bool pending_spill = false;
+  OpId spill_op_id;
+  StreamWalIntentResumeState spill_state;
+
+  // ---- Mid-APPLYING spill resume. ----
+  // The floor points at an UPDATE_TRANSACTION_OP { APPLYING } whose intents did
+  // not fit in a prior batch. Resume only that transaction (mirrors the
+  // GetChangesForCDCSDK partial-txn branch); the next call's normal loop picks
+  // up subsequent records.
+  if (input.resuming_spilled) {
+    const size_t applying_idx = FindOpIndexInSortedWindow(wal_records, input.floor);
+    if (applying_idx == wal_records.size()) {
+      // The APPLYING is not in the read window yet (e.g. the WAL was trimmed to
+      // a later segment). Treat as no-progress so the client retries.
+      output->has_more = false;
+      return Status::OK();
+    }
+    const auto& applying_msg = wal_records[applying_idx];
+    RSTATUS_DCHECK(
+        IsUpdateTransactionOp(applying_msg) &&
+            applying_msg->transaction_state().status() == TransactionStatus::APPLYING,
+        InvalidArgument,
+        Format(
+            "StreamWAL consistent resume: op at floor $0 is not an APPLYING", input.floor));
+
+    StreamWalIntentResumeState resume_state;
+    resume_state.intent_key = input.resume_intent_key;
+    resume_state.intent_write_id = input.resume_intent_write_id;
+
+    std::vector<CDCSDKProtoRecordPB> emitted;
+    StreamWalDispatchResult dispatch_result;
+    RETURN_NOT_OK(DispatchApplyingForStreamWAL(
+        applying_msg, ctx, &resume_state, &emitted, &dispatch_result));
+    for (auto& rec : emitted) {
+      output->records.emplace_back();
+      output->records.back().Swap(&rec);
+    }
+
+    if (dispatch_result.kind == StreamWalDispatchResult::Kind::kApplyingSpilled) {
+      // Still spilling: cursor stays at the APPLYING, commit_ht unchanged.
+      output->mid_applying = true;
+      output->next_floor = input.floor;
+      DCHECK(dispatch_result.mid_applying_resume.has_value());
+      output->next_intent_key = dispatch_result.mid_applying_resume->intent_key;
+      output->next_intent_write_id = dispatch_result.mid_applying_resume->intent_write_id;
+      output->next_commit_ht = input.commit_ht_skip;
+      output->has_more = true;
+      return Status::OK();
+    }
+
+    // Drained. Advance the floor to the APPLYING op and the commit-time frontier
+    // past the transaction's commit_time -- but only if no other record in the
+    // window shares that commit_time (ShouldUpdateSafeTime guards the tie group).
+    output->mid_applying = false;
+    output->next_intent_key.clear();
+    output->next_intent_write_id = 0;
+    output->next_floor = OpId(input.floor.term, input.floor.index);
+    if (ShouldUpdateSafeTime(wal_records, applying_idx)) {
+      output->next_commit_ht =
+          std::max<uint64_t>(input.commit_ht_skip, GetTransactionCommitTime(applying_msg));
+    } else {
+      output->next_commit_ht = input.commit_ht_skip;
+    }
+    // More records very likely remain immediately after the resumed txn.
+    output->has_more = true;
+    return Status::OK();
+  }
+
+  // ---- Normal commit-ordered loop over the sorted window. ----
+  for (size_t index = 0; index < wal_records.size(); ++index) {
+    // Soft batch caps. The first record always ships (current_bytes starts 0,
+    // records starts empty), so a single oversized record is never truncated.
+    if (output->records.size() >= input.max_records || current_bytes >= input.max_bytes) {
+      broke_on_size_cap = true;
+      break;
+    }
+
+    const auto& msg = wal_records[index];
+    const uint64_t msg_commit_time = GetTransactionCommitTime(msg);
+
+    // Skip records already delivered (<= the request frontier), except SPLIT_OP
+    // which can carry a commit_time below the frontier yet still needs to be
+    // reported. Mirrors GetChangesForCDCSDK's commit_time_threshold skip. The
+    // floor still advances past the skipped op (so we don't re-read it).
+    if (msg_commit_time <= commit_time_threshold &&
+        msg->op_type() != consensus::OperationType::SPLIT_OP) {
+      // Already delivered: advance the floor past it (so we don't re-read it),
+      // but do NOT advance the frontier (it is already covered by commit_ht_skip).
+      StreamWalAdvanceFloor(msg, &next_checkpoint_index, all_checkpoints, &cursor_floor);
+      continue;
+    }
+
+    // Stop at the first record above the watermark; it is not yet safe to ship.
+    if (msg_commit_time > consistent_stream_safe_time) {
+      stopped_on_watermark = true;
+      break;
+    }
+
+    std::vector<CDCSDKProtoRecordPB> emitted;
+    auto dispatch_or = DispatchWalOpForStreamWAL(msg, ctx, &emitted);
+    RETURN_NOT_OK(dispatch_or);
+    const StreamWalDispatchResult dispatch_result = *dispatch_or;
+
+    for (auto& rec : emitted) {
+      current_bytes += rec.ByteSizeLong();
+      output->records.emplace_back();
+      output->records.back().Swap(&rec);
+    }
+
+    if (dispatch_result.kind == StreamWalDispatchResult::Kind::kApplyingSpilled) {
+      // The transaction's intents did not fit in this batch. Do not advance the
+      // floor or commit_ht past it; the cursor pins to this APPLYING.
+      pending_spill = true;
+      spill_op_id = OpId(msg->id().term(), msg->id().index());
+      DCHECK(dispatch_result.mid_applying_resume.has_value());
+      spill_state = *dispatch_result.mid_applying_resume;
+      break;
+    }
+
+    if (dispatch_result.kind == StreamWalDispatchResult::Kind::kSplitTerminal) {
+      // SPLIT_OP for this tablet: terminal record. Advance the floor past it so
+      // the next call observes TABLET_DATA_SPLIT_COMPLETED and returns
+      // TABLET_SPLIT.
+      StreamWalAdvanceFrontier(
+          msg, ShouldUpdateSafeTime(wal_records, index), input.commit_ht_skip, &frontier);
+      StreamWalAdvanceFloor(msg, &next_checkpoint_index, all_checkpoints, &cursor_floor);
+      output->saw_split = true;
+      break;
+    }
+
+    // Normal record(s): advance the floor + commit-time frontier in commit order.
+    // ShouldUpdateSafeTime gates the frontier so it never lands inside a group of
+    // records sharing one commit_time (a multi-shard txn or a same-time tie).
+    StreamWalAdvanceFrontier(
+        msg, ShouldUpdateSafeTime(wal_records, index), input.commit_ht_skip, &frontier);
+    StreamWalAdvanceFloor(msg, &next_checkpoint_index, all_checkpoints, &cursor_floor);
+  }
+
+  // ---- Build the composite cursor. ----
+  if (pending_spill) {
+    output->mid_applying = true;
+    output->next_floor = spill_op_id;
+    output->next_intent_key = spill_state.intent_key;
+    output->next_intent_write_id = spill_state.intent_write_id;
+    // commit_ht stays at the request frontier until the txn's COMMIT ships.
+    output->next_commit_ht = input.commit_ht_skip;
+    output->has_more = true;
+    return Status::OK();
+  }
+
+  output->mid_applying = false;
+  output->next_intent_key.clear();
+  output->next_intent_write_id = 0;
+  // cursor_floor advanced in-place via StreamWalAdvanceFloor (or stayed at
+  // input.floor if nothing was consumed).
+  output->next_floor = cursor_floor;
+
+  // Commit-time frontier:
+  //   - frontier valid  -> the last clean tie-group boundary we shipped up to.
+  //   - frontier invalid && we did NOT stop on a size cap -> we
+  //     drained/skipped everything <= W cleanly, so advance to W.
+  //   - frontier invalid && we DID stop on a size cap -> we shipped a partial
+  //     same-commit_time group with no clean boundary yet; do NOT advance past
+  //     the request frontier (the remainder is re-shipped next call). This is
+  //     stricter than GetChanges' GetCDCSDKSafeTimeForTarget, which would
+  //     unconditionally fall back to W and risk skipping the undelivered tail.
+  if (frontier.is_valid()) {
+    output->next_commit_ht = std::max<uint64_t>(input.commit_ht_skip, frontier.ToUint64());
+  } else if (!broke_on_size_cap) {
+    output->next_commit_ht = std::max<uint64_t>(input.commit_ht_skip, consistent_stream_safe_time);
+  } else {
+    output->next_commit_ht = input.commit_ht_skip;
+  }
+
+  output->stopped_on_watermark = stopped_on_watermark;
+  output->has_more = broke_on_size_cap;
+  return Status::OK();
+}
+
 } // namespace yb::cdc

@@ -61,6 +61,18 @@ public class StreamWalRequest extends YRpc<StreamWalResponse> {
    * rather than {@code int} so we can keep the unset state distinct from a real write_id of 0.
    */
   private final Integer fromIntentWriteId;
+  /**
+   * When {@code true}, request commit-time-ordered, watermark-gated delivery
+   * (sets {@code StreamWalRequestPB.consistent_commit_order}). Default {@code false}
+   * preserves WAL-order delivery byte-for-byte.
+   */
+  private final boolean consistentCommitOrder;
+  /**
+   * Consistent-mode commit-time frontier ({@code StreamWalCursorPB.commit_ht}); {@code null}
+   * when unset (WAL-order mode or bootstrap). Opaque to clients: round-trip the value the
+   * server returned in {@code next_op_id}.
+   */
+  private final Long fromCommitHt;
   private final int maxRecords;
   private final long maxBytes;
   private final int deadlineMs;
@@ -108,12 +120,36 @@ public class StreamWalRequest extends YRpc<StreamWalResponse> {
                           int maxRecords,
                           long maxBytes,
                           int deadlineMs) {
+    this(table, tabletId, fromTerm, fromIndex, fromIntentKey, fromIntentWriteId,
+        /*consistentCommitOrder=*/ false, /*fromCommitHt=*/ null, maxRecords, maxBytes, deadlineMs);
+  }
+
+  /**
+   * Fullest constructor, additionally exposing the consistent-commit-order mode toggle and the
+   * commit-time frontier. Pass {@code consistentCommitOrder=false} and {@code fromCommitHt=null}
+   * for the default WAL-order behavior. In consistent mode {@code fromCommitHt} is the opaque
+   * frontier echoed from the prior response's {@code next_op_id}; pass {@code null} at bootstrap
+   * ({@code (0,0)} / {@code (-1,-1)}).
+   */
+  public StreamWalRequest(YBTable table,
+                          String tabletId,
+                          long fromTerm,
+                          long fromIndex,
+                          ByteString fromIntentKey,
+                          Integer fromIntentWriteId,
+                          boolean consistentCommitOrder,
+                          Long fromCommitHt,
+                          int maxRecords,
+                          long maxBytes,
+                          int deadlineMs) {
     super(table);
     this.tabletId = tabletId;
     this.fromTerm = fromTerm;
     this.fromIndex = fromIndex;
     this.fromIntentKey = fromIntentKey;
     this.fromIntentWriteId = fromIntentWriteId;
+    this.consistentCommitOrder = consistentCommitOrder;
+    this.fromCommitHt = fromCommitHt;
     this.maxRecords = maxRecords;
     this.maxBytes = maxBytes;
     this.deadlineMs = deadlineMs;
@@ -138,7 +174,17 @@ public class StreamWalRequest extends YRpc<StreamWalResponse> {
     if (this.fromIntentWriteId != null) {
       cursorBuilder.setIntentWriteId(this.fromIntentWriteId);
     }
+    // Consistent-mode commit-time frontier. Only set when present; in WAL-order mode the field
+    // is left unset so the request is byte-identical to a pre-feature client.
+    if (this.fromCommitHt != null) {
+      cursorBuilder.setCommitHt(this.fromCommitHt);
+    }
     builder.setFromOpId(cursorBuilder.build());
+
+    // Per-request consistent-commit-order toggle. Left unset (default false) for WAL-order mode.
+    if (this.consistentCommitOrder) {
+      builder.setConsistentCommitOrder(true);
+    }
 
     if (this.maxRecords > 0) {
       builder.setMaxRecords(this.maxRecords);

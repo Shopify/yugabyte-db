@@ -365,6 +365,20 @@ class CDCServiceImpl : public CDCServiceIf {
   }
 
  private:
+  // Consistent-commit-order branch of StreamWAL (request.consistent_commit_order
+  // == true). Handles bootstrap / skip-to-latest, drives
+  // cdc::GetConsistentChangesForStreamWAL, and packages the response. The
+  // default (WAL-order) StreamWAL path is left byte-for-byte unchanged; the
+  // public StreamWAL handler simply forks here and returns when the flag is set.
+  void HandleStreamWALConsistentCommitOrder(
+      const StreamWalRequestPB* req,
+      StreamWalResponsePB* resp,
+      rpc::RpcContext* context,
+      const std::shared_ptr<tablet::TabletPeer>& tablet_peer,
+      const tablet::TabletPtr& tablet_ptr,
+      const OpId& leader_tip_op_id,
+      HybridTime leader_safe_time);
+
   friend class XClusterProducerBootstrap;
   friend class CDCSDKVirtualWAL;
   FRIEND_TEST(CDCServiceTest, TestMetricsOnDeletedReplication);

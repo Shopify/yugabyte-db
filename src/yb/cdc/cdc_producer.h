@@ -259,5 +259,103 @@ Status DispatchApplyingForStreamWAL(
     std::vector<CDCSDKProtoRecordPB>* out_records,
     StreamWalDispatchResult* out);
 
+//
+// StreamWAL consistent-commit-order driver.
+//
+// Used exclusively by CDCServiceImpl::StreamWAL when a request sets
+// consistent_commit_order = true. It produces a batch of COMMITTED records in
+// non-decreasing commit_time order, gated behind the per-tablet resolution
+// watermark, plus the COMPOSITE resume cursor (WAL floor + commit_ht + optional
+// mid-APPLYING spill position).
+//
+// It REUSES the existing GetChangesForCDCSDK consistent-streaming helpers that
+// are INDEPENDENT of the global FLAGS_cdc_enable_consistent_records gflag --
+// GetConsistentStreamSafeTime (watermark), GetConsistentWALRecords (segment read
+// + wait_for_wal_update + commit sort), SortConsistentWALRecords, and
+// ShouldUpdateSafeTime (the tie-group guard) -- plus the StreamWAL decoder
+// dispatch above. It does NOT reuse the flag-gated GetChanges checkpoint /
+// safe-time helpers (AcknowledgeStreamedMsg / CanUpdateCheckpointOpId /
+// UpdateSafetimeForResponse / GetCDCSDKSafeTimeForTarget); their consistent-mode
+// logic (WAL floor advance + commit-time frontier advance) is reimplemented
+// locally so that consistent_commit_order is a TRUE per-request mode with no
+// dependency on the global gflag. It does NOT modify GetChangesForCDCSDK or any
+// existing CDC codepath.
+
+struct StreamWalConsistentInput {
+  // WAL re-read floor: (term, index) of the composite cursor. {0,0} means
+  // "from earliest retained WAL".
+  OpId floor;
+
+  // Commit-time dedup frontier from the request cursor (commit_ht). Records
+  // with commit_time <= commit_ht_skip are already delivered and are skipped.
+  // 0 at bootstrap / first call.
+  uint64_t commit_ht_skip = 0;
+
+  // Mid-APPLYING spill resume. When resuming_spilled is true, the floor's
+  // (term, index) points at an UPDATE_TRANSACTION_OP { APPLYING } whose intents
+  // did not fit in a prior batch; the scan resumes one position past
+  // (resume_intent_key, resume_intent_write_id).
+  bool resuming_spilled = false;
+  std::string resume_intent_key;
+  IntraTxnWriteId resume_intent_write_id = 0;
+
+  // Soft batch caps (already defaulted by the handler).
+  uint32_t max_records = 1000;
+  uint64_t max_bytes = 4 * 1024 * 1024;
+
+  // Leader safe time snapshot taken by the handler; fed to
+  // GetConsistentStreamSafeTime as the fallback watermark.
+  HybridTime leader_safe_time;
+
+  // WAL-read deadline (already bounded by the handler).
+  CoarseTimePoint deadline;
+};
+
+struct StreamWalConsistentOutput {
+  // Committed records in non-decreasing commit_time order (EXCLUDES synthetic
+  // bootstrap DDLs, which the handler prepends).
+  std::vector<CDCSDKProtoRecordPB> records;
+
+  // Composite resume cursor.
+  OpId next_floor;
+  uint64_t next_commit_ht = 0;            // advanced commit-time frontier (0 = unset)
+  bool mid_applying = false;              // true iff a spilled APPLYING straddles the batch
+  std::string next_intent_key;           // set iff mid_applying
+  IntraTxnWriteId next_intent_write_id = 0;
+
+  // The resolution watermark this batch gated on (0 / unset while txns load).
+  uint64_t resolution_safe_time = 0;
+  bool resolution_safe_time_set = false;
+
+  bool has_more = false;
+
+  // True iff the batch stopped because the next commit-ordered record has
+  // commit_time > resolution_safe_time (gated on the watermark, not on a size
+  // cap or a spill). The handler uses this to avoid claiming has_more from the
+  // leader tip when the only remaining records are watermark-gated.
+  bool stopped_on_watermark = false;
+
+  // True iff transactions are still loading on the tablet (W invalid). The
+  // handler returns an empty, non-advancing batch with resolution_safe_time
+  // unset.
+  bool txn_load_in_progress = false;
+
+  // True iff the readable WAL window was empty AND we are not waiting on a
+  // pending-but-uncommitted txn (i.e. genuinely nothing to read: a brand-new or
+  // fully-GC'd tablet). The handler uses this on a {0,0} from-start request to
+  // advance the cursor to the leader tip instead of re-bootstrapping forever.
+  bool read_window_empty = false;
+
+  // True iff a SPLIT_OP terminal record for this tablet was emitted. The
+  // handler treats this exactly like the WAL-order path (last record on the
+  // stream; next call returns TABLET_SPLIT).
+  bool saw_split = false;
+};
+
+Status GetConsistentChangesForStreamWAL(
+    const StreamWalConsistentInput& input,
+    StreamWalDecodeContext* ctx,
+    StreamWalConsistentOutput* output);
+
 }  // namespace cdc
 }  // namespace yb

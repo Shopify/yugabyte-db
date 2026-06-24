@@ -746,10 +746,36 @@ public class AsyncYBClient implements AutoCloseable {
       int maxRecords,
       long maxBytes,
       int deadlineMs) {
+    return streamWAL(table, tabletId, fromTerm, fromIndex, fromIntentKey, fromIntentWriteId,
+        /*consistentCommitOrder=*/ false, /*fromCommitHt=*/ null, maxRecords, maxBytes, deadlineMs);
+  }
+
+  /**
+   * StreamWAL variant that additionally exposes the per-request consistent-commit-order mode and
+   * the commit-time frontier. With {@code consistentCommitOrder=true} the server delivers
+   * committed records in commit-time order, gated behind the resolution watermark, using the
+   * composite cursor (WAL floor + {@code fromCommitHt}); pass {@code fromCommitHt=null} at
+   * bootstrap and otherwise echo the value from the prior response
+   * ({@link StreamWalResponse#getNextOpIdCommitHt()}). With {@code consistentCommitOrder=false}
+   * this behaves exactly like the WAL-order overloads.
+   */
+  public Deferred<StreamWalResponse> streamWAL(
+      YBTable table,
+      String tabletId,
+      long fromTerm,
+      long fromIndex,
+      com.google.protobuf.ByteString fromIntentKey,
+      Integer fromIntentWriteId,
+      boolean consistentCommitOrder,
+      Long fromCommitHt,
+      int maxRecords,
+      long maxBytes,
+      int deadlineMs) {
     checkIsClosed();
     StreamWalRequest rpc =
         new StreamWalRequest(table, tabletId, fromTerm, fromIndex,
-            fromIntentKey, fromIntentWriteId, maxRecords, maxBytes, deadlineMs);
+            fromIntentKey, fromIntentWriteId, consistentCommitOrder, fromCommitHt,
+            maxRecords, maxBytes, deadlineMs);
     rpc.maxAttempts = this.maxAttempts;
     Deferred<StreamWalResponse> d = rpc.getDeferred();
     // Allow enough wall-clock for the server's long-poll budget plus network jitter. The
