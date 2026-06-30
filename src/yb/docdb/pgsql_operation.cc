@@ -147,6 +147,16 @@ DEFINE_RUNTIME_bool(vector_index_no_deletions_skip_filter_check, true,
     "Whether to skip filter check during vector index search if table does not have "
     "updates/deletions.");
 
+DEFINE_RUNTIME_bool(ysql_index_backfill_deferred_uniqueness_check, false,
+    "When true, YSQL unique-index backfill writes skip the backward uniqueness check "
+    "(HasDuplicateUniqueIndexValueBackward) and rely on a post-backfill verification "
+    "scan to detect concurrent-insert races. UNSAFE TO ENABLE without the corresponding "
+    "verification phase coordination — silent duplicate index entries may result. "
+    "Intended for incremental development of the deferred-uniqueness-verification "
+    "feature; do not enable in production until the verify phase is in place.");
+TAG_FLAG(ysql_index_backfill_deferred_uniqueness_check, unsafe);
+TAG_FLAG(ysql_index_backfill_deferred_uniqueness_check, advanced);
+
 DECLARE_uint64(rpc_max_message_size);
 DECLARE_double(max_buffer_size_to_rpc_limit_ratio);
 DECLARE_bool(vector_index_dump_stats);
