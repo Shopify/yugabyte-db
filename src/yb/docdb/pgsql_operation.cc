@@ -1290,6 +1290,18 @@ void PgsqlWriteOperation::ClearResponse() {
 // Check if a duplicate value is inserted into a unique index.
 Result<bool> PgsqlWriteOperation::HasDuplicateUniqueIndexValue(const DocOperationApplyData& data) {
   VLOG(3) << "Looking for collisions in\n" << DocDBDebugDumpToStr(data);
+  // When ysql_index_backfill_deferred_uniqueness_check is set, backfill writes skip
+  // both the forward and backward per-write duplicate checks. The post-backfill
+  // verify phase (VerifyIndexChunk RPC + master hook) is responsible for detecting
+  // duplicates before the index is declared valid. Skipping the synchronous check
+  // is the point of the deferred-uniqueness strategy — it eliminates the per-write
+  // contention that motivates the feature. The gflag is tagged `unsafe` and cannot
+  // be enabled without explicit acknowledgement.
+  if (request_.is_backfill() && FLAGS_ysql_index_backfill_deferred_uniqueness_check) {
+    VLOG(3) << "Skipping duplicate check for backfill unique-index write; "
+            << "check deferred to post-backfill verify phase.";
+    return false;
+  }
   // We need to check backwards only for backfilled entries.
   bool ret =
       VERIFY_RESULT(HasDuplicateUniqueIndexValue(data, data.read_time())) ||

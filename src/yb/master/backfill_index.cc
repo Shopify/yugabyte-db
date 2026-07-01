@@ -134,6 +134,8 @@ DEFINE_test_flag(bool, simulate_cannot_enable_compactions, false,
 DEFINE_test_flag(int32, delay_clearing_fully_applied_ms, 0,
     "Amount of time to delay clearing the fully applied schema.");
 
+DECLARE_bool(ysql_index_backfill_deferred_uniqueness_check);
+
 namespace yb {
 namespace master {
 
@@ -1210,8 +1212,23 @@ Status BackfillTable::UpdateIndexPermissionsForIndexes() {
     }
   }
 
+  // When deferred-uniqueness-check is enabled, the retain_delete_markers pin on
+  // successfully backfilled indexes must stay set until the post-backfill verify
+  // phase completes its timeline scan. That coordination lands in a follow-up PR;
+  // for now, on the GFlag path the pin is deferred indefinitely. The GFlag is
+  // tagged `unsafe` and cannot be enabled without explicit acknowledgement.
+  //
+  // TODO: Once the verify phase lands, replace this GFlag check with a check on
+  // the index's verify_state in sys.catalog and release the pin from there.
+  const bool defer_marker_gc = FLAGS_ysql_index_backfill_deferred_uniqueness_check;
   for (const auto& kv_pair : permissions_to_set) {
     if (kv_pair.second == INDEX_PERM_READ_WRITE_AND_DELETE) {
+      if (defer_marker_gc) {
+        LOG(INFO) << "Deferring GC of delete markers on index " << kv_pair.first
+                  << " (ysql_index_backfill_deferred_uniqueness_check is set); "
+                  << "pin will be released after post-backfill verification.";
+        continue;
+      }
       RETURN_NOT_OK(AllowCompactionsToGCDeleteMarkers(kv_pair.first));
     }
   }

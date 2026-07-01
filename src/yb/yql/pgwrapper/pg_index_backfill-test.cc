@@ -1086,6 +1086,34 @@ TEST_P(PgIndexBackfillTest, RetainDeleteMarkersRecoveryViaSeveralRequests) {
   TestRetainDeleteMarkersRecovery(kDatabaseName, true /* use_multiple_requests */);
 }
 
+// With ysql_index_backfill_deferred_uniqueness_check set, master must skip the
+// AllowCompactionsToGCDeleteMarkers step after a successful backfill so the pin on
+// tombstones survives long enough for the (future) verify phase. Assert that the
+// index table's retain_delete_markers in sys.catalog is still true post-backfill.
+TEST_P(PgIndexBackfillTest, DeferredUniquenessCheckRetainsMarkersAfterBackfill) {
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "ysql_index_backfill_deferred_uniqueness_check", "true"));
+  ASSERT_OK(cluster_->SetFlagOnTServers(
+      "ysql_index_backfill_deferred_uniqueness_check", "true"));
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "INSERT INTO $0 SELECT g, g FROM generate_series(1, 100) g", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "CREATE UNIQUE INDEX $0 ON $1 (b)", kIndexName, kTableName));
+
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  const std::string index_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kIndexName));
+  auto info = std::make_shared<client::YBTableInfo>();
+  Synchronizer sync;
+  ASSERT_OK(client->GetTableSchemaById(index_id, info, sync.AsStatusCallback()));
+  ASSERT_OK(sync.Wait());
+  ASSERT_TRUE(info->schema.table_properties().retain_delete_markers())
+      << "expected retain_delete_markers to remain true when deferred uniqueness "
+      << "check is enabled, but it was cleared after backfill";
+}
+
 // Override the index backfill test to do alter slowly.
 class PgIndexBackfillAlterSlowly : public PgIndexBackfillTest {
  public:
@@ -1288,6 +1316,13 @@ class PgIndexBackfillBlockDoBackfill : public PgIndexBackfillTest {
   // (same commit HT, different write_ids). Otherwise they are separate statements
   // (different HTs).
   void TestDeleteAndInsertSameValue(bool use_single_txn);
+
+  // Helper: table starts with duplicates on the indexed column; one duplicate is
+  // deleted after backfill safe time but two remain, so CREATE UNIQUE INDEX must fail
+  // with a duplicate-key error. When deferred_check_enabled is true, the deferred-
+  // uniqueness-check GFlag is set on tservers first — proves the forward check still
+  // catches within-batch duplicates when the backward check is switched off.
+  void TestDuplicatesExistBeforeBackfill(bool deferred_check_enabled);
 };
 
 INSTANTIATE_TEST_CASE_P(, PgIndexBackfillBlockDoBackfill, ::testing::Bool());
@@ -2641,7 +2676,13 @@ TEST_P(PgIndexBackfillBlockDoBackfill, DeleteAndInsertSameValueSeparateStmts) {
 // After backfill safe time, we delete one of them (3, 1), but the remaining
 // rows (1, 1) and (2, 1) still have duplicate b=1. The CREATE UNIQUE INDEX
 // should fail because the backfill encounters the duplicate values.
-TEST_P(PgIndexBackfillBlockDoBackfill, DuplicatesExistBeforeBackfill) {
+void PgIndexBackfillBlockDoBackfill::TestDuplicatesExistBeforeBackfill(
+    bool deferred_check_enabled) {
+  if (deferred_check_enabled) {
+    ASSERT_OK(cluster_->SetFlagOnTServers(
+        "ysql_index_backfill_deferred_uniqueness_check", "true"));
+  }
+
   ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
   ASSERT_OK(conn_->ExecuteFormat("INSERT INTO $0 VALUES (1, 1), (2, 1), (3, 1)", kTableName));
 
@@ -2673,6 +2714,17 @@ TEST_P(PgIndexBackfillBlockDoBackfill, DuplicatesExistBeforeBackfill) {
     ASSERT_OK(cluster_->SetFlagOnMasters("TEST_block_do_backfill", "false"));
   });
   thread_holder_.JoinAll();
+}
+
+TEST_P(PgIndexBackfillBlockDoBackfill, DuplicatesExistBeforeBackfill) {
+  TestDuplicatesExistBeforeBackfill(/* deferred_check_enabled= */ false);
+}
+
+// Same as DuplicatesExistBeforeBackfill, but with the deferred-uniqueness-check
+// GFlag on. Proves the forward check still catches within-batch duplicates when
+// the backward check has been switched off.
+TEST_P(PgIndexBackfillBlockDoBackfill, DuplicatesExistBeforeBackfillDeferredCheck) {
+  TestDuplicatesExistBeforeBackfill(/* deferred_check_enabled= */ true);
 }
 
 // Override to use YSQL backends manager.
