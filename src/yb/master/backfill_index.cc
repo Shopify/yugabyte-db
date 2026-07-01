@@ -1218,8 +1218,16 @@ Status BackfillTable::UpdateIndexPermissionsForIndexes() {
   // for now, on the GFlag path the pin is deferred indefinitely. The GFlag is
   // tagged `unsafe` and cannot be enabled without explicit acknowledgement.
   //
-  // TODO: Once the verify phase lands, replace this GFlag check with a check on
-  // the index's verify_state in sys.catalog and release the pin from there.
+  // TODO(deferred-uniqueness PR 5): the current decision reads a live runtime GFlag on
+  // the master. Two unsafe failure modes result if it stays this way beyond the prototype:
+  //   1. TServers skipped duplicate checks while their flag was set, but the master's
+  //      flag was cleared before this hook runs -> markers get GC'd early -> the verify
+  //      scan later runs against a truncated timeline and produces false negatives.
+  //   2. Master's flag is set at this hook but the index's backfill never actually took
+  //      the deferred path -> markers are retained forever for no reason.
+  // Both are prevented by persisting a `verify_state` on the IndexInfoPB when the index
+  // enters the deferred path, and gating this decision on that field (not the GFlag).
+  // The pin release should also live in the verify-completion path, not here.
   const bool defer_marker_gc = FLAGS_ysql_index_backfill_deferred_uniqueness_check;
   for (const auto& kv_pair : permissions_to_set) {
     if (kv_pair.second == INDEX_PERM_READ_WRITE_AND_DELETE) {

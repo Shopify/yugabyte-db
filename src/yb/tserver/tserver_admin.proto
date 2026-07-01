@@ -129,6 +129,45 @@ message BackfillIndexResponsePB {
   map<string, double> num_rows_backfilled_in_index = 6;
 }
 
+// Verify a chunk of a unique index tablet for duplicate entries. Used by the
+// deferred-uniqueness-check verification phase after backfill completes.
+// The RPC is addressed to the leader of the index tablet.
+message VerifyIndexChunkRequestPB {
+  // UUID of server this request is addressed to.
+  optional bytes dest_uuid = 1;
+
+  // The index tablet to scan.
+  required bytes tablet_id = 2;
+
+  // The index table this tablet belongs to.
+  required bytes index_table_id = 3;
+
+  // Read at HT: verify considers all committed events with HT <= verify_time.
+  // The leader will wait for SafeTime to advance past verify_time before scanning.
+  optional fixed64 verify_time = 4;
+
+  // Chunk bounds (empty = full tablet range). For PR 4 the master will send
+  // empty bounds; pagination arrives in a follow-up.
+  optional bytes start_key = 5;
+  optional bytes end_key = 6;
+
+  optional fixed64 propagated_hybrid_time = 7;
+}
+
+message VerifyIndexChunkResponsePB {
+  optional TabletServerErrorPB error = 1;
+
+  optional fixed64 propagated_hybrid_time = 2;
+
+  // If set, a duplicate was detected in this chunk. Contains the encoded
+  // DocKey of a violating index entry for diagnostics -- surfacing it via
+  // logs / error messages helps operators identify the offending row.
+  optional bytes duplicate_key_hint = 3;
+
+  // For future pagination; empty in PR 4 (whole tablet scanned per call).
+  optional bytes verified_until = 4;
+}
+
 // A create tablet request.
 message CreateTabletRequestPB {
   // UUID of server this request is addressed to.
@@ -478,6 +517,13 @@ service TabletServerAdminService {
 
   // Marks an index table as having completed backfilling.
   rpc BackfillDone(tablet.ChangeMetadataRequestPB) returns (ChangeMetadataResponsePB) {
+    option (yb.rpc.send_metadata) = true;
+  }
+
+  // Scan a chunk of a unique-index tablet for duplicate entries. Addressed to
+  // the leader of the index tablet. Used by the deferred-uniqueness-check
+  // verify phase.
+  rpc VerifyIndexChunk(VerifyIndexChunkRequestPB) returns (VerifyIndexChunkResponsePB) {
     option (yb.rpc.send_metadata) = true;
   }
 

@@ -2838,6 +2838,8 @@ class FakeTabletServerAdminService : public tserver::TabletServerAdminServiceIf 
                          tserver::BackfillIndexResponsePB)
                          UNUSED_TS_ADMIN_METHOD(BackfillDone, tablet::ChangeMetadataRequestPB,
                          tserver::ChangeMetadataResponsePB)
+  UNUSED_TS_ADMIN_METHOD(VerifyIndexChunk, tserver::VerifyIndexChunkRequestPB,
+                         tserver::VerifyIndexChunkResponsePB)
   UNUSED_TS_ADMIN_METHOD(FlushTablets, tserver::FlushTabletsRequestPB,
                          tserver::FlushTabletsResponsePB)
   UNUSED_TS_ADMIN_METHOD(CountIntents, tserver::CountIntentsRequestPB,

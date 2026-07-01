@@ -79,6 +79,7 @@ set(DOCDB_SRCS
         docdb_statistics.cc
         docdb_util.cc
         hybrid_scan_choices.cc
+        index_verify.cc
         intent_aware_iterator.cc
         intent_format.cc
         iter_util.cc

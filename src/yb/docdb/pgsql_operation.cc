@@ -151,11 +151,26 @@ DEFINE_RUNTIME_bool(ysql_index_backfill_deferred_uniqueness_check, false,
     "When true, YSQL unique-index backfill writes skip the backward uniqueness check "
     "(HasDuplicateUniqueIndexValueBackward) and rely on a post-backfill verification "
     "scan to detect concurrent-insert races. UNSAFE TO ENABLE without the corresponding "
-    "verification phase coordination — silent duplicate index entries may result. "
-    "Intended for incremental development of the deferred-uniqueness-verification "
-    "feature; do not enable in production until the verify phase is in place.");
+    "verification phase coordination -- silent duplicate index entries may result. "
+    "PROTOTYPE ONLY: pre-existing base-table duplicates are NOT detected -- YSQL backfill "
+    "uses a fixed hybrid time (see ybModifyTable.c) and RocksDB LWW collapses colliding "
+    "writes at the same DocKey/HT so verify sees only one entry. Only concurrent-write "
+    "duplicates that land at distinct hybrid times are caught. The verify scan also "
+    "requires ysql_enable_packed_row=true, ysql_use_packed_row_v2=true, and "
+    "ysql_mark_update_packed_row=true, and these must have been true for the ENTIRE "
+    "deferred write window (not just at scan time) so no persisted update in the window "
+    "is missing the V2 kIsUpdateFlag marker -- a mid-window flag flip produces unmarked "
+    "UPDATE-rewrite entries that the scan will misclassify as duplicates.");
 TAG_FLAG(ysql_index_backfill_deferred_uniqueness_check, unsafe);
 TAG_FLAG(ysql_index_backfill_deferred_uniqueness_check, advanced);
+
+DEFINE_test_flag(bool, ysql_backfill_skip_online_uniqueness_check, false,
+    "When true, online (non-backfill) writes targeting a YSQL unique-index tablet skip "
+    "the read-before-write duplicate check. Detected via the presence of the "
+    "ybidxbasectid column in the target schema, so base-table PK inserts are unaffected. "
+    "Used by tests to simulate the concurrent-write race window that the "
+    "deferred-uniqueness verification phase is designed to catch -- production writes "
+    "should never bypass the per-write check.");
 
 DECLARE_uint64(rpc_max_message_size);
 DECLARE_double(max_buffer_size_to_rpc_limit_ratio);
@@ -1294,7 +1309,7 @@ Result<bool> PgsqlWriteOperation::HasDuplicateUniqueIndexValue(const DocOperatio
   // both the forward and backward per-write duplicate checks. The post-backfill
   // verify phase (VerifyIndexChunk RPC + master hook) is responsible for detecting
   // duplicates before the index is declared valid. Skipping the synchronous check
-  // is the point of the deferred-uniqueness strategy — it eliminates the per-write
+  // is the point of the deferred-uniqueness strategy -- it eliminates the per-write
   // contention that motivates the feature. The gflag is tagged `unsafe` and cannot
   // be enabled without explicit acknowledgement.
   if (request_.is_backfill() && FLAGS_ysql_index_backfill_deferred_uniqueness_check) {
@@ -1555,6 +1570,14 @@ Status PgsqlWriteOperation::ApplyInsert(const DocOperationApplyData& data, IsUps
         response_->ref_error_message("Duplicate key found in unique index");
         return Status::OK();
       }
+    } else if (PREDICT_FALSE(FLAGS_TEST_ysql_backfill_skip_online_uniqueness_check) &&
+               doc_read_context_->schema().find_column("ybidxbasectid") !=
+                   Schema::kColumnNotFound) {
+      // Test-only: simulate the concurrent-write race window that the deferred-uniqueness
+      // verify phase is designed to catch. Two online writes at distinct hybrid times both
+      // skip the read-before-write check and land in the index; verify must detect them.
+      // Gated on ybidxbasectid so base-table PK inserts still get their duplicate check.
+      VLOG(3) << "TEST: skipping duplicate check for online unique-index write.";
     } else {
       dockv::PgTableRow table_row(projection());
       // Non-backfill requests shouldn't use HasDuplicateUniqueIndexValue because

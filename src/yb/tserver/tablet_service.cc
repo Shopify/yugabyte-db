@@ -63,6 +63,7 @@
 
 #include "yb/docdb/cql_operation.h"
 #include "yb/docdb/doc_vector_index.h"
+#include "yb/docdb/index_verify.h"
 #include "yb/docdb/pgsql_operation.h"
 
 #include "yb/dockv/reader_projection.h"
@@ -1065,6 +1066,91 @@ void TabletServiceAdminImpl::BackfillIndex(
     return;
   }
 
+  context.RespondSuccess();
+}
+
+void TabletServiceAdminImpl::VerifyIndexChunk(
+    const VerifyIndexChunkRequestPB* req, VerifyIndexChunkResponsePB* resp,
+    rpc::RpcContext context) {
+  if (!CheckUuidMatchOrRespond(server_->tablet_manager(), "VerifyIndexChunk", req, resp, &context)) {
+    return;
+  }
+  DVLOG(3) << "Received VerifyIndexChunk RPC: " << req->DebugString();
+
+  server::UpdateClock(*req, server_->Clock());
+
+  auto tablet =
+      LookupLeaderTabletOrRespond(server_->tablet_peer_lookup(), req->tablet_id(), resp, &context);
+  if (!tablet) {
+    return;
+  }
+
+  const CoarseTimePoint deadline = context.GetClientDeadline();
+
+  // Wait for SafeTime to advance past verify_time so every committed write with
+  // HT <= verify_time is durable in the regular DB. The scan does not touch intents.
+  // If the caller did not supply verify_time (proto default 0 == HybridTime::kMin),
+  // pick the tablet's current safe time -- it is >= every write that has already been
+  // committed and applied, which is exactly the guarantee the verify scan needs.
+  const HybridTime requested_verify_time(req->verify_time());
+  const auto safe_time_result =
+      tablet.tablet->SafeTime(tablet::RequireLease::kTrue, requested_verify_time, deadline);
+  if (!safe_time_result.ok()) {
+    SetupErrorAndRespond(resp->mutable_error(), safe_time_result.status(), &context);
+    return;
+  }
+  const HybridTime verify_time =
+      requested_verify_time == HybridTime::kMin ? *safe_time_result : requested_verify_time;
+
+  // Validate the (tablet_id, index_table_id) pairing: GetTableInfo returns NotFound if
+  // the tablet does not host the requested table. The scan itself needs no schema handle
+  // -- classifying insert vs in-place update is decided from the packed-row header's
+  // kIsUpdateFlag bit, which requires no schema knowledge.
+  auto table_info_result =
+      tablet.peer->tablet_metadata()->GetTableInfo(req->index_table_id());
+  if (!table_info_result.ok()) {
+    SetupErrorAndRespond(
+        resp->mutable_error(), table_info_result.status(),
+        TabletServerErrorPB::INVALID_SCHEMA, &context);
+    return;
+  }
+
+  // TODO(deferred-uniqueness prototype): colocated tablets host multiple tables in a single
+  // RocksDB. Scanning empty bounds would sweep unrelated data and produce false positives.
+  // Handling that requires deriving the target table's key prefix (cotable_id or colocation_id)
+  // and bounding the scan accordingly. Prototype scope is non-colocated unique indexes.
+  if (tablet.peer->tablet_metadata()->colocated()) {
+    SetupErrorAndRespond(
+        resp->mutable_error(),
+        STATUS(NotSupported,
+               "VerifyIndexChunk on colocated tablets is not yet supported by the deferred-"
+               "uniqueness prototype."),
+        &context);
+    return;
+  }
+
+  const Slice start_key(req->start_key());
+  const Slice end_key(req->end_key());
+
+  auto verify_result = docdb::VerifyUniqueIndexChunk(
+      tablet.tablet->doc_db(),
+      docdb::VerifyUniqueIndexChunkOptions{
+          .start_key = start_key,
+          .end_key = end_key,
+          .verify_time = verify_time,
+      });
+  if (!verify_result.ok()) {
+    SetupErrorAndRespond(resp->mutable_error(), verify_result.status(), &context);
+    return;
+  }
+
+  if (!verify_result->duplicate_key_hint.empty()) {
+    resp->set_duplicate_key_hint(verify_result->duplicate_key_hint);
+  }
+  if (!verify_result->verified_until.empty()) {
+    resp->set_verified_until(verify_result->verified_until);
+  }
+  resp->set_propagated_hybrid_time(server_->Clock()->Now().ToUint64());
   context.RespondSuccess();
 }
 
