@@ -62,6 +62,20 @@ enum IndexPermissions {
   INDEX_PERM_NOT_USED = 14;
 }
 
+// Tracks whether a post-backfill uniqueness verification pass is required for a
+// unique index, and its outcome. Set at the moment the index enters the
+// deferred-uniqueness path (see ysql_index_backfill_deferred_uniqueness_check
+// and the ysql_index_backfill_verify_uniqueness_enabled AutoFlag). Values other
+// than INDEX_VERIFY_NOT_REQUIRED / INDEX_VERIFY_REQUIRED are reserved for
+// subsequent PRs that add the verify RPC caller.
+enum IndexVerifyState {
+  INDEX_VERIFY_NOT_REQUIRED = 0;
+  INDEX_VERIFY_REQUIRED = 1;
+  INDEX_VERIFY_IN_PROGRESS = 2;
+  INDEX_VERIFY_SUCCEEDED = 3;
+  INDEX_VERIFY_FAILED = 4;
+}
+
 // Client type.
 enum YQLDatabase {
   YQL_DATABASE_UNKNOWN = 1;
