@@ -26,6 +26,8 @@
 #include "yb/master/master_admin.proxy.h"
 #include "yb/master/master_admin.pb.h"
 #include "yb/master/master_client.pb.h"
+#include "yb/master/master_ddl.pb.h"
+#include "yb/master/master_ddl.proxy.h"
 #include "yb/master/master_error.h"
 
 #include "yb/tserver/tserver_admin.proxy.h"
@@ -1379,6 +1381,64 @@ TEST_P(PgIndexBackfillTest, DeferredUniquenessVerifyChunkIgnoresPkUpdate) {
         << tablet_id << " (hint hex=" << Slice(resp.duplicate_key_hint()).ToDebugHexString()
         << ")";
   }
+}
+
+// When a layout-flag precondition is off at CREATE INDEX time,
+// the deferred-uniqueness path must be refused and verify_state must stay at the default
+// INDEX_VERIFY_NOT_REQUIRED. The DDL itself still succeeds. In this prototype, refusing
+// deferred entry only suppresses the persisted verify_state -- the TServer per-write skip is
+// still governed independently by ysql_index_backfill_deferred_uniqueness_check (see
+// docdb/pgsql_operation.cc), so "verify_state = NOT_REQUIRED" does not mean "per-write check
+// ran". Gating the TServer skip on the persisted per-index state is a follow-up PR.
+//
+// Flags set symmetrically on masters and TServers so the test drives the same shape as the
+// positive case above.
+TEST_P(PgIndexBackfillTest, DeferredUniquenessPathEntryRefusedWhenLayoutFlagsOff) {
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "ysql_index_backfill_verify_uniqueness_enabled", "true"));
+  ASSERT_OK(cluster_->SetFlagOnTServers(
+      "ysql_index_backfill_verify_uniqueness_enabled", "true"));
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "ysql_index_backfill_deferred_uniqueness_check", "true"));
+  ASSERT_OK(cluster_->SetFlagOnTServers(
+      "ysql_index_backfill_deferred_uniqueness_check", "true"));
+  ASSERT_OK(cluster_->SetFlagOnMasters("ysql_enable_packed_row", "true"));
+  ASSERT_OK(cluster_->SetFlagOnTServers("ysql_enable_packed_row", "true"));
+  ASSERT_OK(cluster_->SetFlagOnMasters("ysql_use_packed_row_v2", "true"));
+  ASSERT_OK(cluster_->SetFlagOnTServers("ysql_use_packed_row_v2", "true"));
+  // ysql_mark_update_packed_row deliberately left off on both sides -- one of the three
+  // snapshot preconditions is false, so the helper must reject entry.
+  ASSERT_OK(cluster_->SetFlagOnMasters("ysql_mark_update_packed_row", "false"));
+  ASSERT_OK(cluster_->SetFlagOnTServers("ysql_mark_update_packed_row", "false"));
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "CREATE UNIQUE INDEX $0 ON $1 (b)", kIndexName, kTableName));
+
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  const std::string table_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kTableName));
+  const std::string index_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kIndexName));
+
+  auto ddl_proxy = cluster_->GetLeaderMasterProxy<master::MasterDdlProxy>();
+  master::GetTableSchemaRequestPB req;
+  master::GetTableSchemaResponsePB resp;
+  req.mutable_table()->set_table_id(table_id);
+  rpc::RpcController rpc;
+  rpc.set_timeout(30s * kTimeMultiplier);
+  ASSERT_OK(ddl_proxy.GetTableSchema(req, &resp, &rpc));
+  ASSERT_FALSE(resp.has_error()) << resp.error().DebugString();
+
+  const IndexInfoPB* idx = nullptr;
+  for (const auto& candidate : resp.indexes()) {
+    if (candidate.table_id() == index_id) {
+      idx = &candidate;
+      break;
+    }
+  }
+  ASSERT_TRUE(idx != nullptr) << "index " << index_id << " not present on base-table schema";
+  EXPECT_EQ(idx->verify_state(), INDEX_VERIFY_NOT_REQUIRED);
 }
 
 // Override the index backfill test to do alter slowly.

@@ -135,6 +135,10 @@ DEFINE_test_flag(int32, delay_clearing_fully_applied_ms, 0,
     "Amount of time to delay clearing the fully applied schema.");
 
 DECLARE_bool(ysql_index_backfill_deferred_uniqueness_check);
+DECLARE_bool(ysql_index_backfill_verify_uniqueness_enabled);
+DECLARE_bool(ysql_enable_packed_row);
+DECLARE_bool(ysql_use_packed_row_v2);
+DECLARE_bool(ysql_mark_update_packed_row);
 
 namespace yb {
 namespace master {
@@ -180,6 +184,75 @@ Result<bool> ShouldProceedWithPgsqlIndexPermissionUpdate(
       // No need to wait for anything
       return true;
   }
+}
+
+// Decides whether a given index should enter the deferred-uniqueness path when
+// its backfill is being scheduled. On true, *out_preconditions is populated
+// with the master's current view of the packed-row layout flags -- the caller
+// must persist this snapshot on IndexInfoPB.verify_preconditions in the same
+// sys.catalog write that marks the index as entering backfill.
+//
+// KNOWN GAPS (this helper alone is not sufficient for verify correctness --
+// closing these is scoped to follow-up PRs in the same graphite stack):
+//
+//   1. Master-local view only. The AutoFlag
+//      ysql_index_backfill_verify_uniqueness_enabled is universe-wide once
+//      promoted, but the three layout flags are still runtime GFlags. This
+//      helper reads the master's own values -- a TServer whose runtime values
+//      disagreed while the deferred write window was open can still produce
+//      writes without the V2 kIsUpdateFlag marker, which the future verify
+//      pass would misclassify. Consumers of a persisted VERIFY_REQUIRED must
+//      not treat it as proof that the writes on disk actually satisfy the
+//      preconditions.
+//
+//   2. Start-of-window snapshot, not continuous. Even on a single node,
+//      capturing FLAGS_* at path entry does not detect a mid-window flip
+//      (e.g. true -> false -> true) that produces intermediate writes
+//      without the marker bit set.
+//
+//   3. TServer per-write duplicate-check skip is currently gated on
+//      FLAGS_ysql_index_backfill_deferred_uniqueness_check locally (PR 2),
+//      not on the master's stamped verify_state. So a persisted
+//      VERIFY_REQUIRED does not, by itself, guarantee the TServer actually
+//      skipped its per-write check on that index. The reverse can also
+//      happen: TServer skips checks while master stamps NOT_REQUIRED.
+//
+// The proper fix for (1) and (2) is to promote the layout flags themselves to
+// AutoFlags with cluster-wide guaranteed values. The proper fix for (3) is to
+// derive the TServer skip from the persisted per-index state rather than a
+// local runtime GFlag. Both are tracked as later PRs in the same stack.
+bool ShouldEnterDeferredUniquenessPath(
+    const IndexInfoPB& idx,
+    IndexInfoPB::DeferredUniquenessPreconditionsPB* out_preconditions,
+    std::string* reject_reason) {
+  if (!FLAGS_ysql_index_backfill_verify_uniqueness_enabled) {
+    *reject_reason = "ysql_index_backfill_verify_uniqueness_enabled AutoFlag not promoted";
+    return false;
+  }
+  if (!FLAGS_ysql_index_backfill_deferred_uniqueness_check) {
+    *reject_reason = "ysql_index_backfill_deferred_uniqueness_check not set";
+    return false;
+  }
+  if (!idx.is_unique()) {
+    *reject_reason = "index is not unique";
+    return false;
+  }
+  if (!FLAGS_ysql_enable_packed_row) {
+    *reject_reason = "ysql_enable_packed_row not set";
+    return false;
+  }
+  if (!FLAGS_ysql_use_packed_row_v2) {
+    *reject_reason = "ysql_use_packed_row_v2 not set";
+    return false;
+  }
+  if (!FLAGS_ysql_mark_update_packed_row) {
+    *reject_reason = "ysql_mark_update_packed_row not set";
+    return false;
+  }
+  out_preconditions->set_ysql_enable_packed_row(true);
+  out_preconditions->set_ysql_use_packed_row_v2(true);
+  out_preconditions->set_ysql_mark_update_packed_row(true);
+  return true;
 }
 
 } // namespace
@@ -737,9 +810,43 @@ Status BackfillTable::Launch() {
   {
     auto l = indexed_table_->LockForWrite();
     if (l.data().pb.backfill_jobs_size() == 0) {
+      // For each index we are about to back-fill, decide whether the deferred-
+      // uniqueness path applies and, if so, stamp INDEX_VERIFY_REQUIRED plus the
+      // layout-flag snapshot onto the persisted IndexInfoPB. Same sys.catalog
+      // write as the BackfillJobPB creation, so master failover recovers the
+      // decision.
+      std::unordered_map<TableId, IndexInfoPB::DeferredUniquenessPreconditionsPB>
+          verify_required;
+      for (const auto& idx_info : index_infos_) {
+        IndexInfoPB::DeferredUniquenessPreconditionsPB preconditions;
+        std::string reject_reason;
+        if (ShouldEnterDeferredUniquenessPath(idx_info, &preconditions, &reject_reason)) {
+          LOG(INFO) << "Index " << idx_info.table_id()
+                    << " entering deferred-uniqueness path";
+          verify_required.emplace(idx_info.table_id(), std::move(preconditions));
+        } else {
+          VLOG(1) << "Index " << idx_info.table_id()
+                  << " not entering deferred-uniqueness path: " << reject_reason;
+        }
+      }
+      if (!verify_required.empty()) {
+        for (auto& idx_pb : *l.mutable_data()->pb.mutable_indexes()) {
+          auto it = verify_required.find(idx_pb.table_id());
+          if (it != verify_required.end()) {
+            idx_pb.set_verify_state(INDEX_VERIFY_REQUIRED);
+            idx_pb.mutable_verify_preconditions()->CopyFrom(it->second);
+          }
+        }
+      }
       auto* backfill_job = l.mutable_data()->pb.add_backfill_jobs();
       for (const auto& idx_info : index_infos_) {
-        backfill_job->add_indexes()->CopyFrom(idx_info);
+        auto* job_idx = backfill_job->add_indexes();
+        job_idx->CopyFrom(idx_info);
+        auto it = verify_required.find(idx_info.table_id());
+        if (it != verify_required.end()) {
+          job_idx->set_verify_state(INDEX_VERIFY_REQUIRED);
+          job_idx->mutable_verify_preconditions()->CopyFrom(it->second);
+        }
         backfill_job->mutable_backfill_state()->insert(
             {idx_info.table_id(), BackfillJobPB::IN_PROGRESS});
       }

@@ -315,6 +315,37 @@ message IndexInfoPB {
   // are not included in this count. Moreover, after backfill is completed, this field is no longer
   // updated.
   optional double num_rows_backfilled_in_index = 36;
+
+  // Start-of-window snapshot of the MASTER's view of the packed-row layout flags
+  // at the moment this index entered the deferred-uniqueness path.
+  //
+  // WARNING: this is a diagnostic breadcrumb, not a correctness guarantee. Real
+  // uniqueness-verify correctness requires that every write in the deferred
+  // window used V2 packed rows with the kIsUpdateFlag marker set on UPDATE-
+  // produced entries. The three flags below are still runtime GFlags, and this
+  // snapshot cannot observe (a) TServer-side values that disagreed with the
+  // master, or (b) mid-window flips even on a single node. A future PR will
+  // convert the layout flags to promoted AutoFlags so their values are
+  // universe-wide and stable; only then does a match between recorded and
+  // observed values become a genuine precondition proof.
+  message DeferredUniquenessPreconditionsPB {
+    optional bool ysql_enable_packed_row      = 1;
+    optional bool ysql_use_packed_row_v2      = 2;
+    optional bool ysql_mark_update_packed_row = 3;
+  }
+
+  // Post-backfill uniqueness-verify tracking. Set to INDEX_VERIFY_REQUIRED at
+  // deferred-path entry; other transitions land in subsequent PRs.
+  optional IndexVerifyState verify_state              = 37
+      [default = INDEX_VERIFY_NOT_REQUIRED];
+  // HybridTime (as ToUint64()) at which verify should read. 0 = unset.
+  // Reserved: populated by the verify-caller PR.
+  optional fixed64 verify_time                        = 38;
+  // First failure message from the verify pass. Reserved: populated by the
+  // verify-caller PR.
+  optional string verify_error_message                = 39;
+  // Populated whenever verify_state != INDEX_VERIFY_NOT_REQUIRED.
+  optional DeferredUniquenessPreconditionsPB verify_preconditions = 40;
 }
 
 // The possible order modes for clients.

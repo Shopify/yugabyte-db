@@ -164,6 +164,35 @@ DEFINE_RUNTIME_bool(ysql_index_backfill_deferred_uniqueness_check, false,
 TAG_FLAG(ysql_index_backfill_deferred_uniqueness_check, unsafe);
 TAG_FLAG(ysql_index_backfill_deferred_uniqueness_check, advanced);
 
+// Defined in the docdb library so both the master and TServer binaries register
+// it. The AutoFlag promotion protocol needs universe-wide registration to gate a
+// future master->TServer RPC (VerifyIndexChunk, landed in PR 4) on all TServers
+// having caught up to a version that understands it. If this flag were only
+// linked into the master, promotion would say nothing about TServer capability.
+//
+// Scope caveats (not fixed by this AutoFlag; tracked for follow-up PRs):
+//  - Promotion guarantees the flag value is uniform once promoted, but the
+//    deferred path's *layout* preconditions (ysql_enable_packed_row,
+//    ysql_use_packed_row_v2, ysql_mark_update_packed_row) are still runtime
+//    flags that can disagree across nodes or flip mid-window. Verify
+//    correctness depends on those being stable/true for every write in the
+//    window; making them AutoFlags at promoted values is the follow-up.
+//  - The per-write duplicate-check skip on TServers currently consults the
+//    runtime GFlag ysql_index_backfill_deferred_uniqueness_check locally, not
+//    the master's persisted verify_state. A TServer whose GFlag disagrees
+//    with the master's view will either skip checks the master did not stamp
+//    for, or run checks even when the master stamped VERIFY_REQUIRED. Gating
+//    the TServer skip on a per-index signal derived from IndexInfoPB is a
+//    follow-up.
+DEFINE_RUNTIME_AUTO_bool(ysql_index_backfill_verify_uniqueness_enabled,
+    kLocalPersisted, false, true,
+    "When promoted, unique-index backfill jobs that also have "
+    "ysql_index_backfill_deferred_uniqueness_check set will record "
+    "IndexInfoPB.verify_state = INDEX_VERIFY_REQUIRED at path entry, and (in a "
+    "future PR) the master will run VerifyIndexChunk on every index tablet "
+    "after backfill completes. AutoFlag guards a new master->TServer RPC; "
+    "must not be promoted until every TServer in the universe supports it.");
+
 DEFINE_test_flag(bool, ysql_backfill_skip_online_uniqueness_check, false,
     "When true, online (non-backfill) writes targeting a YSQL unique-index tablet skip "
     "the read-before-write duplicate check. Detected via the presence of the "
