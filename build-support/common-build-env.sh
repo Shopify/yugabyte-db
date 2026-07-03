@@ -477,6 +477,11 @@ set_build_root() {
 
   normalize_build_root
 
+  if [[ -n ${predefined_build_root:-} && ${YB_ALLOW_ARBITRARY_BUILD_ROOT:-0} == "1" ]]; then
+    BUILD_ROOT=$predefined_build_root
+    normalize_build_root
+  fi
+
   if [[ ${make_build_root_readonly} == "true" ]]; then
     readonly BUILD_ROOT
   fi
@@ -2197,11 +2202,14 @@ handle_predefined_build_root() {
   # Sometimes $predefined_build_root contains symlinks on its path.
   local expanded_build_root
   expanded_build_root=$(realpath -q "$predefined_build_root")
-  if [[ "${expanded_build_root}" != "$(realpath -q "$YB_BUILD_INTERNAL_PARENT_DIR")"/* && \
+  if [[ ${YB_ALLOW_ARBITRARY_BUILD_ROOT:-0} != "1" && \
+        "${expanded_build_root}" != "$(realpath -q "$YB_BUILD_INTERNAL_PARENT_DIR")"/* && \
         "${expanded_build_root}" != "$(realpath -q "$YB_BUILD_EXTERNAL_PARENT_DIR")"/* ]]
     then
     fatal "Build root '$predefined_build_root' is not within either " \
-          "'$YB_BUILD_INTERNAL_PARENT_DIR' or '$YB_BUILD_EXTERNAL_PARENT_DIR'"
+          "'$YB_BUILD_INTERNAL_PARENT_DIR' or '$YB_BUILD_EXTERNAL_PARENT_DIR'. Set " \
+          "YB_ALLOW_ARBITRARY_BUILD_ROOT=1 for hermetic build systems that need to place the " \
+          "build root elsewhere."
   fi
 
   local basename=${predefined_build_root##*/}

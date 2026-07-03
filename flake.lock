@@ -1,0 +1,37 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1782723713,
+        "narHash": "sha256-oPXCU/SSUokcGaJREHibG1CBX3+s/W7orDWQOZDsEeQ=",
+        "type": "tarball",
+        "url": "https://github.com/NixOS/nixpkgs/archive/nixos-unstable.tar.gz"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://github.com/NixOS/nixpkgs/archive/nixos-unstable.tar.gz"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "yugabyte-bash-common": "yugabyte-bash-common"
+      }
+    },
+    "yugabyte-bash-common": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1755127343,
+        "narHash": "sha256-xuOCqiR4isJI50Pao/Ut1tYBfZcyyWw4r6Pi4JLXXAY=",
+        "type": "tarball",
+        "url": "https://github.com/yugabyte/yugabyte-bash-common/archive/74793a6e1712ac45dc07cd430da303c95d37f584.tar.gz"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://github.com/yugabyte/yugabyte-bash-common/archive/74793a6e1712ac45dc07cd430da303c95d37f584.tar.gz"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

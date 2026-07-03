@@ -480,6 +480,9 @@ class PostgresBuilder(YbBuildToolBase):
                     '-fsanitize-recover=shift-exponent'
                 ]
 
+        if os.environ.get('YB_PG_EXTRA_CFLAGS'):
+            additional_c_cxx_flags += shlex.split(os.environ['YB_PG_EXTRA_CFLAGS'])
+
         # Tell gdb to pretend that we're compiling the code in the $YB_SRC_ROOT/src/postgres
         # directory.
         additional_c_cxx_flags += [
