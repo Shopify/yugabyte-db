@@ -1949,6 +1949,8 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   friend class MultiStageAlterTable;
   friend class BackfillTable;
   friend class BackfillTablet;
+  friend class VerifyIndex;
+  friend class VerifyIndexChunk;
   friend class YsqlBackendsManager;
   friend class BackendsCatalogVersionJob;
   friend class AddTableToXClusterTargetTask;
@@ -3265,6 +3267,13 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   Status DropXClusterStreamsOfTables(const std::unordered_set<TableId>& table_ids) EXCLUDES(mutex_);
 
   void SchedulePostTabletCreationTasksForPendingTables(const LeaderEpoch& epoch) EXCLUDES(mutex_);
+
+  // Failover recovery for the deferred-uniqueness verify phase.
+  // Scans all indexes for verify_state == INDEX_VERIFY_IN_PROGRESS and
+  // re-launches a VerifyIndex orchestrator at the persisted verify_time.
+  // Verify is idempotent: re-running against the same verify_time is a
+  // deterministic read-only scan.
+  void ResumeInProgressUniqueIndexVerify(const LeaderEpoch& epoch) EXCLUDES(mutex_);
 
   Status BumpVersionAndStoreClusterConfig(
       ClusterConfigInfo* cluster_config, ClusterConfigInfo::WriteLock* l);

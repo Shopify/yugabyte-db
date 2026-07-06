@@ -26,6 +26,7 @@
 #include <boost/mpl/and.hpp>
 
 #include "yb/ash/wait_state.h"
+#include "yb/common/common_types.pb.h"
 #include "yb/common/entity_ids.h"
 #include "yb/common/transaction.h"
 #include "yb/dockv/partition.h"
@@ -437,6 +438,129 @@ class BackfillChunk : public RetryingTSRpcTaskWithTable {
   std::shared_ptr<BackfillTablet> backfill_tablet_;
   std::string start_key_;
   const std::string requested_index_names_;
+};
+
+class VerifyIndexChunk;
+
+// Orchestrator for the post-backfill uniqueness verification of a single index.
+// A VerifyIndex is scheduled when a unique index finishes backfilling with
+// verify_state == INDEX_VERIFY_REQUIRED (stamped by the deferred-uniqueness
+// entry hook in PR 5a). It picks a single verify_time HybridTime, dispatches
+// one VerifyIndexChunk per index tablet, and transitions the persisted
+// verify_state to SUCCEEDED or FAILED once every chunk has reported.
+//
+// One VerifyIndex per index. verify_time is not batched across indexes -- each
+// index enters the deferred path at a different point in time and its
+// timeline scan is independent.
+class VerifyIndex : public std::enable_shared_from_this<VerifyIndex> {
+ public:
+  VerifyIndex(
+      Master* master,
+      ThreadPool* callback_pool,
+      scoped_refptr<TableInfo> indexed_table,
+      TableId index_id,
+      HybridTime verify_time,
+      LeaderEpoch epoch);
+
+  // Enumerate tablets of index_id_ and spawn one VerifyIndexChunk per tablet.
+  // Returns after all chunk tasks have been submitted; the terminal-state
+  // transition happens asynchronously in OnChunkComplete.
+  Status Launch();
+
+  // Called by each VerifyIndexChunk on terminal state. rpc_status carries a
+  // non-OK status when the per-tablet RPC exhausted its retries. Otherwise
+  // duplicate_key_hint may be non-empty to indicate a duplicate was found.
+  // The last responder triggers the sys.catalog transition.
+  void OnChunkComplete(
+      const TabletId& tablet_id,
+      const Status& rpc_status,
+      const std::string& duplicate_key_hint);
+
+  Master* master() const { return master_; }
+  ThreadPool* threadpool() const { return callback_pool_; }
+  const HybridTime& verify_time() const { return verify_time_; }
+  const TableId& index_id() const { return index_id_; }
+  const scoped_refptr<TableInfo>& indexed_table() const { return indexed_table_; }
+  const LeaderEpoch& epoch() const { return epoch_; }
+
+  std::string LogPrefix() const;
+
+ private:
+  // Enumerate tablets and dispatch one VerifyIndexChunk per tablet. Any failure
+  // returned here is treated as a terminal launch failure by Launch(), which
+  // persists INDEX_VERIFY_FAILED with the error message.
+  Status LaunchInternal();
+
+  // Persist verify_state = SUCCEEDED or FAILED on the IndexInfoPB for index_id_
+  // (and verify_error_message when failed) in a single sys.catalog Upsert.
+  Status PersistTerminalState(
+      IndexVerifyState terminal_state,
+      const std::string& error_message);
+
+  Master* const master_;
+  ThreadPool* const callback_pool_;
+  const scoped_refptr<TableInfo> indexed_table_;
+  const TableId index_id_;
+  const HybridTime verify_time_;
+  const LeaderEpoch epoch_;
+
+  mutable simple_spinlock mutex_;
+  std::atomic<size_t> tablets_pending_{0};
+  std::atomic_bool terminal_reached_{false};
+  // First duplicate hint reported by any chunk (empty if none). Wins over
+  // RPC errors when both are present because a duplicate is a decisive answer.
+  std::string first_duplicate_hint_ GUARDED_BY(mutex_);
+  // First terminal RPC failure reported by any chunk. Only used when no
+  // duplicate was found on any tablet.
+  Status first_rpc_error_ GUARDED_BY(mutex_){Status::OK()};
+};
+
+// A background task that issues a single VerifyIndexChunk RPC to the leader of
+// one tablet of the index. Mirrors BackfillChunk's structure -- retries on
+// transient TServer errors, gives up after num_max_retries(), and funnels
+// terminal state to the VerifyIndex orchestrator via OnChunkComplete.
+class VerifyIndexChunk : public RetryingTSRpcTaskWithTable {
+ public:
+  VerifyIndexChunk(
+      std::shared_ptr<VerifyIndex> orchestrator,
+      TabletInfoPtr tablet,
+      LeaderEpoch epoch);
+
+  Status Launch();
+
+  server::MonitoredTaskType type() const override {
+    return server::MonitoredTaskType::kVerifyIndexChunk;
+  }
+
+  std::string type_name() const override { return "Verify Index Chunk"; }
+
+  std::string description() const override;
+
+  MonoTime ComputeDeadline() const override;
+
+  // Report a terminal outcome for this chunk to the orchestrator EXACTLY ONCE.
+  // Both the synchronous-launch-failure path in VerifyIndex::LaunchInternal and
+  // the RetryingRpcTask::UnregisterAsyncTask -> UnregisterAsyncTaskCallback
+  // path funnel through here so a chunk cannot double-decrement the
+  // orchestrator's pending counter.
+  void ReportCompletionOnce(const Status& rpc_status, const std::string& duplicate_key_hint);
+
+ private:
+  TabletId tablet_id() const override { return tablet_->id(); }
+
+  void HandleResponse(int attempt) override;
+
+  bool SendRequest(int attempt) override;
+
+  void UnregisterAsyncTaskCallback() override;
+
+  int num_max_retries() override;
+  int max_delay_ms() override;
+
+  const std::shared_ptr<VerifyIndex> orchestrator_;
+  const TabletInfoPtr tablet_;
+  tserver::VerifyIndexChunkResponsePB resp_;
+  std::atomic_bool reported_{false};
 };
 
 }  // namespace master
