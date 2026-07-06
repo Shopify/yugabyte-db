@@ -65,6 +65,8 @@ YB_DEFINE_ENUM(MonitoredTaskType,
   (kBackfillDone)
   (kBackfillTable)
   (kBackfillTabletChunk)
+  (kVerifyIndex)
+  (kVerifyIndexChunk)
   (kChangeConfig)
   (kClearMetaCache)
   (kClonePgSchema)

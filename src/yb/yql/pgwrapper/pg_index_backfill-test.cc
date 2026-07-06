@@ -19,6 +19,7 @@
 #include "yb/client/table_info.h"
 
 #include "yb/common/schema.h"
+#include "yb/common/wire_protocol.h"
 
 #include "yb/integration-tests/backfill-test-util.h"
 #include "yb/integration-tests/external_mini_cluster_validator.h"
@@ -1439,6 +1440,247 @@ TEST_P(PgIndexBackfillTest, DeferredUniquenessPathEntryRefusedWhenLayoutFlagsOff
   }
   ASSERT_TRUE(idx != nullptr) << "index " << index_id << " not present on base-table schema";
   EXPECT_EQ(idx->verify_state(), INDEX_VERIFY_NOT_REQUIRED);
+}
+
+namespace {
+
+// Enables the full deferred-uniqueness precondition flag set on both masters and TServers.
+// Callers still need to set any additional flags their scenario requires
+// (e.g. TEST_ysql_backfill_skip_online_uniqueness_check).
+Status EnableDeferredUniquenessAllFlags(ExternalMiniCluster* cluster) {
+  for (const char* flag : {
+           "ysql_index_backfill_verify_uniqueness_enabled",
+           "ysql_index_backfill_deferred_uniqueness_check",
+           "ysql_enable_packed_row",
+           "ysql_use_packed_row_v2",
+           "ysql_mark_update_packed_row"}) {
+    RETURN_NOT_OK(cluster->SetFlagOnMasters(flag, "true"));
+    RETURN_NOT_OK(cluster->SetFlagOnTServers(flag, "true"));
+  }
+  return Status::OK();
+}
+
+Status FetchIndexInfoPB(
+    ExternalMiniCluster* cluster,
+    const TableId& base_table_id,
+    const TableId& index_id,
+    IndexInfoPB* out) {
+  auto ddl_proxy = cluster->GetLeaderMasterProxy<master::MasterDdlProxy>();
+  master::GetTableSchemaRequestPB req;
+  master::GetTableSchemaResponsePB resp;
+  req.mutable_table()->set_table_id(base_table_id);
+  rpc::RpcController rpc;
+  rpc.set_timeout(30s * kTimeMultiplier);
+  RETURN_NOT_OK(ddl_proxy.GetTableSchema(req, &resp, &rpc));
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+  for (const auto& candidate : resp.indexes()) {
+    if (candidate.table_id() == index_id) {
+      out->CopyFrom(candidate);
+      return Status::OK();
+    }
+  }
+  return STATUS_FORMAT(NotFound, "Index $0 not present on base-table schema", index_id);
+}
+
+Result<IndexInfoPB> WaitForVerifyStateAtLeast(
+    ExternalMiniCluster* cluster,
+    const TableId& base_table_id,
+    const TableId& index_id,
+    IndexVerifyState at_least,
+    MonoDelta timeout) {
+  IndexInfoPB idx;
+  RETURN_NOT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        RETURN_NOT_OK(FetchIndexInfoPB(cluster, base_table_id, index_id, &idx));
+        return idx.verify_state() >= at_least;
+      },
+      timeout,
+      Format("Waiting for verify_state >= $0", IndexVerifyState_Name(at_least))));
+  return idx;
+}
+
+}  // namespace
+
+// End-to-end happy path: a unique index over non-duplicate data completes backfill AND
+// post-backfill verification cleanly. verify_state must land at INDEX_VERIFY_SUCCEEDED,
+// verify_time must be non-zero, and no verify_error_message must be persisted. Also
+// asserts the entry hook stamped verify_preconditions (proving PR 5a's write-side hook
+// ran on the same shape) -- reaching SUCCEEDED necessarily traversed REQUIRED first.
+TEST_P(PgIndexBackfillTest, DeferredUniquenessVerifyPassesOnCleanBackfill) {
+  ASSERT_OK(EnableDeferredUniquenessAllFlags(cluster_.get()));
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "INSERT INTO $0 SELECT g, g FROM generate_series(1, 100) g", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "CREATE UNIQUE INDEX $0 ON $1 (b)", kIndexName, kTableName));
+
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  const std::string table_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kTableName));
+  const std::string index_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kIndexName));
+
+  auto idx = ASSERT_RESULT(WaitForVerifyStateAtLeast(
+      cluster_.get(), table_id, index_id, INDEX_VERIFY_SUCCEEDED,
+      60s * kTimeMultiplier));
+  EXPECT_EQ(idx.verify_state(), INDEX_VERIFY_SUCCEEDED);
+  EXPECT_NE(idx.verify_time(), 0u);
+  EXPECT_TRUE(idx.verify_error_message().empty())
+      << "unexpected verify_error_message: " << idx.verify_error_message();
+  ASSERT_TRUE(idx.has_verify_preconditions());
+  EXPECT_TRUE(idx.verify_preconditions().ysql_enable_packed_row());
+  EXPECT_TRUE(idx.verify_preconditions().ysql_use_packed_row_v2());
+  EXPECT_TRUE(idx.verify_preconditions().ysql_mark_update_packed_row());
+}
+
+// End-to-end failure path: two writes with the same unique key land in the RWD index at
+// distinct HTs, both visible to verify_time. Verify catches the duplicate.
+//
+// To make the duplicate visible to verify, the writes must land AFTER the index reaches
+// RWD (so the index-write path is exercised) but BEFORE verify_time is picked (so the HTs
+// of the two duplicate writes are strictly less than verify_time). The TEST_block_before_
+// verify_state_transition flag holds the master between those two events, giving the main
+// thread a deterministic window to inject writes. The per-write duplicate check is silenced
+// via TEST_ysql_backfill_skip_online_uniqueness_check so the second insert is not rejected
+// synchronously by the index.
+//
+// A background thread runs CREATE UNIQUE INDEX because that statement drives the state
+// machine that eventually parks inside the block window; the main thread orchestrates the
+// injection and later releases the block. Inserting the duplicates BEFORE CREATE INDEX
+// would instead exercise the LWW-collapse case (pre-existing base-table duplicates), which
+// is a documented prototype limitation and would not exercise verify's duplicate detection.
+TEST_P(PgIndexBackfillTest, DeferredUniquenessVerifyFailsOnConcurrentDuplicate) {
+  ASSERT_OK(EnableDeferredUniquenessAllFlags(cluster_.get()));
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "TEST_block_before_verify_state_transition", "true"));
+  ASSERT_OK(cluster_->SetFlagOnTServers(
+      "TEST_ysql_backfill_skip_online_uniqueness_check", "true"));
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+
+  // Fire CREATE UNIQUE INDEX on a background connection. It will drive backfill to RWD
+  // and then park inside UpdateIndexPermissionsForIndexes at the pre-transition block.
+  thread_holder_.AddThreadFunctor([this] {
+    LOG(INFO) << "Begin create-index thread";
+    PGConn create_conn = ASSERT_RESULT(ConnectToDB(kDatabaseName));
+    ASSERT_OK(create_conn.ExecuteFormat(
+        "CREATE UNIQUE INDEX $0 ON $1 (b)", kIndexName, kTableName));
+    LOG(INFO) << "Done create-index thread";
+  });
+
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  const std::string table_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kTableName));
+  // The index id is not visible until the DDL has created the table entry, so wait for it.
+  std::string index_id;
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        auto res = GetTableIdByTableName(client.get(), kDatabaseName, kIndexName);
+        if (!res.ok()) return false;
+        index_id = *res;
+        return true;
+      },
+      60s * kTimeMultiplier,
+      "Waiting for index table id to be visible"));
+
+  // Wait until we are inside the block window. We cannot observe pb.indexes[i] directly
+  // via GetTableSchema: for PGSQL tables in state=ALTERING (which is set the moment
+  // MultiStageAlterTable::UpdateIndexPermission commits RWD), GetTableSchema returns
+  // fully_applied_indexes -- a snapshot captured BEFORE the RWD/verify_state updates.
+  // Read live state via GetBackfillJobs instead: backfill_state[index_id] flips to
+  // SUCCESS the moment backfill completes (before our block spin), and the job's
+  // IndexInfoPB snapshot carries verify_state == REQUIRED from PR 5a's Launch-time
+  // stamp. Both are stable while the state-machine thread is parked in the block.
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        auto job = GetBackfillJobs(cluster_.get(), table_id);
+        if (!job.ok()) return false;
+        auto it = job->backfill_state().find(index_id);
+        if (it == job->backfill_state().end() ||
+            it->second != master::BackfillJobPB::SUCCESS) {
+          return false;
+        }
+        for (const auto& job_idx : job->indexes()) {
+          if (job_idx.table_id() == index_id) {
+            return job_idx.verify_state() == INDEX_VERIFY_REQUIRED;
+          }
+        }
+        return false;
+      },
+      60s * kTimeMultiplier,
+      "Waiting for backfill=SUCCESS + verify_state=REQUIRED (inside the block window)"));
+
+  // Inside the block window: inject the duplicate. Both writes go to the RWD index at
+  // distinct HTs strictly less than the (not-yet-picked) verify_time. Per-write duplicate
+  // check is silenced so the second insert is accepted rather than rejected.
+  ASSERT_OK(conn_->ExecuteFormat("INSERT INTO $0 VALUES (1, 42)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat("INSERT INTO $0 VALUES (2, 42)", kTableName));
+
+  // Release the block. Master proceeds to pick verify_time (strictly greater than both
+  // insert HTs above), stamp IN_PROGRESS, dispatch VerifyIndexChunk to every tablet.
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "TEST_block_before_verify_state_transition", "false"));
+
+  auto idx = ASSERT_RESULT(WaitForVerifyStateAtLeast(
+      cluster_.get(), table_id, index_id, INDEX_VERIFY_SUCCEEDED,
+      60s * kTimeMultiplier));
+  EXPECT_EQ(idx.verify_state(), INDEX_VERIFY_FAILED);
+  EXPECT_FALSE(idx.verify_error_message().empty())
+      << "expected a duplicate hint in verify_error_message";
+  EXPECT_NE(idx.verify_time(), 0u);
+
+  thread_holder_.JoinAll();
+}
+
+// Master-failover recovery: block verify dispatch after the IN_PROGRESS transition is
+// persisted, force a master leader stepdown, then verify that the new leader picks up the
+// in-progress verify and drives it to SUCCEEDED at the SAME verify_time.
+TEST_P(PgIndexBackfillTest, DeferredUniquenessVerifyRestartsOnMasterFailover) {
+  ASSERT_OK(EnableDeferredUniquenessAllFlags(cluster_.get()));
+  // Block VerifyIndex::Launch from spawning per-tablet RPCs, so verify_state stays
+  // IN_PROGRESS until we clear the flag on the failed-over master.
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "TEST_block_verify_after_in_progress_transition", "true"));
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "INSERT INTO $0 SELECT g, g FROM generate_series(1, 100) g", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "CREATE UNIQUE INDEX $0 ON $1 (b)", kIndexName, kTableName));
+
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  const std::string table_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kTableName));
+  const std::string index_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kIndexName));
+
+  auto pre_failover = ASSERT_RESULT(WaitForVerifyStateAtLeast(
+      cluster_.get(), table_id, index_id, INDEX_VERIFY_IN_PROGRESS,
+      60s * kTimeMultiplier));
+  ASSERT_EQ(pre_failover.verify_state(), INDEX_VERIFY_IN_PROGRESS);
+  ASSERT_NE(pre_failover.verify_time(), 0u);
+  const uint64_t original_verify_time = pre_failover.verify_time();
+
+  // Step down FIRST, while the old leader is still blocked in VerifyIndex::Launch. If we
+  // cleared the block flag on all masters before stepping down, the old leader would unblock,
+  // dispatch chunks, and drive verify to SUCCEEDED before we ever hand off -- the test would
+  // pass without exercising failover recovery. Instead we keep the old leader wedged, step
+  // down, and only clear the block after a new leader has been elected so the failover-
+  // recovery path in SysCatalogLoaded is what dispatches the chunks.
+  tserver::TabletServerErrorPB::Code error_code;
+  ASSERT_OK(cluster_->StepDownMasterLeader(&error_code));
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "TEST_block_verify_after_in_progress_transition", "false"));
+
+  auto post_failover = ASSERT_RESULT(WaitForVerifyStateAtLeast(
+      cluster_.get(), table_id, index_id, INDEX_VERIFY_SUCCEEDED,
+      60s * kTimeMultiplier));
+  EXPECT_EQ(post_failover.verify_state(), INDEX_VERIFY_SUCCEEDED);
+  EXPECT_EQ(post_failover.verify_time(), original_verify_time)
+      << "failover recovery must reuse the persisted verify_time, not pick a new one";
 }
 
 // Override the index backfill test to do alter slowly.

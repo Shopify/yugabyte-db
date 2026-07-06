@@ -134,6 +134,13 @@ DEFINE_test_flag(bool, simulate_cannot_enable_compactions, false,
 DEFINE_test_flag(int32, delay_clearing_fully_applied_ms, 0,
     "Amount of time to delay clearing the fully applied schema.");
 
+DEFINE_test_flag(bool, block_before_verify_state_transition, false,
+    "When set on a master, BackfillTable::UpdateIndexPermissionsForIndexes spins after the "
+    "index is promoted to INDEX_PERM_READ_WRITE_AND_DELETE but BEFORE picking verify_time "
+    "and transitioning verify_state to INDEX_VERIFY_IN_PROGRESS. Used by tests to inject "
+    "concurrent writes into the visible window between backfill completion and verify_time "
+    "selection, so those writes are guaranteed to be visible to the verify scan.");
+
 DECLARE_bool(ysql_index_backfill_deferred_uniqueness_check);
 DECLARE_bool(ysql_index_backfill_verify_uniqueness_enabled);
 DECLARE_bool(ysql_enable_packed_row);
@@ -1354,6 +1361,78 @@ Status BackfillTable::UpdateIndexPermissionsForIndexes() {
           std::nullopt),
       "Could not update permissions after backfill. "
       "Possible that the master-leader has changed, or the table was deleted.");
+
+  // Post-backfill uniqueness verify (deferred-uniqueness-check path).
+  //
+  // For each index that just entered RWD AND was stamped INDEX_VERIFY_REQUIRED
+  // at backfill launch (see BackfillTable::Launch), pick a single verify_time,
+  // transition verify_state to IN_PROGRESS, and spawn a VerifyIndex
+  // orchestrator. The state transition and verify_time pin are persisted in a
+  // single sys.catalog Upsert so master failover can recover the decision.
+  //
+  // The BackfillTable's index_infos_ snapshot was taken before PR 5a's stamp
+  // went in; read verify_state from the up-to-date IndexInfoPB via
+  // LockForRead. Failure to dispatch does not roll back RWD -- the index is
+  // already usable; a subsequent trigger (or failover recovery) will re-launch
+  // idempotently because verify_state remains IN_PROGRESS.
+  //
+  // Test hook: pause AFTER the index is at RWD but BEFORE we pick verify_time.
+  // Writes injected in this window are visible to verify (they land at HTs
+  // less than any verify_time we could pick), which is exactly what the
+  // failure-path test needs to observe verify catching a real duplicate.
+  while (PREDICT_FALSE(FLAGS_TEST_block_before_verify_state_transition)) {
+    YB_LOG_EVERY_N_SECS(INFO, 5)
+        << "TEST_block_before_verify_state_transition set; spinning before picking verify_time.";
+    SleepFor(MonoDelta::FromMilliseconds(100));
+  }
+
+  std::vector<std::pair<TableId, HybridTime>> to_verify;
+  {
+    auto l = indexed_table_->LockForWrite();
+    auto& pb = l.mutable_data()->pb;
+    const HybridTime verify_time = master_->clock()->Now();
+    bool any_transitioned = false;
+    for (int i = 0; i < pb.indexes_size(); ++i) {
+      auto* idx_pb = pb.mutable_indexes(i);
+      auto it = permissions_to_set.find(idx_pb->table_id());
+      if (it == permissions_to_set.end() ||
+          it->second != INDEX_PERM_READ_WRITE_AND_DELETE) {
+        continue;
+      }
+      if (idx_pb->verify_state() != INDEX_VERIFY_REQUIRED) {
+        continue;
+      }
+      idx_pb->set_verify_state(INDEX_VERIFY_IN_PROGRESS);
+      idx_pb->set_verify_time(verify_time.ToUint64());
+      idx_pb->clear_verify_error_message();
+      to_verify.emplace_back(idx_pb->table_id(), verify_time);
+      any_transitioned = true;
+    }
+    if (any_transitioned) {
+      RETURN_NOT_OK_PREPEND(
+          master_->catalog_manager_impl()->sys_catalog_->Upsert(epoch_, indexed_table_),
+          "Failed to persist verify_state = IN_PROGRESS");
+      l.Commit();
+    }
+  }
+  for (const auto& [index_id, verify_time] : to_verify) {
+    auto verify = std::make_shared<VerifyIndex>(
+        master_, callback_pool_, indexed_table_, index_id, verify_time, epoch_);
+    // Submit Launch to callback_pool_ so the state-machine thread does not
+    // block on VerifyIndex's per-tablet dispatch (or the test-only spin flag
+    // inside Launch). Verify runs in the background; BackfillTable proceeds
+    // to kComplete without waiting.
+    const TableId captured_index_id = index_id;
+    Status s = callback_pool_->SubmitFunc([verify, captured_index_id]() {
+      WARN_NOT_OK(
+          verify->Launch(),
+          Format("Failed to launch VerifyIndex for $0", captured_index_id));
+    });
+    WARN_NOT_OK(
+        s, Format("Failed to submit VerifyIndex::Launch for $0 to callback_pool_",
+                  index_id));
+  }
+
   backfill_job_->SetState(
       all_success ? MonitoredTaskState::kComplete : MonitoredTaskState::kFailed);
   RETURN_NOT_OK(ClearCheckpointStateInTablets());
@@ -1897,6 +1976,367 @@ void BackfillChunk::UnregisterAsyncTaskCallback() {
                                num_rows_backfilled_in_index_,
         failed_indexes),
         "Failed marking BackfillTablet as done.");
+  }
+}
+
+DEFINE_test_flag(bool, block_verify_after_in_progress_transition, false,
+    "When set on a master, VerifyIndex::Launch spins before dispatching per-tablet "
+    "VerifyIndexChunk RPCs. Used by tests to observe INDEX_VERIFY_IN_PROGRESS on disk "
+    "and to simulate master failover while verify is mid-flight.");
+
+// -----------------------------------------------------------------------------------------------
+// VerifyIndex
+// -----------------------------------------------------------------------------------------------
+
+VerifyIndex::VerifyIndex(
+    Master* master,
+    ThreadPool* callback_pool,
+    scoped_refptr<TableInfo> indexed_table,
+    TableId index_id,
+    HybridTime verify_time,
+    LeaderEpoch epoch)
+    : master_(master),
+      callback_pool_(callback_pool),
+      indexed_table_(std::move(indexed_table)),
+      index_id_(std::move(index_id)),
+      verify_time_(verify_time),
+      epoch_(std::move(epoch)) {}
+
+std::string VerifyIndex::LogPrefix() const {
+  return Format("VerifyIndex[$0 verify_time=$1]: ", index_id_, verify_time_);
+}
+
+Status VerifyIndex::Launch() {
+  Status s = LaunchInternal();
+  if (!s.ok()) {
+    // A pre-dispatch failure would otherwise leave verify_state stuck at
+    // INDEX_VERIFY_IN_PROGRESS forever (no chunks were spawned to converge
+    // OnChunkComplete). Persist FAILED with the launch error so operators
+    // and higher-level code can observe and remediate.
+    LOG_WITH_PREFIX(WARNING)
+        << "VerifyIndex::Launch failed before dispatching per-tablet RPCs: " << s
+        << "; persisting INDEX_VERIFY_FAILED.";
+    WARN_NOT_OK(
+        PersistTerminalState(
+            INDEX_VERIFY_FAILED,
+            Format("VerifyIndex::Launch failed before dispatching per-tablet RPCs: $0",
+                   s.ToString())),
+        "Failed to persist INDEX_VERIFY_FAILED after Launch failure");
+  }
+  return s;
+}
+
+Status VerifyIndex::LaunchInternal() {
+  auto index_table = VERIFY_RESULT(
+      master_->catalog_manager_impl()->FindTableById(index_id_));
+  auto tablets = VERIFY_RESULT(index_table->GetTablets(GetTabletsMode::kOrderByTabletId));
+  if (tablets.empty()) {
+    LOG_WITH_PREFIX(WARNING)
+        << "Index has no tablets; nothing to verify. Persisting SUCCEEDED.";
+    return PersistTerminalState(INDEX_VERIFY_SUCCEEDED, /* error_message = */ "");
+  }
+
+  tablets_pending_.store(tablets.size(), std::memory_order_release);
+
+  while (PREDICT_FALSE(FLAGS_TEST_block_verify_after_in_progress_transition)) {
+    LOG_WITH_PREFIX(INFO) << "TEST_block_verify_after_in_progress_transition is set; sleeping.";
+    SleepFor(MonoDelta::FromMilliseconds(100));
+  }
+
+  LOG_WITH_PREFIX(INFO) << "Dispatching " << tablets.size() << " VerifyIndexChunk RPCs";
+  for (const auto& tablet : tablets) {
+    auto chunk = std::make_shared<VerifyIndexChunk>(shared_from_this(), tablet, epoch_);
+    Status s = chunk->Launch();
+    if (!s.ok()) {
+      LOG_WITH_PREFIX(WARNING) << "Failed to launch VerifyIndexChunk for tablet "
+                               << tablet->id() << ": " << s;
+      // Per-tablet dispatch failures do NOT abort the whole Launch -- other
+      // tablets may still succeed. Route the terminal report through the
+      // chunk's one-shot guard so we don't double-decrement if the base class
+      // Run() already reported via UnregisterAsyncTask on the same error.
+      chunk->ReportCompletionOnce(s, /* duplicate_key_hint = */ "");
+    }
+  }
+  return Status::OK();
+}
+
+void VerifyIndex::OnChunkComplete(
+    const TabletId& tablet_id,
+    const Status& rpc_status,
+    const std::string& duplicate_key_hint) {
+  {
+    std::lock_guard l(mutex_);
+    if (!duplicate_key_hint.empty() && first_duplicate_hint_.empty()) {
+      first_duplicate_hint_ = duplicate_key_hint;
+    }
+    if (!rpc_status.ok() && first_rpc_error_.ok()) {
+      first_rpc_error_ = rpc_status.CloneAndPrepend(
+          Format("VerifyIndexChunk exhausted retries on tablet $0", tablet_id));
+    }
+  }
+  // TODO(deferred-uniqueness): on any tablet reporting a duplicate we could
+  // short-circuit to FAILED immediately instead of waiting for the remaining
+  // tablets. That decision is decisive (a duplicate anywhere fails the whole
+  // index). Similarly, a permanent RPC failure on one tablet could be tolerated
+  // if another tablet reports a duplicate before we run out. Deferred to keep
+  // this prototype close to backfill's per-chunk model.
+  size_t remaining = tablets_pending_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+  if (remaining != 0) {
+    return;
+  }
+  if (terminal_reached_.exchange(true)) {
+    return;
+  }
+
+  std::string duplicate_hint;
+  Status rpc_error;
+  {
+    std::lock_guard l(mutex_);
+    duplicate_hint = first_duplicate_hint_;
+    rpc_error = first_rpc_error_;
+  }
+
+  IndexVerifyState terminal_state;
+  std::string error_message;
+  if (!duplicate_hint.empty()) {
+    terminal_state = INDEX_VERIFY_FAILED;
+    error_message = Format("Duplicate detected during post-backfill verify: $0", duplicate_hint);
+  } else if (!rpc_error.ok()) {
+    terminal_state = INDEX_VERIFY_FAILED;
+    error_message = rpc_error.ToString();
+  } else {
+    terminal_state = INDEX_VERIFY_SUCCEEDED;
+  }
+
+  LOG_WITH_PREFIX(INFO) << "All chunks reported; persisting verify_state = "
+                        << IndexVerifyState_Name(terminal_state)
+                        << (error_message.empty() ? "" : Format(" ($0)", error_message));
+  WARN_NOT_OK(
+      PersistTerminalState(terminal_state, error_message),
+      "Failed to persist terminal verify state");
+}
+
+Status VerifyIndex::PersistTerminalState(
+    IndexVerifyState terminal_state,
+    const std::string& error_message) {
+  auto l = indexed_table_->LockForWrite();
+  auto& pb = l.mutable_data()->pb;
+  bool found = false;
+  for (int i = 0; i < pb.indexes_size(); ++i) {
+    auto* idx_pb = pb.mutable_indexes(i);
+    if (idx_pb->table_id() == index_id_) {
+      idx_pb->set_verify_state(terminal_state);
+      if (!error_message.empty()) {
+        idx_pb->set_verify_error_message(error_message);
+      }
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    return STATUS_FORMAT(
+        NotFound, "Index $0 not found on indexed table $1 while persisting verify state",
+        index_id_, indexed_table_->id());
+  }
+  RETURN_NOT_OK_PREPEND(
+      master_->catalog_manager_impl()->sys_catalog_->Upsert(epoch_, indexed_table_),
+      "Failed to persist post-backfill verify terminal state");
+  l.Commit();
+  return Status::OK();
+}
+
+// -----------------------------------------------------------------------------------------------
+// VerifyIndexChunk
+// -----------------------------------------------------------------------------------------------
+
+VerifyIndexChunk::VerifyIndexChunk(
+    std::shared_ptr<VerifyIndex> orchestrator,
+    TabletInfoPtr tablet,
+    LeaderEpoch epoch)
+    : RetryingTSRpcTaskWithTable(
+          orchestrator->master(),
+          orchestrator->threadpool(),
+          std::unique_ptr<TSPicker>(new PickLeaderReplica(tablet)),
+          tablet->table(),
+          std::move(epoch),
+          /* async_task_throttler = */ nullptr),
+      orchestrator_(std::move(orchestrator)),
+      tablet_(std::move(tablet)) {
+  deadline_ = MonoTime::Max();
+}
+
+Status VerifyIndexChunk::Launch() {
+  tablet_->table()->AddTask(shared_from_this());
+  Status status = Run();
+  RETURN_NOT_OK_PREPEND(
+      status,
+      Substitute("Failed to send VerifyIndexChunk request for $0", tablet_->ToString()));
+  if (status.ok()) {
+    LOG(INFO) << "Started VerifyIndexChunk : " << description();
+  }
+  return Status::OK();
+}
+
+MonoTime VerifyIndexChunk::ComputeDeadline() const {
+  MonoTime timeout = MonoTime::Now();
+  // Verify scans read the same MVCC timeline as backfill and share the same
+  // per-attempt failure envelope; reuse backfill's timeout knobs.
+  if (tablet_->table()->GetTableType() == TableType::PGSQL_TABLE_TYPE) {
+    timeout.AddDelta(MonoDelta::FromMilliseconds(FLAGS_ysql_index_backfill_rpc_timeout_ms));
+  } else {
+    timeout.AddDelta(MonoDelta::FromMilliseconds(FLAGS_index_backfill_rpc_timeout_ms));
+  }
+  return MonoTime::Earliest(timeout, deadline_);
+}
+
+int VerifyIndexChunk::num_max_retries() {
+  return FLAGS_index_backfill_rpc_max_retries;
+}
+
+int VerifyIndexChunk::max_delay_ms() {
+  return FLAGS_index_backfill_rpc_max_delay_ms;
+}
+
+std::string VerifyIndexChunk::description() const {
+  return Format("Verifying index $0 tablet $1 at verify_time $2",
+                orchestrator_->index_id(), tablet_id(), orchestrator_->verify_time());
+}
+
+bool VerifyIndexChunk::SendRequest(int attempt) {
+  tserver::VerifyIndexChunkRequestPB req;
+  req.set_dest_uuid(permanent_uuid());
+  req.set_tablet_id(tablet_->id());
+  req.set_index_table_id(orchestrator_->index_id());
+  req.set_verify_time(orchestrator_->verify_time().ToUint64());
+  // start_key / end_key intentionally unset -- verify scans the whole tablet
+  // in this PR. DocKey-aligned chunking is a follow-up.
+  req.set_propagated_hybrid_time(master_->clock()->Now().ToUint64());
+
+  ts_admin_proxy_->VerifyIndexChunkAsync(req, &resp_, &rpc_, BindRpcCallback());
+  VLOG(1) << "Send " << description() << " to " << permanent_uuid()
+          << " (attempt " << attempt << "):\n"
+          << req.DebugString();
+  return true;
+}
+
+void VerifyIndexChunk::HandleResponse(int attempt) {
+  VLOG(1) << __PRETTY_FUNCTION__ << " response is " << yb::ToString(resp_);
+  Status status;
+  if (resp_.has_error()) {
+    status = StatusFromPB(resp_.error().status());
+    switch (resp_.error().code()) {
+      case TabletServerErrorPB::MISMATCHED_SCHEMA:
+      case TabletServerErrorPB::OPERATION_NOT_SUPPORTED:
+      case TabletServerErrorPB::TABLET_HAS_A_NEWER_SCHEMA:
+      case TabletServerErrorPB::TABLET_NOT_FOUND:
+        LOG(WARNING) << "TS " << permanent_uuid() << ": VerifyIndexChunk failed for tablet "
+                     << tablet_->ToString() << " no further retry: " << status
+                     << " response was " << yb::ToString(resp_);
+        TransitionToFailedState(MonitoredTaskState::kRunning, status);
+        break;
+      default:
+        LOG(WARNING) << "TS " << permanent_uuid() << ": VerifyIndexChunk failed for tablet "
+                     << tablet_->ToString() << ": " << status.ToString()
+                     << " code " << resp_.error().code();
+        break;
+    }
+  } else {
+    TransitionToCompleteState();
+    VLOG(1) << "TS " << permanent_uuid() << ": VerifyIndexChunk complete on tablet "
+            << tablet_->ToString();
+  }
+  server::UpdateClock(resp_, master_->clock());
+}
+
+void VerifyIndexChunk::UnregisterAsyncTaskCallback() {
+  if (state() == MonitoredTaskState::kAborted) {
+    VLOG(1) << description() << " was aborted";
+    ReportCompletionOnce(
+        STATUS(Aborted, "VerifyIndexChunk aborted"),
+        /* duplicate_key_hint = */ "");
+    return;
+  }
+
+  Status rpc_status;
+  std::string duplicate_hint;
+  if (resp_.has_error()) {
+    rpc_status = StatusFromPB(resp_.error().status());
+  } else if (state() != MonitoredTaskState::kComplete) {
+    rpc_status = STATUS_FORMAT(InternalError, "$0 in state $1", description(), state());
+  } else {
+    duplicate_hint = resp_.duplicate_key_hint();
+  }
+  ReportCompletionOnce(rpc_status, duplicate_hint);
+}
+
+void VerifyIndexChunk::ReportCompletionOnce(
+    const Status& rpc_status, const std::string& duplicate_key_hint) {
+  bool expected = false;
+  if (!reported_.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    // Already reported. Common case: RetryingRpcTask::Run() hit a synchronous
+    // launch failure, called UnregisterAsyncTask -> UnregisterAsyncTaskCallback
+    // (which reported here), and then returned the same error to
+    // VerifyIndex::LaunchInternal, which tried to report again. Ignore.
+    VLOG(1) << description() << " completion already reported (dropping duplicate report: "
+            << (rpc_status.ok() ? "OK" : rpc_status.ToString()) << ")";
+    return;
+  }
+  orchestrator_->OnChunkComplete(tablet_->id(), rpc_status, duplicate_key_hint);
+}
+
+// -----------------------------------------------------------------------------------------------
+// Master failover recovery for VerifyIndex
+// -----------------------------------------------------------------------------------------------
+
+void CatalogManager::ResumeInProgressUniqueIndexVerify(const LeaderEpoch& epoch) {
+  // Snapshot the (indexed_table_id, index_id, verify_time) triples under the
+  // shared lock, then launch verifiers outside it so we do not hold the
+  // catalog lock across sys.catalog Upserts.
+  struct PendingVerify {
+    scoped_refptr<TableInfo> indexed_table;
+    TableId index_id;
+    HybridTime verify_time;
+  };
+  std::vector<PendingVerify> pending;
+  {
+    SharedLock lock(mutex_);
+    for (const auto& table : tables_->GetAllTables()) {
+      auto l = table->LockForRead();
+      const auto& pb = l->pb;
+      if (pb.indexes_size() == 0) {
+        continue;
+      }
+      if (l->started_deleting()) {
+        continue;
+      }
+      for (const auto& idx_pb : pb.indexes()) {
+        if (idx_pb.verify_state() != INDEX_VERIFY_IN_PROGRESS) {
+          continue;
+        }
+        DCHECK(idx_pb.has_verify_time())
+            << "verify_state IN_PROGRESS without verify_time on index " << idx_pb.table_id();
+        pending.push_back(
+            {table, idx_pb.table_id(), HybridTime(idx_pb.verify_time())});
+      }
+    }
+  }
+
+  for (auto& p : pending) {
+    LOG(INFO) << "Resuming in-progress unique-index verify for " << p.index_id
+              << " at verify_time " << p.verify_time;
+    auto verify = std::make_shared<VerifyIndex>(
+        master_, AsyncTaskPool(), p.indexed_table, p.index_id, p.verify_time, epoch);
+    // Submit Launch asynchronously so the SysCatalogLoaded caller returns
+    // promptly and the new leader can serve traffic while verify runs.
+    const TableId captured_index_id = p.index_id;
+    Status s = AsyncTaskPool()->SubmitFunc([verify, captured_index_id]() {
+      WARN_NOT_OK(
+          verify->Launch(),
+          Format("Failed to resume VerifyIndex for $0", captured_index_id));
+    });
+    WARN_NOT_OK(
+        s, Format("Failed to submit resumed VerifyIndex::Launch for $0", p.index_id));
   }
 }
 

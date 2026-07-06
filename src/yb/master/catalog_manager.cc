@@ -13957,6 +13957,8 @@ void CatalogManager::SysCatalogLoaded(SysCatalogLoadingState&& state) {
   StartPostLoadTasks(std::move(state.post_load_tasks));
   StartWriteTableToSysCatalogTasks(std::move(state.write_to_disk_tables));
 
+  ResumeInProgressUniqueIndexVerify(state.epoch);
+
   ysql_manager_->SysCatalogLoaded(state.epoch);
 
   master_->snapshot_coordinator().SysCatalogLoaded(state.epoch.leader_term);
