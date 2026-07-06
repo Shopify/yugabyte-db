@@ -122,6 +122,14 @@ SpanWithScopePtr StartSpanWithScope(
 // Child of active context, else an optional root gated by otel_rpc_sampling_ratio.
 SpanWithScopePtr StartClientSpanWithScope(std::string_view op_name);
 
+// Marker attrs on an origin root, read by the sampler to override otel_rpc_sampling_ratio:
+// kForceTraceKey force-records, kSuppressTraceKey force-drops.
+inline constexpr const char* kForceTraceKey = "yb.force_trace";
+inline constexpr const char* kSuppressTraceKey = "yb.suppress_trace";
+
+// Origin root span (no parent) + activated scope so the origin's RPCs nest under it.
+SpanWithScopePtr StartOriginRootSpanWithScope(std::string_view op_name, bool trace);
+
 // Span as a remote child of parent_context (from an inbound request) + activated scope --
 // the server end of a propagated trace; needs no local active context.
 SpanWithScopePtr StartServerSpanWithScope(

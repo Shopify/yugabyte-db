@@ -94,6 +94,7 @@
 #include "commands/dbcommands.h"
 #include "utils/catcache.h"
 #include "utils/yb_inheritscache.h"
+#include "yb/yql/pggate/ybc_dist_trace.h"
 #include "yb/yql/pggate/ybc_gflags.h"
 
 static HeapTuple GetDatabaseTuple(const char *dbname);
@@ -1020,7 +1021,8 @@ InitPostgresImpl(const char *in_dbname, Oid dboid,
 				 bool override_allow_connections,
 				 char *out_dbname,
 				 const YbcPgInitPostgresInfo *yb_init_info,
-				 bool *yb_sys_table_prefetching_started)
+				 bool *yb_sys_table_prefetching_started,
+				 bool *yb_backend_init_span_started)
 {
 	bool		bootstrap = IsBootstrapProcessingMode();
 	bool		am_superuser;
@@ -1141,6 +1143,33 @@ InitPostgresImpl(const char *in_dbname, Oid dboid,
 		SetConfigOption("yb_dist_tracecontext", tracecontext,
 						PGC_BACKEND, PGC_S_CLIENT);
 	}
+
+	/*
+	 * YB: Open a backend-init distributed-trace root span here -- before the
+	 * first catalog RPC below -- and keep it active to the end of this function,
+	 * so every connect-time catalog RPC (the prefetch reads just below,
+	 * RelationCacheInitializePhase3, CheckMyDatabase, ...) nests under it instead
+	 * of becoming a parentless standalone span.
+	 *
+	 * Runs for every non-bootstrap YB backend; the traceparent argument decides
+	 * how the root is parented:
+	 *   - relcache-init connections carry a startup-packet traceparent (the only
+	 *     backend the tserver sets it on), so the root nests under the tserver's
+	 *     origin span and inherits its sampled flag (otel_trace_relcache_init).
+	 *   - everyone else (external clients, and the B_BACKEND internal connections
+	 *     for catalog-version-check and call-home) has no traceparent and gets a
+	 *     local root whose force/suppress otel_trace_backend_init decides; when
+	 *     off the connect burst is dropped even at otel_rpc_sampling_ratio=1.
+	 *
+	 * Started before MyDatabaseId/the session user are resolved, so the span
+	 * carries the dboid/useroid args (InvalidOid when connecting by name).
+	 */
+	if (IsYugaByteEnabled() && !bootstrap &&
+		YBCIsOtelScopeStackEmpty() &&
+		YBCDistTraceStartBackendInitRootSpan(
+			MyProcPort != NULL ? MyProcPort->yb_dist_traceparent : NULL,
+			dboid, useroid))
+		*yb_backend_init_span_started = true;
 
 	if (IsYugaByteEnabled() && !bootstrap)
 	{
@@ -1744,6 +1773,7 @@ InitPostgresImpl(const char *in_dbname, Oid dboid,
 	/* close the transaction we started above */
 	if (!bootstrap)
 		CommitTransactionCommand();
+
 }
 
 static void
@@ -1751,6 +1781,21 @@ YbEnsureSysTablePrefetchingStopped()
 {
 	if (IsYugaByteEnabled() && YBCIsSysTablePrefetchingStarted())
 		YBCStopSysTablePrefetching();
+}
+
+/*
+ * YB: End the backend-init trace span if it is still open, then clear the flag
+ * so a later call is a no-op. See YbInitPostgres for why this is called from
+ * both the normal-return and PG_CATCH paths.
+ */
+static inline void
+YbEndBackendInitTraceSpan(bool *span_started)
+{
+	if (*span_started)
+	{
+		YBCDistTraceEndSpan();
+		*span_started = false;
+	}
 }
 
 void
@@ -1762,19 +1807,34 @@ YbInitPostgres(const char *in_dbname, Oid dboid,
 {
 	bool		sys_table_prefetching_started = false;
 
+	/*
+	 * YB: Whether InitPostgresImpl opened a distributed-trace root span for
+	 * backend init (gated inside InitPostgresImpl). The span brackets the
+	 * init-time catalog RPCs and only exports once it ends, so it must be ended
+	 * on every exit from InitPostgresImpl -- and that function has several early
+	 * returns plus a number of ereport(FATAL) calls. Ending it here, after the
+	 * call returns normally and in PG_CATCH before re-throwing, covers them all
+	 * in one place: a FATAL longjmps to this PG_CATCH on its way to proc_exit.
+	 * Mirrors sys_table_prefetching_started above.
+	 */
+	bool		backend_init_span_started = false;
+
 	PG_TRY();
 	{
 		InitPostgresImpl(in_dbname, dboid, username, useroid,
 						 load_session_libraries, override_allow_connections,
-						 out_dbname, yb_init_info, &sys_table_prefetching_started);
+						 out_dbname, yb_init_info, &sys_table_prefetching_started,
+						 &backend_init_span_started);
 	}
 	PG_CATCH();
 	{
+		YbEndBackendInitTraceSpan(&backend_init_span_started);
 		YbEnsureSysTablePrefetchingStopped();
 		YBCUpdateInitPostgresMetrics();
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	YbEndBackendInitTraceSpan(&backend_init_span_started);
 	YbEnsureSysTablePrefetchingStopped();
 	YBCUpdateInitPostgresMetrics();
 }

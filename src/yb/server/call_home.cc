@@ -23,6 +23,7 @@
 #include "yb/server/call_home.h"
 
 #include "yb/util/atomic.h"
+#include "yb/util/dist_trace.h"
 #include "yb/util/flags/flag_tags.h"
 #include "yb/util/net/net_fwd.h"
 #include "yb/util/flags.h"
@@ -54,6 +55,11 @@ DEFINE_RUNTIME_string(callhome_tag, "",
 
 DEFINE_test_flag(int32, callhome_destructor_sleep_ms, 0,
     "How long to sleep at the beginning of the call home base class destructor.");
+
+DEFINE_RUNTIME_bool(otel_trace_ysql_callhome, false,
+    "Trace a call-home collection run (GetMasterRegistration, the YSQL cluster-stats RPC) under a "
+    "root span covering every collector; also propagates the trace context into internal PG "
+    "connections via the yb_dist_tracecontext GUC. When false the root is suppressed.");
 
 using google::CommandlineFlagsIntoString;
 using strings::Substitute;
@@ -276,6 +282,9 @@ void CallHome::BuildJsonAndSend() {
 void CallHome::DoCallHome() {
   if (FLAGS_callhome_enabled) {
     if (!SkipCallHome()) {
+      // Origin root for this call-home cycle.
+      auto trace_span = dist_trace::StartOriginRootSpanWithScope(
+          "callhome", FLAGS_otel_trace_ysql_callhome);
       BuildJsonAndSend();
     }
   }

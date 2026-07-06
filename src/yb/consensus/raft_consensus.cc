@@ -68,6 +68,7 @@
 #include "yb/util/debug-util.h"
 #include "yb/util/debug/long_operation_tracker.h"
 #include "yb/util/debug/trace_event.h"
+#include "yb/util/dist_trace.h"
 #include "yb/util/enums.h"
 #include "yb/util/flag_validators.h"
 #include "yb/util/flags.h"
@@ -166,6 +167,7 @@ TAG_FLAG(after_stepdown_delay_election_multiplier, advanced);
 TAG_FLAG(after_stepdown_delay_election_multiplier, hidden);
 
 DECLARE_int32(memory_limit_warn_threshold_percentage);
+DECLARE_bool(otel_trace_consensus);
 
 DEFINE_test_flag(int32, inject_delay_leader_change_role_append_secs, 0,
                  "Amount of time to delay leader from sending replicate of change role.");
@@ -507,14 +509,19 @@ Status RaftConsensus::Start(const ConsensusBootstrapInfo& info) {
   // Capture a weak_ptr reference into the functor so it can safely handle
   // outliving the consensus instance.
   std::weak_ptr<RaftConsensus> w = shared_from_this();
-  failure_detector_ = PeriodicTimer::Create(
-      peer_proxy_factory_->messenger(),
-      [w]() {
-        if (auto consensus = w.lock()) {
-          consensus->ReportFailureDetected();
-        }
-      },
-      MinimumElectionTimeout());
+  {
+    // Scope for the timer function.
+    auto trace_span = dist_trace::StartOriginRootSpanWithScope(
+        "consensus.first_leader_election", FLAGS_otel_trace_consensus);
+    failure_detector_ = PeriodicTimer::Create(
+        peer_proxy_factory_->messenger(),
+        [w]() {
+          if (auto consensus = w.lock()) {
+            consensus->ReportFailureDetected();
+          }
+        },
+        MinimumElectionTimeout());
+  }
 
   {
     if (table_type_ != TableType::TRANSACTION_STATUS_TABLE_TYPE) {

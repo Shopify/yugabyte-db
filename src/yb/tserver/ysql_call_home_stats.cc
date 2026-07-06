@@ -17,6 +17,7 @@
 
 #include "yb/tserver/tablet_server_interface.h"
 
+#include "yb/util/dist_trace.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/yql/pgwrapper/libpq_utils.h"
@@ -70,6 +71,9 @@ DEFINE_RUNTIME_int32(callhome_ysql_statement_timeout_ms, 60000,
     "Timeout in milliseconds for individual query execution during YSQL call-home collection. "
     "Passed directly to PostgreSQL's statement_timeout GUC. Set to 0 for no timeout.");
 
+// Defined in yb/server/call_home.cc.
+DECLARE_bool(otel_trace_ysql_callhome);
+
 using std::string;
 
 namespace yb {
@@ -110,6 +114,13 @@ std::optional<CoarseTimePoint> ConnectionDeadline() {
 Result<pgwrapper::PGConn> ConnectToDb(TabletServerIf* server, const string& dbname) {
   auto conn = VERIFY_RESULT(
       server->CreateInternalPGConn(dbname, kDefaultInternalPgUser, false, ConnectionDeadline()));
+
+  // Set trace parent GUC for the connnection.
+  const auto traceparent = dist_trace::GetActiveTraceparent();
+  if (!traceparent.empty()) {
+    RETURN_NOT_OK(conn.ExecuteFormat(
+        "SET yb_dist_tracecontext = 'traceparent=''$0''' /*traceparent='$0'*/", traceparent));
+  }
 
   if (FLAGS_callhome_ysql_statement_timeout_ms > 0) {
     RETURN_NOT_OK(conn.ExecuteFormat(
@@ -217,6 +228,9 @@ string BuildStatsJson(
 }
 
 Result<string> CollectYsqlClusterStatsJson(TabletServerIf* server) {
+  // Open one root span for the whole collection run.
+  auto trace_span = dist_trace::StartOriginRootSpanWithScope(
+      "ysql_callhome", FLAGS_otel_trace_ysql_callhome);
   auto databases = VERIFY_RESULT(GetDbs(server));
   return BuildStatsJson(
       server, databases, YsqlClusterQueries::kClusterLevel, YsqlClusterQueries::kDbLevel);

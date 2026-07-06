@@ -18,9 +18,11 @@
 #include "yb/tserver/ysql_call_home_stats.h"
 
 #include "yb/util/cgroups.h"
+#include "yb/util/dist_trace.h"
 #include "yb/util/format.h"
 
 DECLARE_bool(enable_ysql);
+DECLARE_bool(otel_trace_ysql_callhome);
 
 using std::string;
 
@@ -64,6 +66,10 @@ class YsqlNodeStatsCollector : public TserverCollector {
     if (!throttle_.ShouldCollect()) {
       return;
     }
+    // Open the root span so the template1 connection BuildStatsJson opens (via ConnectToDb, which
+    // propagates the active context) nests under it instead of leaking as parentless roots.
+    auto trace_span = dist_trace::StartOriginRootSpanWithScope(
+        "ysql_callhome", FLAGS_otel_trace_ysql_callhome);
     auto stats_json = BuildStatsJson(tserver(), {"template1"}, YsqlNodeQueries::kNodeLevel, {});
     json_ = Format("\"ysql_node_stats\":$0", stats_json);
   }

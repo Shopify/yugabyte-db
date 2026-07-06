@@ -202,6 +202,7 @@
 #include "yb/util/cgroups.h"
 #include "yb/util/countdown_latch.h"
 #include "yb/util/debug-util.h"
+#include "yb/util/dist_trace.h"
 #include "yb/util/flag_validators.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
@@ -249,6 +250,11 @@ DEFINE_test_flag(bool, get_ysql_catalog_version_from_sys_catalog, false,
     "from the sys_catalog.");
 
 DECLARE_bool(TEST_log_catalog_version_cache_events);
+
+DEFINE_RUNTIME_bool(otel_trace_catalog, false,
+    "Trace the master catalog manager's self-initiated RPCs (tablet processing, system-table "
+    "creation, universe-key fetch, deletes, schema alter, backfill, load balancer, splits, clones, "
+    "etc.) under per-functionality parent spans. When off, those spans are suppressed.");
 
 DEFINE_test_flag(uint32, abort_create_table, 0,
     "Abort the creation of a table at a specified point in code.");
@@ -1175,7 +1181,12 @@ Status CatalogManager::Init() {
   // within CatalogManager. Need not start sys catalog or background tasks
   // when we are started in shell mode.
   if (!master_->opts().IsShellMode()) {
-    RETURN_NOT_OK(GetUniverseKeyRegistryFromOtherMastersAsync());
+    {
+      // Flag-gated origin root: nests the synchronous GetUniverseKeyRegistry fan-out
+      auto trace_span = dist_trace::StartOriginRootSpanWithScope(
+          "catalog.universe_key_fetch", FLAGS_otel_trace_catalog);
+      RETURN_NOT_OK(GetUniverseKeyRegistryFromOtherMastersAsync());
+    }
     RETURN_NOT_OK(EnableBgTasks());
   }
 
@@ -12052,6 +12063,9 @@ Status CatalogManager::ProcessPendingAssignmentsPerTable(
       deferred.needs_create_rpc.empty()) {
     return Status::OK();
   }
+
+  auto trace_span = dist_trace::StartOriginRootSpanWithScope(
+    "catalog.tablet_processing", FLAGS_otel_trace_catalog);
 
   // For those tablets which need to be created in this round, assign replicas.
   Status s;

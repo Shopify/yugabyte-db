@@ -68,6 +68,7 @@
 #include "yb/util/async_util.h"
 #include "yb/util/callsite_profiling.h"
 #include "yb/util/cgroups.h"
+#include "yb/util/dist_trace.h"
 #include "yb/util/logging.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/net_util.h"
@@ -87,6 +88,10 @@ TAG_FLAG(heartbeat_rpc_timeout_ms, advanced);
 DEFINE_RUNTIME_int32(heartbeat_interval_ms, 1000,
     "Interval at which the TS heartbeats to the master.");
 TAG_FLAG(heartbeat_interval_ms, advanced);
+
+DEFINE_RUNTIME_bool(otel_trace_tserver_heartbeat, false,
+    "Trace each TS->master heartbeat poll under a root span so its RPCs are traced. When false the "
+    "root is suppressed.");
 
 DEFINE_UNKNOWN_int32(heartbeat_max_failures_before_backoff, 3,
              "Maximum number of consecutive heartbeat failures until the "
@@ -269,6 +274,10 @@ Status HeartbeatPoller::Poll() {
     YB_LOG_EVERY_N_SECS(INFO, 1) << "Heartbeat disabled for testing.";
     return Status::OK();
   }
+
+  // Open an origin root.
+  auto trace_span = dist_trace::StartOriginRootSpanWithScope(
+      "tserver_heartbeat", FLAGS_otel_trace_tserver_heartbeat);
 
   if (!proxy_) {
     VLOG_WITH_PREFIX(1) << "No valid master proxy. Connecting...";

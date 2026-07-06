@@ -33,6 +33,7 @@
 
 #include "yb/tserver/ysql_advisory_lock_table.h"
 
+#include "yb/util/dist_trace.h"
 #include "yb/util/flag_validators.h"
 #include "yb/util/is_operation_done_result.h"
 #include "yb/util/status_log.h"
@@ -75,6 +76,7 @@ DEFINE_test_flag(bool, simulate_catalog_version_refresh_failure, false,
 DEFINE_test_flag(bool, log_catalog_version_cache_events, false,
     "Log cache hit/miss and refresh events for GetYsqlDBCatalogVersion.");
 DECLARE_bool(ysql_yb_enable_listen_notify);
+DECLARE_bool(otel_trace_catalog);
 
 namespace yb::master {
 
@@ -397,6 +399,16 @@ void YsqlManager::RunBgTasks(const LeaderEpoch& epoch) {
 
   // Avoid creating system tables if we are in the middle of upgrade.
   if (!IsMajorUpgradeInProgress()) {
+    // Flag-gated origin root over the one-time system-table creates. Opened only when a create is
+    // pending, to avoid an empty span every bg tick.
+    const bool create_pending =
+        !advisory_locks_table_created_ ||
+        (FLAGS_ysql_enable_auto_analyze_infra && !pg_auto_analyze_service_created_);
+    auto create_scope = create_pending
+        ? dist_trace::StartOriginRootSpanWithScope(
+              "catalog.ysql_system_table_creation", FLAGS_otel_trace_catalog)
+        : dist_trace::SpanWithScopePtr{};
+
     WARN_NOT_OK(
         CreateYbAdvisoryLocksTableIfNeeded(epoch), "Failed to create YB advisory locks table");
 

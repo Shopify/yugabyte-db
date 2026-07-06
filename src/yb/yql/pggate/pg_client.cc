@@ -70,6 +70,10 @@ DEFINE_UNKNOWN_uint64(pg_client_heartbeat_interval_ms, 10000,
     "Pg client heartbeat interval in ms. Needs to be greater than 1000ms.");
 DEFINE_validator(pg_client_heartbeat_interval_ms, FLAG_GT_VALUE_VALIDATOR(1000));
 
+DEFINE_NON_RUNTIME_bool(otel_trace_pg_heartbeat, false,
+    "Trace each PG backend->tserver heartbeat (PgClientService.Heartbeat) under a root span. When "
+    "false the root is suppressed. Read once at fork, so changing it needs a postmaster restart.");
+
 DEFINE_NON_RUNTIME_int32(pg_client_extra_timeout_ms, 2000,
    "Adding this value to RPC call timeout, so postgres could detect timeout by it's own mechanism "
    "and report it.");
@@ -773,6 +777,10 @@ class PgClient::Impl : public BigDataFetcher {
         return;
       }
     }
+    // Always open an origin root: recorded when the flag is on, dropped when off (which still nests
+    // the heartbeat RPC under it rather than leaving it parentless).
+    auto trace_span =
+        dist_trace::StartOriginRootSpanWithScope("pg_heartbeat", FLAGS_otel_trace_pg_heartbeat);
     tserver::PgHeartbeatRequestPB req;
     if (create) {
       req.set_pid(getpid());

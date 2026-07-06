@@ -130,6 +130,12 @@ DEFINE_RUNTIME_bool(xcluster_target_manual_override, false,
     "YugabyteDB support before using.");
 TAG_FLAG(xcluster_target_manual_override, hidden);
 
+DEFINE_RUNTIME_bool(otel_trace_ysql_shutdown, false,
+    "Trace the RPCs issued during YSQL session teardown (ReleaseObjectLocksGlobal and "
+    "AbortTransaction, fired when a PG backend disconnects and its session is reaped) under a "
+    "single self-rooted ysql.session_shutdown span. When off, those RPCs are not grouped and "
+    "surface as parentless roots.");
+
 DEFINE_test_flag(bool, request_unknown_tables_during_perform, false,
     "Add several unknown tables while processing perfrom request. "
     "It is expected that opening of such tables will fail");
@@ -3243,6 +3249,23 @@ class PgClientSession::Impl {
   void StartShutdown(bool pg_service_shutting_down) {
     VLOG(2) << "StartShutdown for session id: " << id();
     if (!pg_service_shutting_down) {
+      // Flag-gated self-rooted span over the teardown RPCs, opened only when there's work (else empty).
+      // No-txn release hits the master only when the plain session held exclusive locks; else it's local.
+      const bool has_teardown_work =
+          Transaction(PgClientSessionKind::kPlain) ||
+          Transaction(PgClientSessionKind::kAutonomousDdl) ||
+          Transaction(PgClientSessionKind::kPgSession) ||
+          (IsObjectLockingEnabled() && plain_session_has_exclusive_object_locks_.load());
+      auto shutdown_scope = has_teardown_work
+          ? dist_trace::StartOriginRootSpanWithScope(
+                "ysql.session_shutdown", FLAGS_otel_trace_ysql_shutdown)
+          : dist_trace::SpanWithScopePtr{};
+      if (shutdown_scope) {
+        // Identify which PG backend's teardown this is
+        shutdown_scope->SetAttribute("ysql.backend_pid", static_cast<int64_t>(pid_));
+        shutdown_scope->SetAttribute("ysql.session_id", static_cast<int64_t>(id()));
+      }
+
       WARN_NOT_OK(CleanupObjectLocks(), "Error cleaning up object locks");
 
       // Abort txns attached to this session

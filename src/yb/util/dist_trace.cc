@@ -16,6 +16,8 @@
 #include "opentelemetry/exporters/otlp/otlp_http_exporter_options.h"
 #include "opentelemetry/sdk/common/global_log_handler.h"
 #include "opentelemetry/sdk/trace/batch_span_processor_factory.h"
+#include "opentelemetry/sdk/trace/samplers/parent.h"
+#include "opentelemetry/sdk/trace/samplers/trace_id_ratio.h"
 #include "opentelemetry/sdk/trace/tracer_provider_factory.h"
 #include "opentelemetry/sdk/trace/provider.h"
 #include "opentelemetry/trace/propagation/http_trace_context.h"
@@ -67,6 +69,14 @@ DEFINE_validator(otel_ysql_batch_max_queue_size,
 
 DEFINE_validator(otel_internal_log_level,
     FLAG_IN_SET_VALIDATOR("debug", "info", "warning", "error", "none"));
+
+DEFINE_NON_RUNTIME_double(otel_rpc_sampling_ratio, 0.0,
+    "Fraction [0.0, 1.0] of standalone (parentless) outbound RPCs to trace. "
+    "0 disables standalone-RPC tracing; 1 traces all of them. RPCs that already run inside a "
+    "trace are unaffected by this flag.");
+
+// Validate the range here to surface a misconfiguration at startup.
+DEFINE_validator(otel_rpc_sampling_ratio, FLAG_RANGE_VALIDATOR(0.0, 1.0));
 
 namespace yb::dist_trace {
 
@@ -206,13 +216,67 @@ auto CreateProcessor(std::unique_ptr<opentelemetry::sdk::trace::SpanExporter> ex
       std::move(exporter), MakeBatchProcessorOptions());
 }
 
+// Wraps ParentBased(ratio); origin roots override it via a marker attribute (kForceTraceKey /
+// kSuppressTraceKey). A dropped root is still a valid (NoopSpan) context, so its RPCs nest under it
+// and get dropped too. Unmarked spans delegate to the ratio sampler.
+class ForceTraceSampler : public trace_sdk::Sampler {
+ public:
+  explicit ForceTraceSampler(std::unique_ptr<trace_sdk::Sampler> delegate)
+      : delegate_(std::move(delegate)) {}
+
+  trace_sdk::SamplingResult ShouldSample(
+      const trace::SpanContext& parent_context,
+      trace::TraceId trace_id,
+      nostd::string_view name,
+      trace::SpanKind span_kind,
+      const opentelemetry::common::KeyValueIterable& attributes,
+      const trace::SpanContextKeyValueIterable& links) noexcept override {
+    bool forced = false;
+    bool suppressed = false;
+    attributes.ForEachKeyValue(
+        [&forced, &suppressed](
+            nostd::string_view key, opentelemetry::common::AttributeValue) noexcept {
+          if (key == kForceTraceKey) {
+            forced = true;
+            return false;  // stop iterating
+          }
+          if (key == kSuppressTraceKey) {
+            suppressed = true;
+            return false;  // stop iterating
+          }
+          return true;
+        });
+    if (forced) {
+      return {trace_sdk::Decision::RECORD_AND_SAMPLE, nullptr, {}};
+    }
+    if (suppressed) {
+      return {trace_sdk::Decision::DROP, nullptr, {}};
+    }
+    return delegate_->ShouldSample(
+        parent_context, trace_id, name, span_kind, attributes, links);
+  }
+
+  nostd::string_view GetDescription() const noexcept override { return "YbForceTraceSampler"; }
+
+ private:
+  std::unique_ptr<trace_sdk::Sampler> delegate_;
+};
+
 Status InitDistTraceProvider(const resource_sdk::Resource& resource_attrs) {
   return WithMaskedYsqlSignals([&resource_attrs]() -> Status {
     auto exporter = CreateExporter();
     auto processor = CreateProcessor(std::move(exporter));
 
-    std::shared_ptr<trace::TracerProvider> provider =
-        trace_sdk::TracerProviderFactory::Create(std::move(processor), resource_attrs);
+    // Set up sampler.
+    auto root_sampler =
+        std::make_shared<trace_sdk::TraceIdRatioBasedSampler>(FLAGS_otel_rpc_sampling_ratio);
+    std::unique_ptr<trace_sdk::Sampler> ratio_sampler =
+        std::make_unique<trace_sdk::ParentBasedSampler>(root_sampler);
+    std::unique_ptr<trace_sdk::Sampler> sampler =
+        std::make_unique<ForceTraceSampler>(std::move(ratio_sampler));
+
+    std::shared_ptr<trace::TracerProvider> provider = trace_sdk::TracerProviderFactory::Create(
+        std::move(processor), resource_attrs, std::move(sampler));
 
     trace_sdk::Provider::SetTracerProvider(provider);
 
@@ -387,11 +451,25 @@ SpanWithScopePtr StartClientSpanWithScope(std::string_view op_name) {
   }
 
   auto current_span = trace::Tracer::GetCurrentSpan();
-  if (current_span && current_span->GetContext().IsValid()) {
+  if ((current_span && current_span->GetContext().IsValid()) || FLAGS_otel_rpc_sampling_ratio > 0) {
     return StartSpanWithScope(op_name, SpanAttrsView(pending), trace::SpanKind::kClient);
   }
 
   return nullptr;
+}
+
+SpanWithScopePtr StartOriginRootSpanWithScope(std::string_view op_name, bool trace) {
+  if (!IsDistTraceEnabled()) {
+    return nullptr;
+  }
+
+  // TODO: maybe not start if there is an active context.
+  trace::StartSpanOptions options;
+  options.kind = trace::SpanKind::kInternal;
+  const std::vector<std::pair<nostd::string_view, opentelemetry::common::AttributeValue>> attrs = {
+      {trace ? kForceTraceKey : kSuppressTraceKey, true}};
+  return std::make_shared<SpanWithScope>(GetDistTracer()->StartSpan(
+      nostd::string_view(op_name.data(), op_name.size()), attrs, options));
 }
 
 SpanWithScopePtr StartServerSpanWithScope(

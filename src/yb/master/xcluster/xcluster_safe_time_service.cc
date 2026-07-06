@@ -38,6 +38,7 @@
 #include "yb/tablet/tablet_peer.h"
 
 #include "yb/util/atomic.h"
+#include "yb/util/dist_trace.h"
 #include "yb/util/monotime.h"
 #include "yb/util/status.h"
 #include "yb/util/status_format.h"
@@ -60,6 +61,10 @@ DEFINE_RUNTIME_uint32(xcluster_safe_time_log_outliers_interval_secs, 600,
 
 DEFINE_RUNTIME_uint32(xcluster_safe_time_slow_tablet_delta_secs, 600,
     "Lag in seconds at which a tablet is considered an outlier for xcluster safe time.");
+
+DEFINE_RUNTIME_bool(otel_trace_xcluster, false,
+    "Trace self-initiated xCluster safe-time work (the table existence probe via GetTableSchema and "
+    "the table scan reads) under origin root spans. When false they are suppressed.");
 
 METRIC_DECLARE_entity(cluster);
 
@@ -120,6 +125,11 @@ void XClusterSafeTimeService::ProcessTaskPeriodically() {
     return;
   }
   int64_t leader_term = leader_term_result.get();
+
+  // Origin root for this safe-time computation cycle. ComputeSafeTime -> GetSafeTimeFromTable runs
+  // synchronously on this thread, so its RPCs nest under this scope instead of parentless roots.
+  auto trace_span = dist_trace::StartOriginRootSpanWithScope(
+      "xcluster_safe_time", FLAGS_otel_trace_xcluster);
 
   // Compute safe time now and also update the metrics.
   bool further_computation_needed = true;

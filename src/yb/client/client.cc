@@ -101,6 +101,7 @@
 
 #include "yb/tserver/pg_client.pb.h"
 
+#include "yb/util/dist_trace.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
 #include "yb/util/mem_tracker.h"
@@ -252,6 +253,10 @@ DEFINE_RUNTIME_bool(client_suppress_created_logs, false,
     "Suppress 'Created table ...' messages");
 TAG_FLAG(client_suppress_created_logs, advanced);
 TAG_FLAG(client_suppress_created_logs, hidden);
+
+DEFINE_RUNTIME_bool(otel_trace_master_leader_resolution, false,
+    "Trace the bootstrap master-leader-resolution RPCs (GetMasterRegistration) under a single "
+    "parent span. When off, those spans are suppressed.");
 
 DEFINE_RUNTIME_int32(backfill_index_client_rpc_timeout_ms, kDefaultBackfillIndexClientRpcTimeoutMs,
     "Timeout for BackfillIndex RPCs from client to master.");
@@ -532,15 +537,21 @@ Status YBClientBuilder::DoBuild(rpc::Messenger* messenger,
   // Let's allow for plenty of time for discovering the master the first
   // time around.
   auto deadline = CoarseMonoClock::Now() + c->default_admin_operation_timeout();
-  for (;;) {
-    auto status = c->data_->SetMasterServerProxy(deadline,
-            data_->skip_master_leader_resolution_,
-            data_->wait_for_leader_election_on_init_);
-    if (status.ok()) {
-      break;
-    }
-    if (!status.IsNotFound() || CoarseMonoClock::Now() >= deadline) {
-      RETURN_NOT_OK_PREPEND(status, "Could not locate the leader master")
+  {
+    // Single parent span over the whole master-leader resolution. The threadpool/RpcRetrier carry
+    // propagates its scope onto the off-thread GetMasterRegistration fan-out.
+    auto resolution_span = dist_trace::StartOriginRootSpanWithScope(
+        "master_leader_resolution", FLAGS_otel_trace_master_leader_resolution);
+    for (;;) {
+      auto status = c->data_->SetMasterServerProxy(deadline,
+              data_->skip_master_leader_resolution_,
+              data_->wait_for_leader_election_on_init_);
+      if (status.ok()) {
+        break;
+      }
+      if (!status.IsNotFound() || CoarseMonoClock::Now() >= deadline) {
+        RETURN_NOT_OK_PREPEND(status, "Could not locate the leader master")
+      }
     }
   }
 

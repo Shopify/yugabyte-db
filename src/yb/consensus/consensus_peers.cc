@@ -55,6 +55,7 @@
 #include "yb/tserver/tserver_error.h"
 
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/dist_trace.h"
 #include "yb/util/fault_injection.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
@@ -89,6 +90,10 @@ TAG_FLAG(collect_update_consensus_traces, advanced);
 DECLARE_int32(raft_heartbeat_interval_ms);
 
 DECLARE_bool(enable_multi_raft_heartbeat_batcher);
+
+DEFINE_RUNTIME_bool(otel_trace_consensus, false,
+    "Trace self-initiated consensus RPCs (peer init, remote-peer UUID resolution) under origin "
+    "root spans. When false they are suppressed.");
 
 DEFINE_test_flag(double, fault_crash_on_leader_request_fraction, 0.0,
                  "Fraction of the time when the leader will crash just before sending an "
@@ -156,6 +161,10 @@ Status Peer::Init() {
   // Capture a weak_ptr reference into the functor so it can safely handle
   // outliving the peer.
   std::weak_ptr<Peer> weak_peer = shared_from_this();
+  // Scope active while the timer is built; the timer captures it and re-activates it around each
+  // tick, so the heartbeat RPCs nest under this root.
+  auto trace_span = dist_trace::StartOriginRootSpanWithScope(
+      "consensus.heartbeat", FLAGS_otel_trace_consensus);
   heartbeater_ = PeriodicTimer::Create(
       messenger_,
       [weak_peer]() {
@@ -750,6 +759,11 @@ Status SetPermanentUuidForRemotePeer(
 
   DCHECK(!remote_peer->has_permanent_uuid());
   auto deadline = std::chrono::steady_clock::now() + timeout;
+
+  // Origin root for remote-peer UUID resolution (master sys_catalog startup): the GetNodeInstance
+  // RPCs below (across all retry attempts) nest under it instead of surfacing as parentless roots.
+  auto trace_span = dist_trace::StartOriginRootSpanWithScope(
+      "consensus.peer_uuid_resolution", FLAGS_otel_trace_consensus);
 
   std::vector<GetNodeInstanceRequest> requests;
   requests.reserve(endpoints.size());

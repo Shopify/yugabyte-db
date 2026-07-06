@@ -90,6 +90,7 @@
 #include "yb/tserver/ysql_advisory_lock_table.h"
 
 #include "yb/util/debug-util.h"
+#include "yb/util/dist_trace.h"
 #include "yb/util/flags/flag_tags.h"
 #include "yb/util/logging.h"
 #include "yb/util/net/net_util.h"
@@ -160,6 +161,10 @@ TAG_FLAG(ysql_cdc_active_replication_slot_window_ms, advanced);
 DEFINE_RUNTIME_int32(check_pg_object_id_allocators_interval_secs, 3600 * 3,
     "Interval at which pg object id allocators are checked for dropped databases.");
 TAG_FLAG(check_pg_object_id_allocators_interval_secs, advanced);
+
+DEFINE_RUNTIME_bool(otel_trace_check_pg_object_id_allocators, false,
+    "Trace each periodic pg-object-id-allocator check (the ListNamespaces RPC, in both master and "
+    "tserver PgClientService) under a root span. When false the root is suppressed.");
 
 DEFINE_NON_RUNTIME_int64(shmem_exchange_idle_timeout_ms, 2000 * yb::kTimeMultiplier,
     "Idle timeout interval in milliseconds used by shared memory exchange thread pool.");
@@ -3266,6 +3271,11 @@ class PgClientServiceImpl::Impl : public SessionProvider {
           LOG(INFO) << status;
           return;
         }
+        // Origin root for this allocator-check cycle. GetPgDatabaseOids() below runs synchronously on
+        // this scheduler thread and its ListNamespaces RPC is built here, so it nests under this
+        // scope instead of surfacing as a parentless root.
+        auto trace_span = dist_trace::StartOriginRootSpanWithScope(
+            "check_pg_object_id_allocators", FLAGS_otel_trace_check_pg_object_id_allocators);
         auto db_oids = GetPgDatabaseOids();
         if (db_oids.ok()) {
           CheckObjectIdAllocators(*db_oids);

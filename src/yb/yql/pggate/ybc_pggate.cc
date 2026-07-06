@@ -54,6 +54,7 @@
 
 #include "yb/util/atomic.h"
 #include "yb/util/curl_util.h"
+#include "yb/util/dist_trace.h"
 #include "yb/util/flags.h"
 #include "yb/util/jwt_util.h"
 #include "yb/util/result.h"
@@ -106,6 +107,10 @@ DEFINE_RUNTIME_PG_FLAG(bool, yb_user_ddls_preempt_auto_analyze, true,
     "yb_enable_invalidation_messages is enabled.");
 
 DECLARE_bool(TEST_ash_debug_aux);
+
+DEFINE_NON_RUNTIME_bool(otel_trace_ash, false,
+    "Trace each ASH collector tick (PgClientService.ActiveSessionHistory) under a root span. When "
+    "false the root is suppressed. Read once at fork, so changing it needs a postmaster restart.");
 
 /* Constants for replication slot LSN types */
 const std::string YBC_LSN_TYPE_SEQUENCE = "SEQUENCE";
@@ -2824,6 +2829,8 @@ YbcStatus YBCYcqlStatementStats(YbcYCQLStatementStats** stats, size_t* num_stats
 void YBCStoreTServerAshSamples(
     YbcAshAcquireBufferLock acquire_cb_lock_fn, YbcAshGetNextCircularBufferSlot get_cb_slot_fn,
     uint64_t sample_time) {
+  // Always open an origin root.
+  auto trace_span = dist_trace::StartOriginRootSpanWithScope("ash", FLAGS_otel_trace_ash);
   const auto result = pgapi->ActiveSessionHistory();
   // This lock is released inside YbAshMain after copying PG samples
   acquire_cb_lock_fn(true /* exclusive */);

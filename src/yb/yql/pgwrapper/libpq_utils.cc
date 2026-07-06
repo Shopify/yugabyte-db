@@ -1015,7 +1015,8 @@ PGConnBuilder CreateInternalPGConnBuilder(
     std::string_view user, uint64_t postgres_auth_key,
     const std::optional<CoarseTimePoint>& deadline,
     std::string_view yb_internal_conn_kind,
-    std::function<bool()> should_stop) {
+    std::function<bool()> should_stop,
+    std::string_view traceparent) {
   size_t connect_timeout = 0;
   if (deadline && *deadline != CoarseTimePoint::max()) {
     // By default, connect_timeout is 0, meaning infinite. 1 is automatically converted to 2, so set

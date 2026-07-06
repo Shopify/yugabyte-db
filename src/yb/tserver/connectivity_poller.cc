@@ -23,11 +23,16 @@
 #include "yb/tserver/master_leader_poller.h"
 #include "yb/tserver/tserver_service.pb.h"
 
+#include "yb/util/dist_trace.h"
 #include "yb/util/physical_time.h"
 #include "yb/util/status_log.h"
 
 DEFINE_RUNTIME_uint64(connectivity_check_interval_ms, 60000,
     "Milliseconds interval to check connectivity between cluster nodes");
+
+DEFINE_RUNTIME_bool(otel_trace_connectivity, false,
+    "Trace each connectivity poll (tserver->master ListTabletServers plus peer Pings) under a root "
+    "span. When false the root is suppressed.");
 
 namespace yb::tserver {
 
@@ -129,6 +134,10 @@ class ConnectivityPoller::Impl : public MasterLeaderPollerInterface {
   }
 
   Status Poll() override {
+    // connectivity poller root span
+    auto trace_span =
+        dist_trace::StartOriginRootSpanWithScope("connectivity", FLAGS_otel_trace_connectivity);
+
     auto timeout = IntervalToNextPoll(0);
     if (!proxy_) {
       proxy_ = VERIFY_RESULT(finder_.CreateProxy<master::MasterClusterProxy>(timeout));

@@ -509,7 +509,8 @@ PGConnBuilder CreateInternalPGConnBuilder(
     std::string_view user, uint64_t postgres_auth_key,
     const std::optional<CoarseTimePoint>& deadline,
     std::string_view yb_internal_conn_kind = {},
-    std::function<bool()> should_stop = {});
+    std::function<bool()> should_stop = {},
+    std::string_view traceparent = {});
 
 Result<std::string> ResultAsString(
     PGresult* res, const std::string& column_sep = DefaultColumnSeparator(),

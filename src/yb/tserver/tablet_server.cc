@@ -103,6 +103,7 @@
 #include "yb/tserver/xcluster_consumer_if.h"
 
 #include "yb/util/cgroups.h"
+#include "yb/util/dist_trace.h"
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
 #include "yb/util/net/net_util.h"
@@ -262,6 +263,20 @@ DEFINE_RUNTIME_bool(tserver_heartbeat_add_replication_status, true,
 DEFINE_RUNTIME_int32(check_lagging_catalog_versions_interval_secs, 900,
     "Interval at which pg backends are checked for lagging catalog versions.");
 TAG_FLAG(check_lagging_catalog_versions_interval_secs, advanced);
+
+DEFINE_RUNTIME_bool(otel_trace_catalog_version_check, false,
+    "Trace the periodic lagging-catalog-version check under a root span, propagating its context "
+    "into the internal PG connection (via the yb_dist_tracecontext GUC) so the backend RPCs "
+    "(Perform, AcquireObjectLock, OpenTable) nest under it. When false the root is suppressed.");
+
+DEFINE_RUNTIME_bool(otel_trace_relcache_init, false,
+    "Trace each relcache-init connection under a root span, propagating its context into the startup "
+    "packet (via the yb_dist_traceparent parameter) so the InitPostgres catalog RPCs "
+    "(AcquireObjectLock, OpenTable) nest under it. When false the root is suppressed.");
+
+DEFINE_RUNTIME_bool(otel_trace_tserver_init, false,
+    "Trace self-initiated TabletServer::Init RPCs (startup universe-key-registry fetch) under origin "
+    "root spans. When false they are suppressed.");
 
 DEFINE_RUNTIME_int32(min_invalidation_message_retention_time_secs, 60,
     "Minimal time at which a catalog version with invalidation message is retained.");
@@ -571,6 +586,10 @@ Status TabletServer::Init() {
     uint32_t attempts = 1;
     auto start_time = CoarseMonoClock::Now();
     encryption::UniverseKeyRegistryPB universe_key_registry;
+    // Origin root for the startup universe-key fetch: the GetFullUniverseKeyRegistry RPCs built
+    // below (across all retry attempts) nest under it instead of surfacing as parentless roots.
+    auto trace_span = dist_trace::StartOriginRootSpanWithScope(
+        "universe_key_registry", FLAGS_otel_trace_tserver_init);
     while (true) {
       auto res = client::UniverseKeyClient::GetFullUniverseKeyRegistry(
           options_.HostsString(), JoinStrings(master_addresses, ","),
@@ -1526,13 +1545,29 @@ void TabletServer::AbortInFlightRelcacheInitConnections() {
 
 void TabletServer::MakeRelcacheInitConnection(const std::string& dbname) {
   auto deadline = CoarseMonoClock::Now() + default_client_timeout();
+
+  // The InitPostgres phase3 RPCs fire in the PG backend. Open a root span, pass its context in the
+  // startup packet (yb_dist_traceparent) so the backend nests them under it.
+  auto trace_span = dist_trace::StartOriginRootSpanWithScope(
+      "relcache_init", FLAGS_otel_trace_relcache_init);
+  if (trace_span) {
+    trace_span->SetAttribute("db.name", dbname.c_str());
+  }
+  const std::string traceparent =
+      trace_span ? dist_trace::GetActiveTraceparent() : std::string();
+
   // Identify this connection as the dedicated relcache-init builder so the
   // backend takes on YB_RELCACHE_INIT_BACKEND, runs with minimal preload, and
   // does not recursively trigger another internal connection
   // (relcache.c:RelationCacheInitializePhase3).
-  auto status = ResultToStatus(CreateInternalPGConn(
-      dbname, kDefaultInternalPgUser, /*simple_query_protocol=*/false, deadline,
-      pgwrapper::YbInternalConnKindWireName::kRelcacheInit));
+  auto status = ResultToStatus(
+      pgwrapper::CreateInternalPGConnBuilder(
+          pgsql_proxy_bind_address(), dbname, kDefaultInternalPgUser,
+          GetSharedMemoryPostgresAuthKey(), deadline,
+          pgwrapper::YbInternalConnKindWireName::kRelcacheInit,
+          {},
+          traceparent)
+          .Connect(/*simple_query_protocol=*/false));
   if (status.ok()) {
     LOG(INFO) << "Relcache init connection to database " << dbname << " succeeded";
   } else {
@@ -2140,8 +2175,25 @@ void TabletServer::DoGarbageCollectionOfInvalidationMessages(
 
 Status TabletServer::CheckYsqlLaggingCatalogVersions() {
   auto deadline = CoarseMonoClock::Now() + default_client_timeout();
+
+  // Open a root span for catalog version check, pass its context in the
+  // startup packet (yb_dist_traceparent) so the backend nests them under it.
+  auto trace_span = dist_trace::StartOriginRootSpanWithScope(
+      "catalog_version_check", FLAGS_otel_trace_catalog_version_check);
+
   auto pg_conn = VERIFY_RESULT(
       CreateInternalPGConn("template1", kDefaultInternalPgUser, false, deadline));
+
+  if (trace_span) {
+    const auto traceparent = dist_trace::GetActiveTraceparent();
+    if (!traceparent.empty()) {
+      // Also carry the traceparent as a trailing SQL comment (sqlcommenter) so this SET
+      // self-scopes.
+      RETURN_NOT_OK(pg_conn.ExecuteFormat(
+          "SET yb_dist_tracecontext = 'traceparent=''$0''' /*traceparent='$0'*/", traceparent));
+    }
+  }
+
   const std::string query = "SELECT datid, local_catalog_version FROM "
                             "yb_pg_stat_get_backend_local_catalog_version(NULL) "
                             "ORDER BY datid ASC, local_catalog_version ASC";

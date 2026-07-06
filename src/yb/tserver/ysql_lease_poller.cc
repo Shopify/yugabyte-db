@@ -29,6 +29,7 @@
 
 #include "yb/util/async_util.h"
 #include "yb/util/condition_variable.h"
+#include "yb/util/dist_trace.h"
 #include "yb/util/flags/flag_tags.h"
 #include "yb/util/mutex.h"
 #include "yb/util/status.h"
@@ -40,6 +41,10 @@ DEFINE_RUNTIME_uint64(ysql_lease_refresher_rpc_timeout_ms, 15000,
 
 DEFINE_RUNTIME_uint64(ysql_lease_refresher_interval_ms, 1000,
     "The interval between requests from a tablet server to the master to refresh its ysql lease.");
+
+DEFINE_RUNTIME_bool(otel_trace_ysql_lease, false,
+    "Trace each YSQL lease refresh poll (tserver->master RefreshYsqlLease) under a root span. When "
+    "false the root is suppressed.");
 
 DEFINE_test_flag(bool, tserver_enable_ysql_lease_refresh, true,
     "Whether to enable the lease refresh RPCs tablet servers send to the master leader.");
@@ -158,6 +163,11 @@ Status YsqlLeasePoller::Poll() {
   if (!FLAGS_TEST_tserver_enable_ysql_lease_refresh || !IsYsqlLeaseEnabled()) {
     return Status::OK();
   }
+
+  // Always open an origin root: recorded when the flag is on, dropped when off (which still nests
+  // this poller's RPCs under it rather than leaving them parentless).
+  auto trace_span =
+      dist_trace::StartOriginRootSpanWithScope("ysql_lease", FLAGS_otel_trace_ysql_lease);
 
   auto timeout =
       MonoDelta::FromMilliseconds(FLAGS_ysql_lease_refresher_rpc_timeout_ms);
