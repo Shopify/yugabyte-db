@@ -1987,6 +1987,12 @@ DEFINE_test_flag(bool, block_verify_after_in_progress_transition, false,
     "VerifyIndexChunk RPCs. Used by tests to observe INDEX_VERIFY_IN_PROGRESS on disk "
     "and to simulate master failover while verify is mid-flight.");
 
+DEFINE_test_flag(bool, block_before_marker_release_after_terminal_state, false,
+    "When set on a master, VerifyIndex::PersistTerminalState spins between the "
+    "terminal-state sys.catalog Upsert and the AllowCompactionsToGCDeleteMarkers "
+    "call. Simulates a crash in that window so tests can exercise "
+    "ResumeStrandedUniqueIndexMarkerRelease on failover.");
+
 // -----------------------------------------------------------------------------------------------
 // VerifyIndex
 // -----------------------------------------------------------------------------------------------
@@ -2145,6 +2151,12 @@ Status VerifyIndex::PersistTerminalState(
       master_->catalog_manager_impl()->sys_catalog_->Upsert(epoch_, indexed_table_),
       "Failed to persist post-backfill verify terminal state");
   l.Commit();
+
+  while (PREDICT_FALSE(FLAGS_TEST_block_before_marker_release_after_terminal_state)) {
+    LOG_WITH_PREFIX(INFO)
+        << "TEST_block_before_marker_release_after_terminal_state is set; sleeping.";
+    SleepFor(MonoDelta::FromMilliseconds(100));
+  }
 
   // Release the retain_delete_markers pin on the index table. PR 3 deferred this
   // release for the deferred-uniqueness path so verify could scan the full

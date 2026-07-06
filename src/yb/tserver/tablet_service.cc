@@ -195,6 +195,11 @@ TAG_FLAG(index_backfill_additional_delay_before_backfilling_ms, evolving);
 DEFINE_test_flag(int32, index_backfill_fail_after_random_wait_upto_ms, 0,
     "If set to > 0 BackfillIndex calls will be failed after randomly waiting.");
 
+DEFINE_test_flag(bool, fail_next_verify_index_chunk_rpc, false,
+    "If true, the next VerifyIndexChunk RPC on this tserver returns TryAgain and "
+    "resets this flag to false -- exactly one failure is injected per set. Used to "
+    "exercise the RetryingTSRpcTask retry path in VerifyIndex.");
+
 DEFINE_test_flag(bool, block_backfill_before_index_map, false,
     "If true, BackfillIndex will block right before looking up the index_map. "
     "Used to test the race between table drop and backfill to repro GH#29830.");
@@ -1076,6 +1081,15 @@ void TabletServiceAdminImpl::VerifyIndexChunk(
     return;
   }
   DVLOG(3) << "Received VerifyIndexChunk RPC: " << req->DebugString();
+
+  if (PREDICT_FALSE(FLAGS_TEST_fail_next_verify_index_chunk_rpc)) {
+    FLAGS_TEST_fail_next_verify_index_chunk_rpc = false;
+    SetupErrorAndRespond(
+        resp->mutable_error(),
+        STATUS(TryAgain, "TEST_fail_next_verify_index_chunk_rpc was set"),
+        &context);
+    return;
+  }
 
   server::UpdateClock(*req, server_->Clock());
 

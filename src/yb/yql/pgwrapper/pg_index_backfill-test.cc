@@ -1846,6 +1846,202 @@ TEST_P(PgIndexBackfillTest, DeferredUniquenessMarkersReleasedAfterFailedVerify) 
   thread_holder_.JoinAll();
 }
 
+// PR 5c's PersistTerminalState commits verify_state SUCCEEDED/FAILED and then calls
+// AllowCompactionsToGCDeleteMarkers. If the master crashes/steps down between those two
+// steps, retain_delete_markers stays pinned on a terminal-state index. PR 5c's
+// ResumeStrandedUniqueIndexMarkerRelease scans for this on master load and re-invokes
+// the release. This test simulates the crash window via
+// TEST_block_before_marker_release_after_terminal_state.
+TEST_P(PgIndexBackfillTest, DeferredUniquenessStrandedMarkersRecoveredOnFailover) {
+  ASSERT_OK(EnableDeferredUniquenessAllFlags(cluster_.get()));
+  // Wedge the ORIGINAL leader between the terminal-state Upsert and the marker-release call.
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "TEST_block_before_marker_release_after_terminal_state", "true"));
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "INSERT INTO $0 SELECT g, g FROM generate_series(1, 100) g", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "CREATE UNIQUE INDEX $0 ON $1 (b)", kIndexName, kTableName));
+
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  const std::string table_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kTableName));
+  const std::string index_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kIndexName));
+
+  // The terminal-state Upsert lands before the block; verify_state = SUCCEEDED is durable.
+  auto succeeded = ASSERT_RESULT(WaitForVerifyStateAtLeast(
+      cluster_.get(), table_id, index_id, INDEX_VERIFY_SUCCEEDED,
+      60s * kTimeMultiplier));
+  ASSERT_EQ(succeeded.verify_state(), INDEX_VERIFY_SUCCEEDED);
+
+  // Markers are still pinned because the block sits between the terminal Upsert and the
+  // release call. This is the stranded state ResumeStrandedUniqueIndexMarkerRelease targets.
+  ASSERT_TRUE(ASSERT_RESULT(IndexTableRetainsDeleteMarkers(client.get(), index_id)))
+      << "expected retain_delete_markers to remain true while stranded before recovery";
+
+  // Step down FIRST, while the original leader is still spinning inside PersistTerminalState.
+  // If we cleared the block flag before stepping down, the original leader would exit the spin
+  // and complete the release itself -- the test would pass without exercising the recovery
+  // path. Same rationale as the PR 5b failover test.
+  tserver::TabletServerErrorPB::Code error_code;
+  ASSERT_OK(cluster_->StepDownMasterLeader(&error_code));
+
+  // Recovery on the new leader (ResumeStrandedUniqueIndexMarkerRelease inside SysCatalogLoaded)
+  // must release the stranded pin. Poll master-side first, then confirm tablet-side.
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        return !VERIFY_RESULT(IndexTableRetainsDeleteMarkers(client.get(), index_id));
+      },
+      60s * kTimeMultiplier,
+      "Waiting for stranded retain_delete_markers to be released after master failover"));
+  ASSERT_OK(WaitForRetainDeleteMarkersOnTablets(
+      cluster_.get(), client.get(), index_id, /* expected = */ false,
+      60s * kTimeMultiplier));
+
+  // Clear the block on the former leader so its spinning task exits cleanly at teardown.
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "TEST_block_before_marker_release_after_terminal_state", "false"));
+}
+
+// Deferred-uniqueness path applies only to unique indexes. With all deferred-uniqueness flags
+// enabled, a non-unique CREATE INDEX must still traverse the normal (non-deferred) marker-GC
+// path: verify_state stays INDEX_VERIFY_NOT_REQUIRED, verify is never dispatched, and
+// retain_delete_markers is released at the RWD hookpoint as usual. Guards the PR 5c gate
+// (verify_state != NOT_REQUIRED) against accidentally over-deferring on non-unique indexes.
+TEST_P(PgIndexBackfillTest, DeferredUniquenessNonUniqueIndexUsesNormalGCPath) {
+  ASSERT_OK(EnableDeferredUniquenessAllFlags(cluster_.get()));
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "INSERT INTO $0 SELECT g, g FROM generate_series(1, 100) g", kTableName));
+  // Non-unique index (no UNIQUE keyword).
+  ASSERT_OK(conn_->ExecuteFormat(
+      "CREATE INDEX $0 ON $1 (b)", kIndexName, kTableName));
+
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  const std::string table_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kTableName));
+  const std::string index_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kIndexName));
+
+  // The entry hook stamps verify_state = REQUIRED only for unique indexes on the deferred
+  // path. A non-unique index must leave it at the proto default (NOT_REQUIRED).
+  IndexInfoPB info;
+  ASSERT_OK(FetchIndexInfoPB(cluster_.get(), table_id, index_id, &info));
+  EXPECT_EQ(info.verify_state(), INDEX_VERIFY_NOT_REQUIRED);
+  EXPECT_EQ(info.verify_time(), 0u);
+  EXPECT_FALSE(info.has_verify_error_message());
+
+  // Non-deferred path releases markers immediately at the RWD hookpoint.
+  EXPECT_FALSE(ASSERT_RESULT(IndexTableRetainsDeleteMarkers(client.get(), index_id)));
+  ASSERT_OK(WaitForRetainDeleteMarkersOnTablets(
+      cluster_.get(), client.get(), index_id, /* expected = */ false,
+      60s * kTimeMultiplier));
+}
+
+// DROP INDEX must succeed cleanly while a VerifyIndex is wedged at IN_PROGRESS, and the
+// verifier must then resume post-unblock and reach the deleted-index handling path
+// (PersistTerminalState returning NotFound because the index is no longer in the base
+// table's indexes() list) rather than hanging or crashing. The final IndexInfoPB poll on
+// its own only proves DROP INDEX completes -- it can pass before the verifier resumes at
+// all -- so we also LogWaiter on the specific PersistTerminalState WARN emitted only on
+// the deleted-index path.
+TEST_P(PgIndexBackfillTest, DeferredUniquenessDropIndexDuringVerify) {
+  ASSERT_OK(EnableDeferredUniquenessAllFlags(cluster_.get()));
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "TEST_block_verify_after_in_progress_transition", "true"));
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "INSERT INTO $0 SELECT g, g FROM generate_series(1, 100) g", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "CREATE UNIQUE INDEX $0 ON $1 (b)", kIndexName, kTableName));
+
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  const std::string table_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kTableName));
+  const std::string index_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kIndexName));
+
+  auto in_progress = ASSERT_RESULT(WaitForVerifyStateAtLeast(
+      cluster_.get(), table_id, index_id, INDEX_VERIFY_IN_PROGRESS,
+      60s * kTimeMultiplier));
+  ASSERT_EQ(in_progress.verify_state(), INDEX_VERIFY_IN_PROGRESS);
+
+  // Fire DROP INDEX on a fresh connection so the main connection's session-level state
+  // doesn't interfere with the wedged verify orchestrator. The verifier is spinning in
+  // the block loop (holding no table locks) so DROP proceeds normally.
+  PGConn drop_conn = ASSERT_RESULT(ConnectToDB(kDatabaseName));
+  ASSERT_OK(drop_conn.ExecuteFormat("DROP INDEX $0", kIndexName));
+
+  // Arm the LogWaiter BEFORE unblocking so we can't miss the log line. The verifier is
+  // still spinning in the block loop, so nothing has emitted yet. The specific WARN fires
+  // when PersistTerminalState iterates indexed_table's indexes() and doesn't find
+  // index_id_ -- i.e. exactly the deleted-index path this test wants to prove.
+  auto log_waiter =
+      cluster_->GetMasterLogWaiter("Failed to persist terminal verify state");
+
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "TEST_block_verify_after_in_progress_transition", "false"));
+
+  // Proves the verifier resumed post-unblock, dispatched chunks, converged in
+  // OnChunkComplete, and hit the NotFound return in PersistTerminalState.
+  ASSERT_OK(log_waiter.WaitFor(60s * kTimeMultiplier));
+
+  // Sanity check: the base table's IndexInfoPB no longer lists the dropped index.
+  IndexInfoPB tmp;
+  auto s = FetchIndexInfoPB(cluster_.get(), table_id, index_id, &tmp);
+  EXPECT_FALSE(s.ok()) << "index still present in base table's IndexInfoPB";
+}
+
+// A transient tserver failure on one VerifyIndexChunk RPC must be retried by
+// RetryingTSRpcTask, and verify must still reach SUCCEEDED. Uses
+// TEST_fail_next_verify_index_chunk_rpc to fail exactly one RPC per tserver.
+TEST_P(PgIndexBackfillTest, DeferredUniquenessVerifyChunkRetriesTransientFailure) {
+  ASSERT_OK(EnableDeferredUniquenessAllFlags(cluster_.get()));
+  // Shorten retry backoff so the test doesn't sit on the default multi-second delay.
+  ASSERT_OK(cluster_->SetFlagOnMasters("index_backfill_rpc_max_delay_ms", "500"));
+  // Prime the fail-once injection on all tservers before CREATE INDEX kicks off verify.
+  ASSERT_OK(cluster_->SetFlagOnTServers(
+      "TEST_fail_next_verify_index_chunk_rpc", "true"));
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "INSERT INTO $0 SELECT g, g FROM generate_series(1, 100) g", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "CREATE UNIQUE INDEX $0 ON $1 (b)", kIndexName, kTableName));
+
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  const std::string table_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kTableName));
+  const std::string index_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kIndexName));
+
+  auto succeeded = ASSERT_RESULT(WaitForVerifyStateAtLeast(
+      cluster_.get(), table_id, index_id, INDEX_VERIFY_SUCCEEDED,
+      90s * kTimeMultiplier));
+  EXPECT_EQ(succeeded.verify_state(), INDEX_VERIFY_SUCCEEDED);
+  EXPECT_FALSE(succeeded.has_verify_error_message())
+      << "verify_error_message on SUCCEEDED: " << succeeded.verify_error_message();
+
+  // The fail-once flag should have been consumed by the first RPC to hit each tserver whose
+  // tablet leader served a chunk. Check the tserver that actually served the (single) index
+  // tablet: its flag must now be false, proving the injection fired and the retry succeeded.
+  bool any_consumed = false;
+  for (size_t i = 0; i < cluster_->num_tablet_servers(); ++i) {
+    auto flag_value = ASSERT_RESULT(cluster_->GetFlag(
+        cluster_->tablet_server(i), "TEST_fail_next_verify_index_chunk_rpc"));
+    if (flag_value == "false") {
+      any_consumed = true;
+    }
+  }
+  EXPECT_TRUE(any_consumed)
+      << "TEST_fail_next_verify_index_chunk_rpc was never consumed on any tserver -- "
+         "verify may have completed without triggering the fail-injection path.";
+}
+
 // Override the index backfill test to do alter slowly.
 class PgIndexBackfillAlterSlowly : public PgIndexBackfillTest {
  public:
