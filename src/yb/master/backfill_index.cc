@@ -1325,32 +1325,33 @@ Status BackfillTable::UpdateIndexPermissionsForIndexes() {
     }
   }
 
-  // When deferred-uniqueness-check is enabled, the retain_delete_markers pin on
-  // successfully backfilled indexes must stay set until the post-backfill verify
-  // phase completes its timeline scan. That coordination lands in a follow-up PR;
-  // for now, on the GFlag path the pin is deferred indefinitely. The GFlag is
-  // tagged `unsafe` and cannot be enabled without explicit acknowledgement.
-  //
-  // TODO(deferred-uniqueness PR 5): the current decision reads a live runtime GFlag on
-  // the master. Two unsafe failure modes result if it stays this way beyond the prototype:
-  //   1. TServers skipped duplicate checks while their flag was set, but the master's
-  //      flag was cleared before this hook runs -> markers get GC'd early -> the verify
-  //      scan later runs against a truncated timeline and produces false negatives.
-  //   2. Master's flag is set at this hook but the index's backfill never actually took
-  //      the deferred path -> markers are retained forever for no reason.
-  // Both are prevented by persisting a `verify_state` on the IndexInfoPB when the index
-  // enters the deferred path, and gating this decision on that field (not the GFlag).
-  // The pin release should also live in the verify-completion path, not here.
-  const bool defer_marker_gc = FLAGS_ysql_index_backfill_deferred_uniqueness_check;
+  // For each index reaching RWD, decide whether to defer marker-GC based on its
+  // persisted verify_state. PR 5a stamps INDEX_VERIFY_REQUIRED at backfill launch
+  // exactly when the deferred-uniqueness path is genuinely taken (matches the
+  // TServer per-write skip decision). Deferring here keeps the retain_delete_markers
+  // pin held while VerifyIndex scans the timeline; VerifyIndex::PersistTerminalState
+  // releases it once verify reaches SUCCEEDED or FAILED.
+  std::unordered_map<TableId, IndexVerifyState> verify_state_for_index;
+  {
+    auto l = indexed_table_->LockForRead();
+    for (const auto& idx : l->pb.indexes()) {
+      verify_state_for_index[idx.table_id()] = idx.verify_state();
+    }
+  }
   for (const auto& kv_pair : permissions_to_set) {
     if (kv_pair.second == INDEX_PERM_READ_WRITE_AND_DELETE) {
+      auto it = verify_state_for_index.find(kv_pair.first);
+      const bool defer_marker_gc =
+          (it != verify_state_for_index.end() && it->second != INDEX_VERIFY_NOT_REQUIRED);
       if (defer_marker_gc) {
         LOG(INFO) << "Deferring GC of delete markers on index " << kv_pair.first
-                  << " (ysql_index_backfill_deferred_uniqueness_check is set); "
-                  << "pin will be released after post-backfill verification.";
+                  << " (deferred-uniqueness path taken; verify_state="
+                  << IndexVerifyState_Name(it->second) << "); "
+                  << "pin will be released when verify reaches a terminal state.";
         continue;
       }
-      RETURN_NOT_OK(AllowCompactionsToGCDeleteMarkers(kv_pair.first));
+      RETURN_NOT_OK(AllowCompactionsToGCDeleteMarkers(
+          master_, callback_pool_, epoch_, kv_pair.first));
     }
   }
 
@@ -1496,9 +1497,10 @@ void BackfillTable::UnsetIndexTableRetainsDeleteMarkers(PersistentTableInfo* ind
 }
 
 Status BackfillTable::AllowCompactionsToGCDeleteMarkers(
-    const TableId &index_table_id) {
+    Master* master, ThreadPool* callback_pool, const LeaderEpoch& epoch,
+    const TableId& index_table_id) {
   DVLOG(3) << __PRETTY_FUNCTION__;
-  auto res = master_->catalog_manager()->FindTableById(index_table_id);
+  auto res = master->catalog_manager()->FindTableById(index_table_id);
   if (!res && res.status().IsNotFound()) {
     LOG(WARNING) << "Index " << index_table_id << " was not found."
                  << " This is ok in case somebody issued a delete index. : " << res.ToString();
@@ -1543,8 +1545,8 @@ Status BackfillTable::AllowCompactionsToGCDeleteMarkers(
     // Update sys-catalog with the new indexed table info.
     TRACE("Updating index table metadata on disk");
     RETURN_NOT_OK_PREPEND(
-        master_->catalog_manager_impl()->sys_catalog_->Upsert(
-            epoch_, index_table_info),
+        master->catalog_manager_impl()->sys_catalog_->Upsert(
+            epoch, index_table_info),
         yb::Format(
             "Could not update index_table_info for $0 to enable compactions.", index_table_id));
 
@@ -1554,29 +1556,31 @@ Status BackfillTable::AllowCompactionsToGCDeleteMarkers(
   }
   VLOG_WITH_FUNC(2) << "Unlocked index table for Read";
   VLOG(1) << "Sending backfill done requests to the Index table";
-  RETURN_NOT_OK(SendRpcToAllowCompactionsToGCDeleteMarkers(index_table_info));
+  RETURN_NOT_OK(SendRpcToAllowCompactionsToGCDeleteMarkers(
+      master, callback_pool, epoch, index_table_info));
   VLOG(1) << "DONE Sending backfill done requests to the Index table";
   return Status::OK();
 }
 
 Status BackfillTable::SendRpcToAllowCompactionsToGCDeleteMarkers(
+    Master* master, ThreadPool* callback_pool, const LeaderEpoch& epoch,
     const scoped_refptr<TableInfo>& table) {
   auto tablets = VERIFY_RESULT(table->GetTablets());
 
   for (const auto& tablet : tablets) {
-    RETURN_NOT_OK(SendRpcToAllowCompactionsToGCDeleteMarkers(tablet, table->id()));
+    RETURN_NOT_OK(SendRpcToAllowCompactionsToGCDeleteMarkers(
+        master, callback_pool, epoch, tablet, table->id()));
   }
   return Status::OK();
 }
 
 Status BackfillTable::SendRpcToAllowCompactionsToGCDeleteMarkers(
+    Master* master, ThreadPool* callback_pool, const LeaderEpoch& epoch,
     const TabletInfoPtr& tablet, const std::string& table_id) {
-  ADOPT_WAIT_STATE(wait_state_);
-  auto call =
-      std::make_shared<AsyncBackfillDone>(master_, callback_pool_, tablet, table_id, epoch_);
+  auto call = std::make_shared<AsyncBackfillDone>(master, callback_pool, tablet, table_id, epoch);
   tablet->table()->AddTask(call);
   RETURN_NOT_OK_PREPEND(
-      master_->catalog_manager()->ScheduleTask(call),
+      master->catalog_manager()->ScheduleTask(call),
       "Failed to send backfill done request");
   return Status::OK();
 }
@@ -2141,6 +2145,30 @@ Status VerifyIndex::PersistTerminalState(
       master_->catalog_manager_impl()->sys_catalog_->Upsert(epoch_, indexed_table_),
       "Failed to persist post-backfill verify terminal state");
   l.Commit();
+
+  // Release the retain_delete_markers pin on the index table. PR 3 deferred this
+  // release for the deferred-uniqueness path so verify could scan the full
+  // timeline; now that verify has reached a terminal state (SUCCEEDED or FAILED),
+  // the timeline scan is done either way and the markers can be GC'd. See
+  // BackfillTable::UpdateIndexPermissionsForIndexes for the deferral site.
+  //
+  // Crash-window note: a crash between the terminal-state Upsert above and
+  // AllowCompactionsToGCDeleteMarkers' own sys.catalog Upsert would leave
+  // retain_delete_markers=true stranded on a terminal-state index.
+  // CatalogManager::ResumeStrandedUniqueIndexMarkerRelease scans for this
+  // condition on master load and re-invokes the release.
+  //
+  // Same-leader failure gap: if AllowCompactionsToGCDeleteMarkers below returns
+  // non-OK while the master remains leader (rare -- most non-OK returns are
+  // themselves caused by lost leadership, in which case the failover recovery
+  // above covers them), the marker release is stranded until the next master
+  // load/failover triggers the recovery pass. A continuous same-leader retry
+  // loop is left as a follow-up.
+  RETURN_NOT_OK_PREPEND(
+      BackfillTable::AllowCompactionsToGCDeleteMarkers(
+          master_, callback_pool_, epoch_, index_id_),
+      Format("Failed to release retain_delete_markers on index $0 after verify $1",
+             index_id_, IndexVerifyState_Name(terminal_state)));
   return Status::OK();
 }
 
@@ -2336,6 +2364,58 @@ void CatalogManager::ResumeInProgressUniqueIndexVerify(const LeaderEpoch& epoch)
     });
     WARN_NOT_OK(
         s, Format("Failed to submit resumed VerifyIndex::Launch for $0", p.index_id));
+  }
+}
+
+void CatalogManager::ResumeStrandedUniqueIndexMarkerRelease(const LeaderEpoch& epoch) {
+  // Snapshot the index IDs to re-release under a shared lock, then invoke the
+  // release outside the lock so we do not hold the catalog lock across
+  // sys.catalog Upserts.
+  std::vector<TableId> pending;
+  {
+    SharedLock lock(mutex_);
+    for (const auto& table : tables_->GetAllTables()) {
+      auto l = table->LockForRead();
+      const auto& pb = l->pb;
+      if (pb.indexes_size() == 0 || l->started_deleting()) {
+        continue;
+      }
+      for (const auto& idx_pb : pb.indexes()) {
+        const auto state = idx_pb.verify_state();
+        if (state != INDEX_VERIFY_SUCCEEDED && state != INDEX_VERIFY_FAILED) {
+          continue;
+        }
+        auto index_table = GetTableInfoUnlocked(idx_pb.table_id());
+        if (!index_table) {
+          continue;
+        }
+        auto index_l = index_table->LockForRead();
+        if (index_l->started_deleting()) {
+          continue;
+        }
+        if (BackfillTable::GetIndexTableRetainsDeleteMarkers(index_l.data())) {
+          pending.push_back(idx_pb.table_id());
+        }
+      }
+    }
+  }
+
+  for (const auto& index_id : pending) {
+    LOG(INFO) << "Resuming stranded retain_delete_markers release on index " << index_id
+              << " (verify_state terminal, retain_delete_markers still true)";
+    Master* master = master_;
+    ThreadPool* pool = AsyncTaskPool();
+    LeaderEpoch captured_epoch = epoch;
+    TableId captured_index_id = index_id;
+    Status s = pool->SubmitFunc([master, pool, captured_epoch, captured_index_id]() {
+      WARN_NOT_OK(
+          BackfillTable::AllowCompactionsToGCDeleteMarkers(
+              master, pool, captured_epoch, captured_index_id),
+          Format("Failed to resume retain_delete_markers release on index $0",
+                 captured_index_id));
+    });
+    WARN_NOT_OK(
+        s, Format("Failed to submit resumed retain_delete_markers release for $0", index_id));
   }
 }
 

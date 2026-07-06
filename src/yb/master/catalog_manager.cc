@@ -13933,6 +13933,7 @@ void CatalogManager::SysCatalogLoaded(SysCatalogLoadingState&& state) {
   StartWriteTableToSysCatalogTasks(std::move(state.write_to_disk_tables));
 
   ResumeInProgressUniqueIndexVerify(state.epoch);
+  ResumeStrandedUniqueIndexMarkerRelease(state.epoch);
 
   ysql_manager_->SysCatalogLoaded(state.epoch);
 

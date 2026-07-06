@@ -190,6 +190,16 @@ class BackfillTable : public std::enable_shared_from_this<BackfillTable> {
 
   Status Abort(bool from_liveness = false);
 
+  // We want to prevent major compactions from garbage collecting delete markers
+  // on an index table, until the backfill process is complete.
+  // This API is used at the end of a successful backfill to enable major compactions
+  // to gc delete markers on an index table. Also invoked from
+  // VerifyIndex::PersistTerminalState on the deferred-uniqueness path, once the
+  // post-backfill verify scan has reached a terminal state.
+  static Status AllowCompactionsToGCDeleteMarkers(
+      Master* master, ThreadPool* callback_pool, const LeaderEpoch& epoch,
+      const TableId& index_table_id);
+
  private:
   void LaunchBackfillOrAbort();
   Status WaitForTabletSplitting();
@@ -219,17 +229,13 @@ class BackfillTable : public std::enable_shared_from_this<BackfillTable> {
   // Persist the value in read_time_for_backfill_ to the sys-catalog and start the backfill job.
   Status PersistSafeTimeAndStartBackfill() EXCLUDES(mutex_);
 
-  // We want to prevent major compactions from garbage collecting delete markers
-  // on an index table, until the backfill process is complete.
-  // This API is used at the end of a successful backfill to enable major compactions
-  // to gc delete markers on an index table.
-  Status AllowCompactionsToGCDeleteMarkers(const TableId& index_table_id);
-
   // Send the "backfill done request" to all tablets of the specified table.
-  Status SendRpcToAllowCompactionsToGCDeleteMarkers(
+  static Status SendRpcToAllowCompactionsToGCDeleteMarkers(
+      Master* master, ThreadPool* callback_pool, const LeaderEpoch& epoch,
       const TableInfoPtr& index_table);
   // Send the "backfill done request" to the specified tablet.
-  Status SendRpcToAllowCompactionsToGCDeleteMarkers(
+  static Status SendRpcToAllowCompactionsToGCDeleteMarkers(
+      Master* master, ThreadPool* callback_pool, const LeaderEpoch& epoch,
       const TabletInfoPtr& index_table_tablet, const std::string& table_id);
 
   Master* master_;

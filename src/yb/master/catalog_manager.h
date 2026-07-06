@@ -3275,6 +3275,18 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   // deterministic read-only scan.
   void ResumeInProgressUniqueIndexVerify(const LeaderEpoch& epoch) EXCLUDES(mutex_);
 
+  // Failover recovery for the retain_delete_markers pin.
+  // VerifyIndex::PersistTerminalState commits verify_state SUCCEEDED/FAILED
+  // and then calls AllowCompactionsToGCDeleteMarkers. If the master crashes
+  // or steps down between the terminal-state Upsert and that call's own
+  // sys.catalog Upsert, the index is left with retain_delete_markers=true
+  // pinned forever (nothing else drives the release). This scans all indexes
+  // for a terminal verify_state whose index table still shows
+  // retain_delete_markers=true in sys.catalog and re-invokes the release.
+  // The tserver-side follow-through (AsyncBackfillDone RPCs) is handled by
+  // the existing tablet_validator reconciliation loop.
+  void ResumeStrandedUniqueIndexMarkerRelease(const LeaderEpoch& epoch) EXCLUDES(mutex_);
+
   Status BumpVersionAndStoreClusterConfig(
       ClusterConfigInfo* cluster_config, ClusterConfigInfo::WriteLock* l);
 

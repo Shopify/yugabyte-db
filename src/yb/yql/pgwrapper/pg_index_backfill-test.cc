@@ -22,7 +22,10 @@
 #include "yb/common/wire_protocol.h"
 
 #include "yb/integration-tests/backfill-test-util.h"
+#include "yb/integration-tests/external_mini_cluster_fs_inspector.h"
 #include "yb/integration-tests/external_mini_cluster_validator.h"
+
+#include "yb/tablet/metadata.pb.h"
 
 #include "yb/master/master_admin.proxy.h"
 #include "yb/master/master_admin.pb.h"
@@ -1081,34 +1084,6 @@ TEST_P(PgIndexBackfillTest, RetainDeleteMarkersRecoveryViaSeveralRequests) {
   TestRetainDeleteMarkersRecovery(kDatabaseName, true /* use_multiple_requests */);
 }
 
-// With ysql_index_backfill_deferred_uniqueness_check set, master must skip the
-// AllowCompactionsToGCDeleteMarkers step after a successful backfill so the pin on
-// tombstones survives long enough for the (future) verify phase. Assert that the
-// index table's retain_delete_markers in sys.catalog is still true post-backfill.
-TEST_P(PgIndexBackfillTest, DeferredUniquenessCheckRetainsMarkersAfterBackfill) {
-  ASSERT_OK(cluster_->SetFlagOnMasters(
-      "ysql_index_backfill_deferred_uniqueness_check", "true"));
-  ASSERT_OK(cluster_->SetFlagOnTServers(
-      "ysql_index_backfill_deferred_uniqueness_check", "true"));
-
-  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
-  ASSERT_OK(conn_->ExecuteFormat(
-      "INSERT INTO $0 SELECT g, g FROM generate_series(1, 100) g", kTableName));
-  ASSERT_OK(conn_->ExecuteFormat(
-      "CREATE UNIQUE INDEX $0 ON $1 (b)", kIndexName, kTableName));
-
-  auto client = ASSERT_RESULT(cluster_->CreateClient());
-  const std::string index_id = ASSERT_RESULT(GetTableIdByTableName(
-      client.get(), kDatabaseName, kIndexName));
-  auto info = std::make_shared<client::YBTableInfo>();
-  Synchronizer sync;
-  ASSERT_OK(client->GetTableSchemaById(index_id, info, sync.AsStatusCallback()));
-  ASSERT_OK(sync.Wait());
-  ASSERT_TRUE(info->schema.table_properties().retain_delete_markers())
-      << "expected retain_delete_markers to remain true when deferred uniqueness "
-      << "check is enabled, but it was cleared after backfill";
-}
-
 // Send VerifyIndexChunk directly to each index tablet leader after a backfill on genuinely
 // unique base data. Every scan must return an empty duplicate_key_hint -- this exercises the
 // RPC dispatch, tablet lookup, SafeTime wait, and the timeline algorithm's "no duplicate"
@@ -1492,6 +1467,58 @@ Result<IndexInfoPB> WaitForVerifyStateAtLeast(
   return idx;
 }
 
+// Read the index table's retain_delete_markers property directly from its own schema
+// (as opposed to reading the base table's IndexInfoPB, which does not carry this bit).
+Result<bool> IndexTableRetainsDeleteMarkers(
+    client::YBClient* client, const TableId& index_id) {
+  auto info = std::make_shared<client::YBTableInfo>();
+  Synchronizer sync;
+  RETURN_NOT_OK(client->GetTableSchemaById(index_id, info, sync.AsStatusCallback()));
+  RETURN_NOT_OK(sync.Wait());
+  return info->schema.table_properties().retain_delete_markers();
+}
+
+// Reads retain_delete_markers on every tablet superblock of the index table across every
+// tserver. Complements IndexTableRetainsDeleteMarkers (which only reads master's sys.catalog)
+// by also validating that AsyncBackfillDone RPCs reached the tservers -- a regression that
+// flipped sys.catalog but never sent the RPCs would pass the master-side check but leave
+// compactions pinned on the tablets.
+Status WaitForRetainDeleteMarkersOnTablets(
+    ExternalMiniCluster* cluster, client::YBClient* client,
+    const TableId& index_id, bool expected, MonoDelta timeout) {
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+  RETURN_NOT_OK(client->GetTabletsFromTableId(index_id, 0, &tablets));
+  SCHECK_GT(tablets.size(), 0, IllegalState, "Index has no tablets");
+  itest::ExternalMiniClusterFsInspector inspector{cluster};
+  return LoggedWaitFor(
+      [&]() -> Result<bool> {
+        for (const auto& tablet : tablets) {
+          for (size_t n = 0; n < cluster->num_tablet_servers(); ++n) {
+            tablet::RaftGroupReplicaSuperBlockPB superblock;
+            auto s = inspector.ReadTabletSuperBlockOnTS(n, tablet.tablet_id(), &superblock);
+            if (!s.ok()) return false;
+            if (!superblock.has_kv_store()) continue;
+            bool found_index_entry = false;
+            for (const auto& table_pb : superblock.kv_store().tables()) {
+              if (table_pb.table_id() != index_id) continue;
+              if (!table_pb.has_schema() ||
+                  !table_pb.schema().has_table_properties()) {
+                continue;
+              }
+              found_index_entry = true;
+              if (table_pb.schema().table_properties().retain_delete_markers() != expected) {
+                return false;
+              }
+            }
+            if (!found_index_entry) return false;
+          }
+        }
+        return true;
+      },
+      timeout,
+      Format("Waiting for retain_delete_markers=$0 on all tablets of $1", expected, index_id));
+}
+
 }  // namespace
 
 // End-to-end happy path: a unique index over non-duplicate data completes backfill AND
@@ -1672,6 +1699,151 @@ TEST_P(PgIndexBackfillTest, DeferredUniquenessVerifyRestartsOnMasterFailover) {
   EXPECT_EQ(post_failover.verify_state(), INDEX_VERIFY_SUCCEEDED);
   EXPECT_EQ(post_failover.verify_time(), original_verify_time)
       << "failover recovery must reuse the persisted verify_time, not pick a new one";
+}
+
+// PR 3 defers GC of retain_delete_markers on the deferred-uniqueness path so the verify
+// scan can reach the full MVCC timeline. PR 5c gates that defer on the persisted
+// verify_state and moves the pin release into VerifyIndex::PersistTerminalState. This
+// test exercises both halves in one flow: markers stay pinned while verify is wedged at
+// IN_PROGRESS, and are released once verify reaches SUCCEEDED.
+TEST_P(PgIndexBackfillTest, DeferredUniquenessMarkersPinnedDuringVerifyReleasedOnSuccess) {
+  ASSERT_OK(EnableDeferredUniquenessAllFlags(cluster_.get()));
+  // Block VerifyIndex::Launch after the IN_PROGRESS transition is persisted, so we can
+  // observe retain_delete_markers still pinned mid-verify.
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "TEST_block_verify_after_in_progress_transition", "true"));
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "INSERT INTO $0 SELECT g, g FROM generate_series(1, 100) g", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "CREATE UNIQUE INDEX $0 ON $1 (b)", kIndexName, kTableName));
+
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  const std::string table_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kTableName));
+  const std::string index_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kIndexName));
+
+  // DDL returned; verify is wedged inside Launch at IN_PROGRESS.
+  auto in_progress = ASSERT_RESULT(WaitForVerifyStateAtLeast(
+      cluster_.get(), table_id, index_id, INDEX_VERIFY_IN_PROGRESS,
+      60s * kTimeMultiplier));
+  ASSERT_EQ(in_progress.verify_state(), INDEX_VERIFY_IN_PROGRESS);
+
+  // Marker pin must still be held while verify is scanning.
+  ASSERT_TRUE(ASSERT_RESULT(IndexTableRetainsDeleteMarkers(client.get(), index_id)))
+      << "expected retain_delete_markers to remain true while verify is IN_PROGRESS";
+
+  // Unblock verify. Wait for retain_delete_markers to flip; polling is required because
+  // VerifyIndex::PersistTerminalState commits verify_state before releasing markers.
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "TEST_block_verify_after_in_progress_transition", "false"));
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        return !VERIFY_RESULT(IndexTableRetainsDeleteMarkers(client.get(), index_id));
+      },
+      60s * kTimeMultiplier,
+      "Waiting for retain_delete_markers to be released after verify SUCCEEDED"));
+
+  // Also validate the tservers actually saw the release: AllowCompactionsToGCDeleteMarkers
+  // has two halves (sys.catalog Upsert + AsyncBackfillDone RPCs). The master-side check
+  // above only covers the first half; without this a regression that flipped sys.catalog
+  // but never sent the RPCs would pass while tablet-side compactions stayed pinned.
+  ASSERT_OK(WaitForRetainDeleteMarkersOnTablets(
+      cluster_.get(), client.get(), index_id, /* expected = */ false,
+      60s * kTimeMultiplier));
+
+  // Sanity-check that verify itself is now SUCCEEDED (release only fires on terminal state).
+  auto succeeded = ASSERT_RESULT(WaitForVerifyStateAtLeast(
+      cluster_.get(), table_id, index_id, INDEX_VERIFY_SUCCEEDED,
+      60s * kTimeMultiplier));
+  EXPECT_EQ(succeeded.verify_state(), INDEX_VERIFY_SUCCEEDED);
+}
+
+// Complement to the previous test: on the FAILED terminal state, markers must ALSO be
+// released. Per PR 5c design (agreed with operator): the verify scan has already read the
+// timeline by the time we reach a terminal state; storage reclamation beats preserving a
+// timeline no automated path consumes. Same shape as
+// DeferredUniquenessVerifyFailsOnConcurrentDuplicate, plus a post-FAILED marker read.
+TEST_P(PgIndexBackfillTest, DeferredUniquenessMarkersReleasedAfterFailedVerify) {
+  ASSERT_OK(EnableDeferredUniquenessAllFlags(cluster_.get()));
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "TEST_block_before_verify_state_transition", "true"));
+  ASSERT_OK(cluster_->SetFlagOnTServers(
+      "TEST_ysql_backfill_skip_online_uniqueness_check", "true"));
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+
+  // CREATE UNIQUE INDEX drives backfill to RWD and parks inside the pre-transition block.
+  thread_holder_.AddThreadFunctor([this] {
+    LOG(INFO) << "Begin create-index thread";
+    PGConn create_conn = ASSERT_RESULT(ConnectToDB(kDatabaseName));
+    ASSERT_OK(create_conn.ExecuteFormat(
+        "CREATE UNIQUE INDEX $0 ON $1 (b)", kIndexName, kTableName));
+    LOG(INFO) << "Done create-index thread";
+  });
+
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  const std::string table_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kTableName));
+  std::string index_id;
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        auto res = GetTableIdByTableName(client.get(), kDatabaseName, kIndexName);
+        if (!res.ok()) return false;
+        index_id = *res;
+        return true;
+      },
+      60s * kTimeMultiplier,
+      "Waiting for index table id to be visible"));
+
+  // Same block-window observation predicate as PR 5b's ConcurrentDuplicate test: read live
+  // state via GetBackfillJobs since GetTableSchema returns stale fully_applied_indexes
+  // while the base table is in ALTERING state.
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        auto job = GetBackfillJobs(cluster_.get(), table_id);
+        if (!job.ok()) return false;
+        auto it = job->backfill_state().find(index_id);
+        if (it == job->backfill_state().end() ||
+            it->second != master::BackfillJobPB::SUCCESS) {
+          return false;
+        }
+        for (const auto& job_idx : job->indexes()) {
+          if (job_idx.table_id() == index_id) {
+            return job_idx.verify_state() == INDEX_VERIFY_REQUIRED;
+          }
+        }
+        return false;
+      },
+      60s * kTimeMultiplier,
+      "Waiting for backfill=SUCCESS + verify_state=REQUIRED (inside the block window)"));
+
+  // Inject the duplicate at HTs strictly less than the (not-yet-picked) verify_time.
+  ASSERT_OK(conn_->ExecuteFormat("INSERT INTO $0 VALUES (1, 42)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat("INSERT INTO $0 VALUES (2, 42)", kTableName));
+
+  // Release the block; verify picks verify_time, dispatches, catches the duplicate,
+  // transitions to FAILED, and then (per PR 5c) releases markers.
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "TEST_block_before_verify_state_transition", "false"));
+
+  auto idx = ASSERT_RESULT(WaitForVerifyStateAtLeast(
+      cluster_.get(), table_id, index_id, INDEX_VERIFY_SUCCEEDED,
+      60s * kTimeMultiplier));
+  ASSERT_EQ(idx.verify_state(), INDEX_VERIFY_FAILED);
+
+  // Marker release ordering: PersistTerminalState commits verify_state before releasing
+  // markers, so poll (same pattern as the SUCCEEDED test).
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        return !VERIFY_RESULT(IndexTableRetainsDeleteMarkers(client.get(), index_id));
+      },
+      60s * kTimeMultiplier,
+      "Waiting for retain_delete_markers to be released after verify FAILED"));
+
+  thread_holder_.JoinAll();
 }
 
 // Override the index backfill test to do alter slowly.
