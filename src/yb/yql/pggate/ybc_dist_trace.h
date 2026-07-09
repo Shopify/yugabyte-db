@@ -69,7 +69,13 @@ YbcOtelSpanContext YBCGetValidSpanContext(const char* traceparent);
 void YBCDestroySpanContext(YbcOtelSpanContext span_context);
 void YBCDistTraceStartRootSpan(
     const char* query_string, YbcOtelSpanContext span_ctx, YbcPgOid db_oid, YbcPgOid user_id);
+bool YBCDistTraceStartInitRootSpan(
+    const char* name, bool trace, const char* traceparent, YbcPgOid db_oid, YbcPgOid user_id);
 bool YBCDistTraceStartBackendInitRootSpan(
+    const char* traceparent, YbcPgOid db_oid, YbcPgOid user_id);
+bool YBCDistTraceStartAshInitRootSpan(
+    const char* traceparent, YbcPgOid db_oid, YbcPgOid user_id);
+bool YBCDistTraceStartRelcacheInitRootSpan(
     const char* traceparent, YbcPgOid db_oid, YbcPgOid user_id);
 void YBCDistTraceStartSpan(const char* op_name);
 void YBCDistTraceSetCurrSpanAttrUint64(const char* key, uint64_t value);

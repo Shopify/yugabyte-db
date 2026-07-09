@@ -115,13 +115,6 @@ Result<pgwrapper::PGConn> ConnectToDb(TabletServerIf* server, const string& dbna
   auto conn = VERIFY_RESULT(
       server->CreateInternalPGConn(dbname, kDefaultInternalPgUser, false, ConnectionDeadline()));
 
-  // Set trace parent GUC for the connnection.
-  const auto traceparent = dist_trace::GetActiveTraceparent();
-  if (!traceparent.empty()) {
-    RETURN_NOT_OK(conn.ExecuteFormat(
-        "SET yb_dist_tracecontext = 'traceparent=''$0''' /*traceparent='$0'*/", traceparent));
-  }
-
   if (FLAGS_callhome_ysql_statement_timeout_ms > 0) {
     RETURN_NOT_OK(conn.ExecuteFormat(
         "SET statement_timeout = $0", FLAGS_callhome_ysql_statement_timeout_ms));

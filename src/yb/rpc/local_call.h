@@ -144,6 +144,7 @@ auto HandleCall(InboundCallPtr call, F f) {
       f(req, resp, std::move(rpc_context));
     }
   }
+  // Detach the server span's scope on this thread before it is released, so async handlers don't leak it.
   yb_call->DropServerSpanScope();
 }
 

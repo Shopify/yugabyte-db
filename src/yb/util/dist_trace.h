@@ -127,8 +127,11 @@ SpanWithScopePtr StartClientSpanWithScope(std::string_view op_name);
 inline constexpr const char* kForceTraceKey = "yb.force_trace";
 inline constexpr const char* kSuppressTraceKey = "yb.suppress_trace";
 
-// Origin root span (no parent) + activated scope so the origin's RPCs nest under it.
-SpanWithScopePtr StartOriginRootSpanWithScope(std::string_view op_name, bool trace);
+// Origin root span + activated scope so the origin's RPCs nest under it; parents to the active
+// context, else `parent`, else none.
+SpanWithScopePtr StartOriginRootSpanWithScope(
+    std::string_view op_name, bool trace,
+    const trace::SpanContext& parent = trace::SpanContext::GetInvalid());
 
 // Span as a remote child of parent_context (from an inbound request) + activated scope --
 // the server end of a propagated trace; needs no local active context.

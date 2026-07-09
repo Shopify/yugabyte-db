@@ -351,6 +351,12 @@ void YBInboundCall::CreateServerSpan(std::optional<opentelemetry::trace::SpanCon
   }
 }
 
+void YBInboundCall::DropServerSpanScope() {
+  if (span_) {
+    span_->DropScope();
+  }
+}
+
 Status YBInboundCall::SerializeResponseBuffer(AnyMessageConstPtr response, bool is_success) {
   auto body_size = response.SerializedSize();
 

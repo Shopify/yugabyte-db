@@ -227,8 +227,8 @@ YbAshRegister(void)
 	BackgroundWorker worker;
 
 	memset(&worker, 0, sizeof(worker));
-	sprintf(worker.bgw_name, "yb_ash collector");
-	sprintf(worker.bgw_type, "yb_ash collector");
+	sprintf(worker.bgw_name, YB_ASH_COLLECTOR_BGW_TYPE);
+	sprintf(worker.bgw_type, YB_ASH_COLLECTOR_BGW_TYPE);
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time = BgWorkerStart_ConsistentState;
 	/* Value of 1 allows the background worker for yb_ash to restart */
@@ -972,7 +972,8 @@ YbAshMain(Datum main_arg)
 {
 	Assert(yb_ash_circular_buffer_size != 0);
 	ereport(LOG,
-			(errmsg("starting bgworker yb_ash collector with circular buffer size %d bytes",
+			(errmsg("starting bgworker " YB_ASH_COLLECTOR_BGW_TYPE
+					" with circular buffer size %d bytes",
 					yb_ash_circular_buffer_size * 1024)));
 
 	/* Register functions for SIGTERM/SIGHUP management */
@@ -989,7 +990,7 @@ YbAshMain(Datum main_arg)
 	/* We will always get CPU events in ASH, so don't sample ASH collector */
 	MyProc->yb_is_ash_metadata_set = false;
 
-	pgstat_report_appname("yb_ash collector");
+	pgstat_report_appname(YB_ASH_COLLECTOR_BGW_TYPE);
 
 	while (true)
 	{

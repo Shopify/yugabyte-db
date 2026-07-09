@@ -56,6 +56,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
+#include "postmaster/bgworker.h"
 #include "postmaster/postmaster.h"
 #include "replication/slot.h"
 #include "replication/walsender.h"
@@ -96,6 +97,7 @@
 #include "utils/yb_inheritscache.h"
 #include "yb/yql/pggate/ybc_dist_trace.h"
 #include "yb/yql/pggate/ybc_gflags.h"
+#include "yb_ash.h"
 
 static HeapTuple GetDatabaseTuple(const char *dbname);
 static HeapTuple GetDatabaseTupleByOid(Oid dboid);
@@ -1145,31 +1147,24 @@ InitPostgresImpl(const char *in_dbname, Oid dboid,
 	}
 
 	/*
-	 * YB: Open a backend-init distributed-trace root span here -- before the
-	 * first catalog RPC below -- and keep it active to the end of this function,
-	 * so every connect-time catalog RPC (the prefetch reads just below,
-	 * RelationCacheInitializePhase3, CheckMyDatabase, ...) nests under it instead
-	 * of becoming a parentless standalone span.
-	 *
-	 * Runs for every non-bootstrap YB backend; the traceparent argument decides
-	 * how the root is parented:
-	 *   - relcache-init connections carry a startup-packet traceparent (the only
-	 *     backend the tserver sets it on), so the root nests under the tserver's
-	 *     origin span and inherits its sampled flag (otel_trace_relcache_init).
-	 *   - everyone else (external clients, and the B_BACKEND internal connections
-	 *     for catalog-version-check and call-home) has no traceparent and gets a
-	 *     local root whose force/suppress otel_trace_backend_init decides; when
-	 *     off the connect burst is dropped even at otel_rpc_sampling_ratio=1.
-	 *
-	 * Started before MyDatabaseId/the session user are resolved, so the span
-	 * carries the dboid/useroid args (InvalidOid when connecting by name).
+	 * YB: Open the connect-time trace root before the first catalog RPC so they
+	 * nest under it: relcache_init / ash_init / backend_init by backend kind.
 	 */
-	if (IsYugaByteEnabled() && !bootstrap &&
-		YBCIsOtelScopeStackEmpty() &&
-		YBCDistTraceStartBackendInitRootSpan(
-			MyProcPort != NULL ? MyProcPort->yb_dist_traceparent : NULL,
-			dboid, useroid))
-		*yb_backend_init_span_started = true;
+	if (IsYugaByteEnabled() && !bootstrap && YBCIsOtelScopeStackEmpty())
+	{
+		const char *traceparent = MyProcPort != NULL ? MyProcPort->yb_dist_traceparent : NULL;
+
+		if (MyBackendType == YB_RELCACHE_INIT_BACKEND)
+			*yb_backend_init_span_started =
+				YBCDistTraceStartRelcacheInitRootSpan(traceparent, dboid, useroid);
+		else if (MyBgworkerEntry != NULL &&
+				 strcmp(MyBgworkerEntry->bgw_type, YB_ASH_COLLECTOR_BGW_TYPE) == 0)
+			*yb_backend_init_span_started =
+				YBCDistTraceStartAshInitRootSpan(NULL, dboid, useroid);
+		else
+			*yb_backend_init_span_started =
+				YBCDistTraceStartBackendInitRootSpan(traceparent, dboid, useroid);
+	}
 
 	if (IsYugaByteEnabled() && !bootstrap)
 	{

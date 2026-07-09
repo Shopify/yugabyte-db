@@ -33,23 +33,19 @@ DEFINE_RUNTIME_bool(otel_trace_backend_init, false,
     "under it. Covers external connections and the periodic tserver-initiated internal ones. When "
     "false the root is suppressed.");
 
+DECLARE_bool(otel_trace_ash);
+
 namespace yb::pggate {
 
 namespace {
 
-namespace context = opentelemetry::context;
-namespace common = opentelemetry::common;
 namespace trace = opentelemetry::trace;
 namespace nostd = opentelemetry::nostd;
 
 constexpr size_t kMaxTruncatedQueryLength = 256;
 
-using OtelScopeEntry = std::pair<
-    opentelemetry::trace::Scope,
-    opentelemetry::nostd::shared_ptr<opentelemetry::trace::Span>>;
-
-std::stack<OtelScopeEntry>& OtelScopeStack() {
-  static std::stack<OtelScopeEntry> stack;
+std::stack<dist_trace::SpanWithScopePtr>& OtelScopeStack() {
+  static std::stack<dist_trace::SpanWithScopePtr> stack;
   return stack;
 }
 
@@ -115,7 +111,7 @@ void YBCShutdownDistTrace() {
 void YBCDistTraceClearStack() {
   while (!YBCIsOtelScopeStackEmpty()) {
     // Spans remaining on the stack were interrupted by an ERROR before they could end normally.
-    OtelScopeStack().top().second->SetStatus(
+    OtelScopeStack().top()->SetStatus(
         trace::StatusCode::kError, "Span did not end normally");
     OtelScopeStack().pop();
   }
@@ -146,7 +142,7 @@ void StartRootSpan(
        {"query.text", nostd::string_view(query, strnlen(query, kMaxTruncatedQueryLength))}},
       options);
 
-  OtelScopeStack().emplace(trace::Scope(span), std::move(span));
+  OtelScopeStack().push(std::make_shared<dist_trace::SpanWithScope>(std::move(span)));
 }
 
 }  // namespace
@@ -156,60 +152,66 @@ void YBCDistTraceStartRootSpan(
   StartRootSpan("query", query, yb_span_ctx, db_oid, user_id);
 }
 
-bool YBCDistTraceStartBackendInitRootSpan(
-    const char* traceparent, YbcPgOid db_oid, YbcPgOid user_id) {
+bool YBCDistTraceStartInitRootSpan(
+    const char* name, bool trace, const char* traceparent, YbcPgOid db_oid, YbcPgOid user_id) {
   if (!YBCIsDistTraceEnabled()) {
     return false;
   }
   DCHECK(YBCIsOtelScopeStackEmpty());
 
-  // If the connection carried a valid, remote traceparent in its startup packet parent
-  // the backend-init root under it.
+  trace::SpanContext parent = trace::SpanContext::GetInvalid();
   if (traceparent != nullptr && traceparent[0] != '\0') {
-    YbcOtelSpanContext span_ctx = YBCGetValidSpanContext(traceparent);
-    if (span_ctx) {
-      StartRootSpan("backend_init", "backend_init", span_ctx, db_oid, user_id);
-      YBCDestroySpanContext(span_ctx);
-      return true;
+    auto ctx = dist_trace::GetTraceparentSpanContext(traceparent);
+    if (ctx.IsValid()) {
+      parent = ctx;
     }
   }
 
-  trace::StartSpanOptions options;
-  options.kind = trace::SpanKind::kInternal;
-  // No options.parent: a fresh local root trace. The marker (set below) the ForceTraceSampler honors
-  // decides force vs suppress -- a suppressed root is still a valid context, so the connect-time RPCs
-  // nest under it and drop rather than floating free as parentless roots.
-  const bool force = FLAGS_otel_trace_backend_init;
-  auto span = dist_trace::GetDistTracer()->StartSpan(
-      "backend_init",
-      {{"db.id", db_oid},
-       {"user.id", user_id},
-       {force ? dist_trace::kForceTraceKey : dist_trace::kSuppressTraceKey, true}},
-      options);
+  auto span = dist_trace::StartOriginRootSpanWithScope(name, trace, parent);
+  if (!span) {
+    return false;
+  }
+  span->SetAttribute("db.id", db_oid);
+  span->SetAttribute("user.id", user_id);
 
-  OtelScopeStack().emplace(trace::Scope(span), std::move(span));
+  OtelScopeStack().push(std::move(span));
   return true;
 }
 
-void YBCDistTraceStartSpan(const char* op_name) {
-  auto span = dist_trace::StartSpan(op_name);
+bool YBCDistTraceStartBackendInitRootSpan(
+    const char* traceparent, YbcPgOid db_oid, YbcPgOid user_id) {
+  return YBCDistTraceStartInitRootSpan(
+      "backend_init", FLAGS_otel_trace_backend_init, traceparent, db_oid, user_id);
+}
 
-  OtelScopeStack().emplace(trace::Scope(span), std::move(span));
+bool YBCDistTraceStartAshInitRootSpan(
+    const char* traceparent, YbcPgOid db_oid, YbcPgOid user_id) {
+  return YBCDistTraceStartInitRootSpan(
+      "ash_init", FLAGS_otel_trace_ash, traceparent, db_oid, user_id);
+}
+
+bool YBCDistTraceStartRelcacheInitRootSpan(
+    const char* traceparent, YbcPgOid db_oid, YbcPgOid user_id) {
+  return YBCDistTraceStartInitRootSpan("relcache_init", false, traceparent, db_oid, user_id);
+}
+
+void YBCDistTraceStartSpan(const char* op_name) {
+  OtelScopeStack().push(dist_trace::StartSpanWithScope(op_name));
 }
 
 void YBCDistTraceSetCurrSpanAttrUint64(const char* key, uint64_t value) {
   DCHECK(!YBCIsOtelScopeStackEmpty());
-  DCHECK_NOTNULL(OtelScopeStack().top().second)->SetAttribute(key, value);
+  OtelScopeStack().top()->SetAttribute(key, value);
 }
 
 void YBCDistTraceSetCurrSpanAttrStr(const char* key, const char* value) {
   DCHECK(!YBCIsOtelScopeStackEmpty());
-  DCHECK_NOTNULL(OtelScopeStack().top().second)->SetAttribute(key, value);
+  OtelScopeStack().top()->SetAttribute(key, value);
 }
 
 void YBCDistTraceEndSpan() {
   DCHECK(!YBCIsOtelScopeStackEmpty());
-  OtelScopeStack().top().second->SetStatus(trace::StatusCode::kOk);
+  OtelScopeStack().top()->SetStatus(trace::StatusCode::kOk);
   OtelScopeStack().pop();
 }
 

@@ -51,6 +51,9 @@
  */
 #define YbAshIsInvalidQpPair(pair) ((pair).query_id == YB_ASH_INVALID_QUERY_ID)
 
+/* bgw_type the ASH collector background worker registers under. */
+#define YB_ASH_COLLECTOR_BGW_TYPE "yb_ash collector"
+
 /* GUC variables */
 extern bool yb_enable_ash;
 extern int	yb_ash_circular_buffer_size;

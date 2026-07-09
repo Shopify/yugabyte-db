@@ -458,16 +458,29 @@ SpanWithScopePtr StartClientSpanWithScope(std::string_view op_name) {
   return nullptr;
 }
 
-SpanWithScopePtr StartOriginRootSpanWithScope(std::string_view op_name, bool trace) {
+SpanWithScopePtr StartOriginRootSpanWithScope(
+    std::string_view op_name, bool trace, const trace::SpanContext& parent) {
   if (!IsDistTraceEnabled()) {
     return nullptr;
   }
 
-  // TODO: maybe not start if there is an active context.
   trace::StartSpanOptions options;
   options.kind = trace::SpanKind::kInternal;
+
+  bool force = trace;
+  if (HasActiveContext()) {
+    if (GetActiveSpanContext().trace_flags().IsSampled()) {
+      force = true;
+    }
+  } else if (parent.IsValid()) {
+    options.parent = parent;
+    if (parent.trace_flags().IsSampled()) {
+      force = true;
+    }
+  }
+
   const std::vector<std::pair<nostd::string_view, opentelemetry::common::AttributeValue>> attrs = {
-      {trace ? kForceTraceKey : kSuppressTraceKey, true}};
+      {force ? kForceTraceKey : kSuppressTraceKey, true}};
   return std::make_shared<SpanWithScope>(GetDistTracer()->StartSpan(
       nostd::string_view(op_name.data(), op_name.size()), attrs, options));
 }
