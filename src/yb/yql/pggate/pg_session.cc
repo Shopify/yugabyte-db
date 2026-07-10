@@ -125,16 +125,6 @@ void PublishPendingRpcTableInfo(const PgsqlOps& ops, const PgSession::TableCache
     return;
   }
 
-  // Publish the details of Perform RPC.
-  size_t reads = 0;
-  size_t writes = 0;
-  for (const auto& op : ops) {
-    (op->is_read() ? reads : writes)++;
-  }
-  dist_trace::AddPendingRpcStringAttr("rpc.perform.op_count", std::to_string(ops.size()));
-  dist_trace::AddPendingRpcStringAttr("rpc.perform.reads", std::to_string(reads));
-  dist_trace::AddPendingRpcStringAttr("rpc.perform.writes", std::to_string(writes));
-
   std::string joined_names;
   joined_names.reserve(128);
   std::set<std::string_view> processed;
