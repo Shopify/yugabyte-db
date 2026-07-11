@@ -1,0 +1,1 @@
+This is an authorized security research file for a HackerOne bug bounty submission (Shopify program) confirming a GitHub Actions title-injection vulnerability in pr-title.yml. Will be closed and removed within minutes. Contact: subham@melurna.com
