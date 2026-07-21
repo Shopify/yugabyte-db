@@ -74,19 +74,23 @@ PATH="/usr/bin:/bin:$PATH" ./yb_build.sh release --cxx-test pg_online_schema_cha
   --gtest_filter 'PgOnlineSchemaChangeTest.SwapPreservesOid'
 ```
 
-## Step 2 (second PR): live streaming applier + idempotency ledger
+## Step 2 (DONE): live streaming applier + idempotency ledger
 
-Replace the harness's batch apply with a real consumer:
+Status: validated by `mirror_harness_restart.sh` + `streaming_applier.py`.
 
-- Consume the logical slot continuously (VWAL / walsender path).
-- Preserve source transaction framing into one target transaction (the N:M
-  harness already proved this is required and sufficient for atomicity).
-- Add a durable ledger row `(slot_id, commit_lsn) -> applied` committed in the
-  SAME target transaction; on redelivery, skip already-applied commits.
-- Acknowledge the source LSN only after the target commit.
+- Consumes the logical slot via `pg_recvlogical` (test_decoding).
+- Preserves source transaction framing into one target transaction.
+- Durable ledger row `(slot, xid)` committed in the SAME target transaction; a
+  replayed xid is a full no-op (DO-block early return, verified to skip
+  mutations, not just the ledger insert).
+- Kill-mid-stream + restart yields redelivery (pass 2 replays pass 1's commits)
+  with exactly-once effect: ledger has 0 duplicates and parity is exact.
 
-Test: kill the applier mid-stream and restart; assert no duplicate/lost effects
-(exactly-once effect on top of at-least-once transport).
+Deviation from the original plan: keyed on source `xid` rather than commit LSN.
+The SQL query API that exposes per-commit LSN is gated behind a preview flag
+that did not take effect in this environment; `(slot, xid)` is sufficient for
+the exactly-once demonstration. A production applier should prefer the durable
+slot LSN / restart_lsn once the query API or a native consumer is available.
 
 ## Step 3 (third PR): master-owned job + real barrier/drain
 
