@@ -37,6 +37,7 @@
 #include "yb/master/catalog_manager_util.h"
 #include "yb/master/cdcsdk_manager.h"
 #include "yb/master/clone/clone_state_manager.h"
+#include "yb/master/schema_migration/schema_migration_manager.h"
 #include "yb/master/cluster_balance.h"
 #include "yb/master/master.h"
 #include "yb/master/master_admin.pb.h"
@@ -286,6 +287,8 @@ void CatalogManagerBgTasks::RunOnceAsLeader(const LeaderEpoch& epoch) {
   master_->tablet_split_manager().MaybeDoSplitting(tables, tablet_info_map, epoch);
 
   WARN_NOT_OK(master_->clone_state_manager().Run(), "Failed to run CloneStateManager: ");
+  WARN_NOT_OK(
+      master_->schema_migration_manager().Run(epoch), "Failed to run SchemaMigrationManager: ");
 
   if (!to_delete.empty() || catalog_manager_->AreTablesDeletingOrHiding()) {
     catalog_manager_->CleanUpDeletedTables(epoch);

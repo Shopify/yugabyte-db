@@ -48,6 +48,7 @@
 
 #include "yb/master/catalog_manager.h"
 #include "yb/master/clone/clone_state_manager.h"
+#include "yb/master/schema_migration/schema_migration_manager.h"
 #include "yb/master/flush_manager.h"
 #include "yb/master/master_auto_flags_manager.h"
 #include "yb/master/master_backup.service.h"
@@ -179,6 +180,8 @@ Master::Master(const MasterOptions& opts)
       tablet_split_manager_(
           new TabletSplitManager(*this, metric_entity(), metric_entity_cluster())),
       clone_state_manager_(CloneStateManager::Create(catalog_manager(), this, &sys_catalog())),
+      schema_migration_manager_(
+          new SchemaMigrationManager(catalog_manager_impl(), &sys_catalog(), clock())),
       snapshot_coordinator_(new MasterSnapshotCoordinator(
           catalog_manager_impl(), catalog_manager_impl(), tablet_split_manager())),
       test_async_rpc_manager_(new TestAsyncRpcManager(this, catalog_manager())),
@@ -655,6 +658,10 @@ uint32_t Master::GetAutoFlagConfigVersion() const {
 
 CloneStateManager& Master::clone_state_manager() const {
   return *CHECK_NOTNULL(clone_state_manager_.get());
+}
+
+SchemaMigrationManager& Master::schema_migration_manager() const {
+  return *CHECK_NOTNULL(schema_migration_manager_.get());
 }
 
 MasterSnapshotCoordinator& Master::snapshot_coordinator() const {

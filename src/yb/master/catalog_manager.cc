@@ -126,6 +126,7 @@
 #include "yb/master/catalog_manager-internal.h"
 #include "yb/master/cdcsdk_manager.h"
 #include "yb/master/clone/clone_state_manager.h"
+#include "yb/master/schema_migration/schema_migration_manager.h"
 #include "yb/master/cluster_balance.h"
 #include "yb/master/encryption_manager.h"
 #include "yb/master/leader_epoch.h"
@@ -1671,6 +1672,7 @@ Status CatalogManager::RunLoaders(SysCatalogLoadingState* state) {
 
   RETURN_NOT_OK(xcluster_manager_->RunLoaders(hidden_tablets_));
   RETURN_NOT_OK(master_->clone_state_manager().ClearAndRunLoaders(state->epoch));
+  RETURN_NOT_OK(master_->schema_migration_manager().ClearAndRunLoaders(state->epoch));
 
   return Status::OK();
 }
@@ -13948,6 +13950,7 @@ void CatalogManager::SysCatalogLoaded(SysCatalogLoadingState&& state) {
   master_->snapshot_coordinator().SysCatalogLoaded(state.epoch.leader_term);
 
   xcluster_manager_->SysCatalogLoaded(state.epoch);
+  master_->schema_migration_manager().SysCatalogLoaded(state.epoch);
   SchedulePostTabletCreationTasksForPendingTables(state.epoch);
   restoring_sys_catalog_ = false;
 

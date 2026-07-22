@@ -121,6 +121,7 @@ set(MASTER_SRCS
   restoration_state.cc
   restore_sys_catalog_state.cc
   schema_migration/schema_migration_entity.cc
+  schema_migration/schema_migration_manager.cc
   scoped_leader_shared_lock.cc
   snapshot_coordinator_context.cc
   snapshot_schedule_state.cc

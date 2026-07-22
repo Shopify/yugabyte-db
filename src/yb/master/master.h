@@ -143,6 +143,8 @@ class Master : public tserver::DbServerBase {
 
   CloneStateManager& clone_state_manager() const;
 
+  SchemaMigrationManager& schema_migration_manager() const;
+
   MasterSnapshotCoordinator& snapshot_coordinator() const;
 
   scoped_refptr<MetricEntity> metric_entity_cluster();
@@ -299,6 +301,7 @@ class Master : public tserver::DbServerBase {
   std::unique_ptr<MasterClusterHandler> master_cluster_handler_;
   std::unique_ptr<TabletSplitManager> tablet_split_manager_;
   std::unique_ptr<CloneStateManager> clone_state_manager_;
+  std::unique_ptr<SchemaMigrationManager> schema_migration_manager_;
   std::unique_ptr<MasterSnapshotCoordinator> snapshot_coordinator_;
 
   std::unique_ptr<TestAsyncRpcManager> test_async_rpc_manager_;
