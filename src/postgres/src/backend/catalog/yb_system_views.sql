@@ -75,6 +75,25 @@ CREATE VIEW yb_tablet_metadata AS
         -- Condition 2: Include YSQL tables.
         (t.type = 'YSQL');
 
+-- Online schema change migration tracking (roadmap Section 0). Read-only
+-- summary of every tracked migration; filter with an ordinary WHERE clause,
+-- e.g. WHERE migration_id = '...'.
+CREATE VIEW yb_schema_migrations AS
+    SELECT
+        migration_id,
+        kind,
+        state,
+        phase,
+        state_epoch,
+        database_oid,
+        table_oid,
+        submitted_by,
+        submitted_ddl,
+        created_time,
+        updated_time,
+        terminal_error
+    FROM yb_get_schema_migrations('');
+
 CREATE VIEW yb_pg_stat_plans AS
     SELECT *
     FROM yb_pg_stat_plans_get_all_entries() AS stat_plans(dbid oid, userid oid, queryid BIGINT, 

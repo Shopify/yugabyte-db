@@ -5943,6 +5943,158 @@ yb_cancel_transaction(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Online schema change migration tracking (see
+ * architecture/design/online-schema-changes-async-shadow-roadmap.md Section 0).
+ *
+ * yb_start_online_schema_change(ddl text, request_id text DEFAULT NULL) -> text
+ *   Asynchronously admit an online schema change and return its server-generated
+ *   migration id. Row-returning function (not a plain DDL) so the id travels
+ *   through every driver as a normal value.
+ */
+Datum
+yb_start_online_schema_change(PG_FUNCTION_ARGS)
+{
+	if (!IsYbDbAdminUser(GetUserId()))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to start an online schema change")));
+
+	char	   *ddl = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *request_id = NULL;
+
+	if (!PG_ARGISNULL(1))
+		request_id = text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+	const char *migration_id = NULL;
+
+	HandleYBStatus(YBCStartOnlineSchemaChange(ddl, MyDatabaseId, GetUserId(),
+											  request_id, &migration_id));
+
+	if (migration_id == NULL || strlen(migration_id) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("failed to start online schema change"),
+				 errdetail("The master did not admit the migration. Online schema "
+						   "change migrations may be disabled on this cluster.")));
+
+	PG_RETURN_TEXT_P(cstring_to_text(migration_id));
+}
+
+/*
+ * yb_cancel_schema_migration(migration_id text) -> bool
+ */
+Datum
+yb_cancel_schema_migration(PG_FUNCTION_ARGS)
+{
+	if (!IsYbDbAdminUser(GetUserId()))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to cancel a schema migration")));
+
+	char	   *migration_id = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	YbcStatus	status = YBCCancelSchemaMigration(migration_id);
+
+	if (status)
+	{
+		ereport(NOTICE,
+				(errmsg("failed to cancel schema migration"),
+				 errdetail("%s", YBCMessageAsCString(status))));
+		YBCFreeStatus(status);
+		PG_RETURN_BOOL(false);
+	}
+	YBCFreeStatus(status);
+	PG_RETURN_BOOL(true);
+}
+
+/*
+ * yb_get_schema_migrations(state_filter text) -> setof record
+ *   Backs the yb_schema_migrations view. The optional state_filter is applied
+ *   master-side; the outer SQL WHERE can further filter (e.g. by migration_id).
+ */
+Datum
+yb_get_schema_migrations(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+	int			i;
+	char	   *state_filter = NULL;
+#define YB_SCHEMA_MIGRATIONS_COLS 12
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	if (!PG_ARGISNULL(0))
+		state_filter = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errmsg_internal("return type must be a row type")));
+
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	YbcPgSchemaMigrationInfo *migrations = NULL;
+	size_t		num_migrations = 0;
+
+	HandleYBStatus(YBCGetSchemaMigrations(state_filter, &migrations, &num_migrations));
+
+	for (i = 0; i < num_migrations; ++i)
+	{
+		YbcPgSchemaMigrationInfo *m = (YbcPgSchemaMigrationInfo *) migrations + i;
+		Datum		values[YB_SCHEMA_MIGRATIONS_COLS];
+		bool		nulls[YB_SCHEMA_MIGRATIONS_COLS];
+
+		memset(values, 0, sizeof(values));
+		memset(nulls, 0, sizeof(nulls));
+
+		values[0] = CStringGetTextDatum(m->migration_id);
+		values[1] = CStringGetTextDatum(m->kind);
+		values[2] = CStringGetTextDatum(m->state);
+		if (m->phase && strlen(m->phase))
+			values[3] = CStringGetTextDatum(m->phase);
+		else
+			nulls[3] = true;
+		values[4] = Int64GetDatum(m->state_epoch);
+		values[5] = ObjectIdGetDatum(m->database_oid);
+		values[6] = ObjectIdGetDatum(m->table_oid);
+		values[7] = ObjectIdGetDatum(m->submitted_by);
+		if (m->submitted_ddl && strlen(m->submitted_ddl))
+			values[8] = CStringGetTextDatum(m->submitted_ddl);
+		else
+			nulls[8] = true;
+		values[9] = TimestampTzGetDatum(m->created_time);
+		values[10] = TimestampTzGetDatum(m->updated_time);
+		if (m->terminal_error && strlen(m->terminal_error))
+			values[11] = CStringGetTextDatum(m->terminal_error);
+		else
+			nulls[11] = true;
+
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+
+#undef YB_SCHEMA_MIGRATIONS_COLS
+
+	tuplestore_donestoring(tupstore);
+	MemoryContextSwitchTo(oldcontext);
+	return (Datum) 0;
+}
+
+/*
  * This PG function takes one optional bool input argument (legacy).
  * If the input argument is not specified or its value is false, this function
  * returns whether the current database is a colocated database.
