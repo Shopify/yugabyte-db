@@ -1214,6 +1214,33 @@ Status YBClient::ListClones(master::ListClonesResponsePB* ret) {
   return Status::OK();
 }
 
+Status YBClient::StartSchemaMigration(
+    const master::StartSchemaMigrationRequestPB& req,
+    master::StartSchemaMigrationResponsePB* resp) {
+  CALL_SYNC_LEADER_MASTER_RPC_EX(Admin, req, *resp, StartSchemaMigration);
+  return Status::OK();
+}
+
+Status YBClient::GetSchemaMigration(
+    const master::GetSchemaMigrationRequestPB& req, master::GetSchemaMigrationResponsePB* resp) {
+  CALL_SYNC_LEADER_MASTER_RPC_EX(Admin, req, *resp, GetSchemaMigration);
+  return Status::OK();
+}
+
+Status YBClient::ListSchemaMigrations(
+    const master::ListSchemaMigrationsRequestPB& req,
+    master::ListSchemaMigrationsResponsePB* resp) {
+  CALL_SYNC_LEADER_MASTER_RPC_EX(Admin, req, *resp, ListSchemaMigrations);
+  return Status::OK();
+}
+
+Status YBClient::CancelSchemaMigration(
+    const master::CancelSchemaMigrationRequestPB& req,
+    master::CancelSchemaMigrationResponsePB* resp) {
+  CALL_SYNC_LEADER_MASTER_RPC_EX(Admin, req, *resp, CancelSchemaMigration);
+  return Status::OK();
+}
+
 Status YBClient::ReservePgsqlOids(
     const NamespaceName& namespace_id, uint32_t next_oid, uint32_t count, bool use_secondary_space,
     uint32_t* begin_oid, uint32_t* end_oid, uint32_t* oid_cache_invalidations_count) {

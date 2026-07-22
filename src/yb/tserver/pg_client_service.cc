@@ -2967,6 +2967,100 @@ class PgClientServiceImpl::Impl : public SessionProvider {
     return Status::OK();
   }
 
+  static void FillPgSchemaMigrationInfo(
+      const master::SchemaMigrationInfoPB& src, PgSchemaMigrationInfoPB* dst) {
+    dst->set_migration_id(src.migration_id());
+    const auto& entry = src.entry();
+    dst->set_kind(master::SysSchemaMigrationEntryPB::Kind_Name(entry.kind()));
+    dst->set_state(master::SysSchemaMigrationEntryPB::State_Name(entry.state()));
+    dst->set_phase(entry.phase());
+    dst->set_state_epoch(entry.state_epoch());
+    dst->set_database_oid(entry.database_oid());
+    dst->set_table_oid(entry.table_oid());
+    dst->set_submitted_by(entry.submitted_by());
+    dst->set_submitted_ddl(entry.submitted_ddl());
+    dst->set_created_ht(entry.created_ht());
+    dst->set_updated_ht(entry.updated_ht());
+    dst->set_completed_ht(entry.completed_ht());
+    if (entry.has_terminal_error()) {
+      dst->set_terminal_error(StatusFromPB(entry.terminal_error()).ToString());
+    }
+  }
+
+  Status StartSchemaMigration(
+      const PgStartSchemaMigrationRequestPB& req, PgStartSchemaMigrationResponsePB* resp,
+      rpc::RpcContext* context) {
+    master::StartSchemaMigrationRequestPB master_req;
+    master::SysSchemaMigrationEntryPB::Kind kind;
+    SCHECK(
+        master::SysSchemaMigrationEntryPB::Kind_Parse(req.kind(), &kind), InvalidArgument,
+        "Unknown schema migration kind: $0", req.kind());
+    master_req.set_kind(kind);
+    master_req.set_database_oid(req.database_oid());
+    master_req.set_table_oid(req.table_oid());
+    master_req.set_submitted_by(req.submitted_by());
+    master_req.set_submitted_ddl(req.submitted_ddl());
+    if (!req.request_id().empty()) {
+      master_req.set_request_id(req.request_id());
+    }
+    master::StartSchemaMigrationResponsePB master_resp;
+    RETURN_NOT_OK(client().StartSchemaMigration(master_req, &master_resp));
+    if (master_resp.has_error()) {
+      return StatusFromPB(master_resp.error().status());
+    }
+    resp->set_migration_id(master_resp.migration_id());
+    return Status::OK();
+  }
+
+  Status GetSchemaMigration(
+      const PgGetSchemaMigrationRequestPB& req, PgGetSchemaMigrationResponsePB* resp,
+      rpc::RpcContext* context) {
+    master::GetSchemaMigrationRequestPB master_req;
+    master_req.set_migration_id(req.migration_id());
+    master::GetSchemaMigrationResponsePB master_resp;
+    RETURN_NOT_OK(client().GetSchemaMigration(master_req, &master_resp));
+    if (master_resp.has_error()) {
+      return StatusFromPB(master_resp.error().status());
+    }
+    FillPgSchemaMigrationInfo(master_resp.migration(), resp->mutable_migration());
+    return Status::OK();
+  }
+
+  Status ListSchemaMigrations(
+      const PgListSchemaMigrationsRequestPB& req, PgListSchemaMigrationsResponsePB* resp,
+      rpc::RpcContext* context) {
+    master::ListSchemaMigrationsRequestPB master_req;
+    if (!req.state().empty()) {
+      master::SysSchemaMigrationEntryPB::State state;
+      SCHECK(
+          master::SysSchemaMigrationEntryPB::State_Parse(req.state(), &state), InvalidArgument,
+          "Unknown schema migration state: $0", req.state());
+      master_req.set_state(state);
+    }
+    master::ListSchemaMigrationsResponsePB master_resp;
+    RETURN_NOT_OK(client().ListSchemaMigrations(master_req, &master_resp));
+    if (master_resp.has_error()) {
+      return StatusFromPB(master_resp.error().status());
+    }
+    for (const auto& migration : master_resp.migrations()) {
+      FillPgSchemaMigrationInfo(migration, resp->add_migrations());
+    }
+    return Status::OK();
+  }
+
+  Status CancelSchemaMigration(
+      const PgCancelSchemaMigrationRequestPB& req, PgCancelSchemaMigrationResponsePB* resp,
+      rpc::RpcContext* context) {
+    master::CancelSchemaMigrationRequestPB master_req;
+    master_req.set_migration_id(req.migration_id());
+    master::CancelSchemaMigrationResponsePB master_resp;
+    RETURN_NOT_OK(client().CancelSchemaMigration(master_req, &master_resp));
+    if (master_resp.has_error()) {
+      return StatusFromPB(master_resp.error().status());
+    }
+    return Status::OK();
+  }
+
   Status GetYbSystemTableInfo(
       const PgGetYbSystemTableInfoRequestPB& req, PgGetYbSystemTableInfoResponsePB* resp,
       rpc::RpcContext* context) {

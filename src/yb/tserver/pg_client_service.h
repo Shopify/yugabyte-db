@@ -75,6 +75,10 @@ class TserverXClusterContextIf;
     (IsObjectPartOfXRepl) \
     (IsNamespacePartOfCDCSDK) \
     (ListClones) \
+    (StartSchemaMigration) \
+    (GetSchemaMigration) \
+    (ListSchemaMigrations) \
+    (CancelSchemaMigration) \
     (QueryAutoAnalyze) \
     (ResetAutoAnalyzeMutationCounters) \
     (ListLiveTabletServers) \

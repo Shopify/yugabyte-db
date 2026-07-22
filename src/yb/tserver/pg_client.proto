@@ -151,6 +151,15 @@ service PgClientService {
 
   rpc ListClones(PgListClonesRequestPB) returns (PgListClonesResponsePB);
 
+  rpc StartSchemaMigration(PgStartSchemaMigrationRequestPB)
+      returns (PgStartSchemaMigrationResponsePB);
+  rpc GetSchemaMigration(PgGetSchemaMigrationRequestPB)
+      returns (PgGetSchemaMigrationResponsePB);
+  rpc ListSchemaMigrations(PgListSchemaMigrationsRequestPB)
+      returns (PgListSchemaMigrationsResponsePB);
+  rpc CancelSchemaMigration(PgCancelSchemaMigrationRequestPB)
+      returns (PgCancelSchemaMigrationResponsePB);
+
   rpc QueryAutoAnalyze(PgQueryAutoAnalyzeRequestPB) returns (PgQueryAutoAnalyzeResponsePB);
 
   rpc ResetAutoAnalyzeMutationCounters(PgResetAutoAnalyzeMutationCountersRequestPB)
@@ -1358,6 +1367,71 @@ message PgDatabaseCloneInfoPB {
   string state = 5;
   fixed64 as_of_time = 6;
   string failure_reason = 7;
+}
+
+// Online schema change migration tracking (see
+// architecture/design/online-schema-changes-async-shadow-roadmap.md Section 0).
+// Fields are flattened (strings/oids) so pggate/Postgres need not depend on the
+// master catalog_entity_info proto.
+message PgStartSchemaMigrationRequestPB {
+  reserved 1; // ASH metadata is now passed in RequestHeader PB
+  string kind = 2;
+  uint32 database_oid = 3;
+  uint32 table_oid = 4;
+  uint32 submitted_by = 5;
+  string submitted_ddl = 6;
+  bytes request_id = 7;
+}
+
+message PgStartSchemaMigrationResponsePB {
+  AppStatusPB status = 1;
+  string migration_id = 2;
+}
+
+message PgSchemaMigrationInfoPB {
+  string migration_id = 1;
+  string kind = 2;
+  string state = 3;
+  string phase = 4;
+  int64 state_epoch = 5;
+  uint32 database_oid = 6;
+  uint32 table_oid = 7;
+  uint32 submitted_by = 8;
+  string submitted_ddl = 9;
+  fixed64 created_ht = 10;
+  fixed64 updated_ht = 11;
+  fixed64 completed_ht = 12;
+  string terminal_error = 13;
+}
+
+message PgGetSchemaMigrationRequestPB {
+  reserved 1; // ASH metadata is now passed in RequestHeader PB
+  string migration_id = 2;
+}
+
+message PgGetSchemaMigrationResponsePB {
+  AppStatusPB status = 1;
+  PgSchemaMigrationInfoPB migration = 2;
+}
+
+message PgListSchemaMigrationsRequestPB {
+  reserved 1; // ASH metadata is now passed in RequestHeader PB
+  // Optional state filter (empty = all).
+  string state = 2;
+}
+
+message PgListSchemaMigrationsResponsePB {
+  AppStatusPB status = 1;
+  repeated PgSchemaMigrationInfoPB migrations = 2;
+}
+
+message PgCancelSchemaMigrationRequestPB {
+  reserved 1; // ASH metadata is now passed in RequestHeader PB
+  string migration_id = 2;
+}
+
+message PgCancelSchemaMigrationResponsePB {
+  AppStatusPB status = 1;
 }
 
 message PgQueryAutoAnalyzeRequestPB {

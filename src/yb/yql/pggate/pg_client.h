@@ -207,6 +207,15 @@ class PgClient {
 
   Result<tserver::PgListClonesResponsePB> ListDatabaseClones();
 
+  Result<tserver::PgStartSchemaMigrationResponsePB> StartSchemaMigration(
+      const tserver::PgStartSchemaMigrationRequestPB& req);
+  Result<tserver::PgGetSchemaMigrationResponsePB> GetSchemaMigration(
+      const tserver::PgGetSchemaMigrationRequestPB& req);
+  Result<tserver::PgListSchemaMigrationsResponsePB> ListSchemaMigrations(
+      const tserver::PgListSchemaMigrationsRequestPB& req);
+  Result<tserver::PgCancelSchemaMigrationResponsePB> CancelSchemaMigration(
+      const tserver::PgCancelSchemaMigrationRequestPB& req);
+
   Result<tserver::PgQueryAutoAnalyzeResponsePB> QueryAutoAnalyze(PgOid db_oid);
 
   Status ResetAutoAnalyzeMutationCounters(const PgObjectId& table_id);

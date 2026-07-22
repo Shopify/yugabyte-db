@@ -920,6 +920,23 @@ typedef struct {
   const char* failure_reason;
 } YbcPgDatabaseCloneInfo;
 
+// Online schema change migration tracking (roadmap Section 0).
+typedef struct {
+  const char* migration_id;
+  const char* kind;
+  const char* state;
+  const char* phase;
+  int64_t state_epoch;
+  YbcPgOid database_oid;
+  YbcPgOid table_oid;
+  YbcPgOid submitted_by;
+  const char* submitted_ddl;
+  int64_t created_time;
+  int64_t updated_time;
+  int64_t completed_time;
+  const char* terminal_error;
+} YbcPgSchemaMigrationInfo;
+
 typedef struct {
   int rowmark;
   int pg_wait_policy;

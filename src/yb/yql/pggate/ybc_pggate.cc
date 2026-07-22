@@ -3260,6 +3260,85 @@ YbcStatus YBCDatabaseClones(YbcPgDatabaseCloneInfo** database_clones, size_t* co
   return YBCStatusOK();
 }
 
+namespace {
+
+void FillSchemaMigrationInfo(
+    const tserver::PgSchemaMigrationInfoPB& src, YbcPgSchemaMigrationInfo* dst) {
+  new (dst) YbcPgSchemaMigrationInfo{
+      .migration_id = YBCPAllocStdString(src.migration_id()),
+      .kind = YBCPAllocStdString(src.kind()),
+      .state = YBCPAllocStdString(src.state()),
+      .phase = YBCPAllocStdString(src.phase()),
+      .state_epoch = src.state_epoch(),
+      .database_oid = src.database_oid(),
+      .table_oid = src.table_oid(),
+      .submitted_by = src.submitted_by(),
+      .submitted_ddl = YBCPAllocStdString(src.submitted_ddl()),
+      .created_time = YBCGetPgCallbacks()->UnixEpochToPostgresEpoch(
+          static_cast<int64_t>(HybridTime(src.created_ht()).GetPhysicalValueMicros())),
+      .updated_time = YBCGetPgCallbacks()->UnixEpochToPostgresEpoch(
+          static_cast<int64_t>(HybridTime(src.updated_ht()).GetPhysicalValueMicros())),
+      .completed_time = YBCGetPgCallbacks()->UnixEpochToPostgresEpoch(
+          static_cast<int64_t>(HybridTime(src.completed_ht()).GetPhysicalValueMicros())),
+      .terminal_error = YBCPAllocStdString(src.terminal_error()),
+  };
+}
+
+}  // namespace
+
+YbcStatus YBCStartOnlineSchemaChange(
+    const char* ddl, YbcPgOid database_oid, YbcPgOid submitted_by, const char* request_id,
+    const char** migration_id) {
+  tserver::PgStartSchemaMigrationRequestPB req;
+  req.set_kind("ONLINE_TABLE_REWRITE");
+  req.set_database_oid(database_oid);
+  req.set_submitted_by(submitted_by);
+  req.set_submitted_ddl(ddl);
+  if (request_id && *request_id) {
+    req.set_request_id(request_id);
+  }
+  const auto result = pgapi->StartSchemaMigration(req);
+  if (!result.ok()) {
+    return ToYBCStatus(result.status());
+  }
+  *migration_id = YBCPAllocStdString(result.get().migration_id());
+  return YBCStatusOK();
+}
+
+YbcStatus YBCCancelSchemaMigration(const char* migration_id) {
+  tserver::PgCancelSchemaMigrationRequestPB req;
+  req.set_migration_id(migration_id);
+  const auto result = pgapi->CancelSchemaMigration(req);
+  if (!result.ok()) {
+    return ToYBCStatus(result.status());
+  }
+  return YBCStatusOK();
+}
+
+YbcStatus YBCGetSchemaMigrations(
+    const char* state_filter, YbcPgSchemaMigrationInfo** migrations, size_t* count) {
+  tserver::PgListSchemaMigrationsRequestPB req;
+  if (state_filter && *state_filter) {
+    req.set_state(state_filter);
+  }
+  const auto result = pgapi->ListSchemaMigrations(req);
+  if (!result.ok()) {
+    return ToYBCStatus(result.status());
+  }
+  const auto& rows = result.get().migrations();
+  *count = rows.size();
+  if (!rows.empty()) {
+    *migrations = static_cast<YbcPgSchemaMigrationInfo*>(
+        YBCPAlloc(sizeof(YbcPgSchemaMigrationInfo) * rows.size()));
+    YbcPgSchemaMigrationInfo* cur = *migrations;
+    for (const auto& row : rows) {
+      FillSchemaMigrationInfo(row, cur);
+      ++cur;
+    }
+  }
+  return YBCStatusOK();
+}
+
 YbcStatus YBCQueryAutoAnalyze(
     YbcPgOid db_oid, YbcAutoAnalyzeInfo** analyze_info, size_t* count) {
   const auto result = pgapi->QueryAutoAnalyze(db_oid);

@@ -57,6 +57,7 @@
 #include "yb/gutil/macros.h"
 
 #include "yb/master/catalog_entity_info.fwd.h"
+#include "yb/master/master_admin.fwd.h"
 #include "yb/master/master_backup.fwd.h"
 #include "yb/master/master_client.fwd.h"
 #include "yb/master/master_ddl.fwd.h"
@@ -592,6 +593,19 @@ class YBClient {
       const std::optional<YQLDatabase>& database_type = std::nullopt);
 
   Status ListClones(master::ListClonesResponsePB* resp);
+
+  // Online schema change migration tracking (roadmap Section 0).
+  Status StartSchemaMigration(
+      const master::StartSchemaMigrationRequestPB& req,
+      master::StartSchemaMigrationResponsePB* resp);
+  Status GetSchemaMigration(
+      const master::GetSchemaMigrationRequestPB& req, master::GetSchemaMigrationResponsePB* resp);
+  Status ListSchemaMigrations(
+      const master::ListSchemaMigrationsRequestPB& req,
+      master::ListSchemaMigrationsResponsePB* resp);
+  Status CancelSchemaMigration(
+      const master::CancelSchemaMigrationRequestPB& req,
+      master::CancelSchemaMigrationResponsePB* resp);
 
   Status CreateTablegroup(
       const NamespaceName& namespace_name,

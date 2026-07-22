@@ -869,6 +869,42 @@ class PgClient::Impl : public BigDataFetcher {
     return resp;
   }
 
+  Result<tserver::PgStartSchemaMigrationResponsePB> StartSchemaMigration(
+      const tserver::PgStartSchemaMigrationRequestPB& req_in) {
+    tserver::PgStartSchemaMigrationRequestPB req = req_in;
+    tserver::PgStartSchemaMigrationResponsePB resp;
+    RETURN_NOT_OK(DoSyncRPC(&PgClientServiceProxy::StartSchemaMigration,
+        req, resp, PggateRPC::kStartSchemaMigration));
+    return resp;
+  }
+
+  Result<tserver::PgGetSchemaMigrationResponsePB> GetSchemaMigration(
+      const tserver::PgGetSchemaMigrationRequestPB& req_in) {
+    tserver::PgGetSchemaMigrationRequestPB req = req_in;
+    tserver::PgGetSchemaMigrationResponsePB resp;
+    RETURN_NOT_OK(DoSyncRPC(&PgClientServiceProxy::GetSchemaMigration,
+        req, resp, PggateRPC::kGetSchemaMigration));
+    return resp;
+  }
+
+  Result<tserver::PgListSchemaMigrationsResponsePB> ListSchemaMigrations(
+      const tserver::PgListSchemaMigrationsRequestPB& req_in) {
+    tserver::PgListSchemaMigrationsRequestPB req = req_in;
+    tserver::PgListSchemaMigrationsResponsePB resp;
+    RETURN_NOT_OK(DoSyncRPC(&PgClientServiceProxy::ListSchemaMigrations,
+        req, resp, PggateRPC::kListSchemaMigrations));
+    return resp;
+  }
+
+  Result<tserver::PgCancelSchemaMigrationResponsePB> CancelSchemaMigration(
+      const tserver::PgCancelSchemaMigrationRequestPB& req_in) {
+    tserver::PgCancelSchemaMigrationRequestPB req = req_in;
+    tserver::PgCancelSchemaMigrationResponsePB resp;
+    RETURN_NOT_OK(DoSyncRPC(&PgClientServiceProxy::CancelSchemaMigration,
+        req, resp, PggateRPC::kCancelSchemaMigration));
+    return resp;
+  }
+
   Result<tserver::PgQueryAutoAnalyzeResponsePB> QueryAutoAnalyze(PgOid db_oid) {
     tserver::PgQueryAutoAnalyzeRequestPB req;
     tserver::PgQueryAutoAnalyzeResponsePB resp;
@@ -2191,6 +2227,26 @@ Status PgClient::FinishTransaction(Commit commit, const std::optional<DdlMode>& 
 
 Result<tserver::PgListClonesResponsePB> PgClient::ListDatabaseClones() {
   return impl_->ListDatabaseClones();
+}
+
+Result<tserver::PgStartSchemaMigrationResponsePB> PgClient::StartSchemaMigration(
+    const tserver::PgStartSchemaMigrationRequestPB& req) {
+  return impl_->StartSchemaMigration(req);
+}
+
+Result<tserver::PgGetSchemaMigrationResponsePB> PgClient::GetSchemaMigration(
+    const tserver::PgGetSchemaMigrationRequestPB& req) {
+  return impl_->GetSchemaMigration(req);
+}
+
+Result<tserver::PgListSchemaMigrationsResponsePB> PgClient::ListSchemaMigrations(
+    const tserver::PgListSchemaMigrationsRequestPB& req) {
+  return impl_->ListSchemaMigrations(req);
+}
+
+Result<tserver::PgCancelSchemaMigrationResponsePB> PgClient::CancelSchemaMigration(
+    const tserver::PgCancelSchemaMigrationRequestPB& req) {
+  return impl_->CancelSchemaMigration(req);
 }
 
 Result<tserver::PgQueryAutoAnalyzeResponsePB> PgClient::QueryAutoAnalyze(PgOid db_oid) {

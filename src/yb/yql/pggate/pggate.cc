@@ -1247,6 +1247,26 @@ Result<tserver::PgListClonesResponsePB> PgApiImpl::GetDatabaseClones() {
   return pg_client_.ListDatabaseClones();
 }
 
+Result<tserver::PgStartSchemaMigrationResponsePB> PgApiImpl::StartSchemaMigration(
+    const tserver::PgStartSchemaMigrationRequestPB& req) {
+  return pg_client_.StartSchemaMigration(req);
+}
+
+Result<tserver::PgGetSchemaMigrationResponsePB> PgApiImpl::GetSchemaMigration(
+    const tserver::PgGetSchemaMigrationRequestPB& req) {
+  return pg_client_.GetSchemaMigration(req);
+}
+
+Result<tserver::PgListSchemaMigrationsResponsePB> PgApiImpl::ListSchemaMigrations(
+    const tserver::PgListSchemaMigrationsRequestPB& req) {
+  return pg_client_.ListSchemaMigrations(req);
+}
+
+Result<tserver::PgCancelSchemaMigrationResponsePB> PgApiImpl::CancelSchemaMigration(
+    const tserver::PgCancelSchemaMigrationRequestPB& req) {
+  return pg_client_.CancelSchemaMigration(req);
+}
+
 Result<tserver::PgQueryAutoAnalyzeResponsePB> PgApiImpl::QueryAutoAnalyze(PgOid db_oid) {
     return pg_session_->pg_client().QueryAutoAnalyze(db_oid);
 }
