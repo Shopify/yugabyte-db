@@ -96,6 +96,74 @@ unambiguous.
   - `src/yb/master/xrepl_catalog_manager.cc` (rewrite gate)
   - `docs/content/stable/additional-features/change-data-capture/using-logical-replication/advanced-topic.md`
 
+## Prototype Findings (validated)
+
+A working prototype has de-risked the core mechanics of this design. It has two
+parts: an in-tree C++ regression test and an out-of-tree SQL/`pg_recvlogical`
+harness. Artifacts:
+
+- `src/yb/yql/pgwrapper/pg_online_schema_change-test.cc` (in-tree, committed).
+- `prototype/osc-logical-slot/` (harness + applier + README/NEXT-STEPS).
+
+What the prototype proves:
+
+1. **OID-preserving storage switch already exists.** The current YB table
+   rewrite path preserves `pg_class.oid` while moving `relfilenode` to a new
+   DocDB table, and OID-bound dependents (views, foreign keys) keep working.
+   Confirmed by `SwapPreservesOid` and `SwapPreservesDependents`. Implication:
+   the roadmap's cutover is not new machinery to invent; the remaining work is
+   to drive that swap from an externally-built, caught-up shadow instead of the
+   inline snapshot copy at `tablecmds.c:6390-6409`.
+
+2. **Distributed shape holds (N:M).** With source `SPLIT INTO 4` and shadow
+   `SPLIT INTO 6` and a primary-key-changing transform (`new_id = id*2`),
+   transformed rows fan out across all 6 shadow tablets, and multi-row
+   cross-tablet source transactions apply atomically on the target when source
+   `BEGIN`/`COMMIT` framing is preserved. A "single shadow DocDB table" is a
+   multi-tablet distributed table; source and target tablet layouts need not
+   match; routing is by transformed primary key.
+
+3. **Exactly-once effect over at-least-once transport.** A per-source-
+   transaction target transaction plus an idempotency-ledger row committed in
+   the same transaction gives exactly-once effect. Killing the applier
+   mid-stream causes the slot to replay; the ledger makes replayed transactions
+   full no-ops (verified to skip mutations, not just the ledger insert).
+
+4. **Real barrier drain (no sleep).** Fencing the source with ACCESS EXCLUSIVE,
+   inserting a sentinel, and draining until the sentinel's transformed row is
+   visible in the shadow is a deterministic "caught up" signal. Validated under
+   a continuous background writer; post-cutover parity is exact including the
+   full write tail.
+
+Constraints and gotchas discovered (fold into design):
+
+- The logical-slot SQL query API that exposes per-commit LSN
+  (`ysql_yb_enable_replication_slot_query_api`) is a preview flag that did not
+  take effect via session GUC or `--tserver_flags` in the prototype env; the
+  prototype used `pg_recvlogical` + source `xid` as the idempotency key. A
+  production applier should prefer the durable slot LSN / `restart_lsn`.
+- `pg_current_wal_lsn()` is unsupported in YB (issue 30243); slot LSNs
+  (`SEQUENCE` type) and `pg_current_wal_flush_lsn()` are not in comparable
+  spaces, so "caught up" cannot be a naive LSN comparison. Use a sentinel or a
+  per-tablet resolved-HybridTime vector (the real distributed signal).
+- Do not spawn many short-lived `pg_recvlogical` consumers; each holds the slot
+  `active` for a lease window and the next capture gets nothing. Drain once; the
+  slot retains all unacked history.
+- A doubling transform must use a `bigint` target key and cast (`id::bigint*2`)
+  to avoid `int4` overflow on large source ids.
+- YB replication slots can linger `active` briefly after the consumer exits;
+  slot drop needs retry-with-backoff.
+
+What the prototype did NOT prove (still open, drives the roadmap below):
+
+- Wiring the real OID-preserving switch to an externally-built shadow (the
+  harness cutover is still a name swap; the switch is validated only in the
+  isolated C++ test).
+- A master-owned migration job and its failover behavior.
+- A per-tablet resolved-HybridTime barrier vector (prototype used a single-node
+  sentinel).
+- Any of the CDC-handoff, backup, PITR, partition, geo, or colocation behavior.
+
 ## Current DDL Classification
 
 Legend: **M** metadata-only, **V** validation scan, **I** index build/backfill,
@@ -571,22 +639,80 @@ materializes the selected generation's tablet inventory instead of overlaying
 
 # Roadmap (Milestones)
 
-| Milestone | Deliverable |
-|---|---|
-| A | Generation metadata, hidden shadow table, regular-table fixed-HT copy |
-| B | Internal CDCSDK capture, durable queue, idempotent replay |
-| C | Correct final barrier + OID-preserving relfilenode cutover |
-| D | Logical CDC handoff, no internal duplicate events |
-| E | Full backup, restore, PITR, old-generation retention |
-| F | Partitioned + geo-partitioned generation groups |
-| G | Colocated generations + shared-table CDC/backup behavior |
-| H | gRPC CDC generation-transition protocol |
-| I | Incremental backup replacement manifests or auto-full rollover |
-| J | GA hardening: failover, upgrades, observability, cancellation |
-| K | Long-term logical-to-physical generation pointer |
+Status legend: [proto] prototype-validated (mechanic proven out-of-tree or in
+an isolated test); [done] landed in-tree; otherwise not started.
+
+| Milestone | Deliverable | Status |
+|---|---|---|
+| A | Generation metadata, hidden shadow table, regular-table fixed-HT copy | partial: OID-preserving switch and fixed-HT copy [proto]; hidden-generation metadata not started |
+| B | Internal CDCSDK capture, durable queue, idempotent replay | [proto] via logical slot + `(slot,xid)` ledger; internal CDCSDK stream not started |
+| C | Correct final barrier + OID-preserving relfilenode cutover | [proto] sentinel barrier; OID-preserving swap [done] in isolated test; not yet wired to a caught-up shadow |
+| D | Logical CDC handoff, no internal duplicate events | not started |
+| E | Full backup, restore, PITR, old-generation retention | not started |
+| F | Partitioned + geo-partitioned generation groups | not started |
+| G | Colocated generations + shared-table CDC/backup behavior | not started |
+| H | gRPC CDC generation-transition protocol | not started |
+| I | Incremental backup replacement manifests or auto-full rollover | not started |
+| J | GA hardening: failover, upgrades, observability, cancellation | not started |
+| K | Long-term logical-to-physical generation pointer | not started |
 
 GA is blocked until D through J are complete. xCluster tables remain
 unsupported.
+
+## Next Investigations (post-prototype, in priority order)
+
+The prototype validated the three core mechanics in isolation (switch, applier,
+barrier). The following are the concrete next in-tree work items; each is scoped
+to be landable behind a preview gate with its own test.
+
+1. **Generation metadata + hidden shadow (Milestone A backend).**
+   Add an explicit physical-generation role (`ACTIVE`/`SHADOW`/`RETIRED`) to
+   `SysTablesEntryPB`, distinct from `HIDDEN`. Teach `ListTables`, CDC dynamic
+   discovery, backup enumeration, and GC to exclude `SHADOW`. Create a shadow
+   generation via the existing `YbRelationSetNewRelfileNode`/`CreateTable`
+   plumbing with `pg_table_id` set to the source logical id. Test: shadow is
+   invisible to SQL/list/backup but addressable by physical id.
+
+2. **Wire the caught-up shadow into the OID-preserving switch (Milestone C).**
+   The seam is `tablecmds.c:6390-6409` (`make_new_heap` -> inline
+   `ATRewriteTable` copy -> `finish_heap_swap`). Add a `finish`-side path that
+   adopts an already-populated shadow generation and SKIPS the inline copy and
+   index rebuild. Test: swap a pre-filled shadow into the source OID; dependents
+   survive; no data copied during cutover.
+
+3. **Master-owned migration job (Milestones A-C orchestration).**
+   A `SysOnlineSchemaChangeJobPB` state machine (states from Section 2.7),
+   resumable across master failover, fencing stale-epoch callbacks. Test:
+   kill/restart master at each state; job resumes, never double-applies.
+
+4. **Per-tablet resolved-HybridTime barrier (Milestone C, real drain).**
+   Replace the prototype sentinel with a per-source-tablet resolved-HT vector:
+   cutover proceeds only when every source tablet has resolved through `F` and
+   the applier frontier covers `F`. Reuse the index-backfill safe-time
+   primitives (`backfill_index.cc`, `tablet_service.cc` safe-time path).
+
+5. **Internal CDCSDK capture (Milestone B backend).**
+   Replace the user-facing logical slot with an internal, hard-retention
+   CDCSDK stream bound to source physical ids, full row images, transaction
+   assembly. Decide: initial internalized-VWAL vs direct per-tablet assembly
+   (Open Decision 7).
+
+6. **External CDC handoff (Milestone D).**
+   Suppress internal backfill/mirror writes from external CDC; emit one
+   generation/schema transition at `K`; retain old tablets until consumers
+   cross `K`. Blocks GA.
+
+7. **Backup / PITR generation awareness (Milestone E).**
+   Generation selection by snapshot HybridTime; PITR physical coverage of
+   shadow generations; incremental-backup replacement manifest or auto-full.
+   Blocks GA.
+
+8. **Shapes (Milestones F, G).**
+   Partitioned/geo generation groups, then colocated generations. Each is a
+   separate investigation with its own routing and retention concerns.
+
+Items 1-4 make a single non-colocated table migrate end to end in-tree with a
+real cutover. Items 5-8 are the GA gates.
 
 # Required Testing
 
@@ -636,3 +762,15 @@ unsupported.
 - Trigger-based synchronous mirroring as the core mechanism.
 - MySQL-style rename swap that changes the logical table OID.
 - Replacing metadata-only or existing online-index paths.
+
+# Prototype Artifacts
+
+- `src/yb/yql/pgwrapper/pg_online_schema_change-test.cc` - in-tree C++
+  regression test for the OID-preserving storage switch (Milestone C mechanic).
+- `prototype/osc-logical-slot/` - SQL/`pg_recvlogical` validation harness:
+  - `mirror_harness.sh` (1:1), `mirror_harness_nm.sh` (N:M fan-out + atomicity),
+    `mirror_harness_restart.sh` (exactly-once across restart),
+    `mirror_harness_barrier.sh` (real barrier drain under a writer).
+  - `streaming_applier.py` (per-xid target txn + `(slot,xid)` ledger),
+    `apply_changes.py` (transaction-framed batch apply).
+  - `README.md` (results), `NEXT-STEPS.md` (in-tree step plan).
