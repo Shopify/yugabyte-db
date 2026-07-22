@@ -6139,6 +6139,7 @@ std::string CatalogManager::GenerateIdUnlocked(std::optional<const SysRowEntryTy
         if (FindPtrOrNull(udtype_ids_map_, id) == nullptr) return id;
         break;
       case SysRowEntryType::CLONE_STATE: FALLTHROUGH_INTENDED;
+      case SysRowEntryType::SCHEMA_MIGRATION: FALLTHROUGH_INTENDED;
       case SysRowEntryType::SNAPSHOT:
         return id;
       case SysRowEntryType::CDC_STREAM: FALLTHROUGH_INTENDED;

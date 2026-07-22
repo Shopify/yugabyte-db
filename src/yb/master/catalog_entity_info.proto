@@ -763,6 +763,67 @@ message SysCloneStatePB {
   optional string abort_message = 6;
 }
 
+// The data part of a SysRowEntry in the sys.catalog table for an online schema
+// migration job. See architecture/design/online-schema-changes-async-shadow-roadmap.md
+// Section 0 (Migration Identity, State Tracking, and Observability).
+//
+// The migration id (a server-generated UUID) is the sys-catalog row key, not a
+// field here, mirroring SysRestorationEntryPB.
+message SysSchemaMigrationEntryPB {
+  // The kind of long-running schema change this job represents. The tracker is
+  // deliberately generic; only ONLINE_TABLE_REWRITE is implemented today.
+  enum Kind {
+    UNKNOWN_KIND = 0;
+    ONLINE_TABLE_REWRITE = 1;
+  }
+
+  // Lifecycle state, distinct from the finer-grained execution `phase`.
+  //   NEW        -> RUNNING -> {SUCCEEDED, FAILED}
+  //   NEW|RUNNING -> CANCELLING -> CANCELLED
+  // SUCCEEDED/FAILED/CANCELLED are terminal.
+  enum State {
+    UNKNOWN_STATE = 0;
+    NEW = 1;
+    RUNNING = 2;
+    CANCELLING = 3;
+    SUCCEEDED = 4;
+    FAILED = 5;
+    CANCELLED = 6;
+  }
+
+  optional Kind kind = 1;
+  optional State state = 2;
+
+  // Free-form execution phase within RUNNING (e.g. "PREFLIGHT", "SNAPSHOTTING").
+  // Advisory; the authoritative lifecycle is `state`.
+  optional string phase = 3;
+
+  // Bumped on every master-leader reload so stale-epoch worker callbacks are
+  // fenced. Also bumped on cancel.
+  optional int64 state_epoch = 4;
+
+  // Target of the migration and who submitted it (PG OIDs).
+  optional uint32 database_oid = 5;
+  optional uint32 table_oid = 6;
+  optional uint32 submitted_by = 7;
+
+  // The original DDL text submitted by the user.
+  optional string submitted_ddl = 8;
+
+  optional fixed64 created_ht = 9;
+  optional fixed64 updated_ht = 10;
+  optional fixed64 completed_ht = 11;
+
+  // Set when state is FAILED. Distinct from the RPC-level status returned to a
+  // status query (which reports whether the lookup itself succeeded).
+  optional AppStatusPB terminal_error = 12;
+
+  // Optional client-supplied idempotency token, distinct from the migration id.
+  // A retried submission carrying the same request_id resolves to this job
+  // instead of starting a second one.
+  optional bytes request_id = 13;
+}
+
 message SchemaVersionMappingPB {
   required uint32 producer_schema_version = 1;
   required uint32 consumer_schema_version = 2;

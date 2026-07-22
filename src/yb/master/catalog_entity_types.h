@@ -51,7 +51,8 @@ class SysRowEntry;
   ((XCLUSTER_OUTBOUND_REPLICATION_GROUP, SysXClusterOutboundReplicationGroupEntryPB)) \
   ((CLONE_STATE, SysCloneStatePB)) \
   ((TSERVER_REGISTRATION, SysTabletServerEntryPB)) \
-  ((OBJECT_LOCK_ENTRY, SysObjectLockEntryPB))
+  ((OBJECT_LOCK_ENTRY, SysObjectLockEntryPB)) \
+  ((SCHEMA_MIGRATION, SysSchemaMigrationEntryPB))
 
 // We should have an entry for each SysRowEntryType in the map except for UNKNOWN.
 static_assert(
