@@ -116,6 +116,43 @@ class CDCSDKTabletMetrics {
   scoped_refptr<MetricEntity> entity_;
 };
 
+// Container for StreamWAL (checkpoint-less, stream-id-less) per-tablet metrics.
+//
+// Unlike CDCSDKTabletMetrics / XClusterTabletMetrics -- which live on a separate
+// per-(stream_id, tablet) metric entity -- these are attached directly to the
+// tablet's own metric entity. There is exactly one StreamWAL consumer per
+// tablet, so no stream_id keying is needed; the metrics aggregate at the table
+// level (like every other tablet metric) and carry no stream_id / slot_name
+// attribution.
+class StreamWALTabletMetrics {
+ public:
+  explicit StreamWALTabletMetrics(const scoped_refptr<MetricEntity>& metric_entity);
+
+  void ClearMetrics();
+
+  // Total decoded change records sent over StreamWAL for this tablet.
+  scoped_refptr<Counter> streamwal_records_sent;
+  // Total decoded record payload bytes sent over StreamWAL for this tablet.
+  scoped_refptr<Counter> streamwal_traffic_sent;
+  // Lag between the leader's safe time and the commit time of the last record
+  // sent over StreamWAL. Aggregated with kMax -> worst (most-behind) tablet.
+  scoped_refptr<AtomicGauge<int64_t>> streamwal_sent_lag_micros;
+  // WAL ops between the leader tip and the read cursor
+  // (leader_tip.index - next_op_id.index). Aggregated with kMax.
+  scoped_refptr<AtomicGauge<int64_t>> streamwal_wal_lag_index;
+  // Current value of --intents_min_seconds_to_retain. Exposed so dashboards can
+  // derive intent-retention headroom as (window - sent_lag) without hardcoding
+  // the flag (a true kMin "headroom" gauge is not expressible -- only kSum/kMax
+  // aggregation functions exist).
+  scoped_refptr<AtomicGauge<uint64_t>> streamwal_intent_retention_window_secs;
+  // Count of INTENTS_GC_ERROR responses (intents GC'd before StreamWAL could
+  // read them). Must always be zero; non-zero indicates data loss.
+  scoped_refptr<Counter> streamwal_intents_gc_errors;
+
+ private:
+  scoped_refptr<MetricEntity> entity_;
+};
+
 class CDCServerMetrics {
  public:
   explicit CDCServerMetrics(const scoped_refptr<MetricEntity>& metric_entity_server);

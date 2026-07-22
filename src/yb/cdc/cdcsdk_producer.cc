@@ -3313,4 +3313,925 @@ Status GetChangesForCDCSDK(
   return Status::OK();
 }  // NOLINT(readability/fn_size)
 
+// ----------------------------------------------------------------------------
+// StreamWAL helpers.
+//
+// Additive callsites layered on top of the existing decoder family. Used by
+// CDCServiceImpl::StreamWAL only. Do not modify the underlying decoder
+// functions; we only invoke them and assemble small envelope records here.
+// ----------------------------------------------------------------------------
+
+namespace {
+
+// Populate the column / table-properties payload of a synthetic bootstrap DDL
+// record from current tablet metadata for a given (table_id, table_name).
+void FillBootstrapDDLRecord(
+    const tablet::Tablet& tablet,
+    const TableId& table_id,
+    const TableName& table_name,
+    SchemaVersion schema_version,
+    const Schema& schema,
+    uint32_t write_id_for_disambiguation,
+    CDCSDKProtoRecordPB* proto_record) {
+  SchemaPB schema_pb;
+  SchemaToPB(schema, &schema_pb);
+
+  auto* row_message = proto_record->mutable_row_message();
+  row_message->set_op(RowMessage_Op_DDL);
+  row_message->set_table(table_name);
+  row_message->set_table_id(table_id);
+  row_message->set_schema_version(schema_version);
+  row_message->set_pgschema_name(schema_pb.deprecated_pgschema_name());
+
+  for (const auto& column : schema_pb.columns()) {
+    SetColumnInfo(column, row_message->mutable_schema()->add_column_info());
+  }
+
+  SetTableProperties(
+      schema_pb.table_properties(), row_message->mutable_schema()->mutable_tab_info());
+
+  // Bootstrap DDLs are not derived from a real WAL OpId. The contract pins the
+  // term/index to 0 and uses write_id as a per-table disambiguator within the
+  // bootstrap batch.
+  auto* op_id_pb = proto_record->mutable_cdc_sdk_op_id();
+  SetCDCSDKOpId(
+      /*term=*/0, /*index=*/0,
+      /*write_id=*/write_id_for_disambiguation, /*write_id_key=*/"",
+      op_id_pb);
+  (void)tablet;  // unused; reserved for future use (e.g. before-image deps)
+}
+
+}  // namespace
+
+Status PopulateSyntheticBootstrapDDLs(
+    const std::shared_ptr<tablet::TabletPeer>& tablet_peer,
+    std::vector<CDCSDKProtoRecordPB>* out) {
+  RSTATUS_DCHECK(out, InvalidArgument, "out vector must be non-null");
+  auto tablet_ptr = VERIFY_RESULT(tablet_peer->shared_tablet());
+
+  // The sys catalog tablet's schemas are resolved per-row by the decoder; we
+  // do not bootstrap them up-front.
+  if (tablet_ptr->metadata()->IsSysCatalog()) {
+    return Status::OK();
+  }
+
+  const auto& meta = *tablet_ptr->metadata();
+  uint32_t write_id = 0;
+
+  for (const auto& table_id : meta.GetAllColocatedTables()) {
+    auto table_info_result = meta.GetTableInfo(table_id);
+    if (!table_info_result.ok()) {
+      // Could happen for a recently-deleted colocated table; just skip.
+      LOG(WARNING) << "StreamWAL bootstrap: skipping table_id=" << table_id
+                   << " on tablet=" << tablet_ptr->tablet_id()
+                   << " -- no TableInfo: " << table_info_result.status();
+      continue;
+    }
+    const auto& table_info = *table_info_result;
+    const auto& table_name = table_info->table_name;
+
+    // Skip tablegroup / colocation parent tables; they are not user-visible.
+    if (boost::ends_with(table_name, kTablegroupParentTableNameSuffix) ||
+        boost::ends_with(table_name, kColocationParentTableNameSuffix)) {
+      continue;
+    }
+
+    auto schema_ptr = meta.schema(table_id);
+    if (!schema_ptr) {
+      LOG(WARNING) << "StreamWAL bootstrap: skipping table_id=" << table_id
+                   << " on tablet=" << tablet_ptr->tablet_id() << " -- no schema";
+      continue;
+    }
+    const SchemaVersion schema_version = meta.schema_version(table_id);
+
+    out->emplace_back();
+    FillBootstrapDDLRecord(
+        *tablet_ptr, table_id, table_name, schema_version, *schema_ptr, write_id,
+        &out->back());
+    ++write_id;
+  }
+
+  return Status::OK();
+}
+
+Status PopulateStreamWalApplyingRecord(
+    const consensus::ReplicateMsgPtr& msg,
+    CDCSDKProtoRecordPB* out) {
+  RSTATUS_DCHECK(out, InvalidArgument, "out record must be non-null");
+  RSTATUS_DCHECK(
+      msg->has_transaction_state(), InvalidArgument,
+      "UPDATE_TRANSACTION_OP message missing transaction_state");
+
+  const auto& txn_state = msg->transaction_state();
+  RSTATUS_DCHECK(
+      txn_state.status() == TransactionStatus::APPLYING, InvalidArgument,
+      "PopulateStreamWalApplyingRecord requires APPLYING status");
+
+  auto* row_message = out->mutable_row_message();
+  row_message->set_op(RowMessage_Op_COMMIT);
+  // Existing CDCSDK consumers (e.g. the Debezium connector) parse
+  // RowMessage.transaction_id as the UUID-string form (mirrors how
+  // GetChangesForCDCSDK emits BEGIN/COMMIT records via FillBeginRecord /
+  // FillCommitRecord at cdcsdk_producer.cc:1712 / 1728). Decode the raw 16
+  // bytes carried on TransactionStatePB and re-encode as UUID-string here.
+  auto txn_id_result = FullyDecodeTransactionId(txn_state.transaction_id());
+  if (!txn_id_result.ok()) {
+    return txn_id_result.status();
+  }
+  row_message->set_transaction_id(txn_id_result->ToString());
+  if (txn_state.has_commit_hybrid_time()) {
+    row_message->set_commit_time(txn_state.commit_hybrid_time());
+  }
+  if (txn_state.has_xrepl_origin_id()) {
+    row_message->set_xrepl_origin_id(txn_state.xrepl_origin_id());
+  }
+
+  auto* op_id_pb = out->mutable_cdc_sdk_op_id();
+  SetCDCSDKOpId(
+      msg->id().term(), msg->id().index(), /*write_id=*/0, /*write_id_key=*/"",
+      op_id_pb);
+
+  if (txn_state.has_aborted()) {
+    // SubtxnSet uses a compressed delta encoding; we mirror the LW pb's set
+    // field verbatim to the regular SubtxnSetPB output so the wire payload
+    // matches the source WAL entry. Decoding back to a SubtxnSet is then the
+    // client's responsibility (matching SubtxnSet::FromPB on the producer
+    // side -- see e.g. cdcsdk_producer.cc usages).
+    //
+    // Note: the LW pb generator emits `set()` as a single accessor returning
+    // `const ArenaVector<uint32_t>&` (not the heavy-pb `set_size()` / `set(i)`
+    // pair). Range-iterate over it directly.
+    auto* aborted_pb = out->mutable_aborted_subtxn_set();
+    for (uint32_t value : txn_state.aborted().set()) {
+      aborted_pb->add_set(value);
+    }
+  }
+
+  return Status::OK();
+}
+
+Status PopulateStreamWalSplitRecord(
+    const consensus::ReplicateMsgPtr& msg,
+    CDCSDKProtoRecordPB* out) {
+  RSTATUS_DCHECK(out, InvalidArgument, "out record must be non-null");
+  RSTATUS_DCHECK(
+      msg->has_split_request(), InvalidArgument,
+      "SPLIT_OP message missing split_request");
+
+  auto* row_message = out->mutable_row_message();
+  // RowMessage has no dedicated SPLIT op; the split payload is carried on the
+  // parent CDCSDKProtoRecordPB.split_tablet_request field. We mark the
+  // RowMessage op as UNKNOWN so existing clients that only inspect row_message.op
+  // know not to interpret this record as a DML / DDL / etc.
+  row_message->set_op(RowMessage_Op_UNKNOWN);
+  row_message->set_commit_time(msg->hybrid_time());
+
+  auto* op_id_pb = out->mutable_cdc_sdk_op_id();
+  SetCDCSDKOpId(
+      msg->id().term(), msg->id().index(), /*write_id=*/0, /*write_id_key=*/"",
+      op_id_pb);
+
+  msg->split_request().ToGoogleProtobuf(out->mutable_split_tablet_request());
+  return Status::OK();
+}
+
+// Transfer all CDCSDKProtoRecordPBs from a GetChangesResponsePB scratchpad to
+// the StreamWAL output vector. Clears the scratchpad afterwards so the next op
+// starts fresh.
+void TransferDecodedRecords(
+    GetChangesResponsePB* scratchpad,
+    std::vector<CDCSDKProtoRecordPB>* out_records) {
+  for (auto& rec : *scratchpad->mutable_cdc_sdk_proto_records()) {
+    out_records->emplace_back();
+    out_records->back().Swap(&rec);
+  }
+  scratchpad->clear_cdc_sdk_proto_records();
+}
+
+// Stamp the aborted-subtxn set from a WAL APPLYING entry onto the COMMIT
+// envelope's CDCSDKProtoRecordPB.aborted_subtxn_set field. Per-row records
+// emitted from PopulateCDCSDKIntentRecord have ALREADY been filtered against
+// this set server-side; this field is preserved purely for observability /
+// debugging on the COMMIT envelope.
+void StampAbortedSubtxnSetOnCommit(
+    const consensus::ReplicateMsgPtr& applying_msg,
+    std::vector<CDCSDKProtoRecordPB>* out_records) {
+  if (out_records->empty()) {
+    return;
+  }
+  if (!applying_msg->has_transaction_state() ||
+      !applying_msg->transaction_state().has_aborted()) {
+    return;
+  }
+  auto& last = out_records->back();
+  if (!last.has_row_message() || last.row_message().op() != RowMessage_Op_COMMIT) {
+    return;
+  }
+  auto* aborted_pb = last.mutable_aborted_subtxn_set();
+  for (uint32_t value : applying_msg->transaction_state().aborted().set()) {
+    aborted_pb->add_set(value);
+  }
+}
+
+// Stamp the APPLYING op's OpId onto the leading BEGIN envelope record emitted
+// for a committed transaction. The shared decoder (FillBeginRecord) leaves the
+// BEGIN record's cdc_sdk_op_id unset -- GetChangesForCDCSDK clients do not rely
+// on it -- but the StreamWAL contract requires cdc_sdk_op_id on EVERY emitted
+// record: BEGIN/COMMIT envelope records emitted at an APPLYING op carry that
+// APPLYING's (term, index) with write_id = 0. The COMMIT is already stamped by
+// FillCommitRecord; this fills the matching gap on BEGIN without modifying the
+// shared GetChanges codepath. No-op when the leading record is not an unstamped
+// BEGIN (e.g. a spilled-APPLYING continuation batch, which does not re-emit
+// BEGIN).
+void StampOpIdOnLeadingBeginForStreamWAL(
+    const OpId& apply_op_id, std::vector<CDCSDKProtoRecordPB>* out_records) {
+  if (out_records->empty()) {
+    return;
+  }
+  auto& first = out_records->front();
+  if (!first.has_row_message() || first.row_message().op() != RowMessage_Op_BEGIN ||
+      first.has_cdc_sdk_op_id()) {
+    return;
+  }
+  SetCDCSDKOpId(
+      apply_op_id.term, apply_op_id.index, /*write_id=*/0, /*key=*/"",
+      first.mutable_cdc_sdk_op_id());
+}
+
+Status DispatchApplyingForStreamWALImpl(
+    const consensus::ReplicateMsgPtr& applying_msg,
+    StreamWalDecodeContext* ctx,
+    const StreamWalIntentResumeState* resume_state,
+    std::vector<CDCSDKProtoRecordPB>* out_records,
+    StreamWalDispatchResult* out) {
+  RSTATUS_DCHECK(out_records, InvalidArgument, "out_records must be non-null");
+  RSTATUS_DCHECK(out, InvalidArgument, "out must be non-null");
+  RSTATUS_DCHECK(
+      applying_msg->has_transaction_state(), InvalidArgument,
+      "UPDATE_TRANSACTION_OP message missing transaction_state");
+  RSTATUS_DCHECK(
+      applying_msg->transaction_state().status() == TransactionStatus::APPLYING, InvalidArgument,
+      "DispatchApplyingForStreamWAL requires APPLYING status");
+
+  out->mid_applying_resume.reset();
+
+  const auto& txn_state = applying_msg->transaction_state();
+  auto txn_id = VERIFY_RESULT(FullyDecodeTransactionId(txn_state.transaction_id()));
+
+  uint32_t xrepl_origin_id = 0;
+  if (txn_state.has_xrepl_origin_id()) {
+    xrepl_origin_id = txn_state.xrepl_origin_id();
+  }
+
+  HybridTime commit_timestamp;
+  if (txn_state.has_commit_hybrid_time()) {
+    commit_timestamp = HybridTime::FromPB(txn_state.commit_hybrid_time());
+  }
+
+  // Mirror GetChangesForCDCSDK at cdcsdk_producer.cc:2881 / 2709: re-derive
+  // aborted-subtxns from the WAL APPLYING entry on every call.
+  auto aborted_subtxns =
+      FLAGS_cdc_enable_savepoint_rollback_filtering
+          ? VERIFY_RESULT(SubtxnSet::FromPB(txn_state.aborted().set()))
+          : SubtxnSet();
+
+  // ApplyTransactionState is the docdb-level resume cursor. Empty means
+  // "start of intent scan" (BEGIN will be emitted by ProcessIntents). Non-empty
+  // means "resume one position past (key, write_id)" -- BEGIN is skipped.
+  docdb::ApplyTransactionState stream_state;
+  if (resume_state != nullptr) {
+    stream_state.key = resume_state->intent_key;
+    stream_state.write_id = resume_state->intent_write_id;
+  }
+
+  // ProcessIntents emits records into a GetChangesResponsePB scratchpad and
+  // writes the resume cursor (if it spilled) into a CDCSDKCheckpointPB out
+  // parameter. We translate both into the StreamWAL surface afterwards.
+  GetChangesResponsePB scratchpad;
+  CDCSDKCheckpointPB checkpoint;
+  ScopedTrackedConsumption consumption;
+  std::vector<docdb::IntentKeyValueForCDC> key_value_intents;
+  CDCThroughputMetrics throughput_metrics;
+
+  const OpId apply_op_id(applying_msg->id().term(), applying_msg->id().index());
+
+  auto status = ProcessIntentsWithInvalidSchemaRetry(
+      apply_op_id, txn_id, xrepl_origin_id, aborted_subtxns, *ctx->stream_metadata,
+      *ctx->enum_map, *ctx->composite_atts_map, CDCSDKRequestSource::DEBEZIUM,
+      &scratchpad, &consumption, &checkpoint, ctx->tablet_peer,
+      &key_value_intents, &stream_state, ctx->client, ctx->cached_schema_details,
+      ctx->schema_packing_storages, commit_timestamp, &throughput_metrics);
+
+  if (!status.ok()) {
+    // The "intents have been GC'd" condition surfaces as an InternalError whose
+    // message starts with "CDCSDK Trying to fetch already GCed intents" (see
+    // ProcessIntents at cdcsdk_producer.cc:1779). That guard fires whenever
+    // GetIntentsForCDC returns zero intents AND apply_op_id <=
+    // tablet->GetLatestCheckPoint(). In the checkpoint-less StreamWAL design
+    // GetLatestCheckPoint() is permanently OpId::Max(), so the guard collapses
+    // to "zero intents" -- which is ALSO true for committed transactions that
+    // have no streamable intents at all: row-lock-only txns
+    // (SELECT ... FOR UPDATE), txns whose every write was in a rolled-back
+    // savepoint, weak-intent-only txns, etc. Those are NOT data loss.
+    //
+    // Distinguish the two by probing the transaction's reverse index in
+    // IntentsDB. The apply itself never deletes intents (Tablet::ApplyIntents
+    // only writes RegularDB), so:
+    //   - reverse index empty   -> intents physically gone -> real GC error.
+    //   - reverse index present -> legitimately-empty txn  -> emit an empty
+    //     BEGIN/COMMIT envelope, exactly as GetChangesForCDCSDK does for an
+    //     empty committed transaction, and advance the cursor past the APPLYING.
+    if (status.IsInternalError() &&
+        status.message().ToBuffer().find("already GCed intents") != std::string::npos) {
+      auto tablet = VERIFY_RESULT(ctx->tablet_peer->shared_tablet());
+      const auto reverse_index_entries =
+          VERIFY_RESULT(tablet->CountTxnReverseIndexEntriesForCDC(txn_id));
+      if (reverse_index_entries == 0) {
+        return STATUS_FORMAT(
+            IllegalState,
+            "INTENTS_GC_ERROR: intents for transaction $0 at apply_op_id $1 have been "
+            "garbage-collected; underlying status: $2",
+            txn_id, apply_op_id, status);
+      }
+
+      VLOG(1) << "StreamWAL: transaction " << txn_id << " at apply_op_id " << apply_op_id
+              << " has " << reverse_index_entries << " reverse-index entries but no streamable "
+              << "intents (row locks / aborted subtxns / weak intents); emitting an empty "
+              << "BEGIN/COMMIT envelope instead of INTENTS_GC_ERROR";
+
+      GetChangesResponsePB empty_scratchpad;
+      CDCSDKCheckpointPB empty_checkpoint;
+      CDCThroughputMetrics empty_metrics;
+      if (FLAGS_cdc_populate_end_markers_transactions) {
+        FillBeginRecord(
+            txn_id, commit_timestamp.ToUint64(), xrepl_origin_id, &empty_scratchpad,
+            &empty_metrics);
+        FillCommitRecord(
+            apply_op_id, txn_id, xrepl_origin_id, commit_timestamp.ToUint64(), &empty_checkpoint,
+            &empty_scratchpad, &empty_metrics);
+        TransferDecodedRecords(&empty_scratchpad, out_records);
+        StampOpIdOnLeadingBeginForStreamWAL(apply_op_id, out_records);
+        StampAbortedSubtxnSetOnCommit(applying_msg, out_records);
+      }
+      out->kind = StreamWalDispatchResult::Kind::kRecordsEmitted;
+      return Status::OK();
+    }
+    return status;
+  }
+
+  TransferDecodedRecords(&scratchpad, out_records);
+
+  // The shared decoder leaves the BEGIN envelope record's cdc_sdk_op_id unset;
+  // the StreamWAL contract requires it. Stamp the APPLYING op's OpId here
+  // (write_id = 0). On a spilled-APPLYING continuation batch there is no BEGIN,
+  // so this is a no-op.
+  StampOpIdOnLeadingBeginForStreamWAL(apply_op_id, out_records);
+
+  // ProcessIntents indicates a spill via a non-empty checkpoint key + non-zero
+  // write_id. (Mirrors GetChangesForCDCSDK at cdcsdk_producer.cc:2728 / 2920.)
+  const bool spilled = !checkpoint.key().empty() && checkpoint.write_id() != 0;
+
+  if (spilled) {
+    StreamWalIntentResumeState resume;
+    resume.intent_key = checkpoint.key();
+    resume.intent_write_id = checkpoint.write_id();
+    out->mid_applying_resume = std::move(resume);
+    out->kind = StreamWalDispatchResult::Kind::kApplyingSpilled;
+  } else {
+    // Drained: COMMIT was emitted as the last record (assuming
+    // FLAGS_cdc_populate_end_markers_transactions is true). Decorate it with
+    // aborted_subtxn_set for the contract.
+    StampAbortedSubtxnSetOnCommit(applying_msg, out_records);
+    out->kind = StreamWalDispatchResult::Kind::kRecordsEmitted;
+  }
+
+  return Status::OK();
+}
+
+Result<StreamWalDispatchResult> DispatchWalOpForStreamWAL(
+    const consensus::ReplicateMsgPtr& msg,
+    StreamWalDecodeContext* ctx,
+    std::vector<CDCSDKProtoRecordPB>* out_records) {
+  RSTATUS_DCHECK(ctx, InvalidArgument, "ctx must be non-null");
+  RSTATUS_DCHECK(ctx->tablet_peer, InvalidArgument, "ctx->tablet_peer must be non-null");
+  RSTATUS_DCHECK(ctx->stream_metadata, InvalidArgument, "ctx->stream_metadata must be non-null");
+  RSTATUS_DCHECK(
+      ctx->cached_schema_details, InvalidArgument, "ctx->cached_schema_details must be non-null");
+  RSTATUS_DCHECK(
+      ctx->schema_packing_storages, InvalidArgument,
+      "ctx->schema_packing_storages must be non-null");
+  RSTATUS_DCHECK(ctx->enum_map, InvalidArgument, "ctx->enum_map must be non-null");
+  RSTATUS_DCHECK(
+      ctx->composite_atts_map, InvalidArgument, "ctx->composite_atts_map must be non-null");
+  RSTATUS_DCHECK(out_records, InvalidArgument, "out_records must be non-null");
+
+  auto tablet_ptr = VERIFY_RESULT(ctx->tablet_peer->shared_tablet());
+
+  StreamWalDispatchResult result;
+  CDCThroughputMetrics throughput_metrics;
+  GetChangesResponsePB scratchpad;
+
+  switch (msg->op_type()) {
+    case consensus::OperationType::WRITE_OP: {
+      const auto& batch = msg->write().write_batch();
+      if (batch.has_transaction()) {
+        // Transactional WRITE_OP: intents live in IntentsDB and will be
+        // surfaced at the matching APPLYING op via DispatchApplyingForStreamWAL.
+        // Per the StreamWAL contract, the WRITE_OP itself is dropped on the
+        // wire (silent cursor advance). See "Per-OperationType emission rules"
+        // in the contract for WRITE_OP (transactional).
+        result.kind = StreamWalDispatchResult::Kind::kSilent;
+        break;
+      }
+      RETURN_NOT_OK(PopulateCDCSDKWriteRecord(
+          msg, *ctx->stream_metadata, ctx->tablet_peer, *ctx->enum_map,
+          *ctx->composite_atts_map, CDCSDKRequestSource::DEBEZIUM,
+          ctx->cached_schema_details, ctx->schema_packing_storages,
+          &scratchpad, ctx->client, &throughput_metrics));
+      TransferDecodedRecords(&scratchpad, out_records);
+      result.kind = out_records->empty()
+                        ? StreamWalDispatchResult::Kind::kSilent
+                        : StreamWalDispatchResult::Kind::kRecordsEmitted;
+      break;
+    }
+
+    case consensus::OperationType::UPDATE_TRANSACTION_OP: {
+      if (msg->transaction_state().status() == TransactionStatus::APPLYING) {
+        // Read the txn's intents from IntentsDB and emit BEGIN + per-row DMLs
+        // + (conditional) COMMIT. May return kApplyingSpilled if the intents
+        // exceeded the per-call intent budget (FLAGS_cdc_max_stream_intent_records).
+        RETURN_NOT_OK(DispatchApplyingForStreamWALImpl(
+            msg, ctx, /*resume_state=*/nullptr, out_records, &result));
+      } else {
+        // PROMOTING and any other UPDATE_TRANSACTION_OP status: silent cursor
+        // advance, no record emitted.
+        result.kind = StreamWalDispatchResult::Kind::kSilent;
+      }
+      break;
+    }
+
+    case consensus::OperationType::CHANGE_METADATA_OP: {
+      Schema new_schema;
+      RETURN_NOT_OK(SchemaFromPB(
+          msg->change_metadata_request().schema().ToGoogleProtobuf(), &new_schema));
+
+      TableId target_table_id = tablet_ptr->metadata()->table_id();
+      TableName target_table_name = tablet_ptr->metadata()->table_name();
+      if (tablet_ptr->metadata()->colocated() &&
+          !msg->change_metadata_request().alter_table_id().empty()) {
+        auto table_info_result = tablet_ptr->metadata()->GetTableInfo(
+            msg->change_metadata_request().alter_table_id().ToBuffer());
+        if (table_info_result.ok()) {
+          target_table_id = (*table_info_result)->table_id;
+          target_table_name = (*table_info_result)->table_name;
+        }
+      }
+
+      RETURN_NOT_OK(PopulateCDCSDKDDLRecord(
+          msg, scratchpad.add_cdc_sdk_proto_records(), target_table_name, target_table_id,
+          new_schema, &throughput_metrics));
+      TransferDecodedRecords(&scratchpad, out_records);
+      result.kind = StreamWalDispatchResult::Kind::kRecordsEmitted;
+      break;
+    }
+
+    case consensus::OperationType::TRUNCATE_OP: {
+      RETURN_NOT_OK(PopulateCDCSDKTruncateRecord(
+          msg, scratchpad.add_cdc_sdk_proto_records(),
+          *tablet_ptr->schema().get(), &throughput_metrics));
+      // The CDCSDK truncate decoder does not stamp row_message.table_id; fill
+      // it here so consumers can route the record to the right Kafka topic.
+      if (scratchpad.cdc_sdk_proto_records_size() > 0) {
+        auto* rm = scratchpad.mutable_cdc_sdk_proto_records(
+                          scratchpad.cdc_sdk_proto_records_size() - 1)
+                       ->mutable_row_message();
+        if (!rm->has_table_id()) {
+          rm->set_table_id(tablet_ptr->metadata()->table_id());
+        }
+      }
+      TransferDecodedRecords(&scratchpad, out_records);
+      result.kind = StreamWalDispatchResult::Kind::kRecordsEmitted;
+      break;
+    }
+
+    case consensus::OperationType::SPLIT_OP: {
+      // Only emit SPLIT_OP for the current tablet. Other SPLIT_OPs are silent.
+      if (msg->has_split_request() &&
+          msg->split_request().tablet_id() == ctx->tablet_peer->tablet_id()) {
+        CDCSDKProtoRecordPB split_record;
+        RETURN_NOT_OK(PopulateStreamWalSplitRecord(msg, &split_record));
+        out_records->emplace_back();
+        out_records->back().Swap(&split_record);
+        result.kind = StreamWalDispatchResult::Kind::kSplitTerminal;
+      } else {
+        result.kind = StreamWalDispatchResult::Kind::kSilent;
+      }
+      break;
+    }
+
+    case consensus::OperationType::NO_OP:
+    case consensus::OperationType::UNKNOWN_OP:
+    case consensus::OperationType::CHANGE_CONFIG_OP:
+    case consensus::OperationType::SNAPSHOT_OP:
+    case consensus::OperationType::HISTORY_CUTOFF_OP:
+    case consensus::OperationType::CHANGE_AUTO_FLAGS_CONFIG_OP:
+    case consensus::OperationType::CLONE_OP:
+      // Silent cursor advance.
+      result.kind = StreamWalDispatchResult::Kind::kSilent;
+      break;
+  }
+
+  return result;
+}
+
+Status DispatchApplyingForStreamWAL(
+    const consensus::ReplicateMsgPtr& applying_msg,
+    StreamWalDecodeContext* ctx,
+    const StreamWalIntentResumeState* resume_state,
+    std::vector<CDCSDKProtoRecordPB>* out_records,
+    StreamWalDispatchResult* out) {
+  RSTATUS_DCHECK(ctx, InvalidArgument, "ctx must be non-null");
+  RSTATUS_DCHECK(ctx->tablet_peer, InvalidArgument, "ctx->tablet_peer must be non-null");
+  RSTATUS_DCHECK(ctx->stream_metadata, InvalidArgument, "ctx->stream_metadata must be non-null");
+  RSTATUS_DCHECK(
+      ctx->cached_schema_details, InvalidArgument, "ctx->cached_schema_details must be non-null");
+  RSTATUS_DCHECK(
+      ctx->schema_packing_storages, InvalidArgument,
+      "ctx->schema_packing_storages must be non-null");
+  RSTATUS_DCHECK(ctx->enum_map, InvalidArgument, "ctx->enum_map must be non-null");
+  RSTATUS_DCHECK(
+      ctx->composite_atts_map, InvalidArgument, "ctx->composite_atts_map must be non-null");
+  return DispatchApplyingForStreamWALImpl(
+      applying_msg, ctx, resume_state, out_records, out);
+}
+
+// ----------------------------------------------------------------------------
+// StreamWAL consistent-commit-order driver.
+//
+// Produces a batch of committed records in non-decreasing commit_time order,
+// gated behind the per-tablet resolution watermark, plus the composite resume
+// cursor (WAL floor + commit_ht + optional mid-APPLYING spill). It mirrors the
+// consistent branch of GetChangesForCDCSDK but emits via the StreamWAL decoder
+// dispatch and packages a StreamWalCursorPB-shaped cursor. It REUSES the
+// existing consistent-streaming helpers verbatim; it does not modify them.
+// ----------------------------------------------------------------------------
+namespace {
+
+// Find the position of the WAL op with the given (term, index) inside the
+// commit-sorted window. Returns wal_records.size() if not present.
+size_t FindOpIndexInSortedWindow(
+    const std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& wal_records,
+    const OpId& op_id) {
+  for (size_t i = 0; i < wal_records.size(); ++i) {
+    if (wal_records[i]->id().term() == op_id.term &&
+        wal_records[i]->id().index() == op_id.index) {
+      return i;
+    }
+  }
+  return wal_records.size();
+}
+
+// StreamWAL-local commit-time frontier advance.
+//
+// Mirrors the consistent branch of UpdateSafetimeForResponse, intentionally
+// WITHOUT the FLAGS_cdc_enable_consistent_records dependency: StreamWAL's
+// consistent_commit_order is a PER-REQUEST mode and must not consult the global
+// gflag. `should_advance` comes from ShouldUpdateSafeTime (the tie-group guard,
+// which is itself flag-independent and reused as-is) -- it is false when
+// advancing the frontier to this record's commit_time would split a group of
+// records sharing that commit_time. `skip_frontier` is the request cursor's
+// commit_ht (records at/below it are already delivered).
+void StreamWalAdvanceFrontier(
+    const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg, bool should_advance,
+    uint64_t skip_frontier, HybridTime* frontier) {
+  if (!should_advance) {
+    return;
+  }
+  const uint64_t commit_time = GetTransactionCommitTime(msg);
+  if (commit_time >= skip_frontier &&
+      (!frontier->is_valid() || frontier->ToUint64() < commit_time)) {
+    *frontier = HybridTime(commit_time);
+  }
+}
+
+// StreamWAL-local WAL floor advance.
+//
+// Mirrors the consistent branch of CanUpdateCheckpointOpId, intentionally
+// WITHOUT the FLAGS_cdc_enable_consistent_records dependency and WITHOUT the
+// GetChanges wal_segment_index bookkeeping. Advances `next_checkpoint_index`
+// through the WAL-ordered `all_checkpoints` past every op whose commit_time is
+// below `msg`'s (already delivered, since we walk records in commit order) or
+// whose WAL index equals `msg`'s, then pins `floor` to the last such op. The
+// floor is therefore the largest WAL op all of whose commit-time predecessors
+// have been delivered -- the safe WAL re-read point. Called for both shipped and
+// skipped (already-delivered) records, exactly as GetChangesForCDCSDK calls
+// AcknowledgeStreamedMsg in both cases.
+void StreamWalAdvanceFloor(
+    const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg, size_t* next_checkpoint_index,
+    const std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& all_checkpoints,
+    OpId* floor) {
+  const uint64_t msg_commit_time = GetTransactionCommitTime(msg);
+  while (*next_checkpoint_index < all_checkpoints.size() &&
+         ((GetTransactionCommitTime(all_checkpoints[*next_checkpoint_index]) < msg_commit_time) ||
+          (all_checkpoints[*next_checkpoint_index]->id().index() == msg->id().index()))) {
+    ++(*next_checkpoint_index);
+  }
+  if (*next_checkpoint_index > 0) {
+    const auto& cp = all_checkpoints[*next_checkpoint_index - 1];
+    *floor = OpId(cp->id().term(), cp->id().index());
+  }
+}
+
+}  // namespace
+
+Status GetConsistentChangesForStreamWAL(
+    const StreamWalConsistentInput& input,
+    StreamWalDecodeContext* ctx,
+    StreamWalConsistentOutput* output) {
+  // Mirror GetChangesForCDCSDK: free the per-call QLValuePB decode arena on exit.
+  auto scope_exit = ScopeExit([&] { docdb::DeleteMemoryContextForCDCWrapper(); });
+
+  RSTATUS_DCHECK(ctx, InvalidArgument, "ctx must be non-null");
+  RSTATUS_DCHECK(ctx->tablet_peer, InvalidArgument, "ctx->tablet_peer must be non-null");
+  RSTATUS_DCHECK(ctx->stream_metadata, InvalidArgument, "ctx->stream_metadata must be non-null");
+  RSTATUS_DCHECK(output, InvalidArgument, "output must be non-null");
+
+  auto& tablet_peer = ctx->tablet_peer;
+  auto tablet_ptr = VERIFY_RESULT(tablet_peer->shared_tablet());
+
+  // The request cursor's commit_ht is the skip frontier: every record with
+  // commit_time <= it is already delivered. It also feeds GetConsistentStreamSafeTime
+  // / GetConsistentWALRecords as their 'safe_hybrid_time_req' input. NOTE: those
+  // reused helpers, GetConsistentStreamSafeTime, SortConsistentWALRecords and
+  // ShouldUpdateSafeTime are all INDEPENDENT of FLAGS_cdc_enable_consistent_records;
+  // the floor / frontier advance (the only flag-gated logic in GetChanges) is
+  // reimplemented locally above (StreamWalAdvanceFloor / StreamWalAdvanceFrontier),
+  // so consistent_commit_order is a true per-request mode with no global-flag
+  // coupling.
+  const int64_t safe_hybrid_time_req = static_cast<int64_t>(input.commit_ht_skip);
+
+  // StreamWAL does not key memory tracking by stream id; the msgs_holder keeps
+  // the decoded messages alive for the duration of this call.
+  const MemTrackerPtr mem_tracker = nullptr;
+
+  // Default the cursor to "no progress" (round-trip the request cursor). The
+  // branches below overwrite these when the batch makes progress.
+  output->next_floor = input.floor;
+  output->next_commit_ht = input.commit_ht_skip;
+  output->mid_applying = input.resuming_spilled;
+  output->next_intent_key = input.resume_intent_key;
+  output->next_intent_write_id = input.resume_intent_write_id;
+
+  // ---- Step 1: resolution watermark W. ----
+  bool txn_load_in_progress = false;
+  uint64_t consistent_stream_safe_time = VERIFY_RESULT(GetConsistentStreamSafeTime(
+      tablet_peer, tablet_ptr, input.leader_safe_time, safe_hybrid_time_req, input.deadline,
+      &txn_load_in_progress));
+
+  if (txn_load_in_progress) {
+    // W is invalid; do not advance, do not set resolution_safe_time.
+    output->txn_load_in_progress = true;
+    output->resolution_safe_time_set = false;
+    output->has_more = false;
+    return Status::OK();
+  }
+
+  const OpId historical_max_op_id =
+      tablet_ptr->transaction_participant()
+          ? tablet_ptr->transaction_participant()->GetHistoricalMaxOpId()
+          : OpId::Invalid();
+
+  // ---- Step 2: bounded WAL read starting at the floor. ----
+  consensus::ReplicateMsgsHolder msgs_holder;
+  ScopedTrackedConsumption consumption;
+  std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>> wal_records, all_checkpoints;
+  bool wait_for_wal_update = false;
+  bool is_entire_wal_read = false;
+  HybridTime last_read_wal_op_record_time = HybridTime::kInvalid;
+  int64_t last_readable_opid_index = 0;
+  // The WAL reader returns ops strictly after last_seen_op_id. To re-fetch a
+  // spilled APPLYING (whose own op-id IS the floor) we must read from one index
+  // earlier, exactly as the WAL-order StreamWAL resume does. For a normal read
+  // the floor is the last delivered op, so reading strictly after it is correct.
+  OpId last_seen_op_id = input.resuming_spilled
+                             ? OpId(input.floor.term, std::max<int64_t>(input.floor.index - 1, 0))
+                             : input.floor;
+
+  RETURN_NOT_OK(GetConsistentWALRecords(
+      tablet_peer, mem_tracker, &msgs_holder, &consumption, &consistent_stream_safe_time,
+      historical_max_op_id, &wait_for_wal_update, &last_seen_op_id, last_readable_opid_index,
+      safe_hybrid_time_req, input.deadline, &wal_records, &all_checkpoints,
+      &last_read_wal_op_record_time, &is_entire_wal_read));
+
+  // W is valid from here on; advertise it.
+  output->resolution_safe_time = consistent_stream_safe_time;
+  output->resolution_safe_time_set = true;
+
+  if (wait_for_wal_update || wal_records.empty()) {
+    // The WAL is not yet up to date with all committed transactions (an open
+    // txn pins the watermark, or there are replicated-but-not-committed ops), or
+    // there is simply nothing to read. Return an empty, non-advancing batch.
+    // read_window_empty distinguishes "genuinely nothing in the WAL" (so a
+    // {0,0} caller can be advanced to the tip) from "waiting on a pending txn"
+    // (where the cursor must stay put).
+    output->read_window_empty = !wait_for_wal_update;
+    output->has_more = false;
+    return Status::OK();
+  }
+
+  // No snapshot concept in StreamWAL: the skip threshold is exactly the request
+  // frontier (GetCommitTimeThreshold(nullopt, req) would return the same value).
+  const uint64_t commit_time_threshold = input.commit_ht_skip;
+
+  // Composite-cursor bookkeeping, computed via the StreamWAL-local advance
+  // helpers (no global-flag dependency, no GetChanges wal_segment_index).
+  //   cursor_floor  -> next_op_id.{term,index} (the WAL re-read point)
+  //   frontier      -> the highest commit_time C such that every record with
+  //                    commit_time <= C has been delivered (a clean tie boundary)
+  OpId cursor_floor = input.floor;
+  size_t next_checkpoint_index = 0;
+  HybridTime frontier = HybridTime::kInvalid;
+
+  uint64_t current_bytes = 0;
+  bool broke_on_size_cap = false;
+  bool stopped_on_watermark = false;
+  bool pending_spill = false;
+  OpId spill_op_id;
+  StreamWalIntentResumeState spill_state;
+
+  // ---- Mid-APPLYING spill resume. ----
+  // The floor points at an UPDATE_TRANSACTION_OP { APPLYING } whose intents did
+  // not fit in a prior batch. Resume only that transaction (mirrors the
+  // GetChangesForCDCSDK partial-txn branch); the next call's normal loop picks
+  // up subsequent records.
+  if (input.resuming_spilled) {
+    const size_t applying_idx = FindOpIndexInSortedWindow(wal_records, input.floor);
+    if (applying_idx == wal_records.size()) {
+      // The APPLYING is not in the read window yet (e.g. the WAL was trimmed to
+      // a later segment). Treat as no-progress so the client retries.
+      output->has_more = false;
+      return Status::OK();
+    }
+    const auto& applying_msg = wal_records[applying_idx];
+    RSTATUS_DCHECK(
+        IsUpdateTransactionOp(applying_msg) &&
+            applying_msg->transaction_state().status() == TransactionStatus::APPLYING,
+        InvalidArgument,
+        Format(
+            "StreamWAL consistent resume: op at floor $0 is not an APPLYING", input.floor));
+
+    StreamWalIntentResumeState resume_state;
+    resume_state.intent_key = input.resume_intent_key;
+    resume_state.intent_write_id = input.resume_intent_write_id;
+
+    std::vector<CDCSDKProtoRecordPB> emitted;
+    StreamWalDispatchResult dispatch_result;
+    RETURN_NOT_OK(DispatchApplyingForStreamWAL(
+        applying_msg, ctx, &resume_state, &emitted, &dispatch_result));
+    for (auto& rec : emitted) {
+      output->records.emplace_back();
+      output->records.back().Swap(&rec);
+    }
+
+    if (dispatch_result.kind == StreamWalDispatchResult::Kind::kApplyingSpilled) {
+      // Still spilling: cursor stays at the APPLYING, commit_ht unchanged.
+      output->mid_applying = true;
+      output->next_floor = input.floor;
+      DCHECK(dispatch_result.mid_applying_resume.has_value());
+      output->next_intent_key = dispatch_result.mid_applying_resume->intent_key;
+      output->next_intent_write_id = dispatch_result.mid_applying_resume->intent_write_id;
+      output->next_commit_ht = input.commit_ht_skip;
+      output->has_more = true;
+      return Status::OK();
+    }
+
+    // Drained. Advance the floor to the APPLYING op and the commit-time frontier
+    // past the transaction's commit_time -- but only if no other record in the
+    // window shares that commit_time (ShouldUpdateSafeTime guards the tie group).
+    output->mid_applying = false;
+    output->next_intent_key.clear();
+    output->next_intent_write_id = 0;
+    output->next_floor = OpId(input.floor.term, input.floor.index);
+    if (ShouldUpdateSafeTime(wal_records, applying_idx)) {
+      output->next_commit_ht =
+          std::max<uint64_t>(input.commit_ht_skip, GetTransactionCommitTime(applying_msg));
+    } else {
+      output->next_commit_ht = input.commit_ht_skip;
+    }
+    // More records very likely remain immediately after the resumed txn.
+    output->has_more = true;
+    return Status::OK();
+  }
+
+  // ---- Normal commit-ordered loop over the sorted window. ----
+  for (size_t index = 0; index < wal_records.size(); ++index) {
+    // Soft batch caps. The first record always ships (current_bytes starts 0,
+    // records starts empty), so a single oversized record is never truncated.
+    if (output->records.size() >= input.max_records || current_bytes >= input.max_bytes) {
+      broke_on_size_cap = true;
+      break;
+    }
+
+    const auto& msg = wal_records[index];
+    const uint64_t msg_commit_time = GetTransactionCommitTime(msg);
+
+    // Skip records already delivered (<= the request frontier), except SPLIT_OP
+    // which can carry a commit_time below the frontier yet still needs to be
+    // reported. Mirrors GetChangesForCDCSDK's commit_time_threshold skip. The
+    // floor still advances past the skipped op (so we don't re-read it).
+    if (msg_commit_time <= commit_time_threshold &&
+        msg->op_type() != consensus::OperationType::SPLIT_OP) {
+      // Already delivered: advance the floor past it (so we don't re-read it),
+      // but do NOT advance the frontier (it is already covered by commit_ht_skip).
+      StreamWalAdvanceFloor(msg, &next_checkpoint_index, all_checkpoints, &cursor_floor);
+      continue;
+    }
+
+    // Stop at the first record above the watermark; it is not yet safe to ship.
+    if (msg_commit_time > consistent_stream_safe_time) {
+      stopped_on_watermark = true;
+      break;
+    }
+
+    std::vector<CDCSDKProtoRecordPB> emitted;
+    auto dispatch_or = DispatchWalOpForStreamWAL(msg, ctx, &emitted);
+    RETURN_NOT_OK(dispatch_or);
+    const StreamWalDispatchResult dispatch_result = *dispatch_or;
+
+    for (auto& rec : emitted) {
+      current_bytes += rec.ByteSizeLong();
+      output->records.emplace_back();
+      output->records.back().Swap(&rec);
+    }
+
+    if (dispatch_result.kind == StreamWalDispatchResult::Kind::kApplyingSpilled) {
+      // The transaction's intents did not fit in this batch. Do not advance the
+      // floor or commit_ht past it; the cursor pins to this APPLYING.
+      pending_spill = true;
+      spill_op_id = OpId(msg->id().term(), msg->id().index());
+      DCHECK(dispatch_result.mid_applying_resume.has_value());
+      spill_state = *dispatch_result.mid_applying_resume;
+      break;
+    }
+
+    if (dispatch_result.kind == StreamWalDispatchResult::Kind::kSplitTerminal) {
+      // SPLIT_OP for this tablet: terminal record. Advance the floor past it so
+      // the next call observes TABLET_DATA_SPLIT_COMPLETED and returns
+      // TABLET_SPLIT.
+      StreamWalAdvanceFrontier(
+          msg, ShouldUpdateSafeTime(wal_records, index), input.commit_ht_skip, &frontier);
+      StreamWalAdvanceFloor(msg, &next_checkpoint_index, all_checkpoints, &cursor_floor);
+      output->saw_split = true;
+      break;
+    }
+
+    // Normal record(s): advance the floor + commit-time frontier in commit order.
+    // ShouldUpdateSafeTime gates the frontier so it never lands inside a group of
+    // records sharing one commit_time (a multi-shard txn or a same-time tie).
+    StreamWalAdvanceFrontier(
+        msg, ShouldUpdateSafeTime(wal_records, index), input.commit_ht_skip, &frontier);
+    StreamWalAdvanceFloor(msg, &next_checkpoint_index, all_checkpoints, &cursor_floor);
+  }
+
+  // ---- Build the composite cursor. ----
+  if (pending_spill) {
+    output->mid_applying = true;
+    output->next_floor = spill_op_id;
+    output->next_intent_key = spill_state.intent_key;
+    output->next_intent_write_id = spill_state.intent_write_id;
+    // commit_ht stays at the request frontier until the txn's COMMIT ships.
+    output->next_commit_ht = input.commit_ht_skip;
+    output->has_more = true;
+    return Status::OK();
+  }
+
+  output->mid_applying = false;
+  output->next_intent_key.clear();
+  output->next_intent_write_id = 0;
+  // cursor_floor advanced in-place via StreamWalAdvanceFloor (or stayed at
+  // input.floor if nothing was consumed).
+  output->next_floor = cursor_floor;
+
+  // Commit-time frontier:
+  //   - frontier valid  -> the last clean tie-group boundary we shipped up to.
+  //   - frontier invalid && we did NOT stop on a size cap -> we
+  //     drained/skipped everything <= W cleanly, so advance to W.
+  //   - frontier invalid && we DID stop on a size cap -> we shipped a partial
+  //     same-commit_time group with no clean boundary yet; do NOT advance past
+  //     the request frontier (the remainder is re-shipped next call). This is
+  //     stricter than GetChanges' GetCDCSDKSafeTimeForTarget, which would
+  //     unconditionally fall back to W and risk skipping the undelivered tail.
+  if (frontier.is_valid()) {
+    output->next_commit_ht = std::max<uint64_t>(input.commit_ht_skip, frontier.ToUint64());
+  } else if (!broke_on_size_cap) {
+    output->next_commit_ht = std::max<uint64_t>(input.commit_ht_skip, consistent_stream_safe_time);
+  } else {
+    output->next_commit_ht = input.commit_ht_skip;
+  }
+
+  output->stopped_on_watermark = stopped_on_watermark;
+  output->has_more = broke_on_size_cap;
+  return Status::OK();
+}
+
 } // namespace yb::cdc

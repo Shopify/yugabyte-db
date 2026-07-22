@@ -466,7 +466,12 @@ public class TabletClient extends ReplayingDecoder<Void> {
       }
       else if (decoded.getSecond() instanceof CdcService.CDCErrorPB) {
         CdcService.CDCErrorPB error = (CdcService.CDCErrorPB) decoded.getSecond();
-        exception = dispatchCDCErrorOrReturnException(rpc, error);
+        // We pass the full decoded response (decoded.getFirst()) alongside the error so the
+        // dispatch function can read response-level fields like tablet_consensus_info on the
+        // LEADER_NOT_READY branch. The TS / Master sibling dispatch functions don't need this
+        // because their hint-equivalents (NOT_THE_LEADER + the existing demote-walk) work off
+        // the error envelope alone.
+        exception = dispatchCDCErrorOrReturnException(rpc, error, decoded.getFirst());
         if (exception == null) {
           // It was taken care of.
           return;
@@ -528,17 +533,77 @@ public class TabletClient extends ReplayingDecoder<Void> {
     return null;
   }
 
+  /**
+   * Refresh the meta-cache's leader pointer for the tablet targeted by {@code rpc} from a
+   * {@link StreamWalResponse}'s {@code tablet_consensus_info} hint, if present. No-op when
+   * the hint is missing, the response isn't a StreamWAL response, or the RPC isn't a
+   * {@link StreamWalRequest}. See {@link AsyncYBClient#refreshTabletLeaderFromConsensus} for
+   * the full contract.
+   *
+   * <p>Per the CDC StreamWAL contract (see {@code FillTabletConsensusInfo} in
+   * {@code cdc_service.cc}) the server populates {@code tablet_consensus_info} only on
+   * {@code LEADER_NOT_READY} responses, so callers should invoke this only from that branch
+   * of {@link #dispatchCDCErrorOrReturnException}.
+   */
+  private void maybeApplyConsensusHint(YRpc<?> rpc, Object response) {
+    if (rpc instanceof StreamWalRequest && response instanceof StreamWalResponse) {
+      StreamWalResponse resp = (StreamWalResponse) response;
+      if (resp.hasTabletConsensusInfo()) {
+        String tabletId = ((StreamWalRequest) rpc).getTabletId();
+        boolean applied = ybClient.refreshTabletLeaderFromConsensus(
+            tabletId, resp.getTabletConsensusInfo());
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("StreamWAL tablet={} consensus hint apply={} (hinted leader_uuid={})",
+              tabletId, applied,
+              resp.getTabletConsensusInfo().getConsensusState().getLeaderUuid());
+        }
+      }
+    }
+  }
+
+  /**
+   * Dispatch a CDC error envelope.
+   *
+   * <p>{@code response} is the full decoded response object (a {@link StreamWalResponse} or a
+   * {@code GetChangesResponse}, typically) and is consulted only on the {@code LEADER_NOT_READY}
+   * branch to apply a {@code tablet_consensus_info} hint to the meta-cache before handing off
+   * to {@link AsyncYBClient#handleNotLeader}. Other branches do not read {@code response};
+   * keeping the parameter on the signature avoids a second visitor pass.
+   */
   private Exception dispatchCDCErrorOrReturnException(YRpc rpc,
-                                                     CdcService.CDCErrorPB error) {
+                                                     CdcService.CDCErrorPB error,
+                                                     Object response) {
     WireProtocol.AppStatusPB.ErrorCode code = error.getStatus().getCode();
     CDCErrorException ex = new CDCErrorException(uuid, error);
-    if (error.getCode() == CdcService.CDCErrorPB.Code.TABLET_NOT_RUNNING ||
-      error.getCode() == CdcService.CDCErrorPB.Code.LEADER_NOT_READY ||
-      error.getCode() == CdcService.CDCErrorPB.Code.NOT_LEADER ||
-      error.getCode() == CdcService.CDCErrorPB.Code.NOT_RUNNING) {
-      // rpc.deadlineTracker.reset();
+    // CDC error codes that must NEVER be retried at the yb-client RPC layer. These represent
+    // either bugs (INVALID_REQUEST), terminal conditions on the tablet (TABLET_SPLIT,
+    // OPERATION_DISALLOWED), or unrecoverable data loss (CHECKPOINT_TOO_OLD,
+    // INTENTS_GC_ERROR). The status-code-driven branches below would otherwise treat the
+    // ILLEGAL_STATE inner status these errors carry as "not leader, retry" -- spending the
+    // whole RPC deadline looping. Fail fast and let the caller decide.
+    if (error.getCode() == CdcService.CDCErrorPB.Code.INTENTS_GC_ERROR ||
+        error.getCode() == CdcService.CDCErrorPB.Code.CHECKPOINT_TOO_OLD ||
+        error.getCode() == CdcService.CDCErrorPB.Code.INVALID_REQUEST ||
+        error.getCode() == CdcService.CDCErrorPB.Code.TABLET_SPLIT ||
+        error.getCode() == CdcService.CDCErrorPB.Code.OPERATION_DISALLOWED ||
+        error.getCode() == CdcService.CDCErrorPB.Code.AUTO_FLAGS_CONFIG_VERSION_MISMATCH) {
+      return ex;
+    }
+    if (error.getCode() == CdcService.CDCErrorPB.Code.LEADER_NOT_READY) {
+      // Server contract: tablet_consensus_info is populated only on this code, and only when
+      // the responding peer is a follower that knows who the actual leader is. Refresh the
+      // meta-cache from the hint before handing off to handleNotLeader; its demoteLeader call
+      // then sees leaderIndex already pointing at the new leader and is a no-op, and the
+      // retry scheduled by handleRetryableError goes straight to the correct peer.
+      maybeApplyConsensusHint(rpc, response);
       ybClient.handleNotLeader(rpc, ex, this);
       // we're not calling rpc.callback() so we rely on the client to retry that RPC
+    } else if (error.getCode() == CdcService.CDCErrorPB.Code.TABLET_NOT_RUNNING ||
+      error.getCode() == CdcService.CDCErrorPB.Code.NOT_LEADER ||
+      error.getCode() == CdcService.CDCErrorPB.Code.NOT_RUNNING) {
+      // Same demote-walk recovery as LEADER_NOT_READY, but no consensus hint is ever attached
+      // to these codes server-side. handleNotLeader walks tabletServers linearly.
+      ybClient.handleNotLeader(rpc, ex, this);
     } else if (code == WireProtocol.AppStatusPB.ErrorCode.SERVICE_UNAVAILABLE ||
       code == WireProtocol.AppStatusPB.ErrorCode.IO_ERROR ||
       code == WireProtocol.AppStatusPB.ErrorCode.LEADER_NOT_READY_TO_SERVE ||

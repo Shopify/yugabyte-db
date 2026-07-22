@@ -358,6 +358,13 @@ class Tablet : public AbstractTablet,
       std::vector<docdb::IntentKeyValueForCDC>* keyValueIntents,
       docdb::ApplyTransactionState* stream_state);
 
+  // Returns the number of per-write reverse-index entries for `id` currently in
+  // IntentsDB (excludes txn metadata / post-apply metadata). Used by the
+  // StreamWAL APPLYING path to distinguish a transaction whose intents were
+  // garbage-collected (returns 0) from one that legitimately has no streamable
+  // intents (returns > 0). See docdb::CountTxnReverseIndexEntriesForCDC.
+  Result<size_t> CountTxnReverseIndexEntriesForCDC(const TransactionId& id);
+
   // Apply all of the row operations associated with this transaction.
   //
   // `apply_to_storages` selects which storages this write is materialized into -- the regular

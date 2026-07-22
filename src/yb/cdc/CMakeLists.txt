@@ -120,5 +120,6 @@ ADD_YB_LIBRARY(
          yrpc server_common server_process tablet yb_util ql_util gutil yb_client yb_pgwrapper)
 
 # Tests
-set(YB_TEST_LINK_LIBS integration-tests ${YB_MIN_TEST_LIBS})
+set(YB_TEST_LINK_LIBS integration-tests pg_wrapper_test_base ${YB_MIN_TEST_LIBS})
 ADD_YB_TEST(xcluster_producer-test)
+ADD_YB_TEST(stream_wal-test)

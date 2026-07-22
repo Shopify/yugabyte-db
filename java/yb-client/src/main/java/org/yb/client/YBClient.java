@@ -2000,6 +2000,70 @@ public class YBClient implements AutoCloseable {
     return d.join(2 * getDefaultAdminOperationTimeoutMs());
   }
 
+  /**
+   * Synchronous wrapper for {@link AsyncYBClient#streamWAL}.
+   *
+   * <p>Blocks for at most {@code 2 * defaultOperationTimeout + deadlineMs} — covers the server's
+   * long-poll budget plus headroom for the client-side network round-trip.
+   *
+   * @see AsyncYBClient#streamWAL(YBTable, String, long, long, int, long, int)
+   */
+  public StreamWalResponse streamWAL(
+      YBTable table,
+      String tabletId,
+      long fromTerm,
+      long fromIndex,
+      int maxRecords,
+      long maxBytes,
+      int deadlineMs) throws Exception {
+    return streamWAL(table, tabletId, fromTerm, fromIndex, /*fromIntentKey=*/ null,
+        /*fromIntentWriteId=*/ null, maxRecords, maxBytes, deadlineMs);
+  }
+
+  /**
+   * Synchronous wrapper for {@link AsyncYBClient#streamWAL} that exposes the mid-APPLYING
+   * resume fields. Use this overload when the prior batch returned a partial-APPLYING cursor
+   * (i.e. {@link StreamWalResponse#nextOpIdIsMidApplying()} was {@code true}).
+   */
+  public StreamWalResponse streamWAL(
+      YBTable table,
+      String tabletId,
+      long fromTerm,
+      long fromIndex,
+      com.google.protobuf.ByteString fromIntentKey,
+      Integer fromIntentWriteId,
+      int maxRecords,
+      long maxBytes,
+      int deadlineMs) throws Exception {
+    return streamWAL(table, tabletId, fromTerm, fromIndex, fromIntentKey, fromIntentWriteId,
+        /*consistentCommitOrder=*/ false, /*fromCommitHt=*/ null, maxRecords, maxBytes, deadlineMs);
+  }
+
+  /**
+   * Synchronous wrapper for {@link AsyncYBClient#streamWAL} exposing the per-request
+   * consistent-commit-order mode and the commit-time frontier. See the async overload for
+   * semantics. {@code consistentCommitOrder=false} + {@code fromCommitHt=null} reproduces the
+   * WAL-order behavior exactly.
+   */
+  public StreamWalResponse streamWAL(
+      YBTable table,
+      String tabletId,
+      long fromTerm,
+      long fromIndex,
+      com.google.protobuf.ByteString fromIntentKey,
+      Integer fromIntentWriteId,
+      boolean consistentCommitOrder,
+      Long fromCommitHt,
+      int maxRecords,
+      long maxBytes,
+      int deadlineMs) throws Exception {
+    Deferred<StreamWalResponse> d =
+        asyncClient.streamWAL(table, tabletId, fromTerm, fromIndex,
+            fromIntentKey, fromIntentWriteId, consistentCommitOrder, fromCommitHt,
+            maxRecords, maxBytes, deadlineMs);
+    return d.join(2 * getDefaultOperationTimeoutMs() + Math.max(0, deadlineMs));
+  }
+
   public GetDBStreamInfoResponse getDBStreamInfo(String streamId) throws Exception {
     Deferred<GetDBStreamInfoResponse> d = asyncClient.getDBStreamInfo(streamId);
     return d.join(2 * getDefaultAdminOperationTimeoutMs());

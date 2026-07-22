@@ -174,6 +174,13 @@ class CDCServiceImpl : public CDCServiceIf {
       const ListTabletsRequestPB* req, ListTabletsResponsePB* resp, rpc::RpcContext rpc) override;
   void GetChanges(
       const GetChangesRequestPB* req, GetChangesResponsePB* resp, rpc::RpcContext rpc) override;
+
+  // StreamWAL: per-tablet, leader-only WAL pull RPC for the new stream-id-less
+  // CDC architecture. See StreamWAL data contract for details.
+  void StreamWAL(
+      const StreamWalRequestPB* req,
+      StreamWalResponsePB* resp,
+      rpc::RpcContext rpc) override;
   bool IsReplicationPausedForStream(const std::string& stream_id) const EXCLUDES(mutex_);
   void GetCheckpoint(
       const GetCheckpointRequestPB* req,
@@ -358,6 +365,20 @@ class CDCServiceImpl : public CDCServiceIf {
   }
 
  private:
+  // Consistent-commit-order branch of StreamWAL (request.consistent_commit_order
+  // == true). Handles bootstrap / skip-to-latest, drives
+  // cdc::GetConsistentChangesForStreamWAL, and packages the response. The
+  // default (WAL-order) StreamWAL path is left byte-for-byte unchanged; the
+  // public StreamWAL handler simply forks here and returns when the flag is set.
+  void HandleStreamWALConsistentCommitOrder(
+      const StreamWalRequestPB* req,
+      StreamWalResponsePB* resp,
+      rpc::RpcContext* context,
+      const std::shared_ptr<tablet::TabletPeer>& tablet_peer,
+      const tablet::TabletPtr& tablet_ptr,
+      const OpId& leader_tip_op_id,
+      HybridTime leader_safe_time);
+
   friend class XClusterProducerBootstrap;
   friend class CDCSDKVirtualWAL;
   FRIEND_TEST(CDCServiceTest, TestMetricsOnDeletedReplication);
