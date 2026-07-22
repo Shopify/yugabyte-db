@@ -326,6 +326,58 @@ message WriteSysCatalogEntryResponsePB {
   optional MasterErrorPB error = 1;
 }
 
+// Online schema change migration tracking (see
+// architecture/design/online-schema-changes-async-shadow-roadmap.md Section 0).
+
+message StartSchemaMigrationRequestPB {
+  optional SysSchemaMigrationEntryPB.Kind kind = 1;
+  optional uint32 database_oid = 2;
+  optional uint32 table_oid = 3;
+  optional uint32 submitted_by = 4;
+  optional string submitted_ddl = 5;
+  // Optional client idempotency token, distinct from the returned migration id.
+  optional bytes request_id = 6;
+}
+
+message StartSchemaMigrationResponsePB {
+  optional MasterErrorPB error = 1;
+  // Server-generated migration id (a UUID string).
+  optional bytes migration_id = 2;
+}
+
+// Wraps a single migration job for status responses.
+message SchemaMigrationInfoPB {
+  optional bytes migration_id = 1;
+  optional SysSchemaMigrationEntryPB entry = 2;
+}
+
+message GetSchemaMigrationRequestPB {
+  optional bytes migration_id = 1;
+}
+
+message GetSchemaMigrationResponsePB {
+  optional MasterErrorPB error = 1;
+  optional SchemaMigrationInfoPB migration = 2;
+}
+
+message ListSchemaMigrationsRequestPB {
+  // Optional state filter.
+  optional SysSchemaMigrationEntryPB.State state = 1;
+}
+
+message ListSchemaMigrationsResponsePB {
+  optional MasterErrorPB error = 1;
+  repeated SchemaMigrationInfoPB migrations = 2;
+}
+
+message CancelSchemaMigrationRequestPB {
+  optional bytes migration_id = 1;
+}
+
+message CancelSchemaMigrationResponsePB {
+  optional MasterErrorPB error = 1;
+}
+
 service MasterAdmin {
   option (yb.rpc.custom_service_name) = "yb.master.MasterService";
 
@@ -386,4 +438,13 @@ service MasterAdmin {
       returns (DumpSysCatalogEntriesResponsePB);
   rpc WriteSysCatalogEntry(WriteSysCatalogEntryRequestPB)
       returns (WriteSysCatalogEntryResponsePB);
+
+  rpc StartSchemaMigration(StartSchemaMigrationRequestPB)
+      returns (StartSchemaMigrationResponsePB);
+  rpc GetSchemaMigration(GetSchemaMigrationRequestPB)
+      returns (GetSchemaMigrationResponsePB);
+  rpc ListSchemaMigrations(ListSchemaMigrationsRequestPB)
+      returns (ListSchemaMigrationsResponsePB);
+  rpc CancelSchemaMigration(CancelSchemaMigrationRequestPB)
+      returns (CancelSchemaMigrationResponsePB);
 }

@@ -17,6 +17,7 @@
 #include "yb/master/master_service.h"
 #include "yb/master/master_service_base.h"
 #include "yb/master/master_service_base-internal.h"
+#include "yb/master/schema_migration/schema_migration_manager.h"
 #include "yb/master/tablet_split_manager.h"
 #include "yb/master/test_async_rpc_manager.h"
 #include "yb/master/ts_descriptor.h"
@@ -71,6 +72,76 @@ class MasterAdminServiceImpl : public MasterServiceBase, public MasterAdminIf {
       return;
     }
     auto s = server_->catalog_manager_impl()->WriteSysCatalogEntry(req, resp, &rpc);
+    CheckRespErrorOrSetUnknown(s, resp);
+    rpc.RespondSuccess();
+  }
+
+  void StartSchemaMigration(
+      const StartSchemaMigrationRequestPB* req, StartSchemaMigrationResponsePB* resp,
+      rpc::RpcContext rpc) override {
+    SCOPED_LEADER_SHARED_LOCK(l, server_->catalog_manager_impl());
+    if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, &rpc)) {
+      return;
+    }
+    auto result = server_->schema_migration_manager().StartSchemaMigration(
+        req->kind(), req->database_oid(), req->table_oid(), req->submitted_by(),
+        req->submitted_ddl(), req->request_id(), l.epoch());
+    if (!result.ok()) {
+      CheckRespErrorOrSetUnknown(result.status(), resp);
+      rpc.RespondSuccess();
+      return;
+    }
+    resp->set_migration_id(*result);
+    rpc.RespondSuccess();
+  }
+
+  void GetSchemaMigration(
+      const GetSchemaMigrationRequestPB* req, GetSchemaMigrationResponsePB* resp,
+      rpc::RpcContext rpc) override {
+    SCOPED_LEADER_SHARED_LOCK(l, server_->catalog_manager_impl());
+    if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, &rpc)) {
+      return;
+    }
+    auto result = server_->schema_migration_manager().GetSchemaMigration(req->migration_id());
+    if (!result.ok()) {
+      CheckRespErrorOrSetUnknown(result.status(), resp);
+      rpc.RespondSuccess();
+      return;
+    }
+    auto* migration = resp->mutable_migration();
+    migration->set_migration_id(req->migration_id());
+    *migration->mutable_entry() = std::move(*result);
+    rpc.RespondSuccess();
+  }
+
+  void ListSchemaMigrations(
+      const ListSchemaMigrationsRequestPB* req, ListSchemaMigrationsResponsePB* resp,
+      rpc::RpcContext rpc) override {
+    SCOPED_LEADER_SHARED_LOCK(l, server_->catalog_manager_impl());
+    if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, &rpc)) {
+      return;
+    }
+    std::optional<SysSchemaMigrationEntryPB::State> filter;
+    if (req->has_state()) {
+      filter = req->state();
+    }
+    for (auto& [id, entry] : server_->schema_migration_manager().ListSchemaMigrations(filter)) {
+      auto* migration = resp->add_migrations();
+      migration->set_migration_id(id);
+      *migration->mutable_entry() = std::move(entry);
+    }
+    rpc.RespondSuccess();
+  }
+
+  void CancelSchemaMigration(
+      const CancelSchemaMigrationRequestPB* req, CancelSchemaMigrationResponsePB* resp,
+      rpc::RpcContext rpc) override {
+    SCOPED_LEADER_SHARED_LOCK(l, server_->catalog_manager_impl());
+    if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, &rpc)) {
+      return;
+    }
+    auto s = server_->schema_migration_manager().CancelSchemaMigration(
+        req->migration_id(), l.epoch());
     CheckRespErrorOrSetUnknown(s, resp);
     rpc.RespondSuccess();
   }
