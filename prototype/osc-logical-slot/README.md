@@ -66,6 +66,23 @@ This validates exactly-once EFFECT on top of at-least-once transport: the
 `(slot, xid)` ledger committed in the same target transaction as the mutations
 survives an applier restart mid-stream.
 
+`mirror_harness_barrier.sh` (Step 3: real barrier drain, no sleep): PASS.
+A continuous background writer mutates the source (produced a ~212-row tail in a
+run). To finalize, the harness takes `ACCESS EXCLUSIVE` on the source (fences
+new writes), inserts a unique BARRIER sentinel row, then drains the slot and
+applies it, polling until the sentinel's TRANSFORMED row appears in the shadow.
+That sentinel visibility is the deterministic "mirror caught up" signal that
+replaces the earlier fixed `sleep`. After cutover, parity is exact including the
+full writer tail (2212 == 2212, 0 missing/extra, 0 ledger dupes).
+
+Notes from building Step 3:
+- Do NOT spawn many short-lived `pg_recvlogical` consumers in a tight loop; each
+  leaves the slot `active` for a lease window and the next start captures
+  nothing. Drain once after the barrier (the slot retains all unacked history);
+  a small bounded retry only rides out a transient slot-active window.
+- The transform `new_id = id*2` must target a `bigint` column and cast
+  (`id::bigint*2`); doubling a large `int` source id overflows `int4`.
+
 ## Validated primitives
 
 - `wal_level = logical`; slots via `pg_create_logical_replication_slot`.
@@ -79,7 +96,8 @@ survives an applier restart mid-stream.
   switch itself is validated separately in-tree by
   `src/yb/yql/pgwrapper/pg_online_schema_change-test.cc` (roadmap Step 1);
   wiring it as the harness cutover is future work.
-- Drain is a fixed sleep, not a "mirror applied through barrier F" check.
+- Drain: `mirror_harness_barrier.sh` (Step 3) uses a real sentinel-based
+  caught-up check. The earlier harnesses still use a fixed sleep for brevity.
 - Idempotency ledger keys on source `xid` (from test_decoding) rather than a
   commit LSN, because the SQL query API (`pg_logical_slot_get_changes`) that
   exposes LSN is gated behind a preview flag that did not take effect in this
@@ -100,6 +118,9 @@ timeout), so slot drop needs retry-with-backoff. The harness handles this in
   multi-row cross-tablet txns; asserts fan-out + atomicity + parity.
 - `mirror_harness_restart.sh` - Step 2: kills the applier mid-stream and
   restarts; asserts exactly-once effect (ledger dedupe) + parity.
+- `mirror_harness_barrier.sh` - Step 3: continuous background writer + real
+  sentinel-based barrier drain (no sleep); asserts the write tail is caught and
+  parity is exact.
 - `apply_changes.py`          - parses `test_decoding` output into shadow apply
   SQL, preserving source BEGIN/COMMIT framing into atomic target transactions.
 - `streaming_applier.py`      - Step 2 applier: per-source-xid target

@@ -92,12 +92,30 @@ that did not take effect in this environment; `(slot, xid)` is sufficient for
 the exactly-once demonstration. A production applier should prefer the durable
 slot LSN / restart_lsn once the query API or a native consumer is available.
 
-## Step 3 (third PR): master-owned job + real barrier/drain
+## Step 3 (PARTIAL): real barrier drain (done); master-owned job (todo)
 
-- A `SysOnlineSchemaChangeJobPB`-style entity (state machine from the roadmap).
-- Real "mirror applied through barrier F" check replacing the sleep: per-source-
-  tablet resolved-HT vector, not a single LSN.
-- Wire Step 1 switch as the job's cutover action under a short object lock.
+Done in the SQL harness (`mirror_harness_barrier.sh`):
+- Real caught-up check replacing the fixed sleep: fence source with ACCESS
+  EXCLUSIVE, insert a unique sentinel, drain until the sentinel's transformed
+  row is visible in the shadow. Validated under a continuous background writer;
+  parity exact including the full write tail.
+
+Still todo (needs backend work, not a SQL harness):
+- A `SysOnlineSchemaChangeJobPB`-style master-owned entity + state machine.
+- Replace the sentinel with a per-source-tablet resolved-HybridTime barrier
+  vector (the real distributed "applied through F" signal).
+- Wire the Step 1 OID-preserving switch as the job's cutover action under a
+  short distributed object lock, driven from an externally-built caught-up
+  shadow (the seam at tablecmds.c:6390-6409 that currently does an inline
+  snapshot copy).
+
+## Known prototype constraints discovered while building
+- Logical-slot query API (LSN-exposing SQL functions) is gated behind a preview
+  flag that did not take effect here; used pg_recvlogical + xid.
+- Repeatedly spawning short-lived pg_recvlogical consumers collides on the slot
+  lease; drain once after the barrier instead.
+- The doubling transform requires a bigint target key + cast to avoid int4
+  overflow on large source ids.
 
 ## Sequencing rationale
 

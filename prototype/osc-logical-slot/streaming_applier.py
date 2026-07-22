@@ -60,7 +60,9 @@ def sql_text(raw):
 
 
 def tkey(id_token):
-    return "NULL" if id_token is None else "((%s) * 2)" % id_token
+    # new_id = id*2 in bigint space (source id can be large; doubling an int can
+    # overflow int4, so compute and store as bigint).
+    return "NULL" if id_token is None else "((%s)::bigint * 2)" % id_token
 
 
 def upsert(shadow, cols):
