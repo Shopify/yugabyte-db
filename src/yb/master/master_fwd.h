@@ -55,6 +55,7 @@ class CatalogManagerBgTasks;
 class CdcsdkManager;
 class CdcsdkManagerIf;
 class CloneStateManager;
+class SchemaMigrationManager;
 class XClusterRpcTasks;
 class ClusterConfigInfo;
 class ClusterLoadBalancer;
@@ -115,6 +116,9 @@ using AsyncTabletSnapshotOpPtr = std::shared_ptr<AsyncTabletSnapshotOp>;
 
 class CloneStateInfo;
 using CloneStateInfoPtr = std::shared_ptr<CloneStateInfo>;
+
+class SchemaMigrationInfo;
+using SchemaMigrationInfoPtr = std::shared_ptr<SchemaMigrationInfo>;
 
 class NamespaceInfo;
 using NamespaceInfoPtr = scoped_refptr<NamespaceInfo>;
