@@ -32,6 +32,35 @@ preserves the table's logical PostgreSQL identity.
   backup, incremental backup, PITR, partitioned and geo-partitioned tables, and
   colocated tables. Early prototypes may support only regular, non-colocated
   tables.
+- **Submission is asynchronous with a durable, server-generated id.** Starting a
+  migration returns a `migration_id` (a master-generated 16-byte UUID) as soon
+  as the job is durably admitted, without waiting for copy/replay/cutover. The
+  client uses that id to query status later. This mirrors the snapshot-
+  restoration contract (`RestoreSnapshot -> restoration_id ->
+  ListSnapshotRestorations`), not the current `CREATE INDEX` contract (which
+  blocks until backfill completes and exposes no durable id).
+- **Ordinary DDL wire behavior is preserved.** We do NOT change `ALTER TABLE`
+  (or any existing DDL) to return a UUID. Returning an id from every DDL is
+  broadly incompatible: encoding it in the `CommandComplete` command tag is not
+  reachable through standard JDBC and can trip pgjdbc's trailing-token parser;
+  encoding it as a result row flips libpq from `PGRES_COMMAND_OK` to
+  `PGRES_TUPLES_OK` and makes JDBC `executeUpdate(DDL)` throw. The migration id
+  is exposed only through an explicit, opt-in, row-returning API.
+- **The status model is generic, with OSC as its first producer.** State is
+  stored under a generic schema-migration entity keyed by `migration_id` and a
+  `kind` discriminator (`ONLINE_TABLE_REWRITE` first). The design leaves room to
+  later fold other long-running schema changes (index backfill, validation
+  scans, `SET TABLESPACE` placement moves) into the same view, but that is not
+  required for the OSC feature.
+- **Status is queryable as read-only relations, not just functions.** Summary
+  and per-tablet/range detail are exposed as `pg_catalog` relations filterable
+  with ordinary predicates (`WHERE migration_id = ...`); mutating operations
+  (start, cancel) remain functions. See Section "Migration Identity, State
+  Tracking, and Observability".
+- **A client-supplied idempotency key is optional and distinct from the id.**
+  The server always owns the canonical `migration_id`. A caller may pass a
+  request token so a retried submission after a lost response resolves to the
+  same job rather than starting a second one.
 
 ### Terminology
 
@@ -164,6 +193,84 @@ What the prototype did NOT prove (still open, drives the roadmap below):
   sentinel).
 - Any of the CDC-handoff, backup, PITR, partition, geo, or colocation behavior.
 
+## Existing Status and Progress Surfaces (findings)
+
+Surveyed so the migration status model reuses proven mechanics and avoids the
+gaps that keep index backfill from being a durable, queryable operation.
+
+- **Index backfill** is the closest execution precedent but is NOT a durable
+  job: `BackfillJobPB` (embedded in the base table's `SysTablesEntryPB`) holds
+  aggregate rows-read / rows-inserted and per-index state; per-tablet
+  checkpoints live in `SysTabletsEntryPB.backfilled_until`. There is no job id,
+  no authoritative percentage, and the job record is cleared on completion.
+  `CREATE INDEX` (even plain, which is implicitly concurrent) waits for backfill
+  via `PgClientSession::BackfillIndex(..., wait=true)`.
+  - `src/yb/master/catalog_entity_info.proto` (`BackfillJobPB`)
+  - `src/yb/master/backfill_index.cc` (launch/checkpoint/clear)
+  - `src/yb/master/master_client.proto` (`GetIndexBackfillProgress` -> rows only)
+  - `src/postgres/src/backend/catalog/system_views.sql`
+    (`pg_stat_progress_create_index`: node-local, cleared on completion,
+    `tuples_total` is an estimate)
+- **Snapshot restoration** is the strongest reusable contract: a dedicated,
+  server-generated `restoration_id` returned after durable admission, later
+  looked up by `ListSnapshotRestorations`, persisted as its own
+  `SysRestorationEntryPB` sys-catalog entity, and resumed after master failover.
+  The migration job adopts this contract.
+  - `src/yb/master/master_backup.proto` (`RestoreSnapshotResponsePB.restoration_id`,
+    `SysRestorationEntryPB`, `RestorationInfoPB`, `ListSnapshotRestorations*`)
+  - `src/yb/master/master_snapshot_coordinator.cc` (generate id, replicate, reload)
+- **Queryable metadata precedent:** `yb_servers()`, `yb_local_tablets`,
+  `yb_tablet_metadata` expose master/cluster state as `pg_catalog` relations
+  (views over internal C SRFs that fetch via RPC). Important caveat for the
+  status design: these SRF-backed views materialize the FULL result before SQL
+  applies `WHERE`; a literal `WHERE id = ...` is a post-RPC filter, not RPC-side
+  pushdown (`FunctionScan` fills a tuplestore, then `ExecScan` filters). So a
+  plain view-over-SRF does not give efficient point lookup for large progress
+  histories; the status relations need explicit `migration_id` pushdown (custom
+  scan / parameterized RPC) or a directly queryable internal table.
+  - `src/postgres/src/backend/catalog/yb_system_views.sql`,
+    `src/postgres/src/include/catalog/pg_proc.dat`,
+    `src/postgres/src/backend/utils/misc/pg_yb_utils.c`
+  - `src/postgres/src/backend/executor/nodeFunctionscan.c`
+  - Real indexed system catalog with DocDB key pushdown as the alternative model:
+    `src/postgres/src/include/catalog/pg_yb_catalog_version.h`,
+    `src/postgres/src/backend/access/yb_access/yb_scan.c`
+- **Driver-compatibility finding** (why start is a function, not DDL): adding a
+  UUID to the `CommandComplete` tag is unreachable through standard JDBC and
+  ~39% of random UUIDs trip pgjdbc's numeric trailing-token parser; returning a
+  UUID row flips libpq to `PGRES_TUPLES_OK` and makes JDBC `executeUpdate(DDL)`
+  throw "A result was returned when none was expected". The repo itself relies
+  on both behaviors (`libpq_utils.cc` treats tuples from `Execute` as an error;
+  many `executeUpdate(DDL)` call sites in `java/yb-pgsql`).
+  - `src/postgres/src/include/tcop/cmdtaglist.h` (`CMDTAG_ALTER_TABLE`, no rowcount)
+  - `src/postgres/src/interfaces/libpq/fe-protocol3.c`,
+    `src/yb/yql/pgwrapper/libpq_utils.cc`
+
+## Current Instant / Existing Migration Classes (findings)
+
+Today's YSQL schema changes fall into these cost classes; only the last two are
+in scope for this feature, and none currently has a durable, queryable
+operation identity tying the SQL statement to master-side work.
+
+| Class | Examples | Lock / wait today | Durable state today |
+|---|---|---|---|
+| Metadata-only, near-instant | rename, set/drop default, drop NOT NULL, ADD ... USING INDEX | usually ACCESS EXCLUSIVE, trivial work | none operation-specific |
+| Distributed metadata, no scan | add nullable / nonvolatile-default column, drop ordinary column | ACCESS EXCLUSIVE; waits for tablet schema-version propagation | master `ALTERING` (version/done only) |
+| Async placement | `SET TABLESPACE` | metadata commits; replicas move in background | load-balancer moves, no unified job |
+| Validation scan | `SET NOT NULL`, validate CHECK / FK, `ADD UNIQUE` (nonconcurrent) | ACCESS EXCLUSIVE (FK: SHARE ROW EXCL); synchronous PG scan | none (foreground) |
+| Online index backfill | `CREATE INDEX` [CONCURRENTLY] | SHARE UPDATE EXCL; SQL waits for backfill | index permissions + `BackfillJobPB` (resumable, cleared on done) |
+| Full table rewrite (**in scope**) | add/drop PK, volatile default, non-binary-compatible type change | ACCESS EXCLUSIVE; synchronous PG rewrite + swap | none unified; only constituent create/drop/DDL-verify |
+| Reshape (**in scope**) | colocation/tablegroup change, repartition, geo relayout | no in-place path today | none |
+
+Implication: OSC is the first schema change to get a durable, server-owned job
+and a queryable status surface. The entity is deliberately generic
+(`kind = ONLINE_TABLE_REWRITE` first) so backfill/validation/placement could be
+represented later without a second framework.
+  - Dispatch/lock selection: `src/postgres/src/backend/commands/tablecmds.c`
+    (`ATController`, `ATRewriteTables`, `ATColumnChangeRequiresRewrite`)
+  - Alter wait/state: `src/yb/client/table_alterer.cc`,
+    `src/yb/master/catalog_manager.cc` (`IsAlterTableDone` == not `ALTERING`)
+
 ## Current DDL Classification
 
 Legend: **M** metadata-only, **V** validation scan, **I** index build/backfill,
@@ -203,6 +310,136 @@ Metadata-only and index-backfill operations keep their current fast paths. The
 new flow targets the **R** and **U** rows: the expensive rewrites and the
 reshaping operations that have no in-place path today.
 
+# Section 0: Migration Identity, State Tracking, and Observability
+
+This is the user-facing contract and the durable substrate the rest of the
+design reports through. It is a prerequisite for every later section: copy,
+replay, barrier, and cutover all record progress here.
+
+## 0.1 Submission and identity
+
+Submission is asynchronous and returns a durable, server-generated id.
+
+```sql
+-- Returns a migration_id (uuid) immediately after durable admission.
+SELECT yb_start_online_schema_change(
+  ddl        => 'ALTER TABLE t ALTER COLUMN value TYPE bigint',
+  request_id => NULL            -- optional client idempotency token
+);
+```
+
+- The master generates a random 16-byte `migration_id` (UUID), writes the
+  initial job row to the sys catalog, waits for that write to replicate, then
+  returns the id. Returning only after durable admission matches snapshot
+  creation and guarantees a subsequently supplied id is always resolvable.
+- `request_id` is an optional client token, distinct from `migration_id`. If a
+  submission is retried after a lost response, the same token resolves to the
+  existing job instead of starting a second migration. The server still owns the
+  canonical id.
+- Ordinary `ALTER TABLE` is unchanged. Start is a row-returning SQL function so
+  the uuid travels through every driver as a normal `uuid` value; callers must
+  use `execute()` / `executeQuery()`, not `executeUpdate()`. The same id is also
+  returned by the equivalent master RPC and `yb-admin` command.
+- The submitting `ALTER TABLE`-style DDL semantics (whether a convenience
+  wrapper blocks until terminal state) are layered on top of this async core;
+  the async id is the primitive.
+
+## 0.2 Storage: two tiers
+
+State is split by cardinality and update frequency, following the split that
+index backfill approximates (aggregate job vs. per-tablet checkpoint) but making
+the job a first-class, durably-retained, id-addressable entity.
+
+Tier 1 - one summary row per migration, a dedicated master sys-catalog entity
+(a new `SCHEMA_MIGRATION` catalog entity type, modeled on `SNAPSHOT_RESTORATION`,
+NOT embedded in `SysTablesEntryPB`):
+
+```text
+SysSchemaMigrationEntryPB
+  migration_id            # server-generated UUID (primary identity)
+  request_id              # optional client idempotency token
+  kind                    # ONLINE_TABLE_REWRITE (first); extensible
+  state, phase, state_epoch
+  database_oid, logical_table_oid (L)
+  g0_physical_id, g1_physical_id  (base + index bundles)
+  source_schema_hash, target_schema_hash, plan_hash
+  submitted_by, submitted_ddl_text
+  created_ht, updated_ht, completed_ht
+  S, F, K
+  aggregate_counters      # rows/bytes copied+applied, tablets resolved, lag
+  retry_state
+  terminal_error          # AppStatusPB, separate from status-query error
+```
+
+Tier 2 - one row per work unit (potentially thousands), in an internal
+replicated DocDB table (NOT a master sys-catalog protobuf, to avoid a hot,
+oversized entity), keyed by the SOURCE tablet/range because transformed rows fan
+out to many target tablets:
+
+```text
+key: (migration_id, work_kind, source_table_id, tablet_lineage_id, range_start)
+val: state, checkpoint, rows_processed, bytes_processed,
+     cdc_checkpoint, resolved_ht, applied_ht, attempt, worker_epoch, error
+```
+
+`work_kind` distinguishes copy, capture/apply, validation, and barrier work.
+Workers update Tier 2 at chunk/transaction boundaries; the master updates the
+Tier 1 summary only on phase transitions or coalesced intervals.
+
+## 0.3 Observability: queryable relations
+
+Status is exposed as read-only `pg_catalog` relations, filterable with ordinary
+predicates, plus mutating functions for actions.
+
+```sql
+-- summary: one row per migration
+SELECT * FROM yb_schema_migrations WHERE migration_id = '...';
+SELECT * FROM yb_schema_migrations WHERE state = 'REPLAYING';
+
+-- detail: one row per tablet/range work unit
+SELECT * FROM yb_schema_migration_progress
+WHERE migration_id = '...'
+ORDER BY work_kind, tablet_id, range_start;
+
+-- actions (mutating -> functions)
+SELECT yb_cancel_schema_migration('...');
+```
+
+Requirements on these relations:
+
+- Native `uuid` `migration_id` as the identity/lookup key.
+- Efficient point lookup by `migration_id`. A plain view-over-SRF (the
+  `yb_tablet_metadata` pattern) materializes all rows then filters, which does
+  not scale to large progress histories; the relations must push
+  `migration_id = ...` into the RPC / DocDB scan (custom scan or parameterized
+  read), or be backed by a directly queryable internal table with the id as a
+  key prefix. This is called out as Open Decision below.
+- Also filterable by `state`, `kind`, `database`, `relation`, and submission
+  time for a fleet-wide view.
+- Read-only SQL permission distinct from the privilege to start/cancel.
+- Tier 1 summary rows are retained after terminal state for a configurable
+  window (so `SUCCEEDED` / `FAILED` remain queryable, unlike `BackfillJobPB`
+  which is cleared); Tier 2 detail may be pruned earlier.
+
+## 0.4 Progress semantics
+
+- Raw counters and phase are authoritative; any percentage is advisory only.
+  Tablet splits change the denominator, row totals are estimates, and replay
+  lag is time-based rather than row-based.
+- Phases derive from the state machine in Section 2.7 (e.g. `SNAPSHOTTING`,
+  `REPLAYING`, `VALIDATING`, `FENCING`, `CUTOVER_PENDING_VERIFICATION`).
+- Failover: a new master leader reloads all non-terminal jobs, bumps
+  `state_epoch`, fences stale-epoch worker callbacks, and resumes. This is the
+  snapshot-coordinator reload pattern applied to migrations.
+
+## 0.5 Generic-but-scoped
+
+The entity is generic (`kind`) and the relations are named generically
+(`yb_schema_migrations`) so index backfill, validation scans, and placement
+moves can later be surfaced through the same view. For this feature only
+`ONLINE_TABLE_REWRITE` is implemented; folding in other kinds is explicitly out
+of scope here and tracked as a follow-on.
+
 # Section 1: Shadow Generation and Distributed Copy
 
 ## 1.1 Physical identity
@@ -232,29 +469,25 @@ capability/lease (prototype may use a superuser GUC bypass).
 
 ## 1.2 Job metadata
 
-Add a first-class master-owned online-rewrite job (do not overload
-`BackfillJobPB` long term):
+The durable job entity and its two-tier storage are defined in Section 0.2
+(`SysSchemaMigrationEntryPB` summary + internal per-work-unit table). It is a
+first-class master-owned entity, not an overload of `BackfillJobPB`. Beyond the
+public status fields, the job additionally carries the copy/replay internals:
 
 ```text
-migration id, state, state epoch
-logical table / root OID
-G0 and G1 physical ids (base + index bundles)
-source and target schemas + hashes
 transform plan + dependency fingerprints
 source and target partition manifests
-S, F, K
-per-range copy checkpoints
 internal CDC stream id + checkpoints
 capture frontier, apply frontier
 external CDC handoff metadata
 retention owners
-error classification + retry state
 ```
 
-Store high-volume per-tablet/range state in an internal replicated DocDB table
-keyed by `(migration_id, source_table_id, tablet_lineage_id, range_start)`, not
-in the master sys catalog. Every worker RPC carries `migration_id` and
-`state_epoch`; stale workers are fenced after failover/cancel/cutover.
+Every worker RPC carries `migration_id` and `state_epoch`; stale workers are
+fenced after failover/cancel/cutover. High-volume per-tablet/range state lives
+in the Tier 2 internal table keyed by
+`(migration_id, work_kind, source_table_id, tablet_lineage_id, range_start)`,
+which is exactly what `yb_schema_migration_progress` (Section 0.3) reads.
 
 ## 1.3 Creation sequence
 
@@ -446,6 +679,12 @@ side: PAUSED_RESOURCE | FAILED_RETRYABLE | FAILED_SEMANTIC
 
 Before `K`, cancel leaves `G0` authoritative and drops `G1`. After `K`, recovery
 is roll-forward only.
+
+These states are the authoritative source of the `state` / `phase` columns
+exposed by `yb_schema_migrations` (Section 0.3). The side states map to the
+public terminal/paused values (`FAILED`, `CANCELLED`, `PAUSED_RESOURCE`), and
+`terminal_error` carries the classified reason. `state_epoch` is bumped on every
+master-leader reload so stale-epoch worker callbacks are fenced.
 
 # Section 3: Atomic Storage Switch
 
@@ -644,6 +883,7 @@ an isolated test); [done] landed in-tree; otherwise not started.
 
 | Milestone | Deliverable | Status |
 |---|---|---|
+| A0 | Durable async migration job entity + `migration_id` + queryable status/progress relations | not started |
 | A | Generation metadata, hidden shadow table, regular-table fixed-HT copy | partial: OID-preserving switch and fixed-HT copy [proto]; hidden-generation metadata not started |
 | B | Internal CDCSDK capture, durable queue, idempotent replay | [proto] via logical slot + `(slot,xid)` ledger; internal CDCSDK stream not started |
 | C | Correct final barrier + OID-preserving relfilenode cutover | [proto] sentinel barrier; OID-preserving swap [done] in isolated test; not yet wired to a caught-up shadow |
@@ -664,6 +904,23 @@ unsupported.
 The prototype validated the three core mechanics in isolation (switch, applier,
 barrier). The following are the concrete next in-tree work items; each is scoped
 to be landable behind a preview gate with its own test.
+
+0. **Durable async migration job + queryable status (Milestone A0, Section 0).**
+   Add the `SCHEMA_MIGRATION` sys-catalog entity (`SysSchemaMigrationEntryPB`,
+   modeled on `SysRestorationEntryPB`) and the Tier 2 internal progress table.
+   Add master RPCs `StartSchemaMigration` (returns server-generated
+   `migration_id` after durable admission), `GetSchemaMigrationStatus`,
+   `ListSchemaMigrations`, `CancelSchemaMigration`; reload non-terminal jobs on
+   leader change. Expose `yb_start_online_schema_change(...)` (row-returning
+   function) plus read-only relations `yb_schema_migrations` and
+   `yb_schema_migration_progress` with `migration_id` predicate pushdown. First
+   `kind` is `ONLINE_TABLE_REWRITE`; the job initially drives a no-op/skeleton
+   pipeline so the contract can land before the copy/replay backend.
+   Tests: start returns a resolvable uuid; status/progress queryable by
+   `migration_id` and by `state`; terminal rows retained; a duplicate
+   `request_id` resolves to the same job; master-failover mid-flight resumes and
+   re-exposes the same id; ordinary `ALTER TABLE` wire behavior unchanged
+   (`PGRES_COMMAND_OK`, JDBC `executeUpdate` still returns 0).
 
 1. **Generation metadata + hidden shadow (Milestone A backend).**
    Add an explicit physical-generation role (`ACTIVE`/`SHADOW`/`RETIRED`) to
@@ -711,8 +968,9 @@ to be landable behind a preview gate with its own test.
    Partitioned/geo generation groups, then colocated generations. Each is a
    separate investigation with its own routing and retention concerns.
 
-Items 1-4 make a single non-colocated table migrate end to end in-tree with a
-real cutover. Items 5-8 are the GA gates.
+Item 0 lands the user-facing contract and durable substrate first (everything
+below reports through it). Items 1-4 make a single non-colocated table migrate
+end to end in-tree with a real cutover. Items 5-8 are the GA gates.
 
 # Required Testing
 
@@ -735,6 +993,17 @@ real cutover. Items 5-8 are the GA gates.
 - Cancellation before cutover; ambiguous cutover commit.
 - Disk/WAL/history retention pressure and exhaustion policy.
 - Semantic transform and uniqueness failures.
+- Async submission returns a resolvable `migration_id` before any copy work.
+- Duplicate `request_id` (lost-response retry) resolves to the same job, not a
+  second migration.
+- Status/progress relations queryable by `migration_id` and by `state`; point
+  lookup does not full-scan all progress rows.
+- Terminal (`SUCCEEDED`/`FAILED`/`CANCELLED`) summary rows retained and
+  queryable after completion; detail pruned per policy.
+- Master-failover mid-migration: job reloads, `state_epoch` bumps, same
+  `migration_id` still resolvable, stale-epoch worker callbacks fenced.
+- Ordinary DDL wire behavior unchanged: `ALTER TABLE` stays `PGRES_COMMAND_OK`,
+  JDBC `executeUpdate(DDL)` returns 0, command tag unchanged.
 
 # Open Decisions
 
@@ -754,7 +1023,24 @@ real cutover. Items 5-8 are the GA gates.
 10. Partition hierarchy size limit for near-term relfilenode cutover.
 11. Physical id format: reuse PG-OID-based relfilenodes vs. generation UUIDs.
 12. Job storage: standalone sys-catalog entity vs. state attached to source tables
-    (standalone needs explicit PITR restore support).
+    (standalone needs explicit PITR restore support). Leaning standalone
+    (`SCHEMA_MIGRATION` entity) per Section 0.2, matching `SNAPSHOT_RESTORATION`.
+13. Status-relation implementation: `migration_id` predicate pushdown via a
+    custom/foreign scan or parameterized RPC, vs. a directly queryable internal
+    DocDB table with the id as key prefix. A plain view-over-SRF (the
+    `yb_tablet_metadata` pattern) is rejected for progress because it
+    materializes all rows before filtering.
+14. Submission surface: keep async-only `yb_start_online_schema_change(...)`, or
+    also provide a blocking `ALTER TABLE ... ONLINE` convenience wrapper that
+    polls to terminal state on top of the same async id.
+15. Scope of the generic status view: OSC-only now vs. later folding index
+    backfill / validation / placement moves into the same `kind`-discriminated
+    relations (out of scope for this feature, but the schema must not preclude
+    it).
+16. Percentage semantics: expose an advisory percent column at all, or only raw
+    counters + phase (denominator is unstable under tablet splits and estimates).
+17. Retention windows for terminal summary rows and detail rows, and whether
+    they are covered by backup/PITR.
 
 # Non-Goals
 
@@ -762,6 +1048,10 @@ real cutover. Items 5-8 are the GA gates.
 - Trigger-based synchronous mirroring as the core mechanism.
 - MySQL-style rename swap that changes the logical table OID.
 - Replacing metadata-only or existing online-index paths.
+- Changing ordinary DDL to return an id (compatibility-breaking across drivers).
+- Folding non-OSC schema changes (index backfill, validation, placement) into
+  the status view now; the entity is designed to allow it later, but only
+  `ONLINE_TABLE_REWRITE` is implemented for this feature.
 
 # Prototype Artifacts
 
