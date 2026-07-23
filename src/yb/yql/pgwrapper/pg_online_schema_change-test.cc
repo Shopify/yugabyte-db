@@ -86,6 +86,59 @@ class PgOnlineSchemaChangeTest : public PgMiniTestBase {
     }
     return count;
   }
+
+  // Number of RUNNING tablets for a table id (across all tservers/replicas the
+  // master knows about).
+  Result<size_t> RunningTabletCount(const TableId& table_id) {
+    auto* cm = VERIFY_RESULT(catalog_manager_impl());
+    auto table = cm->GetTableInfo(table_id);
+    SCHECK(table != nullptr, NotFound, "table not found");
+    auto tablets = VERIFY_RESULT(table->GetTablets());
+    size_t running = 0;
+    for (const auto& t : tablets) {
+      if (t->LockForRead()->pb.state() == master::SysTabletsEntryPB::RUNNING) {
+        ++running;
+      }
+    }
+    return running;
+  }
+
+  // Start a migration for `relname` and wait until it reaches SUCCEEDED (or fail
+  // the test on FAILED). Returns the job PB.
+  Result<master::SysSchemaMigrationEntryPB> RunMigrationToCompletion(
+      PGConn* conn, const std::string& relname) {
+    const auto table_oid = VERIFY_RESULT(conn->FetchRow<PGOid>(
+        Format("SELECT '$0'::regclass::oid", relname)));
+    const auto database_oid = VERIFY_RESULT(conn->FetchRow<PGOid>(
+        "SELECT oid FROM pg_database WHERE datname = current_database()"));
+
+    auto* mini_master = VERIFY_RESULT(cluster_->GetLeaderMiniMaster());
+    auto& mgr = mini_master->master()->schema_migration_manager();
+    auto epoch = mini_master->catalog_manager_impl().GetLeaderEpochInternal();
+
+    auto migration_id = VERIFY_RESULT(mgr.StartSchemaMigration(
+        master::SysSchemaMigrationEntryPB::ONLINE_TABLE_REWRITE, database_oid, table_oid,
+        /* submitted_by */ 10, Format("ALTER TABLE $0 ADD c int", relname),
+        /* request_id */ "", epoch));
+
+    RETURN_NOT_OK(WaitFor([&]() -> Result<bool> {
+      auto pb = VERIFY_RESULT(mgr.GetSchemaMigration(migration_id));
+      if (pb.state() == master::SysSchemaMigrationEntryPB::FAILED) {
+        return STATUS_FORMAT(IllegalState, "migration failed: $0",
+                             StatusFromPB(pb.terminal_error()));
+      }
+      return pb.state() == master::SysSchemaMigrationEntryPB::SUCCEEDED;
+    }, 360s, "migration reaches SUCCEEDED"));
+
+    return mgr.GetSchemaMigration(migration_id);
+  }
+};
+
+// Multi-tablet, multi-tserver (RF3) variant to exercise per-tablet snapshot +
+// tablet clone + consensus-peer seeding across nodes.
+class PgOnlineSchemaChangeRf3Test : public PgOnlineSchemaChangeTest {
+ public:
+  size_t NumTabletServers() override { return 3; }
 };
 
 // A rewrite that materializes existing rows (volatile default) must keep the
@@ -344,6 +397,48 @@ TEST_F(PgOnlineSchemaChangeTest, ShadowGenerationHiddenFromListTables) {
     l.Commit();
   }
   ASSERT_EQ(ASSERT_RESULT(CountInListTables("shadow_demo")), 1);
+}
+
+// End-to-end on a multi-tablet table across an RF3 cluster: the migration
+// creates a hidden shadow generation with the same number of tablets spread
+// across all tservers and cuts over (shadow -> ACTIVE, source -> RETIRED).
+// Exercises the per-tablet, cross-node shadow-generation path that the single
+// tablet/RF1 tests do not.
+//
+// NOTE: the COPYING phase is currently a no-op (the shadow is created empty);
+// the tablet-clone data copy is validated to hard-link SSTs but its
+// post-processing (tablets -> RUNNING, snapshot restore) is not yet wired. See
+// architecture/design/online-schema-changes/generation-metadata.md. So this
+// test does NOT assert row-level data parity yet.
+TEST_F(PgOnlineSchemaChangeRf3Test, MultiTabletMigration) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_enable_schema_migration_admission) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_schema_migration_create_shadow) = true;
+
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute(
+      "CREATE TABLE mt (id int PRIMARY KEY, v text) SPLIT INTO 4 TABLETS"));
+  ASSERT_OK(conn.Execute(
+      "INSERT INTO mt SELECT g, 'v' || g FROM generate_series(1, 500) g"));
+
+  auto source = ASSERT_RESULT(FindUserTable("mt"));
+  const auto source_id = source->id();
+  const auto source_tablets = ASSERT_RESULT(RunningTabletCount(source_id));
+  ASSERT_GE(source_tablets, 4);
+
+  auto pb = ASSERT_RESULT(RunMigrationToCompletion(&conn, "mt"));
+  ASSERT_FALSE(pb.shadow_table_id().empty());
+
+  auto* cm = ASSERT_RESULT(catalog_manager_impl());
+  auto shadow = cm->GetTableInfo(pb.shadow_table_id());
+  ASSERT_TRUE(shadow != nullptr);
+
+  // Shadow has the same number of running tablets as the source did, spread
+  // across the RF3 cluster.
+  ASSERT_EQ(ASSERT_RESULT(RunningTabletCount(pb.shadow_table_id())), source_tablets);
+
+  // Cutover flipped the roles.
+  ASSERT_TRUE(source->LockForRead()->is_retired_generation());
+  ASSERT_TRUE(shadow->LockForRead()->is_active_generation());
 }
 
 }  // namespace pgwrapper
