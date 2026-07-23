@@ -13,6 +13,8 @@
 
 #include "yb/master/schema_migration/schema_migration_manager.h"
 
+#include "yb/common/entity_ids.h"
+
 #include "yb/master/catalog_manager.h"
 #include "yb/master/master_types.pb.h"
 #include "yb/master/sys_catalog.h"
@@ -36,6 +38,11 @@ DEFINE_test_flag(bool, pause_schema_migration_in_running, false,
 DEFINE_test_flag(bool, fail_schema_migration_in_running, false,
     "When true, the skeleton schema-migration executor moves RUNNING jobs to FAILED instead of "
     "SUCCEEDED, so tests can exercise terminal-error retention.");
+
+DEFINE_test_flag(bool, schema_migration_create_shadow, false,
+    "When true, the SHADOW_CREATING phase actually creates a hidden shadow DocDB generation for "
+    "the source table. Default false so the observable phase pipeline can run without a real "
+    "source table until the full copy/replay/cutover backend lands.");
 
 namespace yb::master {
 
@@ -215,6 +222,42 @@ void SchemaMigrationManager::SysCatalogLoaded(const LeaderEpoch& epoch) {
   VLOG(1) << "Schema migration manager loaded for leader term " << epoch.leader_term;
 }
 
+Status SchemaMigrationManager::PerformPhaseWork(
+    const SchemaMigrationInfoPtr& job, const std::string& phase, const LeaderEpoch& epoch) {
+  if (phase != kPhaseShadowCreating || !FLAGS_TEST_schema_migration_create_shadow) {
+    // PREFLIGHT / COPYING / CUTOVER are no-ops for now (the real copy/replay/
+    // cutover backend plugs in here). Shadow creation is gated until the full
+    // pipeline exists, so the observable phase pipeline runs without a real
+    // source table.
+    return Status::OK();
+  }
+
+  // Resolve the source table's physical id from the PG oids recorded at start,
+  // then create the hidden shadow generation (idempotent: skip if already set).
+  uint32_t database_oid;
+  uint32_t table_oid;
+  std::string migration_id;
+  {
+    auto l = job->LockForRead();
+    if (!l->pb.shadow_table_id().empty()) {
+      return Status::OK();  // Already created (e.g. resumed after failover).
+    }
+    database_oid = l->pb.database_oid();
+    table_oid = l->pb.table_oid();
+    migration_id = job->id();
+  }
+
+  const TableId source_table_id = GetPgsqlTableId(database_oid, table_oid);
+  const auto shadow_table_id = VERIFY_RESULT(
+      catalog_manager_->CreateShadowGeneration(source_table_id, migration_id, epoch));
+
+  auto l = job->LockForWrite();
+  l.mutable_data()->pb.set_shadow_table_id(shadow_table_id);
+  RETURN_NOT_OK(sys_catalog_->Upsert(epoch, job.get()));
+  l.Commit();
+  return Status::OK();
+}
+
 Result<bool> SchemaMigrationManager::AdvanceJob(
     const SchemaMigrationInfoPtr& job, const LeaderEpoch& epoch) {
   auto l = job->LockForWrite();
@@ -244,23 +287,39 @@ Result<bool> SchemaMigrationManager::AdvanceJob(
         l.Commit();
         return true;
       }
-      // Advance one execution phase per tick. No DocDB storage work is performed
-      // yet (no table is mutated); this drives the observable pipeline that the
-      // real shadow-create / copy / replay / cutover backend will implement.
-      const char* next = NextPhase(pb.phase());
-      if (next != nullptr) {
-        pb.set_phase(next);
-        pb.set_updated_ht(now);
+
+      // Perform the current phase's work (may be a no-op), then advance. Real
+      // DocDB work (shadow creation) happens here without holding the job lock;
+      // heavier phases (copy/replay/cutover) plug in the same way.
+      const std::string current_phase = pb.phase();
+      // Release the job write lock across catalog work to avoid lock inversion.
+      l.Commit();
+
+      auto work_status = PerformPhaseWork(job, current_phase, epoch);
+      auto wl = job->LockForWrite();
+      auto& wpb = wl.mutable_data()->pb;
+      const auto now2 = clock_->Now().ToUint64();
+      if (!work_status.ok()) {
+        wpb.set_state(SysSchemaMigrationEntryPB::FAILED);
+        StatusToPB(work_status, wpb.mutable_terminal_error());
+        wpb.set_updated_ht(now2);
+        wpb.set_completed_ht(now2);
         RETURN_NOT_OK(sys_catalog_->Upsert(epoch, job.get()));
-        l.Commit();
+        wl.Commit();
         return true;
       }
-      // Reached the end of the phase pipeline.
-      pb.set_state(SysSchemaMigrationEntryPB::SUCCEEDED);
-      pb.set_updated_ht(now);
-      pb.set_completed_ht(now);
+
+      const char* next = NextPhase(current_phase);
+      if (next != nullptr) {
+        wpb.set_phase(next);
+        wpb.set_updated_ht(now2);
+      } else {
+        wpb.set_state(SysSchemaMigrationEntryPB::SUCCEEDED);
+        wpb.set_updated_ht(now2);
+        wpb.set_completed_ht(now2);
+      }
       RETURN_NOT_OK(sys_catalog_->Upsert(epoch, job.get()));
-      l.Commit();
+      wl.Commit();
       return true;
     }
     case SysSchemaMigrationEntryPB::CANCELLING: {

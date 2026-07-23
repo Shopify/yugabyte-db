@@ -26,15 +26,26 @@
 
 #include <gtest/gtest.h>
 
+#include "yb/integration-tests/mini_cluster.h"
+
 #include "yb/master/catalog_entity_info.h"
 #include "yb/master/catalog_manager.h"
 #include "yb/master/catalog_manager_if.h"
+#include "yb/master/master.h"
 #include "yb/master/master_ddl.pb.h"
+#include "yb/master/mini_master.h"
+#include "yb/master/schema_migration/schema_migration_manager.h"
 
 #include "yb/yql/pgwrapper/libpq_utils.h"
 #include "yb/yql/pgwrapper/pg_mini_test_base.h"
 
+#include "yb/util/backoff_waiter.h"
 #include "yb/util/test_macros.h"
+
+DECLARE_bool(TEST_enable_schema_migration_admission);
+DECLARE_bool(TEST_schema_migration_create_shadow);
+
+using namespace std::chrono_literals;
 
 namespace yb {
 namespace pgwrapper {
@@ -154,6 +165,97 @@ TEST_F(PgOnlineSchemaChangeTest, SwapPreservesDependents) {
   const auto child_rows = ASSERT_RESULT(conn.FetchRow<int64_t>(
       "SELECT count(*) FROM child"));
   ASSERT_EQ(child_rows, 3);
+}
+
+// Driven through the migration job: with the shadow-creation phase enabled, a
+// started migration for a real table reaches SUCCEEDED and, along the way,
+// creates a hidden shadow generation owned by that migration and recorded on the
+// job. End-to-end validation of the SHADOW_CREATING phase.
+TEST_F(PgOnlineSchemaChangeTest, MigrationCreatesShadowGeneration) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_enable_schema_migration_admission) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_schema_migration_create_shadow) = true;
+
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE mig_demo (id int PRIMARY KEY, v text)"));
+
+  const auto table_oid = ASSERT_RESULT(conn.FetchRow<PGOid>(
+      "SELECT 'mig_demo'::regclass::oid"));
+  const auto database_oid = ASSERT_RESULT(conn.FetchRow<PGOid>(
+      "SELECT oid FROM pg_database WHERE datname = current_database()"));
+
+  auto* mini_master = ASSERT_RESULT(cluster_->GetLeaderMiniMaster());
+  auto& mgr = mini_master->master()->schema_migration_manager();
+  auto epoch = mini_master->catalog_manager_impl().GetLeaderEpochInternal();
+
+  auto migration_id = ASSERT_RESULT(mgr.StartSchemaMigration(
+      master::SysSchemaMigrationEntryPB::ONLINE_TABLE_REWRITE, database_oid, table_oid,
+      /* submitted_by */ 10, "ALTER TABLE mig_demo ADD c int", /* request_id */ "", epoch));
+
+  // Wait for the job to reach SUCCEEDED.
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    auto pb = VERIFY_RESULT(mgr.GetSchemaMigration(migration_id));
+    return pb.state() == master::SysSchemaMigrationEntryPB::SUCCEEDED;
+  }, 60s, "migration reaches SUCCEEDED"));
+
+  // The job recorded a shadow generation id.
+  auto pb = ASSERT_RESULT(mgr.GetSchemaMigration(migration_id));
+  ASSERT_FALSE(pb.shadow_table_id().empty());
+
+  // That shadow exists, is a SHADOW generation, owned by this migration, and
+  // shares the source's logical identity.
+  auto* cm = ASSERT_RESULT(catalog_manager_impl());
+  auto source = ASSERT_RESULT(FindUserTable("mig_demo"));
+  auto shadow = cm->GetTableInfo(pb.shadow_table_id());
+  ASSERT_TRUE(shadow != nullptr);
+  {
+    auto sl = shadow->LockForRead();
+    ASSERT_TRUE(sl->is_shadow_generation());
+    ASSERT_EQ(sl->pb.owning_migration_id(), migration_id);
+  }
+  // Still invisible to clients.
+  ASSERT_EQ(ASSERT_RESULT(CountInListTables("mig_demo")), 1);
+}
+
+// The master can create a hidden SHADOW physical generation of a live YSQL
+// table: it shares the source's logical identity (pg_table_id) but has a fresh
+// distinct physical id, is owned by the migration, and is excluded from the
+// client-facing ListTables view.
+TEST_F(PgOnlineSchemaChangeTest, CreateShadowGeneration) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE gen_demo (id int PRIMARY KEY, v text)"));
+  ASSERT_OK(conn.Execute(
+      "INSERT INTO gen_demo SELECT g, 'v' || g FROM generate_series(1, 20) g"));
+
+  auto* cm = ASSERT_RESULT(catalog_manager_impl());
+  auto source = ASSERT_RESULT(FindUserTable("gen_demo"));
+  const auto source_id = source->id();
+  const auto source_pg_table_id = source->LockForRead()->pb.pg_table_id();
+
+  const std::string migration_id = "test-migration-abc";
+  auto shadow_id = ASSERT_RESULT(cm->CreateShadowGeneration(
+      source_id, migration_id, cm->GetLeaderEpochInternal()));
+
+  // Distinct physical generation.
+  ASSERT_NE(shadow_id, source_id);
+
+  auto shadow = cm->GetTableInfo(shadow_id);
+  ASSERT_TRUE(shadow != nullptr);
+  {
+    auto l = shadow->LockForRead();
+    ASSERT_TRUE(l->is_shadow_generation());
+    ASSERT_EQ(l->pb.owning_migration_id(), migration_id);
+    // Shares the source's logical identity.
+    const auto expected_logical =
+        source_pg_table_id.empty() ? source_id : source_pg_table_id;
+    const auto shadow_logical =
+        l->pb.pg_table_id().empty() ? shadow_id : l->pb.pg_table_id();
+    ASSERT_EQ(shadow_logical, expected_logical);
+    // Same schema shape (column count).
+    ASSERT_EQ(l->pb.schema().columns_size(), source->LockForRead()->pb.schema().columns_size());
+  }
+
+  // The shadow is invisible to clients; only the source's single name is listed.
+  ASSERT_EQ(ASSERT_RESULT(CountInListTables("gen_demo")), 1);
 }
 
 // A table whose physical generation is marked SHADOW must disappear from the

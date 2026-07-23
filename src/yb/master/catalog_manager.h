@@ -322,6 +322,17 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
       std::function<Result<CreateTableRequestPB>()> generate_request, const LeaderEpoch& epoch)
       EXCLUDES(mutex_);
 
+  // Online schema change: create a hidden second physical DocDB generation of an
+  // existing YSQL table (same schema/partitioning/tablet count), sharing the
+  // source's logical identity (pg_table_id) but with a fresh relfilenode. The
+  // new table is marked SHADOW and owned by `migration_id`, so it is excluded
+  // from every user-facing enumeration from its first write. Returns the new
+  // physical table id. See
+  // architecture/design/online-schema-changes/generation-metadata.md.
+  Result<TableId> CreateShadowGeneration(
+      const TableId& source_table_id, const std::string& migration_id, const LeaderEpoch& epoch)
+      EXCLUDES(mutex_);
+
   // Create a new transaction status table.
   Status CreateTransactionStatusTable(const CreateTransactionStatusTableRequestPB* req,
                                       CreateTransactionStatusTableResponsePB* resp,

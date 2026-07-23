@@ -121,16 +121,49 @@ phases are the seams where that backend plugs in:
 | `COPYING` | fixed-HT distributed copy + CDC replay into the shadow |
 | `CUTOVER` | barrier + adopt the shadow into the source OID |
 
+## Shadow generation creation (landed)
+
+`CatalogManager::CreateShadowGeneration(source_table_id, migration_id, epoch)`
+creates the hidden generation entirely master-side (no Postgres backend, no
+client RPC):
+
+1. Read-lock the source; require a non-colocated, non-index, active YSQL table.
+2. Copy its `schema`, `partition_schema`, and tablet count into a
+   `CreateTableRequestPB`; set `pg_table_id` to the source's logical id (the
+   shared identity) and the new fields `physical_generation_role = SHADOW` +
+   `owning_migration_id`.
+3. Mint a fresh relfilenode from the source database's normal OID space (via
+   `ReservePgsqlOids`) and set the new physical `table_id`
+   (`database_oid + relfilenode`), so it never collides with a future
+   PG-allocated one.
+4. Call the internal `CreateTable(&req, &resp, /*rpc=*/nullptr, epoch)`.
+
+`CreateTableInfo` sets the role from the request, so the table is `SHADOW` from
+its first sys-catalog write - never transiently visible as an ACTIVE copy. The
+new `CreateTableRequestPB.physical_generation_role` / `owning_migration_id`
+fields carry this (option (a): request-carried, atomic with the table row).
+
+The migration job's `SHADOW_CREATING` phase calls this (gated by
+`TEST_schema_migration_create_shadow` until the full copy/replay/cutover
+pipeline exists) and records the result in
+`SysSchemaMigrationEntryPB.shadow_table_id`. Idempotent across failover: if
+`shadow_table_id` is already set, the phase is a no-op.
+
+Tested by `pg_online_schema_change-test`:
+`CreateShadowGeneration` (direct) and `MigrationCreatesShadowGeneration`
+(end-to-end through the job): the shadow exists, is a `SHADOW` generation owned
+by the migration, shares the source logical id, and stays out of `ListTables`.
+
 ## Not yet done (drives later steps)
 
-- Creating a shadow generation via `CreateTable` with `pg_table_id` set to the
-  source logical id and `physical_generation_role = SHADOW` (the
-  `SHADOW_CREATING` phase). This needs master `CreateTable` plumbing to accept
-  the role + owning migration id, and to allocate a physical id without exposing
-  the table.
+- The `COPYING` phase: fixed-HT distributed copy of the source snapshot into the
+  shadow, plus CDC replay of concurrent writes.
 - Adopting a caught-up shadow into the source OID at cutover (the `CUTOVER`
   phase; roadmap Section 3, the `tablecmds.c` `make_new_heap`/`finish_heap_swap`
   seam). The current in-tree rewrite still copies inline; adoption must skip the
   copy and index rebuild and instead swap in the already-populated shadow.
 - Migration-driven GC of `SHADOW` (on cancel) and `RETIRED` (after retention).
 - Preflight rejection of explicit operations targeting a shadow physical id.
+- Passing the target `table_oid` from the SQL `yb_start_online_schema_change`
+  path (today the SQL function records `table_oid = 0`; the end-to-end test
+  drives the job via the master API with the resolved oid).

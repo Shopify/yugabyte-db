@@ -5143,6 +5143,65 @@ Status CatalogManager::CreateTableIfNotFound(
   return Status::OK();
 }
 
+Result<TableId> CatalogManager::CreateShadowGeneration(
+    const TableId& source_table_id, const std::string& migration_id, const LeaderEpoch& epoch) {
+  auto source = VERIFY_RESULT(FindTableById(source_table_id));
+
+  // Snapshot the source shape under a read lock, then release before creating.
+  CreateTableRequestPB req;
+  std::string namespace_id;
+  {
+    auto l = source->LockForRead();
+    SCHECK_EQ(
+        l->table_type(), PGSQL_TABLE_TYPE, InvalidArgument,
+        "Shadow generations are only supported for YSQL tables");
+    SCHECK(
+        l->is_active_generation(), InvalidArgument,
+        "Source table is not an active generation");
+    SCHECK(!source->colocated(), NotSupported, "Colocated tables are not yet supported");
+    SCHECK(!l->is_index(), NotSupported, "Indexes cannot have shadow generations");
+
+    namespace_id = l->namespace_id();
+    req.set_name(l->name());
+    req.mutable_namespace_()->set_id(namespace_id);
+    req.set_table_type(PGSQL_TABLE_TYPE);
+    *req.mutable_schema() = l->pb.schema();
+    *req.mutable_partition_schema() = l->pb.partition_schema();
+    // Preserve the logical identity: the shadow shares the source's pg_table_id
+    // (the stable pg_class.oid), which is the source's own id if never rewritten.
+    req.set_pg_table_id(l->pb.pg_table_id().empty() ? source_table_id : l->pb.pg_table_id());
+    req.set_physical_generation_role(SysTablesEntryPB::SHADOW);
+    req.set_owning_migration_id(migration_id);
+  }
+
+  // Same number of tablets as the source.
+  const auto num_tablets = VERIFY_RESULT(source->GetTablets()).size();
+  req.set_num_tablets(narrow_cast<int32_t>(num_tablets));
+
+  // Mint a fresh relfilenode from the source database's normal OID space, so the
+  // shadow's physical id (database_oid + relfilenode) never collides with a
+  // future PG-allocated one.
+  const uint32_t database_oid = VERIFY_RESULT(GetPgsqlDatabaseOid(namespace_id));
+  ReservePgsqlOidsRequestPB oid_req;
+  ReservePgsqlOidsResponsePB oid_resp;
+  oid_req.set_namespace_id(namespace_id);
+  oid_req.set_next_oid(0);
+  oid_req.set_count(1);
+  RETURN_NOT_OK(ReservePgsqlOids(&oid_req, &oid_resp, /* rpc */ nullptr));
+  const uint32_t new_relfilenode = oid_resp.begin_oid();
+  req.set_table_id(GetPgsqlTableId(database_oid, new_relfilenode));
+
+  CreateTableResponsePB resp;
+  RETURN_NOT_OK(CreateTable(&req, &resp, /* rpc */ nullptr, epoch));
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+  LOG(INFO) << "Created shadow generation " << req.table_id() << " (pg_table_id "
+            << req.pg_table_id() << ") for source " << source_table_id << ", migration "
+            << migration_id;
+  return req.table_id();
+}
+
 void CatalogManager::ScheduleVerifyTablePgLayer(
     TransactionMetadata txn, const TableInfoPtr& table, const LeaderEpoch& epoch) {
   auto when_done = [this, table, epoch](Result<std::optional<bool>> exists) {
@@ -6266,6 +6325,15 @@ scoped_refptr<TableInfo> CatalogManager::CreateTableInfo(const CreateTableReques
 
   if (req.has_pg_table_id()) {
     metadata->set_pg_table_id(req.pg_table_id());
+  }
+
+  // Online schema change: mark a hidden physical generation from its first write
+  // so it is never transiently visible as an ACTIVE copy of the logical table.
+  if (req.has_physical_generation_role()) {
+    metadata->set_physical_generation_role(req.physical_generation_role());
+  }
+  if (req.has_owning_migration_id()) {
+    metadata->set_owning_migration_id(req.owning_migration_id());
   }
 
   if (colocated) {

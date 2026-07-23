@@ -152,6 +152,14 @@ message CreateTableRequestPB {
 
   // For YSQL tables, the sub-transaction used by this DDL. If aborted, table will be removed.
   optional uint32 sub_transaction_id = 35;
+
+  // Online schema change: create this table as a hidden physical generation of an
+  // existing logical table. When SHADOW, the table is excluded from all
+  // user-facing enumeration from its first sys-catalog write. See
+  // architecture/design/online-schema-changes/generation-metadata.md.
+  optional SysTablesEntryPB.PhysicalGenerationRole physical_generation_role = 36;
+  // The schema-migration job id that owns this SHADOW/RETIRED generation.
+  optional bytes owning_migration_id = 37;
 }
 
 message CreateTableResponsePB {

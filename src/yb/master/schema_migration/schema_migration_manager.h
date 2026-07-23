@@ -84,6 +84,12 @@ class SchemaMigrationManager {
   // Advance one job's state machine by one step; returns true if it mutated.
   Result<bool> AdvanceJob(const SchemaMigrationInfoPtr& job, const LeaderEpoch& epoch);
 
+  // Perform the side-effecting work for `phase` (called without holding the job
+  // lock). SHADOW_CREATING creates the hidden shadow generation; other phases
+  // are currently no-ops. On success any results are persisted onto the job.
+  Status PerformPhaseWork(
+      const SchemaMigrationInfoPtr& job, const std::string& phase, const LeaderEpoch& epoch);
+
   SchemaMigrationInfoPtr FindJobUnlocked(const std::string& migration_id) REQUIRES(mutex_);
 
   CatalogManager* const catalog_manager_;

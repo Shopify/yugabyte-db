@@ -849,6 +849,10 @@ message SysSchemaMigrationEntryPB {
   // A retried submission carrying the same request_id resolves to this job
   // instead of starting a second one.
   optional bytes request_id = 13;
+
+  // The physical table id (database_oid + relfilenode) of the hidden SHADOW
+  // generation created during the SHADOW_CREATING phase. Empty until then.
+  optional bytes shadow_table_id = 14;
 }
 
 message SchemaVersionMappingPB {
