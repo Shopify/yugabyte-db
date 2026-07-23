@@ -193,19 +193,34 @@ Prototype scope: assumes the source is quiesced (no incremental CDC replay of
 post-snapshot writes yet); non-colocated single heap; clone runs synchronously
 inside the COPYING phase (bounded by a deadline).
 
-## Cutover (partial - master side landed)
+## Cutover (landed)
 
-`CatalogManager::CutoverToShadow(source_table_id, shadow_table_id, epoch)` flips
-roles in one sys-catalog batch: shadow -> `ACTIVE`, old source -> `RETIRED`.
+Cutover has two halves:
 
-**Important:** this master-side role flip alone does NOT redirect reads/writes.
-In YSQL the physical table is resolved per-query from `pg_class.relfilenode`
-(via `YbGetRelfileNodeId`), not from the master's generation role. A complete
-cutover must also repoint the logical relation's `pg_class.relfilenode` to the
-shadow's relfilenode (a Postgres-layer change, e.g. via a tserver RPC or the
-`swap_relation_files` mechanics). That PG repoint is the remaining
-correctness-critical piece; until it lands, the role flip is validated in
-isolation (test asserts the roles, not query routing).
+1. **Master role flip** - `CatalogManager::CutoverToShadow(source, shadow, epoch)`
+   flips generation roles in one sys-catalog batch: shadow -> `ACTIVE`, old
+   source -> `RETIRED`. This governs visibility/enumeration/GC.
+2. **Postgres relfilenode repoint** - `yb_finalize_online_schema_change(rel
+   regclass, migration_id text)` (a `yb_db_admin` SQL function) repoints the
+   logical relation's `pg_class.relfilenode` to the shadow's relfilenode. This
+   is the load-bearing step: in YSQL the physical table is resolved per-query
+   from `pg_class.relfilenode` (via `YbGetRelfileNodeId`), not from the master's
+   generation role, so this is what actually redirects reads/writes to the
+   copied shadow data. It sets `yb_non_ddl_txn_for_sys_tables_allowed` for the
+   catalog write and invalidates the relcache (same net effect as
+   `swap_relation_files`, minus creating a new DocDB table). The shadow's
+   relfilenode is surfaced to PG via `PgSchemaMigrationInfoPB.shadow_relfilenode`
+   (the pg table oid encoded in the shadow's physical id).
+
+Validated end to end (RF1 `FinalizeServesFromShadow` and live ysqlsh): after
+finalize, `SELECT` on the original table name serves from the shadow generation
+and returns all copied rows; `pg_class.relfilenode` has changed to the shadow's.
+
+Prototype ordering caveat: the master auto-flips roles at the `CUTOVER` phase,
+and the client calls `yb_finalize_online_schema_change` separately. For a
+quiesced source there is no concurrent DML in the window between the two.
+Coordinating them atomically (single distributed commit) and gating reads via a
+catalog-version bump is future work.
 
 ## Job wiring and SQL entry (landed)
 
@@ -233,10 +248,10 @@ record count as the source - real data parity - then roles flipped).
 
 ## Not yet done (drives later steps)
 
-- The Postgres-layer `pg_class.relfilenode` repoint at cutover (the load-bearing
-  step that actually redirects I/O). Needs a tserver RPC / PG catalog update;
-  today only the master role flip is done, so reads/writes still resolve to the
-  source generation.
+- Atomically coordinate the master role flip and the PG relfilenode repoint
+  (single distributed commit) and gate reads via a catalog-version bump, so
+  cutover is safe under concurrent DML. Today they are two steps over a quiesced
+  source, and `yb_finalize_online_schema_change` is a manual client call.
 - Make COPYING resumable/async rather than blocking the catalog bg thread for
   the clone+restore duration (bounded by a deadline today).
 - Incremental CDC replay of writes committed after the copy snapshot time

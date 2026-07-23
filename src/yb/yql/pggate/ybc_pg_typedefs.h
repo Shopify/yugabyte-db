@@ -935,6 +935,7 @@ typedef struct {
   int64_t updated_time;
   int64_t completed_time;
   const char* terminal_error;
+  YbcPgOid shadow_relfilenode;
 } YbcPgSchemaMigrationInfo;
 
 typedef struct {

@@ -2985,6 +2985,13 @@ class PgClientServiceImpl::Impl : public SessionProvider {
     if (entry.has_terminal_error()) {
       dst->set_terminal_error(StatusFromPB(entry.terminal_error()).ToString());
     }
+    // The shadow's relfilenode is the pg table oid encoded in its physical id.
+    if (!entry.shadow_table_id().empty()) {
+      auto relfilenode = GetPgsqlTableOid(entry.shadow_table_id());
+      if (relfilenode.ok()) {
+        dst->set_shadow_relfilenode(*relfilenode);
+      }
+    }
   }
 
   Status StartSchemaMigration(

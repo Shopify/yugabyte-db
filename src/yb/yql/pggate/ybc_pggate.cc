@@ -3281,6 +3281,7 @@ void FillSchemaMigrationInfo(
       .completed_time = YBCGetPgCallbacks()->UnixEpochToPostgresEpoch(
           static_cast<int64_t>(HybridTime(src.completed_ht()).GetPhysicalValueMicros())),
       .terminal_error = YBCPAllocStdString(src.terminal_error()),
+      .shadow_relfilenode = src.shadow_relfilenode(),
   };
 }
 

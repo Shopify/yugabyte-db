@@ -6022,6 +6022,78 @@ yb_cancel_schema_migration(PG_FUNCTION_ARGS)
 }
 
 /*
+ * yb_finalize_online_schema_change(rel regclass, migration_id text) -> bool
+ *   Repoints the given relation's pg_class.relfilenode at the migration's shadow
+ *   generation, so future reads/writes resolve to the copied (shadow) DocDB
+ *   table. This is the Postgres-layer half of cutover; the master flips the
+ *   generation roles separately. Prototype: assumes the source is quiesced.
+ */
+Datum
+yb_finalize_online_schema_change(PG_FUNCTION_ARGS)
+{
+	if (!IsYbDbAdminUser(GetUserId()))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to finalize an online schema change")));
+
+	Oid			relid = PG_GETARG_OID(0);
+	char	   *migration_id = text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+	/* Find the migration and its shadow relfilenode. */
+	YbcPgSchemaMigrationInfo *migrations = NULL;
+	size_t		num_migrations = 0;
+
+	HandleYBStatus(YBCGetSchemaMigrations(NULL, &migrations, &num_migrations));
+
+	Oid			shadow_relfilenode = InvalidOid;
+
+	for (size_t i = 0; i < num_migrations; ++i)
+	{
+		if (strcmp(migrations[i].migration_id, migration_id) == 0)
+		{
+			shadow_relfilenode = migrations[i].shadow_relfilenode;
+			break;
+		}
+	}
+
+	if (!OidIsValid(shadow_relfilenode))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("migration %s has no shadow generation to finalize",
+						migration_id)));
+
+	/*
+	 * Repoint pg_class.relfilenode of the logical relation to the shadow's
+	 * relfilenode (the shadow DocDB table already exists and holds the copied
+	 * data), then invalidate the relcache. This is the same net effect as
+	 * swap_relation_files, minus creating a new DocDB table.
+	 *
+	 * Allow a non-DDL write to the system catalog for this session (this
+	 * function is invoked as a plain SQL function, not a DDL statement).
+	 */
+	(void) set_config_option("yb_non_ddl_txn_for_sys_tables_allowed", "true",
+							 PGC_USERSET, PGC_S_SESSION, GUC_ACTION_LOCAL,
+							 true /* changeVal */, 0, false /* is_reload */);
+
+	Relation	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+	HeapTuple	reltup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+
+	if (!HeapTupleIsValid(reltup))
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+
+	Form_pg_class relform = (Form_pg_class) GETSTRUCT(reltup);
+
+	relform->relfilenode = shadow_relfilenode;
+	CatalogTupleUpdate(pg_class, &reltup->t_self, reltup);
+	CacheInvalidateRelcacheByTuple(reltup);
+
+	heap_freetuple(reltup);
+	table_close(pg_class, RowExclusiveLock);
+
+	PG_RETURN_BOOL(true);
+}
+
+/*
  * yb_get_schema_migrations(state_filter text) -> setof record
  *   Backs the yb_schema_migrations view. The optional state_filter is applied
  *   master-side; the outer SQL WHERE can further filter (e.g. by migration_id).

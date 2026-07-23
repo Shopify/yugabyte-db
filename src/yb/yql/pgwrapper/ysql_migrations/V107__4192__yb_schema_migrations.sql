@@ -31,7 +31,10 @@ BEGIN;
      '{i,o,o,o,o,o,o,o,o}',
      '{state_filter,migration_id,work_kind,source_table_id,tablet_id,state,' ||
      'rows_done,rows_total,updated_time}',
-     NULL, NULL, 'yb_get_schema_migration_progress', NULL, NULL, NULL)
+     NULL, NULL, 'yb_get_schema_migration_progress', NULL, NULL, NULL),
+    (8123, 'yb_finalize_online_schema_change', 11, 10, 12, 1, 0, 0, '-', 'f', false,
+     false, true, false, 'v', 'u', 2, 0, 16, '2205 25', NULL, NULL,
+     '{rel,migration_id}', NULL, NULL, 'yb_finalize_online_schema_change', NULL, NULL, NULL)
   ON CONFLICT DO NOTHING;
 
   -- Dependency records (pg_depend has no OID/unique constraint; guard manually).
@@ -46,7 +49,8 @@ BEGIN;
         (0, 0, 0, 1255, 8119, 0, 'p'),
         (0, 0, 0, 1255, 8120, 0, 'p'),
         (0, 0, 0, 1255, 8121, 0, 'p'),
-        (0, 0, 0, 1255, 8122, 0, 'p');
+        (0, 0, 0, 1255, 8122, 0, 'p'),
+        (0, 0, 0, 1255, 8123, 0, 'p');
     END IF;
   END $$;
 COMMIT;
@@ -57,6 +61,8 @@ REVOKE EXECUTE ON FUNCTION yb_start_online_schema_change(regclass, text, text) F
 GRANT EXECUTE ON FUNCTION yb_start_online_schema_change(regclass, text, text) TO yb_db_admin;
 REVOKE EXECUTE ON FUNCTION yb_cancel_schema_migration(text) FROM public;
 GRANT EXECUTE ON FUNCTION yb_cancel_schema_migration(text) TO yb_db_admin;
+REVOKE EXECUTE ON FUNCTION yb_finalize_online_schema_change(regclass, text) FROM public;
+GRANT EXECUTE ON FUNCTION yb_finalize_online_schema_change(regclass, text) TO yb_db_admin;
 
 -- Read-only status view.
 CREATE OR REPLACE VIEW pg_catalog.yb_schema_migrations WITH (use_initdb_acl = true) AS

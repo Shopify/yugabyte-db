@@ -336,6 +336,60 @@ TEST_F(PgOnlineSchemaChangeTest, MigrationCopiesAndCutsOver) {
   ASSERT_TRUE(shadow->LockForRead()->is_active_generation());
 }
 
+// Full live-serving migration entirely from SQL: start via
+// yb_start_online_schema_change, wait for the job to copy+cutover, then
+// yb_finalize_online_schema_change repoints the relation's relfilenode to the
+// shadow. After finalize, SELECT on the original table name serves from the
+// shadow generation and returns all the copied rows.
+TEST_F(PgOnlineSchemaChangeTest, FinalizeServesFromShadow) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_enable_schema_migration_admission) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_schema_migration_create_shadow) = true;
+
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE srv (id int PRIMARY KEY, v text)"));
+  ASSERT_OK(conn.Execute(
+      "INSERT INTO srv SELECT g, 'v' || g FROM generate_series(1, 100) g"));
+
+  const auto relfilenode_before = ASSERT_RESULT(conn.FetchRow<PGOid>(
+      "SELECT relfilenode FROM pg_class WHERE relname = 'srv'"));
+
+  // Start the migration via SQL and wait for it to finish (copy + cutover).
+  const auto migration_id = ASSERT_RESULT(conn.FetchRow<std::string>(
+      "SELECT yb_start_online_schema_change('srv'::regclass, "
+      "'ALTER TABLE srv ADD c int', NULL)"));
+  ASSERT_FALSE(migration_id.empty());
+
+  auto* mini_master = ASSERT_RESULT(cluster_->GetLeaderMiniMaster());
+  auto& mgr = mini_master->master()->schema_migration_manager();
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    auto pb = VERIFY_RESULT(mgr.GetSchemaMigration(migration_id));
+    if (pb.state() == master::SysSchemaMigrationEntryPB::FAILED) {
+      return STATUS_FORMAT(IllegalState, "migration failed: $0",
+                           StatusFromPB(pb.terminal_error()));
+    }
+    return pb.state() == master::SysSchemaMigrationEntryPB::SUCCEEDED;
+  }, 120s, "migration reaches SUCCEEDED"));
+
+  // Finalize: repoint pg_class.relfilenode to the shadow.
+  ASSERT_TRUE(ASSERT_RESULT(conn.FetchRow<bool>(Format(
+      "SELECT yb_finalize_online_schema_change('srv'::regclass, '$0')", migration_id))));
+
+  // The relation's relfilenode changed (now the shadow's).
+  const auto relfilenode_after = ASSERT_RESULT(conn.FetchRow<PGOid>(
+      "SELECT relfilenode FROM pg_class WHERE relname = 'srv'"));
+  ASSERT_NE(relfilenode_before, relfilenode_after);
+
+  // Reads on the original table name now serve from the shadow generation and
+  // return all copied rows. Use a fresh connection to avoid any stale relcache.
+  auto conn2 = ASSERT_RESULT(Connect());
+  const auto row_count = ASSERT_RESULT(conn2.FetchRow<int64_t>(
+      "SELECT count(*) FROM srv"));
+  ASSERT_EQ(row_count, 100);
+  const auto max_id = ASSERT_RESULT(conn2.FetchRow<int32_t>(
+      "SELECT max(id) FROM srv"));
+  ASSERT_EQ(max_id, 100);
+}
+
 // The master can create a hidden SHADOW physical generation of a live YSQL
 // table: it shares the source's logical identity (pg_table_id) but has a fresh
 // distinct physical id, is owned by the migration, and is excluded from the

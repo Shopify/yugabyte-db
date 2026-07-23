@@ -242,3 +242,6 @@ GRANT EXECUTE ON FUNCTION yb_start_online_schema_change(regclass, text, text)
 REVOKE EXECUTE ON FUNCTION yb_cancel_schema_migration(text) FROM public;
 GRANT EXECUTE ON FUNCTION yb_cancel_schema_migration(text)
   TO yb_db_admin;
+REVOKE EXECUTE ON FUNCTION yb_finalize_online_schema_change(regclass, text) FROM public;
+GRANT EXECUTE ON FUNCTION yb_finalize_online_schema_change(regclass, text)
+  TO yb_db_admin;

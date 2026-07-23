@@ -12149,6 +12149,13 @@
   proargnames => '{migration_id}',
   prosrc => 'yb_cancel_schema_migration' },
 
+{ oid => '8123',
+  descr => 'finalize an online schema change (repoint relfilenode to shadow)',
+  proname => 'yb_finalize_online_schema_change', provolatile => 'v',
+  proparallel => 'u', prorettype => 'bool', proargtypes => 'regclass text',
+  proargnames => '{rel,migration_id}',
+  prosrc => 'yb_finalize_online_schema_change' },
+
 { oid => '8121', descr => 'get online schema change migrations',
   proname => 'yb_get_schema_migrations', prorows => '100',
   proretset => 't', provolatile => 'v', proisstrict => 'f', proparallel => 'u',

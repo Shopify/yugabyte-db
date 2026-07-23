@@ -1402,6 +1402,9 @@ message PgSchemaMigrationInfoPB {
   fixed64 updated_ht = 11;
   fixed64 completed_ht = 12;
   string terminal_error = 13;
+  // The shadow generation's relfilenode (low 32 bits of its physical table id).
+  // Set once SHADOW_CREATING has run. Used by cutover to repoint pg_class.
+  uint32 shadow_relfilenode = 14;
 }
 
 message PgGetSchemaMigrationRequestPB {
