@@ -88,6 +88,23 @@ TEST_F(SchemaMigrationManagerITest, AdmitAndSucceed) {
   ASSERT_OK(GetState(id));
 }
 
+// The executor advances through the PREFLIGHT -> SHADOW_CREATING -> COPYING ->
+// CUTOVER phase pipeline before reaching SUCCEEDED.
+TEST_F(SchemaMigrationManagerITest, PhasePipeline) {
+  auto id = ASSERT_RESULT(StartOne());
+  // The job must pass through CUTOVER (the last phase) at some point. Since the
+  // executor advances one phase per bg tick, poll for it before terminal.
+  bool saw_cutover = false;
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    auto pb = VERIFY_RESULT(manager().GetSchemaMigration(id));
+    if (pb.phase() == "CUTOVER") {
+      saw_cutover = true;
+    }
+    return saw_cutover || pb.state() == SysSchemaMigrationEntryPB::SUCCEEDED;
+  }, 30s, "job reaches CUTOVER phase or succeeds"));
+  ASSERT_OK(WaitForState(id, SysSchemaMigrationEntryPB::SUCCEEDED));
+}
+
 // A duplicate request_id resolves to the same job instead of creating a second.
 TEST_F(SchemaMigrationManagerITest, RequestIdIdempotency) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_schema_migration_in_running) = true;

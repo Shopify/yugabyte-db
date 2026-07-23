@@ -98,12 +98,39 @@ Explicit exclusions added at the enumeration seams that do NOT go through
   reconcile. A rollback with a live shadow present requires the migration to be
   cancelled first (tracked with the job lifecycle, not here).
 
+## Executor phase pipeline (landed)
+
+The master-owned job executor (`SchemaMigrationManager::AdvanceJob`) now drives
+an observable phase pipeline inside the `RUNNING` state, advancing one phase per
+background tick and persisting each transition:
+
+```
+NEW -> RUNNING[PREFLIGHT -> SHADOW_CREATING -> COPYING -> CUTOVER] -> SUCCEEDED
+```
+
+These phases surface through `yb_schema_migrations.phase` and
+`yb_schema_migration_progress.state`, so a consumer sees a real lifecycle. No
+DocDB storage work is performed yet - no table is mutated - so this is safe to
+run (behind the preview gate) while the actual per-phase backend is built. The
+phases are the seams where that backend plugs in:
+
+| Phase | Will do (future) |
+|---|---|
+| `PREFLIGHT` | validate DDL/target, reject xCluster/unsupported shapes |
+| `SHADOW_CREATING` | create the hidden `SHADOW` generation (below) |
+| `COPYING` | fixed-HT distributed copy + CDC replay into the shadow |
+| `CUTOVER` | barrier + adopt the shadow into the source OID |
+
 ## Not yet done (drives later steps)
 
 - Creating a shadow generation via `CreateTable` with `pg_table_id` set to the
-  source logical id and `physical_generation_role = SHADOW` (Step: wire into the
-  migration job).
-- Adopting a caught-up shadow into the source OID at cutover (roadmap Section 3,
-  the `tablecmds.c` `make_new_heap`/`finish_heap_swap` seam).
+  source logical id and `physical_generation_role = SHADOW` (the
+  `SHADOW_CREATING` phase). This needs master `CreateTable` plumbing to accept
+  the role + owning migration id, and to allocate a physical id without exposing
+  the table.
+- Adopting a caught-up shadow into the source OID at cutover (the `CUTOVER`
+  phase; roadmap Section 3, the `tablecmds.c` `make_new_heap`/`finish_heap_swap`
+  seam). The current in-tree rewrite still copies inline; adoption must skip the
+  copy and index rebuild and instead swap in the already-populated shadow.
 - Migration-driven GC of `SHADOW` (on cancel) and `RETIRED` (after retention).
 - Preflight rejection of explicit operations targeting a shadow physical id.

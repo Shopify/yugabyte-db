@@ -41,7 +41,24 @@ namespace yb::master {
 
 namespace {
 
+// Execution phases within the RUNNING state. The executor advances one phase per
+// tick and persists each transition, so the status/progress surface reflects a
+// real pipeline. These map to the roadmap Section 2.7 state machine; the actual
+// DocDB shadow-copy/replay/cutover work is not performed yet (no table is
+// mutated) - this is the observable skeleton the real backend plugs into.
 const char* kPhasePreflight = "PREFLIGHT";
+const char* kPhaseShadowCreating = "SHADOW_CREATING";
+const char* kPhaseCopying = "COPYING";
+const char* kPhaseCutover = "CUTOVER";
+
+// Returns the next phase after `phase`, or nullptr if `phase` is the last one
+// (after which the job succeeds).
+const char* NextPhase(const std::string& phase) {
+  if (phase == kPhasePreflight) return kPhaseShadowCreating;
+  if (phase == kPhaseShadowCreating) return kPhaseCopying;
+  if (phase == kPhaseCopying) return kPhaseCutover;
+  return nullptr;  // kPhaseCutover is terminal -> SUCCEEDED.
+}
 
 }  // namespace
 
@@ -216,16 +233,30 @@ Result<bool> SchemaMigrationManager::AdvanceJob(
       if (FLAGS_TEST_pause_schema_migration_in_running) {
         return false;
       }
-      // Skeleton executor: no real work is performed. A future change wires the
-      // shadow copy/replay/cutover phases in here.
       if (FLAGS_TEST_fail_schema_migration_in_running) {
         pb.set_state(SysSchemaMigrationEntryPB::FAILED);
         StatusToPB(
             STATUS(NotSupported, "schema migration executor not implemented (test failure)"),
             pb.mutable_terminal_error());
-      } else {
-        pb.set_state(SysSchemaMigrationEntryPB::SUCCEEDED);
+        pb.set_updated_ht(now);
+        pb.set_completed_ht(now);
+        RETURN_NOT_OK(sys_catalog_->Upsert(epoch, job.get()));
+        l.Commit();
+        return true;
       }
+      // Advance one execution phase per tick. No DocDB storage work is performed
+      // yet (no table is mutated); this drives the observable pipeline that the
+      // real shadow-create / copy / replay / cutover backend will implement.
+      const char* next = NextPhase(pb.phase());
+      if (next != nullptr) {
+        pb.set_phase(next);
+        pb.set_updated_ht(now);
+        RETURN_NOT_OK(sys_catalog_->Upsert(epoch, job.get()));
+        l.Commit();
+        return true;
+      }
+      // Reached the end of the phase pipeline.
+      pb.set_state(SysSchemaMigrationEntryPB::SUCCEEDED);
       pb.set_updated_ht(now);
       pb.set_completed_ht(now);
       RETURN_NOT_OK(sys_catalog_->Upsert(epoch, job.get()));
