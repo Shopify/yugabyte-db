@@ -38,6 +38,9 @@
 #include "yb/master/mini_master.h"
 #include "yb/master/schema_migration/schema_migration_manager.h"
 
+#include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_peer.h"
+
 #include "yb/yql/pgwrapper/libpq_utils.h"
 #include "yb/yql/pgwrapper/pg_mini_test_base.h"
 
@@ -101,6 +104,18 @@ class PgOnlineSchemaChangeTest : public PgMiniTestBase {
       }
     }
     return running;
+  }
+
+  // Count regular-DB DocDB records across a table's tablet leaders (one leader
+  // per tablet, so replicas are not double-counted). For a freshly loaded table
+  // with no updates/deletes this equals the row count.
+  Result<size_t> CountDbRecords(const TableId& table_id) {
+    size_t total = 0;
+    for (const auto& peer : ListTableActiveTabletLeadersPeers(cluster_.get(), table_id)) {
+      auto tablet = VERIFY_RESULT(peer->shared_tablet());
+      total += VERIFY_RESULT(tablet->TEST_CountDBRecords(docdb::StorageDbType::kRegular));
+    }
+    return total;
   }
 
   // Start a migration for `relname` and wait until it reaches SUCCEEDED (or fail
@@ -400,16 +415,11 @@ TEST_F(PgOnlineSchemaChangeTest, ShadowGenerationHiddenFromListTables) {
 }
 
 // End-to-end on a multi-tablet table across an RF3 cluster: the migration
-// creates a hidden shadow generation with the same number of tablets spread
-// across all tservers and cuts over (shadow -> ACTIVE, source -> RETIRED).
-// Exercises the per-tablet, cross-node shadow-generation path that the single
-// tablet/RF1 tests do not.
-//
-// NOTE: the COPYING phase is currently a no-op (the shadow is created empty);
-// the tablet-clone data copy is validated to hard-link SSTs but its
-// post-processing (tablets -> RUNNING, snapshot restore) is not yet wired. See
-// architecture/design/online-schema-changes/generation-metadata.md. So this
-// test does NOT assert row-level data parity yet.
+// creates a hidden shadow generation, clones every source tablet into the
+// paired shadow tablet across all tservers, restores the data, and cuts over
+// (shadow -> ACTIVE, source -> RETIRED). Verifies the shadow holds the same
+// DocDB records as the source (real data parity) and the role flip. Exercises
+// the per-tablet, cross-node path the single tablet/RF1 tests do not.
 TEST_F(PgOnlineSchemaChangeRf3Test, MultiTabletMigration) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_enable_schema_migration_admission) = true;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_schema_migration_create_shadow) = true;
@@ -420,10 +430,16 @@ TEST_F(PgOnlineSchemaChangeRf3Test, MultiTabletMigration) {
   ASSERT_OK(conn.Execute(
       "INSERT INTO mt SELECT g, 'v' || g FROM generate_series(1, 500) g"));
 
+  // Flush so the source rows are in SSTs; the copy snapshots/flushes anyway, but
+  // this makes the DocDB record count comparison meaningful.
+  ASSERT_OK(cluster_->FlushTablets());
+
   auto source = ASSERT_RESULT(FindUserTable("mt"));
   const auto source_id = source->id();
   const auto source_tablets = ASSERT_RESULT(RunningTabletCount(source_id));
   ASSERT_GE(source_tablets, 4);
+  const auto source_records = ASSERT_RESULT(CountDbRecords(source_id));
+  ASSERT_GT(source_records, 0);
 
   auto pb = ASSERT_RESULT(RunMigrationToCompletion(&conn, "mt"));
   ASSERT_FALSE(pb.shadow_table_id().empty());
@@ -435,6 +451,12 @@ TEST_F(PgOnlineSchemaChangeRf3Test, MultiTabletMigration) {
   // Shadow has the same number of running tablets as the source did, spread
   // across the RF3 cluster.
   ASSERT_EQ(ASSERT_RESULT(RunningTabletCount(pb.shadow_table_id())), source_tablets);
+
+  // Real data parity: the shadow's tablets hold the same DocDB records as the
+  // source (clone hard-linked the SSTs and restore loaded them).
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    return VERIFY_RESULT(CountDbRecords(pb.shadow_table_id())) == source_records;
+  }, 60s, "shadow tablets hold the copied records"));
 
   // Cutover flipped the roles.
   ASSERT_TRUE(source->LockForRead()->is_retired_generation());

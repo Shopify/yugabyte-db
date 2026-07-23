@@ -5174,6 +5174,11 @@ Result<TableId> CatalogManager::CreateShadowGeneration(
     req.set_pg_table_id(l->pb.pg_table_id().empty() ? source_table_id : l->pb.pg_table_id());
     req.set_physical_generation_role(SysTablesEntryPB::SHADOW);
     req.set_owning_migration_id(migration_id);
+    // Create the shadow's tablets in CREATING state so the COPYING-phase tablet
+    // clone materializes them (like the clone workflow's target). If they were
+    // created RUNNING, the clone would reject them as already present and copy
+    // nothing.
+    req.set_is_clone(true);
   }
 
   // Same number of tablets as the source.
@@ -5204,40 +5209,174 @@ Result<TableId> CatalogManager::CreateShadowGeneration(
   return req.table_id();
 }
 
+Result<TxnSnapshotId> CatalogManager::CreateAndWaitTableSnapshot(
+    const TableInfoPtr& table, int64_t leader_term, CoarseTimePoint deadline) {
+  auto& coordinator = master_->snapshot_coordinator();
+  google::protobuf::RepeatedPtrField<TableIdentifierPB> tables;
+  tables.Add()->set_table_id(table->id());
+  // Collect just this table and its tablets. Do NOT set kAddIndexes: index
+  // collection is unsupported for a single YSQL table id and the shadow slice is
+  // a single heap with no secondary indexes.
+  auto entries = VERIFY_RESULT(CollectEntriesFromActiveSysCatalog(
+      tables, CollectFlags{CollectFlag::kSucceedIfCreateInProgress}));
+  auto snapshot_id = VERIFY_RESULT(coordinator.Create(
+      entries, /* imported */ false, leader_term, deadline, /* retention_duration_hours */ 0));
+
+  RETURN_NOT_OK(Wait(
+      [&coordinator, &snapshot_id]() -> Result<bool> {
+        ListSnapshotsResponsePB resp;
+        RETURN_NOT_OK(coordinator.ListSnapshots(
+            snapshot_id, /* list_deleted */ false, ListSnapshotsDetailOptionsPB(), &resp));
+        if (resp.snapshots_size() != 1) {
+          return false;
+        }
+        const auto state = resp.snapshots(0).entry().state();
+        if (state == SysSnapshotEntryPB::FAILED || state == SysSnapshotEntryPB::CANCELLED) {
+          return STATUS_FORMAT(IllegalState, "Snapshot $0 entered state $1", snapshot_id, state);
+        }
+        return state == SysSnapshotEntryPB::COMPLETE;
+      },
+      deadline, Format("Waiting for snapshot $0 to complete", snapshot_id)));
+  return snapshot_id;
+}
+
 Status CatalogManager::CopyGenerationData(
     const TableId& source_table_id, const TableId& shadow_table_id, const LeaderEpoch& epoch) {
   auto source = VERIFY_RESULT(FindTableById(source_table_id));
   auto shadow = VERIFY_RESULT(FindTableById(shadow_table_id));
 
-  // The shadow was created with the same partition schema and tablet count as
-  // the source, so tablets zip 1:1 by partition range.
+  // The shadow was created (is_clone=true) with the same partition schema and
+  // tablet count as the source; its tablets are in CREATING, to be materialized
+  // by the clone. Zip source/shadow tablets 1:1 by partition range.
   auto source_tablets = VERIFY_RESULT(source->GetTablets(GetTabletsMode::kOrderByPartitions));
   auto shadow_tablets = VERIFY_RESULT(shadow->GetTablets(GetTabletsMode::kOrderByPartitions));
   SCHECK_EQ(
       source_tablets.size(), shadow_tablets.size(), IllegalState,
       "Source and shadow tablet counts differ; cannot copy");
 
-  // TODO(online-schema-change): implement the real data copy.
-  //
-  // Validated so far (see architecture/design/online-schema-changes/
-  // generation-metadata.md): snapshotting the source and issuing per-tablet
-  // AsyncCloneTablet with a fresh clone_request_seq_no DOES hard-link the source
-  // SSTs into the paired shadow tablets across an RF3, multi-tablet cluster.
-  //
-  // The remaining gap is clone post-processing: the cloned shadow tablets do not
-  // reach RUNNING in the master's view, and the target snapshot must then be
-  // Restore()d to load the hard-linked data into the tablets' active RocksDB.
-  // That orchestration (materialize clone tablets -> wait RUNNING -> restore ->
-  // clear metacaches) is exactly what CloneStateManager drives at namespace
-  // scope. Wiring an equivalent per-table clone state machine (or reusing
-  // CloneStateManager) is the correct next step; hand-rolling the individual
-  // clone ops here leaves the tablets stuck in CREATING.
-  //
-  // Until that lands, COPYING is a no-op: the shadow is created empty and the
-  // cutover role-flip is validated independently.
-  LOG(INFO) << "COPYING is not yet implemented; shadow " << shadow_table_id
-            << " for source " << source_table_id << " (" << source_tablets.size()
-            << " tablet(s)) is left empty. Data copy is deferred (see design doc).";
+  const auto deadline = CoarseMonoClock::Now() + 300s;
+
+  // Fresh, non-zero clone sequence number from the source namespace (seq_no 0 is
+  // the "never cloned" sentinel and every clone would be trivially skipped).
+  uint32_t clone_seq_no;
+  NamespaceId namespace_id;
+  {
+    auto source_lock = source->LockForRead();
+    namespace_id = source_lock->namespace_id();
+    auto ns = VERIFY_RESULT(FindNamespaceById(namespace_id));
+    auto ns_lock = ns->LockForWrite();
+    clone_seq_no = ns_lock->pb.clone_request_seq_no() + 1;
+    ns_lock.mutable_data()->pb.set_clone_request_seq_no(clone_seq_no);
+    RETURN_NOT_OK(sys_catalog_->Upsert(epoch, ns));
+    ns_lock.Commit();
+  }
+
+  // Snapshot the source (provides the SSTs the clone hard-links) and wait.
+  auto source_snapshot_id = VERIFY_RESULT(
+      CreateAndWaitTableSnapshot(source, epoch.leader_term, deadline));
+
+  // Create the target snapshot as *imported* (shadow tablets are still CREATING,
+  // so we must not wait for a live snapshot). This allocates the target snapshot
+  // id/dirs the clone writes into, and is later Restore()d to load the data.
+  TxnSnapshotId target_snapshot_id;
+  {
+    CreateSnapshotRequestPB create_req;
+    CreateSnapshotResponsePB create_resp;
+    create_req.mutable_tables()->Add()->set_table_id(shadow_table_id);
+    create_req.set_add_indexes(false);
+    create_req.set_imported(true);
+    RETURN_NOT_OK(DoCreateSnapshot(&create_req, &create_resp, deadline, epoch));
+    if (create_resp.has_error()) {
+      return StatusFromPB(create_resp.error().status());
+    }
+    target_snapshot_id = VERIFY_RESULT(FullyDecodeTxnSnapshotId(create_resp.snapshot_id()));
+  }
+
+  {
+    auto shadow_lock = shadow->LockForRead();
+    for (size_t i = 0; i < source_tablets.size(); ++i) {
+      const auto& source_tablet = source_tablets[i];
+      const auto& shadow_tablet = shadow_tablets[i];
+
+      // Seed the shadow tablet's consensus peers from the source so the cloned
+      // replicas are not tombstoned on first heartbeat (mirrors clone).
+      {
+        auto sl = source_tablet->LockForRead();
+        auto tl = shadow_tablet->LockForWrite();
+        if (tl->pb.committed_consensus_state().config().peers_size() == 0 &&
+            sl->pb.committed_consensus_state().config().peers_size() != 0) {
+          tl.mutable_data()->pb.mutable_committed_consensus_state()->mutable_config()
+              ->mutable_peers()->CopyFrom(sl->pb.committed_consensus_state().config().peers());
+          RETURN_NOT_OK(sys_catalog_->Upsert(epoch, shadow_tablet));
+          tl.Commit();
+        }
+      }
+
+      tablet::CloneTabletRequestPB req;
+      req.set_tablet_id(source_tablet->id());
+      req.set_target_tablet_id(shadow_tablet->id());
+      req.set_source_snapshot_id(source_snapshot_id.data(), source_snapshot_id.size());
+      req.set_target_snapshot_id(target_snapshot_id.data(), target_snapshot_id.size());
+      req.set_target_table_id(shadow_table_id);
+      req.set_target_namespace_name(shadow_lock->namespace_name());
+      req.set_target_namespace_id(shadow_lock->namespace_id());
+      req.set_target_pg_table_id(shadow_lock->pb.pg_table_id());
+      req.set_clone_request_seq_no(clone_seq_no);
+      *req.mutable_target_schema() = shadow_lock->pb.schema();
+      *req.mutable_target_partition_schema() = shadow_lock->pb.partition_schema();
+
+      auto call = std::make_shared<AsyncCloneTablet>(
+          master_, AsyncTaskPool(), source_tablet, epoch, std::move(req));
+      RETURN_NOT_OK(ScheduleTask(call));
+    }
+  }
+  LOG(INFO) << "Scheduled data copy of " << source_tablets.size() << " tablet(s) from "
+            << source_table_id << " into shadow " << shadow_table_id;
+
+  // Wait for the clone to materialize every shadow tablet to RUNNING.
+  const auto expected_tablets = shadow_tablets.size();
+  RETURN_NOT_OK(Wait(
+      [this, &shadow_table_id, expected_tablets]() -> Result<bool> {
+        auto s = FindTableById(shadow_table_id);
+        if (!s.ok()) return false;
+        auto tablets_res = (*s)->GetTablets();
+        if (!tablets_res.ok()) return false;
+        size_t running = 0;
+        for (const auto& t : *tablets_res) {
+          if (t->LockForRead()->pb.state() == SysTabletsEntryPB::RUNNING) {
+            ++running;
+          }
+        }
+        return running == expected_tablets;
+      },
+      deadline, Format("Waiting for shadow $0 tablets to become RUNNING", shadow_table_id)));
+
+  // Restore the target snapshot to load the hard-linked data into the shadow
+  // tablets' active RocksDB, at the target snapshot's own hybrid time.
+  HybridTime restore_at;
+  {
+    ListSnapshotsResponsePB resp;
+    RETURN_NOT_OK(master_->snapshot_coordinator().ListSnapshots(
+        target_snapshot_id, /* list_deleted */ false, ListSnapshotsDetailOptionsPB(), &resp));
+    SCHECK_EQ(resp.snapshots_size(), 1, IllegalState, "Target snapshot not found");
+    restore_at = HybridTime::FromPB(resp.snapshots(0).entry().snapshot_hybrid_time());
+  }
+  auto restoration_id = VERIFY_RESULT(master_->snapshot_coordinator().Restore(
+      target_snapshot_id, restore_at, epoch.leader_term));
+  RETURN_NOT_OK(Wait(
+      [this, &restoration_id]() -> Result<bool> {
+        ListSnapshotRestorationsResponsePB resp;
+        RETURN_NOT_OK(master_->snapshot_coordinator().ListRestorations(
+            restoration_id, TxnSnapshotId::Nil(), &resp));
+        if (resp.restorations_size() != 1) {
+          return false;
+        }
+        return resp.restorations(0).entry().state() == SysSnapshotEntryPB::RESTORED;
+      },
+      deadline, Format("Waiting for restoration $0 to complete", restoration_id)));
+
+  LOG(INFO) << "Data copy complete for shadow " << shadow_table_id << " ("
+            << expected_tablets << " tablet(s))";
   return Status::OK();
 }
 

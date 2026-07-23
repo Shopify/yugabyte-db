@@ -344,6 +344,10 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
       const TableId& source_table_id, const TableId& shadow_table_id, const LeaderEpoch& epoch)
       EXCLUDES(mutex_);
 
+  // Snapshot a single table and wait until COMPLETE. Helper for CopyGenerationData.
+  Result<TxnSnapshotId> CreateAndWaitTableSnapshot(
+      const TableInfoPtr& table, int64_t leader_term, CoarseTimePoint deadline);
+
   // Online schema change CUTOVER phase (master side): make the shadow the ACTIVE
   // generation and mark the old one RETIRED, in one sys-catalog batch. The
   // Postgres-layer relfilenode repoint (which actually redirects I/O) is done

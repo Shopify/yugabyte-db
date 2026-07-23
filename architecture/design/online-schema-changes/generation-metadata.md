@@ -154,43 +154,44 @@ Tested by `pg_online_schema_change-test`:
 (end-to-end through the job): the shadow exists, is a `SHADOW` generation owned
 by the migration, shares the source logical id, and stays out of `ListTables`.
 
-## Copy (partial - deferred, no-op stub)
+## Copy (landed)
 
-`CatalogManager::CopyGenerationData(source_table_id, shadow_table_id, epoch)` is
-currently a **no-op stub**: the shadow is created empty and the data copy is
-deferred. What was investigated and the exact boundary reached:
+`CatalogManager::CopyGenerationData(source_table_id, shadow_table_id, epoch)`
+bulk-copies the source data into the shadow by **tablet clone** (SST hard-link)
+plus **snapshot restore**, reusing the clone infrastructure. Validated with real
+data parity on an RF3, multi-tablet (4-tablet) cluster. Steps:
 
-**Validated (works):** the tablet-clone mechanism copies data across an RF3,
-multi-tablet cluster. Snapshotting the source and issuing per-tablet
-`AsyncCloneTablet` (`tablet::CloneTabletRequestPB`) with a **fresh, non-zero**
-`clone_request_seq_no` hard-links the source SSTs into the paired shadow tablets
-on the owning tservers. Confirmed in tserver logs ("Hard-linking from
-table-<source>/tablet-... to table-<shadow>/tablet-..."). Key gotchas found:
+1. Allocate a fresh, non-zero `clone_request_seq_no` from the source namespace's
+   monotonic counter. `seq_no = 0` is the "never cloned" sentinel and every
+   clone would be trivially skipped.
+2. Snapshot the source and wait `COMPLETE` (`CreateAndWaitTableSnapshot`).
+   Entries are collected with `CollectEntriesFromActiveSysCatalog` using minimal
+   flags - NOT `kAddIndexes` (unsupported for a single YSQL table id).
+3. Create the target snapshot `imported = true` (no wait): the shadow tablets
+   are still `CREATING` (the shadow was created `is_clone = true`), so they can't
+   be live-snapshotted; this only allocates the target snapshot id/dirs the clone
+   writes into.
+4. Seed each shadow tablet's consensus peers from the source (so cloned replicas
+   are not tombstoned on first heartbeat), then issue one `AsyncCloneTablet` per
+   source/shadow tablet pair (zipped by partition range). The tserver hard-links
+   the source snapshot SSTs into the shadow tablet.
+5. Wait for every shadow tablet to reach `RUNNING` (the master leaves
+   `created_by_clone` tablets for the source replicas to materialize; they come
+   up as the cloned replicas heartbeat).
+6. `Restore()` the target snapshot at its own hybrid time and wait `RESTORED` -
+   this loads the hard-linked SSTs into the shadow tablets' active RocksDB.
 
-- `clone_request_seq_no` must be `>= 1` (allocated from the source namespace's
-  monotonic counter, like `CloneStateManager`). `seq_no = 0` is the
-  "never cloned" sentinel and every clone is trivially skipped.
-- The shadow tablets must NOT pre-exist as RUNNING tablets, or `DoApplyCloneTablet`
-  rejects them ("Clone target tablet is already present") and copies nothing.
-  Creating the shadow with `is_clone = true` puts its tablets in `CREATING` so
-  the clone materializes them.
-- The target snapshot must be created `imported = true` (no wait), because the
-  shadow tablets are still `CREATING` and cannot be live-snapshotted.
-- Source-table entry collection must NOT set `kAddIndexes` (unsupported for a
-  single YSQL table id).
+Key requirements discovered:
 
-**Blocking gap (why it is a stub):** after the clone hard-links the SSTs, the
-cloned shadow tablets do not reach `RUNNING` in the master's view, and the
-target snapshot then has to be `Restore()`d to load the hard-linked data into
-the tablets' active RocksDB. That post-processing - materialize clone tablets ->
-wait `RUNNING` -> restore -> clear metacaches - is exactly the state machine
-`CloneStateManager` runs at namespace scope. Hand-rolling the individual clone
-ops leaves the tablets stuck in `CREATING`. The correct next step is to wire an
-equivalent per-table clone state machine (or reuse `CloneStateManager`), not to
-issue clone ops directly.
+- The shadow must be created with `is_clone = true` so its tablets are `CREATING`
+  (materialized by the clone). If created `RUNNING`, `DoApplyCloneTablet` rejects
+  them ("Clone target tablet is already present") and copies nothing.
+- The `Restore` step is essential: without it the tablets are `RUNNING` with the
+  hard-linked snapshot present but the data is not in the active RocksDB.
 
-Prototype scope when implemented: quiesced source (no incremental CDC replay of
-post-snapshot writes yet); non-colocated single heap.
+Prototype scope: assumes the source is quiesced (no incremental CDC replay of
+post-snapshot writes yet); non-colocated single heap; clone runs synchronously
+inside the COPYING phase (bounded by a deadline).
 
 ## Cutover (partial - master side landed)
 
@@ -227,23 +228,19 @@ Tested by `pg_online_schema_change-test`: `MigrationCreatesShadowGeneration`
 (stops before cutover; shadow is SHADOW, owned, hidden),
 `MigrationCopiesAndCutsOver` (RF1 full pipeline to SUCCEEDED; source -> RETIRED,
 shadow -> ACTIVE), and `MultiTabletMigration` (RF3 `PgOnlineSchemaChangeRf3Test`:
-4-tablet source, shadow created with the same running tablet count across all
-tservers, roles flipped). Because COPYING is a no-op stub, these tests assert
-shadow creation / tablet layout / role flip, NOT row-level data parity.
+4-tablet source across all tservers, verifies the shadow holds the same DocDB
+record count as the source - real data parity - then roles flipped).
 
 ## Not yet done (drives later steps)
 
-- **The data copy** (`CopyGenerationData`): wire a per-table clone state machine
-  (or reuse `CloneStateManager`) that materializes the cloned shadow tablets to
-  `RUNNING` and `Restore()`s the target snapshot to load the hard-linked data.
-  The per-tablet SST hard-link is already proven; only the orchestration is
-  missing.
 - The Postgres-layer `pg_class.relfilenode` repoint at cutover (the load-bearing
   step that actually redirects I/O). Needs a tserver RPC / PG catalog update;
-  today only the master role flip is done.
+  today only the master role flip is done, so reads/writes still resolve to the
+  source generation.
+- Make COPYING resumable/async rather than blocking the catalog bg thread for
+  the clone+restore duration (bounded by a deadline today).
 - Incremental CDC replay of writes committed after the copy snapshot time
-  (the copy will assume a quiesced source initially).
+  (the copy currently assumes a quiesced source).
 - Migration-driven GC of `SHADOW` (on cancel) and `RETIRED` (after retention).
 - Preflight rejection of explicit operations targeting a shadow physical id.
-- Colocated / indexed / geo shapes (copy will zip tablets 1:1 and skip indexes
-  initially).
+- Colocated / indexed / geo shapes (copy zips tablets 1:1 and skips indexes).
