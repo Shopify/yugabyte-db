@@ -12158,6 +12158,15 @@
   proargnames => '{state_filter,migration_id,kind,state,phase,state_epoch,database_oid,table_oid,submitted_by,submitted_ddl,created_time,updated_time,terminal_error}',
   prosrc => 'yb_get_schema_migrations' },
 
+{ oid => '8122', descr => 'get online schema change migration progress',
+  proname => 'yb_get_schema_migration_progress', prorows => '1000',
+  proretset => 't', provolatile => 'v', proisstrict => 'f', proparallel => 'u',
+  prorettype => 'record', proargtypes => 'text',
+  proallargtypes => '{text,text,text,oid,oid,text,int8,int8,timestamptz}',
+  proargmodes => '{i,o,o,o,o,o,o,o,o}',
+  proargnames => '{state_filter,migration_id,work_kind,source_table_id,tablet_id,state,rows_done,rows_total,updated_time}',
+  prosrc => 'yb_get_schema_migration_progress' },
+
 { oid => '8077',
   descr => 'cancels query diagnostics bundle',
   proname => 'yb_cancel_query_diagnostics',

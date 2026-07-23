@@ -24,7 +24,14 @@ BEGIN;
      '{i,o,o,o,o,o,o,o,o,o,o,o,o}',
      '{state_filter,migration_id,kind,state,phase,state_epoch,database_oid,table_oid,' ||
      'submitted_by,submitted_ddl,created_time,updated_time,terminal_error}',
-     NULL, NULL, 'yb_get_schema_migrations', NULL, NULL, NULL)
+     NULL, NULL, 'yb_get_schema_migrations', NULL, NULL, NULL),
+    (8122, 'yb_get_schema_migration_progress', 11, 10, 12, 1, 1000, 0, '-', 'f', false,
+     false, false, true, 'v', 'u', 1, 0, 2249, '25',
+     '{25,25,25,26,26,25,20,20,1184}',
+     '{i,o,o,o,o,o,o,o,o}',
+     '{state_filter,migration_id,work_kind,source_table_id,tablet_id,state,' ||
+     'rows_done,rows_total,updated_time}',
+     NULL, NULL, 'yb_get_schema_migration_progress', NULL, NULL, NULL)
   ON CONFLICT DO NOTHING;
 
   -- Dependency records (pg_depend has no OID/unique constraint; guard manually).
@@ -38,7 +45,8 @@ BEGIN;
       ) VALUES
         (0, 0, 0, 1255, 8119, 0, 'p'),
         (0, 0, 0, 1255, 8120, 0, 'p'),
-        (0, 0, 0, 1255, 8121, 0, 'p');
+        (0, 0, 0, 1255, 8121, 0, 'p'),
+        (0, 0, 0, 1255, 8122, 0, 'p');
     END IF;
   END $$;
 COMMIT;
@@ -66,3 +74,16 @@ CREATE OR REPLACE VIEW pg_catalog.yb_schema_migrations WITH (use_initdb_acl = tr
     updated_time,
     terminal_error
   FROM yb_get_schema_migrations('');
+
+-- Per-work-unit progress detail view.
+CREATE OR REPLACE VIEW pg_catalog.yb_schema_migration_progress WITH (use_initdb_acl = true) AS
+  SELECT
+    migration_id,
+    work_kind,
+    source_table_id,
+    tablet_id,
+    state,
+    rows_done,
+    rows_total,
+    updated_time
+  FROM yb_get_schema_migration_progress('');

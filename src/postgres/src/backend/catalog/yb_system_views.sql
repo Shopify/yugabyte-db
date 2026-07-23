@@ -94,6 +94,21 @@ CREATE VIEW yb_schema_migrations AS
         terminal_error
     FROM yb_get_schema_migrations('');
 
+-- Per-work-unit detail for online schema change migrations. One row per
+-- tablet/range work unit; today a single synthetic 'JOB' row per migration
+-- until the copy/replay backend produces real progress. Filter by migration_id.
+CREATE VIEW yb_schema_migration_progress AS
+    SELECT
+        migration_id,
+        work_kind,
+        source_table_id,
+        tablet_id,
+        state,
+        rows_done,
+        rows_total,
+        updated_time
+    FROM yb_get_schema_migration_progress('');
+
 CREATE VIEW yb_pg_stat_plans AS
     SELECT *
     FROM yb_pg_stat_plans_get_all_entries() AS stat_plans(dbid oid, userid oid, queryid BIGINT, 

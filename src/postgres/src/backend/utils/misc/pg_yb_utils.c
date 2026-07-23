@@ -6095,6 +6095,88 @@ yb_get_schema_migrations(PG_FUNCTION_ARGS)
 }
 
 /*
+ * yb_get_schema_migration_progress(state_filter text) -> setof record
+ *   Backs the yb_schema_migration_progress view: per-work-unit detail for
+ *   migrations. Until the distributed copy/replay backend produces real
+ *   per-tablet/range progress rows, this emits a single synthetic whole-job
+ *   ('JOB') work unit per migration so the queryable contract (filter by
+ *   migration_id) is exercised end to end. See roadmap Section 0.3.
+ */
+Datum
+yb_get_schema_migration_progress(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+	int			i;
+	char	   *state_filter = NULL;
+#define YB_SCHEMA_MIGRATION_PROGRESS_COLS 8
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	if (!PG_ARGISNULL(0))
+		state_filter = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errmsg_internal("return type must be a row type")));
+
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	YbcPgSchemaMigrationInfo *migrations = NULL;
+	size_t		num_migrations = 0;
+
+	HandleYBStatus(YBCGetSchemaMigrations(state_filter, &migrations, &num_migrations));
+
+	for (i = 0; i < num_migrations; ++i)
+	{
+		YbcPgSchemaMigrationInfo *m = (YbcPgSchemaMigrationInfo *) migrations + i;
+		Datum		values[YB_SCHEMA_MIGRATION_PROGRESS_COLS];
+		bool		nulls[YB_SCHEMA_MIGRATION_PROGRESS_COLS];
+
+		memset(values, 0, sizeof(values));
+		memset(nulls, 0, sizeof(nulls));
+
+		values[0] = CStringGetTextDatum(m->migration_id);
+		/* work_kind: synthetic whole-job unit until real per-tablet progress. */
+		values[1] = CStringGetTextDatum("JOB");
+		/* source_table_id (oid of the source table). */
+		values[2] = ObjectIdGetDatum(m->table_oid);
+		/* tablet_id: NULL for the synthetic whole-job unit. */
+		nulls[3] = true;
+		values[4] = CStringGetTextDatum(m->state);
+		/* rows_done / rows_total: unknown for the skeleton (NULL). */
+		nulls[5] = true;
+		nulls[6] = true;
+		values[7] = TimestampTzGetDatum(m->updated_time);
+
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+
+#undef YB_SCHEMA_MIGRATION_PROGRESS_COLS
+
+	tuplestore_donestoring(tupstore);
+	MemoryContextSwitchTo(oldcontext);
+	return (Datum) 0;
+}
+
+/*
  * This PG function takes one optional bool input argument (legacy).
  * If the input argument is not specified or its value is false, this function
  * returns whether the current database is a colocated database.

@@ -73,6 +73,20 @@ TEST_F(PgSchemaMigrationTest, StartQueryAndSucceed) {
   ASSERT_EQ(kind, "ONLINE_TABLE_REWRITE");
 }
 
+// The progress view exposes one work-unit row per migration, filterable by id.
+TEST_F(PgSchemaMigrationTest, ProgressView) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_schema_migration_in_running) = true;
+  auto conn = ASSERT_RESULT(Connect());
+  auto id = ASSERT_RESULT(Start(&conn, "ALTER TABLE t ADD c int", nullptr));
+  ASSERT_OK(WaitForState(&conn, id, "RUNNING"));
+  auto rows = ASSERT_RESULT((conn.FetchRows<std::string, std::string>(Format(
+      "SELECT work_kind, state FROM yb_schema_migration_progress "
+      "WHERE migration_id = '$0'", id))));
+  ASSERT_EQ(rows.size(), 1);
+  ASSERT_EQ(std::get<0>(rows[0]), "JOB");
+  ASSERT_EQ(std::get<1>(rows[0]), "RUNNING");
+}
+
 // A duplicate request_id resolves to the same job (lost-response idempotency).
 TEST_F(PgSchemaMigrationTest, RequestIdIdempotency) {
   auto conn = ASSERT_RESULT(Connect());
