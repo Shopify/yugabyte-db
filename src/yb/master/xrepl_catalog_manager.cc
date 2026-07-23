@@ -1737,7 +1737,10 @@ Status CatalogManager::SetAllCDCSDKRetentionBarriers(
   const bool single_batch_mode = (raw_batch_size <= 0);
   const int32_t batch_size =
       single_batch_mode ? std::numeric_limits<int32_t>::max() : raw_batch_size;
-  const auto deadline = rpc->GetClientDeadline();
+  // Internal callers (e.g. the online-schema-change executor arming a slot-less
+  // stream) have no RpcContext; fall back to a bounded deadline in that case.
+  const auto deadline = rpc ? rpc->GetClientDeadline()
+                            : CoarseMonoClock::Now() + MonoDelta::FromMinutes(5);
 
   // Tables accumulated for the current batch. Cleared after each flush.
   std::vector<scoped_refptr<TableInfo>> current_batch;

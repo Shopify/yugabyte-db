@@ -60,14 +60,23 @@ namespace {
 const char* kPhasePreflight = "PREFLIGHT";
 const char* kPhaseShadowCreating = "SHADOW_CREATING";
 const char* kPhaseCopying = "COPYING";
+const char* kPhaseReplaying = "REPLAYING";
 const char* kPhaseCutover = "CUTOVER";
 
 // Returns the next phase after `phase`, or nullptr if `phase` is the last one
 // (after which the job succeeds).
+//
+// The phase order mirrors the gh-ost/LHM online-migration ordering: capture is
+// armed on the source before the snapshot (in SHADOW_CREATING, ahead of the
+// clone in COPYING), the shadow is populated from a metadata-only clone at the
+// snapshot hybrid time S (COPYING), post-S source changes are replayed into the
+// shadow (REPLAYING) until the shadow is caught up to a barrier, and the final
+// pointer swap happens under a brief fence (CUTOVER).
 const char* NextPhase(const std::string& phase) {
   if (phase == kPhasePreflight) return kPhaseShadowCreating;
   if (phase == kPhaseShadowCreating) return kPhaseCopying;
-  if (phase == kPhaseCopying) return kPhaseCutover;
+  if (phase == kPhaseCopying) return kPhaseReplaying;
+  if (phase == kPhaseReplaying) return kPhaseCutover;
   return nullptr;  // kPhaseCutover is terminal -> SUCCEEDED.
 }
 
@@ -240,12 +249,16 @@ Status SchemaMigrationManager::PerformPhaseWork(
   uint32_t table_oid;
   std::string migration_id;
   std::string shadow_table_id;
+  std::string capture_stream_id;
+  uint64_t copy_snapshot_ht;
   {
     auto l = job->LockForRead();
     database_oid = l->pb.database_oid();
     table_oid = l->pb.table_oid();
     migration_id = job->id();
     shadow_table_id = l->pb.shadow_table_id();
+    capture_stream_id = l->pb.capture_stream_id();
+    copy_snapshot_ht = l->pb.copy_snapshot_ht();
   }
   const TableId source_table_id = GetPgsqlTableId(database_oid, table_oid);
 
@@ -264,7 +277,44 @@ Status SchemaMigrationManager::PerformPhaseWork(
 
   if (phase == kPhaseCopying) {
     SCHECK(!shadow_table_id.empty(), IllegalState, "COPYING with no shadow generation");
-    return catalog_manager_->CopyGenerationData(source_table_id, shadow_table_id, epoch);
+    // gh-ost/LHM ordering: arm change capture on the source BEFORE the copy
+    // snapshot, so post-snapshot writes are retained for replay. Persist the
+    // stream id and the snapshot hybrid time S so REPLAYING can resume across a
+    // leader failover.
+    std::string stream_id = capture_stream_id;
+    if (stream_id.empty()) {
+      stream_id = VERIFY_RESULT(catalog_manager_->ArmChangeCapture(source_table_id, epoch));
+      auto l = job->LockForWrite();
+      l.mutable_data()->pb.set_capture_stream_id(stream_id);
+      RETURN_NOT_OK(sys_catalog_->Upsert(epoch, job.get()));
+      l.Commit();
+    }
+    uint64_t snapshot_ht = 0;
+    RETURN_NOT_OK(catalog_manager_->CopyGenerationData(
+        source_table_id, shadow_table_id, epoch, &snapshot_ht));
+    auto l = job->LockForWrite();
+    l.mutable_data()->pb.set_copy_snapshot_ht(snapshot_ht);
+    RETURN_NOT_OK(sys_catalog_->Upsert(epoch, job.get()));
+    l.Commit();
+    return Status::OK();
+  }
+
+  if (phase == kPhaseReplaying) {
+    SCHECK(!shadow_table_id.empty(), IllegalState, "REPLAYING with no shadow generation");
+    SCHECK(!capture_stream_id.empty(), IllegalState, "REPLAYING with no capture stream");
+    SCHECK(copy_snapshot_ht != 0, IllegalState, "REPLAYING with no copy snapshot time");
+    // Stream source changes with commit_time > S into the shadow, then establish
+    // the cutover barrier F and drain the shadow up to F. Persist F so CUTOVER
+    // (and a resumed job) can verify the shadow is caught up before the swap.
+    uint64_t barrier_ht = 0;
+    RETURN_NOT_OK(catalog_manager_->ReplayGenerationChanges(
+        source_table_id, shadow_table_id, capture_stream_id, copy_snapshot_ht, epoch,
+        &barrier_ht));
+    auto l = job->LockForWrite();
+    l.mutable_data()->pb.set_cutover_barrier_ht(barrier_ht);
+    RETURN_NOT_OK(sys_catalog_->Upsert(epoch, job.get()));
+    l.Commit();
+    return Status::OK();
   }
 
   if (phase == kPhaseCutover) {

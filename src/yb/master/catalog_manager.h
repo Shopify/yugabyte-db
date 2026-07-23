@@ -333,16 +333,34 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
       const TableId& source_table_id, const std::string& migration_id, const LeaderEpoch& epoch)
       EXCLUDES(mutex_);
 
+  // Online schema change: arm an internal (slot-less) CDCSDK change stream on
+  // the source table BEFORE the copy snapshot, so WAL/history from this point is
+  // retained and post-snapshot writes can be replayed into the shadow. Returns
+  // the stream id. Must be called ahead of CopyGenerationData.
+  Result<std::string> ArmChangeCapture(const TableId& source_table_id, const LeaderEpoch& epoch)
+      EXCLUDES(mutex_);
+
   // Online schema change COPYING phase: bulk-copy the source table's data into
   // the shadow generation at a fixed read time, by snapshotting the source and
   // cloning its tablets (SST hard-link) into the shadow's tablets. Requires the
   // shadow to share the source's partition schema and tablet count (as created
   // by CreateShadowGeneration). Blocks until the copy is scheduled and the
-  // shadow tablets are running. Prototype scope: assumes the source is quiesced
-  // (no incremental write catch-up yet).
+  // shadow tablets are running. Outputs the snapshot hybrid time S (via
+  // `snapshot_ht_out`) that anchors the copy and the start of change replay.
   Status CopyGenerationData(
-      const TableId& source_table_id, const TableId& shadow_table_id, const LeaderEpoch& epoch)
-      EXCLUDES(mutex_);
+      const TableId& source_table_id, const TableId& shadow_table_id, const LeaderEpoch& epoch,
+      uint64_t* snapshot_ht_out) EXCLUDES(mutex_);
+
+  // Online schema change REPLAYING phase: stream source changes with
+  // commit_time > `snapshot_ht` (S) from the armed capture stream and apply them
+  // idempotently (upsert/delete) into the shadow generation. Then establish a
+  // cutover barrier F = clock.Now(), drain the stream and the shadow up to F,
+  // and output F via `barrier_ht_out`. On return the shadow reflects every
+  // source write with commit_time <= F.
+  Status ReplayGenerationChanges(
+      const TableId& source_table_id, const TableId& shadow_table_id,
+      const std::string& capture_stream_id, uint64_t snapshot_ht, const LeaderEpoch& epoch,
+      uint64_t* barrier_ht_out) EXCLUDES(mutex_);
 
   // Snapshot a single table and wait until COMPLETE. Helper for CopyGenerationData.
   Result<TxnSnapshotId> CreateAndWaitTableSnapshot(

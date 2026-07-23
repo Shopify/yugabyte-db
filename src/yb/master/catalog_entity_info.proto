@@ -853,6 +853,18 @@ message SysSchemaMigrationEntryPB {
   // The physical table id (database_oid + relfilenode) of the hidden SHADOW
   // generation created during the SHADOW_CREATING phase. Empty until then.
   optional bytes shadow_table_id = 14;
+
+  // Online-migration change-capture bookkeeping (gh-ost/LHM style). An internal
+  // (slot-less) CDCSDK stream is armed on the source BEFORE the copy snapshot so
+  // WAL/history from that point is retained; its id is stored here. The copy is
+  // taken at snapshot hybrid time `copy_snapshot_ht` (S); the REPLAYING phase
+  // then streams source changes with commit_time > S into the shadow. The final
+  // cutover barrier `cutover_barrier_ht` (F) is the hybrid time at/above which
+  // the source is quiesced and the shadow must be caught up before the pointer
+  // swap. All are empty/zero until the corresponding phase sets them.
+  optional bytes capture_stream_id = 15;
+  optional fixed64 copy_snapshot_ht = 16;
+  optional fixed64 cutover_barrier_ht = 17;
 }
 
 message SchemaVersionMappingPB {

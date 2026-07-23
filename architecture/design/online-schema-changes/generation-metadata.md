@@ -259,3 +259,66 @@ record count as the source - real data parity - then roles flipped).
 - Migration-driven GC of `SHADOW` (on cancel) and `RETIRED` (after retention).
 - Preflight rejection of explicit operations targeting a shadow physical id.
 - Colocated / indexed / geo shapes (copy zips tablets 1:1 and skips indexes).
+
+## Online change replay (gh-ost/LHM ordering)
+
+The copy above (clone + snapshot restore) is a physical snapshot at a single
+hybrid time `S`; it is O(metadata) (SST hard-link), so it scales to large
+tablets, unlike a row-by-row backfill. But writes committed to the source
+*after* `S` land only on the source and would be lost at cutover. To be correct
+under concurrent DML without a whole-migration lock, the phases follow the
+classic online-migration ordering:
+
+1. **Arm capture before the snapshot** (`SHADOW_CREATING`/`COPYING`):
+   `CatalogManager::ArmChangeCapture` creates an internal, slot-less change
+   stream bound to the single source table (via
+   `CreateNewCDCStreamForNamespace` with `cdcsdk_stream_create_options
+   .bound_table_ids`, `NOEXPORT_SNAPSHOT` - we already clone the base data).
+   Arming first installs WAL/history retention barriers so records from `S`
+   onward are preserved. The stream id is persisted on the migration entry
+   (`capture_stream_id`).
+2. **Copy at `S`** (`COPYING`): existing clone + restore. `CopyGenerationData`
+   now reports the source snapshot hybrid time `S` out; it is persisted as
+   `copy_snapshot_ht`.
+3. **Replay `> S`** (`REPLAYING`): `CatalogManager::ReplayGenerationChanges`
+   polls `GetChanges` per source tablet from `S` and applies each change into
+   the corresponding shadow tablet, then establishes a barrier
+   `F = clock.Now()`, drains until each source tablet's `safe_hybrid_time >= F`,
+   and persists `F` as `cutover_barrier_ht`. On return the shadow reflects every
+   source write with `commit_time <= F`.
+4. **Cutover** (`CUTOVER`): role flip + relfilenode repoint. A brief write fence
+   at `F` (see below) closes the tail window; because the copy+replay already
+   carried the shadow to `F`, the fenced window is just the pointer swap, not the
+   whole migration.
+
+### Apply path decision: raw-KV (xCluster-style) vs logical (CDCSDK datums)
+
+The shadow is a *true clone* of the source (created via clone/snapshot, so it has
+identical DocDB column ids and, for a non-colocated YSQL table, no cotable/
+colocation key prefix). Consequences (verified against `dockv/doc_key.cc`
+`DocKeyEncoder::Schema`/`CotableId`/`ColocationId`): the row-key encoding of a
+non-colocated YSQL table carries **no table-id prefix**, so raw DocDB KV pairs
+from a source tablet transplant **verbatim** into the matching shadow tablet;
+only the packed-row `schema_version` needs remapping (identity while the shadow
+shares the source schema). This makes the raw-KV apply (the xCluster
+`XClusterWriteImplementation`/`AddRecord` path, `external_hybrid_time` write
+batch) the least-code correct option and avoids reconstructing writes from
+`DatumMessagePB` (for which there is no reverse helper in-tree - the only
+consumer hands `pg_ql_value` up to PG to re-encode). Caveats captured for later:
+colocated/cotable tables DO carry a differing key prefix (would need key
+rewriting), and a shadow with a genuinely different schema needs a real
+`schema_versions_map` remap.
+
+### Cutover fence / downtime
+
+YB offers a smoother redirect than a hard table lock: a **catalog-version bump**
+forces backends to replan against the swapped relfilenode within ~1 heartbeat
+(`FLAGS_heartbeat_interval_ms`, default 1000 ms) with no in-flight aborts;
+`WaitForYsqlBackendsCatalogVersion` can confirm all backends flipped. For a
+strict serialization instant, a momentary `LOCK TABLE ... ACCESS EXCLUSIVE`
+(cluster-wide only when `enable_object_locking_for_table_locks` is on - off by
+default on macOS, enable on the Linux test cluster) fences the swap for tens to
+low-hundreds of ms. The prototype targets: replay to `F`, brief fence for the
+swap, unfence + catalog-version bump. Full near-zero-downtime (dual-write +
+permission-state flip, mirroring the index-backfill `IndexPermissions` state
+machine) is future work.

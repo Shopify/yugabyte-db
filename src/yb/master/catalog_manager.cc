@@ -71,11 +71,17 @@
 
 #include <boost/algorithm/string/predicate.hpp>
 
+#include "yb/cdc/cdc_service.pb.h"
+#include "yb/cdc/cdc_service.proxy.h"
 #include "yb/cdc/cdc_state_table.h"
+#include "yb/cdc/cdc_types.h"
 
 #include "yb/client/client.h"
 #include "yb/client/schema.h"
+#include "yb/client/session.h"
+#include "yb/client/table.h"
 #include "yb/client/universe_key_client.h"
+#include "yb/client/yb_op.h"
 
 #include "yb/common/colocated_util.h"
 #include "yb/common/common_flags.h"
@@ -5241,7 +5247,8 @@ Result<TxnSnapshotId> CatalogManager::CreateAndWaitTableSnapshot(
 }
 
 Status CatalogManager::CopyGenerationData(
-    const TableId& source_table_id, const TableId& shadow_table_id, const LeaderEpoch& epoch) {
+    const TableId& source_table_id, const TableId& shadow_table_id, const LeaderEpoch& epoch,
+    uint64_t* snapshot_ht_out) {
   auto source = VERIFY_RESULT(FindTableById(source_table_id));
   auto shadow = VERIFY_RESULT(FindTableById(shadow_table_id));
 
@@ -5274,6 +5281,17 @@ Status CatalogManager::CopyGenerationData(
   // Snapshot the source (provides the SSTs the clone hard-links) and wait.
   auto source_snapshot_id = VERIFY_RESULT(
       CreateAndWaitTableSnapshot(source, epoch.leader_term, deadline));
+
+  // The source snapshot's hybrid time is the copy anchor S: the shadow reflects
+  // source state as of S, and change replay resumes from S. Report it out so the
+  // migration entry can persist it for the REPLAYING phase.
+  if (snapshot_ht_out != nullptr) {
+    ListSnapshotsResponsePB src_resp;
+    RETURN_NOT_OK(master_->snapshot_coordinator().ListSnapshots(
+        source_snapshot_id, /* list_deleted */ false, ListSnapshotsDetailOptionsPB(), &src_resp));
+    SCHECK_EQ(src_resp.snapshots_size(), 1, IllegalState, "Source snapshot not found");
+    *snapshot_ht_out = src_resp.snapshots(0).entry().snapshot_hybrid_time();
+  }
 
   // Create the target snapshot as *imported* (shadow tablets are still CREATING,
   // so we must not wait for a live snapshot). This allocates the target snapshot
@@ -5377,6 +5395,63 @@ Status CatalogManager::CopyGenerationData(
 
   LOG(INFO) << "Data copy complete for shadow " << shadow_table_id << " ("
             << expected_tablets << " tablet(s))";
+  return Status::OK();
+}
+
+Result<std::string> CatalogManager::ArmChangeCapture(
+    const TableId& source_table_id, const LeaderEpoch& epoch) {
+  auto source = VERIFY_RESULT(FindTableById(source_table_id));
+  NamespaceId namespace_id;
+  {
+    auto l = source->LockForRead();
+    namespace_id = l->namespace_id();
+  }
+
+  // Create an internal, slot-less CDCSDK stream bound to just the source table.
+  // Binding a single table (rather than the whole namespace) keeps the shadow's
+  // own writes out of the change feed. NOEXPORT_SNAPSHOT because the base data
+  // is copied physically by the clone; we only need the post-snapshot changes.
+  // Arming installs WAL/history retention barriers so records from the copy
+  // snapshot onward are retained for replay.
+  CreateCDCStreamRequestPB req;
+  CreateCDCStreamResponsePB resp;
+  req.set_namespace_id(namespace_id);
+  req.set_table_id(namespace_id);  // Legacy fallback path reads the ns id here.
+  req.set_cdcsdk_consistent_snapshot_option(CDCSDKSnapshotOption::NOEXPORT_SNAPSHOT);
+  req.mutable_cdcsdk_stream_create_options()->mutable_bound_table_ids()->add_table_ids(
+      source_table_id);
+  // Force the CDCSDK (namespace-id) branch of CreateCDCStream and request full
+  // row images so replay can reconstruct complete rows.
+  auto* id_opt = req.add_options();
+  id_opt->set_key(std::string(cdc::kIdType));
+  id_opt->set_value(std::string(cdc::kNamespaceId));
+  auto* src_opt = req.add_options();
+  src_opt->set_key(std::string(cdc::kSourceType));
+  src_opt->set_value(cdc::CDCRequestSource_Name(cdc::CDCRequestSource::CDCSDK));
+  auto* rec_opt = req.add_options();
+  rec_opt->set_key(std::string(cdc::kRecordType));
+  rec_opt->set_value(cdc::CDCRecordType_Name(cdc::CDCRecordType::PG_FULL));
+
+  RETURN_NOT_OK(CreateCDCStream(&req, &resp, /*rpc=*/nullptr, epoch));
+  SCHECK(!resp.stream_id().empty(), IllegalState, "CreateCDCStream returned no stream id");
+  LOG(INFO) << "Armed change capture stream " << resp.stream_id() << " on source "
+            << source_table_id << " for online schema change";
+  return resp.stream_id();
+}
+
+Status CatalogManager::ReplayGenerationChanges(
+    const TableId& source_table_id, const TableId& shadow_table_id,
+    const std::string& capture_stream_id, uint64_t snapshot_ht, const LeaderEpoch& epoch,
+    uint64_t* barrier_ht_out) {
+  // TODO(#4192): implement the WALSENDER-mode GetChanges -> PgsqlWriteRequestPB
+  // (UPSERT/DELETE) replay driver. Stub for now so the phase pipeline links;
+  // the smoke test validates the underlying capture path first.
+  if (barrier_ht_out != nullptr) {
+    *barrier_ht_out = snapshot_ht;
+  }
+  LOG(WARNING) << "ReplayGenerationChanges is a stub (source " << source_table_id << ", shadow "
+               << shadow_table_id << ", stream " << capture_stream_id << ", S " << snapshot_ht
+               << "); post-snapshot changes are NOT yet replayed";
   return Status::OK();
 }
 

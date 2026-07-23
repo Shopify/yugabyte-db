@@ -72,6 +72,70 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestBaseFunctions)) {
   ASSERT_FALSE(table.is_cql_namespace());
 }
 
+// Throwaway de-risking test for the online-schema-change change-replay design
+// (issue #4192): proves that a plain internal (non-slot) CDCSDK stream, read via
+// a raw per-tablet GetChanges with cdcsdk_request_source=WALSENDER, returns
+// column values as pg_ql_value (QLValuePB) on a USER tablet - the clean form
+// needed to reconstruct writes against a differently-schema'd shadow table. The
+// in-tree WALSENDER-on-user-tablet path is otherwise only exercised via the
+// VirtualWAL/slot machinery, so this validates it works without a slot.
+TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(WalsenderQlValueSmoke)) {
+  ASSERT_OK(SetUpWithParams(1, 1, false /* colocated */));
+
+  const uint32_t num_tablets = 1;
+  auto table = ASSERT_RESULT(
+      CreateTable(&test_cluster_, test_namespace_name, kTableName, num_tablets));
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+  ASSERT_OK(test_client()->GetTablets(table, 0, &tablets, /* partition_list_version =*/nullptr));
+  ASSERT_EQ(tablets.size(), num_tablets);
+
+  // Internal, non-slot stream. PG_FULL => before-image on UPDATE/DELETE.
+  auto stream_id = ASSERT_RESULT(
+      CreateDBStream(CDCCheckpointType::IMPLICIT, CDCRecordType::PG_FULL));
+  auto set_resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets));
+  ASSERT_FALSE(set_resp.has_error());
+
+  ASSERT_OK(WriteRows(1 /* start */, 2 /* end */, &test_cluster_));
+  ASSERT_OK(UpdateRows(1, 3, &test_cluster_));
+  ASSERT_OK(DeleteRows(1, &test_cluster_));
+  ASSERT_OK(WaitForFlushTables(
+      {table.table_id()}, /* add_indexes = */ false, /* timeout_secs = */ 30,
+      /* is_compaction = */ false));
+
+  // Build a raw request and force WALSENDER so columns come back as pg_ql_value.
+  GetChangesRequestPB change_req;
+  PrepareChangeRequest(&change_req, stream_id, tablets);
+  change_req.set_cdcsdk_request_source(CDCSDKRequestSource::WALSENDER);
+  auto change_resp = ASSERT_RESULT(GetChangesFromCDC(change_req));
+
+  int dml_records = 0;
+  bool saw_pg_ql_value = false;
+  for (const auto& record : change_resp.cdc_sdk_proto_records()) {
+    const auto& rm = record.row_message();
+    if (rm.op() == RowMessage::INSERT || rm.op() == RowMessage::UPDATE) {
+      ++dml_records;
+      ASSERT_GT(rm.new_tuple_size(), 0);
+      for (const auto& d : rm.new_tuple()) {
+        // The whole point: WALSENDER mode must populate pg_ql_value (a clean
+        // QLValuePB), NOT the DEBEZIUM datum_* PG-binary scalars.
+        ASSERT_TRUE(d.has_pg_ql_value())
+            << "column " << d.column_name() << " op " << RowMessage::Op_Name(rm.op())
+            << " did not carry pg_ql_value; record: " << record.ShortDebugString();
+        saw_pg_ql_value = true;
+      }
+      LOG(INFO) << "WALSENDER record: " << record.ShortDebugString();
+    } else if (rm.op() == RowMessage::DELETE) {
+      ++dml_records;
+      // DELETE key lives in old_tuple; assert it is a clean QLValuePB too.
+      ASSERT_GT(rm.old_tuple_size(), 0);
+      ASSERT_TRUE(rm.old_tuple(0).has_pg_ql_value())
+          << "DELETE key not pg_ql_value; record: " << record.ShortDebugString();
+    }
+  }
+  ASSERT_GE(dml_records, 3) << "expected INSERT+UPDATE+DELETE";
+  ASSERT_TRUE(saw_pg_ql_value);
+}
+
 TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestLoadInsertionOnly)) {
   // set up an RF3 cluster
   ASSERT_OK(SetUpWithParams(3, 1, false));
