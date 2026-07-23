@@ -50,7 +50,9 @@ class SchemaMigrationManagerITest : public integration_tests::YBTableTestBase {
 
  protected:
   SchemaMigrationManager& manager() {
-    return CHECK_RESULT(mini_cluster()->GetLeaderMiniMaster())->master()->schema_migration_manager();
+    return CHECK_RESULT(mini_cluster()->GetLeaderMiniMaster())
+        ->master()
+        ->schema_migration_manager();
   }
 
   LeaderEpoch epoch() {

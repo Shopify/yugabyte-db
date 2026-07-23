@@ -6073,7 +6073,7 @@ yb_finalize_online_schema_change(PG_FUNCTION_ARGS)
 	 */
 	(void) set_config_option("yb_non_ddl_txn_for_sys_tables_allowed", "true",
 							 PGC_USERSET, PGC_S_SESSION, GUC_ACTION_LOCAL,
-							 true /* changeVal */, 0, false /* is_reload */);
+							 true /* changeVal */ , 0, false /* is_reload */ );
 
 	Relation	pg_class = table_open(RelationRelationId, RowExclusiveLock);
 	HeapTuple	reltup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
