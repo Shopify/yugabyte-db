@@ -1,0 +1,50 @@
+@startuml
+title Durable migration job state machine
+
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam state {
+  BackgroundColor #EDF4FA
+  BorderColor #315B7D
+  ArrowColor #315B7D
+}
+
+[*] --> NEW : durable admission
+NEW --> RUNNING
+
+state RUNNING {
+  [*] --> PREFLIGHT
+  PREFLIGHT --> SHADOW_CREATING
+  SHADOW_CREATING --> COPYING
+  COPYING --> REPLAYING
+  REPLAYING --> CUTOVER
+  CUTOVER --> [*]
+}
+
+RUNNING --> SUCCEEDED : all phases complete
+NEW --> CANCELLING : cancel
+RUNNING --> CANCELLING : cancel before K
+CANCELLING --> CANCELLED : cleanup complete (target)
+RUNNING --> FAILED : terminal error
+
+SUCCEEDED --> [*]
+FAILED --> [*]
+CANCELLED --> [*]
+
+note right of RUNNING
+  Every phase transition is persisted.
+  Master reload bumps state_epoch and
+  resumes non-terminal jobs.
+end note
+
+note right of SUCCEEDED
+  Current: master-side role flip complete;
+  manual SQL finalize is still required.
+  Target: authoritative cutover is complete.
+end note
+
+note bottom of CANCELLING
+  Current prototype marks CANCELLED
+  without full resource cleanup.
+end note
+@enduml

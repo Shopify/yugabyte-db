@@ -1,0 +1,54 @@
+@startuml
+title Online schema change: component topology
+
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam componentStyle rectangle
+skinparam component {
+  BackgroundColor #F7F9FB
+  BorderColor #415A77
+}
+skinparam database {
+  BackgroundColor #FFF7E6
+  BorderColor #8A6D1D
+}
+
+actor "SQL client" as client
+
+node "YB-TServer / YSQL" as ysql {
+  component "YSQL functions + views" as sql
+  component "Pggate / PgClient" as pggate
+  database "PostgreSQL catalogs\n(pg_class, pg_attribute, ...)" as pgcat
+}
+
+node "YB-Master leader" as master {
+  component "SchemaMigrationManager" as mgr
+  component "CatalogManager" as cm
+  database "Master sys catalog\n(migration + generations)" as syscat
+}
+
+node "Source tablet leaders (G0)" as source {
+  component "CDCService / CDCSDK producer" as cdc
+  database "Source RocksDB + WAL" as g0
+}
+
+node "Shadow tablet leaders (G1)" as shadow {
+  component "YSQL write path" as writer
+  database "Shadow RocksDB" as g1
+}
+
+database "cdc_state" as cdcstate
+
+client --> sql : start / status / finalize
+sql --> pggate
+pggate --> mgr : master RPCs
+mgr --> syscat : persist job + phases
+mgr --> cm : phase work
+cm --> source : snapshot / clone / GetChanges
+cm --> shadow : create / restore / logical writes
+cdc --> g0
+cdc --> cdcstate : stream state + retention
+writer --> g1
+sql --> pgcat : manual relfilenode finalize today\nschema cutover target
+pgcat ..> shadow : routes logical relation L to G1
+@enduml

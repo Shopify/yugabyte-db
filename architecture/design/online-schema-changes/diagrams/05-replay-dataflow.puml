@@ -1,0 +1,36 @@
+@startuml
+title Logical change replay data flow
+
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam componentStyle rectangle
+skinparam component {
+  BackgroundColor #F7F9FB
+  BorderColor #315B7D
+}
+
+component "Source tablet WAL / intents" as wal
+component "CDCSDK producer" as producer
+component "GetChanges\nrequest_source=WALSENDER" as get
+component "CDCSDKProtoRecordPB\nRowMessage + pg_ql_value" as record
+component "Shadow schema mapper" as mapper
+component "PgsqlWriteRequestPB" as request
+component "YBClient session" as session
+component "Shadow tablet routing" as routing
+database "Shadow G1" as shadow
+
+wal --> producer : committed source changes
+producer --> get : per-tablet checkpoint
+get --> record : INSERT / UPDATE / DELETE
+record --> mapper : column_name + QLValuePB
+mapper --> request : hash key / range key / target column id
+request --> session : UPSERT or DELETE
+session --> routing : partition key
+routing --> shadow : apply + flush
+
+note bottom of mapper
+  Current prototype maps the same schema.
+  Target transform handles add/drop/retype,
+  defaults, keys, indexes, and constraints.
+end note
+@enduml

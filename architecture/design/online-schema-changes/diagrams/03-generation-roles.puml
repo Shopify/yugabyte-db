@@ -1,0 +1,39 @@
+@startuml
+title Physical generation roles
+
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam state {
+  BackgroundColor #EDF4FA
+  BorderColor #315B7D
+  ArrowColor #315B7D
+}
+
+state "ACTIVE" as Active
+state "SHADOW" as Shadow
+state "RETIRED" as Retired
+
+[*] --> Active : ordinary table / default role
+Active : user-visible
+Active : serves logical relation L
+Active : eligible for ordinary enumeration
+
+[*] --> Shadow : migration creates G1
+Shadow : internally writable
+Shadow : hidden from users / backup / CDC discovery
+Shadow : owning_migration_id required
+
+Shadow --> Active : authoritative cutover K
+Active --> Retired : authoritative cutover K
+
+Retired : not user-visible
+Retired : retained by CDC / PITR / rollback owners
+Retired --> [*] : all retention owners released
+
+Shadow --> [*] : cancel before K / cleanup
+
+note bottom of Shadow
+  Generation role is independent of hide_state.
+  SHADOW is not a dropped HIDDEN object.
+end note
+@enduml

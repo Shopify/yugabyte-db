@@ -1,0 +1,39 @@
+@startuml
+title Master failover and migration recovery
+
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam sequence {
+  ArrowColor #315B7D
+  LifeLineBorderColor #315B7D
+  LifeLineBackgroundColor #F7F9FB
+  ParticipantBorderColor #315B7D
+  ParticipantBackgroundColor #E8F1FA
+}
+
+participant "Old master leader" as old
+database "Replicated sys catalog" as sys
+participant "Copy / replay worker" as worker
+participant "New master leader" as new
+database "Work checkpoints (target)" as progress
+
+old -> sys : persist phase + state_epoch N
+old -> worker : start work(epoch N)
+worker -> progress : persist checkpoint
+... old leader fails ...
+new -> sys : load non-terminal migration
+new -> sys : persist state_epoch N+1
+worker -> new : late callback(epoch N)
+new --> worker : reject stale epoch
+new -> progress : load durable checkpoint
+new -> worker : resume work(epoch N+1)
+worker -> progress : advance checkpoint
+worker -> new : phase complete(epoch N+1)
+new -> sys : persist next phase
+
+note over progress
+  Current prototype persists only summary state,
+  stream id, S, and F. Per-tablet durable copy/replay
+  checkpoints are target work.
+end note
+@enduml

@@ -1,0 +1,49 @@
+@startuml
+title Copy, replay, and cutover timeline
+
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam sequence {
+  ArrowColor #315B7D
+  LifeLineBorderColor #315B7D
+  LifeLineBackgroundColor #F7F9FB
+  ParticipantBorderColor #315B7D
+  ParticipantBackgroundColor #E8F1FA
+}
+
+participant "Source G0" as G0
+participant "CDC stream" as CDC
+participant "Shadow G1" as G1
+participant "Catalog / routing" as CAT
+
+G0 -> CDC : arm retention before snapshot
+G0 -> G1 : snapshot / clone state at S
+note over G0,G1
+  commit_ht <= S is represented by the copy
+end note
+
+G0 -> CDC : user INSERT / UPDATE / DELETE after S
+CDC -> G1 : logical replay (S, F]
+note over CDC,G1
+  Replay must cover every transaction
+  committed through final barrier F.
+end note
+
+== Current prototype ==
+CAT -> CAT : choose F before replay drain
+G0 -> CDC : writes can still commit after F
+CDC -> G1 : drain only through F
+CAT -> CAT : master role flip
+CAT -> CAT : later manual relfilenode finalize
+note over G0,G1 #FFDDDD
+  Unsafe tail: writes committed after F and before finalize.
+  External quiescing is required today.
+end note
+
+== Target ==
+CAT -> G0 : acquire distributed write fence
+CAT -> CAT : choose F after in-flight writers drain
+CDC -> G1 : drain final tiny tail through F
+CAT -> CAT : atomic generation + catalog switch K
+CAT -> G0 : release write fence
+@enduml

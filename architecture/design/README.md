@@ -20,6 +20,7 @@ Below you can find a table of high level and non-trivial features, relevant desi
 |[Encryption at rest](docdb-encryption-at-rest.md)|Rahul|
 |Master DDL operation handling|TBD|
 |[Online index backfill](online-index-backfill.md)|Amitanand|
+|[Online schema changes](online-schema-changes/README.md)|TBD|
 |Raft consensus|TBD|
 |Raft read replica support|Rahul|
 |Read from followers|Amit|

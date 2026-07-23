@@ -1,0 +1,40 @@
+@startuml
+title Cutover downtime: current prototype versus target
+
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam activity {
+  BackgroundColor #E8F1FA
+  BorderColor #315B7D
+  DiamondBackgroundColor #FFF2CC
+  DiamondBorderColor #8A6D1D
+}
+
+partition "Current prototype" {
+  start
+  :Externally quiesce writers;
+  #FFDDDD:Choose F;
+  #FFDDDD:Drain replay through F;
+  #FFDDDD:Flip master generation roles;
+  #FFDDDD:Run manual SQL finalize;
+  #FFDDDD:Resume writers;
+  stop
+}
+
+partition "Target brief fence" {
+  start
+  :Copy and replay continuously;
+  :Wait for low lag;
+  #FFF2CC:Acquire distributed write fence;
+  #FFF2CC:Drain in-flight writers and choose F;
+  #FFF2CC:Replay tiny final tail;
+  #FFF2CC:Atomic catalog switch + invalidation;
+  #FFF2CC:Release fence;
+  stop
+}
+
+legend right
+  |<#FFDDDD>| Current write downtime |
+  |<#FFF2CC>| Target write interruption |
+endlegend
+@enduml

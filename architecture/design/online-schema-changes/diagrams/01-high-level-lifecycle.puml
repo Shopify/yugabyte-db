@@ -1,0 +1,37 @@
+@startuml
+title Online schema change: target high-level lifecycle
+
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam activity {
+  BackgroundColor #E8F1FA
+  BorderColor #315B7D
+  DiamondBackgroundColor #FFF2CC
+  DiamondBorderColor #8A6D1D
+}
+
+start
+:Submit DDL and durably admit job;
+:Create hidden target generation G1;
+:Arm source CDC retention;
+:Choose snapshot HybridTime S;
+note right
+  Current prototype has no final fence.
+  Writers must be quiesced externally
+  from F selection through finalize.
+end note
+fork
+  :Clone / transform source state at S;
+fork again
+  :Capture source commits after S;
+end fork
+:Replay changes into G1;
+:Wait until replay lag is small;
+:Acquire brief distributed write fence;
+:Choose final barrier F;
+:Drain final changes through F;
+:Atomically activate G1 for logical table L;
+:Invalidate catalogs and release fence;
+:Retain then garbage-collect G0;
+stop
+@enduml
