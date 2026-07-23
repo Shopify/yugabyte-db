@@ -26,6 +26,11 @@
 
 #include <gtest/gtest.h>
 
+#include "yb/master/catalog_entity_info.h"
+#include "yb/master/catalog_manager.h"
+#include "yb/master/catalog_manager_if.h"
+#include "yb/master/master_ddl.pb.h"
+
 #include "yb/yql/pgwrapper/libpq_utils.h"
 #include "yb/yql/pgwrapper/pg_mini_test_base.h"
 
@@ -37,6 +42,36 @@ namespace pgwrapper {
 class PgOnlineSchemaChangeTest : public PgMiniTestBase {
  public:
   size_t NumTabletServers() override { return 1; }
+
+ protected:
+  // Find the master TableInfo for a YSQL user table by name.
+  Result<master::TableInfoPtr> FindUserTable(const std::string& relname) {
+    auto* cm = VERIFY_RESULT(catalog_manager_impl());
+    for (const auto& table : cm->GetTables(master::GetTablesMode::kAll)) {
+      auto l = table->LockForRead();
+      if (l->table_type() == PGSQL_TABLE_TYPE && l->name() == relname &&
+          l->is_active_generation()) {
+        return table;
+      }
+    }
+    return STATUS_FORMAT(NotFound, "user table $0 not found", relname);
+  }
+
+  // Number of times relname appears in a ListTables result (client-facing view).
+  Result<int> CountInListTables(const std::string& relname) {
+    auto* cm = VERIFY_RESULT(catalog_manager_impl());
+    master::ListTablesRequestPB req;
+    master::ListTablesResponsePB resp;
+    req.set_name_filter(relname);
+    RETURN_NOT_OK(cm->ListTables(&req, &resp));
+    int count = 0;
+    for (const auto& t : resp.tables()) {
+      if (t.name() == relname) {
+        ++count;
+      }
+    }
+    return count;
+  }
 };
 
 // A rewrite that materializes existing rows (volatile default) must keep the
@@ -119,6 +154,42 @@ TEST_F(PgOnlineSchemaChangeTest, SwapPreservesDependents) {
   const auto child_rows = ASSERT_RESULT(conn.FetchRow<int64_t>(
       "SELECT count(*) FROM child"));
   ASSERT_EQ(child_rows, 3);
+}
+
+// A table whose physical generation is marked SHADOW must disappear from the
+// client-facing ListTables view (roadmap Milestone A / generation-metadata.md),
+// while its logical pg_class row remains. This pins the invisibility invariant
+// the migration relies on before cutover.
+TEST_F(PgOnlineSchemaChangeTest, ShadowGenerationHiddenFromListTables) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE shadow_demo (id int PRIMARY KEY, v text)"));
+
+  // Initially visible to clients.
+  ASSERT_EQ(ASSERT_RESULT(CountInListTables("shadow_demo")), 1);
+  auto table = ASSERT_RESULT(FindUserTable("shadow_demo"));
+
+  // Flip the physical-generation role to SHADOW (as the migration job will when
+  // it creates a hidden target generation).
+  {
+    auto l = table->LockForWrite();
+    l.mutable_data()->pb.set_physical_generation_role(master::SysTablesEntryPB::SHADOW);
+    l.Commit();
+  }
+
+  // No longer surfaced to clients, even though it still exists physically.
+  ASSERT_EQ(ASSERT_RESULT(CountInListTables("shadow_demo")), 0);
+  // The logical relation is untouched in pg_class.
+  const auto pg_class_rows = ASSERT_RESULT(conn.FetchRow<int64_t>(
+      "SELECT count(*) FROM pg_class WHERE relname = 'shadow_demo'"));
+  ASSERT_EQ(pg_class_rows, 1);
+
+  // Restoring ACTIVE makes it visible again.
+  {
+    auto l = table->LockForWrite();
+    l.mutable_data()->pb.set_physical_generation_role(master::SysTablesEntryPB::ACTIVE);
+    l.Commit();
+  }
+  ASSERT_EQ(ASSERT_RESULT(CountInListTables("shadow_demo")), 1);
 }
 
 }  // namespace pgwrapper
