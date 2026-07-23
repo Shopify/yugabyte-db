@@ -72,6 +72,10 @@ Source and target tablet counts can differ. Backfill writes must order below
 post-`S` replay so a late copy cannot resurrect a deleted row or overwrite a
 newer update.
 
+The transform contract and catalog-object side-effect rules are described in
+[API and workflow evolution](api-and-workflows.md) and
+[Catalog objects and dependency semantics](catalog-object-semantics.md).
+
 ## Capacity and throttling
 
 The target design needs:

@@ -20,6 +20,10 @@ row-returning function and leaves ordinary `ALTER TABLE` wire behavior intact.
 The server owns the canonical migration id. An optional `request_id` is a client
 idempotency token used to resolve a retry after a lost response.
 
+Possible automated DDL syntax, expert-defined targets, transform functions,
+transaction restrictions, target inspection, and related workflows are covered
+in [API and workflow evolution](api-and-workflows.md).
+
 ## SQL surface
 
 ```sql

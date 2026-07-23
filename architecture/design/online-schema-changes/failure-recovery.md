@@ -74,6 +74,10 @@ prefer the active source table over the migration:
 - cancel the migration and release its retention owner at a hard threshold;
 - persist a classified terminal error and cleanup status.
 
+Metrics, pressure thresholds, tuning, troubleshooting, and support-bundle
+requirements are specified in
+[Performance, observability, and supportability](performance-observability.md).
+
 ## Required recovery tests
 
 - Master, source leader, shadow leader, and tserver restart in every phase.

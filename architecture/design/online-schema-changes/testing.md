@@ -83,6 +83,11 @@ uninterrupted writers through cutover; see
 - CDC stream/retention cleanup on success, cancel, and failure.
 - Structural target schema: add/drop/retype/default and primary-key change.
 - Target index and constraint validation through `F`.
+- Trigger/rule/default side effects occur exactly once on the authoritative
+  generation; internal copy/replay does not fire them.
+- Incoming/outgoing FKs, views, policies, row types, publications, ACLs,
+  comments, and statistics follow their catalog-object plan.
+- Direct shadow DML and conflicting source/target DDL are rejected.
 - External CDC event-set proving no internal copy/replay events.
 - Backup/PITR before, during, and after `K`.
 - Object-lock cutover timing under long and short transactions on Linux.
@@ -91,6 +96,8 @@ uninterrupted writers through cutover; see
 
 - RF1/RF3 and multiple source/target tablet counts.
 - Large-table resource throttling and disk/WAL pressure cancellation.
+- Copy/replay throughput, workload latency, replay convergence, retained bytes,
+  and final-fence duration against defined budgets.
 - Partitioned, geo-partitioned, and colocated generation groups.
 - Incremental backup chain crossing cutover.
 - Mixed-version upgrade/rollback with a paused migration.

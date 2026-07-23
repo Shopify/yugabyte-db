@@ -19,12 +19,16 @@ them.
 | Final write fence | Not implemented | Current safe operation requires external quiescing |
 | Atomic role flip + relfilenode repoint | Not implemented | Master and PostgreSQL catalog steps are separate |
 | Target-schema construction | Not implemented | Shadow currently copies the source schema; submitted DDL is not applied |
+| Durable transform plan | Not implemented | No compiled expression/dependency contract shared by copy and replay |
+| Catalog/dependent-object bundle | Not implemented | Indexes, triggers, FKs, policies, privileges, and validation are not migrated by the prototype |
+| Concurrent DDL lease/preflight | Incomplete | Unsupported shapes and plan-invalidating DDL are not comprehensively fenced/rejected |
 | Transaction-preserving replay | Not implemented | Records are applied and flushed one at a time; BEGIN/COMMIT are ignored |
 | Durable per-tablet replay checkpoint | Not implemented | Replay restarts from `S`; only stream id, `S`, and `F` are persisted |
 | CDC stream cleanup | Not implemented | Terminal migrations can retain WAL/history until cleanup is added |
 | External CDC handoff | Not implemented | Required before production use with logical/gRPC CDC |
 | Backup/PITR awareness | Not implemented | Required before production use with backup schedules/PITR |
 | Partitioned/geo/colocated/index bundles | Not implemented | Prototype supports one regular non-colocated heap |
+| Performance/retention observability | Incomplete | Summary phases exist; production metrics, pressure policy, tuning, and support bundle do not |
 
 ## What the current tests prove
 

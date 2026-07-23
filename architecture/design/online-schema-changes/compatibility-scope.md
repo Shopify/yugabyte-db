@@ -28,6 +28,23 @@ Current backend support is intentionally narrow:
 Production behavior must reject unsupported shapes in preflight rather than
 partially execute. Current preflight validation is incomplete.
 
+## Access and concurrent DDL policy
+
+`G0` remains the only user-writable authority before cutover and `G1` becomes the
+only user-writable authority after cutover. Direct user DML against the shadow or
+an expert target template is disallowed while the migration owns it. Optional
+target inspection must be read-only and expose the target apply frontier.
+
+The migration needs a durable schema/object lease over the full relation,
+partition, and index hierarchy. Conflicting DDL must block or fail for the
+duration of the migration even though ordinary DML remains online. The safe
+initial policy is to reject unclassified concurrent DDL, including schema,
+index/constraint, partition topology, placement, publication, and replica-
+identity changes that invalidate the migration plan.
+
+Detailed object rules are in
+[Catalog objects and dependency semantics](catalog-object-semantics.md).
+
 ## Target table shapes
 
 | Shape | Target behavior |
@@ -62,7 +79,12 @@ Required work:
 - deterministic behavior when existing rows are transformed (consumer transform,
   rebootstrap, or reject).
 
-xCluster-managed tables remain out of scope and must be rejected.
+xCluster-managed tables remain out of scope and must be rejected. An OSC copy or
+mirror write is not automatically equivalent to a user write on a remote
+universe: external-HybridTime/origin filtering, target schema timing, generation
+activation, and checkpoint handoff would need coordinated execution on both
+universes. Running the local generation switch independently could leave remote
+storage/schema inconsistent.
 
 ## Backup and PITR
 
@@ -99,6 +121,24 @@ Production enablement requires:
 - wire/protobuf additions remain backward-compatible;
 - catalog changes define forward and rollback behavior around `K`.
 
+## Related workflows
+
+- **Automated online DDL:** expected primary product workflow, layered over the
+  durable job without changing ordinary DDL result semantics.
+- **Expert target definition:** possible for reshapes, but the admitted target
+  must become internally owned/read-only rather than a second user authority.
+- **Manual synchronization:** possible future policy; it still retains WAL and
+  requires the same fenced final drain.
+- **Bidirectional writes:** separate replication/conflict-resolution feature,
+  not an initial OSC rollback mechanism.
+- **CREATE TABLE AS:** may reuse distributed snapshot scan/transform/routing
+  workers but creates a new logical object rather than switching generations.
+- **REFRESH MATERIALIZED VIEW:** may reuse generation activation for simple
+  plans, but maintaining arbitrary query results incrementally is outside table
+  CDC replay semantics.
+
+See [API and workflow evolution](api-and-workflows.md).
+
 ## Non-goals
 
 - Trigger-based synchronous mirroring as the core mechanism.
@@ -106,3 +146,5 @@ Production enablement requires:
 - Replacing metadata-only or existing online-index paths.
 - Changing ordinary DDL response semantics to return a migration id.
 - Supporting xCluster table migrations in the initial feature.
+- Bidirectional user writes to both generations.
+- General incremental maintenance for arbitrary CTAS/materialized-view queries.

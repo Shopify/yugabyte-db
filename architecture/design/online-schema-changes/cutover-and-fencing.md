@@ -92,6 +92,9 @@ Near-term OID-preserving activation must coordinate:
 The original relation OID remains referenced by views, FKs, triggers, policies,
 publications, ACLs, comments, and dependencies.
 
+The complete preserve/rewrite/build/validate matrix is in
+[Catalog objects and dependency semantics](catalog-object-semantics.md).
+
 ## Failure decision
 
 - Before the catalog cutover commit `K`, `G0` remains authoritative and the

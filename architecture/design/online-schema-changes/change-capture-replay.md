@@ -103,6 +103,10 @@ Two frontiers are needed:
 Source CDC checkpoints may advance to capture; retained queue entries may be
 removed only through apply.
 
+Copy and replay must execute the same durable, dependency-fingerprinted transform
+plan. The API and expression-safety requirements are described in
+[API and workflow evolution](api-and-workflows.md).
+
 ## Why not raw KV replay
 
 For a non-colocated same-schema clone, DocDB keys can be transplanted and packed

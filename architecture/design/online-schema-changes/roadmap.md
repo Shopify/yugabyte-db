@@ -12,19 +12,21 @@ Status legend: **Done**, **Prototype**, **Next**, **Planned**.
 | A0 | Durable migration job and SQL status API | Done | Job survives master failover; idempotent submission; terminal state queryable |
 | A1 | Hidden physical generation | Done | Shadow is internally addressable and excluded from user enumeration |
 | A2 | Fixed-HT physical copy | Prototype | RF3 multi-tablet clone/restore parity at snapshot `S` |
+| A3 | Automated online-DDL workflow | Planned | Compile DDL to target schema/transform and submit the same durable job without breaking driver semantics |
 | B1 | Internal logical change capture | Prototype | Slot-less table-bound CDCSDK stream armed before `S` |
 | B2 | Logical replay | Prototype | Post-`S` INSERT/UPDATE/DELETE reach the shadow and drain to `F` |
 | B3 | Durable transaction-aware replay | Next | Preserve source transactions; durable per-tablet checkpoints; retry exactly once in effect |
 | C1 | OID-preserving storage switch | Prototype | Original relation OID serves from shadow relfilenode |
 | C2 | Brief fenced cutover | Next | Writes fenced only for final tail drain + switch; no post-`F` loss window |
 | C3 | Atomic catalog activation | Planned | Role flip, relfilenode/schema switch, catalog version, and invalidation recover as one decision |
-| D | Target schema and transform plan | Planned | Apply submitted rewrite DDL; deterministic copy/replay transform; constraints validated |
+| D1 | Target schema and transform plan | Planned | Apply submitted rewrite DDL; deterministic copy/replay transform |
+| D2 | Catalog-object bundle and validation | Planned | Every dependent object classified; indexes/constraints/triggers staged and valid through `F` |
 | E | Cleanup and retention ownership | Next | Drop capture stream on terminal paths; GC abandoned shadow and retained source safely |
 | F | External CDC handoff | Planned | No internal mirror events; one generation/schema transition; checkpoint handoff |
 | G | Backup, restore, and PITR | Planned | Generation selected by snapshot time; restore returns one ordinary active generation |
 | H | Partition/index generation groups | Planned | Root/leaves/index bundle switches atomically; independent source/target routing |
 | I | Geo and colocated layouts | Planned | Placement-aware copy; table-level generation handling in shared tablets |
-| J | GA hardening | Planned | Upgrade/rollback, pressure policy, observability, cancellation, and fault matrix complete |
+| J | GA hardening | Planned | Upgrade/rollback, resource-pressure policy, observability/support bundle, cancellation, and fault matrix complete |
 | K | Logical-to-physical generation pointer | Long term | Constant-work generation-group activation replaces per-relation relfilenode edits |
 
 ## Immediate sequence
@@ -63,6 +65,23 @@ Status legend: **Done**, **Prototype**, **Next**, **Planned**.
 - Define add/drop/retype/default/primary-key mappings for copy and replay.
 - Validate constraints and indexes through the final barrier.
 
+### 5. Catalog-object correctness
+
+- Discover and persist an action for every dependent object.
+- Suppress triggers/default side effects during internal copy/replay.
+- Stage and validate FKs, constraints, and indexes through `F`.
+- Preserve logical OIDs/ACLs/ownership and invalidate dependent plans/types.
+- Reject unsupported extension, FDW, publication, or hierarchy semantics in
+  preflight.
+
+### 6. Product workflow and shared infrastructure
+
+- Decide automated online-DDL syntax and async/waiting behavior.
+- Define whether an expert target-schema workflow is required for reshapes.
+- Specify read-only target inspection and transform-function safety.
+- Keep manual sync and bidirectional mirroring explicitly separate policies.
+- Evaluate CTAS/materialized-view reuse without expanding initial OSC semantics.
+
 ## Production gates
 
 Before enabling the feature for general use:
@@ -73,6 +92,9 @@ Before enabling the feature for general use:
   support or deterministic preflight rejection.
 - Disk/WAL/history pressure has a source-availability-first cancellation policy.
 - Mixed-version upgrade and rollback behavior is specified and tested.
+- Performance budgets, lag/retention metrics, runtime throttles, and support
+  bundles are implemented and validated under load.
+- Every catalog/dependent object class is handled or rejected by preflight.
 - Every phase has crash, failover, retry, cancellation, and timeout tests.
 
 ## Long-term direction

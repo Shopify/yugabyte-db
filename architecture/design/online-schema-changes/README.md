@@ -26,12 +26,16 @@ Tracking issue: [#4192](https://github.com/yugabyte/yugabyte-db/issues/4192)
 | Component | Document |
 |---|---|
 | Durable migration identity, phases, SQL/RPC surfaces | [Job and SQL API](job-and-sql-api.md) |
+| User workflows, transform contract, and future syntax | [API and workflow evolution](api-and-workflows.md) |
 | Active, shadow, and retired physical storage | [Physical generations](physical-generations.md) |
 | Snapshot, tablet clone, and restore | [Copy: clone and restore](copy-clone-restore.md) |
 | Internal CDCSDK capture and logical apply | [Change capture and replay](change-capture-replay.md) |
+| PostgreSQL objects, dependencies, validation, and side effects | [Catalog objects and dependency semantics](catalog-object-semantics.md) |
 | Barrier, downtime, relfilenode switch, and cache invalidation | [Cutover and fencing](cutover-and-fencing.md) |
 | Failover, cancellation, cleanup, and retention | [Failure recovery](failure-recovery.md) |
 | Supported and future table/feature shapes | [Compatibility and scope](compatibility-scope.md) |
+| Trigger/CDC/copy/swap alternatives and rationale | [Alternatives](alternatives.md) |
+| Resource model, metrics, tuning, and troubleshooting | [Performance and observability](performance-observability.md) |
 
 ## Diagrams
 
