@@ -1,4 +1,4 @@
--- Online schema change migration tracking (roadmap Section 0).
+-- Online schema change migration tracking.
 -- Adds yb_start_online_schema_change / yb_cancel_schema_migration /
 -- yb_get_schema_migrations and the yb_schema_migrations view for clusters that
 -- were initialized before these catalog entries existed. Must stay in sync with
