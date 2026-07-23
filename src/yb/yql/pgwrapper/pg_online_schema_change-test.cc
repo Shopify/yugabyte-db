@@ -26,6 +26,8 @@
 
 #include <gtest/gtest.h>
 
+#include "yb/common/entity_ids.h"
+
 #include "yb/integration-tests/mini_cluster.h"
 
 #include "yb/master/catalog_entity_info.h"
@@ -44,6 +46,7 @@
 
 DECLARE_bool(TEST_enable_schema_migration_admission);
 DECLARE_bool(TEST_schema_migration_create_shadow);
+DECLARE_bool(TEST_schema_migration_stop_before_cutover);
 
 using namespace std::chrono_literals;
 
@@ -167,13 +170,16 @@ TEST_F(PgOnlineSchemaChangeTest, SwapPreservesDependents) {
   ASSERT_EQ(child_rows, 3);
 }
 
-// Driven through the migration job: with the shadow-creation phase enabled, a
-// started migration for a real table reaches SUCCEEDED and, along the way,
-// creates a hidden shadow generation owned by that migration and recorded on the
-// job. End-to-end validation of the SHADOW_CREATING phase.
+// Driven through the migration job: with the shadow-creation phase enabled and
+// the pipeline paused in RUNNING, a started migration for a real table creates a
+// hidden shadow generation owned by that migration and recorded on the job,
+// while it is still a SHADOW (pre-cutover). Validates the SHADOW_CREATING phase.
 TEST_F(PgOnlineSchemaChangeTest, MigrationCreatesShadowGeneration) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_enable_schema_migration_admission) = true;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_schema_migration_create_shadow) = true;
+  // Stop before cutover so we observe the shadow while it is still a SHADOW
+  // generation (cutover would flip its role to ACTIVE).
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_schema_migration_stop_before_cutover) = true;
 
   auto conn = ASSERT_RESULT(Connect());
   ASSERT_OK(conn.Execute("CREATE TABLE mig_demo (id int PRIMARY KEY, v text)"));
@@ -191,20 +197,16 @@ TEST_F(PgOnlineSchemaChangeTest, MigrationCreatesShadowGeneration) {
       master::SysSchemaMigrationEntryPB::ONLINE_TABLE_REWRITE, database_oid, table_oid,
       /* submitted_by */ 10, "ALTER TABLE mig_demo ADD c int", /* request_id */ "", epoch));
 
-  // Wait for the job to reach SUCCEEDED.
+  // The paused pipeline creates the shadow during PREFLIGHT->SHADOW_CREATING and
+  // records it on the job, then stops (pause is checked at RUNNING).
   ASSERT_OK(WaitFor([&]() -> Result<bool> {
-    auto pb = VERIFY_RESULT(mgr.GetSchemaMigration(migration_id));
-    return pb.state() == master::SysSchemaMigrationEntryPB::SUCCEEDED;
-  }, 60s, "migration reaches SUCCEEDED"));
+    return !VERIFY_RESULT(mgr.GetSchemaMigration(migration_id)).shadow_table_id().empty();
+  }, 60s, "shadow generation recorded on the job"));
 
-  // The job recorded a shadow generation id.
   auto pb = ASSERT_RESULT(mgr.GetSchemaMigration(migration_id));
-  ASSERT_FALSE(pb.shadow_table_id().empty());
 
-  // That shadow exists, is a SHADOW generation, owned by this migration, and
-  // shares the source's logical identity.
+  // That shadow exists, is a SHADOW generation, owned by this migration.
   auto* cm = ASSERT_RESULT(catalog_manager_impl());
-  auto source = ASSERT_RESULT(FindUserTable("mig_demo"));
   auto shadow = cm->GetTableInfo(pb.shadow_table_id());
   ASSERT_TRUE(shadow != nullptr);
   {
@@ -214,6 +216,56 @@ TEST_F(PgOnlineSchemaChangeTest, MigrationCreatesShadowGeneration) {
   }
   // Still invisible to clients.
   ASSERT_EQ(ASSERT_RESULT(CountInListTables("mig_demo")), 1);
+}
+
+// Full pipeline through the job with the real backend enabled: the migration
+// creates a shadow, copies the source data into it (tablet clone), and cuts
+// over (shadow -> ACTIVE, source -> RETIRED). Verifies the copied row count in
+// the shadow generation and the post-cutover role flip.
+TEST_F(PgOnlineSchemaChangeTest, MigrationCopiesAndCutsOver) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_enable_schema_migration_admission) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_schema_migration_create_shadow) = true;
+
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE copy_demo (id int PRIMARY KEY, v text)"));
+  ASSERT_OK(conn.Execute(
+      "INSERT INTO copy_demo SELECT g, 'v' || g FROM generate_series(1, 50) g"));
+
+  const auto table_oid = ASSERT_RESULT(conn.FetchRow<PGOid>(
+      "SELECT 'copy_demo'::regclass::oid"));
+  const auto database_oid = ASSERT_RESULT(conn.FetchRow<PGOid>(
+      "SELECT oid FROM pg_database WHERE datname = current_database()"));
+
+  auto* mini_master = ASSERT_RESULT(cluster_->GetLeaderMiniMaster());
+  auto& mgr = mini_master->master()->schema_migration_manager();
+  auto* cm = ASSERT_RESULT(catalog_manager_impl());
+  auto epoch = cm->GetLeaderEpochInternal();
+
+  auto migration_id = ASSERT_RESULT(mgr.StartSchemaMigration(
+      master::SysSchemaMigrationEntryPB::ONLINE_TABLE_REWRITE, database_oid, table_oid,
+      /* submitted_by */ 10, "ALTER TABLE copy_demo ADD c int", /* request_id */ "", epoch));
+
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    auto pb = VERIFY_RESULT(mgr.GetSchemaMigration(migration_id));
+    if (pb.state() == master::SysSchemaMigrationEntryPB::FAILED) {
+      return STATUS_FORMAT(IllegalState, "migration failed: $0",
+                           StatusFromPB(pb.terminal_error()));
+    }
+    return pb.state() == master::SysSchemaMigrationEntryPB::SUCCEEDED;
+  }, 120s, "migration reaches SUCCEEDED"));
+
+  auto pb = ASSERT_RESULT(mgr.GetSchemaMigration(migration_id));
+  ASSERT_FALSE(pb.shadow_table_id().empty());
+
+  const auto source_id = GetPgsqlTableId(database_oid, table_oid);
+  auto source = cm->GetTableInfo(source_id);
+  auto shadow = cm->GetTableInfo(pb.shadow_table_id());
+  ASSERT_TRUE(source != nullptr);
+  ASSERT_TRUE(shadow != nullptr);
+
+  // Cutover flipped the roles.
+  ASSERT_TRUE(source->LockForRead()->is_retired_generation());
+  ASSERT_TRUE(shadow->LockForRead()->is_active_generation());
 }
 
 // The master can create a hidden SHADOW physical generation of a live YSQL

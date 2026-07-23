@@ -13,8 +13,8 @@ BEGIN;
     proargnames, proargdefaults, protrftypes, prosrc, probin, proconfig, proacl
   ) VALUES
     (8119, 'yb_start_online_schema_change', 11, 10, 12, 1, 0, 0, '-', 'f', false,
-     false, false, false, 'v', 'u', 2, 0, 25, '25 25', NULL, NULL,
-     '{ddl,request_id}', NULL, NULL, 'yb_start_online_schema_change', NULL, NULL, NULL),
+     false, false, false, 'v', 'u', 3, 0, 25, '2205 25 25', NULL, NULL,
+     '{rel,ddl,request_id}', NULL, NULL, 'yb_start_online_schema_change', NULL, NULL, NULL),
     (8120, 'yb_cancel_schema_migration', 11, 10, 12, 1, 0, 0, '-', 'f', false,
      false, true, false, 'v', 'u', 1, 0, 16, '25', NULL, NULL,
      '{migration_id}', NULL, NULL, 'yb_cancel_schema_migration', NULL, NULL, NULL),
@@ -53,8 +53,8 @@ COMMIT;
 
 -- Restrict the mutating functions to yb_db_admin (the C functions also enforce
 -- this, but revoke EXECUTE from PUBLIC to match fresh initdb ACLs).
-REVOKE EXECUTE ON FUNCTION yb_start_online_schema_change(text, text) FROM public;
-GRANT EXECUTE ON FUNCTION yb_start_online_schema_change(text, text) TO yb_db_admin;
+REVOKE EXECUTE ON FUNCTION yb_start_online_schema_change(regclass, text, text) FROM public;
+GRANT EXECUTE ON FUNCTION yb_start_online_schema_change(regclass, text, text) TO yb_db_admin;
 REVOKE EXECUTE ON FUNCTION yb_cancel_schema_migration(text) FROM public;
 GRANT EXECUTE ON FUNCTION yb_cancel_schema_migration(text) TO yb_db_admin;
 

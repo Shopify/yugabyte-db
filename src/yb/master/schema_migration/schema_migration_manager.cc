@@ -44,6 +44,10 @@ DEFINE_test_flag(bool, schema_migration_create_shadow, false,
     "the source table. Default false so the observable phase pipeline can run without a real "
     "source table until the full copy/replay/cutover backend lands.");
 
+DEFINE_test_flag(bool, schema_migration_stop_before_cutover, false,
+    "When true, the executor stops advancing once it reaches the CUTOVER phase (does not perform "
+    "cutover), so tests can observe the populated shadow while it is still a SHADOW generation.");
+
 namespace yb::master {
 
 namespace {
@@ -224,37 +228,51 @@ void SchemaMigrationManager::SysCatalogLoaded(const LeaderEpoch& epoch) {
 
 Status SchemaMigrationManager::PerformPhaseWork(
     const SchemaMigrationInfoPtr& job, const std::string& phase, const LeaderEpoch& epoch) {
-  if (phase != kPhaseShadowCreating || !FLAGS_TEST_schema_migration_create_shadow) {
-    // PREFLIGHT / COPYING / CUTOVER are no-ops for now (the real copy/replay/
-    // cutover backend plugs in here). Shadow creation is gated until the full
-    // pipeline exists, so the observable phase pipeline runs without a real
-    // source table.
+  // The real backend (shadow create / copy / cutover) is gated until the full
+  // pipeline exists, so the observable phase pipeline can run without a real
+  // source table by default.
+  if (!FLAGS_TEST_schema_migration_create_shadow) {
     return Status::OK();
   }
 
-  // Resolve the source table's physical id from the PG oids recorded at start,
-  // then create the hidden shadow generation (idempotent: skip if already set).
+  // Read the job's source/shadow identity once.
   uint32_t database_oid;
   uint32_t table_oid;
   std::string migration_id;
+  std::string shadow_table_id;
   {
     auto l = job->LockForRead();
-    if (!l->pb.shadow_table_id().empty()) {
-      return Status::OK();  // Already created (e.g. resumed after failover).
-    }
     database_oid = l->pb.database_oid();
     table_oid = l->pb.table_oid();
     migration_id = job->id();
+    shadow_table_id = l->pb.shadow_table_id();
+  }
+  const TableId source_table_id = GetPgsqlTableId(database_oid, table_oid);
+
+  if (phase == kPhaseShadowCreating) {
+    if (!shadow_table_id.empty()) {
+      return Status::OK();  // Idempotent: already created (e.g. resumed).
+    }
+    const auto new_shadow_id = VERIFY_RESULT(
+        catalog_manager_->CreateShadowGeneration(source_table_id, migration_id, epoch));
+    auto l = job->LockForWrite();
+    l.mutable_data()->pb.set_shadow_table_id(new_shadow_id);
+    RETURN_NOT_OK(sys_catalog_->Upsert(epoch, job.get()));
+    l.Commit();
+    return Status::OK();
   }
 
-  const TableId source_table_id = GetPgsqlTableId(database_oid, table_oid);
-  const auto shadow_table_id = VERIFY_RESULT(
-      catalog_manager_->CreateShadowGeneration(source_table_id, migration_id, epoch));
+  if (phase == kPhaseCopying) {
+    SCHECK(!shadow_table_id.empty(), IllegalState, "COPYING with no shadow generation");
+    return catalog_manager_->CopyGenerationData(source_table_id, shadow_table_id, epoch);
+  }
 
-  auto l = job->LockForWrite();
-  l.mutable_data()->pb.set_shadow_table_id(shadow_table_id);
-  RETURN_NOT_OK(sys_catalog_->Upsert(epoch, job.get()));
-  l.Commit();
+  if (phase == kPhaseCutover) {
+    SCHECK(!shadow_table_id.empty(), IllegalState, "CUTOVER with no shadow generation");
+    return catalog_manager_->CutoverToShadow(source_table_id, shadow_table_id, epoch);
+  }
+
+  // PREFLIGHT: nothing to do yet.
   return Status::OK();
 }
 
@@ -274,6 +292,11 @@ Result<bool> SchemaMigrationManager::AdvanceJob(
     }
     case SysSchemaMigrationEntryPB::RUNNING: {
       if (FLAGS_TEST_pause_schema_migration_in_running) {
+        return false;
+      }
+      // Test hook: stop once the shadow is populated but before cutover, so the
+      // shadow can be observed while still a SHADOW generation.
+      if (FLAGS_TEST_schema_migration_stop_before_cutover && pb.phase() == kPhaseCutover) {
         return false;
       }
       if (FLAGS_TEST_fail_schema_migration_in_running) {

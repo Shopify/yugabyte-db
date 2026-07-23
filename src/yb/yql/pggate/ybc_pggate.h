@@ -1055,8 +1055,8 @@ YbcStatus YBCDatabaseClones(YbcPgDatabaseCloneInfo** databaseClones, size_t* cou
 
 // Online schema change migration tracking (roadmap Section 0).
 YbcStatus YBCStartOnlineSchemaChange(
-    const char* ddl, YbcPgOid database_oid, YbcPgOid submitted_by, const char* request_id,
-    const char** migration_id);
+    const char* ddl, YbcPgOid database_oid, YbcPgOid table_oid, YbcPgOid submitted_by,
+    const char* request_id, const char** migration_id);
 YbcStatus YBCCancelSchemaMigration(const char* migration_id);
 YbcStatus YBCGetSchemaMigrations(
     const char* state_filter, YbcPgSchemaMigrationInfo** migrations, size_t* count);

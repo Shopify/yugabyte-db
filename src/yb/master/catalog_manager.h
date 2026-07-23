@@ -333,6 +333,29 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
       const TableId& source_table_id, const std::string& migration_id, const LeaderEpoch& epoch)
       EXCLUDES(mutex_);
 
+  // Online schema change COPYING phase: bulk-copy the source table's data into
+  // the shadow generation at a fixed read time, by snapshotting the source and
+  // cloning its tablets (SST hard-link) into the shadow's tablets. Requires the
+  // shadow to share the source's partition schema and tablet count (as created
+  // by CreateShadowGeneration). Blocks until the copy is scheduled and the
+  // shadow tablets are running. Prototype scope: assumes the source is quiesced
+  // (no incremental write catch-up yet).
+  Status CopyGenerationData(
+      const TableId& source_table_id, const TableId& shadow_table_id, const LeaderEpoch& epoch)
+      EXCLUDES(mutex_);
+
+  // Snapshot a single table and wait until COMPLETE. Helper for CopyGenerationData.
+  Result<TxnSnapshotId> CreateAndWaitTableSnapshot(
+      const TableInfoPtr& table, int64_t leader_term, CoarseTimePoint deadline);
+
+  // Online schema change CUTOVER phase (master side): make the shadow the ACTIVE
+  // generation and mark the old one RETIRED, in one sys-catalog batch. The
+  // Postgres-layer relfilenode repoint (which actually redirects I/O) is done
+  // separately via a tserver RPC / PG catalog update.
+  Status CutoverToShadow(
+      const TableId& source_table_id, const TableId& shadow_table_id, const LeaderEpoch& epoch)
+      EXCLUDES(mutex_);
+
   // Create a new transaction status table.
   Status CreateTransactionStatusTable(const CreateTransactionStatusTableRequestPB* req,
                                       CreateTransactionStatusTableResponsePB* resp,

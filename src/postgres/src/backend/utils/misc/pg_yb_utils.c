@@ -5946,10 +5946,12 @@ yb_cancel_transaction(PG_FUNCTION_ARGS)
  * Online schema change migration tracking (see
  * architecture/design/online-schema-changes-async-shadow-roadmap.md Section 0).
  *
- * yb_start_online_schema_change(ddl text, request_id text DEFAULT NULL) -> text
- *   Asynchronously admit an online schema change and return its server-generated
- *   migration id. Row-returning function (not a plain DDL) so the id travels
- *   through every driver as a normal value.
+ * yb_start_online_schema_change(rel regclass, ddl text, request_id text) -> text
+ *   Asynchronously admit an online schema change for the given relation and
+ *   return its server-generated migration id. Row-returning function (not a
+ *   plain DDL) so the id travels through every driver as a normal value. The
+ *   relation's relfilenode (not its pg_class.oid) identifies the source physical
+ *   generation to the master.
  */
 Datum
 yb_start_online_schema_change(PG_FUNCTION_ARGS)
@@ -5959,15 +5961,28 @@ yb_start_online_schema_change(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to start an online schema change")));
 
-	char	   *ddl = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	Oid			relid = PG_GETARG_OID(0);
+	char	   *ddl = text_to_cstring(PG_GETARG_TEXT_PP(1));
 	char	   *request_id = NULL;
 
-	if (!PG_ARGISNULL(1))
-		request_id = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	if (!PG_ARGISNULL(2))
+		request_id = text_to_cstring(PG_GETARG_TEXT_PP(2));
+
+	/* The YB physical table id encodes the relfilenode, not the pg_class.oid. */
+	Relation	rel = RelationIdGetRelation(relid);
+
+	if (!RelationIsValid(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("could not open relation with OID %u", relid)));
+
+	Oid			relfilenode = YbGetRelfileNodeId(rel);
+
+	RelationClose(rel);
 
 	const char *migration_id = NULL;
 
-	HandleYBStatus(YBCStartOnlineSchemaChange(ddl, MyDatabaseId, GetUserId(),
+	HandleYBStatus(YBCStartOnlineSchemaChange(ddl, MyDatabaseId, relfilenode, GetUserId(),
 											  request_id, &migration_id));
 
 	if (migration_id == NULL || strlen(migration_id) == 0)

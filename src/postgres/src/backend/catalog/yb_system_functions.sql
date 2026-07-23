@@ -236,8 +236,8 @@ GRANT EXECUTE ON FUNCTION yb_pg_stat_plans_read_file()
 REVOKE EXECUTE ON FUNCTION yb_pg_stat_plans_write_file() FROM public;
 GRANT EXECUTE ON FUNCTION yb_pg_stat_plans_write_file()
   TO yb_db_admin;
-REVOKE EXECUTE ON FUNCTION yb_start_online_schema_change(text, text) FROM public;
-GRANT EXECUTE ON FUNCTION yb_start_online_schema_change(text, text)
+REVOKE EXECUTE ON FUNCTION yb_start_online_schema_change(regclass, text, text) FROM public;
+GRANT EXECUTE ON FUNCTION yb_start_online_schema_change(regclass, text, text)
   TO yb_db_admin;
 REVOKE EXECUTE ON FUNCTION yb_cancel_schema_migration(text) FROM public;
 GRANT EXECUTE ON FUNCTION yb_cancel_schema_migration(text)

@@ -12139,7 +12139,7 @@
   descr => 'start an online schema change and return its migration id',
   proname => 'yb_start_online_schema_change', provolatile => 'v',
   proisstrict => 'f', proparallel => 'u', prorettype => 'text',
-  proargtypes => 'text text', proargnames => '{ddl,request_id}',
+  proargtypes => 'regclass text text', proargnames => '{rel,ddl,request_id}',
   prosrc => 'yb_start_online_schema_change' },
 
 { oid => '8120',

@@ -154,16 +154,72 @@ Tested by `pg_online_schema_change-test`:
 (end-to-end through the job): the shadow exists, is a `SHADOW` generation owned
 by the migration, shares the source logical id, and stays out of `ListTables`.
 
+## Copy (landed)
+
+`CatalogManager::CopyGenerationData(source_table_id, shadow_table_id, epoch)`
+bulk-copies the source data into the shadow by **tablet clone** (SST hard-link),
+reusing the clone infrastructure:
+
+1. Snapshot both the source and the shadow at a fixed time and wait for
+   `COMPLETE` (`CreateAndWaitTableSnapshot`). The source snapshot carries the
+   data SSTs; the shadow snapshot provides the target snapshot dirs the clone
+   hard-links into. Entries are collected with `CollectEntriesFromActiveSysCatalog`
+   using minimal flags - crucially **not** `kAddIndexes`, which is unsupported
+   for a single YSQL table id.
+2. Zip source tablets to shadow tablets by partition start key (valid because the
+   shadow was created with the same partition schema and tablet count).
+3. Seed each shadow tablet's consensus peers from the source (so cloned replicas
+   are not tombstoned on first heartbeat), then issue one `AsyncCloneTablet`
+   (`tablet::CloneTabletRequestPB`) per pair. The tserver hard-links the source
+   snapshot SSTs into the shadow tablet.
+
+Prototype scope: assumes the source is quiesced (no incremental CDC replay of
+writes after the snapshot time yet); single-node/RF1; non-colocated single heap.
+
+## Cutover (partial - master side landed)
+
+`CatalogManager::CutoverToShadow(source_table_id, shadow_table_id, epoch)` flips
+roles in one sys-catalog batch: shadow -> `ACTIVE`, old source -> `RETIRED`.
+
+**Important:** this master-side role flip alone does NOT redirect reads/writes.
+In YSQL the physical table is resolved per-query from `pg_class.relfilenode`
+(via `YbGetRelfileNodeId`), not from the master's generation role. A complete
+cutover must also repoint the logical relation's `pg_class.relfilenode` to the
+shadow's relfilenode (a Postgres-layer change, e.g. via a tserver RPC or the
+`swap_relation_files` mechanics). That PG repoint is the remaining
+correctness-critical piece; until it lands, the role flip is validated in
+isolation (test asserts the roles, not query routing).
+
+## Job wiring and SQL entry (landed)
+
+The executor phases call the real backend (gated by
+`TEST_schema_migration_create_shadow`):
+`SHADOW_CREATING` -> `CreateShadowGeneration`, `COPYING` -> `CopyGenerationData`,
+`CUTOVER` -> `CutoverToShadow`. `TEST_schema_migration_stop_before_cutover` lets
+tests observe the populated shadow while it is still a `SHADOW`.
+
+The SQL entry point now takes the target relation:
+`yb_start_online_schema_change(rel regclass, ddl text, request_id text)`. It
+passes the relation's **relfilenode** (`YbGetRelfileNodeId`, the YB physical id,
+not `pg_class.oid`) as `table_oid`, so the master resolves the correct source
+physical generation. Verified end to end from `ysqlsh`: start returns an id, the
+job runs shadow-create -> copy -> cutover to `SUCCEEDED`, and
+`yb_schema_migrations` / `yb_schema_migration_progress` report the real
+`table_oid` / `source_table_id`.
+
+Tested by `pg_online_schema_change-test`: `MigrationCreatesShadowGeneration`
+(stops before cutover; shadow is SHADOW, owned, hidden), and
+`MigrationCopiesAndCutsOver` (full pipeline to SUCCEEDED; source -> RETIRED,
+shadow -> ACTIVE).
+
 ## Not yet done (drives later steps)
 
-- The `COPYING` phase: fixed-HT distributed copy of the source snapshot into the
-  shadow, plus CDC replay of concurrent writes.
-- Adopting a caught-up shadow into the source OID at cutover (the `CUTOVER`
-  phase; roadmap Section 3, the `tablecmds.c` `make_new_heap`/`finish_heap_swap`
-  seam). The current in-tree rewrite still copies inline; adoption must skip the
-  copy and index rebuild and instead swap in the already-populated shadow.
+- The Postgres-layer `pg_class.relfilenode` repoint at cutover (the load-bearing
+  step that actually redirects I/O). Needs a tserver RPC / PG catalog update;
+  today only the master role flip is done.
+- Incremental CDC replay of writes committed after the copy snapshot time
+  (the copy currently assumes a quiesced source).
 - Migration-driven GC of `SHADOW` (on cancel) and `RETIRED` (after retention).
 - Preflight rejection of explicit operations targeting a shadow physical id.
-- Passing the target `table_oid` from the SQL `yb_start_online_schema_change`
-  path (today the SQL function records `table_oid = 0`; the end-to-end test
-  drives the job via the master API with the resolved oid).
+- Multi-tablet / colocated / indexed / geo shapes (copy currently zips tablets
+  1:1 and skips indexes).

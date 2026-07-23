@@ -85,6 +85,7 @@
 #include "yb/common/common.pb.h"
 #include "yb/common/constants.h"
 #include "yb/common/entity_ids.h"
+#include "yb/common/snapshot.h"
 #include "yb/common/key_encoder.h"
 #include "yb/common/pg_catversions.h"
 #include "yb/common/pgsql_error.h"
@@ -126,6 +127,7 @@
 #include "yb/master/catalog_manager-internal.h"
 #include "yb/master/cdcsdk_manager.h"
 #include "yb/master/clone/clone_state_manager.h"
+#include "yb/master/clone/clone_tasks.h"
 #include "yb/master/schema_migration/schema_migration_manager.h"
 #include "yb/master/cluster_balance.h"
 #include "yb/master/encryption_manager.h"
@@ -5200,6 +5202,122 @@ Result<TableId> CatalogManager::CreateShadowGeneration(
             << req.pg_table_id() << ") for source " << source_table_id << ", migration "
             << migration_id;
   return req.table_id();
+}
+
+Result<TxnSnapshotId> CatalogManager::CreateAndWaitTableSnapshot(
+    const TableInfoPtr& table, int64_t leader_term, CoarseTimePoint deadline) {
+  auto& coordinator = master_->snapshot_coordinator();
+  google::protobuf::RepeatedPtrField<TableIdentifierPB> tables;
+  tables.Add()->set_table_id(table->id());
+  // Collect just this table and its tablets. Do NOT set kAddIndexes: index
+  // collection is unsupported for a single YSQL table id and the shadow slice is
+  // a single heap with no secondary indexes.
+  auto entries = VERIFY_RESULT(CollectEntriesFromActiveSysCatalog(
+      tables, CollectFlags{CollectFlag::kSucceedIfCreateInProgress}));
+  auto snapshot_id = VERIFY_RESULT(coordinator.Create(
+      entries, /* imported */ false, leader_term, deadline, /* retention_duration_hours */ 0));
+
+  RETURN_NOT_OK(Wait(
+      [&coordinator, &snapshot_id]() -> Result<bool> {
+        ListSnapshotsResponsePB resp;
+        RETURN_NOT_OK(coordinator.ListSnapshots(
+            snapshot_id, /* list_deleted */ false, ListSnapshotsDetailOptionsPB(), &resp));
+        if (resp.snapshots_size() != 1) {
+          return false;
+        }
+        const auto state = resp.snapshots(0).entry().state();
+        if (state == SysSnapshotEntryPB::FAILED || state == SysSnapshotEntryPB::CANCELLED) {
+          return STATUS_FORMAT(IllegalState, "Snapshot $0 entered state $1", snapshot_id, state);
+        }
+        return state == SysSnapshotEntryPB::COMPLETE;
+      },
+      deadline, Format("Waiting for snapshot $0 to complete", snapshot_id)));
+  return snapshot_id;
+}
+
+Status CatalogManager::CopyGenerationData(
+    const TableId& source_table_id, const TableId& shadow_table_id, const LeaderEpoch& epoch) {
+  auto source = VERIFY_RESULT(FindTableById(source_table_id));
+  auto shadow = VERIFY_RESULT(FindTableById(shadow_table_id));
+
+  // Order each table's tablets by partition start key so we can zip them. Valid
+  // because the shadow was created with the same partition schema and tablet
+  // count as the source (CreateShadowGeneration).
+  auto source_tablets = VERIFY_RESULT(source->GetTablets(GetTabletsMode::kOrderByPartitions));
+  auto shadow_tablets = VERIFY_RESULT(shadow->GetTablets(GetTabletsMode::kOrderByPartitions));
+  SCHECK_EQ(
+      source_tablets.size(), shadow_tablets.size(), IllegalState,
+      "Source and shadow tablet counts differ; cannot copy");
+
+  const auto deadline = CoarseMonoClock::Now() + 120s;
+
+  // Snapshot both tables (source provides the data SSTs; the shadow snapshot
+  // provides the target snapshot dirs the clone hard-links into).
+  auto source_snapshot_id = VERIFY_RESULT(
+      CreateAndWaitTableSnapshot(source, epoch.leader_term, deadline));
+  auto target_snapshot_id = VERIFY_RESULT(
+      CreateAndWaitTableSnapshot(shadow, epoch.leader_term, deadline));
+
+  auto shadow_lock = shadow->LockForRead();
+  for (size_t i = 0; i < source_tablets.size(); ++i) {
+    const auto& source_tablet = source_tablets[i];
+    const auto& shadow_tablet = shadow_tablets[i];
+
+    // Seed the shadow tablet's consensus peers from the source so the cloned
+    // replicas are not tombstoned on first heartbeat (mirrors clone).
+    {
+      auto sl = source_tablet->LockForRead();
+      auto tl = shadow_tablet->LockForWrite();
+      if (tl->pb.committed_consensus_state().config().peers_size() == 0 &&
+          sl->pb.committed_consensus_state().config().peers_size() != 0) {
+        tl.mutable_data()->pb.mutable_committed_consensus_state()->mutable_config()
+            ->mutable_peers()->CopyFrom(sl->pb.committed_consensus_state().config().peers());
+        RETURN_NOT_OK(sys_catalog_->Upsert(epoch, shadow_tablet));
+        tl.Commit();
+      }
+    }
+
+    tablet::CloneTabletRequestPB req;
+    req.set_tablet_id(source_tablet->id());
+    req.set_target_tablet_id(shadow_tablet->id());
+    req.set_source_snapshot_id(source_snapshot_id.data(), source_snapshot_id.size());
+    req.set_target_snapshot_id(target_snapshot_id.data(), target_snapshot_id.size());
+    req.set_target_table_id(shadow_table_id);
+    req.set_target_namespace_name(shadow_lock->namespace_name());
+    req.set_target_namespace_id(shadow_lock->namespace_id());
+    req.set_target_pg_table_id(shadow_lock->pb.pg_table_id());
+    *req.mutable_target_schema() = shadow_lock->pb.schema();
+    *req.mutable_target_partition_schema() = shadow_lock->pb.partition_schema();
+
+    auto call = std::make_shared<AsyncCloneTablet>(
+        master_, AsyncTaskPool(), source_tablet, epoch, std::move(req));
+    RETURN_NOT_OK(ScheduleTask(call));
+  }
+
+  LOG(INFO) << "Scheduled data copy of " << source_tablets.size() << " tablet(s) from "
+            << source_table_id << " into shadow " << shadow_table_id;
+  return Status::OK();
+}
+
+Status CatalogManager::CutoverToShadow(
+    const TableId& source_table_id, const TableId& shadow_table_id, const LeaderEpoch& epoch) {
+  auto source = VERIFY_RESULT(FindTableById(source_table_id));
+  auto shadow = VERIFY_RESULT(FindTableById(shadow_table_id));
+
+  // Flip roles in a single sys-catalog batch: shadow becomes ACTIVE, the old
+  // generation becomes RETIRED. The Postgres-layer relfilenode repoint (which
+  // actually redirects reads/writes) is applied separately.
+  auto source_lock = source->LockForWrite();
+  auto shadow_lock = shadow->LockForWrite();
+  shadow_lock.mutable_data()->pb.set_physical_generation_role(SysTablesEntryPB::ACTIVE);
+  source_lock.mutable_data()->pb.set_physical_generation_role(SysTablesEntryPB::RETIRED);
+  RETURN_NOT_OK(sys_catalog_->Upsert(epoch, source, shadow));
+  shadow_lock.Commit();
+  source_lock.Commit();
+
+  LOG(INFO) << "Cutover: shadow " << shadow_table_id << " is now ACTIVE, source "
+            << source_table_id << " RETIRED";
+  return Status::OK();
 }
 
 void CatalogManager::ScheduleVerifyTablePgLayer(

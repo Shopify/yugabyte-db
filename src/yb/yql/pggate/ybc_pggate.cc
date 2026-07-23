@@ -3287,11 +3287,12 @@ void FillSchemaMigrationInfo(
 }  // namespace
 
 YbcStatus YBCStartOnlineSchemaChange(
-    const char* ddl, YbcPgOid database_oid, YbcPgOid submitted_by, const char* request_id,
-    const char** migration_id) {
+    const char* ddl, YbcPgOid database_oid, YbcPgOid table_oid, YbcPgOid submitted_by,
+    const char* request_id, const char** migration_id) {
   tserver::PgStartSchemaMigrationRequestPB req;
   req.set_kind("ONLINE_TABLE_REWRITE");
   req.set_database_oid(database_oid);
+  req.set_table_oid(table_oid);
   req.set_submitted_by(submitted_by);
   req.set_submitted_ddl(ddl);
   if (request_id && *request_id) {
