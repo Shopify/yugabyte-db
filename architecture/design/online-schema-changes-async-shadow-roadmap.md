@@ -922,13 +922,16 @@ to be landable behind a preview gate with its own test.
    re-exposes the same id; ordinary `ALTER TABLE` wire behavior unchanged
    (`PGRES_COMMAND_OK`, JDBC `executeUpdate` still returns 0).
 
-1. **Generation metadata + hidden shadow (Milestone A backend).**
+1. **Generation metadata + hidden shadow (Milestone A backend).** [in progress]
    Add an explicit physical-generation role (`ACTIVE`/`SHADOW`/`RETIRED`) to
    `SysTablesEntryPB`, distinct from `HIDDEN`. Teach `ListTables`, CDC dynamic
    discovery, backup enumeration, and GC to exclude `SHADOW`. Create a shadow
    generation via the existing `YbRelationSetNewRelfileNode`/`CreateTable`
    plumbing with `pg_table_id` set to the source logical id. Test: shadow is
    invisible to SQL/list/backup but addressable by physical id.
+   Detail + findings: `online-schema-changes/generation-metadata.md`. The role
+   enum, accessors, and the `ListTables`/CDC/backup exclusions have landed; shadow
+   creation and GC wire in with the migration job.
 
 2. **Wire the caught-up shadow into the OID-preserving switch (Milestone C).**
    The seam is `tablecmds.c:6390-6409` (`make_new_heap` -> inline

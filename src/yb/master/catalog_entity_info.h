@@ -472,7 +472,29 @@ struct PersistentTableInfo : public Persistent<SysTablesEntryPB> {
            pb.state() == SysTablesEntryPB::ALTERING;
   }
 
-  bool visible_to_client() const { return is_running() && !is_hidden(); }
+  bool visible_to_client() const {
+    return is_running() && !is_hidden() && is_active_generation();
+  }
+
+  // Physical-generation role for online schema changes. Absent means ACTIVE
+  // (every ordinary table). See SysTablesEntryPB.PhysicalGenerationRole.
+  SysTablesEntryPB::PhysicalGenerationRole physical_generation_role() const {
+    return pb.physical_generation_role();
+  }
+
+  bool is_active_generation() const {
+    return physical_generation_role() == SysTablesEntryPB::ACTIVE;
+  }
+
+  // A hidden second physical copy of a live table being populated by an online
+  // schema change. Must be excluded from user-facing enumeration.
+  bool is_shadow_generation() const {
+    return physical_generation_role() == SysTablesEntryPB::SHADOW;
+  }
+
+  bool is_retired_generation() const {
+    return physical_generation_role() == SysTablesEntryPB::RETIRED;
+  }
 
   bool is_hiding() const {
     return pb.hide_state() == SysTablesEntryPB::HIDING;

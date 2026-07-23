@@ -8798,6 +8798,13 @@ Status CatalogManager::ListTables(const ListTablesRequestPB* req,
         continue;
       }
 
+      // Online-schema-change shadow/retired generations are internal physical
+      // copies and must never appear in user-facing listings, even when
+      // include_not_running is set.
+      if (!ltm->is_active_generation()) {
+        continue;
+      }
+
       const auto& table_namespace_id = ltm->namespace_id();
       if (table_namespace_id.empty() ||
           (!req_namespace.id().empty() && req_namespace.id() != table_namespace_id)) {

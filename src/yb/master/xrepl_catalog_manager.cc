@@ -2705,6 +2705,14 @@ bool CatalogManager::IsTableEligibleForCDCSDKStream(
     return false;
   }
 
+  // Online-schema-change shadow/retired generations are internal physical copies
+  // and must not be discovered by CDC. The active generation carries the logical
+  // table's CDC; the migration handles the handoff at cutover (roadmap Section
+  // 3.3).
+  if (!lock->is_active_generation()) {
+    return false;
+  }
+
   if (IsInternalTableToBeExcludedFromCDCSDKStream(lock)) {
     return false;
   }

@@ -83,6 +83,24 @@ message SysTablesEntryPB {
     HIDDEN = 2;
   }
 
+  // Physical-generation role for online schema changes (see
+  // architecture/design/online-schema-changes-async-shadow-roadmap.md, Section 1
+  // and the "Generation metadata" design). This is orthogonal to HideState
+  // (which tracks dropped/hidden USER objects): a SHADOW generation is a hidden
+  // second physical copy of a live table being built by an online schema change.
+  //   ACTIVE  - the user-visible generation (default; also the value for every
+  //             ordinary table).
+  //   SHADOW  - a hidden target generation being populated by a migration. Must
+  //             be excluded from SQL lookup/listing, CDC discovery, backup
+  //             enumeration, DDL events, and hidden-object GC.
+  //   RETIRED - a former ACTIVE generation kept only for rollback/retention
+  //             after a cutover; not user-visible.
+  enum PhysicalGenerationRole {
+    ACTIVE = 0;
+    SHADOW = 1;
+    RETIRED = 2;
+  }
+
   // Table name
   required bytes name = 1;
 
@@ -230,6 +248,15 @@ message SysTablesEntryPB {
   }
 
   optional XClusterTableInfo xcluster_table_info = 42;
+
+  // Physical-generation role for online schema changes. Absent/ACTIVE for every
+  // ordinary table. Set to SHADOW while a migration populates a hidden target
+  // generation, and RETIRED for a superseded generation kept for rollback.
+  optional PhysicalGenerationRole physical_generation_role = 43 [ default = ACTIVE ];
+
+  // For a SHADOW/RETIRED generation, the migration_id (schema-migration job id)
+  // that owns it. Used to fence access and drive GC.
+  optional bytes owning_migration_id = 44;
 }
 
 // The on-disk entry in the sys.catalog table ("metadata" column) for
