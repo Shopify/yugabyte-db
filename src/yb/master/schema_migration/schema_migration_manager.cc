@@ -48,6 +48,11 @@ DEFINE_test_flag(bool, schema_migration_stop_before_cutover, false,
     "When true, the executor stops advancing once it reaches the CUTOVER phase (does not perform "
     "cutover), so tests can observe the populated shadow while it is still a SHADOW generation.");
 
+DEFINE_test_flag(bool, pause_schema_migration_before_replaying, false,
+    "When true, the executor stops advancing once it reaches the REPLAYING phase (after COPYING, "
+    "before performing change replay), so tests can inject concurrent writes to the source that "
+    "must be captured and replayed into the shadow before cutover.");
+
 namespace yb::master {
 
 namespace {
@@ -100,6 +105,15 @@ Result<std::string> SchemaMigrationManager::StartSchemaMigration(
   SCHECK(
       kind == SysSchemaMigrationEntryPB::ONLINE_TABLE_REWRITE, InvalidArgument,
       "Unsupported schema migration kind: $0", SysSchemaMigrationEntryPB::Kind_Name(kind));
+
+  // Eagerly ensure the cdc_state system table exists (and its tablet is RUNNING)
+  // now, on this RPC thread, rather than lazily during ArmChangeCapture. Arming
+  // runs on the catalog background-tasks (leader) thread; if the cdc_state table
+  // had to be created there, the synchronous WaitForCreateTableToFinish would
+  // deadlock against the same leader loop that must drive the tablet to RUNNING.
+  if (FLAGS_TEST_schema_migration_create_shadow) {
+    RETURN_NOT_OK(catalog_manager_->CreateCdcStateTableIfNotFound(epoch));
+  }
 
   {
     // Lost-response idempotency: a retried submission with the same request_id
@@ -347,6 +361,12 @@ Result<bool> SchemaMigrationManager::AdvanceJob(
       // Test hook: stop once the shadow is populated but before cutover, so the
       // shadow can be observed while still a SHADOW generation.
       if (FLAGS_TEST_schema_migration_stop_before_cutover && pb.phase() == kPhaseCutover) {
+        return false;
+      }
+      // Test hook: stop after COPYING, before change replay runs, so tests can
+      // inject concurrent source writes that REPLAYING must capture (commit_ht
+      // > S) and apply to the shadow before cutover.
+      if (FLAGS_TEST_pause_schema_migration_before_replaying && pb.phase() == kPhaseReplaying) {
         return false;
       }
       if (FLAGS_TEST_fail_schema_migration_in_running) {

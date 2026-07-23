@@ -77,9 +77,11 @@
 #include "yb/cdc/cdc_types.h"
 
 #include "yb/client/client.h"
+#include "yb/client/error.h"
 #include "yb/client/schema.h"
 #include "yb/client/session.h"
 #include "yb/client/table.h"
+#include "yb/client/table_info.h"
 #include "yb/client/universe_key_client.h"
 #include "yb/client/yb_op.h"
 
@@ -193,6 +195,7 @@
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/rpc_controller.h"
 #include "yb/rpc/scheduler.h"
+#include "yb/rpc/sidecars.h"
 
 #include "yb/tablet/operations/change_metadata_operation.h"
 #include "yb/tablet/tablet_peer.h"
@@ -216,6 +219,7 @@
 #include "yb/util/format.h"
 #include "yb/util/is_operation_done_result.h"
 #include "yb/util/logging.h"
+#include "yb/util/memory/arena.h"
 #include "yb/util/metrics.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/net_util.h"
@@ -5439,19 +5443,236 @@ Result<std::string> CatalogManager::ArmChangeCapture(
   return resp.stream_id();
 }
 
+Result<std::shared_ptr<client::YBTable>> CatalogManager::BuildHiddenTableForWrite(
+    const TableId& table_id) {
+  auto table = VERIFY_RESULT(FindTableById(table_id));
+
+  client::YBTableInfo info;
+  Schema schema;
+  dockv::PartitionSchema partition_schema;
+  {
+    auto l = table->LockForRead();
+    RETURN_NOT_OK(SchemaFromPB(l->pb.schema(), &schema));
+    RETURN_NOT_OK(dockv::PartitionSchema::FromPB(l->pb.partition_schema(), schema,
+                                                 &partition_schema));
+    info.table_name = client::YBTableName(
+        YQL_DATABASE_PGSQL, l->namespace_id(), l->namespace_name(), l->name());
+    info.table_id = table_id;
+    info.schema = client::YBSchema(schema);
+    // SchemaPB carries no version; take it from the table entry so writes send
+    // the schema version the shadow tablet actually expects.
+    info.schema.set_version(l->pb.version());
+    info.partition_schema = partition_schema;
+    info.table_type = VERIFY_RESULT(client::PBToClientTableType(l->pb.table_type()));
+    info.colocated = l->pb.colocated();
+    info.pg_table_id = l->pb.pg_table_id();
+  }
+
+  // Assemble the partition list from the table's tablets (each tablet's
+  // partition_key_start), ordered by partition. The client write path routes by
+  // this list and does NOT re-check visibility.
+  auto tablets = VERIFY_RESULT(table->GetTablets(GetTabletsMode::kOrderByPartitions));
+  auto partitions = std::make_shared<client::VersionedTablePartitionList>();
+  partitions->version = table->LockForRead()->pb.partition_list_version();
+  for (const auto& tablet : tablets) {
+    partitions->keys.push_back(tablet->LockForRead()->pb.partition().partition_key_start());
+  }
+
+  return std::make_shared<client::YBTable>(info, std::move(partitions));
+}
+
+namespace {
+
+// Places a single CDCSDK column value (name + WALSENDER pg_ql_value) into the
+// correct slot of a shadow write request, per the shadow schema's column
+// layout: hash keys -> partition_column_values, range keys ->
+// range_column_values, others -> column_values (column_id + expr.value). Key
+// columns are appended in schema order by the caller (see ApplyReplayRecord).
+Status PlaceReplayColumn(
+    const client::YBSchema& shadow_schema, const DatumMessagePB& datum, bool keys_only,
+    LWPgsqlWriteRequestPB* write) {
+  const auto idx = shadow_schema.FindColumn(datum.column_name());
+  SCHECK_GE(
+      idx, 0, NotFound,
+      Format("Column $0 from change record not found in shadow schema", datum.column_name()));
+  const size_t i = static_cast<size_t>(idx);
+  const auto col = shadow_schema.Column(i);
+  if (col.is_hash_key()) {
+    write->add_partition_column_values()->mutable_value()->CopyFrom(datum.pg_ql_value());
+  } else if (col.is_key()) {
+    write->add_range_column_values()->mutable_value()->CopyFrom(datum.pg_ql_value());
+  } else if (!keys_only) {
+    auto* cv = write->add_column_values();
+    cv->set_column_id(shadow_schema.ColumnId(i));
+    cv->mutable_expr()->mutable_value()->CopyFrom(datum.pg_ql_value());
+  }
+  return Status::OK();
+}
+
+// Builds and applies one shadow write for a single CDCSDK DML record. INSERT and
+// UPDATE become an idempotent PGSQL_UPSERT of the full new row; DELETE becomes a
+// PGSQL_DELETE keyed by the old-image key columns. Key columns must be added in
+// shadow-schema order, so we iterate the schema (not the record) for keys.
+Status ApplyReplayRecord(
+    const client::YBTablePtr& shadow_table, const client::YBSessionPtr& session,
+    const cdc::RowMessage& rm) {
+  const auto& shadow_schema = shadow_table->schema();
+  const bool is_delete = rm.op() == cdc::RowMessage::DELETE;
+  auto arena = SharedThreadSafeArena();
+  rpc::Sidecars sidecars;
+  auto op = is_delete
+      ? client::YBPgsqlWriteOp::NewDelete(shadow_table, arena, &sidecars)
+      : client::YBPgsqlWriteOp::NewInsert(shadow_table, arena, &sidecars);
+  auto* write = op->mutable_request();
+  if (!is_delete) {
+    write->set_stmt_type(PgsqlWriteRequestPB::PGSQL_UPSERT);
+  }
+  op->set_is_single_row_txn(true);
+
+  // Index the tuple by column name so we can walk the schema in key order.
+  const auto& tuple = is_delete ? rm.old_tuple() : rm.new_tuple();
+  std::unordered_map<std::string, const DatumMessagePB*> by_name;
+  for (const auto& d : tuple) {
+    if (!d.column_name().empty()) {
+      by_name[d.column_name()] = &d;
+    }
+  }
+
+  // Emit key columns first, in schema order (composite key ordering matters).
+  for (size_t i = 0; i < shadow_schema.num_key_columns(); ++i) {
+    const auto col = shadow_schema.Column(i);
+    auto it = by_name.find(col.name());
+    SCHECK(
+        it != by_name.end(), Corruption,
+        Format("Key column $0 missing from change record", col.name()));
+    RETURN_NOT_OK(PlaceReplayColumn(shadow_schema, *it->second, /*keys_only=*/true, write));
+  }
+  if (!is_delete) {
+    // Non-key columns for the upsert.
+    for (size_t i = shadow_schema.num_key_columns(); i < shadow_schema.num_columns(); ++i) {
+      const auto col = shadow_schema.Column(i);
+      auto it = by_name.find(col.name());
+      if (it == by_name.end()) {
+        continue;  // Column absent from the record (e.g. added by the migration DDL).
+      }
+      RETURN_NOT_OK(PlaceReplayColumn(shadow_schema, *it->second, /*keys_only=*/false, write));
+    }
+  }
+
+  session->Apply(op);
+  RETURN_NOT_OK(session->FlushFuture().get().status);
+  SCHECK(
+      op->response().status() == PgsqlResponsePB::PGSQL_STATUS_OK, IllegalState,
+      Format(
+          "Replay write to shadow failed: $0",
+          PgsqlResponsePB::RequestStatus_Name(op->response().status())));
+  return Status::OK();
+}
+
+}  // namespace
+
 Status CatalogManager::ReplayGenerationChanges(
     const TableId& source_table_id, const TableId& shadow_table_id,
     const std::string& capture_stream_id, uint64_t snapshot_ht, const LeaderEpoch& epoch,
     uint64_t* barrier_ht_out) {
-  // TODO(#4192): implement the WALSENDER-mode GetChanges -> PgsqlWriteRequestPB
-  // (UPSERT/DELETE) replay driver. Stub for now so the phase pipeline links;
-  // the smoke test validates the underlying capture path first.
-  if (barrier_ht_out != nullptr) {
-    *barrier_ht_out = snapshot_ht;
+  auto source = VERIFY_RESULT(FindTableById(source_table_id));
+
+  // Open the shadow table for writing the replayed changes. The shadow is a
+  // SHADOW generation (not visible_to_client), so it cannot be opened via the
+  // visibility-gated OpenTable RPC; build the YBTable from master metadata.
+  auto* client = master_->client_future().get();
+  auto shadow_table = VERIFY_RESULT(BuildHiddenTableForWrite(shadow_table_id));
+  auto session = client->NewSession(60s);
+
+  // The cutover barrier: every source write with commit_ht <= F must be applied
+  // to the shadow before cutover. Picking F now (leader clock) and draining each
+  // source tablet's stream until its safe_hybrid_time >= F guarantees this.
+  const auto barrier = master_->clock()->Now();
+  const uint64_t barrier_ht = barrier.ToUint64();
+
+  auto source_tablets = VERIFY_RESULT(source->GetTablets(GetTabletsMode::kOrderByPartitions));
+  const auto deadline = CoarseMonoClock::Now() + 300s;
+
+  int64_t total_applied = 0;
+  for (const auto& source_tablet : source_tablets) {
+    // Resolve the source tablet leader's CDC service proxy.
+    auto ts_desc = VERIFY_RESULT(source_tablet->GetLeader());
+    std::shared_ptr<cdc::CDCServiceProxy> cdc_proxy;
+    RETURN_NOT_OK(ts_desc->GetProxy(&cdc_proxy));
+
+    // Start reading from the copy snapshot time S. from_cdc_sdk_checkpoint with
+    // an empty key + snapshot_time=S anchors the stream at S; subsequent calls
+    // echo back the response checkpoint.
+    cdc::CDCSDKCheckpointPB checkpoint;
+    checkpoint.set_term(0);
+    checkpoint.set_index(0);
+    checkpoint.set_key("");
+    checkpoint.set_write_id(0);
+    checkpoint.set_snapshot_time(snapshot_ht);
+    int64_t safe_hybrid_time = -1;
+    int32_t wal_segment_index = 0;
+    bool first = true;
+
+    while (true) {
+      cdc::GetChangesRequestPB req;
+      cdc::GetChangesResponsePB resp;
+      req.set_stream_id(capture_stream_id);
+      req.set_tablet_id(source_tablet->id());
+      req.set_table_id(source_table_id);
+      *req.mutable_from_cdc_sdk_checkpoint() = checkpoint;
+      req.set_safe_hybrid_time(safe_hybrid_time);
+      req.set_wal_segment_index(wal_segment_index);
+      // WALSENDER mode => column values arrive as clean pg_ql_value (QLValuePB),
+      // which ApplyReplayRecord copies straight into the shadow write.
+      req.set_cdcsdk_request_source(cdc::CDCSDKRequestSource::WALSENDER);
+
+      rpc::RpcController rpc;
+      rpc.set_deadline(deadline);
+      RETURN_NOT_OK(cdc_proxy->GetChanges(req, &resp, &rpc));
+      if (resp.has_error()) {
+        return StatusFromPB(resp.error().status());
+      }
+
+      for (const auto& record : resp.cdc_sdk_proto_records()) {
+        const auto& rm = record.row_message();
+        switch (rm.op()) {
+          case cdc::RowMessage::INSERT: FALLTHROUGH_INTENDED;
+          case cdc::RowMessage::UPDATE: FALLTHROUGH_INTENDED;
+          case cdc::RowMessage::DELETE:
+            RETURN_NOT_OK(ApplyReplayRecord(shadow_table, session, rm));
+            ++total_applied;
+            break;
+          default:
+            break;  // BEGIN/COMMIT/DDL/SAFEPOINT/READ: nothing to apply.
+        }
+      }
+
+      checkpoint = resp.cdc_sdk_checkpoint();
+      safe_hybrid_time = resp.safe_hybrid_time();
+      wal_segment_index = resp.wal_segment_index();
+
+      // Drained to the barrier: this tablet has emitted everything with
+      // commit_ht <= F. Guard against a first empty poll returning -1.
+      if (!first && safe_hybrid_time >= 0 &&
+          static_cast<uint64_t>(safe_hybrid_time) >= barrier_ht) {
+        break;
+      }
+      first = false;
+      if (resp.cdc_sdk_proto_records().empty() && safe_hybrid_time < 0) {
+        // No progress and no safe time yet; brief backoff to avoid a hot loop.
+        SleepFor(MonoDelta::FromMilliseconds(50));
+      }
+      SCHECK(
+          CoarseMonoClock::Now() < deadline, TimedOut,
+          Format("Replay for tablet $0 did not reach barrier", source_tablet->id()));
+    }
   }
-  LOG(WARNING) << "ReplayGenerationChanges is a stub (source " << source_table_id << ", shadow "
-               << shadow_table_id << ", stream " << capture_stream_id << ", S " << snapshot_ht
-               << "); post-snapshot changes are NOT yet replayed";
+
+  if (barrier_ht_out != nullptr) {
+    *barrier_ht_out = barrier_ht;
+  }
+  LOG(INFO) << "Replay complete for shadow " << shadow_table_id << ": applied " << total_applied
+            << " change record(s) up to barrier " << barrier_ht;
   return Status::OK();
 }
 

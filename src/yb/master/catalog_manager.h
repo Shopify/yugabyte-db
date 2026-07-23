@@ -351,6 +351,13 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
       const TableId& source_table_id, const TableId& shadow_table_id, const LeaderEpoch& epoch,
       uint64_t* snapshot_ht_out) EXCLUDES(mutex_);
 
+  // Build a client::YBTable for a table directly from its master TableInfo
+  // (schema + partitions), bypassing the visibility-gated GetTableSchema RPC.
+  // Needed to write to a SHADOW generation, which is intentionally not
+  // visible_to_client() and so cannot be opened via YBClient::OpenTable.
+  Result<std::shared_ptr<client::YBTable>> BuildHiddenTableForWrite(
+      const TableId& table_id) EXCLUDES(mutex_);
+
   // Online schema change REPLAYING phase: stream source changes with
   // commit_time > `snapshot_ht` (S) from the armed capture stream and apply them
   // idempotently (upsert/delete) into the shadow generation. Then establish a

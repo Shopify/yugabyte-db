@@ -254,8 +254,11 @@ record count as the source - real data parity - then roles flipped).
   source, and `yb_finalize_online_schema_change` is a manual client call.
 - Make COPYING resumable/async rather than blocking the catalog bg thread for
   the clone+restore duration (bounded by a deadline today).
-- Incremental CDC replay of writes committed after the copy snapshot time
-  (the copy currently assumes a quiesced source).
+- Incremental CDC replay of writes committed after the copy snapshot time: DONE
+  (the `REPLAYING` phase; see "Online change replay" below). Remaining: shrink
+  the cutover fence to just the final barrier (dual-write), delete the capture
+  stream on terminal states to release retention, and handle structural schema
+  changes (column add/drop) in the per-record translation.
 - Migration-driven GC of `SHADOW` (on cancel) and `RETIRED` (after retention).
 - Preflight rejection of explicit operations targeting a shadow physical id.
 - Colocated / indexed / geo shapes (copy zips tablets 1:1 and skips indexes).
@@ -291,23 +294,56 @@ classic online-migration ordering:
    carried the shadow to `F`, the fenced window is just the pointer swap, not the
    whole migration.
 
-### Apply path decision: raw-KV (xCluster-style) vs logical (CDCSDK datums)
+### Apply path decision: logical (CDCSDK) vs raw-KV (xCluster-style)
 
-The shadow is a *true clone* of the source (created via clone/snapshot, so it has
-identical DocDB column ids and, for a non-colocated YSQL table, no cotable/
-colocation key prefix). Consequences (verified against `dockv/doc_key.cc`
-`DocKeyEncoder::Schema`/`CotableId`/`ColocationId`): the row-key encoding of a
-non-colocated YSQL table carries **no table-id prefix**, so raw DocDB KV pairs
-from a source tablet transplant **verbatim** into the matching shadow tablet;
-only the packed-row `schema_version` needs remapping (identity while the shadow
-shares the source schema). This makes the raw-KV apply (the xCluster
-`XClusterWriteImplementation`/`AddRecord` path, `external_hybrid_time` write
-batch) the least-code correct option and avoids reconstructing writes from
-`DatumMessagePB` (for which there is no reverse helper in-tree - the only
-consumer hands `pg_ql_value` up to PG to re-encode). Caveats captured for later:
-colocated/cotable tables DO carry a differing key prefix (would need key
-rewriting), and a shadow with a genuinely different schema needs a real
-`schema_versions_map` remap.
+Two apply paths were considered:
+
+- **Raw-KV (xCluster style):** for a non-colocated YSQL table the row-key
+  encoding carries no cotable/colocation prefix (verified against
+  `dockv/doc_key.cc` `DocKeyEncoder::Schema`/`CotableId`/`ColocationId`), so raw
+  DocDB KV pairs transplant *verbatim* into a clone shadow with only a
+  packed-row `schema_version` remap. Least code - **but only while the shadow
+  shares the source's physical encoding.** The whole point of an online `ALTER`
+  is a *different* shadow schema (add/drop/retype a column), which changes the
+  packed-row layout and column ids, so verbatim KV replay is incorrect for the
+  target use case.
+- **Logical (CDCSDK):** reconstruct each row from the change record and re-encode
+  it against the shadow's own schema. Correct across schema changes. Chosen.
+
+Key enabler (validated by `cdcsdk_ysql-test` `WalsenderQlValueSmoke`): a
+`GetChanges` request with `cdcsdk_request_source = WALSENDER` returns YSQL column
+values as clean `pg_ql_value` (`QLValuePB`), keyed by `column_name` with PG type
+oid and attnum. This is a per-request flag with **no replication-slot
+dependency**, and it works on user tablets (in-tree it is otherwise only
+exercised via the VirtualWAL/slot path). `ReplayGenerationChanges` copies each
+`pg_ql_value` into the correct slot of a shadow `PgsqlWriteRequestPB`
+(hash/range/regular, keyed by the shadow schema) and applies INSERT/UPDATE as an
+idempotent `PGSQL_UPSERT`, DELETE as `PGSQL_DELETE`.
+
+Implementation findings:
+
+- **Opening the shadow for writes:** the shadow is a SHADOW generation
+  (`visible_to_client() == false`), so `YBClient::OpenTable` fails its
+  visibility check ("object is not running"). `CatalogManager::
+  BuildHiddenTableForWrite` builds the `client::YBTable` directly from the master
+  `TableInfo` (schema + partition list) - the session write path routes by that
+  partition list and does not re-check visibility.
+- **Schema version:** `SchemaPB` carries no version, so the built `YBSchema` must
+  have `set_version(table_entry.version())` or the shadow tablet rejects the
+  write with `PGSQL_STATUS_SCHEMA_VERSION_MISMATCH`.
+- **Arming must not run on the catalog bg thread's critical path for table
+  creation:** arming a CDCSDK stream lazily creates the `cdc_state` system table,
+  and the synchronous `WaitForCreateTableToFinish` inside that call deadlocks
+  against the same leader/bg loop that must drive the new tablet to RUNNING. Fix:
+  eagerly `CreateCdcStateTableIfNotFound` at migration *admission* (on the RPC
+  thread), so by arming time the table is RUNNING and the wait returns instantly.
+- **Checkpoint:** start GetChanges from `from_cdc_sdk_checkpoint` with
+  `term=0,index=0,key="",write_id=0,snapshot_time=S`; `term=-1/index=-1` trips a
+  `log_index > 0` CHECK in the tserver.
+
+Caveats for later: colocated/cotable tables carry a differing key prefix; a
+shadow with structural schema changes needs column add/drop handling in the
+per-record translation (absent columns are skipped today).
 
 ### Cutover fence / downtime
 

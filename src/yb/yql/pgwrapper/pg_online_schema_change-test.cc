@@ -50,6 +50,7 @@
 DECLARE_bool(TEST_enable_schema_migration_admission);
 DECLARE_bool(TEST_schema_migration_create_shadow);
 DECLARE_bool(TEST_schema_migration_stop_before_cutover);
+DECLARE_bool(TEST_pause_schema_migration_before_replaying);
 
 using namespace std::chrono_literals;
 
@@ -515,6 +516,83 @@ TEST_F(PgOnlineSchemaChangeRf3Test, MultiTabletMigration) {
   // Cutover flipped the roles.
   ASSERT_TRUE(source->LockForRead()->is_retired_generation());
   ASSERT_TRUE(shadow->LockForRead()->is_active_generation());
+}
+
+// Online change replay: writes committed to the source AFTER the copy snapshot
+// (S) but before cutover must be captured and replayed into the shadow, so no
+// data is lost when serving switches to the shadow. The executor is paused after
+// COPYING; while paused we INSERT a new row, UPDATE an existing row, and DELETE
+// an existing row; then replay is resumed. After finalize, reads served from the
+// shadow must reflect all three concurrent mutations (exact parity with what the
+// source contains).
+TEST_F(PgOnlineSchemaChangeTest, ReplayCapturesConcurrentWrites) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_enable_schema_migration_admission) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_schema_migration_create_shadow) = true;
+  // Hold the pipeline after COPYING so we can inject post-snapshot writes that
+  // only REPLAYING (not the copy) can carry into the shadow.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_schema_migration_before_replaying) = true;
+
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE cw (id int PRIMARY KEY, v text)"));
+  ASSERT_OK(conn.Execute(
+      "INSERT INTO cw SELECT g, 'v' || g FROM generate_series(1, 100) g"));
+
+  const auto migration_id = ASSERT_RESULT(conn.FetchRow<std::string>(
+      "SELECT yb_start_online_schema_change('cw'::regclass, "
+      "'ALTER TABLE cw ADD c int', NULL)"));
+  ASSERT_FALSE(migration_id.empty());
+
+  auto* mini_master = ASSERT_RESULT(cluster_->GetLeaderMiniMaster());
+  auto& mgr = mini_master->master()->schema_migration_manager();
+
+  // Wait until the job is parked at REPLAYING (copy done, replay not yet run).
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    auto pb = VERIFY_RESULT(mgr.GetSchemaMigration(migration_id));
+    if (pb.state() == master::SysSchemaMigrationEntryPB::FAILED) {
+      return STATUS_FORMAT(IllegalState, "migration failed: $0",
+                           StatusFromPB(pb.terminal_error()));
+    }
+    return pb.phase() == "REPLAYING" &&
+           pb.state() == master::SysSchemaMigrationEntryPB::RUNNING;
+  }, 120s, "migration parks at REPLAYING"));
+
+  // Concurrent writes to the source, committed strictly after the copy snapshot.
+  ASSERT_OK(conn.Execute("INSERT INTO cw VALUES (101, 'new101')"));   // new row
+  ASSERT_OK(conn.Execute("UPDATE cw SET v = 'updated5' WHERE id = 5"));  // update
+  ASSERT_OK(conn.Execute("DELETE FROM cw WHERE id = 7"));             // delete
+
+  // Resume: REPLAYING captures the three mutations (commit_ht > S) and applies
+  // them to the shadow; then CUTOVER flips roles.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_schema_migration_before_replaying) = false;
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    auto pb = VERIFY_RESULT(mgr.GetSchemaMigration(migration_id));
+    if (pb.state() == master::SysSchemaMigrationEntryPB::FAILED) {
+      return STATUS_FORMAT(IllegalState, "migration failed: $0",
+                           StatusFromPB(pb.terminal_error()));
+    }
+    return pb.state() == master::SysSchemaMigrationEntryPB::SUCCEEDED;
+  }, 120s, "migration reaches SUCCEEDED"));
+
+  // Finalize: serve from the shadow.
+  ASSERT_TRUE(ASSERT_RESULT(conn.FetchRow<bool>(Format(
+      "SELECT yb_finalize_online_schema_change('cw'::regclass, '$0')", migration_id))));
+
+  // Reads now come from the shadow. Assert the three concurrent mutations are
+  // reflected - i.e. replay did not lose post-snapshot writes.
+  auto conn2 = ASSERT_RESULT(Connect());
+  // INSERT captured: row 101 exists.
+  ASSERT_EQ(ASSERT_RESULT(conn2.FetchRow<int64_t>(
+      "SELECT count(*) FROM cw WHERE id = 101")), 1);
+  ASSERT_EQ(ASSERT_RESULT(conn2.FetchRow<std::string>(
+      "SELECT v FROM cw WHERE id = 101")), "new101");
+  // UPDATE captured: row 5's value is the updated one.
+  ASSERT_EQ(ASSERT_RESULT(conn2.FetchRow<std::string>(
+      "SELECT v FROM cw WHERE id = 5")), "updated5");
+  // DELETE captured: row 7 is gone.
+  ASSERT_EQ(ASSERT_RESULT(conn2.FetchRow<int64_t>(
+      "SELECT count(*) FROM cw WHERE id = 7")), 0);
+  // Exact total: 100 seed - 1 deleted + 1 inserted = 100.
+  ASSERT_EQ(ASSERT_RESULT(conn2.FetchRow<int64_t>("SELECT count(*) FROM cw")), 100);
 }
 
 }  // namespace pgwrapper
