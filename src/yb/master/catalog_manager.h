@@ -478,8 +478,6 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   Status UpdateSysCatalogWithNewSchema(
     const scoped_refptr<TableInfo>& table,
     const std::vector<DdlLogEntry>& ddl_log_entries,
-    const std::string& new_namespace_id,
-    const std::string& new_table_name,
     const LeaderEpoch& epoch,
     AlterTableResponsePB* resp);
 
@@ -559,7 +557,6 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
 
   Status YsqlDdlTxnAlterTableHelper(const YsqlTableDdlTxnState txn_data,
                                     const std::vector<DdlLogEntry>& ddl_log_entries,
-                                    const std::string& new_table_name,
                                     bool success,
                                     int rollback_till_ddl_state_index = 0);
 
