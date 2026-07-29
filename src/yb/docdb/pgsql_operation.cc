@@ -164,6 +164,35 @@ DEFINE_RUNTIME_bool(ysql_index_backfill_deferred_uniqueness_check, false,
 TAG_FLAG(ysql_index_backfill_deferred_uniqueness_check, unsafe);
 TAG_FLAG(ysql_index_backfill_deferred_uniqueness_check, advanced);
 
+DEFINE_RUNTIME_string(ysql_index_backfill_unique_check_mode, "full",
+    "EXPERIMENTAL: controls the per-write behavior of YSQL unique-index BACKFILL writes so "
+    "backfill throughput can be compared against non-unique index backfill. Values: "
+    "'full' (default; forward + backward duplicate checks, INSERT read-modify-write shape -- "
+    "current master behavior); 'skip_backward' (forward check only; skip the backward MVCC "
+    "scan); 'skip_reads' (skip both forward and backward checks but keep the INSERT read "
+    "snapshot / strong-read lock); 'blind' (skip both checks AND drop the read-modify-write "
+    "shape so the write behaves like a non-unique UPSERT: serializable isolation, write-only "
+    "lock, no read snapshot). Only affects backfill writes into unique indexes; foreground "
+    "writes are unaffected. Any value other than 'full' can produce an index that contains "
+    "duplicates -- these modes are for performance experiments and rely on a separate "
+    "verification phase (not run by this flag) for correctness. Legacy fallback: when this "
+    "flag is 'full' and ysql_index_backfill_deferred_uniqueness_check is set, backfill writes "
+    "behave as 'skip_reads'.");
+TAG_FLAG(ysql_index_backfill_unique_check_mode, unsafe);
+TAG_FLAG(ysql_index_backfill_unique_check_mode, advanced);
+
+namespace {
+bool ValidateUniqueBackfillCheckMode(const char* flag_name, const std::string& value) {
+  if (value == "full" || value == "skip_backward" || value == "skip_reads" || value == "blind") {
+    return true;
+  }
+  LOG_FLAG_VALIDATION_ERROR(flag_name, value)
+      << "Expected one of: full, skip_backward, skip_reads, blind.";
+  return false;
+}
+}  // namespace
+DEFINE_validator(ysql_index_backfill_unique_check_mode, &ValidateUniqueBackfillCheckMode);
+
 // Defined in the docdb library so both the master and TServer binaries register
 // it. The AutoFlag promotion protocol needs universe-wide registration to gate a
 // future master->TServer RPC (VerifyIndexChunk, landed in PR 4) on all TServers
@@ -1319,10 +1348,56 @@ Status PgsqlWriteOperation::Init(PgsqlResponseMsg* response) {
   return Status::OK();
 }
 
+namespace {
+// Experiment-only modes for unique-index backfill writes; see the
+// ysql_index_backfill_unique_check_mode flag description.
+enum class UniqueBackfillCheckMode { kFull, kSkipBackward, kSkipReads, kBlind };
+
+// Resolves the effective mode for a write, applying the legacy-flag fallback. `is_backfill`
+// must be the request's is_backfill() value. Both RequireReadSnapshot() and
+// HasDuplicateUniqueIndexValue() consult this so they never disagree.
+UniqueBackfillCheckMode EffectiveUniqueBackfillCheckMode(bool is_backfill) {
+  const auto& mode = FLAGS_ysql_index_backfill_unique_check_mode;
+  UniqueBackfillCheckMode parsed;
+  if (mode == "skip_backward") {
+    parsed = UniqueBackfillCheckMode::kSkipBackward;
+  } else if (mode == "skip_reads") {
+    parsed = UniqueBackfillCheckMode::kSkipReads;
+  } else if (mode == "blind") {
+    parsed = UniqueBackfillCheckMode::kBlind;
+  } else {
+    // Includes "full" and any unexpected value (the flag validator rejects bad values at set
+    // time, so this branch is only "full" in practice).
+    parsed = UniqueBackfillCheckMode::kFull;
+  }
+  // Legacy fallback: the pre-existing deferred-uniqueness bool, when set, is equivalent to
+  // skip_reads on the write path (skip both per-write checks, keep the INSERT read snapshot).
+  // The enum takes precedence whenever it is set to anything other than the default.
+  if (parsed == UniqueBackfillCheckMode::kFull && is_backfill &&
+      FLAGS_ysql_index_backfill_deferred_uniqueness_check) {
+    parsed = UniqueBackfillCheckMode::kSkipReads;
+  }
+  return parsed;
+}
+}  // namespace
+
 bool PgsqlWriteOperation::RequireReadSnapshot() const {
   // For YSQL the the standard operations (INSERT/UPDATE/DELETE) will read/check the primary key.
   // We use UPSERT stmt type for specific requests when we can guarantee we can skip the read.
-  return request_.stmt_type() != PgsqlWriteRequestPB::PGSQL_UPSERT;
+  if (request_.stmt_type() == PgsqlWriteRequestPB::PGSQL_UPSERT) {
+    return false;
+  }
+  // EXPERIMENTAL 'blind' mode: make a unique-index backfill write behave like a non-unique
+  // UPSERT by dropping the read snapshot. This cascades to serializable isolation and a
+  // write-only lock (GetDocPaths + GetIntentTypesForWrite), and skips ScopedReadOperation in
+  // WriteQuery -- exactly the non-unique write path. Backfill only; foreground writes keep the
+  // read snapshot.
+  if (request_.is_backfill() &&
+      EffectiveUniqueBackfillCheckMode(/* is_backfill = */ true) ==
+          UniqueBackfillCheckMode::kBlind) {
+    return false;
+  }
+  return true;
 }
 
 void PgsqlWriteOperation::ClearResponse() {
@@ -1332,21 +1407,34 @@ void PgsqlWriteOperation::ClearResponse() {
 }
 
 // Check if a duplicate value is inserted into a unique index.
+//
+// This dispatcher is only invoked for backfill writes (ApplyInsert calls it inside the
+// is_backfill() branch); foreground writes take a different path and are unaffected by the
+// experiment mode below.
 Result<bool> PgsqlWriteOperation::HasDuplicateUniqueIndexValue(const DocOperationApplyData& data) {
   VLOG(3) << "Looking for collisions in\n" << DocDBDebugDumpToStr(data);
-  // When ysql_index_backfill_deferred_uniqueness_check is set, backfill writes skip
-  // both the forward and backward per-write duplicate checks. The post-backfill
-  // verify phase (VerifyIndexChunk RPC + master hook) is responsible for detecting
-  // duplicates before the index is declared valid. Skipping the synchronous check
-  // is the point of the deferred-uniqueness strategy -- it eliminates the per-write
-  // contention that motivates the feature. The gflag is tagged `unsafe` and cannot
-  // be enabled without explicit acknowledgement.
-  if (request_.is_backfill() && FLAGS_ysql_index_backfill_deferred_uniqueness_check) {
-    VLOG(3) << "Skipping duplicate check for backfill unique-index write; "
-            << "check deferred to post-backfill verify phase.";
-    return false;
+  // ysql_index_backfill_unique_check_mode selects which per-write duplicate checks run for a
+  // unique-index backfill write. Any mode other than 'full' relies on a separate post-backfill
+  // verification phase (not gated by this flag) for correctness; the flag is tagged `unsafe`.
+  switch (EffectiveUniqueBackfillCheckMode(request_.is_backfill())) {
+    case UniqueBackfillCheckMode::kSkipReads:
+    case UniqueBackfillCheckMode::kBlind:
+      // Skip both the forward and backward per-write checks.
+      VLOG(3) << "Skipping duplicate check for backfill unique-index write "
+              << "(ysql_index_backfill_unique_check_mode); deferred to verify phase.";
+      return false;
+    case UniqueBackfillCheckMode::kSkipBackward: {
+      // Forward check only; skip the backward MVCC scan.
+      bool ret = VERIFY_RESULT(HasDuplicateUniqueIndexValue(data, data.read_time()));
+      if (!ret) {
+        VLOG(3) << "No collisions found (forward check only)";
+      }
+      return ret;
+    }
+    case UniqueBackfillCheckMode::kFull:
+      break;
   }
-  // We need to check backwards only for backfilled entries.
+  // kFull: forward check, plus the backward check for backfilled entries.
   bool ret =
       VERIFY_RESULT(HasDuplicateUniqueIndexValue(data, data.read_time())) ||
       (request_.is_backfill() &&

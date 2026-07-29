@@ -1894,6 +1894,16 @@ class PgIndexBackfillBlockDoBackfill : public PgIndexBackfillTest {
   // LWW, so CREATE UNIQUE INDEX succeeds silently -- locks in the documented prototype
   // limitation until PR 5's post-backfill verify phase lands.
   void TestDuplicatesExistBeforeBackfill(bool deferred_check_enabled);
+
+  // Helper for the experiment flag ysql_index_backfill_unique_check_mode. Same setup as
+  // TestDuplicatesExistBeforeBackfill (pre-existing duplicates on the indexed column), but
+  // parameterized on the mode string. `expect_index_created` is the expected CREATE UNIQUE
+  // INDEX outcome: 'full' and 'skip_backward' must reject the pre-existing duplicates (the
+  // forward check catches sibling entries), while 'skip_reads' and 'blind' silence both
+  // checks and the build succeeds (producing a corrupt index -- correctness is deferred to a
+  // verification phase not run here).
+  void TestUniqueCheckModeOnPreexistingDuplicates(
+      const std::string& mode, bool expect_index_created);
 };
 
 INSTANTIATE_TEST_CASE_P(, PgIndexBackfillBlockDoBackfill, ::testing::Bool());
@@ -3316,6 +3326,69 @@ TEST_P(PgIndexBackfillBlockDoBackfill, DuplicatesExistBeforeBackfill) {
 // failure -- see the comment on TestDuplicatesExistBeforeBackfill.
 TEST_P(PgIndexBackfillBlockDoBackfill, DuplicatesExistBeforeBackfillDeferredCheck) {
   TestDuplicatesExistBeforeBackfill(/* deferred_check_enabled= */ true);
+}
+
+// Experiment flag ysql_index_backfill_unique_check_mode: confirm each mode is honored on a
+// table with pre-existing duplicates. 'full' and 'skip_backward' reject the duplicates (the
+// forward check catches sibling entries); 'skip_reads' and 'blind' silence both checks so the
+// build succeeds and produces a corrupt index.
+void PgIndexBackfillBlockDoBackfill::TestUniqueCheckModeOnPreexistingDuplicates(
+    const std::string& mode, bool expect_index_created) {
+  ASSERT_OK(cluster_->SetFlagOnTServers("ysql_index_backfill_unique_check_mode", mode));
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat("INSERT INTO $0 VALUES (1, 1), (2, 1), (3, 1)", kTableName));
+
+  // conn_ should be used by at most one thread for thread safety.
+  thread_holder_.AddThreadFunctor([this, mode, expect_index_created] {
+    LOG(INFO) << "Begin create thread (mode=" << mode << ")";
+    PGConn create_conn = ASSERT_RESULT(ConnectToDB(kDatabaseName));
+    auto status = create_conn.ExecuteFormat(
+        "CREATE UNIQUE INDEX $0 ON $1 (b ASC)", kIndexName, kTableName);
+    LOG(INFO) << "CREATE INDEX status (mode=" << mode << "): " << status;
+    if (expect_index_created) {
+      ASSERT_OK(status);
+    } else {
+      ASSERT_NOK(status);
+      ASSERT_TRUE(status.message().ToBuffer().find("duplicate") != std::string::npos)
+          << "Expected duplicate key error, got: " << status;
+    }
+  });
+  thread_holder_.AddThreadFunctor([this] {
+    LOG(INFO) << "Begin write thread";
+    ASSERT_OK(WaitForBackfillSafeTime(kYBTableName));
+
+    // Delete one of the duplicates, but two remain.
+    LOG(INFO) << "Delete row (3, 1)";
+    ASSERT_OK(conn_->ExecuteFormat("DELETE FROM $0 WHERE a = 3", kTableName));
+
+    // It should still be in the backfill stage.
+    ASSERT_TRUE(ASSERT_RESULT(IsAtTargetIndexStateFlags(
+        kIndexName, IndexStateFlags{IndexStateFlag::kIndIsLive, IndexStateFlag::kIndIsReady})));
+
+    // Unblock CREATE INDEX waiting to do backfill.
+    ASSERT_OK(cluster_->SetFlagOnMasters("TEST_block_do_backfill", "false"));
+  });
+  thread_holder_.JoinAll();
+}
+
+TEST_P(PgIndexBackfillBlockDoBackfill, UniqueCheckModeFullRejectsDuplicates) {
+  TestUniqueCheckModeOnPreexistingDuplicates("full", /* expect_index_created= */ false);
+}
+
+TEST_P(PgIndexBackfillBlockDoBackfill, UniqueCheckModeSkipBackwardRejectsDuplicates) {
+  // Forward check is retained, so pre-existing sibling duplicates are still caught.
+  TestUniqueCheckModeOnPreexistingDuplicates("skip_backward", /* expect_index_created= */ false);
+}
+
+TEST_P(PgIndexBackfillBlockDoBackfill, UniqueCheckModeSkipReadsSilencesChecks) {
+  // Both checks skipped; fixed-HT backfill + LWW collapse hides the duplicates. Corrupt index.
+  TestUniqueCheckModeOnPreexistingDuplicates("skip_reads", /* expect_index_created= */ true);
+}
+
+TEST_P(PgIndexBackfillBlockDoBackfill, UniqueCheckModeBlindSilencesChecks) {
+  // Both checks skipped and the write drops its read snapshot (UPSERT-equivalent). Corrupt index.
+  TestUniqueCheckModeOnPreexistingDuplicates("blind", /* expect_index_created= */ true);
 }
 
 // Override to use YSQL backends manager.
