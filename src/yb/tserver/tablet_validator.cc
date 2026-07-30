@@ -71,6 +71,10 @@ DEFINE_test_flag(uint32, tablet_validator_max_tables_number_per_rpc, 50,
 DEFINE_test_flag(bool, tablet_validator_one_rpc_per_validation_period, false,
     "Used in tests to send exactly only one RPC per validation period.");
 
+DEFINE_RUNTIME_bool(otel_trace_tablet_validator, false,
+    "Trace each tablet validator backfill-status sync with the master under a root span so its "
+    "RPCs are traced. When false the root is suppressed unless it links to a sampled trace.");
+
 using namespace std::literals;
 
 namespace yb::tserver {
@@ -93,7 +97,7 @@ struct IndexTableInfo {
   TableId  group_id; // Generally contains indexed_table_id.
 
   // OTel context active when this index was scheduled (the CreateTablet RPC's trace, carried into
-  // OpenTablet by the threadpool). Used to nest the later GetBackfillStatus poll under that trace.
+  // OpenTablet by the threadpool). The later GetBackfillStatus poll span links back to it.
   dist_trace::trace::SpanContext trace_parent = dist_trace::trace::SpanContext::GetInvalid();
 
   std::string ToString() const {
@@ -499,12 +503,28 @@ Result<master::GetBackfillStatusResponsePB> TabletMetadataValidator::Impl::SyncW
     to_sync.emplace(it->index_table_id);
   }
 
-  // First entry wins: one RPC batches many index tables (possibly from different DDLs), but a span
-  // has a single parent. Nest the RPC under the first batched index's captured trace context.
-  const auto trace_parent = index_tablets_to_sync_.empty()
-      ? dist_trace::trace::SpanContext::GetInvalid()
-      : index_tablets_to_sync_.begin()->trace_parent;
-  auto otel_scope = dist_trace::ActivateParentScope(trace_parent);
+  // One RPC batches many index tables, possibly scheduled under different traces (different DDLs),
+  // so no single trace can own the RPC as a parent. Start an origin root for this sync and link it
+  // to each distinct trace captured at scheduling time. Deduped by trace id; TraceId provides no
+  // operator< or hash, so compare the raw 16-byte ids.
+  const auto trace_id_less = [](const auto& lhs, const auto& rhs) {
+    return memcmp(lhs.trace_id().Id().data(), rhs.trace_id().Id().data(),
+                  dist_trace::trace::TraceId::kSize) < 0;
+  };
+  std::set<dist_trace::trace::SpanContext, decltype(trace_id_less)> link_set(trace_id_less);
+  for (const auto& info : index_tablets_to_sync_) {
+    if (to_sync.contains(info.index_table_id)) {
+      link_set.insert(info.trace_parent);
+    }
+  }
+  dist_trace::SpanLinks links;
+  links.reserve(link_set.size());
+  for (const auto& context : link_set) {
+    dist_trace::AddSpanLink(links, context);
+  }
+  auto otel_scope = dist_trace::StartOriginRootSpanWithScope(
+      "tablet_validator.backfill_status_sync", FLAGS_otel_trace_tablet_validator,
+      dist_trace::trace::SpanContext::GetInvalid(), links);
 
   // Only backfilling status is being synced with the master at the moment.
   VLOG_WITH_PREFIX(1) << "Requesting backfill status for " << yb::ToString(to_sync);

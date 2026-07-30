@@ -1515,6 +1515,10 @@ Status CatalogManager::VisitSysCatalog(SysCatalogLoadingState* state) {
             LOG_WITH_PREFIX(INFO)
                 << wait_ts_count
                 << " tablet servers registered, creating the transaction status table";
+            // Flag-gated detached root: triggered by the Nth heartbeat but not part of it, so it
+            // starts its own trace and links back instead of ballooning the heartbeat trace.
+            auto trace_span = dist_trace::StartDetachedRootSpanWithScope(
+                "catalog.transaction_status_table_creation", FLAGS_otel_trace_catalog);
             // Retry table creation until it succeedes. It might fail initially because placement
             // UUID of live replicas is set through an RPC from YugaWare, and we won't be able to
             // calculate the number of primary (non-read-replica) tablet servers until that happens.
@@ -12064,8 +12068,22 @@ Status CatalogManager::ProcessPendingAssignmentsPerTable(
     return Status::OK();
   }
 
+  // Runs async from the creating DDL, so link (not parent) to each distinct origin trace.
+  std::set<std::string> traceparents;
+  for (const TabletInfoPtr& tablet : tablets) {
+    if (!tablet->trace_parent().empty()) {
+      traceparents.insert(tablet->trace_parent());
+    }
+  }
+  dist_trace::SpanLinks links;
+  links.reserve(traceparents.size());
+  for (const auto& traceparent : traceparents) {
+    dist_trace::AddSpanLink(links, dist_trace::GetTraceparentSpanContext(traceparent.c_str()));
+  }
+
   auto trace_span = dist_trace::StartOriginRootSpanWithScope(
-    "catalog.tablet_processing", FLAGS_otel_trace_catalog);
+      "catalog.tablet_processing", FLAGS_otel_trace_catalog,
+      dist_trace::trace::SpanContext::GetInvalid(), links);
 
   // For those tablets which need to be created in this round, assign replicas.
   Status s;

@@ -458,31 +458,83 @@ SpanWithScopePtr StartClientSpanWithScope(std::string_view op_name) {
   return nullptr;
 }
 
+void AddSpanLink(SpanLinks& links, const trace::SpanContext& context, LinkAttrs attrs) {
+  if (context.IsValid() && context.trace_flags().IsSampled()) {
+    links.emplace_back(context, std::move(attrs));
+  }
+}
+
+// Shared tail of the root-span starters. detach masks the active context while the span is
+// created, so it starts a new trace.
+static SpanWithScopePtr MakeRootSpanWithScope(
+    std::string_view op_name, bool force, const SpanLinks& links,
+    const trace::SpanContext& parent, bool detach) {
+
+  trace::StartSpanOptions options;
+  options.kind = trace::SpanKind::kInternal;
+  
+  if (parent.IsValid()) {
+    options.parent = parent;
+  }
+  const std::vector<std::pair<nostd::string_view, opentelemetry::common::AttributeValue>> attrs = {
+      {force ? kForceTraceKey : kSuppressTraceKey, true}};
+  nostd::shared_ptr<trace::Span> span;
+  {
+    auto detach_token = detach ? context::RuntimeContext::Attach(context::Context{})
+                               : nostd::unique_ptr<context::Token>{};
+    span = GetDistTracer()->StartSpan(
+        nostd::string_view(op_name.data(), op_name.size()), attrs, links, options);
+  }
+  return std::make_shared<SpanWithScope>(std::move(span));
+}
+
 SpanWithScopePtr StartOriginRootSpanWithScope(
-    std::string_view op_name, bool trace, const trace::SpanContext& parent) {
+    std::string_view op_name, bool trace, const trace::SpanContext& parent,
+    const SpanLinks& links) {
   if (!IsDistTraceEnabled()) {
     return nullptr;
   }
 
-  trace::StartSpanOptions options;
-  options.kind = trace::SpanKind::kInternal;
-
   bool force = trace;
+  bool detach = false;
+  trace::SpanContext root_parent = trace::SpanContext::GetInvalid();
   if (HasActiveContext()) {
     if (GetActiveSpanContext().trace_flags().IsSampled()) {
       force = true;
+    } else {
+      // The active trace was dropped; parenting to it would leave a recorded root whose parent
+      // is never exported. Start a fresh trace instead.
+      detach = true;
     }
-  } else if (parent.IsValid()) {
-    options.parent = parent;
-    if (parent.trace_flags().IsSampled()) {
-      force = true;
-    }
+  } else if (parent.IsValid() && parent.trace_flags().IsSampled()) {
+    root_parent = parent;
+    force = true;
   }
 
-  const std::vector<std::pair<nostd::string_view, opentelemetry::common::AttributeValue>> attrs = {
-      {force ? kForceTraceKey : kSuppressTraceKey, true}};
-  return std::make_shared<SpanWithScope>(GetDistTracer()->StartSpan(
-      nostd::string_view(op_name.data(), op_name.size()), attrs, options));
+  // Callers pass only links worth attaching (valid and sampled). A link makes this root relevant
+  // to a recorded trace, so record it too -- otherwise that trace would carry a link pointing at
+  // a dropped span.
+  if (!links.empty()) {
+    force = true;
+  }
+
+  return MakeRootSpanWithScope(op_name, force, links, root_parent, detach);
+}
+
+SpanWithScopePtr StartDetachedRootSpanWithScope(std::string_view op_name, bool trace) {
+  if (!IsDistTraceEnabled()) {
+    return nullptr;
+  }
+
+  // Link back to the trace active on this thread -- the request whose work spawned the loop this
+  // root anchors. Only when recording: a link would force-record the root, overriding suppression.
+  SpanLinks links;
+  if (trace) {
+    AddSpanLink(links, GetActiveSpanContext());
+  }
+
+  return MakeRootSpanWithScope(
+      op_name, /* force = */ trace, links, trace::SpanContext::GetInvalid(), /* detach = */ true);
 }
 
 SpanWithScopePtr StartServerSpanWithScope(

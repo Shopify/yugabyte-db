@@ -587,7 +587,7 @@ Status TabletServer::Init() {
     // Origin root for the startup universe-key fetch: the GetFullUniverseKeyRegistry RPCs built
     // below (across all retry attempts) nest under it instead of surfacing as parentless roots.
     auto trace_span = dist_trace::StartOriginRootSpanWithScope(
-        "universe_key_registry", FLAGS_otel_trace_tserver_init);
+        "tserver_init.universe_key_registry", FLAGS_otel_trace_tserver_init);
     while (true) {
       auto res = client::UniverseKeyClient::GetFullUniverseKeyRegistry(
           options_.HostsString(), JoinStrings(master_addresses, ","),

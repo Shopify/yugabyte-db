@@ -57,6 +57,7 @@
 #include "yb/master/xcluster_rpc_tasks.h"
 
 #include "yb/util/atomic.h"
+#include "yb/util/dist_trace.h"
 #include "yb/util/flags/auto_flags.h"
 #include "yb/util/format.h"
 #include "yb/util/oid_generator.h"
@@ -196,6 +197,7 @@ class TabletInfo::LeaderChangeReporter {
 TabletInfo::TabletInfo(const TableInfoPtr& table, TabletId tablet_id)
     : tablet_id_(std::move(tablet_id)),
       table_(table),
+      trace_parent_(dist_trace::GetActiveTraceparent()),
       last_update_time_(MonoTime::Now()),
       last_time_with_valid_leader_(last_update_time_) {
 }

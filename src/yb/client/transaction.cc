@@ -43,6 +43,7 @@
 
 #include "yb/util/atomic.h"
 #include "yb/util/countdown_latch.h"
+#include "yb/util/dist_trace.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
@@ -88,6 +89,11 @@ DEFINE_RUNTIME_bool(auto_promote_nonlocal_transactions_to_global, true,
 
 DEFINE_RUNTIME_bool(log_failed_txn_metadata, false, "Log metadata about failed transactions.");
 TAG_FLAG(log_failed_txn_metadata, advanced);
+
+DEFINE_RUNTIME_bool(otel_trace_transaction_heartbeat, false,
+    "Record each transaction's heartbeat chain as its own transaction.heartbeat trace, linked "
+    "back to the trace that started the transaction. When false the chain is suppressed.");
+TAG_FLAG(otel_trace_transaction_heartbeat, advanced);
 
 // (DEPRECATE_EOL 2026.1) This was only needed for sending the now-deleted
 // UpdateTransactionStatusLocation RPC during an upgrade to 2024.2.0+.
@@ -1006,6 +1012,11 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
     return metadata_.transaction_id;
   }
 
+  opentelemetry::trace::SpanContext heartbeat_trace_context() EXCLUDES(mutex_) {
+    SharedLock<std::shared_mutex> lock(mutex_);
+    return heartbeat_trace_context_;
+  }
+
   ConsistentReadPoint& read_point() {
     return read_point_;
   }
@@ -1902,6 +1913,17 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
                         SendHeartbeatToNewTablet(promoting));
         }
       };
+      // Every reschedule of the heartbeat loop re-captures the context active at the previous
+      // send, so the context active here would receive the chain's spans every 500 ms for the
+      // transaction's lifetime. Root the chain in its own trace, linked back to it instead.
+      auto heartbeat_root = dist_trace::StartDetachedRootSpanWithScope(
+          "transaction.heartbeat", FLAGS_otel_trace_transaction_heartbeat);
+      {
+        std::lock_guard lock(mutex_);
+        heartbeat_trace_context_ =
+            heartbeat_root ? heartbeat_root->GetContext()
+                           : opentelemetry::trace::SpanContext::GetInvalid();
+      }
       if (PREDICT_FALSE(FLAGS_TEST_new_txn_status_initial_heartbeat_delay_ms > 0)) {
         manager_->client()->messenger()->scheduler().Schedule(
             std::move(send_new_heartbeat),
@@ -2675,6 +2697,11 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
   // detect deadlocks involving advisory locks and row-level locks (and object locks in future).
   std::weak_ptr<YBTransaction> background_transaction_ GUARDED_BY(mutex_);
 
+  // Root context of this transaction's detached heartbeat-chain trace; invalid until the chain
+  // starts or when heartbeat tracing is suppressed.
+  opentelemetry::trace::SpanContext heartbeat_trace_context_ GUARDED_BY(mutex_) =
+      opentelemetry::trace::SpanContext::GetInvalid();
+
   mutable std::mutex async_write_query_mutex_;
   std::unordered_map<TabletId, AsyncWriteQuery> inflight_async_writes_
       GUARDED_BY(async_write_query_mutex_);
@@ -2757,6 +2784,10 @@ const TransactionId& YBTransaction::id() const {
 
 IsolationLevel YBTransaction::isolation() const {
   return impl_->isolation();
+}
+
+opentelemetry::trace::SpanContext YBTransaction::heartbeat_trace_context() const {
+  return impl_->heartbeat_trace_context();
 }
 
 const ConsistentReadPoint& YBTransaction::read_point() const {

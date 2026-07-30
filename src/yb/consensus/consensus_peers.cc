@@ -161,10 +161,15 @@ Status Peer::Init() {
   // Capture a weak_ptr reference into the functor so it can safely handle
   // outliving the peer.
   std::weak_ptr<Peer> weak_peer = shared_from_this();
-  // Scope active while the timer is built; the timer captures it and re-activates it around each
-  // tick, so the heartbeat RPCs nest under this root.
-  auto trace_span = dist_trace::StartOriginRootSpanWithScope(
+  // Detached: the timer captures this context and re-activates it around each tick for the
+  // peer's lifetime, so it must be this peer's own trace, not the ambient (e.g. election)
+  // trace. Links back to it instead.
+  auto trace_span = dist_trace::StartDetachedRootSpanWithScope(
       "consensus.heartbeat", FLAGS_otel_trace_consensus);
+  if (trace_span) {
+    trace_span->SetAttribute("yb.tablet_id", tablet_id_);
+    trace_span->SetAttribute("yb.peer_uuid", peer_pb_.permanent_uuid());
+  }
   heartbeater_ = PeriodicTimer::Create(
       messenger_,
       [weak_peer]() {

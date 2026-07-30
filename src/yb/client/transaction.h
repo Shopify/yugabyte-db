@@ -30,6 +30,7 @@
 #include "yb/client/in_flight_op.h"
 #include "yb/common/pg_types.h"
 
+#include "yb/util/dist_trace_fwd.h"
 #include "yb/util/status_callback.h"
 #include "yb/util/status_fwd.h"
 
@@ -141,6 +142,10 @@ class YBTransaction : public std::enable_shared_from_this<YBTransaction> {
 
   // Returns transaction ID.
   const TransactionId& id() const;
+
+  // Root context of this transaction's heartbeat-chain trace; invalid when the chain hasn't
+  // started or heartbeat tracing is suppressed.
+  opentelemetry::trace::SpanContext heartbeat_trace_context() const;
 
   const ConsistentReadPoint& read_point() const;
   ConsistentReadPoint& read_point();

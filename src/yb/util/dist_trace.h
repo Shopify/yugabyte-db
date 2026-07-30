@@ -127,11 +127,23 @@ SpanWithScopePtr StartClientSpanWithScope(std::string_view op_name);
 inline constexpr const char* kForceTraceKey = "yb.force_trace";
 inline constexpr const char* kSuppressTraceKey = "yb.suppress_trace";
 
-// Origin root span + activated scope so the origin's RPCs nest under it; parents to the active
-// context, else `parent`, else none.
+// Origin root span + activated scope; parents to the active context, else `parent`, else none.
+// `links` attaches related traces (fan-in); any link force-records the root.
+using LinkAttrs =
+    std::vector<std::pair<nostd::string_view, opentelemetry::common::AttributeValue>>;
+using SpanLinks = std::vector<std::pair<trace::SpanContext, LinkAttrs>>;
+
+// Appends (context, attrs) to links if the context is valid and sampled (else it would dangle).
+void AddSpanLink(SpanLinks& links, const trace::SpanContext& context, LinkAttrs attrs = {});
+
 SpanWithScopePtr StartOriginRootSpanWithScope(
     std::string_view op_name, bool trace,
-    const trace::SpanContext& parent = trace::SpanContext::GetInvalid());
+    const trace::SpanContext& parent = trace::SpanContext::GetInvalid(),
+    const SpanLinks& links = {});
+
+// Root span starting a NEW trace even while a context is active, linking back instead of
+// parenting -- for self-perpetuating loops (heartbeat chains) that must not grow the origin trace.
+SpanWithScopePtr StartDetachedRootSpanWithScope(std::string_view op_name, bool trace);
 
 // Span as a remote child of parent_context (from an inbound request) + activated scope --
 // the server end of a propagated trace; needs no local active context.

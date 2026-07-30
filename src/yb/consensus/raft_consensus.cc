@@ -506,22 +506,20 @@ void RaftConsensus::SetPerDbCgroup(Cgroup* cgroup) {
 Status RaftConsensus::Start(const ConsensusBootstrapInfo& info) {
   RETURN_NOT_OK(ExecuteHook(PRE_START));
 
+  // Remember the trace that created this tablet; election traces link to it.
+  creation_trace_context_ = dist_trace::GetActiveSpanContext();
+
   // Capture a weak_ptr reference into the functor so it can safely handle
   // outliving the consensus instance.
   std::weak_ptr<RaftConsensus> w = shared_from_this();
-  {
-    // Scope for the timer function.
-    auto trace_span = dist_trace::StartOriginRootSpanWithScope(
-        "consensus.first_leader_election", FLAGS_otel_trace_consensus);
-    failure_detector_ = PeriodicTimer::Create(
-        peer_proxy_factory_->messenger(),
-        [w]() {
-          if (auto consensus = w.lock()) {
-            consensus->ReportFailureDetected();
-          }
-        },
-        MinimumElectionTimeout());
-  }
+  failure_detector_ = PeriodicTimer::Create(
+      peer_proxy_factory_->messenger(),
+      [w]() {
+        if (auto consensus = w.lock()) {
+          consensus->ReportFailureDetected();
+        }
+      },
+      MinimumElectionTimeout());
 
   {
     if (table_type_ != TableType::TRANSACTION_STATUS_TABLE_TYPE) {
@@ -616,6 +614,27 @@ Status RaftConsensus::DoStartElection(const LeaderElectionData& data, PreElected
     LOG(INFO) << "Election start skipped as TEST_do_not_start_election_test_only flag "
                  "is set to true.";
     return Status::OK();
+  }
+
+  // One trace per election; the post-pre-election call continues the pre-election's trace.
+  dist_trace::SpanWithScopePtr origin_scope;
+  dist_trace::SpanWithScopePtr trace_span;
+  if (!preelected) {
+    // The root links to the active context. If the trigger isn't traced (e.g. suppressed
+    // heartbeat), fall back to the trace that created this tablet.
+    const auto ambient = dist_trace::GetActiveSpanContext();
+    if (!(ambient.IsValid() && ambient.trace_flags().IsSampled())) {
+      origin_scope = dist_trace::ActivateParentScope(creation_trace_context_);
+    }
+    trace_span = dist_trace::StartDetachedRootSpanWithScope(
+        "consensus.election", FLAGS_otel_trace_consensus);
+    if (trace_span) {
+      trace_span->SetAttribute("yb.tablet_id", tablet_id());
+      trace_span->SetAttribute("yb.peer_uuid", peer_uuid());
+      election_trace_context_ = trace_span->GetContext();
+    }
+  } else {
+    trace_span = dist_trace::ActivateParentScope(election_trace_context_);
   }
 
   // If pre-elections disabled or we already won pre-election then start regular election,
@@ -1134,7 +1153,11 @@ Status RaftConsensus::BecomeLeaderUnlocked() {
   queue_->RegisterObserver(this);
 
   // Refresh queue and peers before initiating NO_OP.
-  RefreshConsensusQueueAndPeersUnlocked();
+  {
+    // Peers created here start heartbeat traces; make them link to this tablet's election trace.
+    auto trace_scope = dist_trace::ActivateParentScope(election_trace_context_);
+    RefreshConsensusQueueAndPeersUnlocked();
+  }
 
   // Initiate a NO_OP operation that is sent at the beginning of every term
   // change in raft.

@@ -3256,14 +3256,29 @@ class PgClientSession::Impl {
           Transaction(PgClientSessionKind::kAutonomousDdl) ||
           Transaction(PgClientSessionKind::kPgSession) ||
           (IsObjectLockingEnabled() && plain_session_has_exclusive_object_locks_.load());
-      auto shutdown_scope = has_teardown_work
-          ? dist_trace::StartOriginRootSpanWithScope(
-                "ysql.session_shutdown", FLAGS_otel_trace_ysql_shutdown)
-          : dist_trace::SpanWithScopePtr{};
-      if (shutdown_scope) {
-        // Identify which PG backend's teardown this is
-        shutdown_scope->SetAttribute("ysql.backend_pid", static_cast<int64_t>(pid_));
-        shutdown_scope->SetAttribute("ysql.session_id", static_cast<int64_t>(id()));
+      dist_trace::SpanWithScopePtr shutdown_scope;
+      if (has_teardown_work) {
+        // Link to the heartbeat-chain traces of the txns aborted below. Collected only when the
+        // shutdown flag is on: any link force-records the root, overriding suppression.
+        dist_trace::SpanLinks links;
+        if (dist_trace::IsDistTraceEnabled() && FLAGS_otel_trace_ysql_shutdown) {
+          for (const auto kind :
+               {PgClientSessionKind::kPlain, PgClientSessionKind::kAutonomousDdl,
+                PgClientSessionKind::kPgSession}) {
+            const auto& txn = Transaction(kind);
+            if (txn) {
+              dist_trace::AddSpanLink(links, txn->heartbeat_trace_context());
+            }
+          }
+        }
+        shutdown_scope = dist_trace::StartOriginRootSpanWithScope(
+            "ysql.session_shutdown", FLAGS_otel_trace_ysql_shutdown,
+            opentelemetry::trace::SpanContext::GetInvalid(), links);
+        if (shutdown_scope) {
+          // Identify which PG backend's teardown this is
+          shutdown_scope->SetAttribute("ysql.backend_pid", static_cast<int64_t>(pid_));
+          shutdown_scope->SetAttribute("ysql.session_id", static_cast<int64_t>(id()));
+        }
       }
 
       WARN_NOT_OK(CleanupObjectLocks(), "Error cleaning up object locks");

@@ -318,6 +318,10 @@ class TabletInfo : public MetadataCowWrapper<PersistentTabletInfo> {
   scoped_refptr<const TableInfo> table() const { return table_; }
   const scoped_refptr<TableInfo>& table() { return table_; }
 
+  // W3C traceparent of the trace active when this tablet was created (typically the DDL that
+  // created the table); empty when none. The tablet-processing round links back to it.
+  const std::string& trace_parent() const { return trace_parent_; }
+
   // Accessors for the latest known tablet replica locations.
   // These locations include only the members of the latest-reported Raft
   // configuration whose tablet servers have ever heartbeated to this Master.
@@ -405,6 +409,9 @@ class TabletInfo : public MetadataCowWrapper<PersistentTabletInfo> {
 
   const TabletId tablet_id_;
   const scoped_refptr<TableInfo> table_;
+
+  // Set once at construction; immutable afterwards, so no locking needed.
+  const std::string trace_parent_;
 
   // Lock protecting the below mutable fields.
   // This doesn't protect metadata_ (the on-disk portion).

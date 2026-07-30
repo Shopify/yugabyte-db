@@ -53,6 +53,7 @@
 #include "yb/rpc/scheduler.h"
 
 #include "yb/util/atomic.h"
+#include "yb/util/dist_trace.h"
 #include "yb/util/random.h"
 
 DECLARE_int32(leader_lease_duration_ms);
@@ -735,6 +736,16 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   Random rng_;
 
   std::shared_ptr<rpc::PeriodicTimer> failure_detector_;
+
+  // Root context of the latest consensus.election trace, set in DoStartElection; peer heartbeat
+  // traces link to it.
+  dist_trace::trace::SpanContext election_trace_context_ =
+      dist_trace::trace::SpanContext::GetInvalid();
+
+  // Context of the trace that created this tablet, captured in Start(); election traces link to
+  // it when their trigger isn't traced.
+  dist_trace::trace::SpanContext creation_trace_context_ =
+      dist_trace::trace::SpanContext::GetInvalid();
 
   // If any RequestVote() RPC arrives before this hybrid time,
   // the request will be ignored. This prevents abandoned or partitioned
