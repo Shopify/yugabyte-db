@@ -48,6 +48,7 @@
 #include "yb/util/async_util.h"
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/countdown_latch.h"
+#include "yb/util/dist_trace.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
@@ -74,6 +75,11 @@ TAG_FLAG(ysql_operation_lease_ttl_client_buffer_ms, advanced);
 DEFINE_NON_RUNTIME_uint64(object_lock_cleanup_interval_ms, 5000,
                           "The interval between runs of the background cleanup task for "
                           "table-level locks held by unresponsive TServers.");
+
+DEFINE_RUNTIME_bool(otel_trace_object_lock_cleanup, false,
+    "Record each expired-lease-epoch cleanup pass, including the ReleaseObjectLocks RPCs it "
+    "fans out to tservers, as its own master.cleanup_expired_lease_epochs trace. When false "
+    "the pass is suppressed.");
 
 DEFINE_test_flag(bool, skip_launch_release_request, false,
     "If true, skip launching the release request after persisting it to in progress requests.");
@@ -1450,6 +1456,8 @@ void ObjectLockInfoManager::Impl::CleanupExpiredLeaseEpochs() {
   if (expiring_leases.empty() && infos_with_expired_lease_epochs.empty()) {
     return;
   }
+  auto cleanup_scope = dist_trace::StartOriginRootSpanWithScope(
+      "object_lock_cleanup.cleanup_expired_lease_epochs", FLAGS_otel_trace_object_lock_cleanup);
   // Loop again through the expiring leases to confirm mutations by acquiring the write locks.
   std::vector<ObjectLockInfo*> object_infos_to_write;
   std::vector<ObjectLockInfo::WriteLock> write_locks;

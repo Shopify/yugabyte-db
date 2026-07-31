@@ -187,7 +187,7 @@ bool YBCDistTraceStartBackendInitRootSpan(
 bool YBCDistTraceStartAshInitRootSpan(
     const char* traceparent, YbcPgOid db_oid, YbcPgOid user_id) {
   return YBCDistTraceStartInitRootSpan(
-      "ash_init", FLAGS_otel_trace_ash, traceparent, db_oid, user_id);
+      "ash.ash_init", FLAGS_otel_trace_ash, traceparent, db_oid, user_id);
 }
 
 bool YBCDistTraceStartRelcacheInitRootSpan(

@@ -129,7 +129,7 @@ void XClusterSafeTimeService::ProcessTaskPeriodically() {
   // Origin root for this safe-time computation cycle. ComputeSafeTime -> GetSafeTimeFromTable runs
   // synchronously on this thread, so its RPCs nest under this scope instead of parentless roots.
   auto trace_span = dist_trace::StartOriginRootSpanWithScope(
-      "xcluster_safe_time", FLAGS_otel_trace_xcluster);
+      "xcluster.safe_time", FLAGS_otel_trace_xcluster);
 
   // Compute safe time now and also update the metrics.
   bool further_computation_needed = true;

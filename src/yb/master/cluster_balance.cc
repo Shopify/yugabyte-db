@@ -32,6 +32,7 @@
 #include "yb/master/ts_manager.h"
 #include "yb/master/ysql_tablespace_manager.h"
 
+#include "yb/util/dist_trace.h"
 #include "yb/util/flags.h"
 #include "yb/util/metrics.h"
 #include "yb/util/monotime.h"
@@ -144,6 +145,7 @@ DEFINE_RUNTIME_bool(cluster_balancer_stepdown_to_preferred_leader_on_remove, tru
     "balancer will step down the leader to a tserver in the most preferred zone.");
 
 DECLARE_int32(replication_factor);
+DECLARE_bool(otel_trace_consensus);
 
 METRIC_DEFINE_gauge_int64(cluster,
                           is_load_balancing_enabled,
@@ -1645,6 +1647,8 @@ Result<bool> ClusterLoadBalancer::HandleLeaderMoves(
 Status ClusterLoadBalancer::AddOrMoveReplica(
     const TabletId& tablet_id, const std::string& from_ts, const TabletServerId& to_ts,
     const std::string& reason) {
+  auto trace_scope = dist_trace::StartOriginRootSpanWithScope(
+      "consensus.add_or_move_replica", FLAGS_otel_trace_consensus);
   // from_ts is only used for logging, because the remove replica happens in a later cluster
   // balancer iteration (once the tablet is already over-replicated).
   if (from_ts.empty()) {
@@ -1665,6 +1669,8 @@ Status ClusterLoadBalancer::AddOrMoveReplica(
 
 Status ClusterLoadBalancer::RemoveReplica(
     const TabletId& tablet_id, const TabletServerId& ts_uuid, const std::string& reason) {
+  auto trace_scope = dist_trace::StartOriginRootSpanWithScope(
+      "consensus.remove_replica", FLAGS_otel_trace_consensus);
   LOG(INFO) << Format(
       "Removing replica of tablet $0 from $1. Reason: $2", tablet_id, ts_uuid, reason);
   auto tablet_opt = GetTabletInfo(tablet_id);
@@ -1750,6 +1756,8 @@ TabletServerId ClusterLoadBalancer::SelectBestLeaderAfterStepdown(
 }
 
 Status ClusterLoadBalancer::MoveLeader(const LeaderMoveDetails& move_details) {
+  auto trace_scope = dist_trace::StartOriginRootSpanWithScope(
+      "consensus.move_leader", FLAGS_otel_trace_consensus);
   LOG(INFO) << Format("Moving leader of tablet $0 from $1 to $2. Reason: $3",
                    move_details.tablet_id, move_details.from_ts, move_details.to_ts,
                    move_details.reason);

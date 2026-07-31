@@ -93,7 +93,6 @@ TAG_FLAG(log_failed_txn_metadata, advanced);
 DEFINE_RUNTIME_bool(otel_trace_transaction_heartbeat, false,
     "Record each transaction's heartbeat chain as its own transaction.heartbeat trace, linked "
     "back to the trace that started the transaction. When false the chain is suppressed.");
-TAG_FLAG(otel_trace_transaction_heartbeat, advanced);
 
 // (DEPRECATE_EOL 2026.1) This was only needed for sending the now-deleted
 // UpdateTransactionStatusLocation RPC during an upgrade to 2024.2.0+.
@@ -1917,7 +1916,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
       // send, so the context active here would receive the chain's spans every 500 ms for the
       // transaction's lifetime. Root the chain in its own trace, linked back to it instead.
       auto heartbeat_root = dist_trace::StartDetachedRootSpanWithScope(
-          "transaction.heartbeat", FLAGS_otel_trace_transaction_heartbeat);
+          "transaction_heartbeat.heartbeat", FLAGS_otel_trace_transaction_heartbeat);
       {
         std::lock_guard lock(mutex_);
         heartbeat_trace_context_ =

@@ -50,6 +50,7 @@
 #include "yb/server/clock.h"
 
 #include "yb/util/atomic.h"
+#include "yb/util/dist_trace.h"
 #include "yb/util/status_format.h"
 #include "yb/util/status_log.h"
 
@@ -70,6 +71,8 @@ DEFINE_RUNTIME_AUTO_bool(persist_tserver_registry, kLocalPersisted, false, true,
     "the sys catalog.");
 
 DEFINE_RUNTIME_bool(skip_tserver_version_checks, false, "Skip all tserver version checks");
+
+DECLARE_bool(otel_trace_consensus);
 
 namespace yb::master {
 namespace {
@@ -423,6 +426,11 @@ Status TSManager::MarkUnresponsiveTServers(const LeaderEpoch& epoch) {
         updated_descs.push_back(desc.get());
         cow_locks.push_back(std::move(lock_opt).value());
       }
+    }
+    dist_trace::SpanWithScopePtr trace_scope;
+    if (!updated_descs.empty()) {
+      trace_scope = dist_trace::StartOriginRootSpanWithScope(
+          "consensus.mark_unresponsive_tservers", FLAGS_otel_trace_consensus);
     }
     RETURN_NOT_OK(UpsertIfRequired(epoch, sys_catalog_, updated_descs));
     for (auto& l : cow_locks) {

@@ -431,7 +431,7 @@ SpanWithScopePtr StartSpanWithScope(
     std::string_view op_name,
     const std::vector<std::pair<nostd::string_view, opentelemetry::common::AttributeValue>>& attrs,
     trace::SpanKind kind) {
-  if (!HasActiveContext()) {
+  if (!IsDistTraceEnabled()) {
     return nullptr;
   }
   trace::StartSpanOptions options;
@@ -472,7 +472,7 @@ static SpanWithScopePtr MakeRootSpanWithScope(
 
   trace::StartSpanOptions options;
   options.kind = trace::SpanKind::kInternal;
-  
+
   if (parent.IsValid()) {
     options.parent = parent;
   }

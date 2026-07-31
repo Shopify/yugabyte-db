@@ -3272,7 +3272,7 @@ class PgClientSession::Impl {
           }
         }
         shutdown_scope = dist_trace::StartOriginRootSpanWithScope(
-            "ysql.session_shutdown", FLAGS_otel_trace_ysql_shutdown,
+            "ysql_shutdown.session_shutdown", FLAGS_otel_trace_ysql_shutdown,
             opentelemetry::trace::SpanContext::GetInvalid(), links);
         if (shutdown_scope) {
           // Identify which PG backend's teardown this is
