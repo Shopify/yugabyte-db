@@ -653,7 +653,12 @@ Status TabletServer::Init() {
 }
 
 Status TabletServer::InitFlags(rpc::Messenger* messenger) {
-  RETURN_NOT_OK(auto_flags_manager_->Init(messenger, *opts_.GetMasterAddresses()));
+  {
+    // Origin root for the startup auto-flags fetch RPCs.
+    auto trace_span = dist_trace::StartOriginRootSpanWithScope(
+        "tserver_init.auto_flags_config", FLAGS_otel_trace_tserver_init);
+    RETURN_NOT_OK(auto_flags_manager_->Init(messenger, *opts_.GetMasterAddresses()));
+  }
 
   return RpcAndWebServerBase::InitFlags(messenger);
 }

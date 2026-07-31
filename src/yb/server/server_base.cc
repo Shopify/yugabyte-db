@@ -33,6 +33,7 @@
 #include "yb/server/server_base.h"
 
 #include <algorithm>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -71,6 +72,7 @@
 #include "yb/util/atomic.h"
 #include "yb/util/cgroups.h"
 #include "yb/util/concurrent_value.h"
+#include "yb/util/dist_trace.h"
 #include "yb/util/env.h"
 #include "yb/util/flags.h"
 #include "yb/util/jsonwriter.h"
@@ -551,6 +553,14 @@ Status RpcAndWebServerBase::Init() {
 
   if (PREDICT_FALSE(FLAGS_TEST_simulate_port_conflict_error)) {
     return STATUS(NetworkError, "Simulated port conflict error");
+  }
+
+  // Initialize distributed tracing once per process, before the first RPCs fire below.
+  if (dist_trace::IsDistTraceEnabled()) {
+    static std::once_flag dist_trace_once;
+    std::call_once(dist_trace_once, [this] {
+      dist_trace::InitDistTrace(name_, fs_manager_->uuid());
+    });
   }
 
   RETURN_NOT_OK(RpcServerBase::Init());
