@@ -355,7 +355,9 @@ extern void HandleYBTableDescStatus(YbcStatus status, YbcPgTableDesc table);
  * is started. Reports errors using ereport.
  */
 
-extern void YBInitPostgresBackend(const char *program_name, const YbcPgInitPostgresInfo *init_info);
+extern void YBInitPostgresBackend(const char *program_name, const YbcPgInitPostgresInfo *init_info,
+								  Oid dboid, Oid useroid,
+								  bool *yb_backend_init_span_started);
 
 /*
  * This should be called on all exit paths from the PostgreSQL backend process.

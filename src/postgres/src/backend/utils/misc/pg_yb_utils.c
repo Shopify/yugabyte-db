@@ -121,6 +121,7 @@
 #include "parser/parser.h"
 #include "pg_yb_utils.h"
 #include "pgstat.h"
+#include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "replication/origin.h"
 #include "replication/slot.h"
@@ -1016,7 +1017,8 @@ YbGetSessionReplicationOriginId(void)
 }
 
 void
-YBInitPostgresBackend(const char *program_name, const YbcPgInitPostgresInfo *init_info)
+YBInitPostgresBackend(const char *program_name, const YbcPgInitPostgresInfo *init_info,
+					  Oid dboid, Oid useroid, bool *yb_backend_init_span_started)
 {
 	HandleYBStatus(YBCInit(program_name, palloc, cstring_to_text_with_len,
 						   YbSwitchPgGateMemoryContext, YbCreatePgGateMemoryContext,
@@ -1031,6 +1033,44 @@ YBInitPostgresBackend(const char *program_name, const YbcPgInitPostgresInfo *ini
 	 */
 	if (YBIsEnabledInPostgresEnvVar())
 	{
+		bool		bootstrap = IsBootstrapProcessingMode();
+
+		/*
+		 * Initialize OpenTelemetry batch span processor for distributed
+		 * tracing. Done before pggate init below so the RPCs it sends (e.g.
+		 * the create-heartbeat) are traced.
+		 * TODO(Ishan): Since this creates a thread, this can be
+		 * initialized and cleanedup based on a GUC.
+		 */
+		/* The tserver passes its UUID to postgres via this env var. */
+		const char *tserver_uuid =
+			getenv("FLAGS_pggate_tserver_shared_memory_uuid");
+
+		if (YBCIsDistTraceEnabled() && tserver_uuid)
+			YBCInitDistTrace(tserver_uuid);
+
+		/*
+		 * Open the connect-time trace root before the first RPC (including
+		 * the create-heartbeat fired by pggate init below) so they nest
+		 * under it: relcache_init / ash_init / backend_init by backend kind.
+		 */
+		if (!bootstrap && YBCIsOtelScopeStackEmpty())
+		{
+			const char *traceparent = MyProcPort != NULL ?
+				MyProcPort->yb_dist_traceparent : NULL;
+
+			if (MyBackendType == YB_RELCACHE_INIT_BACKEND)
+				*yb_backend_init_span_started =
+					YBCDistTraceStartRelcacheInitRootSpan(traceparent, dboid, useroid);
+			else if (MyBgworkerEntry != NULL &&
+					 strcmp(MyBgworkerEntry->bgw_type, YB_ASH_COLLECTOR_BGW_TYPE) == 0)
+				*yb_backend_init_span_started =
+					YBCDistTraceStartAshInitRootSpan(NULL, dboid, useroid);
+			else
+				*yb_backend_init_span_started =
+					YBCDistTraceStartBackendInitRootSpan(traceparent, dboid, useroid);
+		}
+
 		const YbcPgCallbacks callbacks = {
 			.GetCurrentYbMemctx = &GetCurrentYbMemctx,
 			.GetDebugQueryString = &GetDebugQueryString,
@@ -1059,6 +1099,24 @@ YBInitPostgresBackend(const char *program_name, const YbcPgInitPostgresInfo *ini
 												 &ash_config,
 												 &yb_session_stats.current_state,
 												 IsBinaryUpgrade), FATAL);
+
+		/*
+		 * Seed the trace-context GUC from the traceparent the client sent at
+		 * connect. Must run after pggate init above: the GUC's assign hook
+		 * registers the span context through pggate callbacks.
+		 */
+		if (!bootstrap && MyProcPort != NULL &&
+			MyProcPort->yb_dist_traceparent != NULL &&
+			MyProcPort->yb_dist_traceparent[0] != '\0')
+		{
+			char		tracecontext[128];
+
+			snprintf(tracecontext, sizeof(tracecontext), "traceparent='%s'",
+					 MyProcPort->yb_dist_traceparent);
+			SetConfigOption("yb_dist_tracecontext", tracecontext,
+							PGC_BACKEND, PGC_S_CLIENT);
+		}
+
 		YBCInstallTxnDdlHook();
 
 		/*
@@ -1083,22 +1141,6 @@ YBInitPostgresBackend(const char *program_name, const YbcPgInitPostgresInfo *ini
 		 * mapped to PG backends.
 		 */
 		yb_pgstat_add_session_info(YBCPgGetSessionID());
-
-		/*
-		 * Initialize OpenTelemetry batch span processor for distributed
-		 * tracing.
-		 * TODO(Ishan): Since this creates a thread, this can be
-		 * initialized and cleanedup based on a GUC.
-		 */
-		if (YBCIsDistTraceEnabled())
-		{
-			char		hex_uuid[2 * UUID_LEN + 1];
-
-			hex_encode((const char *) YbGetLocalTServerUuid(), UUID_LEN, hex_uuid);
-			hex_uuid[2 * UUID_LEN] = '\0';
-
-			YBCInitDistTrace(hex_uuid);
-		}
 	}
 }
 

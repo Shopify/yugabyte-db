@@ -1132,39 +1132,8 @@ InitPostgresImpl(const char *in_dbname, Oid dboid,
 		YbAshSetOneTimeMetadata();
 
 	/* Connect to YugaByte cluster. */
-	YBInitPostgresBackend("postgres", yb_init_info);
-
-	if (IsYugaByteEnabled() && !bootstrap && MyProcPort != NULL &&
-		MyProcPort->yb_dist_traceparent != NULL &&
-		MyProcPort->yb_dist_traceparent[0] != '\0')
-	{
-		char		tracecontext[128];
-
-		snprintf(tracecontext, sizeof(tracecontext), "traceparent='%s'",
-				 MyProcPort->yb_dist_traceparent);
-		SetConfigOption("yb_dist_tracecontext", tracecontext,
-						PGC_BACKEND, PGC_S_CLIENT);
-	}
-
-	/*
-	 * YB: Open the connect-time trace root before the first catalog RPC so they
-	 * nest under it: relcache_init / ash_init / backend_init by backend kind.
-	 */
-	if (IsYugaByteEnabled() && !bootstrap && YBCIsOtelScopeStackEmpty())
-	{
-		const char *traceparent = MyProcPort != NULL ? MyProcPort->yb_dist_traceparent : NULL;
-
-		if (MyBackendType == YB_RELCACHE_INIT_BACKEND)
-			*yb_backend_init_span_started =
-				YBCDistTraceStartRelcacheInitRootSpan(traceparent, dboid, useroid);
-		else if (MyBgworkerEntry != NULL &&
-				 strcmp(MyBgworkerEntry->bgw_type, YB_ASH_COLLECTOR_BGW_TYPE) == 0)
-			*yb_backend_init_span_started =
-				YBCDistTraceStartAshInitRootSpan(NULL, dboid, useroid);
-		else
-			*yb_backend_init_span_started =
-				YBCDistTraceStartBackendInitRootSpan(traceparent, dboid, useroid);
-	}
+	YBInitPostgresBackend("postgres", yb_init_info, dboid, useroid,
+						  yb_backend_init_span_started);
 
 	if (IsYugaByteEnabled() && !bootstrap)
 	{
