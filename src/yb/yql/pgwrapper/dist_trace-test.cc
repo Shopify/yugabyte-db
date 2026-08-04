@@ -587,6 +587,38 @@ class OtlpHttpCollector {
     return downstream_span;
   }
 
+  // Waits for any span from child_service in trace_id whose parent is a span from parent_service,
+  // regardless of op names.
+  Result<Span> WaitForCrossServiceChildSpan(
+      std::string_view trace_id, std::string_view parent_service,
+      std::string_view child_service) const EXCLUDES(mutex_) {
+    Span child_span;
+    RETURN_NOT_OK(WaitFor(
+        [&]() -> Result<bool> {
+          std::lock_guard lock(mutex_);
+          auto it = traces_.find(std::string(trace_id));
+          if (it == traces_.end()) return false;
+          const auto& spans = it->second.spans;
+          for (const auto& child : spans) {
+            if (child.service_name != child_service || child.parent_span_id.empty()) {
+              continue;
+            }
+            for (const auto& parent : spans) {
+              if (parent.service_name == parent_service &&
+                  parent.span_id == child.parent_span_id) {
+                child_span = child;
+                return true;
+              }
+            }
+          }
+          return false;
+        },
+        kOtelBatchScheduleDelayMs * kTimeMultiplier * 50ms,
+        Format("Span on '$0' parented by a '$1' span in trace '$2'",
+               child_service, parent_service, trace_id)));
+    return child_span;
+  }
+
  private:
   void HandleTraceRequest(const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
     if (req.request_method != "POST") {
@@ -1941,6 +1973,28 @@ TEST_F(DistTraceTest, TestApplyTaskCarriesTraceContextToMaster) {
 
   ASSERT_EQ(master_span.str_attrs["rpc.service"], "yb.tserver.TabletServerService");
   ASSERT_EQ(master_span.str_attrs["rpc.method"], "UpdateTransaction");
+}
+
+// A tserver-initiated PG backend must join the trace of the statement that caused it. CREATE INDEX
+// on a YSQL table drives Tablet::BackfillIndexesForYsql, which opens an internal PG connection
+// while the BackfillIndex server span is active; the traceparent rides the startup packet, so the
+// backfill backend's own spans (service "ysql") come back parented under that tserver span. The
+// session's own ysql spans are parented under ysql or under the injected root, never under a
+// TabletServer span, so a ysql-under-TabletServer pairing can only have come from the backfill
+// backend.
+TEST_F(DistTraceTest, TestBackfillBackendJoinsQueryTrace) {
+  ASSERT_OK(CreateTable("backfill_trace_test", 10));
+
+  auto tp = GenerateTraceparent();
+  ASSERT_OK(conn_->ExecuteFormat(
+      "SET yb_dist_tracecontext = 'traceparent=''$0'''", tp.full));
+  ASSERT_OK(conn_->Execute("CREATE INDEX backfill_trace_test_idx ON backfill_trace_test (val)"));
+
+  auto backend_span = ASSERT_RESULT(collector_.WaitForCrossServiceChildSpan(
+      tp.trace_id, "TabletServer" /* parent_service */, "ysql" /* child_service */));
+
+  ASSERT_EQ(backend_span.trace_id, tp.trace_id);
+  ASSERT_FALSE(backend_span.op_name.empty());
 }
 
 TEST_F(DistTraceRpcTest, TestOtelInternalMessagesAreLogged) {
