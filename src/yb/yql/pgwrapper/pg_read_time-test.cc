@@ -25,8 +25,11 @@
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/ts_tablet_manager.h"
+#include "yb/util/backoff_waiter.h"
+#include "yb/util/countdown_latch.h"
 #include "yb/util/status.h"
 #include "yb/util/string_util.h"
+#include "yb/util/sync_point.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_thread_holder.h"
 #include "yb/util/tsan_util.h"
@@ -44,6 +47,9 @@ DECLARE_bool(ysql_disable_index_backfill);
 DECLARE_bool(enable_object_locking_for_table_locks);
 DECLARE_bool(ysql_enable_concurrent_ddl);
 DECLARE_bool(ysql_yb_ddl_transaction_block_enabled);
+DECLARE_bool(TEST_tablet_pause_apply_write_ops);
+DECLARE_string(TEST_pause_apply_write_ops_tablet_id_filter);
+DECLARE_bool(TEST_disable_apply_committed_transactions);
 
 METRIC_DECLARE_counter(picked_read_time_on_docdb);
 
@@ -1581,6 +1587,84 @@ TEST_P(PgClampDeferReadTest, NoReadRestart) {
       threads.Stop();
     }
   }
+}
+
+class PgReadRestartTest : public PgReadTimeTest {
+ protected:
+  size_t NumTabletServers() override {
+    return 1;
+  }
+
+  void DoBeforeTearDown() override {
+    yb::SyncPoint::GetInstance()->DisableProcessing();
+    yb::SyncPoint::GetInstance()->ClearAllCallBacks();
+    PgReadTimeTest::DoBeforeTearDown();
+  }
+
+  // Counted down once a write parks in apply, which is what pins the tablet's safe time.
+  CountDownLatch write_parked_{1};
+};
+
+TEST_F(PgReadRestartTest, RestartOnDocdbSeesConsistentSnapshot) {
+  constexpr auto kTable = "restart_test"sv;
+  const auto kQuery = Format("SELECT k FROM $0 ORDER BY k", kTable);
+
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 (k INT PRIMARY KEY) SPLIT INTO 1 TABLETS", kTable));
+
+  auto peers = ASSERT_RESULT(ListTabletPeersForTableName(cluster_.get(), std::string(kTable)));
+  ASSERT_EQ(peers.size(), 1);
+  auto tablet = ASSERT_RESULT(peers.front()->shared_tablet());
+
+  // Write an intent that stays unapplied, so the reader has to resolve it via the status tablet
+  // and restart to its commit time.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_disable_apply_committed_transactions) = true;
+  auto txn_conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(txn_conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+  ASSERT_OK(txn_conn.ExecuteFormat("INSERT INTO $0 VALUES (1)", kTable));
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_apply_write_ops_tablet_id_filter) =
+      tablet->tablet_id();
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_tablet_pause_apply_write_ops) = true;
+
+  yb::SyncPoint::GetInstance()->SetCallBack(
+      "WriteOperation::ApplyOperation:Paused", [this](void*) { write_parked_.CountDown(); });
+  yb::SyncPoint::GetInstance()->EnableProcessing();
+
+  TestThreadHolder threads;
+  // This write gets a hybrid time and then blocks in apply, pinning the tablet's safe time below
+  // it while the transaction above commits at a later hybrid time.
+  threads.AddThreadFunctor([this, kTable] {
+    auto write_conn = ASSERT_RESULT(Connect());
+    ASSERT_OK(write_conn.ExecuteFormat("INSERT INTO $0 VALUES (2)", kTable));
+  });
+
+  ASSERT_TRUE(write_parked_.WaitFor(60s * kTimeMultiplier));
+
+  ASSERT_OK(txn_conn.CommitTransaction());
+
+  // The reader restarts to the commit time above and then waits for safe time to reach it. That
+  // wait cannot finish until the parked write applies, so release it once the wait begins.
+  yb::SyncPoint::GetInstance()->SetCallBack(
+      "ReadQuery::Complete:BeforeSafeTimeWait", [](void*) {
+        ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_tablet_pause_apply_write_ops) = false;
+      });
+  yb::SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+  const auto first = ASSERT_RESULT(conn.FetchRows<int32_t>(kQuery));
+
+  // A no-op unless the read returned without waiting, in which case it keeps the parked write from
+  // blocking the join below.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_tablet_pause_apply_write_ops) = false;
+
+  threads.JoinAll();
+
+  const auto second = ASSERT_RESULT(conn.FetchRows<int32_t>(kQuery));
+  ASSERT_OK(conn.CommitTransaction());
+
+  ASSERT_EQ(first, second);
 }
 
 } // namespace yb::pgwrapper

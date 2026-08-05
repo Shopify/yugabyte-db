@@ -41,6 +41,7 @@
 #include "yb/util/flags.h"
 #include "yb/util/range.h"
 #include "yb/util/scope_exit.h"
+#include "yb/util/sync_point.h"
 #include "yb/util/trace.h"
 
 using namespace std::literals;
@@ -619,6 +620,16 @@ Status ReadQuery::Complete() {
     if (CoarseMonoClock::now() > context_.GetClientDeadline()) {
       TRACE("Read timed out");
       return STATUS(TimedOut, "Read timed out");
+    }
+
+    // The restart read time can be above the safe time picked for this read, so writes below it
+    // may not be applied yet. Wait for them before retrying, the same way the explicit read time
+    // path in DoPickReadTime does, otherwise the retry can miss already committed writes.
+    if (!IsPgsqlFollowerReadAtAFollower() ||
+        !FLAGS_ysql_follower_reads_avoid_waiting_for_safe_time) {
+      TEST_SYNC_POINT("ReadQuery::Complete:BeforeSafeTimeWait");
+      safe_ht_to_read_ = VERIFY_RESULT(abstract_tablet_->SafeTime(
+          require_lease_, read_time_.read, context_.GetClientDeadline()));
     }
   }
   // Set here since the loop above clears resp_ on each attempt.

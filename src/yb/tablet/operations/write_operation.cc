@@ -49,6 +49,9 @@ DEFINE_test_flag(int32, tablet_inject_latency_on_apply_write_txn_ms, 0,
                  "How much latency to inject when a write operation is applied.");
 DEFINE_test_flag(bool, tablet_pause_apply_write_ops, false,
                  "Pause applying of write operations.");
+DEFINE_test_flag(string, pause_apply_write_ops_tablet_id_filter, "",
+                 "When non-empty, TEST_tablet_pause_apply_write_ops only pauses write operations "
+                 "of the tablet with this id.");
 
 namespace yb::tablet {
 
@@ -102,8 +105,13 @@ Status WriteOperation::ApplyOperation(int64_t leader_term, bool skip_opid_update
       TRACE("Injecting $0ms of latency due to --TEST_tablet_inject_latency_on_apply_write_txn_ms",
             injected_latency);
       SleepFor(MonoDelta::FromMilliseconds(injected_latency));
-  } else {
-    TEST_PAUSE_IF_FLAG(TEST_tablet_pause_apply_write_ops);
+  } else if (PREDICT_FALSE(ANNOTATE_UNPROTECTED_READ(FLAGS_TEST_tablet_pause_apply_write_ops))) {
+    const auto& tablet_id_filter = FLAGS_TEST_pause_apply_write_ops_tablet_id_filter;
+    if (tablet_id_filter.empty() ||
+        tablet_id_filter == VERIFY_RESULT(tablet_safe())->tablet_id()) {
+      TEST_SYNC_POINT("WriteOperation::ApplyOperation:Paused");
+      TEST_PAUSE_IF_FLAG(TEST_tablet_pause_apply_write_ops);
+    }
   }
 
   RETURN_NOT_OK(VERIFY_RESULT(tablet_safe())
