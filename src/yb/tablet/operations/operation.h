@@ -240,6 +240,10 @@ class Operation {
   // Actual implementation of Aborted, should return status that should be passed to callback.
   virtual Status DoAborted(const Status& status) = 0;
 
+  virtual Status ValidateLeaderOpId(const OpId& op_id) const {
+    return Status::OK();
+  }
+
   // A private version of this transaction's transaction state so that we can use base
   // Operation methods on destructors.
   const OperationType operation_type_;

@@ -221,6 +221,32 @@ TEST(DocHybridTimeTest, TestExactByteRepresentation) {
   }
 }
 
+TEST(DocHybridTimeTest, WriteIdEncodedSizeGrowth) {
+  const auto baseline_size =
+      DocHybridTime(kYugaByteMicrosecondEpoch, 0, kMinWriteId).EncodedInDocDbFormat().size();
+
+  struct TestCase {
+    IntraTxnWriteId write_id;
+    size_t expected_growth;
+  };
+  const std::vector<TestCase> test_cases = {
+      {kMinWriteId, 0},
+      {100'000, 3},
+      {1'000'000, 3},
+      {10'000'000, 4},
+      {kMaxWriteId - 1, 5},
+  };
+
+  for (const auto& test_case : test_cases) {
+    SCOPED_TRACE(Format("write_id: $0", test_case.write_id));
+    const auto encoded_size =
+        DocHybridTime(kYugaByteMicrosecondEpoch, 0, test_case.write_id)
+            .EncodedInDocDbFormat()
+            .size();
+    ASSERT_EQ(baseline_size + test_case.expected_growth, encoded_size);
+  }
+}
+
 TEST(DocHybridTimeTest, DefaultConstructionAndComparison) {
   const auto default_value = DocHybridTime();
   EXPECT_EQ(kInvalidHybridTimeValue, default_value.hybrid_time().value());

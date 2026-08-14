@@ -32,6 +32,7 @@
 
 #include "yb/tablet/operations/write_operation.h"
 
+#include "yb/common/doc_hybrid_time.h"
 #include "yb/common/pgsql_error.h"
 #include "yb/common/transaction_error.h"
 
@@ -45,6 +46,10 @@
 #include "yb/util/sync_point.h"
 #include "yb/util/trace.h"
 
+DEFINE_test_flag(uint32, fixed_hybrid_time_write_id_max, yb::kMaxWriteId - 1,
+                 "Maximum Raft index accepted as a fixed-hybrid-time write ID.");
+DEFINE_test_flag(bool, log_fixed_hybrid_time_write_id_validation, false,
+                 "Log when a marked fixed-hybrid-time write reaches Raft OpId validation.");
 DEFINE_test_flag(int32, tablet_inject_latency_on_apply_write_txn_ms, 0,
                  "How much latency to inject when a write operation is applied.");
 DEFINE_test_flag(bool, tablet_pause_apply_write_ops, false,
@@ -65,6 +70,25 @@ LWWritePB* RequestTraits<LWWritePB>::MutableRequest(consensus::LWReplicateMsg* r
 
 Status WriteOperation::Prepare(IsLeaderSide is_leader_side) {
   TRACE_EVENT0("txn", "WriteOperation::Prepare");
+  return Status::OK();
+}
+
+Status WriteOperation::ValidateLeaderOpId(const OpId& op_id) const {
+  if (!request()->write_batch().use_raft_index_for_write_id()) {
+    return Status::OK();
+  }
+
+  if (PREDICT_FALSE(FLAGS_TEST_log_fixed_hybrid_time_write_id_validation)) {
+    LOG(INFO) << "TEST: validating fixed-hybrid-time write with Raft OpId " << op_id;
+  }
+
+  SCHECK_GE(op_id.index, 0, IllegalState, "Fixed-hybrid-time write has an invalid Raft index");
+  SCHECK_LT(
+      op_id.index, static_cast<int64_t>(kMaxWriteId), IllegalState,
+      "Raft operation index exhausted the fixed-hybrid-time write ID space");
+  SCHECK_LE(
+      op_id.index, static_cast<int64_t>(FLAGS_TEST_fixed_hybrid_time_write_id_max), IllegalState,
+      "Raft operation index exhausted the fixed-hybrid-time write ID space");
   return Status::OK();
 }
 

@@ -71,6 +71,7 @@
 #include "yb/util/debug.h"
 #include "yb/util/debug-util.h"
 #include "yb/util/enums.h"
+#include "yb/util/flag_validators.h"
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
 #include "yb/util/range.h"
@@ -111,6 +112,11 @@ DEFINE_UNKNOWN_bool(pgsql_consistent_transactional_paging, true,
 
 DEFINE_test_flag(int32, slowdown_pgsql_aggregate_read_ms, 0,
     "If set > 0, slows down the response to pgsql aggregate read by this amount.");
+DEFINE_test_flag(string, ysql_index_backfill_unique_check_mode, "full",
+    "Unique-index backfill check mode for tests: full, skip_backward, or skip_reads.");
+DEFINE_validator(
+    TEST_ysql_index_backfill_unique_check_mode,
+    FLAG_IN_SET_VALIDATOR("full", "skip_backward", "skip_reads"));
 
 // Disable packed row by default in debug builds.
 constexpr bool kYsqlEnablePackedRowTargetVal = !yb::kIsDebug;
@@ -1280,13 +1286,19 @@ void PgsqlWriteOperation::ClearResponse() {
 // Check if a duplicate value is inserted into a unique index.
 Result<bool> PgsqlWriteOperation::HasDuplicateUniqueIndexValue(const DocOperationApplyData& data) {
   VLOG(3) << "Looking for collisions in\n" << DocDBDebugDumpToStr(data);
-  // We need to check backwards only for backfilled entries.
-  bool ret =
-      VERIFY_RESULT(HasDuplicateUniqueIndexValue(data, data.read_time())) ||
-      (request_.is_backfill() &&
-       VERIFY_RESULT(HasDuplicateUniqueIndexValueBackward(data)));
+  const auto& mode = FLAGS_TEST_ysql_index_backfill_unique_check_mode;
+  if (request_.is_backfill() && mode == "skip_reads") {
+    VLOG(3) << "Skipping forward and backward unique-index backfill checks";
+    return false;
+  }
+
+  bool ret = VERIFY_RESULT(HasDuplicateUniqueIndexValue(data, data.read_time()));
+  if (!ret && request_.is_backfill() && mode == "full") {
+    ret = VERIFY_RESULT(HasDuplicateUniqueIndexValueBackward(data));
+  }
   if (!ret) {
-    VLOG(3) << "No collisions found";
+    VLOG(3) << "No collisions found"
+            << (mode == "skip_backward" ? " (forward check only)" : "");
   }
   return ret;
 }

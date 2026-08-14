@@ -10,6 +10,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <map>
@@ -286,6 +287,23 @@ class PgIndexBackfillTest : public LibPqTestBase, public ::testing::WithParamInt
 INSTANTIATE_TEST_CASE_P(, PgIndexBackfillTest, ::testing::Bool());
 
 namespace {
+
+class LogSubstringCounter : public ExternalDaemon::StringListener {
+ public:
+  explicit LogSubstringCounter(std::string needle) : needle_(std::move(needle)) {}
+
+  void Handle(const GStringPiece& value) override {
+    if (value.contains(needle_)) {
+      count_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  int count() const { return count_.load(std::memory_order_relaxed); }
+
+ private:
+  const std::string needle_;
+  std::atomic<int> count_{0};
+};
 
 Result<int> TotalBackfillRpcMetric(ExternalMiniCluster* cluster, const char* type) {
   int total_rpc_calls = 0;
@@ -1240,6 +1258,82 @@ TEST_P(PgIndexBackfillGinStress, YB_LINUX_RELEASE_ONLY_TEST(GinStress)) {
       )#",
       kTableName, kNumIndexRowsPerTableRow, kNumRows));
   ASSERT_OK(conn_->ExecuteFormat("CREATE INDEX $0 ON $1 USING ybgin (a)", kIndexName, kTableName));
+}
+
+class PgIndexBackfillSkipReadsWithRaftOrdering : public PgIndexBackfillTest {
+ public:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    PgIndexBackfillTest::UpdateMiniClusterOptions(options);
+    options->extra_tserver_flags.push_back(
+        "--TEST_ysql_index_backfill_unique_check_mode=skip_reads");
+    options->extra_tserver_flags.push_back(
+        "--TEST_ysql_index_backfill_use_raft_index_write_id=true");
+  }
+};
+
+INSTANTIATE_TEST_CASE_P(, PgIndexBackfillSkipReadsWithRaftOrdering, ::testing::Bool());
+
+TEST_P(PgIndexBackfillSkipReadsWithRaftOrdering, UniqueIndexBackfillAndForegroundCheck) {
+  constexpr auto kNumRows = 800;
+  constexpr auto kNumSourceTablets = 8;
+  ASSERT_OK(conn_->ExecuteFormat(
+      "CREATE TABLE $0 (a int, b int, PRIMARY KEY (a ASC)) $1", kTableName,
+      GenerateSplitClause(kNumRows, kNumSourceTablets)));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "INSERT INTO $0 SELECT g, g FROM generate_series(1, $1) g", kTableName, kNumRows));
+
+  ASSERT_OK(conn_->ExecuteFormat(
+      "CREATE UNIQUE INDEX $0 ON $1 (b HASH) SPLIT INTO 1 TABLETS", kIndexName, kTableName));
+  ASSERT_OK(CheckIndexConsistency(kIndexName));
+  ASSERT_OK(conn_->Execute("SET enable_seqscan = off"));
+  ASSERT_EQ(
+      kNumRows / 2,
+      ASSERT_RESULT(conn_->FetchRow<int32_t>(
+          Format("SELECT a FROM $0 WHERE b = $1", kTableName, kNumRows / 2))));
+
+  const auto status = conn_->ExecuteFormat(
+      "INSERT INTO $0 VALUES ($1, 1)", kTableName, kNumRows + 1);
+  ASSERT_NOK(status);
+  ASSERT_STR_CONTAINS(status.message().ToBuffer(), "duplicate key");
+}
+
+class PgIndexBackfillRaftOrderingActivation :
+    public PgIndexBackfillSkipReadsWithRaftOrdering {
+ public:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    PgIndexBackfillSkipReadsWithRaftOrdering::UpdateMiniClusterOptions(options);
+    options->extra_tserver_flags.push_back(
+        "--TEST_log_fixed_hybrid_time_write_id_validation=true");
+  }
+};
+
+INSTANTIATE_TEST_CASE_P(, PgIndexBackfillRaftOrderingActivation, ::testing::Bool());
+
+TEST_P(PgIndexBackfillRaftOrderingActivation, MarkerReachesRaftIndexValidation) {
+  constexpr auto kLogNeedle = "TEST: validating fixed-hybrid-time write with Raft OpId";
+  const auto tservers = cluster_->tserver_daemons();
+  std::vector<std::unique_ptr<LogSubstringCounter>> counters;
+  for (auto* tserver : tservers) {
+    counters.push_back(std::make_unique<LogSubstringCounter>(kLogNeedle));
+    tserver->SetLogListener(counters.back().get());
+  }
+  auto remove_listeners = ScopeExit([&] {
+    for (size_t i = 0; i != counters.size(); ++i) {
+      tservers[i]->RemoveLogListener(counters[i].get());
+    }
+  });
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat("INSERT INTO $0 VALUES (1, 1)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "CREATE UNIQUE INDEX $0 ON $1 (b HASH) SPLIT INTO 1 TABLETS", kIndexName, kTableName));
+  ASSERT_OK(LoggedWaitFor(
+      [&] {
+        return std::any_of(counters.begin(), counters.end(), [](const auto& counter) {
+          return counter->count() > 0;
+        });
+      },
+      MonoDelta::FromSeconds(5), "marked backfill write to reach Raft OpId validation"));
 }
 
 // Override the index backfill test to have slower backfill-related operations

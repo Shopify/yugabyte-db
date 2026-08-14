@@ -1377,7 +1377,11 @@ Status RaftConsensus::DoAppendNewRoundsToQueueUnlocked(
     // the write batch inside the write operation.
     //
     // TODO: we could allocate multiple HybridTimes in batch, only reading system clock once.
-    RETURN_NOT_OK(round->NotifyAddedToLeader(op_id, committed_op_id));
+    auto status = round->NotifyAddedToLeader(op_id, committed_op_id);
+    if (!status.ok()) {
+      state_->CancelPendingOperation(op_id, /* should_exist= */ false);
+      return status;
+    }
 
     auto s = state_->AddPendingOperation(round, OperationMode::kLeader);
     if (!s.ok()) {

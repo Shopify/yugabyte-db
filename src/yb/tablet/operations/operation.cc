@@ -127,6 +127,8 @@ HybridTime Operation::WriteHybridTime() const {
 }
 
 Status Operation::AddedToLeader(const OpId& op_id, const OpId& committed_op_id) {
+  RETURN_NOT_OK(ValidateLeaderOpId(op_id));
+
   HybridTime hybrid_time;
   auto tablet = VERIFY_RESULT(tablet_safe());
   if (use_mvcc()) {

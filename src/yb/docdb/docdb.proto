@@ -114,6 +114,9 @@ message KeyValueWriteBatchPB {
 
   // Used to keep track of packing schema versions used in a xCluster write batch.
   repeated XClusterUsedSchemaVersionPB xcluster_used_schema_versions = 19;
+
+  // Experimental marker for fixed-hybrid-time write ordering.
+  optional bool use_raft_index_for_write_id = 20;
 }
 
 message PerDbFilterPB {

@@ -112,6 +112,7 @@
 #include "yb/tserver/tserver_error.h"
 #include "yb/tserver/ysql_advisory_lock_table.h"
 
+#include "yb/util/checked_narrow_cast.h"
 #include "yb/util/debug-util.h"
 #include "yb/util/debug/trace_event.h"
 #include "yb/util/file_util.h"
@@ -2019,8 +2020,21 @@ Status Tablet::ApplyOperation(
     frontiers.Smallest().AddSchemaVersion(table_id, p.schema_version());
     frontiers.Largest().AddSchemaVersion(table_id, p.schema_version());
   }
+  std::optional<IntraTxnWriteId> write_id_override;
+  if (write_batch.use_raft_index_for_write_id()) {
+    SCHECK(
+        !write_batch.has_transaction() && !write_batch.has_subtransaction(), Corruption,
+        "Replicated fixed-hybrid-time write batch cannot be transactional");
+    write_id_override = VERIFY_RESULT(
+        checked_narrow_cast<IntraTxnWriteId>(operation.op_id().index));
+    SCHECK_NE(
+        *write_id_override, kMaxWriteId, IllegalState,
+        "Raft operation index exhausted the fixed-hybrid-time write ID space");
+  }
+
   return ApplyKeyValueRowOperations(
-      batch_idx, write_batch, frontiers, write_hybrid_time, batch_hybrid_time, apply_to_storages);
+      batch_idx, write_batch, frontiers, write_hybrid_time, batch_hybrid_time, apply_to_storages,
+      write_id_override);
 }
 
 Status Tablet::WriteTransactionMetadataUpdate(
@@ -2109,7 +2123,8 @@ Status Tablet::WriteTransactionalBatch(
 Status Tablet::ApplyKeyValueRowOperations(
     int64_t batch_idx, const docdb::LWKeyValueWriteBatchPB& put_batch,
     docdb::ConsensusFrontiers& frontiers, HybridTime write_hybrid_time,
-    HybridTime batch_hybrid_time, const docdb::StorageSet& apply_to_storages) {
+    HybridTime batch_hybrid_time, const docdb::StorageSet& apply_to_storages,
+    std::optional<IntraTxnWriteId> write_id_override) {
   if (put_batch.write_pairs().empty() && put_batch.read_pairs().empty() &&
       put_batch.lock_pairs().empty() && put_batch.apply_external_transactions().empty()) {
     return Status::OK();
@@ -2127,7 +2142,7 @@ Status Tablet::ApplyKeyValueRowOperations(
     docdb::NonTransactionalBatchWriter batcher(
         put_batch, write_hybrid_time, batch_hybrid_time, intents_db_.get(), &intents_write_batch,
         GetSchemaPackingProvider(), frontiers, vector_indexes_->List().impl(), apply_to_storages,
-        table_type());
+        table_type(), write_id_override);
 
     rocksdb::WriteBatch regular_write_batch;
     regular_write_batch.SetDirectWriter(&batcher);

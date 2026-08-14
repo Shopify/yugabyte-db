@@ -13,6 +13,9 @@
 
 #include "yb/tablet/write_query.h"
 
+#include <algorithm>
+#include <unordered_set>
+
 #include "yb/ash/wait_state.h"
 
 #include <boost/logic/tribool.hpp>
@@ -89,6 +92,8 @@ TAG_FLAG(skip_prefix_locks_suppress_warning_for_serializable_op, advanced);
 
 DEFINE_test_flag(bool, writequery_stuck_from_callback_leak, false,
     "Simulate WriteQuery stuck because of the update index flushed rpc call back leak");
+DEFINE_test_flag(bool, ysql_index_backfill_use_raft_index_write_id, false,
+    "Use target Raft indexes as write IDs for eligible YSQL unique-index backfill tests.");
 
 DECLARE_bool(batch_tablet_metrics_update);
 DECLARE_bool(ysql_analyze_dump_metrics);
@@ -131,6 +136,23 @@ void SetupKeyValueBatch(const tserver::WriteRequestMsg& client_request, LWWriteP
   if (client_request.has_xcluster_target_applied()) {
     out_request->set_xcluster_target_applied(client_request.xcluster_target_applied());
   }
+}
+
+Status ValidateRaftIndexWriteIdBatch(const docdb::LWKeyValueWriteBatchPB& write_batch) {
+  if (!write_batch.use_raft_index_for_write_id()) {
+    return Status::OK();
+  }
+
+  SCHECK(
+      !write_batch.has_transaction() && !write_batch.has_subtransaction(), InvalidArgument,
+      "A fixed-hybrid-time write batch cannot be transactional");
+  std::unordered_set<std::string> keys;
+  for (const auto& write_pair : write_batch.write_pairs()) {
+    SCHECK(
+        keys.insert(write_pair.key().ToBuffer()).second, InvalidArgument,
+        "A fixed-hybrid-time write batch cannot contain duplicate unversioned keys");
+  }
+  return Status::OK();
 }
 
 template <class Code, class Resp>
@@ -312,6 +334,12 @@ void WriteQuery::DoStartSynchronization(const Status& status) {
 
   if (!status.ok()) {
     Cancel(status);
+    return;
+  }
+
+  auto validation_status = ValidateRaftIndexWriteIdBatch(request().write_batch());
+  if (!validation_status.ok()) {
+    Cancel(validation_status);
     return;
   }
 
@@ -1603,6 +1631,21 @@ void WriteQuery::PgsqlExecuteDone(const Status& status) {
   if (!status.ok() || read_restart_data_.is_valid() || schema_version_mismatch_) {
     StartSynchronization(std::move(self_), status);
     return;
+  }
+
+  if (FLAGS_TEST_ysql_index_backfill_use_raft_index_write_id) {
+    const auto& pgsql_batch = client_request_->pgsql_write_batch();
+    const auto eligible =
+        !pgsql_batch.empty() && request().has_external_hybrid_time() &&
+        !request().write_batch().has_transaction() &&
+        client_request_->write_batch().write_pairs().empty() &&
+        std::all_of(pgsql_batch.begin(), pgsql_batch.end(), [](const auto& pgsql_request) {
+          return pgsql_request.is_backfill() &&
+                 pgsql_request.stmt_type() == PgsqlWriteRequestPB::PGSQL_INSERT;
+        });
+    if (eligible) {
+      request().mutable_write_batch()->set_use_raft_index_for_write_id(true);
+    }
   }
 
   for (auto& doc_op : doc_ops_) {
