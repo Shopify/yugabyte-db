@@ -423,15 +423,16 @@ TEST_F(TabletPeerTest, FixedHybridTimeWritesUseRaftIndexWriteId) {
   ASSERT_GT(first_op_id.index, 0);
   ASSERT_GT(second_op_id.index, first_op_id.index);
 
+  // The stored write ID is the Raft index lifted into the reserved marked domain.
   const std::vector<std::string> expected_entries = {
       Format(
           "SubDocKey(DocKey(0x0000, [\"row\"], []), "
           "[HT{ physical: 6000 w: $0 }]) -> \"second\"",
-          second_op_id.index),
+          kBackfillWriteIdFloor | static_cast<IntraTxnWriteId>(second_op_id.index)),
       Format(
           "SubDocKey(DocKey(0x0000, [\"row\"], []), "
           "[HT{ physical: 6000 w: $0 }]) -> \"first\"",
-          first_op_id.index)};
+          kBackfillWriteIdFloor | static_cast<IntraTxnWriteId>(first_op_id.index))};
   auto get_entries = [](const TabletPtr& source_tablet) {
     std::vector<std::string> entries;
     source_tablet->TEST_DocDBDumpToContainer(entries, docdb::IncludeIntents::kFalse);
@@ -563,7 +564,7 @@ TEST_F(TabletPeerTest, FixedHybridTimeWriteIdOverflowRejectedBeforeRaftAppend) {
     return ExecuteWriteAndReturnStatus(tablet_peer_.get(), request);
   };
 
-  ASSERT_LT(initial_op_id.index + 2, static_cast<int64_t>(kMaxWriteId));
+  ASSERT_LT(initial_op_id.index + 2, static_cast<int64_t>(kBackfillWriteIdIndexMax));
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_fixed_hybrid_time_write_id_max) =
       static_cast<uint32_t>(initial_op_id.index + 1);
   ASSERT_OK(write("first"));

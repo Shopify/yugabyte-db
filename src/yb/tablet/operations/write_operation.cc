@@ -46,8 +46,10 @@
 #include "yb/util/sync_point.h"
 #include "yb/util/trace.h"
 
-DEFINE_test_flag(uint32, fixed_hybrid_time_write_id_max, yb::kMaxWriteId - 1,
-                 "Maximum Raft index accepted as a fixed-hybrid-time write ID.");
+DEFINE_test_flag(uint32, fixed_hybrid_time_write_id_max, yb::kBackfillWriteIdIndexMax,
+                 "Maximum Raft index accepted for deriving a fixed-hybrid-time write ID. The "
+                 "default is the production ceiling: the derived write ID is "
+                 "kBackfillWriteIdFloor | index, which must stay below the reserved kMaxWriteId.");
 DEFINE_test_flag(bool, log_fixed_hybrid_time_write_id_validation, false,
                  "Log when a marked fixed-hybrid-time write reaches Raft OpId validation.");
 DEFINE_test_flag(int32, tablet_inject_latency_on_apply_write_txn_ms, 0,
@@ -83,8 +85,10 @@ Status WriteOperation::ValidateLeaderOpId(const OpId& op_id) const {
   }
 
   SCHECK_GE(op_id.index, 0, IllegalState, "Fixed-hybrid-time write has an invalid Raft index");
-  SCHECK_LT(
-      op_id.index, static_cast<int64_t>(kMaxWriteId), IllegalState,
+  // The stored write ID is kBackfillWriteIdFloor | index; indexes above kBackfillWriteIdIndexMax
+  // would collide with the reserved kMaxWriteId sentinel or overflow the marked domain.
+  SCHECK_LE(
+      op_id.index, static_cast<int64_t>(kBackfillWriteIdIndexMax), IllegalState,
       "Raft operation index exhausted the fixed-hybrid-time write ID space");
   SCHECK_LE(
       op_id.index, static_cast<int64_t>(FLAGS_TEST_fixed_hybrid_time_write_id_max), IllegalState,

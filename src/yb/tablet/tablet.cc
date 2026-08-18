@@ -2025,11 +2025,18 @@ Status Tablet::ApplyOperation(
     SCHECK(
         !write_batch.has_transaction() && !write_batch.has_subtransaction(), Corruption,
         "Replicated fixed-hybrid-time write batch cannot be transactional");
-    write_id_override = VERIFY_RESULT(
+    // The stored write ID lives in the reserved marked domain [kBackfillWriteIdFloor,
+    // kMaxWriteId): even a foreground write landing at exactly the fixed hybrid time cannot
+    // produce an identical (key, hybrid time, write id) tuple, because foreground
+    // intra-transaction write IDs are capped below the floor. This derivation runs on leader
+    // apply, follower apply, and WAL-replay bootstrap alike, so every replica stores the same
+    // physical key.
+    const auto raft_index = VERIFY_RESULT(
         checked_narrow_cast<IntraTxnWriteId>(operation.op_id().index));
-    SCHECK_NE(
-        *write_id_override, kMaxWriteId, IllegalState,
+    SCHECK_LE(
+        raft_index, kBackfillWriteIdIndexMax, IllegalState,
         "Raft operation index exhausted the fixed-hybrid-time write ID space");
+    write_id_override = kBackfillWriteIdFloor | raft_index;
   }
 
   return ApplyKeyValueRowOperations(

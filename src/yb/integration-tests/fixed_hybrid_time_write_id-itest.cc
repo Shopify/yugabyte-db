@@ -21,6 +21,7 @@
 #include "yb/client/table_handle.h"
 #include "yb/client/yb_table_name.h"
 
+#include "yb/common/doc_hybrid_time.h"
 #include "yb/common/hybrid_time.h"
 #include "yb/common/ql_value.h"
 #include "yb/common/wire_protocol.h"
@@ -191,12 +192,14 @@ class FixedHybridTimeWriteIdITest : public YBMiniClusterTestBase<MiniCluster> {
   }
 
   // Renders the expected DocDB dump line for one column-level entry written by SendMarkedWrite
-  // at kWriteHT under the given Raft-index write ID.
-  std::string ExpectedEntry(const std::string& key, int64_t write_id, const std::string& value) {
+  // at kWriteHT under the given Raft operation index. The stored write ID is the index lifted
+  // into the reserved marked domain: kBackfillWriteIdFloor | index.
+  std::string ExpectedEntry(const std::string& key, int64_t raft_index, const std::string& value) {
     return Format(
         "SubDocKey(DocKey(0x0000, [\"$0\"], []), [ColumnId($1); HT{ physical: $2 w: $3 }]) "
         "-> \"$4\"",
-        key, table_.ColumnId("v"), kWriteHT.GetPhysicalValueMicros(), write_id, value);
+        key, table_.ColumnId("v"), kWriteHT.GetPhysicalValueMicros(),
+        kBackfillWriteIdFloor | static_cast<IntraTxnWriteId>(raft_index), value);
   }
 
   // Asserts that the DocDB regular database of every replica contains exactly the expected

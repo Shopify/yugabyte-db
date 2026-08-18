@@ -235,6 +235,12 @@ TEST(DocHybridTimeTest, WriteIdEncodedSizeGrowth) {
       {1'000'000, 3},
       {10'000'000, 4},
       {kMaxWriteId - 1, 5},
+      // The marked (backfill) domain: kBackfillWriteIdFloor | raft_index. The encoded size is a
+      // constant +5 across the whole domain -- every marked entry pays the same key-size cost
+      // regardless of where in the build it was written.
+      {kBackfillWriteIdFloor, 5},
+      {kBackfillWriteIdFloor | 50'000, 5},
+      {kBackfillWriteIdFloor | kBackfillWriteIdIndexMax, 5},
   };
 
   for (const auto& test_case : test_cases) {

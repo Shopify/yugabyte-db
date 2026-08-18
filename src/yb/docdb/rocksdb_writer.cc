@@ -436,6 +436,15 @@ Status TransactionalWriter::operator()(
 
   }
 
+  // [0, kBackfillWriteIdFloor) is the foreground intra-transaction write ID domain;
+  // [kBackfillWriteIdFloor, kMaxWriteId) is reserved for fixed-hybrid-time index-backfill
+  // writes (see kBackfillWriteIdFloor). Fail closed rather than crossing into the reserved
+  // range; this also replaces the previous silent uint32 wraparound of the counter.
+  SCHECK_LT(
+      intra_txn_write_id_, kBackfillWriteIdFloor, IllegalState,
+      "Transaction wrote too many intents to a single tablet: the intra-transaction write ID "
+      "space below the backfill write ID floor is exhausted");
+
   const auto transaction_value_type = ValueEntryTypeAsChar::kTransactionId;
   const auto write_id_value_type = ValueEntryTypeAsChar::kWriteId;
   IntraTxnWriteId big_endian_write_id = BigEndian::FromHost32(intra_txn_write_id_);

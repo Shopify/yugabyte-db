@@ -32,6 +32,20 @@ constexpr IntraTxnWriteId kMinWriteId = 0;
 constexpr IntraTxnWriteId kDefaultWriteId = kMinWriteId;
 constexpr IntraTxnWriteId kMaxWriteId = std::numeric_limits<IntraTxnWriteId>::max();
 
+// Write IDs at or above this floor are reserved for fixed-hybrid-time index-backfill writes,
+// whose write ID is derived from the target tablet's Raft operation index as
+// (kBackfillWriteIdFloor | index). Foreground transactional intra-transaction write IDs and
+// positional per-batch write IDs must stay below the floor, so a foreground write that lands at
+// exactly the backfill hybrid time can never produce the same (key, hybrid time, write id)
+// tuple as a backfill write and silently shadow it (or be shadowed by it).
+//
+// kMaxWriteId remains reserved as a sentinel (compaction cutoffs and iterator bounds encode it
+// to make hybrid-time bounds inclusive of every write ID), so the largest Raft operation index
+// that may be marked is kBackfillWriteIdIndexMax.
+constexpr IntraTxnWriteId kBackfillWriteIdFloor = 0x80000000;
+constexpr IntraTxnWriteId kBackfillWriteIdIndexMax = kMaxWriteId - kBackfillWriteIdFloor - 1;
+static_assert((kBackfillWriteIdFloor | kBackfillWriteIdIndexMax) == kMaxWriteId - 1);
+
 // An aggressive upper bound on the length of a DocDB-encoded hybrid time with a write id.
 // This could happen in the degenerate case when all three VarInts in encoded representation of a
 // DocHybridTime take 10 bytes (the maximum length for a VarInt-encoded int64_t).
