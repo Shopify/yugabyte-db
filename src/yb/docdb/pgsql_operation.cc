@@ -150,7 +150,11 @@ DEFINE_RUNTIME_bool(vector_index_no_deletions_skip_filter_check, true,
 DEFINE_RUNTIME_bool(ysql_index_backfill_deferred_uniqueness_check, false,
     "When true, YSQL unique-index backfill writes skip the backward uniqueness check "
     "(HasDuplicateUniqueIndexValueBackward) and rely on a post-backfill verification "
-    "scan to detect concurrent-insert races. UNSAFE TO ENABLE without the corresponding "
+    "scan to detect concurrent-insert races. MUST BE SET ON BOTH MASTERS AND TSERVERS: "
+    "the TServer value governs the per-write check skip, while the MASTER value governs "
+    "whether the post-backfill verification pass is scheduled (verify_state stamping in "
+    "BackfillTable::Launch). Setting it on TServers only silently skips verification. "
+    "UNSAFE TO ENABLE without the corresponding "
     "verification phase coordination -- silent duplicate index entries may result. "
     "PROTOTYPE ONLY: pre-existing base-table duplicates are NOT detected -- YSQL backfill "
     "uses a fixed hybrid time (see ybModifyTable.c) and RocksDB LWW collapses colliding "

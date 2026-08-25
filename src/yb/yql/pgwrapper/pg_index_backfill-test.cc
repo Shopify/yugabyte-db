@@ -1384,64 +1384,6 @@ TEST_P(PgIndexBackfillTest, DeferredUniquenessVerifyChunkIgnoresPkUpdate) {
   }
 }
 
-// When a layout-flag precondition is off at CREATE INDEX time,
-// the deferred-uniqueness path must be refused and verify_state must stay at the default
-// INDEX_VERIFY_NOT_REQUIRED. The DDL itself still succeeds. In this prototype, refusing
-// deferred entry only suppresses the persisted verify_state -- the TServer per-write skip is
-// still governed independently by ysql_index_backfill_deferred_uniqueness_check (see
-// docdb/pgsql_operation.cc), so "verify_state = NOT_REQUIRED" does not mean "per-write check
-// ran". Gating the TServer skip on the persisted per-index state is a follow-up PR.
-//
-// Flags set symmetrically on masters and TServers so the test drives the same shape as the
-// positive case above.
-TEST_P(PgIndexBackfillTest, DeferredUniquenessPathEntryRefusedWhenLayoutFlagsOff) {
-  ASSERT_OK(cluster_->SetFlagOnMasters(
-      "ysql_index_backfill_verify_uniqueness_enabled", "true"));
-  ASSERT_OK(cluster_->SetFlagOnTServers(
-      "ysql_index_backfill_verify_uniqueness_enabled", "true"));
-  ASSERT_OK(cluster_->SetFlagOnMasters(
-      "ysql_index_backfill_deferred_uniqueness_check", "true"));
-  ASSERT_OK(cluster_->SetFlagOnTServers(
-      "ysql_index_backfill_deferred_uniqueness_check", "true"));
-  ASSERT_OK(cluster_->SetFlagOnMasters("ysql_enable_packed_row", "true"));
-  ASSERT_OK(cluster_->SetFlagOnTServers("ysql_enable_packed_row", "true"));
-  ASSERT_OK(cluster_->SetFlagOnMasters("ysql_use_packed_row_v2", "true"));
-  ASSERT_OK(cluster_->SetFlagOnTServers("ysql_use_packed_row_v2", "true"));
-  // ysql_mark_update_packed_row deliberately left off on both sides -- one of the three
-  // snapshot preconditions is false, so the helper must reject entry.
-  ASSERT_OK(cluster_->SetFlagOnMasters("ysql_mark_update_packed_row", "false"));
-  ASSERT_OK(cluster_->SetFlagOnTServers("ysql_mark_update_packed_row", "false"));
-
-  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
-  ASSERT_OK(conn_->ExecuteFormat(
-      "CREATE UNIQUE INDEX $0 ON $1 (b)", kIndexName, kTableName));
-
-  auto client = ASSERT_RESULT(cluster_->CreateClient());
-  const std::string table_id = ASSERT_RESULT(GetTableIdByTableName(
-      client.get(), kDatabaseName, kTableName));
-  const std::string index_id = ASSERT_RESULT(GetTableIdByTableName(
-      client.get(), kDatabaseName, kIndexName));
-
-  auto ddl_proxy = cluster_->GetLeaderMasterProxy<master::MasterDdlProxy>();
-  master::GetTableSchemaRequestPB req;
-  master::GetTableSchemaResponsePB resp;
-  req.mutable_table()->set_table_id(table_id);
-  rpc::RpcController rpc;
-  rpc.set_timeout(30s * kTimeMultiplier);
-  ASSERT_OK(ddl_proxy.GetTableSchema(req, &resp, &rpc));
-  ASSERT_FALSE(resp.has_error()) << resp.error().DebugString();
-
-  const IndexInfoPB* idx = nullptr;
-  for (const auto& candidate : resp.indexes()) {
-    if (candidate.table_id() == index_id) {
-      idx = &candidate;
-      break;
-    }
-  }
-  ASSERT_TRUE(idx != nullptr) << "index " << index_id << " not present on base-table schema";
-  EXPECT_EQ(idx->verify_state(), INDEX_VERIFY_NOT_REQUIRED);
-}
-
 namespace {
 
 // Enables the full deferred-uniqueness precondition flag set on both masters and TServers.
@@ -1503,6 +1445,54 @@ Result<IndexInfoPB> WaitForVerifyStateAtLeast(
 
 }  // namespace
 
+// The master-local packed-row layout flags are deliberately NOT gates for the deferred-
+// uniqueness path (they say nothing about the layout TServers actually write; gating on
+// them silently skipped verification during the 2026-08-21 experiment suite). With one of
+// them off everywhere, the index must still enter the deferred path, the persisted
+// preconditions snapshot must record the false value as a breadcrumb, and verification
+// must still run to completion. Insert-only data means the missing kIsUpdateFlag marker
+// cannot cause misclassification, so verify lands at SUCCEEDED.
+TEST_P(PgIndexBackfillTest, DeferredUniquenessPathEntryRecordsLayoutFlagSnapshot) {
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "ysql_index_backfill_verify_uniqueness_enabled", "true"));
+  ASSERT_OK(cluster_->SetFlagOnTServers(
+      "ysql_index_backfill_verify_uniqueness_enabled", "true"));
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "ysql_index_backfill_deferred_uniqueness_check", "true"));
+  ASSERT_OK(cluster_->SetFlagOnTServers(
+      "ysql_index_backfill_deferred_uniqueness_check", "true"));
+  ASSERT_OK(cluster_->SetFlagOnMasters("ysql_enable_packed_row", "true"));
+  ASSERT_OK(cluster_->SetFlagOnTServers("ysql_enable_packed_row", "true"));
+  ASSERT_OK(cluster_->SetFlagOnMasters("ysql_use_packed_row_v2", "true"));
+  ASSERT_OK(cluster_->SetFlagOnTServers("ysql_use_packed_row_v2", "true"));
+  // ysql_mark_update_packed_row deliberately left off on both sides. Entry must proceed
+  // anyway; the snapshot records the false value.
+  ASSERT_OK(cluster_->SetFlagOnMasters("ysql_mark_update_packed_row", "false"));
+  ASSERT_OK(cluster_->SetFlagOnTServers("ysql_mark_update_packed_row", "false"));
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "INSERT INTO $0 SELECT g, g FROM generate_series(1, 100) g", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "CREATE UNIQUE INDEX $0 ON $1 (b)", kIndexName, kTableName));
+
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  const std::string table_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kTableName));
+  const std::string index_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kIndexName));
+
+  auto idx = ASSERT_RESULT(WaitForVerifyStateAtLeast(
+      cluster_.get(), table_id, index_id, INDEX_VERIFY_SUCCEEDED,
+      60s * kTimeMultiplier));
+  EXPECT_EQ(idx.verify_state(), INDEX_VERIFY_SUCCEEDED);
+  ASSERT_TRUE(idx.has_verify_preconditions());
+  EXPECT_TRUE(idx.verify_preconditions().ysql_enable_packed_row());
+  EXPECT_TRUE(idx.verify_preconditions().ysql_use_packed_row_v2());
+  EXPECT_FALSE(idx.verify_preconditions().ysql_mark_update_packed_row())
+      << "expected the preconditions snapshot to record ysql_mark_update_packed_row=false";
+}
+
 // End-to-end happy path: a unique index over non-duplicate data completes backfill AND
 // post-backfill verification cleanly. verify_state must land at INDEX_VERIFY_SUCCEEDED,
 // verify_time must be non-zero, and no verify_error_message must be persisted. Also
@@ -1534,6 +1524,102 @@ TEST_P(PgIndexBackfillTest, DeferredUniquenessVerifyPassesOnCleanBackfill) {
   EXPECT_TRUE(idx.verify_preconditions().ysql_enable_packed_row());
   EXPECT_TRUE(idx.verify_preconditions().ysql_use_packed_row_v2());
   EXPECT_TRUE(idx.verify_preconditions().ysql_mark_update_packed_row());
+}
+
+// Pagination path: with a tiny per-chunk entry budget, each VerifyIndexChunk RPC stops
+// early with a resume key and the master must chain follow-up chunks per tablet until
+// the whole index is scanned. 500 rows / 16-entry chunks forces tens of resume rounds
+// per tablet; verify must still converge to SUCCEEDED. This is the mechanism that lets
+// verification of large (multi-hundred-million-entry) tablets survive production-shaped
+// RPC deadlines instead of timing out and retrying whole-tablet scans from scratch.
+TEST_P(PgIndexBackfillTest, DeferredUniquenessVerifyPaginates) {
+  ASSERT_OK(EnableDeferredUniquenessAllFlags(cluster_.get()));
+  ASSERT_OK(cluster_->SetFlagOnTServers("verify_index_max_entries_per_chunk", "16"));
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "INSERT INTO $0 SELECT g, g FROM generate_series(1, 500) g", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "CREATE UNIQUE INDEX $0 ON $1 (b)", kIndexName, kTableName));
+
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  const std::string table_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kTableName));
+  const std::string index_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kIndexName));
+
+  auto idx = ASSERT_RESULT(WaitForVerifyStateAtLeast(
+      cluster_.get(), table_id, index_id, INDEX_VERIFY_SUCCEEDED,
+      120s * kTimeMultiplier));
+  EXPECT_EQ(idx.verify_state(), INDEX_VERIFY_SUCCEEDED);
+  EXPECT_TRUE(idx.verify_error_message().empty())
+      << "unexpected verify_error_message: " << idx.verify_error_message();
+}
+
+// Pagination must not mask duplicates: with the same tiny per-chunk budget, a duplicate
+// injected in the post-RWD window must still be detected by one of the chained chunks.
+TEST_P(PgIndexBackfillTest, DeferredUniquenessVerifyPaginatesDetectsDuplicate) {
+  ASSERT_OK(EnableDeferredUniquenessAllFlags(cluster_.get()));
+  ASSERT_OK(cluster_->SetFlagOnTServers("verify_index_max_entries_per_chunk", "16"));
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "TEST_block_before_verify_state_transition", "true"));
+  ASSERT_OK(cluster_->SetFlagOnTServers(
+      "TEST_ysql_backfill_skip_online_uniqueness_check", "true"));
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "INSERT INTO $0 SELECT g, g FROM generate_series(1, 500) g", kTableName));
+
+  thread_holder_.AddThreadFunctor([this] {
+    LOG(INFO) << "Begin create-index thread";
+    PGConn create_conn = ASSERT_RESULT(ConnectToDB(kDatabaseName));
+    ASSERT_OK(create_conn.ExecuteFormat(
+        "CREATE UNIQUE INDEX $0 ON $1 (b)", kIndexName, kTableName));
+    LOG(INFO) << "Done create-index thread";
+  });
+
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  const std::string table_id = ASSERT_RESULT(GetTableIdByTableName(
+      client.get(), kDatabaseName, kTableName));
+  std::string index_id;
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        auto res = GetTableIdByTableName(client.get(), kDatabaseName, kIndexName);
+        if (!res.ok()) return false;
+        index_id = *res;
+        return true;
+      },
+      60s * kTimeMultiplier,
+      "Waiting for index table id to be visible"));
+
+  // Wait until we are parked inside the pre-verify block window (see
+  // DeferredUniquenessVerifyFailsOnConcurrentDuplicate for why GetBackfillJobs is used).
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        auto job = GetBackfillJobs(cluster_.get(), table_id);
+        if (!job.ok()) return false;
+        auto it = job->backfill_state().find(index_id);
+        return it != job->backfill_state().end() &&
+               it->second == master::BackfillJobPB::SUCCESS;
+      },
+      60s * kTimeMultiplier,
+      "Waiting for backfill SUCCESS (inside the block window)"));
+
+  // Inject a duplicate on a key in the middle of the range so several chunk hops happen
+  // before the duplicate's DocKey group is reached.
+  ASSERT_OK(conn_->ExecuteFormat("INSERT INTO $0 VALUES (1001, 250)", kTableName));
+
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "TEST_block_before_verify_state_transition", "false"));
+
+  auto idx = ASSERT_RESULT(WaitForVerifyStateAtLeast(
+      cluster_.get(), table_id, index_id, INDEX_VERIFY_SUCCEEDED,
+      120s * kTimeMultiplier));
+  EXPECT_EQ(idx.verify_state(), INDEX_VERIFY_FAILED);
+  EXPECT_FALSE(idx.verify_error_message().empty())
+      << "expected a duplicate hint in verify_error_message";
+
+  thread_holder_.JoinAll();
 }
 
 // End-to-end failure path: two writes with the same unique key land in the RWD index at

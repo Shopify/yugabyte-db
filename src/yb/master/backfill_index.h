@@ -467,14 +467,25 @@ class VerifyIndex : public std::enable_shared_from_this<VerifyIndex> {
   // transition happens asynchronously in OnChunkComplete.
   Status Launch();
 
-  // Called by each VerifyIndexChunk on terminal state. rpc_status carries a
-  // non-OK status when the per-tablet RPC exhausted its retries. Otherwise
-  // duplicate_key_hint may be non-empty to indicate a duplicate was found.
+  // Called by each VerifyIndexChunk on terminal state for its tablet. rpc_status
+  // carries a non-OK status when the per-tablet RPC exhausted its retries.
+  // Otherwise duplicate_key_hint may be non-empty to indicate a duplicate was
+  // found. entries_scanned accumulates into the per-index totals for logging.
   // The last responder triggers the sys.catalog transition.
   void OnChunkComplete(
       const TabletId& tablet_id,
       const Status& rpc_status,
-      const std::string& duplicate_key_hint);
+      const std::string& duplicate_key_hint,
+      uint64_t entries_scanned);
+
+  // Called by a VerifyIndexChunk that completed successfully but exhausted its
+  // work budget before reaching the end of the tablet. Launches a follow-up
+  // chunk for the same tablet resuming at next_start_key. The per-tablet
+  // pending counter is NOT decremented -- the tablet is still in flight.
+  void OnChunkPartialProgress(
+      const TabletInfoPtr& tablet,
+      const std::string& next_start_key,
+      uint64_t entries_scanned);
 
   Master* master() const { return master_; }
   ThreadPool* threadpool() const { return callback_pool_; }
@@ -504,9 +515,16 @@ class VerifyIndex : public std::enable_shared_from_this<VerifyIndex> {
   const HybridTime verify_time_;
   const LeaderEpoch epoch_;
 
+  // Set when Launch starts dispatching; used to report the verify wall clock in the
+  // terminal log line (the measurement of record for experiments).
+  MonoTime start_time_;
+
   mutable simple_spinlock mutex_;
   std::atomic<size_t> tablets_pending_{0};
   std::atomic_bool terminal_reached_{false};
+  // Aggregated measurement counters across all chunk RPCs of this verify.
+  std::atomic<uint64_t> total_entries_scanned_{0};
+  std::atomic<uint64_t> total_chunk_rpcs_{0};
   // First duplicate hint reported by any chunk (empty if none). Wins over
   // RPC errors when both are present because a duplicate is a decisive answer.
   std::string first_duplicate_hint_ GUARDED_BY(mutex_);
@@ -518,13 +536,17 @@ class VerifyIndex : public std::enable_shared_from_this<VerifyIndex> {
 // A background task that issues a single VerifyIndexChunk RPC to the leader of
 // one tablet of the index. Mirrors BackfillChunk's structure -- retries on
 // transient TServer errors, gives up after num_max_retries(), and funnels
-// terminal state to the VerifyIndex orchestrator via OnChunkComplete.
+// terminal state to the VerifyIndex orchestrator via OnChunkComplete. A chunk
+// that succeeds but exhausts its work budget (response carries verified_until)
+// instead reports partial progress, and the orchestrator launches a follow-up
+// chunk resuming from that key -- mirroring BackfillTablet's chunk chain.
 class VerifyIndexChunk : public RetryingTSRpcTaskWithTable {
  public:
   VerifyIndexChunk(
       std::shared_ptr<VerifyIndex> orchestrator,
       TabletInfoPtr tablet,
-      LeaderEpoch epoch);
+      LeaderEpoch epoch,
+      std::string start_key = std::string());
 
   Status Launch();
 
@@ -538,11 +560,12 @@ class VerifyIndexChunk : public RetryingTSRpcTaskWithTable {
 
   MonoTime ComputeDeadline() const override;
 
-  // Report a terminal outcome for this chunk to the orchestrator EXACTLY ONCE.
-  // Both the synchronous-launch-failure path in VerifyIndex::LaunchInternal and
-  // the RetryingRpcTask::UnregisterAsyncTask -> UnregisterAsyncTaskCallback
-  // path funnel through here so a chunk cannot double-decrement the
-  // orchestrator's pending counter.
+  // Report the outcome of this chunk to the orchestrator EXACTLY ONCE -- either
+  // terminal (OnChunkComplete) or, on success with a resume key, partial
+  // progress (OnChunkPartialProgress). Both the synchronous-launch-failure path
+  // in VerifyIndex::LaunchInternal and the RetryingRpcTask::UnregisterAsyncTask
+  // -> UnregisterAsyncTaskCallback path funnel through here so a chunk cannot
+  // double-decrement the orchestrator's pending counter.
   void ReportCompletionOnce(const Status& rpc_status, const std::string& duplicate_key_hint);
 
  private:
@@ -559,6 +582,8 @@ class VerifyIndexChunk : public RetryingTSRpcTaskWithTable {
 
   const std::shared_ptr<VerifyIndex> orchestrator_;
   const TabletInfoPtr tablet_;
+  // Resume position within the tablet (empty = scan from the beginning).
+  const std::string start_key_;
   tserver::VerifyIndexChunkResponsePB resp_;
   std::atomic_bool reported_{false};
 };

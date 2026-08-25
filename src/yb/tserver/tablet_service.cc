@@ -208,6 +208,17 @@ DEFINE_RUNTIME_int32(index_backfill_wait_for_old_txns_ms, 0,
     "commits from blocking the index backfill forever.");
 TAG_FLAG(index_backfill_wait_for_old_txns_ms, evolving);
 
+DEFINE_RUNTIME_int32(verify_index_chunk_safety_margin_ms, 2000,
+    "Deferred-uniqueness verify: a VerifyIndexChunk scan stops (at the next DocKey "
+    "boundary, returning a resume key) this many milliseconds before the RPC's client "
+    "deadline, so the response reliably beats the master's per-attempt timeout instead "
+    "of the master timing out and retrying the whole range from scratch.");
+
+DEFINE_RUNTIME_uint64(verify_index_max_entries_per_chunk, 0,
+    "Deferred-uniqueness verify: cap on the number of raw entries examined by a single "
+    "VerifyIndexChunk scan before it stops (at the next DocKey boundary) and returns a "
+    "resume key. 0 = unlimited (the RPC deadline margin is then the only budget).");
+
 DEFINE_test_flag(double, respond_write_failed_probability, 0.0,
     "Probability to respond that write request is failed");
 
@@ -1132,17 +1143,42 @@ void TabletServiceAdminImpl::VerifyIndexChunk(
   const Slice start_key(req->start_key());
   const Slice end_key(req->end_key());
 
+  // Budget the scan so the response (with a resume key) reliably beats the caller's
+  // per-attempt deadline; otherwise the master would time out and retry the whole
+  // range from scratch while this scan keeps burning a service thread.
+  CoarseTimePoint scan_deadline = deadline;
+  if (scan_deadline != CoarseTimePoint::max()) {
+    scan_deadline -= std::chrono::milliseconds(FLAGS_verify_index_chunk_safety_margin_ms);
+  }
+
+  const auto scan_start = CoarseMonoClock::Now();
   auto verify_result = docdb::VerifyUniqueIndexChunk(
       tablet.tablet->doc_db(),
       docdb::VerifyUniqueIndexChunkOptions{
           .start_key = start_key,
           .end_key = end_key,
           .verify_time = verify_time,
+          .deadline = scan_deadline,
+          .max_entries = FLAGS_verify_index_max_entries_per_chunk,
       });
   if (!verify_result.ok()) {
+    LOG(WARNING) << "VerifyIndexChunk failed on tablet " << req->tablet_id()
+                 << " index " << req->index_table_id() << ": " << verify_result.status();
     SetupErrorAndRespond(resp->mutable_error(), verify_result.status(), &context);
     return;
   }
+
+  const double scan_seconds = MonoDelta(CoarseMonoClock::Now() - scan_start).ToSeconds();
+  LOG(INFO) << "VerifyIndexChunk on tablet " << req->tablet_id()
+            << " index " << req->index_table_id()
+            << ": entries_scanned=" << verify_result->entries_seen
+            << " insert_events=" << verify_result->insert_events
+            << " update_events=" << verify_result->update_events
+            << " delete_events=" << verify_result->delete_events
+            << " duplicate_found=" << !verify_result->duplicate_key_hint.empty()
+            << " resumed=" << !req->start_key().empty()
+            << " more_to_scan=" << !verify_result->verified_until.empty()
+            << " scan_seconds=" << scan_seconds;
 
   if (!verify_result->duplicate_key_hint.empty()) {
     resp->set_duplicate_key_hint(verify_result->duplicate_key_hint);
@@ -1150,6 +1186,10 @@ void TabletServiceAdminImpl::VerifyIndexChunk(
   if (!verify_result->verified_until.empty()) {
     resp->set_verified_until(verify_result->verified_until);
   }
+  resp->set_entries_scanned(verify_result->entries_seen);
+  resp->set_insert_events(verify_result->insert_events);
+  resp->set_update_events(verify_result->update_events);
+  resp->set_delete_events(verify_result->delete_events);
   resp->set_propagated_hybrid_time(server_->Clock()->Now().ToUint64());
   context.RespondSuccess();
 }

@@ -164,8 +164,17 @@ message VerifyIndexChunkResponsePB {
   // logs / error messages helps operators identify the offending row.
   optional bytes duplicate_key_hint = 3;
 
-  // For future pagination; empty in PR 4 (whole tablet scanned per call).
+  // When the scan stopped early on a work budget (RPC deadline margin or
+  // verify_index_max_entries_per_chunk), the encoded DocKey the next chunk
+  // must resume from (inclusive; always a DocKey group boundary). Empty when
+  // the requested range was fully scanned.
   optional bytes verified_until = 4;
+
+  // Scan statistics for this chunk, for measurement and logging.
+  optional uint64 entries_scanned = 5;
+  optional uint64 insert_events = 6;
+  optional uint64 update_events = 7;
+  optional uint64 delete_events = 8;
 }
 
 // A create tablet request.

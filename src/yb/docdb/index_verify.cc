@@ -103,12 +103,14 @@ Result<VerifyUniqueIndexChunkResult> VerifyUniqueIndexChunk(
     const DocDB& doc_db, const VerifyUniqueIndexChunkOptions& options) {
   VerifyUniqueIndexChunkResult result;
 
-  // TODO(deferred-uniqueness prototype): the timeline algorithm assumes all entries for a
-  // given DocKey fall within the same chunk. Nothing here enforces that start_key/end_key
-  // are DocKey-aligned; a misaligned end_key that splits a DocKey group between chunks would
-  // cause a false negative on either side. Master-side chunking must produce DocKey-aligned
-  // bounds (matches existing backfill chunking), and this function should defensively snap
-  // end_key to a DocKey boundary or SCHECK the caller has done so before the feature ships.
+  // How often (in raw entries) to consult the coarse clock for the deadline budget.
+  constexpr size_t kDeadlineCheckInterval = 1024;
+
+  // The timeline algorithm assumes all entries for a given DocKey fall within the same
+  // chunk. Budget-driven stops below only happen at DocKey group boundaries, and resume
+  // keys (verified_until) are bare encoded DocKeys, so chunk bounds produced by this
+  // function are always DocKey-aligned. A caller-supplied misaligned end_key would still
+  // split a group (master sends empty end_key today).
   const bool has_upper_bound = !options.end_key.empty();
   BoundedRocksDbIterator iter = CreateRocksDBIterator(
       doc_db.regular,
@@ -126,7 +128,9 @@ Result<VerifyUniqueIndexChunkResult> VerifyUniqueIndexChunk(
   }
 
   VLOG(1) << "VerifyUniqueIndexChunk: starting scan verify_time="
-          << options.verify_time.ToDebugString();
+          << options.verify_time.ToDebugString()
+          << " start_key=" << options.start_key.ToDebugHexString()
+          << " max_entries=" << options.max_entries;
 
   // Per-DocKey state for the descending-order timeline walk. Within a DocKey the raw iterator
   // yields entries HT-descending. A duplicate is any DocKey that accumulates two or more
@@ -137,13 +141,13 @@ Result<VerifyUniqueIndexChunkResult> VerifyUniqueIndexChunk(
   std::string current_doc_key;
   size_t insert_count = 0;
 
-  size_t entries_seen = 0;
+  // Set once a work budget (deadline or max_entries) is exhausted; the scan then continues
+  // only to the next DocKey group boundary, where it records the resume key and stops.
+  bool stop_requested = false;
+
   size_t entries_after_filter = 0;
-  size_t insert_events = 0;
-  size_t update_events = 0;
-  size_t delete_events = 0;
   while (iter.Valid()) {
-    ++entries_seen;
+    ++result.entries_seen;
 
     Slice mutable_key = iter.key();
     const auto ht = VERIFY_RESULT(DocHybridTime::DecodeFromEnd(&mutable_key));
@@ -155,10 +159,30 @@ Result<VerifyUniqueIndexChunkResult> VerifyUniqueIndexChunk(
     Slice doc_key_slice(mutable_key.data(), doc_key_size);
     Slice subkey_bytes(mutable_key.data() + doc_key_size, mutable_key.size() - doc_key_size);
 
-    // Reset per-DocKey state on group change.
-    if (doc_key_slice.compare(current_doc_key) != 0) {
+    const bool group_changed = doc_key_slice.compare(current_doc_key) != 0;
+    if (group_changed) {
+      // Budget stop: we finished a whole DocKey group and a budget was exhausted while
+      // scanning it. Resume from the first entry of this (unprocessed) group next chunk.
+      if (stop_requested && !current_doc_key.empty()) {
+        result.verified_until.assign(doc_key_slice.cdata(), doc_key_slice.size());
+        break;
+      }
+      // Reset per-DocKey state on group change.
       current_doc_key.assign(doc_key_slice.cdata(), doc_key_slice.size());
       insert_count = 0;
+    }
+
+    // Evaluate work budgets. Entry budget is checked every entry; the deadline every
+    // kDeadlineCheckInterval entries to keep clock reads off the per-entry hot path.
+    if (!stop_requested) {
+      if (options.max_entries != 0 && result.entries_seen >= options.max_entries) {
+        stop_requested = true;
+      } else if (
+          options.deadline != CoarseTimePoint::max() &&
+          result.entries_seen % kDeadlineCheckInterval == 0 &&
+          CoarseMonoClock::Now() >= options.deadline) {
+        stop_requested = true;
+      }
     }
 
     // Enforce the verify_time filter: entries above verify_time are ignored.
@@ -178,14 +202,14 @@ Result<VerifyUniqueIndexChunkResult> VerifyUniqueIndexChunk(
       case RowEvent::kIgnore:
         break;
       case RowEvent::kDelete:
-        ++delete_events;
+        ++result.delete_events;
         insert_count = 0;
         break;
       case RowEvent::kUpdatePacked:
-        ++update_events;
+        ++result.update_events;
         break;
       case RowEvent::kInsertPacked:
-        ++insert_events;
+        ++result.insert_events;
         ++insert_count;
         if (insert_count >= 2) {
           result.duplicate_key_hint.assign(doc_key_slice.cdata(), doc_key_slice.size());
@@ -210,11 +234,12 @@ Result<VerifyUniqueIndexChunkResult> VerifyUniqueIndexChunk(
   }
   RETURN_NOT_OK(iter.status());
 
-  VLOG(1) << "VerifyUniqueIndexChunk: scan done, entries_seen=" << entries_seen
+  VLOG(1) << "VerifyUniqueIndexChunk: scan " << (result.verified_until.empty() ? "done" : "paused")
+          << ", entries_seen=" << result.entries_seen
           << " entries_after_filter=" << entries_after_filter
-          << " insert_events=" << insert_events
-          << " update_events=" << update_events
-          << " delete_events=" << delete_events;
+          << " insert_events=" << result.insert_events
+          << " update_events=" << result.update_events
+          << " delete_events=" << result.delete_events;
 
   return result;
 }

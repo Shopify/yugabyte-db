@@ -23,6 +23,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <boost/preprocessor/cat.hpp>
@@ -199,66 +200,69 @@ Result<bool> ShouldProceedWithPgsqlIndexPermissionUpdate(
 // must persist this snapshot on IndexInfoPB.verify_preconditions in the same
 // sys.catalog write that marks the index as entering backfill.
 //
-// KNOWN GAPS (this helper alone is not sufficient for verify correctness --
-// closing these is scoped to follow-up PRs in the same graphite stack):
+// The packed-row layout flags (ysql_enable_packed_row, ysql_use_packed_row_v2,
+// ysql_mark_update_packed_row) are deliberately NOT gates. They are recorded as
+// diagnostic breadcrumbs only:
+//   - The master-local values say nothing about the layout the TServers
+//     actually write (they are independent runtime GFlags per process), so
+//     gating on them here can silently skip verification on a cluster whose
+//     TServers are correctly configured -- the failure mode that hid the
+//     verify phase during the 2026-08-21 experiment suite.
+//   - A genuinely wrong TServer-side layout is caught loudly by the verify
+//     scan itself (NotSupported for unpacked/V1 rows), which persists
+//     INDEX_VERIFY_FAILED with a clear message. Loud failure beats silent
+//     skip for the prototype.
 //
-//   1. Master-local view only. The AutoFlag
-//      ysql_index_backfill_verify_uniqueness_enabled is universe-wide once
-//      promoted, but the three layout flags are still runtime GFlags. This
-//      helper reads the master's own values -- a TServer whose runtime values
-//      disagreed while the deferred write window was open can still produce
-//      writes without the V2 kIsUpdateFlag marker, which the future verify
-//      pass would misclassify. Consumers of a persisted VERIFY_REQUIRED must
-//      not treat it as proof that the writes on disk actually satisfy the
-//      preconditions.
+// KNOWN GAPS (closing these is scoped to follow-up PRs in the same stack):
 //
-//   2. Start-of-window snapshot, not continuous. Even on a single node,
-//      capturing FLAGS_* at path entry does not detect a mid-window flip
-//      (e.g. true -> false -> true) that produces intermediate writes
-//      without the marker bit set.
+//   1. Mid-window flips of ysql_mark_update_packed_row on TServers can
+//      produce UPDATE-rewrite entries without the V2 kIsUpdateFlag marker,
+//      which the verify pass would misclassify as inserts (false positives).
+//      Proper fix: promote the layout flags to AutoFlags with cluster-wide
+//      guaranteed values.
 //
-//   3. TServer per-write duplicate-check skip is currently gated on
+//   2. TServer per-write duplicate-check skip is currently gated on
 //      FLAGS_ysql_index_backfill_deferred_uniqueness_check locally (PR 2),
 //      not on the master's stamped verify_state. So a persisted
 //      VERIFY_REQUIRED does not, by itself, guarantee the TServer actually
 //      skipped its per-write check on that index. The reverse can also
 //      happen: TServer skips checks while master stamps NOT_REQUIRED.
-//
-// The proper fix for (1) and (2) is to promote the layout flags themselves to
-// AutoFlags with cluster-wide guaranteed values. The proper fix for (3) is to
-// derive the TServer skip from the persisted per-index state rather than a
-// local runtime GFlag. Both are tracked as later PRs in the same stack.
+//      For experiments the deferred flag must be set on BOTH masters and
+//      TServers. Proper fix: derive the TServer skip from the persisted
+//      per-index state rather than a local runtime GFlag.
 bool ShouldEnterDeferredUniquenessPath(
     const IndexInfoPB& idx,
     IndexInfoPB::DeferredUniquenessPreconditionsPB* out_preconditions,
     std::string* reject_reason) {
+  if (!idx.is_unique()) {
+    *reject_reason = "index is not unique";
+    return false;
+  }
   if (!FLAGS_ysql_index_backfill_verify_uniqueness_enabled) {
     *reject_reason = "ysql_index_backfill_verify_uniqueness_enabled AutoFlag not promoted";
     return false;
   }
   if (!FLAGS_ysql_index_backfill_deferred_uniqueness_check) {
-    *reject_reason = "ysql_index_backfill_deferred_uniqueness_check not set";
+    *reject_reason =
+        "ysql_index_backfill_deferred_uniqueness_check not set on this master (it must be "
+        "set on the master leader, not just on TServers, for verify to be scheduled)";
     return false;
   }
-  if (!idx.is_unique()) {
-    *reject_reason = "index is not unique";
-    return false;
+  if (!FLAGS_ysql_enable_packed_row || !FLAGS_ysql_use_packed_row_v2 ||
+      !FLAGS_ysql_mark_update_packed_row) {
+    LOG(WARNING)
+        << "Index " << idx.table_id() << " entering deferred-uniqueness path while the "
+        << "master-local packed-row layout flags are not all set (ysql_enable_packed_row="
+        << FLAGS_ysql_enable_packed_row
+        << ", ysql_use_packed_row_v2=" << FLAGS_ysql_use_packed_row_v2
+        << ", ysql_mark_update_packed_row=" << FLAGS_ysql_mark_update_packed_row
+        << "). The TServer-side values are what actually govern the persisted layout; if "
+        << "they are also unset the verify scan will fail with NotSupported (unpacked/V1 "
+        << "rows) or may misclassify UPDATE rewrites as duplicates (unmarked V2 rows).";
   }
-  if (!FLAGS_ysql_enable_packed_row) {
-    *reject_reason = "ysql_enable_packed_row not set";
-    return false;
-  }
-  if (!FLAGS_ysql_use_packed_row_v2) {
-    *reject_reason = "ysql_use_packed_row_v2 not set";
-    return false;
-  }
-  if (!FLAGS_ysql_mark_update_packed_row) {
-    *reject_reason = "ysql_mark_update_packed_row not set";
-    return false;
-  }
-  out_preconditions->set_ysql_enable_packed_row(true);
-  out_preconditions->set_ysql_use_packed_row_v2(true);
-  out_preconditions->set_ysql_mark_update_packed_row(true);
+  out_preconditions->set_ysql_enable_packed_row(FLAGS_ysql_enable_packed_row);
+  out_preconditions->set_ysql_use_packed_row_v2(FLAGS_ysql_use_packed_row_v2);
+  out_preconditions->set_ysql_mark_update_packed_row(FLAGS_ysql_mark_update_packed_row);
   return true;
 }
 
@@ -831,6 +835,12 @@ Status BackfillTable::Launch() {
           LOG(INFO) << "Index " << idx_info.table_id()
                     << " entering deferred-uniqueness path";
           verify_required.emplace(idx_info.table_id(), std::move(preconditions));
+        } else if (idx_info.is_unique()) {
+          // INFO, not VLOG: a silent skip here is what hid the missing verify phase
+          // during the 2026-08-21 experiment suite (the reject reason was VLOG(1)-only,
+          // so an hour of master-log watching produced nothing).
+          LOG(INFO) << "Unique index " << idx_info.table_id()
+                    << " NOT entering deferred-uniqueness path: " << reject_reason;
         } else {
           VLOG(1) << "Index " << idx_info.table_id()
                   << " not entering deferred-uniqueness path: " << reject_reason;
@@ -1326,28 +1336,28 @@ Status BackfillTable::UpdateIndexPermissionsForIndexes() {
     }
   }
 
-  // When deferred-uniqueness-check is enabled, the retain_delete_markers pin on
-  // successfully backfilled indexes must stay set until the post-backfill verify
-  // phase completes its timeline scan. That coordination lands in a follow-up PR;
-  // for now, on the GFlag path the pin is deferred indefinitely. The GFlag is
-  // tagged `unsafe` and cannot be enabled without explicit acknowledgement.
-  //
-  // TODO(deferred-uniqueness PR 5): the current decision reads a live runtime GFlag on
-  // the master. Two unsafe failure modes result if it stays this way beyond the prototype:
-  //   1. TServers skipped duplicate checks while their flag was set, but the master's
-  //      flag was cleared before this hook runs -> markers get GC'd early -> the verify
-  //      scan later runs against a truncated timeline and produces false negatives.
-  //   2. Master's flag is set at this hook but the index's backfill never actually took
-  //      the deferred path -> markers are retained forever for no reason.
-  // Both are prevented by persisting a `verify_state` on the IndexInfoPB when the index
-  // enters the deferred path, and gating this decision on that field (not the GFlag).
-  // The pin release should also live in the verify-completion path, not here.
-  const bool defer_marker_gc = FLAGS_ysql_index_backfill_deferred_uniqueness_check;
+  // When an index entered the deferred-uniqueness path (verify_state was stamped
+  // INDEX_VERIFY_REQUIRED at backfill launch), the retain_delete_markers pin on it
+  // must stay set until the post-backfill verify phase completes its timeline scan.
+  // Keyed on the PERSISTED per-index verify_state, not the live GFlag, so a
+  // mid-run flag flip on the master can neither GC markers early for a deferred
+  // index nor retain markers forever on an index that never took the deferred
+  // path. Pin release after verification is still a follow-up (prototype scope:
+  // experiment indexes are dropped after each run).
+  std::unordered_set<TableId> verify_required_indexes;
+  {
+    auto l = indexed_table_->LockForRead();
+    for (const auto& idx_pb : l.data().pb.indexes()) {
+      if (idx_pb.verify_state() == INDEX_VERIFY_REQUIRED) {
+        verify_required_indexes.insert(idx_pb.table_id());
+      }
+    }
+  }
   for (const auto& kv_pair : permissions_to_set) {
     if (kv_pair.second == INDEX_PERM_READ_WRITE_AND_DELETE) {
-      if (defer_marker_gc) {
+      if (verify_required_indexes.contains(kv_pair.first)) {
         LOG(INFO) << "Deferring GC of delete markers on index " << kv_pair.first
-                  << " (ysql_index_backfill_deferred_uniqueness_check is set); "
+                  << " (verify_state is INDEX_VERIFY_REQUIRED); "
                   << "pin will be released after post-backfill verification.";
         continue;
       }
@@ -2036,6 +2046,7 @@ Status VerifyIndex::LaunchInternal() {
     return PersistTerminalState(INDEX_VERIFY_SUCCEEDED, /* error_message = */ "");
   }
 
+  start_time_ = MonoTime::Now();
   tablets_pending_.store(tablets.size(), std::memory_order_release);
 
   while (PREDICT_FALSE(FLAGS_TEST_block_verify_after_in_progress_transition)) {
@@ -2060,10 +2071,33 @@ Status VerifyIndex::LaunchInternal() {
   return Status::OK();
 }
 
+void VerifyIndex::OnChunkPartialProgress(
+    const TabletInfoPtr& tablet,
+    const std::string& next_start_key,
+    uint64_t entries_scanned) {
+  total_entries_scanned_.fetch_add(entries_scanned, std::memory_order_acq_rel);
+  total_chunk_rpcs_.fetch_add(1, std::memory_order_acq_rel);
+  VLOG_WITH_PREFIX(1) << "Partial progress on tablet " << tablet->id()
+                      << "; launching follow-up chunk from resume key.";
+  auto chunk = std::make_shared<VerifyIndexChunk>(
+      shared_from_this(), tablet, epoch_, next_start_key);
+  Status s = chunk->Launch();
+  if (!s.ok()) {
+    LOG_WITH_PREFIX(WARNING) << "Failed to launch follow-up VerifyIndexChunk for tablet "
+                             << tablet->id() << ": " << s;
+    // Same routing as LaunchInternal: report the failure through the chunk's
+    // one-shot guard so the tablet's pending slot converges exactly once.
+    chunk->ReportCompletionOnce(s, /* duplicate_key_hint = */ "");
+  }
+}
+
 void VerifyIndex::OnChunkComplete(
     const TabletId& tablet_id,
     const Status& rpc_status,
-    const std::string& duplicate_key_hint) {
+    const std::string& duplicate_key_hint,
+    uint64_t entries_scanned) {
+  total_entries_scanned_.fetch_add(entries_scanned, std::memory_order_acq_rel);
+  total_chunk_rpcs_.fetch_add(1, std::memory_order_acq_rel);
   {
     std::lock_guard l(mutex_);
     if (!duplicate_key_hint.empty() && first_duplicate_hint_.empty()) {
@@ -2108,9 +2142,18 @@ void VerifyIndex::OnChunkComplete(
     terminal_state = INDEX_VERIFY_SUCCEEDED;
   }
 
+  // The measurement line of record for experiments: wall clock covers dispatch of the
+  // first chunk through the last chunk's report; entries/chunks aggregate every RPC
+  // (including budget-paused partials).
+  const double elapsed_seconds =
+      start_time_ ? (MonoTime::Now() - start_time_).ToSeconds() : 0.0;
   LOG_WITH_PREFIX(INFO) << "All chunks reported; persisting verify_state = "
                         << IndexVerifyState_Name(terminal_state)
-                        << (error_message.empty() ? "" : Format(" ($0)", error_message));
+                        << (error_message.empty() ? "" : Format(" ($0)", error_message))
+                        << "; verify_seconds=" << elapsed_seconds
+                        << " total_entries_scanned="
+                        << total_entries_scanned_.load(std::memory_order_acquire)
+                        << " chunk_rpcs=" << total_chunk_rpcs_.load(std::memory_order_acquire);
   WARN_NOT_OK(
       PersistTerminalState(terminal_state, error_message),
       "Failed to persist terminal verify state");
@@ -2152,7 +2195,8 @@ Status VerifyIndex::PersistTerminalState(
 VerifyIndexChunk::VerifyIndexChunk(
     std::shared_ptr<VerifyIndex> orchestrator,
     TabletInfoPtr tablet,
-    LeaderEpoch epoch)
+    LeaderEpoch epoch,
+    std::string start_key)
     : RetryingTSRpcTaskWithTable(
           orchestrator->master(),
           orchestrator->threadpool(),
@@ -2161,7 +2205,8 @@ VerifyIndexChunk::VerifyIndexChunk(
           std::move(epoch),
           /* async_task_throttler = */ nullptr),
       orchestrator_(std::move(orchestrator)),
-      tablet_(std::move(tablet)) {
+      tablet_(std::move(tablet)),
+      start_key_(std::move(start_key)) {
   deadline_ = MonoTime::Max();
 }
 
@@ -2208,8 +2253,12 @@ bool VerifyIndexChunk::SendRequest(int attempt) {
   req.set_tablet_id(tablet_->id());
   req.set_index_table_id(orchestrator_->index_id());
   req.set_verify_time(orchestrator_->verify_time().ToUint64());
-  // start_key / end_key intentionally unset -- verify scans the whole tablet
-  // in this PR. DocKey-aligned chunking is a follow-up.
+  // Resume position within the tablet: empty on the first chunk; the DocKey-aligned
+  // resume key from the previous chunk's verified_until on follow-up chunks. end_key
+  // stays unset (scan to the end of the tablet, subject to the TServer work budget).
+  if (!start_key_.empty()) {
+    req.set_start_key(start_key_);
+  }
   req.set_propagated_hybrid_time(master_->clock()->Now().ToUint64());
 
   ts_admin_proxy_->VerifyIndexChunkAsync(req, &resp_, &rpc_, BindRpcCallback());
@@ -2282,7 +2331,16 @@ void VerifyIndexChunk::ReportCompletionOnce(
             << (rpc_status.ok() ? "OK" : rpc_status.ToString()) << ")";
     return;
   }
-  orchestrator_->OnChunkComplete(tablet_->id(), rpc_status, duplicate_key_hint);
+  const uint64_t entries_scanned = resp_.entries_scanned();
+  // A successful chunk that stopped on a work budget reports partial progress:
+  // the orchestrator launches a follow-up chunk resuming at verified_until and
+  // the tablet stays pending. A duplicate found mid-tablet is terminal -- the
+  // remaining range does not need scanning to fail the index.
+  if (rpc_status.ok() && duplicate_key_hint.empty() && !resp_.verified_until().empty()) {
+    orchestrator_->OnChunkPartialProgress(tablet_, resp_.verified_until(), entries_scanned);
+    return;
+  }
+  orchestrator_->OnChunkComplete(tablet_->id(), rpc_status, duplicate_key_hint, entries_scanned);
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -2297,6 +2355,12 @@ void CatalogManager::ResumeInProgressUniqueIndexVerify(const LeaderEpoch& epoch)
     scoped_refptr<TableInfo> indexed_table;
     TableId index_id;
     HybridTime verify_time;
+    // True for indexes found stuck at INDEX_VERIFY_REQUIRED after their backfill
+    // fully completed (RWD permissions, no backfill job). These missed the normal
+    // REQUIRED -> IN_PROGRESS transition (master restart between RWD promotion and
+    // the verify hook, or a failed dispatch submit) and need a fresh verify_time
+    // picked and persisted before launch.
+    bool needs_in_progress_transition = false;
   };
   std::vector<PendingVerify> pending;
   {
@@ -2311,20 +2375,68 @@ void CatalogManager::ResumeInProgressUniqueIndexVerify(const LeaderEpoch& epoch)
         continue;
       }
       for (const auto& idx_pb : pb.indexes()) {
-        if (idx_pb.verify_state() != INDEX_VERIFY_IN_PROGRESS) {
-          continue;
+        if (idx_pb.verify_state() == INDEX_VERIFY_IN_PROGRESS) {
+          DCHECK(idx_pb.has_verify_time())
+              << "verify_state IN_PROGRESS without verify_time on index " << idx_pb.table_id();
+          pending.push_back(
+              {table, idx_pb.table_id(), HybridTime(idx_pb.verify_time())});
+        } else if (
+            idx_pb.verify_state() == INDEX_VERIFY_REQUIRED &&
+            pb.backfill_jobs_size() == 0 &&
+            idx_pb.index_permissions() == INDEX_PERM_READ_WRITE_AND_DELETE) {
+          // Backfill finished (job cleared, index at RWD) but the verify hook never
+          // transitioned this index to IN_PROGRESS -- it would be stuck forever.
+          // Safe to verify now: no more backfill writes (which land at fixed HTs
+          // below safe time) can arrive for a completed backfill.
+          pending.push_back(
+              {table, idx_pb.table_id(), HybridTime::kInvalid,
+               /* needs_in_progress_transition = */ true});
         }
-        DCHECK(idx_pb.has_verify_time())
-            << "verify_state IN_PROGRESS without verify_time on index " << idx_pb.table_id();
-        pending.push_back(
-            {table, idx_pb.table_id(), HybridTime(idx_pb.verify_time())});
       }
     }
   }
 
   for (auto& p : pending) {
-    LOG(INFO) << "Resuming in-progress unique-index verify for " << p.index_id
-              << " at verify_time " << p.verify_time;
+    if (p.needs_in_progress_transition) {
+      // Pick a fresh verify_time and persist REQUIRED -> IN_PROGRESS before launching,
+      // mirroring the transition normally done by UpdateIndexPermissionsForIndexes.
+      const HybridTime verify_time = master_->clock()->Now();
+      bool transitioned = false;
+      {
+        auto l = p.indexed_table->LockForWrite();
+        auto& pb = l.mutable_data()->pb;
+        for (int i = 0; i < pb.indexes_size(); ++i) {
+          auto* idx_pb = pb.mutable_indexes(i);
+          if (idx_pb->table_id() != p.index_id ||
+              idx_pb->verify_state() != INDEX_VERIFY_REQUIRED) {
+            continue;
+          }
+          idx_pb->set_verify_state(INDEX_VERIFY_IN_PROGRESS);
+          idx_pb->set_verify_time(verify_time.ToUint64());
+          idx_pb->clear_verify_error_message();
+          transitioned = true;
+          break;
+        }
+        if (transitioned) {
+          Status s = sys_catalog_->Upsert(epoch, p.indexed_table);
+          if (!s.ok()) {
+            WARN_NOT_OK(s, Format("Failed to persist verify_state = IN_PROGRESS while "
+                                  "recovering stuck REQUIRED index $0", p.index_id));
+            continue;
+          }
+          l.Commit();
+        }
+      }
+      if (!transitioned) {
+        continue;
+      }
+      p.verify_time = verify_time;
+      LOG(INFO) << "Recovering unique-index verify stuck at REQUIRED for " << p.index_id
+                << "; picked verify_time " << p.verify_time;
+    } else {
+      LOG(INFO) << "Resuming in-progress unique-index verify for " << p.index_id
+                << " at verify_time " << p.verify_time;
+    }
     auto verify = std::make_shared<VerifyIndex>(
         master_, AsyncTaskPool(), p.indexed_table, p.index_id, p.verify_time, epoch);
     // Submit Launch asynchronously so the SysCatalogLoaded caller returns
