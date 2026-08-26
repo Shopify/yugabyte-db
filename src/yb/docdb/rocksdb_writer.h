@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <optional>
 #include <span>
 
 #include <boost/logic/tribool.hpp>
@@ -407,7 +408,8 @@ class NonTransactionalBatchWriter : public rocksdb::DirectWriter,
       HybridTime batch_hybrid_time, rocksdb::DB* intents_db,
       rocksdb::WriteBatch* intents_write_batch, SchemaPackingProvider& schema_packing_provider,
       ConsensusFrontiers& frontiers, const DocVectorIndexesPtr& vector_indexes,
-      const StorageSet& apply_to_storages, TableType table_type);
+      const StorageSet& apply_to_storages, TableType table_type,
+      std::optional<IntraTxnWriteId> write_id_override = std::nullopt);
 
   bool Empty() const;
 
@@ -443,6 +445,10 @@ class NonTransactionalBatchWriter : public rocksdb::DirectWriter,
   DocVectorIndexesPtr vector_indexes_;
   StorageSet apply_to_storages_;
   TableType table_type_;
+  // When set (replicated fixed-hybrid-time batches), every regular record in the batch is
+  // written with this exact write ID instead of the positional per-batch counter. See
+  // KeyValueWriteBatchPB.use_raft_index_for_write_id.
+  std::optional<IntraTxnWriteId> write_id_override_;
 };
 
 // Context class for dumping intents records for a transaction.
