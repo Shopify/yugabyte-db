@@ -714,6 +714,89 @@ void TabletServiceAdminImpl::BackfillDone(
   tablet.peer->Submit(std::move(operation), tablet.leader_term);
 }
 
+void TabletServiceAdminImpl::VerifyUniqueIndexTablet(
+    const VerifyUniqueIndexTabletRequestPB* req, VerifyUniqueIndexTabletResponsePB* resp,
+    rpc::RpcContext context) {
+  if (!CheckUuidMatchOrRespond(
+          server_->tablet_manager(), "VerifyUniqueIndexTablet", req, resp, &context)) {
+    return;
+  }
+  DVLOG(3) << "Received VerifyUniqueIndexTablet RPC: " << req->DebugString();
+
+  server::UpdateClock(*req, server_->Clock());
+
+  auto tablet =
+      LookupLeaderTabletOrRespond(server_->tablet_peer_lookup(), req->tablet_id(), resp, &context);
+  if (!tablet) {
+    return;
+  }
+
+  const auto deadline = context.GetClientDeadline();
+  const auto verify_upper_ht = HybridTime::FromPB(req->verify_upper_ht());
+  if (!verify_upper_ht) {
+    SetupErrorAndRespond(
+        resp->mutable_error(),
+        STATUS(InvalidArgument, "verify_upper_ht must be a valid hybrid time"), &context);
+    return;
+  }
+
+  // Two-step precondition, both required before a regular-DB-only scan is meaningful:
+  // the safe-time wait (leader lease held; no future write can land at or below the bound),
+  // then ResolveIntents -- safe time alone does NOT imply applied: transactional apply is
+  // asynchronous, so a transaction committed at or below verify_upper_ht may not have written
+  // its regular records yet, and the record missed could be exactly the foreground half of a
+  // duplicate. ResolveIntents returns only once all such transactions are applied.
+  const auto safe_time =
+      tablet.tablet->SafeTime(tablet::RequireLease::kTrue, verify_upper_ht, deadline);
+  if (!safe_time.ok()) {
+    SetupErrorAndRespond(resp->mutable_error(), safe_time.status(), &context);
+    return;
+  }
+  auto* participant = tablet.tablet->transaction_participant();
+  if (participant) {
+    const auto resolve_status = participant->ResolveIntents(verify_upper_ht, deadline);
+    if (!resolve_status.ok()) {
+      SetupErrorAndRespond(resp->mutable_error(), resolve_status, &context);
+      return;
+    }
+  }
+
+  const auto result = tablet.tablet->VerifyUniqueIndex(*req, deadline);
+  if (!result.ok()) {
+    // Typed codes so callers do not burn a retry budget on deterministic failures:
+    // IllegalState (generation mismatch, cutoff violations) and InvalidArgument (not a
+    // unique-index tablet, bad window) cannot succeed on retry with the same request.
+    const auto code = result.status().IsIllegalState()
+        ? TabletServerErrorPB::OPERATION_NOT_SUPPORTED
+        : result.status().IsInvalidArgument() ? TabletServerErrorPB::INVALID_SCHEMA
+                                              : TabletServerErrorPB::UNKNOWN_ERROR;
+    SetupErrorAndRespond(resp->mutable_error(), result.status(), code, &context);
+    return;
+  }
+
+  switch (result->outcome) {
+    case docdb::UniqueIndexVerificationOutcome::kClean:
+      resp->set_outcome(VerifyUniqueIndexTabletResponsePB::CLEAN);
+      break;
+    case docdb::UniqueIndexVerificationOutcome::kViolation:
+      resp->set_outcome(VerifyUniqueIndexTabletResponsePB::VIOLATION);
+      break;
+    case docdb::UniqueIndexVerificationOutcome::kInconclusive:
+      resp->set_outcome(VerifyUniqueIndexTabletResponsePB::INCONCLUSIVE);
+      break;
+  }
+  if (!result->reason.empty()) {
+    resp->set_reason(result->reason);
+  }
+  if (!result->resume_from_dockey.empty()) {
+    resp->set_resume_key(result->resume_from_dockey);
+  }
+  resp->set_dockey_groups_scanned(result->dockey_groups_scanned);
+  resp->set_versions_scanned(result->versions_scanned);
+  resp->set_propagated_hybrid_time(server_->Clock()->Now().ToUint64());
+  context.RespondSuccess();
+}
+
 void TabletServiceAdminImpl::UpdateIndexBackfillOrderingGeneration(
     const tablet::ChangeMetadataRequestPB* req, ChangeMetadataResponsePB* resp,
     rpc::RpcContext context) {
