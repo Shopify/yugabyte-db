@@ -202,6 +202,10 @@ DEFINE_test_flag(bool, fail_index_backfill_ordering_generation_update, false,
     "Fail UpdateIndexBackfillOrderingGeneration RPCs, to exercise activation-failure handling "
     "of SKIP_ALL unique-index backfill jobs.");
 
+DEFINE_test_flag(bool, pause_verify_unique_index_tablet_rpc, false,
+    "Reject VerifyUniqueIndexTablet RPCs with a retryable error, holding the shadow "
+    "verification phase open for tests (e.g. master failover mid-phase).");
+
 DEFINE_RUNTIME_int32(index_backfill_wait_for_old_txns_ms, 0,
     "Index backfill needs to wait for transactions that started before the "
     "WRITE_AND_DELETE phase to commit or abort before choosing a time for "
@@ -722,6 +726,15 @@ void TabletServiceAdminImpl::VerifyUniqueIndexTablet(
     return;
   }
   DVLOG(3) << "Received VerifyUniqueIndexTablet RPC: " << req->DebugString();
+
+  if (PREDICT_FALSE(FLAGS_TEST_pause_verify_unique_index_tablet_rpc)) {
+    // Retryable rejection: keeps the coordinator's task alive while a test arranges a master
+    // failover (or similar) around an in-flight verification phase.
+    SetupErrorAndRespond(
+        resp->mutable_error(),
+        STATUS(TryAgain, "TEST: verification paused"), &context);
+    return;
+  }
 
   server::UpdateClock(*req, server_->Clock());
 

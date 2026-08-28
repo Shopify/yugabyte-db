@@ -33,6 +33,7 @@
 
 #include <memory>
 
+#include "yb/master/backfill_index.h"
 #include "yb/master/catalog_entity_info.h"
 #include "yb/master/catalog_manager_util.h"
 #include "yb/master/cdcsdk_manager.h"
@@ -178,8 +179,30 @@ void CatalogManagerBgTasks::TryResumeBackfillForTables(
       continue;
     }
     const auto& table_info = *table_info_result;
-    // Get schema version.
-    uint32_t version = table_info->LockForRead()->pb.version();
+    // Get schema version and job/alter state.
+    bool altering = false;
+    bool has_backfill_job = false;
+    uint32_t version;
+    {
+      auto l = table_info->LockForRead();
+      version = l->pb.version();
+      altering = l->pb.state() == SysTablesEntryPB::ALTERING;
+      has_backfill_job = l->pb.backfill_jobs_size() > 0;
+    }
+    // A job interrupted after its alter completed -- e.g. a master failover during the
+    // post-success shadow verification phase -- cannot be resumed through schema-version
+    // reports: the table is no longer ALTERING, so HandleTabletSchemaVersionReport no-ops.
+    // Drive the persisted job directly.
+    if (!altering && has_backfill_job) {
+      LOG(INFO) << "Resuming interrupted backfill job for table " << table_info->id()
+                << " (table is not altering; driving the persisted job directly)";
+      WARN_NOT_OK(
+          MultiStageAlterTable::LaunchNextTableInfoVersionIfNecessary(
+              catalog_manager_, table_info, version, epoch, std::nullopt,
+              /* respect_backfill_deferrals= */ false),
+          "Failed to resume interrupted backfill job");
+      continue;
+    }
     const auto tablets_result = table_info->GetTablets();
     if (!tablets_result) {
       LOG(WARNING) << Format(

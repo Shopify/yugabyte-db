@@ -144,6 +144,15 @@ Status TableLoader::Visit(const TableId& table_id, const SysTablesEntryPB& metad
     LOG(INFO) << "Index table " << table_id << " added for backfill status validation";
   }
 
+  // An interrupted backfill job must be re-driven by the new leader in every phase: the
+  // heartbeat-driven resume only fires on schema-version mismatches, which no longer occur
+  // once the backfill chunks are complete -- e.g. a failover during the post-success shadow
+  // verification phase would otherwise strand the job (and CREATE INDEX) forever.
+  if (table_data.pb.backfill_jobs_size() > 0) {
+    catalog_manager_->AddPendingBackFill(table_id);
+    LOG(INFO) << "Table " << table_id << " has an interrupted backfill job; queued for resume";
+  }
+
   table_lock.Commit();
   catalog_manager_->HandleNewTableId(table->id());
 
