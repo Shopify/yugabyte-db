@@ -71,7 +71,8 @@ class ServicePool : public RpcService {
               ThreadPoolProvider thread_pool_provider,
               Scheduler* scheduler,
               ServiceIfPtr service,
-              const scoped_refptr<MetricEntity>& metric_entity);
+              const scoped_refptr<MetricEntity>& metric_entity,
+              RpcPriority rpc_priority = RpcPriority::kNormal);
   virtual ~ServicePool();
 
   void StartShutdown() override;

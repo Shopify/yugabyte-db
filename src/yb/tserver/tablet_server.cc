@@ -803,9 +803,12 @@ Status TabletServer::RegisterServices() {
 
   RETURN_NOT_OK(RegisterService(
       FLAGS_ts_backup_svc_queue_length,
-      std::make_shared<TabletServiceBackupImpl>(tablet_manager_.get(), metric_entity())));
+      std::make_shared<TabletServiceBackupImpl>(tablet_manager_.get(), metric_entity()),
+      rpc::ServicePriority::kNormal, rpc::RpcPriority::kLow));
 
-  RETURN_NOT_OK(RegisterService(FLAGS_xcluster_svc_queue_length, cdc_service_));
+  RETURN_NOT_OK(RegisterService(
+      FLAGS_xcluster_svc_queue_length, cdc_service_,
+      rpc::ServicePriority::kNormal, rpc::RpcPriority::kLow));
 
   auto tablet_server_service = std::make_shared<TabletServiceImpl>(this);
   tablet_server_service_ = tablet_server_service;
@@ -815,14 +818,19 @@ Status TabletServer::RegisterServices() {
 
   auto admin_service = std::make_shared<TabletServiceAdminImpl>(this);
   LOG(INFO) << "yb::tserver::TabletServiceAdminImpl created at " << admin_service.get();
-  RETURN_NOT_OK(RegisterService(FLAGS_ts_admin_svc_queue_length, std::move(admin_service)));
+  // Admin covers background/maintenance operations (notably index backfill), so it is
+  // dispatched behind user-facing work.
+  RETURN_NOT_OK(RegisterService(
+      FLAGS_ts_admin_svc_queue_length, std::move(admin_service),
+      rpc::ServicePriority::kNormal, rpc::RpcPriority::kLow));
 
   auto consensus_service = std::make_shared<ConsensusServiceImpl>(
       metric_entity(), tablet_manager_.get());
   LOG(INFO) << "yb::tserver::ConsensusServiceImpl created at " << consensus_service.get();
   RETURN_NOT_OK(RegisterService(FLAGS_ts_consensus_svc_queue_length,
                                 std::move(consensus_service),
-                                rpc::ServicePriority::kHigh));
+                                rpc::ServicePriority::kHigh,
+                                rpc::RpcPriority::kHigh));
 
   auto remote_bootstrap_service = std::make_shared<RemoteBootstrapServiceImpl>(
           fs_manager_.get(), tablet_manager_.get(), metric_entity(), this->MakeCloudInfoPB(),
@@ -831,7 +839,8 @@ Status TabletServer::RegisterServices() {
   LOG(INFO) << "yb::tserver::RemoteBootstrapServiceImpl created at " <<
     remote_bootstrap_service.get();
   RETURN_NOT_OK(RegisterService(
-      FLAGS_ts_remote_bootstrap_svc_queue_length, std::move(remote_bootstrap_service)));
+      FLAGS_ts_remote_bootstrap_svc_queue_length, std::move(remote_bootstrap_service),
+      rpc::ServicePriority::kNormal, rpc::RpcPriority::kLow));
 
   auto pg_client_service_holder = std::make_shared<PgClientServiceHolder>(
         *this, tablet_manager_->client_future(), clock(),
@@ -867,8 +876,9 @@ Status TabletServer::RegisterServices() {
     LOG(INFO) << "yb::tserver::stateful_service::TestEchoService created at "
               << test_echo_service.get();
     RETURN_NOT_OK(test_echo_service->Init(tablet_manager_.get()));
-    RETURN_NOT_OK(
-        RegisterService(FLAGS_stateful_svc_default_queue_length, std::move(test_echo_service)));
+    RETURN_NOT_OK(RegisterService(
+        FLAGS_stateful_svc_default_queue_length, std::move(test_echo_service),
+        rpc::ServicePriority::kNormal, rpc::RpcPriority::kLow));
   }
 
   if (FLAGS_ysql_enable_auto_analyze_infra) {
@@ -885,7 +895,8 @@ Status TabletServer::RegisterServices() {
               << pg_auto_analyze_service.get();
     RETURN_NOT_OK(pg_auto_analyze_service->Init(tablet_manager_.get()));
     RETURN_NOT_OK(RegisterService(FLAGS_stateful_svc_default_queue_length,
-                                  std::move(pg_auto_analyze_service)));
+                                  std::move(pg_auto_analyze_service),
+                                  rpc::ServicePriority::kNormal, rpc::RpcPriority::kLow));
   }
 
   if (FLAGS_enable_pg_cron) {
@@ -896,7 +907,8 @@ Status TabletServer::RegisterServices() {
     RETURN_NOT_OK(pg_cron_leader_service->Init(tablet_manager_.get()));
 
     RETURN_NOT_OK(RegisterService(
-        FLAGS_stateful_svc_default_queue_length, std::move(pg_cron_leader_service)));
+        FLAGS_stateful_svc_default_queue_length, std::move(pg_cron_leader_service),
+        rpc::ServicePriority::kNormal, rpc::RpcPriority::kLow));
   }
 
   return Status::OK();

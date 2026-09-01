@@ -160,6 +160,14 @@ using ResponseCallback = std::function<void()>;
 
 YB_DEFINE_ENUM(ServicePriority, (kNormal)(kHigh));
 
+// Priority of RPC work for dispatch ordering, used by RpcPriorityQueue to decide which
+// admitted work is handed to worker thread pools first. Not to be confused with
+// ServicePriority above, which selects the thread pool a service's handlers execute on.
+// Queued kHigh work (cluster health: consensus, heartbeats) is dispatched before kNormal
+// (user-facing queries), which is dispatched before kLow (background: backfill, remote
+// bootstrap, backups, xCluster/CDC).
+YB_DEFINE_ENUM(RpcPriority, (kHigh)(kNormal)(kLow));
+
 // Specifies how to run callback for async outbound call.
 YB_DEFINE_ENUM(InvokeCallbackMode,
     // On reactor thread.

@@ -121,8 +121,10 @@ class ServicePoolImpl final : public InboundCallHandler {
       ThreadPoolProvider thread_pool_provider,
       Scheduler* scheduler,
       ServiceIfPtr service,
-      const scoped_refptr<MetricEntity>& entity)
+      const scoped_refptr<MetricEntity>& entity,
+      RpcPriority rpc_priority)
       : max_queued_calls_(max_tasks),
+        rpc_priority_(rpc_priority),
         thread_pool_provider_(std::move(thread_pool_provider)),
         scheduler_(*scheduler),
         service_(std::move(service)),
@@ -144,7 +146,8 @@ class ServicePoolImpl final : public InboundCallHandler {
                   description, MetricUnit::kRequests, description, MetricLevel::kInfo)),
               static_cast<int64>(0) /* initial_value */);
 
-          LOG_WITH_PREFIX(INFO) << "yb::rpc::ServicePoolImpl created at " << this;
+          LOG_WITH_PREFIX(INFO) << "yb::rpc::ServicePoolImpl created at " << this
+                                << ", rpc priority: " << rpc_priority_;
   }
 
   ~ServicePoolImpl() {
@@ -413,6 +416,9 @@ class ServicePoolImpl final : public InboundCallHandler {
   }
 
   const size_t max_queued_calls_;
+  // Dispatch priority for this service's admitted calls. All calls of a service share one
+  // priority (service-level classification). Consumed by RpcPriorityQueue-based dispatch.
+  const RpcPriority rpc_priority_;
   ThreadPoolProvider thread_pool_provider_;
   Scheduler& scheduler_;
   ServiceIfPtr service_;
@@ -475,9 +481,11 @@ ServicePool::ServicePool(
     ThreadPoolProvider thread_pool_provider,
     Scheduler* scheduler,
     ServiceIfPtr service,
-    const scoped_refptr<MetricEntity>& metric_entity)
+    const scoped_refptr<MetricEntity>& metric_entity,
+    RpcPriority rpc_priority)
     : impl_(new ServicePoolImpl(
-        max_tasks, std::move(thread_pool_provider), scheduler, std::move(service), metric_entity)) {
+        max_tasks, std::move(thread_pool_provider), scheduler, std::move(service), metric_entity,
+        rpc_priority)) {
 }
 
 ServicePool::~ServicePool() {

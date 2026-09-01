@@ -137,7 +137,8 @@ class RpcServerBase {
 
   Status RegisterService(
       size_t queue_limit, rpc::ServiceIfPtr rpc_impl,
-      rpc::ServicePriority priority = rpc::ServicePriority::kNormal);
+      rpc::ServicePriority priority = rpc::ServicePriority::kNormal,
+      rpc::RpcPriority rpc_priority = rpc::RpcPriority::kNormal);
   Status StartRpcServer();
   virtual void Shutdown();
   void SetConnectionContextFactory(rpc::ConnectionContextFactoryPtr connection_context_factory);

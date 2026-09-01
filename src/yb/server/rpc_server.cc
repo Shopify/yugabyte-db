@@ -125,7 +125,8 @@ Status RpcServer::Init(Messenger* messenger) {
 
 Status RpcServer::RegisterService(size_t queue_limit,
                                   rpc::ServiceIfPtr service,
-                                  rpc::ServicePriority priority) {
+                                  rpc::ServicePriority priority,
+                                  rpc::RpcPriority rpc_priority) {
   CHECK(server_state_ == INITIALIZED ||
         server_state_ == BOUND) << "bad state: " << server_state_;
   const scoped_refptr<MetricEntity>& metric_entity = messenger_->metric_entity();
@@ -145,7 +146,7 @@ Status RpcServer::RegisterService(size_t queue_limit,
         }
         return messenger_->ThreadPoolPtr(priority);
       },
-      &messenger_->scheduler(), std::move(service), metric_entity));
+      &messenger_->scheduler(), std::move(service), metric_entity, rpc_priority));
   RETURN_NOT_OK(messenger_->RegisterService(service_name, service_pool));
   return Status::OK();
 }

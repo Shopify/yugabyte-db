@@ -71,7 +71,8 @@ class RpcServer {
   // The service's ownership will be given to a ServicePool.
   Status RegisterService(
       size_t queue_limit, rpc::ServiceIfPtr service,
-      rpc::ServicePriority priority = rpc::ServicePriority::kNormal);
+      rpc::ServicePriority priority = rpc::ServicePriority::kNormal,
+      rpc::RpcPriority rpc_priority = rpc::RpcPriority::kNormal);
   Status Bind();
   Status Start();
 
