@@ -580,6 +580,11 @@ class Tablet : public AbstractTablet,
 
   std::atomic<int64_t>* monotonic_counter() { return &monotonic_counter_; }
 
+  // Highest marked-write Raft index applied by this tablet (0 = none); see the member note.
+  int64_t max_marked_write_op_index() const {
+    return max_marked_write_op_index_.load(std::memory_order_acquire);
+  }
+
   // Set the conter to at least 'value'.
   void UpdateMonotonicCounter(int64_t value);
 
@@ -1392,6 +1397,11 @@ class Tablet : public AbstractTablet,
   client::YBMetaDataCache* metadata_cache_;
 
   std::atomic<int64_t> last_committed_write_index_{0};
+
+  // Highest marked-write (use_raft_index_for_write_id) Raft index this tablet has applied.
+  // Monotonic; re-seeded by bootstrap replay. Persisted into the generation record at
+  // release as the downgrade fence's flushed-frontier target.
+  std::atomic<int64_t> max_marked_write_op_index_{0};
 
   HybridTimeLeaseProvider ht_lease_provider_;
 
