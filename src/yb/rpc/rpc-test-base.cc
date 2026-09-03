@@ -21,6 +21,7 @@
 
 #include "yb/rpc/proxy.h"
 #include "yb/rpc/rpc_controller.h"
+#include "yb/rpc/rpc_priority_queue.h"
 #include "yb/rpc/yb_rpc.h"
 
 #include "yb/util/debug-util.h"
@@ -41,6 +42,7 @@ DEFINE_test_flag(bool, pause_calculator_echo_request, false,
 
 DECLARE_int64(outbound_rpc_block_size);
 DECLARE_int64(outbound_rpc_memory_limit);
+DECLARE_bool(rpc_priority_queue_enabled);
 
 namespace yb { namespace rpc {
 
@@ -525,6 +527,14 @@ class AbacusService: public rpc_test::AbacusServiceIf {
 
 } // namespace
 
+std::unique_ptr<ServiceIf> MakeCalculatorService(const scoped_refptr<MetricEntity>& entity) {
+  return CreateCalculatorService(entity);
+}
+
+std::unique_ptr<ServiceIf> MakeAshTestService(const scoped_refptr<MetricEntity>& entity) {
+  return std::make_unique<AshTestService>(entity);
+}
+
 TestServer::TestServer(std::unique_ptr<Messenger>&& messenger,
                        const TestServerOptions& options)
     : messenger_(std::move(messenger)),
@@ -532,6 +542,10 @@ TestServer::TestServer(std::unique_ptr<Messenger>&& messenger,
         .name = "rpc-test",
         .max_workers = options.n_worker_threads,
       })) {
+  if (FLAGS_rpc_priority_queue_enabled) {
+    priority_queue_ = std::make_unique<RpcPriorityQueue>(
+        "rpc-test", options.n_worker_threads, messenger_->metric_entity());
+  }
 
   EXPECT_OK(messenger_->ListenAddress(
       rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>(),
@@ -542,12 +556,13 @@ Status TestServer::Start() {
   return messenger_->StartAcceptor();
 }
 
-Status TestServer::RegisterService(std::unique_ptr<ServiceIf> service) {
+Status TestServer::RegisterService(std::unique_ptr<ServiceIf> service, RpcPriority rpc_priority) {
   const std::string& service_name = service->service_name();
 
   auto service_pool = make_scoped_refptr<ServicePool>(
       kQueueLength, [pool = thread_pool_](auto) { return pool; },
-      &messenger_->scheduler(), std::move(service), messenger_->metric_entity());
+      &messenger_->scheduler(), std::move(service), messenger_->metric_entity(), rpc_priority,
+      priority_queue_.get());
   if (!service_pool_) {
     service_pool_ = service_pool;
   }
@@ -556,11 +571,11 @@ Status TestServer::RegisterService(std::unique_ptr<ServiceIf> service) {
 }
 
 TestServer::~TestServer() {
-  thread_pool_ = nullptr;
   if (service_pool_) {
     messenger_->UnregisterAllServices();
     service_pool_->Shutdown();
   }
+  ShutdownWorkers();
   if (messenger_) {
     messenger_->Shutdown();
   }
@@ -569,7 +584,25 @@ TestServer::~TestServer() {
 void TestServer::Shutdown() {
   messenger_->UnregisterAllServices();
   service_pool_->Shutdown();
+  ShutdownWorkers();
   messenger_->Shutdown();
+}
+
+void TestServer::ShutdownWorkers() {
+  if (!priority_queue_) {
+    // Without a queue, keep the historical behavior: drop our reference and let the pool shut down
+    // when the service pools release theirs.
+    thread_pool_ = nullptr;
+    return;
+  }
+  // Same ordering as Messenger::ShutdownThreadPools: close the queue, shut the pool down (which
+  // completes or aborts everything dispatched), then wait for the queue to drain.
+  priority_queue_->StartShutdown();
+  if (thread_pool_) {
+    thread_pool_->Shutdown();
+    thread_pool_ = nullptr;
+  }
+  priority_queue_->CompleteShutdown();
 }
 
 RpcTestBase::RpcTestBase()

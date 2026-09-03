@@ -325,6 +325,12 @@ class Messenger : public ProxyContext {
 
   Result<rpc::ThreadPoolPtr> TaggedThreadPool(TaggedThreadPools::Tag pool_tag = 0);
 
+  // Priority queue gating dispatch to all of this messenger's worker thread pools, or null when
+  // rpc_priority_queue_enabled is off (work is then submitted to the pools directly).
+  RpcPriorityQueue* rpc_priority_queue() const {
+    return rpc_priority_queue_.get();
+  }
+
   const std::shared_ptr<RpcMetrics>& rpc_metrics() override {
     return rpc_metrics_;
   }
@@ -460,6 +466,10 @@ class Messenger : public ProxyContext {
   // This could be used for high-priority services such as Consensus.
   rpc::ThreadPoolPtr high_priority_thread_pool_;
   std::atomic<bool> high_priority_thread_pool_ready_;
+
+  // Created in Init when rpc_priority_queue_enabled. Shut down together with the thread pools it
+  // dispatches to, see ShutdownThreadPools.
+  std::unique_ptr<RpcPriorityQueue> rpc_priority_queue_;
 
   std::unique_ptr<DnsResolver> resolver_;
 

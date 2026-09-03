@@ -79,6 +79,7 @@ class RpcCallParams;
 class RpcConnectionPB;
 class RpcContext;
 class RpcController;
+class RpcPriorityQueue;
 class Rpcs;
 class Scheduler;
 class SecureContext;

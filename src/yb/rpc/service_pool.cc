@@ -48,6 +48,7 @@
 #include "yb/gutil/strings/substitute.h"
 
 #include "yb/rpc/inbound_call.h"
+#include "yb/rpc/rpc_priority_queue.h"
 #include "yb/rpc/scheduler.h"
 #include "yb/rpc/service_if.h"
 
@@ -122,9 +123,11 @@ class ServicePoolImpl final : public InboundCallHandler {
       Scheduler* scheduler,
       ServiceIfPtr service,
       const scoped_refptr<MetricEntity>& entity,
-      RpcPriority rpc_priority)
+      RpcPriority rpc_priority,
+      RpcPriorityQueue* priority_queue)
       : max_queued_calls_(max_tasks),
         rpc_priority_(rpc_priority),
+        priority_queue_(priority_queue),
         thread_pool_provider_(std::move(thread_pool_provider)),
         scheduler_(*scheduler),
         service_(std::move(service)),
@@ -147,7 +150,9 @@ class ServicePoolImpl final : public InboundCallHandler {
               static_cast<int64>(0) /* initial_value */);
 
           LOG_WITH_PREFIX(INFO) << "yb::rpc::ServicePoolImpl created at " << this
-                                << ", rpc priority: " << rpc_priority_;
+                                << ", rpc priority: " << rpc_priority_
+                                << ", priority queue: "
+                                << (priority_queue_ ? priority_queue_->name() : "none");
   }
 
   ~ServicePoolImpl() {
@@ -205,7 +210,13 @@ class ServicePoolImpl final : public InboundCallHandler {
       ScheduleCheckTimeout(call_deadline);
     }
 
-    thread_pool->Enqueue(task);
+    // Either submission path ends with the task's Done() being invoked exactly once, so the
+    // failure handling in InboundCallTask::Done (-> Failure below) is the same for both.
+    if (priority_queue_) {
+      priority_queue_->Enqueue(task, rpc_priority_, thread_pool);
+    } else {
+      thread_pool->Enqueue(task);
+    }
   }
 
   const Counter* RpcsTimedOutInQueueMetricForTests() const {
@@ -417,8 +428,10 @@ class ServicePoolImpl final : public InboundCallHandler {
 
   const size_t max_queued_calls_;
   // Dispatch priority for this service's admitted calls. All calls of a service share one
-  // priority (service-level classification). Consumed by RpcPriorityQueue-based dispatch.
+  // priority (service-level classification). Only meaningful when priority_queue_ is set.
   const RpcPriority rpc_priority_;
+  // Shared queue that gates dispatch to the worker pools, or null to dispatch directly. Not owned.
+  RpcPriorityQueue* const priority_queue_;
   ThreadPoolProvider thread_pool_provider_;
   Scheduler& scheduler_;
   ServiceIfPtr service_;
@@ -482,10 +495,11 @@ ServicePool::ServicePool(
     Scheduler* scheduler,
     ServiceIfPtr service,
     const scoped_refptr<MetricEntity>& metric_entity,
-    RpcPriority rpc_priority)
+    RpcPriority rpc_priority,
+    RpcPriorityQueue* priority_queue)
     : impl_(new ServicePoolImpl(
         max_tasks, std::move(thread_pool_provider), scheduler, std::move(service), metric_entity,
-        rpc_priority)) {
+        rpc_priority, priority_queue)) {
 }
 
 ServicePool::~ServicePool() {

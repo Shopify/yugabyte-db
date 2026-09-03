@@ -63,16 +63,22 @@ namespace rpc {
 
 using ThreadPoolProvider = std::function<ThreadPoolPtr(ThreadPoolTag)>;
 
-// A pool of threads that handle new incoming RPC calls.
-// Also includes a queue that calls get pushed onto for handling by the pool.
+// Per-service admission and dispatch for incoming RPC calls: enforces the service's queue limit,
+// tracks queue time and timeouts, and submits admitted calls to a worker thread pool, either
+// directly or via a shared RpcPriorityQueue when one is provided.
 class ServicePool : public RpcService {
  public:
+  // priority_queue may be null, in which case admitted calls are submitted straight to the thread
+  // pool selected by thread_pool_provider. When non-null, they are submitted to priority_queue
+  // with rpc_priority and that thread pool as the dispatch target; the queue must outlive this
+  // pool's CompleteShutdown.
   ServicePool(size_t max_tasks,
               ThreadPoolProvider thread_pool_provider,
               Scheduler* scheduler,
               ServiceIfPtr service,
               const scoped_refptr<MetricEntity>& metric_entity,
-              RpcPriority rpc_priority = RpcPriority::kNormal);
+              RpcPriority rpc_priority = RpcPriority::kNormal,
+              RpcPriorityQueue* priority_queue = nullptr);
   virtual ~ServicePool();
 
   void StartShutdown() override;
