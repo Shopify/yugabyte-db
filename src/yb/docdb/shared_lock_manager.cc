@@ -32,11 +32,16 @@
 #include "yb/dockv/intent.h"
 
 #include "yb/util/callsite_profiling.h"
+#include "yb/util/flags.h"
 #include "yb/util/logging.h"
 #include "yb/util/ref_cnt_buffer.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/tostring.h"
 #include "yb/util/trace.h"
+
+DEFINE_RUNTIME_uint32(shared_lock_manager_max_free_entries, 256,
+    "Per-tablet cap on the number of unused lock entries the SharedLockManager keeps cached for "
+    "reuse. Entries released beyond this cap are freed. 0 disables caching.");
 
 namespace yb::docdb {
 
@@ -154,6 +159,9 @@ class SharedLockManager::Impl {
 
   void DumpStatusHtml(std::ostream& out) EXCLUDES(global_mutex_);
 
+  size_t TEST_LocksSize() const EXCLUDES(global_mutex_);
+  size_t TEST_FreeEntriesCount() const EXCLUDES(global_mutex_);
+
  private:
   // Make sure the entries exist in the locks_ map and return pointers so we can access
   // them without holding the global lock. Returns a vector with pointers in the same order
@@ -167,10 +175,15 @@ class SharedLockManager::Impl {
   // The global mutex should be taken only for very short duration, with no blocking wait.
   mutable std::mutex global_mutex_;
 
-  std::unordered_map<RefCntPrefix, SharedLockedBatchEntry*> locks_ GUARDED_BY(global_mutex_);
-  // Cache of lock entries, to avoid allocation/deallocation of heavy SharedLockedBatchEntry.
-  std::vector<std::unique_ptr<SharedLockedBatchEntry>> lock_entries_ GUARDED_BY(global_mutex_);
-  std::vector<SharedLockedBatchEntry*> free_lock_entries_ GUARDED_BY(global_mutex_);
+  // An entry is owned by exactly one of these two containers at any time: locks_ while some batch
+  // references it, free_lock_entries_ afterwards (until reused or evicted).
+  std::unordered_map<RefCntPrefix, std::unique_ptr<SharedLockedBatchEntry>> locks_
+      GUARDED_BY(global_mutex_);
+  // Cache of released entries, to avoid allocation/deallocation of SharedLockedBatchEntry on
+  // every lock. Bounded by FLAGS_shared_lock_manager_max_free_entries so that a burst of distinct
+  // keys (e.g. a bulk write) does not become a permanent per-tablet memory floor (#21013).
+  std::vector<std::unique_ptr<SharedLockedBatchEntry>> free_lock_entries_
+      GUARDED_BY(global_mutex_);
 };
 
 bool SharedLockManager::Impl::Lock(
@@ -230,14 +243,14 @@ void SharedLockManager::Impl::Reserve(LockBatchEntries<SharedLockManager>& key_t
     auto& value = locks_[key_and_intent_type.key];
     if (!value) {
       if (!free_lock_entries_.empty()) {
-        value = free_lock_entries_.back();
+        value = std::move(free_lock_entries_.back());
         free_lock_entries_.pop_back();
       } else {
-        value = lock_entries_.emplace_back(std::make_unique<SharedLockedBatchEntry>()).get();
+        value = std::make_unique<SharedLockedBatchEntry>();
       }
     }
     value->ref_count++;
-    key_and_intent_type.locked = value;
+    key_and_intent_type.locked = value.get();
   }
 }
 
@@ -245,11 +258,31 @@ void SharedLockManager::Impl::Cleanup(
     const LockBatchEntries<SharedLockManager>& key_to_intent_type) {
   std::lock_guard lock(global_mutex_);
   for (const auto& item : key_to_intent_type) {
-    if (--item.locked->ref_count == 0) {
-      locks_.erase(item.key);
-      free_lock_entries_.push_back(item.locked);
+    if (--item.locked->ref_count != 0) {
+      continue;
     }
+    auto it = locks_.find(item.key);
+    if (PREDICT_FALSE(it == locks_.end() || it->second.get() != item.locked)) {
+      LOG(DFATAL) << "Lock manager state corrupted: no entry for key " << AsString(item.key);
+      continue;
+    }
+    LOG_IF(DFATAL, item.locked->num_waiters.load(std::memory_order_acquire) != 0)
+        << "Lock manager state corrupted: releasing entry with waiters " << item.locked->ToString();
+    if (free_lock_entries_.size() < FLAGS_shared_lock_manager_max_free_entries) {
+      free_lock_entries_.push_back(std::move(it->second));
+    }
+    locks_.erase(it);
   }
+}
+
+size_t SharedLockManager::Impl::TEST_LocksSize() const {
+  std::lock_guard lock(global_mutex_);
+  return locks_.size();
+}
+
+size_t SharedLockManager::Impl::TEST_FreeEntriesCount() const {
+  std::lock_guard lock(global_mutex_);
+  return free_lock_entries_.size();
 }
 
 SharedLockManager::SharedLockManager() : impl_(std::make_unique<Impl>()) {}
@@ -267,6 +300,14 @@ void SharedLockManager::Unlock(const LockBatchEntries<SharedLockManager>& key_to
 
 void SharedLockManager::DumpStatusHtml(std::ostream& out) {
   impl_->DumpStatusHtml(out);
+}
+
+size_t SharedLockManager::TEST_LocksSize() const {
+  return impl_->TEST_LocksSize();
+}
+
+size_t SharedLockManager::TEST_FreeEntriesCount() const {
+  return impl_->TEST_FreeEntriesCount();
 }
 
 }  // namespace yb::docdb

@@ -42,6 +42,11 @@ class SharedLockManager {
 
   void DumpStatusHtml(std::ostream& out);
 
+  // Number of keys currently holding a lock entry (locked or reserved).
+  size_t TEST_LocksSize() const;
+  // Number of unused lock entries cached for reuse.
+  size_t TEST_FreeEntriesCount() const;
+
  private:
   class Impl;
   std::unique_ptr<Impl> impl_;

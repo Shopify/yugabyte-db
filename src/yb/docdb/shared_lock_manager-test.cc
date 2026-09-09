@@ -35,6 +35,7 @@ using std::vector;
 using std::thread;
 
 DECLARE_bool(dump_lock_keys);
+DECLARE_uint32(shared_lock_manager_max_free_entries);
 
 namespace yb {
 namespace docdb {
@@ -191,6 +192,49 @@ TEST_F(SharedLockManagerTest, LockConflicts) {
   }
 
   tp.Shutdown();
+}
+
+// A burst of distinct keys must not leave a permanent per-tablet footprint: released entries
+// beyond FLAGS_shared_lock_manager_max_free_entries are freed rather than cached.
+TEST_F(SharedLockManagerTest, FreeListBounded) {
+  constexpr size_t kBurstKeys = 1000;
+  constexpr uint32_t kCap = 8;
+
+  auto make_burst = [](size_t num_keys) {
+    LockBatchEntries<SharedLockManager> entries;
+    entries.reserve(num_keys);
+    for (size_t i = 0; i != num_keys; ++i) {
+      entries.push_back(
+          {RefCntPrefix(Format("burst_$0", i)), IntentTypeSet({IntentType::kWeakRead})});
+    }
+    return entries;
+  };
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_shared_lock_manager_max_free_entries) = kCap;
+  {
+    LockBatch lb(&lm_, make_burst(kBurstKeys), CoarseTimePoint::max());
+    ASSERT_OK(lb.status());
+    ASSERT_EQ(lm_.TEST_LocksSize(), kBurstKeys);
+  }
+  ASSERT_EQ(lm_.TEST_LocksSize(), 0);
+  ASSERT_EQ(lm_.TEST_FreeEntriesCount(), kCap);
+
+  // Cached entries are reused before new ones are allocated.
+  {
+    auto lb = TestLockBatch();
+    ASSERT_OK(lb.status());
+    ASSERT_EQ(lm_.TEST_FreeEntriesCount(), kCap - lb.size());
+  }
+  ASSERT_EQ(lm_.TEST_FreeEntriesCount(), kCap);
+
+  // Zero disables caching: the burst consumes the kCap cached entries and nothing is re-cached.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_shared_lock_manager_max_free_entries) = 0;
+  {
+    LockBatch lb(&lm_, make_burst(kBurstKeys), CoarseTimePoint::max());
+    ASSERT_OK(lb.status());
+  }
+  ASSERT_EQ(lm_.TEST_LocksSize(), 0);
+  ASSERT_EQ(lm_.TEST_FreeEntriesCount(), 0);
 }
 
 TEST_F(SharedLockManagerTest, DumpKeys) {
