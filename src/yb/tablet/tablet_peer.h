@@ -389,6 +389,8 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
     return clock_;
   }
 
+  // Submits directly to the tablet's tagged RPC worker pool, bypassing the messenger's
+  // RpcPriorityQueue (see the "not gated" list in rpc/rpc_priority_queue.h).
   void Enqueue(rpc::ThreadPoolTask* task);
   void StrandEnqueue(rpc::StrandTask* task) override;
 

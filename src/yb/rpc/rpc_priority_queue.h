@@ -47,10 +47,29 @@ namespace yb::rpc {
 // every task the queue dispatches has a worker available, so "dispatched" means "executing" for
 // the queue's own work and permits are released at the rate work actually completes. Without it,
 // tasks could pile up inside one pool's internal (non-priority) queue while holding permits that a
-// higher-priority task for an idle pool is waiting for. Enqueue enforces this with a DCHECK. Note
-// that work submitted to a target pool directly, bypassing this queue (e.g. TabletPeer::Enqueue),
-// can still occupy that pool's workers and delay the queue's dispatched tasks; that exposure is
-// bounded by the pool's worker count and is unchanged from pre-queue behavior.
+// higher-priority task for an idle pool is waiting for. Enqueue enforces this with a DCHECK.
+//
+// What is not gated (v1). The queue sees exactly two kinds of work: inbound service calls
+// (ServicePoolImpl::Process) and async outbound-call callbacks (OutboundCall::InvokeCallback via
+// the messenger's callback recipients). Work reaching RPC worker pools by any other route bypasses
+// the queue. It shares pool workers with dispatched tasks, so the pool-size invariant above bounds
+// but does not eliminate in-pool waiting for the queue's own work; the exposure is limited by the
+// pool's worker count and is unchanged from pre-queue behavior. The routes are:
+//  - Inline local calls: a call whose handler is in the same process and that arrives on a thread
+//    the target pool already owns runs inline (ServicePoolImpl::Process fast path). The worker is
+//    already occupied by a task (normally one dispatched through the queue), so no additional
+//    concurrency is created and no permit is needed.
+//  - Direct submission to Messenger::ThreadPool(): continuations of already-admitted work, e.g.
+//    wait-queue and object-lock waiter resumption (docdb), PgClientService session cleanup and
+//    table-query continuations, CQL processor rescheduling, xCluster safe-time service. Bounded,
+//    kNormal-equivalent, and a candidate for routing through the queue via a Messenger-level
+//    helper in a follow-up.
+//  - TabletPeer::Enqueue: already-admitted per-tablet work continuing on the tablet's tagged
+//    pool. Same follow-up as above.
+//  - The PgClientService shared-memory exchange pool (one dedicated thread per PG session,
+//    unbounded, no queue): a separate request path that does not use the RPC worker pools.
+//  - Callbacks run on the reactor (InvokeCallbackMode::kReactorThread, sync-RPC latches) and
+//    non-RPC pools (raft, prepare, apply): never on RPC worker pools.
 //
 // Task classes and deadlock freedom: an inbound handler may block waiting for the callback of an
 // outbound call it made (synchronous YBClient calls from inside handlers do exactly this), and

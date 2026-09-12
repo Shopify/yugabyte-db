@@ -33,7 +33,10 @@ DEFINE_NON_RUNTIME_bool(rpc_priority_queue_enabled, false,
     "per-messenger RpcPriorityQueue that bounds the number of concurrently executing RPC tasks "
     "across all RPC worker pools and dispatches waiting work in priority order "
     "(cluster health > user-facing > background). When enabled, total RPC concurrency is bounded "
-    "by rpc_priority_queue_max_dispatched rather than by each pool's worker limit independently.");
+    "by rpc_priority_queue_max_dispatched rather than by each pool's worker limit independently. "
+    "Only work entering the pools through service dispatch or async callbacks is gated; work "
+    "submitted to the pools directly (e.g. wait-queue resumption, TabletPeer continuations) and "
+    "the PgClientService shared-memory exchange path are not.");
 TAG_FLAG(rpc_priority_queue_enabled, advanced);
 
 DEFINE_NON_RUNTIME_int32(rpc_priority_queue_max_dispatched, 0,

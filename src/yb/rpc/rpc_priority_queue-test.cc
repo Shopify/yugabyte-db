@@ -413,7 +413,8 @@ TEST_F(RpcPriorityQueueTest, EnqueueRacesWithShutdown) {
   constexpr int kAttemptsPerProducer = NonTsanVsTsan(2000, 300);
 
   auto pool = MakePool("race", 4);
-  auto queue = std::make_unique<RpcPriorityQueue>("race", 4, /* callback_reserve= */ 0, metric_entity_);
+  auto queue = std::make_unique<RpcPriorityQueue>(
+      "race", 4, /* callback_reserve= */ 0, metric_entity_);
   CountingTask::Counters counters;
   std::atomic<int> submitted{0};
   CountDownLatch producers_started(kProducers);

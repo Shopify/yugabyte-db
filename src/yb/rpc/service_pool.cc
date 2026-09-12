@@ -191,6 +191,9 @@ class ServicePoolImpl final : public InboundCallHandler {
         << "Calling Process on closed service pool";
     auto thread_pool = thread_pool_provider_(call->pool_tag());
     if (!queue && thread_pool->OwnsThisThread()) {
+      // Local call arriving on a thread of the target pool: run inline. This does not take a
+      // priority-queue permit: the thread is a pool worker already occupied by a task (normally one
+      // dispatched through the queue), so no additional concurrency is created.
       Handle(std::move(call));
       return;
     }

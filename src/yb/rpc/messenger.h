@@ -317,6 +317,9 @@ class Messenger : public ProxyContext {
     return *resolver_;
   }
 
+  // Direct access to the worker pools. Work enqueued on them here bypasses rpc_priority_queue()
+  // (see the "not gated" list in rpc_priority_queue.h); use it only for bounded continuations of
+  // work that has already been admitted. A priority-aware submission helper is a planned follow-up.
   rpc::ThreadPool& ThreadPool(ServicePriority priority = ServicePriority::kNormal);
 
   const rpc::ThreadPoolPtr& ThreadPoolPtr(ServicePriority priority = ServicePriority::kNormal);
