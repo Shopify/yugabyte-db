@@ -1333,8 +1333,40 @@ typedef struct
 
 static YbDdlTransactionState ddl_transaction_state = {0};
 
+/*
+ * Catalog version increment of a top-level ANALYZE that runs its DDL in the
+ * regular transaction block (yb_ddl_transaction_block_enabled), deferred to
+ * the end of the statement.
+ *
+ * vacuum() commits after each analyzed relation (see use_own_xacts) and every
+ * one of those commits goes through YBCommitTransactionContainingDDL, so
+ * ANALYZE of N relations would increment the catalog version N times. While
+ * the statement is still executing, those commits only add their
+ * invalidation messages here and the statement's final commit does a single
+ * increment carrying all of them. That matches the separate DDL transaction
+ * mode (see YbTrackPgTxnInvalMessagesForAnalyze) and is safe because ANALYZE
+ * only writes statistics: other backends pick all of them up once the
+ * statement finishes instead of relation by relation.
+ *
+ * This lives outside ddl_transaction_state because every intermediate commit
+ * resets that struct, and its messages are allocated in mem_context because
+ * the transactions that produced them are gone by the time they are sent.
+ */
+typedef struct
+{
+	bool		pending;
+	/* Union of the catalog modification aspects of the deferred commits. */
+	uint64_t	aspects;
+	MemoryContext mem_context;
+	YbCatalogMessageList *head;
+	YbCatalogMessageList *tail;
+} YbDeferredAnalyzeIncrement;
+
+static YbDeferredAnalyzeIncrement deferred_analyze_increment = {0};
+
 static void YBResetEnableSpecialDDLMode();
 static void YBResetDdlState();
+static void YbClearDeferredAnalyzeIncrement();
 
 void
 YBCRecreateTransaction()
@@ -1384,6 +1416,14 @@ YBCAbortTransaction()
 
 	if (ddl_transaction_state.use_regular_txn_block)
 		YBResetDdlState();
+
+	/*
+	 * A failed multi-relation ANALYZE drops the increment it was holding back
+	 * for the relations it had already committed (see
+	 * deferred_analyze_increment): their new statistics stay unannounced to
+	 * other backends until they are analyzed again.
+	 */
+	YbClearDeferredAnalyzeIncrement();
 
 	/*
 	 * If a DDL operation during a DDL txn fails, the txn will be aborted before
@@ -3155,10 +3195,117 @@ YbCopyCommittedPgTxnMessages(SharedInvalidationMessage *currentInvalMessages)
 	}
 }
 
+/*
+ * True while a top-level ANALYZE (or VACUUM ANALYZE) whose DDL runs in the
+ * regular transaction block is still executing. A transaction commit that
+ * happens now is one of the per-relation commits done by vacuum(), not the
+ * statement's final commit, so its catalog version increment is deferred.
+ * is_top_level_ddl_active is reset as soon as the statement finishes
+ * executing (see YBTxnDdlProcessUtility), before the final commit.
+ */
+static bool
+YbShouldDeferAnalyzeIncrement()
+{
+	return ddl_transaction_state.use_regular_txn_block &&
+		ddl_transaction_state.is_top_level_ddl_active &&
+		ddl_transaction_state.current_stmt_node_tag == T_VacuumStmt;
+}
+
+static void
+YbDeferAnalyzeIncrement(YbDdlMode mode,
+						const SharedInvalidationMessage *catCacheInvalMessages,
+						int numCatCacheMsgs,
+						const SharedInvalidationMessage *relCacheInvalMessages,
+						int numRelCacheMsgs)
+{
+	deferred_analyze_increment.pending = true;
+	deferred_analyze_increment.aspects |= mode;
+
+	const int	nmsgs = numCatCacheMsgs + numRelCacheMsgs;
+
+	if (nmsgs == 0)
+		return;
+
+	if (!deferred_analyze_increment.mem_context)
+		deferred_analyze_increment.mem_context =
+			AllocSetContextCreate(TopMemoryContext,
+								  "deferred analyze inval messages",
+								  ALLOCSET_SMALL_SIZES);
+
+	YbCatalogMessageList *entry = (YbCatalogMessageList *)
+		MemoryContextAlloc(deferred_analyze_increment.mem_context,
+						   sizeof(YbCatalogMessageList));
+
+	entry->msgs = (SharedInvalidationMessage *)
+		MemoryContextAlloc(deferred_analyze_increment.mem_context,
+						   nmsgs * sizeof(SharedInvalidationMessage));
+	entry->nmsgs = nmsgs;
+	entry->next = NULL;
+	if (numCatCacheMsgs > 0)
+		memcpy(entry->msgs, catCacheInvalMessages,
+			   numCatCacheMsgs * sizeof(SharedInvalidationMessage));
+	if (numRelCacheMsgs > 0)
+		memcpy(entry->msgs + numCatCacheMsgs, relCacheInvalMessages,
+			   numRelCacheMsgs * sizeof(SharedInvalidationMessage));
+
+	/* Append, so that the messages are sent in the order they were generated. */
+	if (deferred_analyze_increment.tail)
+		deferred_analyze_increment.tail->next = entry;
+	else
+		deferred_analyze_increment.head = entry;
+	deferred_analyze_increment.tail = entry;
+	elog(DEBUG1, "deferring catalog version increment of ANALYZE: %d messages",
+		 nmsgs);
+}
+
+static int
+YbTotalDeferredAnalyzeMessages()
+{
+	int			total = 0;
+
+	for (YbCatalogMessageList *current = deferred_analyze_increment.head;
+		 current != NULL; current = current->next)
+		total += current->nmsgs;
+	return total;
+}
+
+static void
+YbCopyDeferredAnalyzeMessages(SharedInvalidationMessage *dest)
+{
+	for (YbCatalogMessageList *current = deferred_analyze_increment.head;
+		 current != NULL; current = current->next)
+	{
+		memcpy(dest, current->msgs,
+			   current->nmsgs * sizeof(SharedInvalidationMessage));
+		dest += current->nmsgs;
+	}
+}
+
+static void
+YbClearDeferredAnalyzeIncrement()
+{
+	if (deferred_analyze_increment.mem_context)
+		MemoryContextReset(deferred_analyze_increment.mem_context);
+	deferred_analyze_increment.pending = false;
+	deferred_analyze_increment.aspects = 0;
+	deferred_analyze_increment.head = NULL;
+	deferred_analyze_increment.tail = NULL;
+}
+
 void
 YBCommitTransactionContainingDDL()
 {
 	const bool	has_change = YbHasDdlMadeChanges();
+
+	/*
+	 * Intermediate commit of a multi-relation ANALYZE: hold back this commit's
+	 * catalog version increment (see deferred_analyze_increment). The
+	 * statement's final commit, or the next commit that is not one of them,
+	 * publishes what was held back.
+	 */
+	const bool	defer_increment = YbShouldDeferAnalyzeIncrement();
+	const bool	publish_deferred = deferred_analyze_increment.pending &&
+		!defer_increment;
 
 	MergeCatalogModificationAspects(&ddl_transaction_state.catalog_modification_aspects,
 									has_change);
@@ -3193,9 +3340,14 @@ YBCommitTransactionContainingDDL()
 	bool		is_breaking_change = false;
 	SharedInvalidationMessage *currentInvalMessages = NULL;
 
-	if (has_change)
+	if (has_change || publish_deferred)
 	{
-		const YbDdlMode mode = YbCatalogModificationAspectsToDdlMode(ddl_transaction_state.catalog_modification_aspects.applied);
+		uint64_t	aspects = ddl_transaction_state.catalog_modification_aspects.applied;
+
+		if (publish_deferred)
+			aspects |= deferred_analyze_increment.aspects;
+
+		const YbDdlMode mode = YbCatalogModificationAspectsToDdlMode(aspects);
 
 		/* accumulated invalidation messages in the transaction block */
 		SharedInvalidationMessage *catCacheInvalMessages = NULL;
@@ -3231,6 +3383,7 @@ YBCommitTransactionContainingDDL()
 			Assert(numRelCacheMsgs >= numExistingRelCacheMsgs);
 
 			int			total = YbTotalCommittedPgTxnMessages();
+			int			num_deferred = publish_deferred ? YbTotalDeferredAnalyzeMessages() : 0;
 
 			/*
 			 * We can not have committed pg txns in ANALYZE within a
@@ -3258,7 +3411,18 @@ YBCommitTransactionContainingDDL()
 			numRelCacheMsgs -= numExistingRelCacheMsgs;
 			YbAddNumInvalMessagesInTxn(YB_RELCACHE_MSGS, numRelCacheMsgs);
 
-			nmsgs = numCatCacheMsgs + numRelCacheMsgs + total;
+			if (defer_increment)
+			{
+				YbDeferAnalyzeIncrement(mode,
+										currentCatCacheInvalMessages,
+										numCatCacheMsgs,
+										currentRelCacheInvalMessages,
+										numRelCacheMsgs);
+				numCatCacheMsgs = 0;
+				numRelCacheMsgs = 0;
+			}
+
+			nmsgs = numCatCacheMsgs + numRelCacheMsgs + total + num_deferred;
 			if (nmsgs > 0)
 			{
 				int			max_allowed = yb_max_num_invalidation_messages;
@@ -3280,6 +3444,9 @@ YBCommitTransactionContainingDDL()
 										   nmsgs * sizeof(SharedInvalidationMessage));
 					if (total > 0)
 						YbCopyCommittedPgTxnMessages(currentInvalMessages);
+					if (num_deferred > 0)
+						YbCopyDeferredAnalyzeMessages(currentInvalMessages + total);
+					total += num_deferred;
 
 					if (numCatCacheMsgs > 0)
 						memcpy(currentInvalMessages + total,
@@ -3295,6 +3462,9 @@ YBCommitTransactionContainingDDL()
 				Assert(nmsgs == 0);
 			YBC_LOG_INFO("DEBUG: pg null=%d, nmsgs=%d", !currentInvalMessages, nmsgs);
 		}
+		else if (defer_increment)
+			/* Without messages, there is only the increment to hold back. */
+			YbDeferAnalyzeIncrement(mode, NULL, 0, NULL, 0);
 		else if (ddl_transaction_state.num_committed_pg_txns > 0)
 			YBC_LOG_INFO("DEBUG: num_committed_pg_txns: %d",
 						 ddl_transaction_state.num_committed_pg_txns);
@@ -3345,7 +3515,7 @@ YBCommitTransactionContainingDDL()
 		/*
 		 * We can skip incrementing catalog version if nmsgs is 0.
 		 */
-		increment_done =
+		increment_done = !defer_increment &&
 			((mode & YB_SYS_CAT_MOD_ASPECT_VERSION_INCREMENT) ||
 			 increment_for_conn_mgr_needed) &&
 			(!enable_inval_msgs || nmsgs > 0) &&
@@ -3367,6 +3537,8 @@ YBCommitTransactionContainingDDL()
 		YbIncrementMasterLogicalClientVersionTableEntry();
 
 	YBClearDdlTransactionState();
+	if (publish_deferred)
+		YbClearDeferredAnalyzeIncrement();
 
 	if (use_regular_txn_block)
 	{

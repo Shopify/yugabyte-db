@@ -2110,15 +2110,14 @@ TEST_F(PgCatalogVersionTest, AnalyzeTwoTables) {
   auto conn_yugabyte = ASSERT_RESULT(ConnectToDB(kYugabyteDatabase));
   const auto yugabyte_db_oid = ASSERT_RESULT(GetDatabaseOid(&conn_yugabyte, kYugabyteDatabase));
   // Analyze two tables, PG internally creates an additional transaction that commits separately.
-  // We see two catalog version increments so we should see two rows of version 2 and 3 in
-  // pg_yb_invalidation_messages.
+  // Regardless of whether DDLs run in a separate DDL transaction or in the regular transaction
+  // block, the messages of both relations are published by a single catalog version increment at
+  // the end of the statement, so we should see one row of version 2 in pg_yb_invalidation_messages.
   ASSERT_OK(conn_yugabyte.Execute("ANALYZE pg_class, pg_attribute"));
   auto result = ASSERT_RESULT(conn_yugabyte.FetchAllAsString(
       "SELECT db_oid, current_version, length(messages) FROM pg_yb_invalidation_messages"));
   LOG(INFO) << "result:\n" << result;
-  const string expected = IsTransactionalDdlEnabled()
-      ? Format("$0, 2, 792; $0, 3, 624", yugabyte_db_oid)
-      : Format("$0, 2, 1416", yugabyte_db_oid);
+  const string expected = Format("$0, 2, 1416", yugabyte_db_oid);
   ASSERT_EQ(result, expected);
 }
 
@@ -2126,23 +2125,13 @@ TEST_F(PgCatalogVersionTest, AnalyzeAllTables) {
   RestartClusterWithInvalMessageEnabled();
   auto conn_yugabyte = ASSERT_RESULT(ConnectToDB(kYugabyteDatabase));
   const auto yugabyte_db_oid = ASSERT_RESULT(GetDatabaseOid(&conn_yugabyte, kYugabyteDatabase));
+  // ANALYZE of all relations increments the catalog version once at the end of the statement,
+  // with the same set of messages in both DDL modes.
   ASSERT_OK(conn_yugabyte.Execute("ANALYZE"));
   auto result = ASSERT_RESULT(conn_yugabyte.FetchAllAsString(
       "SELECT db_oid, current_version, length(messages) FROM pg_yb_invalidation_messages"));
   LOG(INFO) << "result:\n" << result;
-  string expected = IsTransactionalDdlEnabled()
-      ? "$0, 2, 120; $0, 3, 768; $0, 4, 624; $0, 5, 720; "
-        "$0, 6, 792; $0, 7, 504; $0, 8, 96; $0, 9, 600; $0, 10, 192; "
-        "$0, 11, 168; $0, 12, 216; $0, 13, 528; $0, 14, 96; $0, 15, 216; "
-        "$0, 16, 144; $0, 17, 144; $0, 18, 624; $0, 19, 192; $0, 20, 168; "
-        "$0, 21, 96; $0, 22, 504; $0, 23, 216; $0, 24, 96; $0, 25, 216; "
-        "$0, 26, 360; $0, 27, 192; $0, 28, 120; $0, 29, 192; $0, 30, 72; "
-        "$0, 31, 120; $0, 32, 264; $0, 33, 168; $0, 34, 144; $0, 35, 192; "
-        "$0, 36, 120; $0, 37, 96; $0, 38, 120; $0, 39, 216; $0, 40, 96; "
-        "$0, 41, 48; $0, 42, 240; $0, 43, 168; $0, 44, 120; $0, 45, 120; "
-        "$0, 46, 96"
-      : "$0, 2, 11064";
-  expected = Format(expected, yugabyte_db_oid);
+  const string expected = Format("$0, 2, 11064", yugabyte_db_oid);
   if (result != expected) {
     LOG(INFO) << ASSERT_RESULT(conn_yugabyte.FetchAllAsString(
         "SELECT db_oid, current_version, messages FROM pg_yb_invalidation_messages"));
@@ -3002,11 +2991,9 @@ TEST_F(PgCatalogVersionTest, InvalMessageWaitOnVersionGap) {
   // conn1 connects to node 1
   auto conn1 = ASSERT_RESULT(ConnectToDB(kYugabyteDatabase));
   auto v = ASSERT_RESULT(GetCatalogVersion(&conn1));
-  // ANALYZE bumps the catalog version once per non-empty relation it writes stats
-  // for. The global views populate three formerly-empty FDW catalogs
-  // (pg_foreign_data_wrapper, pg_foreign_server, pg_foreign_table), so each ANALYZE
-  // now updates 3 more relations. This test runs ANALYZE twice: +6, so 88 -> 94.
-  ASSERT_EQ(v, IsTransactionalDdlEnabled() ? 94 : 4);
+  // Each ANALYZE bumps the catalog version once, no matter how many relations it writes stats
+  // for.
+  ASSERT_EQ(v, 4);
   auto result = ASSERT_RESULT(conn1.FetchAllAsString("SELECT id FROM test_table"));
   ASSERT_EQ(result, "1");
 
