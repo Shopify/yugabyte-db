@@ -94,6 +94,7 @@ set(YRPC_SRCS
     rpc_context.cc
     rpc_controller.cc
     rpc_metrics.cc
+    rpc_priority_queue.cc
     rpc_with_call_id.cc
     rpc_with_queue.cc
     rpc_util.cc
@@ -179,5 +180,6 @@ ADD_YB_TEST(periodic-test)
 ADD_YB_TEST(reactor-test)
 ADD_YB_TEST(rpc-bench RUN_SERIAL true)
 ADD_YB_TEST(rpc-test)
+ADD_YB_TEST(rpc_priority_queue-test)
 ADD_YB_TEST(rpc_stub-test RUN_SERIAL true)
 ADD_YB_TEST(scheduler-test)
