@@ -35,7 +35,7 @@ class LocalOutboundCall : public OutboundCall {
                     RpcController* controller,
                     std::shared_ptr<RpcMetrics> rpc_metrics,
                     ResponseCallback callback,
-                    ThreadPool* callback_thread_pool);
+                    ThreadPoolTaskRecipient* callback_recipient);
 
   Status SetRequestParam(
       AnyMessageConstPtr req, std::unique_ptr<Sidecars> sidecars,

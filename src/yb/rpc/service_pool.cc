@@ -213,7 +213,7 @@ class ServicePoolImpl final : public InboundCallHandler {
     // Either submission path ends with the task's Done() being invoked exactly once, so the
     // failure handling in InboundCallTask::Done (-> Failure below) is the same for both.
     if (priority_queue_) {
-      priority_queue_->Enqueue(task, rpc_priority_, thread_pool);
+      priority_queue_->Enqueue(task, rpc_priority_, RpcTaskClass::kInbound, thread_pool);
     } else {
       thread_pool->Enqueue(task);
     }
@@ -261,6 +261,13 @@ class ServicePoolImpl final : public InboundCallHandler {
         << LogPrefix()
         << call->method_name() << " request on " << service_->service_name() << " from "
         << call->remote_address() << " dropped because of: " << status.ToString();
+    if (status.IsServiceUnavailable()) {
+      // Rejected for capacity (e.g. the RpcPriorityQueue could not accept another waiting task),
+      // not because we are going away: tell the client to retry rather than to drop the connection.
+      rpcs_queue_overflow_->Increment();
+      call->RespondFailure(ErrorStatusPB::ERROR_SERVER_TOO_BUSY, status);
+      return;
+    }
     const auto response_status = STATUS(ServiceUnavailable, "Service is shutting down");
     call->RespondFailure(ErrorStatusPB::FATAL_SERVER_SHUTTING_DOWN, response_status);
   }

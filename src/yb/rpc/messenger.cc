@@ -89,6 +89,7 @@ DECLARE_bool(TEST_running_test);
 DECLARE_int32(num_connections_to_server);
 DECLARE_bool(rpc_priority_queue_enabled);
 DECLARE_int32(rpc_priority_queue_max_dispatched);
+DECLARE_int32(rpc_priority_queue_callback_reserve);
 DEFINE_UNKNOWN_int32(rpc_default_keepalive_time_ms, 65000,
              "If an RPC connection from a client is idle for this amount of time, the server "
              "will disconnect the client. Setting flag to 0 disables this clean up.");
@@ -418,6 +419,19 @@ rpc::ThreadPool& Messenger::ThreadPool(ServicePriority priority) {
   return *ThreadPoolPtr(priority);
 }
 
+ThreadPoolTaskRecipient& Messenger::CallbackRecipient(ServicePriority priority) {
+  if (rpc_priority_queue_) {
+    switch (priority) {
+      case ServicePriority::kNormal:
+        return *normal_callback_recipient_;
+      case ServicePriority::kHigh:
+        return *high_callback_recipient_;
+    }
+    FATAL_INVALID_ENUM_VALUE(ServicePriority, priority);
+  }
+  return ThreadPool(priority);
+}
+
 const ThreadPoolPtr& Messenger::ThreadPoolPtr(ServicePriority priority) {
   switch (priority) {
     case ServicePriority::kNormal:
@@ -681,7 +695,18 @@ Status Messenger::Init(const MessengerBuilder &bld) {
           << "size (" << thread_pool_workers_limit_ << "); clamping to the pool size";
       budget = thread_pool_workers_limit_;
     }
-    rpc_priority_queue_ = std::make_unique<RpcPriorityQueue>(name_, budget, metric_entity_);
+    size_t callback_reserve = FLAGS_rpc_priority_queue_callback_reserve < 0
+        ? std::max<size_t>(2, budget / 20)
+        : static_cast<size_t>(FLAGS_rpc_priority_queue_callback_reserve);
+    rpc_priority_queue_ = std::make_unique<RpcPriorityQueue>(
+        name_, budget, callback_reserve, metric_entity_);
+    // Callback recipients dispatch to the same pools the corresponding ServicePriority selects.
+    // The high-priority pool is normally created lazily; create it now so the recipient can hold
+    // it.
+    normal_callback_recipient_ = std::make_unique<PriorityQueueCallbackRecipient>(
+        rpc_priority_queue_.get(), RpcPriority::kNormal, default_normal_thread_pool_);
+    high_callback_recipient_ = std::make_unique<PriorityQueueCallbackRecipient>(
+        rpc_priority_queue_.get(), RpcPriority::kHigh, ThreadPoolPtr(ServicePriority::kHigh));
   }
 
   reactors_.reserve(bld.num_reactors_);

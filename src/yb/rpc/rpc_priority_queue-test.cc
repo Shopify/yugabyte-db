@@ -12,11 +12,14 @@
 //
 
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
+
+#include "yb/gutil/casts.h"
 
 #include "yb/rpc/rpc_priority_queue.h"
 #include "yb/rpc/thread_pool.h"
@@ -25,7 +28,9 @@
 #include "yb/util/countdown_latch.h"
 #include "yb/util/metrics.h"
 #include "yb/util/random_util.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/status.h"
+#include "yb/util/sync_point.h"
 #include "yb/util/test_util.h"
 #include "yb/util/tsan_util.h"
 
@@ -33,6 +38,8 @@ METRIC_DECLARE_entity(server);
 METRIC_DECLARE_event_stats(rpc_priority_queue_wait_time_normal);
 METRIC_DECLARE_counter(rpc_priority_queue_dispatched_low);
 METRIC_DECLARE_counter(rpc_priority_queue_aborted);
+
+DECLARE_bool(rpc_priority_queue_check_callbacks_do_not_wait);
 
 using namespace std::literals;
 
@@ -154,12 +161,12 @@ class RpcPriorityQueueTest : public YBTest {
 // With free permits and nothing waiting, tasks go straight to the pool without touching a band.
 TEST_F(RpcPriorityQueueTest, FastPathDoesNotQueue) {
   auto pool = MakePool("fast", 4);
-  RpcPriorityQueue queue("fast", 4, metric_entity_);
+  RpcPriorityQueue queue("fast", 4, /* callback_reserve= */ 0, metric_entity_);
 
   std::vector<std::unique_ptr<BlockingTask>> tasks;
   for (int i = 0; i < 4; ++i) {
     tasks.push_back(std::make_unique<BlockingTask>(i, &recorder_));
-    ASSERT_TRUE(queue.Enqueue(tasks.back().get(), RpcPriority::kLow, pool));
+    ASSERT_TRUE(queue.Enqueue(tasks.back().get(), RpcPriority::kLow, RpcTaskClass::kInbound, pool));
     ASSERT_EQ(queue.TEST_queued(), 0);
   }
   ASSERT_EQ(queue.TEST_dispatched(), 4);
@@ -185,22 +192,22 @@ TEST_F(RpcPriorityQueueTest, FastPathDoesNotQueue) {
 // regardless of arrival order.
 TEST_F(RpcPriorityQueueTest, StrictPriorityOrderingUnderSaturation) {
   auto pool = MakePool("strict", 4);
-  RpcPriorityQueue queue("strict", 1, metric_entity_);
+  RpcPriorityQueue queue("strict", 1, /* callback_reserve= */ 0, metric_entity_);
 
   BlockingTask blocker(0, &recorder_);
-  ASSERT_TRUE(queue.Enqueue(&blocker, RpcPriority::kNormal, pool));
+  ASSERT_TRUE(queue.Enqueue(&blocker, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
   ASSERT_TRUE(blocker.WaitStarted());
 
   // Enqueue in "wrong" order: low first, then normal, then high, then more of each.
   InstantTask low1(1, &recorder_), low2(2, &recorder_);
   InstantTask normal1(3, &recorder_), normal2(4, &recorder_);
   InstantTask high1(5, &recorder_), high2(6, &recorder_);
-  ASSERT_TRUE(queue.Enqueue(&low1, RpcPriority::kLow, pool));
-  ASSERT_TRUE(queue.Enqueue(&normal1, RpcPriority::kNormal, pool));
-  ASSERT_TRUE(queue.Enqueue(&high1, RpcPriority::kHigh, pool));
-  ASSERT_TRUE(queue.Enqueue(&low2, RpcPriority::kLow, pool));
-  ASSERT_TRUE(queue.Enqueue(&normal2, RpcPriority::kNormal, pool));
-  ASSERT_TRUE(queue.Enqueue(&high2, RpcPriority::kHigh, pool));
+  ASSERT_TRUE(queue.Enqueue(&low1, RpcPriority::kLow, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(queue.Enqueue(&normal1, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(queue.Enqueue(&high1, RpcPriority::kHigh, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(queue.Enqueue(&low2, RpcPriority::kLow, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(queue.Enqueue(&normal2, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(queue.Enqueue(&high2, RpcPriority::kHigh, RpcTaskClass::kInbound, pool));
 
   ASSERT_EQ(queue.TEST_queued(), 6);
   ASSERT_EQ(queue.TEST_queued(RpcPriority::kHigh), 2);
@@ -235,19 +242,19 @@ TEST_F(RpcPriorityQueueTest, StrictPriorityOrderingUnderSaturation) {
 // new task, even if the new arrival would have taken the fast path on an empty queue.
 TEST_F(RpcPriorityQueueTest, WaitingTaskIsNotOvertakenByNewArrival) {
   auto pool = MakePool("overtake", 4);
-  RpcPriorityQueue queue("overtake", 1, metric_entity_);
+  RpcPriorityQueue queue("overtake", 1, /* callback_reserve= */ 0, metric_entity_);
 
   BlockingTask blocker(0, &recorder_);
-  ASSERT_TRUE(queue.Enqueue(&blocker, RpcPriority::kNormal, pool));
+  ASSERT_TRUE(queue.Enqueue(&blocker, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
   ASSERT_TRUE(blocker.WaitStarted());
 
   BlockingTask waiting_high(1, &recorder_);
-  ASSERT_TRUE(queue.Enqueue(&waiting_high, RpcPriority::kHigh, pool));
+  ASSERT_TRUE(queue.Enqueue(&waiting_high, RpcPriority::kHigh, RpcTaskClass::kInbound, pool));
   ASSERT_EQ(queue.TEST_queued(), 1);
 
   // While the high task is waiting, new arrivals must queue behind it rather than fast-path.
   InstantTask late_normal(2, &recorder_);
-  ASSERT_TRUE(queue.Enqueue(&late_normal, RpcPriority::kNormal, pool));
+  ASSERT_TRUE(queue.Enqueue(&late_normal, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
   ASSERT_EQ(queue.TEST_queued(), 2);
 
   blocker.Release();
@@ -260,7 +267,7 @@ TEST_F(RpcPriorityQueueTest, WaitingTaskIsNotOvertakenByNewArrival) {
 
   // A new arrival while the permit is held and something waits still cannot fast-path.
   InstantTask another_normal(3, &recorder_);
-  ASSERT_TRUE(queue.Enqueue(&another_normal, RpcPriority::kNormal, pool));
+  ASSERT_TRUE(queue.Enqueue(&another_normal, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
   ASSERT_EQ(queue.TEST_queued(), 2);
 
   waiting_high.Release();
@@ -279,14 +286,14 @@ TEST_F(RpcPriorityQueueTest, WaitingTaskIsNotOvertakenByNewArrival) {
 TEST_F(RpcPriorityQueueTest, BudgetIsSharedAcrossTargetPools) {
   auto pool_a = MakePool("pool_a", 2);
   auto pool_b = MakePool("pool_b", 2);
-  RpcPriorityQueue queue("shared", 1, metric_entity_);
+  RpcPriorityQueue queue("shared", 1, /* callback_reserve= */ 0, metric_entity_);
 
   BlockingTask on_a(0, &recorder_);
-  ASSERT_TRUE(queue.Enqueue(&on_a, RpcPriority::kNormal, pool_a));
+  ASSERT_TRUE(queue.Enqueue(&on_a, RpcPriority::kNormal, RpcTaskClass::kInbound, pool_a));
   ASSERT_TRUE(on_a.WaitStarted());
 
   BlockingTask on_b(1, &recorder_);
-  ASSERT_TRUE(queue.Enqueue(&on_b, RpcPriority::kHigh, pool_b));
+  ASSERT_TRUE(queue.Enqueue(&on_b, RpcPriority::kHigh, RpcTaskClass::kInbound, pool_b));
   ASSERT_EQ(queue.TEST_queued(), 1);
   // Pool B has idle workers, but the shared budget is exhausted, so on_b must not have started.
   SleepFor(50ms * kTimeMultiplier);
@@ -309,16 +316,16 @@ TEST_F(RpcPriorityQueueTest, BudgetIsSharedAcrossTargetPools) {
 // YBThreadPool's behavior, and CompleteShutdown waits for in-flight tasks.
 TEST_F(RpcPriorityQueueTest, ShutdownAbortsWaitingAndWaitsForDispatched) {
   auto pool = MakePool("shutdown", 4);
-  RpcPriorityQueue queue("shutdown", 1, metric_entity_);
+  RpcPriorityQueue queue("shutdown", 1, /* callback_reserve= */ 0, metric_entity_);
 
   BlockingTask running(0, &recorder_);
-  ASSERT_TRUE(queue.Enqueue(&running, RpcPriority::kNormal, pool));
+  ASSERT_TRUE(queue.Enqueue(&running, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
   ASSERT_TRUE(running.WaitStarted());
 
   InstantTask waiting1(1, &recorder_), waiting2(2, &recorder_), waiting3(3, &recorder_);
-  ASSERT_TRUE(queue.Enqueue(&waiting1, RpcPriority::kHigh, pool));
-  ASSERT_TRUE(queue.Enqueue(&waiting2, RpcPriority::kNormal, pool));
-  ASSERT_TRUE(queue.Enqueue(&waiting3, RpcPriority::kLow, pool));
+  ASSERT_TRUE(queue.Enqueue(&waiting1, RpcPriority::kHigh, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(queue.Enqueue(&waiting2, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(queue.Enqueue(&waiting3, RpcPriority::kLow, RpcTaskClass::kInbound, pool));
   ASSERT_EQ(queue.TEST_queued(), 3);
 
   queue.StartShutdown();
@@ -334,7 +341,7 @@ TEST_F(RpcPriorityQueueTest, ShutdownAbortsWaitingAndWaitsForDispatched) {
 
   // New submissions are refused and failed immediately.
   InstantTask late(4, &recorder_);
-  ASSERT_FALSE(queue.Enqueue(&late, RpcPriority::kHigh, pool));
+  ASSERT_FALSE(queue.Enqueue(&late, RpcPriority::kHigh, RpcTaskClass::kInbound, pool));
   ASSERT_TRUE(late.WaitDone());
   ASSERT_EQ(recorder_.CountDoneWith(Status::Code::kAborted), 4);
 
@@ -406,7 +413,7 @@ TEST_F(RpcPriorityQueueTest, EnqueueRacesWithShutdown) {
   constexpr int kAttemptsPerProducer = NonTsanVsTsan(2000, 300);
 
   auto pool = MakePool("race", 4);
-  auto queue = std::make_unique<RpcPriorityQueue>("race", 4, metric_entity_);
+  auto queue = std::make_unique<RpcPriorityQueue>("race", 4, /* callback_reserve= */ 0, metric_entity_);
   CountingTask::Counters counters;
   std::atomic<int> submitted{0};
   CountDownLatch producers_started(kProducers);
@@ -419,7 +426,7 @@ TEST_F(RpcPriorityQueueTest, EnqueueRacesWithShutdown) {
         auto priority = static_cast<RpcPriority>((p + i) % kRpcPriorityMapSize);
         submitted.fetch_add(1);
         // Both return values are fine; a false return means Done(aborted) was already invoked.
-        queue->Enqueue(new CountingTask(&counters), priority, pool);
+        queue->Enqueue(new CountingTask(&counters), priority, RpcTaskClass::kInbound, pool);
       }
     });
   }
@@ -457,22 +464,24 @@ TEST_F(RpcPriorityQueueTest, PoolShutdownWithDeepBacklogDoesNotRecurse) {
   constexpr int kBacklog = NonTsanVsTsan(20000, 2000);
 
   auto pool = MakePool("deep", 1);
-  RpcPriorityQueue queue("deep", 1, metric_entity_);
+  RpcPriorityQueue queue("deep", 1, /* callback_reserve= */ 0, metric_entity_);
   CountingTask::Counters counters;
 
   BlockingTask blocker(0, &recorder_);
-  ASSERT_TRUE(queue.Enqueue(&blocker, RpcPriority::kNormal, pool));
+  ASSERT_TRUE(queue.Enqueue(&blocker, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
   ASSERT_TRUE(blocker.WaitStarted());
 
   for (int i = 0; i < kBacklog; ++i) {
     auto priority = static_cast<RpcPriority>(i % kRpcPriorityMapSize);
-    ASSERT_TRUE(queue.Enqueue(new CountingTask(&counters), priority, pool));
+    ASSERT_TRUE(queue.Enqueue(new CountingTask(&counters), priority, RpcTaskClass::kInbound, pool));
   }
   ASSERT_EQ(queue.TEST_queued(), kBacklog);
 
   // Shut the pool down first. YBThreadPool::Shutdown joins its worker, which is blocked in the
-  // blocker, so run it on a helper thread and then release the blocker.
+  // blocker, so run it on a helper thread; wait until the pool is closing (so every dispatch in
+  // the cascade below is refused rather than accepted by the pool) and then release the blocker.
   std::thread pool_shutdown([&pool] { pool->Shutdown(); });
+  ASSERT_OK(WaitFor([&pool] { return pool->IsClosing(); }, kWaitTimeout, "pool closing"));
   blocker.Release();
   ASSERT_TRUE(blocker.WaitDone());
   pool_shutdown.join();
@@ -497,20 +506,20 @@ TEST_F(RpcPriorityQueueTest, PoolShutdownWithDeepBacklogDoesNotRecurse) {
 TEST_F(RpcPriorityQueueTest, HighPriorityForIdlePoolNotBlockedBySaturatedPool) {
   auto pool_a = MakePool("sat_a", 2);
   auto pool_b = MakePool("idle_b", 2);
-  RpcPriorityQueue queue("cross", 2, metric_entity_);
+  RpcPriorityQueue queue("cross", 2, /* callback_reserve= */ 0, metric_entity_);
 
   BlockingTask a1(0, &recorder_), a2(1, &recorder_);
-  ASSERT_TRUE(queue.Enqueue(&a1, RpcPriority::kLow, pool_a));
-  ASSERT_TRUE(queue.Enqueue(&a2, RpcPriority::kLow, pool_a));
+  ASSERT_TRUE(queue.Enqueue(&a1, RpcPriority::kLow, RpcTaskClass::kInbound, pool_a));
+  ASSERT_TRUE(queue.Enqueue(&a2, RpcPriority::kLow, RpcTaskClass::kInbound, pool_a));
   ASSERT_TRUE(a1.WaitStarted());
   ASSERT_TRUE(a2.WaitStarted());
   ASSERT_EQ(queue.TEST_dispatched(), 2);
 
   InstantTask low_a3(2, &recorder_), low_a4(3, &recorder_);
-  ASSERT_TRUE(queue.Enqueue(&low_a3, RpcPriority::kLow, pool_a));
-  ASSERT_TRUE(queue.Enqueue(&low_a4, RpcPriority::kLow, pool_a));
+  ASSERT_TRUE(queue.Enqueue(&low_a3, RpcPriority::kLow, RpcTaskClass::kInbound, pool_a));
+  ASSERT_TRUE(queue.Enqueue(&low_a4, RpcPriority::kLow, RpcTaskClass::kInbound, pool_a));
   InstantTask high_b(4, &recorder_);
-  ASSERT_TRUE(queue.Enqueue(&high_b, RpcPriority::kHigh, pool_b));
+  ASSERT_TRUE(queue.Enqueue(&high_b, RpcPriority::kHigh, RpcTaskClass::kInbound, pool_b));
   ASSERT_EQ(queue.TEST_queued(), 3);
 
   a1.Release();
@@ -537,12 +546,12 @@ TEST_F(RpcPriorityQueueTest, HighPriorityForIdlePoolNotBlockedBySaturatedPool) {
 // release the permit so the queue does not leak budget.
 TEST_F(RpcPriorityQueueTest, PoolRefusalReleasesPermit) {
   auto pool = MakePool("refuse", 2);
-  RpcPriorityQueue queue("refuse", 2, metric_entity_);
+  RpcPriorityQueue queue("refuse", 2, /* callback_reserve= */ 0, metric_entity_);
   pool->Shutdown();
 
   InstantTask task(0, &recorder_);
   // Enqueue returns true (the queue accepted it); the pool fails it synchronously.
-  ASSERT_TRUE(queue.Enqueue(&task, RpcPriority::kNormal, pool));
+  ASSERT_TRUE(queue.Enqueue(&task, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
   ASSERT_TRUE(task.WaitDone());
   ASSERT_EQ(recorder_.CountDoneWith(Status::Code::kAborted), 1);
   ASSERT_EQ(recorder_.RunOrder().size(), 0);
@@ -561,7 +570,7 @@ TEST_F(RpcPriorityQueueTest, ConcurrentStressDoesNotLeakPermits) {
   constexpr int kTotalTasks = kProducers * kTasksPerProducer;
 
   auto pool = MakePool("stress", kBudget);
-  RpcPriorityQueue queue("stress", kBudget, metric_entity_);
+  RpcPriorityQueue queue("stress", kBudget, /* callback_reserve= */ 1, metric_entity_);
 
   std::atomic<int> running{0};
   std::atomic<int> max_running{0};
@@ -601,8 +610,9 @@ TEST_F(RpcPriorityQueueTest, ConcurrentStressDoesNotLeakPermits) {
     producers.emplace_back([&, p] {
       for (int i = 0; i < kTasksPerProducer; ++i) {
         auto priority = static_cast<RpcPriority>((p + i) % kRpcPriorityMapSize);
+        auto task_class = static_cast<RpcTaskClass>(i % kRpcTaskClassMapSize);
         CHECK(queue.Enqueue(
-            new StressTask(&running, &max_running, &completed), priority, pool));
+            new StressTask(&running, &max_running, &completed), priority, task_class, pool));
       }
     });
   }
@@ -615,11 +625,597 @@ TEST_F(RpcPriorityQueueTest, ConcurrentStressDoesNotLeakPermits) {
   ASSERT_OK(WaitFor(
       [&queue] { return queue.TEST_dispatched() == 0; }, kWaitTimeout, "permits released"));
   ASSERT_EQ(queue.TEST_queued(), 0);
+  ASSERT_EQ(queue.TEST_dispatched_inbound(), 0);
   ASSERT_LE(max_running.load(), static_cast<int>(kBudget));
 
   queue.StartShutdown();
   queue.CompleteShutdown();
   pool->Shutdown();
 }
+
+// The inbound cap: inbound tasks may hold at most budget - reserve permits, while callbacks may
+// use the whole budget and may bypass inbound work that is waiting on the cap.
+TEST_F(RpcPriorityQueueTest, CallbacksBypassInboundWaitingOnCap) {
+  // This test holds a permit with a callback that blocks on a latch, which the callback contract
+  // forbids (and which is fatal in debug builds); it is the simplest way to observe permit
+  // accounting for callbacks, so the check is disabled for the duration of the test.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_check_callbacks_do_not_wait) = false;
+  auto flag_reset = ScopeExit([] {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_check_callbacks_do_not_wait) = true;
+  });
+
+  auto pool = MakePool("cap", 4);
+  // Budget 2, reserve 1 -> at most one inbound task at a time.
+  RpcPriorityQueue queue("cap", 2, /* callback_reserve= */ 1, metric_entity_);
+  ASSERT_EQ(queue.max_dispatched_inbound(), 1);
+
+  BlockingTask inbound1(0, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(&inbound1, RpcPriority::kHigh, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(inbound1.WaitStarted());
+  ASSERT_EQ(queue.TEST_dispatched(), 1);
+  ASSERT_EQ(queue.TEST_dispatched_inbound(), 1);
+
+  // A second inbound task waits on the cap even though a permit is free.
+  InstantTask inbound2(1, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(&inbound2, RpcPriority::kHigh, RpcTaskClass::kInbound, pool));
+  ASSERT_EQ(queue.TEST_queued(), 1);
+  ASSERT_EQ(queue.TEST_dispatched(), 1);
+
+  // A lower-priority callback takes the free permit past the waiting high-priority inbound task.
+  BlockingTask callback1(2, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(&callback1, RpcPriority::kLow, RpcTaskClass::kCallback, pool));
+  ASSERT_TRUE(callback1.WaitStarted());
+  ASSERT_EQ(queue.TEST_dispatched(), 2);
+  ASSERT_EQ(queue.TEST_dispatched_inbound(), 1);
+  ASSERT_EQ(recorder_.RunOrder(), (std::vector<int>{0, 2}));
+
+  // Budget is now full: a further callback waits.
+  InstantTask callback2(3, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(&callback2, RpcPriority::kLow, RpcTaskClass::kCallback, pool));
+  ASSERT_EQ(queue.TEST_queued(), 2);
+
+  // Callback finishing: its permit goes to the waiting callback, not the capped inbound task,
+  // despite the inbound task's higher priority.
+  callback1.Release();
+  ASSERT_TRUE(callback1.WaitDone());
+  ASSERT_TRUE(callback2.WaitDone());
+  ASSERT_EQ(recorder_.RunOrder(), (std::vector<int>{0, 2, 3}));
+  ASSERT_OK(WaitFor(
+      [&queue] { return queue.TEST_dispatched() == 1; }, kWaitTimeout, "callback permit released"));
+  ASSERT_EQ(queue.TEST_queued(), 1);
+
+  // Inbound finishing frees the inbound slot: the waiting inbound task runs.
+  inbound1.Release();
+  ASSERT_TRUE(inbound1.WaitDone());
+  ASSERT_TRUE(inbound2.WaitDone());
+  ASSERT_EQ(recorder_.RunOrder(), (std::vector<int>{0, 2, 3, 1}));
+  ASSERT_OK(WaitFor(
+      [&queue] { return queue.TEST_dispatched() == 0; }, kWaitTimeout, "permits released"));
+  ASSERT_EQ(queue.TEST_dispatched_inbound(), 0);
+
+  queue.StartShutdown();
+  queue.CompleteShutdown();
+  pool->Shutdown();
+}
+
+// Inbound handlers that block until a callback they submitted to the same queue has run: with a
+// callback reserve this always makes progress, no matter how many such handlers are submitted.
+TEST_F(RpcPriorityQueueTest, BlockingHandlersDoNotStarveCallbacks) {
+  constexpr int kHandlers = 20;
+  auto pool = MakePool("deadlock", 4);
+  RpcPriorityQueue queue("deadlock", 2, /* callback_reserve= */ 1, metric_entity_);
+
+  // Handler: submits a callback to the queue and waits for it to complete, mirroring a
+  // synchronous YBClient call made from inside an RPC handler.
+  class BlockingHandler : public ThreadPoolTask {
+   public:
+    BlockingHandler(RpcPriorityQueue* queue, ThreadPoolPtr pool, std::atomic<int>* completed)
+        : queue_(queue), pool_(std::move(pool)), completed_(completed) {}
+
+    void Run() override {
+      CountDownLatch callback_done(1);
+      auto* callback = MakeFunctorThreadPoolTask<std::function<void()>, ThreadPoolTask>(
+          std::function<void()>([&callback_done] { callback_done.CountDown(); }));
+      CHECK(queue_->Enqueue(callback, RpcPriority::kNormal, RpcTaskClass::kCallback, pool_));
+      callback_done.Wait();
+    }
+
+    void Done(const Status& status) override {
+      CHECK_OK(status);
+      completed_->fetch_add(1);
+      delete this;
+    }
+
+   private:
+    RpcPriorityQueue* const queue_;
+    const ThreadPoolPtr pool_;
+    std::atomic<int>* const completed_;
+  };
+
+  std::atomic<int> completed{0};
+  for (int i = 0; i < kHandlers; ++i) {
+    ASSERT_TRUE(queue.Enqueue(
+        new BlockingHandler(&queue, pool, &completed), RpcPriority::kNormal,
+        RpcTaskClass::kInbound, pool));
+  }
+  ASSERT_OK(WaitFor(
+      [&completed] { return completed.load() == kHandlers; }, 30s, "all handlers complete"));
+  ASSERT_OK(WaitFor(
+      [&queue] { return queue.TEST_dispatched() == 0; }, kWaitTimeout, "permits released"));
+
+  queue.StartShutdown();
+  queue.CompleteShutdown();
+  pool->Shutdown();
+}
+
+// Within a band, inbound and callback tasks are dispatched in arrival order when both are eligible.
+TEST_F(RpcPriorityQueueTest, ArrivalOrderPreservedAcrossClassesWithinBand) {
+  auto pool = MakePool("order", 4);
+  RpcPriorityQueue queue("order", 1, /* callback_reserve= */ 0, metric_entity_);
+
+  BlockingTask blocker(0, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(&blocker, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(blocker.WaitStarted());
+
+  InstantTask callback1(1, &recorder_), inbound1(2, &recorder_), callback2(3, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(&callback1, RpcPriority::kNormal, RpcTaskClass::kCallback, pool));
+  // Ensure distinct queued_at timestamps.
+  SleepFor(1ms);
+  ASSERT_TRUE(queue.Enqueue(&inbound1, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  SleepFor(1ms);
+  ASSERT_TRUE(queue.Enqueue(&callback2, RpcPriority::kNormal, RpcTaskClass::kCallback, pool));
+  ASSERT_EQ(queue.TEST_queued(), 3);
+
+  blocker.Release();
+  ASSERT_TRUE(blocker.WaitDone());
+  for (auto* task : {&callback1, &inbound1, &callback2}) {
+    ASSERT_TRUE(task->WaitDone());
+  }
+  ASSERT_EQ(recorder_.RunOrder(), (std::vector<int>{0, 1, 2, 3}));
+
+  queue.StartShutdown();
+  queue.CompleteShutdown();
+  pool->Shutdown();
+}
+
+// Two threads call StartShutdown concurrently: neither may return before every waiting task has
+// been failed, and CompleteShutdown must then find the queue quiescent.
+TEST_F(RpcPriorityQueueTest, ConcurrentStartShutdownWaitsForDrain) {
+  constexpr int kWaiting = 20;
+  auto pool = MakePool("concurrent_shutdown", 4);
+  auto queue = std::make_unique<RpcPriorityQueue>(
+      "concurrent_shutdown", 1, /* callback_reserve= */ 0, metric_entity_);
+
+  // Waiting task whose Done() is slow, to widen the drain window.
+  class SlowDoneTask : public ThreadPoolTask {
+   public:
+    explicit SlowDoneTask(std::atomic<int>* done) : done_(done) {}
+    void Run() override { LOG(FATAL) << "waiting task must not run"; }
+    void Done(const Status& status) override {
+      CHECK(status.IsAborted()) << status;
+      SleepFor(10ms);
+      done_->fetch_add(1);
+      delete this;
+    }
+   private:
+    std::atomic<int>* const done_;
+  };
+
+  BlockingTask blocker(0, &recorder_);
+  ASSERT_TRUE(queue->Enqueue(&blocker, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(blocker.WaitStarted());
+  std::atomic<int> done{0};
+  for (int i = 0; i < kWaiting; ++i) {
+    ASSERT_TRUE(queue->Enqueue(
+        new SlowDoneTask(&done), RpcPriority::kLow, RpcTaskClass::kInbound, pool));
+  }
+  ASSERT_EQ(queue->TEST_queued(), kWaiting);
+
+  std::atomic<int> done_observed_at_return[2] = {-1, -1};
+  std::thread shutdown_threads[2];
+  for (int t = 0; t < 2; ++t) {
+    shutdown_threads[t] = std::thread([&, t] {
+      queue->StartShutdown();
+      done_observed_at_return[t] = done.load();
+    });
+  }
+  for (auto& thread : shutdown_threads) {
+    thread.join();
+  }
+  // Both callers returned only after the whole drain, including the loser of the closed-bit race.
+  ASSERT_EQ(done_observed_at_return[0].load(), kWaiting);
+  ASSERT_EQ(done_observed_at_return[1].load(), kWaiting);
+  ASSERT_EQ(queue->TEST_queued(), 0);
+
+  blocker.Release();
+  ASSERT_TRUE(blocker.WaitDone());
+  queue->CompleteShutdown();
+  queue.reset();
+  pool->Shutdown();
+}
+
+// The queued counter is bounded: at the bound, admission fails with ServiceUnavailable instead of
+// wrapping the counter.
+TEST_F(RpcPriorityQueueTest, QueuedCounterBoundRejectsAdmission) {
+  auto pool = MakePool("bound", 2);
+  RpcPriorityQueue queue("bound", 1, /* callback_reserve= */ 0, metric_entity_);
+
+  BlockingTask blocker(0, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(&blocker, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(blocker.WaitStarted());
+
+  // Pretend the bands hold max_queued() tasks (without allocating them).
+  queue.TEST_SetQueuedCount(narrow_cast<uint32_t>(RpcPriorityQueue::max_queued()));
+  InstantTask rejected(1, &recorder_);
+  ASSERT_FALSE(queue.Enqueue(&rejected, RpcPriority::kHigh, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(rejected.WaitDone());
+  ASSERT_EQ(recorder_.CountDoneWith(Status::Code::kServiceUnavailable), 1);
+  ASSERT_EQ(recorder_.RunOrder(), std::vector<int>{0});
+  ASSERT_EQ(queue.TEST_queued(), RpcPriorityQueue::max_queued());
+  // Callbacks are bounded the same way (the budget is full so it cannot fast-path either).
+  InstantTask rejected_callback(2, &recorder_);
+  ASSERT_FALSE(queue.Enqueue(
+      &rejected_callback, RpcPriority::kHigh, RpcTaskClass::kCallback, pool));
+  ASSERT_TRUE(rejected_callback.WaitDone());
+  ASSERT_EQ(recorder_.CountDoneWith(Status::Code::kServiceUnavailable), 2);
+
+  // Restore the real (empty) band size; admission works again.
+  queue.TEST_SetQueuedCount(0);
+  InstantTask accepted(3, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(&accepted, RpcPriority::kHigh, RpcTaskClass::kInbound, pool));
+  ASSERT_EQ(queue.TEST_queued(), 1);
+  blocker.Release();
+  ASSERT_TRUE(blocker.WaitDone());
+  ASSERT_TRUE(accepted.WaitDone());
+  ASSERT_EQ(recorder_.RunOrder(), (std::vector<int>{0, 3}));
+
+  queue.StartShutdown();
+  queue.CompleteShutdown();
+  pool->Shutdown();
+}
+
+// Task whose Done() shuts the queue down, modelling a callback that reacts to a failure by
+// shutting down its owner. Enqueue must have released its active-admission registration before
+// invoking Done(), or CompleteShutdown would wait for it forever.
+class ShutdownFromDoneTask : public ThreadPoolTask {
+ public:
+  ShutdownFromDoneTask(RpcPriorityQueue* queue, bool complete, Recorder* recorder)
+      : queue_(queue), complete_(complete), recorder_(recorder) {}
+
+  void Run() override { LOG(FATAL) << "must not run"; }
+
+  void Done(const Status& status) override {
+    recorder_->RecordDone(status);
+    queue_->StartShutdown();
+    if (complete_) {
+      queue_->CompleteShutdown();
+    }
+    done_.CountDown();
+  }
+
+  bool WaitDone() { return done_.WaitFor(kWaitTimeout); }
+
+ private:
+  RpcPriorityQueue* const queue_;
+  const bool complete_;
+  Recorder* const recorder_;
+  CountDownLatch done_{1};
+};
+
+// A task rejected because the queue is closed may shut the queue down from its Done().
+TEST_F(RpcPriorityQueueTest, RejectedTaskMayShutDownQueueFromDone) {
+  auto pool = MakePool("reject_shutdown", 2);
+  auto queue = std::make_unique<RpcPriorityQueue>(
+      "reject_shutdown", 1, /* callback_reserve= */ 0, metric_entity_);
+  queue->StartShutdown();
+
+  ShutdownFromDoneTask task(queue.get(), /* complete= */ true, &recorder_);
+  ASSERT_FALSE(queue->Enqueue(&task, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(task.WaitDone());
+  ASSERT_EQ(recorder_.CountDoneWith(Status::Code::kAborted), 1);
+  // Done() already completed the shutdown; destroying is safe.
+  queue.reset();
+  pool->Shutdown();
+}
+
+// A task rejected at the queued-counter bound may shut the queue down from its Done(), including
+// waiting in CompleteShutdown for tasks that other threads are still running.
+TEST_F(RpcPriorityQueueTest, TaskRejectedAtBoundMayShutDownQueueFromDone) {
+  auto pool = MakePool("bound_shutdown", 2);
+  auto queue = std::make_unique<RpcPriorityQueue>(
+      "bound_shutdown", 1, /* callback_reserve= */ 0, metric_entity_);
+
+  BlockingTask blocker(0, &recorder_);
+  ASSERT_TRUE(queue->Enqueue(&blocker, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(blocker.WaitStarted());
+  queue->TEST_SetQueuedCount(narrow_cast<uint32_t>(RpcPriorityQueue::max_queued()));
+
+  // Done() restores the real (empty) band count before shutting down, since the bound was faked.
+  class RejectedThenShutdown : public ThreadPoolTask {
+   public:
+    RejectedThenShutdown(RpcPriorityQueue* queue, Recorder* recorder)
+        : queue_(queue), recorder_(recorder) {}
+    void Run() override { LOG(FATAL) << "must not run"; }
+    void Done(const Status& status) override {
+      recorder_->RecordDone(status);
+      queue_->TEST_SetQueuedCount(0);
+      queue_->StartShutdown();
+      queue_->CompleteShutdown();  // Blocks until the blocker (another thread) finishes.
+      done_.CountDown();
+    }
+    bool WaitDone() { return done_.WaitFor(kWaitTimeout); }
+   private:
+    RpcPriorityQueue* const queue_;
+    Recorder* const recorder_;
+    CountDownLatch done_{1};
+  };
+
+  RejectedThenShutdown task(queue.get(), &recorder_);
+  std::atomic<bool> enqueue_returned{false};
+  std::thread enqueuer([&] {
+    ASSERT_FALSE(queue->Enqueue(&task, RpcPriority::kHigh, RpcTaskClass::kInbound, pool));
+    enqueue_returned = true;
+  });
+  // The rejected task's Done() is now inside CompleteShutdown, waiting only for the blocker (not
+  // for the Enqueue call it is nested in).
+  SleepFor(100ms * kTimeMultiplier);
+  ASSERT_FALSE(enqueue_returned.load());
+  ASSERT_EQ(recorder_.CountDoneWith(Status::Code::kServiceUnavailable), 1);
+  blocker.Release();
+  ASSERT_TRUE(blocker.WaitDone());
+  enqueuer.join();
+  ASSERT_TRUE(task.WaitDone());
+  queue.reset();
+  pool->Shutdown();
+}
+
+// A task refused synchronously by a closing target pool (Enqueue returns true, Done(Aborted) has
+// run) may call StartShutdown from its Done(); the shutdown is then completed from outside.
+TEST_F(RpcPriorityQueueTest, PoolRefusedTaskMayStartShutdownFromDone) {
+  auto pool = MakePool("refused_start", 2);
+  auto queue = std::make_unique<RpcPriorityQueue>(
+      "refused_start", 2, /* callback_reserve= */ 0, metric_entity_);
+  pool->Shutdown();
+
+  ShutdownFromDoneTask task(queue.get(), /* complete= */ false, &recorder_);
+  ASSERT_TRUE(queue->Enqueue(&task, RpcPriority::kNormal, RpcTaskClass::kCallback, pool));
+  ASSERT_TRUE(task.WaitDone());
+  ASSERT_EQ(recorder_.CountDoneWith(Status::Code::kAborted), 1);
+  // Permit was returned after Done(); the queue is closed and quiescent.
+  ASSERT_EQ(queue->TEST_dispatched(), 0);
+  InstantTask late(1, &recorder_);
+  ASSERT_FALSE(queue->Enqueue(&late, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  queue->CompleteShutdown();
+  queue.reset();
+}
+
+namespace {
+
+// A task refused by a closing pool whose Done() also calls CompleteShutdown: the task still holds
+// its permit at that point, so completion cannot be satisfied from there.
+void CompleteShutdownFromPoolRefusedDone(
+    const scoped_refptr<MetricEntity>& metric_entity, Recorder* recorder) {
+  auto pool = MakePool("refused_complete", 2);
+  RpcPriorityQueue queue("refused_complete", 2, /* callback_reserve= */ 0, metric_entity);
+  pool->Shutdown();
+  ShutdownFromDoneTask task(&queue, /* complete= */ true, recorder);
+  CHECK(queue.Enqueue(&task, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  CHECK(task.WaitDone());
+  // Only reached in release builds, where the misuse is logged rather than fatal: the queue must
+  // still be shut down cleanly from outside and nothing may have hung.
+  queue.CompleteShutdown();
+}
+
+} // namespace
+
+TEST_F(RpcPriorityQueueTest, CompleteShutdownFromDispatchedTaskIsRejected) {
+#ifndef NDEBUG
+  ASSERT_DEATH(CompleteShutdownFromPoolRefusedDone(metric_entity_, &recorder_),
+               "CompleteShutdown called synchronously from one of the queue's own tasks");
+#else
+  ASSERT_NO_FATALS(CompleteShutdownFromPoolRefusedDone(metric_entity_, &recorder_));
+  ASSERT_EQ(recorder_.CountDoneWith(Status::Code::kAborted), 1);
+#endif
+}
+
+// A task failed by StartShutdown's drain may re-enter StartShutdown from its Done().
+TEST_F(RpcPriorityQueueTest, DrainedTaskMayReenterStartShutdown) {
+  auto pool = MakePool("drain_reenter", 2);
+  RpcPriorityQueue queue("drain_reenter", 1, /* callback_reserve= */ 0, metric_entity_);
+
+  BlockingTask blocker(0, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(&blocker, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(blocker.WaitStarted());
+  ShutdownFromDoneTask waiting(&queue, /* complete= */ false, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(&waiting, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  ASSERT_EQ(queue.TEST_queued(), 1);
+
+  // The drain fails `waiting`, whose Done() re-enters StartShutdown; that must not hang.
+  queue.StartShutdown();
+  ASSERT_TRUE(waiting.WaitDone());
+  ASSERT_EQ(recorder_.CountDoneWith(Status::Code::kAborted), 1);
+  ASSERT_EQ(queue.TEST_queued(), 0);
+
+  blocker.Release();
+  ASSERT_TRUE(blocker.WaitDone());
+  queue.CompleteShutdown();
+  pool->Shutdown();
+}
+
+#ifndef NDEBUG
+// A completion that observes the closed bit under the lock returns its permit instead of
+// dispatching a waiting task past StartShutdown's drain. Sync points force the interleaving that
+// used to dispatch: the completion takes the lock after the closed bit is set but before
+// StartShutdown drains the bands.
+TEST_F(RpcPriorityQueueTest, CompletionAfterCloseReleasesPermit) {
+  auto pool = MakePool("close_race", 2);
+  RpcPriorityQueue queue("close_race", 1, /* callback_reserve= */ 0, metric_entity_);
+
+  BlockingTask blocker(0, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(&blocker, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(blocker.WaitStarted());
+  InstantTask waiting(1, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(&waiting, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  ASSERT_EQ(queue.TEST_queued(), 1);
+
+  auto* sync = SyncPoint::GetInstance();
+  sync->LoadDependency({
+      // The completion may take the lock only once the closed bit is set...
+      {"RpcPriorityQueue::StartShutdown::Closed",
+       "RpcPriorityQueue::ProcessOneCompletion::BeforeLock"},
+      // ...and the drain may run only once the completion has made its decision.
+      {"RpcPriorityQueue::ProcessOneCompletion::AfterLock",
+       "RpcPriorityQueue::StartShutdown::BeforeDrain"}});
+  sync->ClearTrace();
+  sync->EnableProcessing();
+  auto sync_reset = ScopeExit([sync] {
+    sync->DisableProcessing();
+    sync->ClearTrace();
+  });
+
+  // The blocker's completion finds queued != 0 and pauses before taking the lock.
+  blocker.Release();
+  ASSERT_TRUE(blocker.WaitDone());
+  std::thread shutdown([&queue] { queue.StartShutdown(); });
+  shutdown.join();
+
+  // The completion saw closed and released its permit; the drain then failed the waiting task.
+  ASSERT_TRUE(waiting.WaitDone());
+  ASSERT_EQ(recorder_.CountDoneWith(Status::Code::kAborted), 1);
+  ASSERT_EQ(recorder_.RunOrder(), std::vector<int>{0});
+  queue.CompleteShutdown();
+  ASSERT_EQ(queue.TEST_dispatched(), 0);
+  ASSERT_EQ(queue.TEST_queued(), 0);
+  pool->Shutdown();
+}
+
+// CompleteShutdown does not return while a thread is still inside Enqueue, even if that thread
+// registered before closure and has not yet observed the closed bit.
+TEST_F(RpcPriorityQueueTest, CompleteShutdownWaitsForActiveEnqueue) {
+  auto pool = MakePool("active_enqueue", 2);
+  auto queue = std::make_unique<RpcPriorityQueue>(
+      "active_enqueue", 1, /* callback_reserve= */ 0, metric_entity_);
+
+  auto* sync = SyncPoint::GetInstance();
+  sync->LoadDependency({{
+      "RpcPriorityQueueTest::CompleteShutdownWaitsForActiveEnqueue::Proceed",
+      "RpcPriorityQueue::Enqueue::Registered"}});
+  sync->ClearTrace();
+  sync->EnableProcessing();
+  auto sync_reset = ScopeExit([sync] {
+    sync->DisableProcessing();
+    sync->ClearTrace();
+  });
+
+  InstantTask task(0, &recorder_);
+  std::atomic<bool> enqueue_returned{false};
+  std::thread enqueuer([&] {
+    // Pauses inside Enqueue right after registering as active.
+    ASSERT_FALSE(queue->Enqueue(&task, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+    enqueue_returned = true;
+  });
+
+  queue->StartShutdown();
+  std::atomic<bool> complete_returned{false};
+  std::thread completer([&] {
+    queue->CompleteShutdown();
+    complete_returned = true;
+  });
+  SleepFor(100ms * kTimeMultiplier);
+  ASSERT_FALSE(complete_returned.load()) << "CompleteShutdown returned with an Enqueue in flight";
+  ASSERT_FALSE(enqueue_returned.load());
+
+  TEST_SYNC_POINT("RpcPriorityQueueTest::CompleteShutdownWaitsForActiveEnqueue::Proceed");
+  enqueuer.join();
+  completer.join();
+  ASSERT_TRUE(task.WaitDone());
+  ASSERT_EQ(recorder_.CountDoneWith(Status::Code::kAborted), 1);
+  ASSERT_EQ(recorder_.RunOrder().size(), 0);
+  // Safe to destroy now.
+  queue.reset();
+  pool->Shutdown();
+}
+
+namespace {
+
+// Submits a callback that waits on a latch, which violates the callback contract.
+void RunBlockingCallback(const scoped_refptr<MetricEntity>& metric_entity) {
+  auto pool = MakePool("fatal", 2);
+  RpcPriorityQueue queue("fatal", 2, /* callback_reserve= */ 1, metric_entity);
+  CountDownLatch never(1);
+  auto* callback = MakeFunctorThreadPoolTask<std::function<void()>, ThreadPoolTask>(
+      std::function<void()>([&never] { never.WaitFor(1s); }));
+  queue.Enqueue(callback, RpcPriority::kNormal, RpcTaskClass::kCallback, pool);
+  SleepFor(2s);
+}
+
+} // namespace
+
+// The no-blocking contract for callbacks is enforced: a callback that waits crashes the process.
+TEST_F(RpcPriorityQueueTest, BlockingCallbackIsFatal) {
+  ASSERT_TRUE(FLAGS_rpc_priority_queue_check_callbacks_do_not_wait);
+  ASSERT_DEATH(RunBlockingCallback(metric_entity_), "Waiting is not allowed");
+}
+
+// Boundary of what the reserve can do when callbacks violate the contract: a chain of nested
+// waits (handler -> callback -> callback ...) completes only as long as its depth does not exceed
+// the reserve. Documents the limit rather than protecting against it; the check above is what
+// protects. The check is disabled here so the chain can be built.
+TEST_F(RpcPriorityQueueTest, NestedBlockingCallbackChainWithinReserveCompletes) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_check_callbacks_do_not_wait) = false;
+  auto flag_reset = ScopeExit([] {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_check_callbacks_do_not_wait) = true;
+  });
+
+  constexpr size_t kReserve = 2;
+  auto pool = MakePool("nested", 4);
+  RpcPriorityQueue queue("nested", 1 + kReserve, kReserve, metric_entity_);
+  ASSERT_EQ(queue.max_dispatched_inbound(), 1);
+
+  // Task that submits a chain of `depth` further callbacks to the queue, each waiting on the next.
+  class ChainTask : public ThreadPoolTask {
+   public:
+    ChainTask(RpcPriorityQueue* queue, ThreadPoolPtr pool, size_t depth, CountDownLatch* done)
+        : queue_(queue), pool_(std::move(pool)), depth_(depth), done_(done) {}
+
+    void Run() override {
+      if (depth_ == 0) {
+        return;
+      }
+      CountDownLatch next_done(1);
+      CHECK(queue_->Enqueue(
+          new ChainTask(queue_, pool_, depth_ - 1, &next_done), RpcPriority::kNormal,
+          RpcTaskClass::kCallback, pool_));
+      next_done.Wait();
+    }
+
+    void Done(const Status& status) override {
+      CHECK_OK(status);
+      done_->CountDown();
+      delete this;
+    }
+
+   private:
+    RpcPriorityQueue* const queue_;
+    const ThreadPoolPtr pool_;
+    const size_t depth_;
+    CountDownLatch* const done_;
+  };
+
+  // Handler waiting on a chain of kReserve nested callbacks: the deepest one takes the last
+  // reserved permit, so the chain completes.
+  CountDownLatch done(1);
+  ASSERT_TRUE(queue.Enqueue(
+      new ChainTask(&queue, pool, kReserve, &done), RpcPriority::kNormal, RpcTaskClass::kInbound,
+      pool));
+  ASSERT_TRUE(done.WaitFor(kWaitTimeout));
+  ASSERT_OK(WaitFor(
+      [&queue] { return queue.TEST_dispatched() == 0; }, kWaitTimeout, "permits released"));
+
+  queue.StartShutdown();
+  queue.CompleteShutdown();
+  pool->Shutdown();
+}
+#endif  // NDEBUG
 
 } // namespace yb::rpc

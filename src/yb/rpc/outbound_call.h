@@ -285,7 +285,7 @@ class OutboundCall : public RpcCall {
                RpcController* controller,
                std::shared_ptr<RpcMetrics> rpc_metrics,
                ResponseCallback callback,
-               ThreadPool* callback_thread_pool,
+               ThreadPoolTaskRecipient* callback_recipient,
                MetadataSerializerFactory* metadata_serializer_factory);
 
   virtual ~OutboundCall();
@@ -498,7 +498,7 @@ class OutboundCall : public RpcCall {
   MUST_USE_RESULT bool UpdateCallbackTime(
       std::atomic<CoarseTimePoint>& time, CoarseTimePoint now, const char* callback_action);
 
-  // Invokes the user-provided callback. Uses callback_thread_pool_ if set. This is only invoked
+  // Invokes the user-provided callback. Uses callback_recipient_ if set. This is only invoked
   // after a successful transition of the call state to one of the final states, so it should be
   // called exactly once. Can be passed in the clock value as an optimization if the clock has
   // already been read by the caller.
@@ -520,7 +520,9 @@ class OutboundCall : public RpcCall {
   const RemoteMethod& remote_method_;
 
   ResponseCallback callback_;
-  ThreadPool* const callback_thread_pool_;
+  // Where the callback runs when it is not run on the reactor: a worker pool, or the RPC
+  // priority queue adapter for it. Null means run synchronously on the completing thread.
+  ThreadPoolTaskRecipient* const callback_recipient_;
   const std::shared_ptr<OutboundCallMetrics> outbound_call_metrics_;
   const std::shared_ptr<RpcMetrics> rpc_metrics_;
   const std::shared_ptr<const OutboundMethodMetrics> method_metrics_;

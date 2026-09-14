@@ -54,11 +54,13 @@ DECLARE_int32(log_cache_size_limit_mb);
 DECLARE_int32(global_log_cache_size_limit_mb);
 DECLARE_bool(rpc_priority_queue_enabled);
 DECLARE_int32(rpc_priority_queue_max_dispatched);
+DECLARE_int32(rpc_priority_queue_callback_reserve);
 DECLARE_int32(rpc_workers_limit);
 
 METRIC_DECLARE_counter(rpc_priority_queue_dispatched_high);
 METRIC_DECLARE_counter(rpc_priority_queue_dispatched_normal);
 METRIC_DECLARE_counter(rpc_priority_queue_dispatched_low);
+METRIC_DECLARE_counter(rpc_priority_queue_dispatched_callbacks);
 METRIC_DECLARE_event_stats(rpc_priority_queue_wait_time_high);
 METRIC_DECLARE_event_stats(rpc_priority_queue_wait_time_normal);
 METRIC_DECLARE_event_stats(rpc_priority_queue_wait_time_low);
@@ -106,12 +108,18 @@ class KVTablePriorityQueueTest : public KVTableTest {
   // RPC handlers are mostly asynchronous and release their worker quickly, so with a budget equal
   // to the worker count a handful of client threads never saturate it. A budget of 2 per server
   // guarantees contention under the load test while leaving the pools their full worker count.
+  // With one permit reserved for callbacks, at most one inbound handler runs at a time on each
+  // server, which is the harshest possible setting for the deadlock-freedom argument (handlers
+  // blocking on callbacks) while still making progress.
   static constexpr int kRpcWorkersLimit = 8;
   static constexpr int kDispatchBudget = 2;
+  static constexpr int kCallbackReserve = 1;
+  static constexpr int kInboundCap = kDispatchBudget - kCallbackReserve;
 
   void SetUp() override {
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_enabled) = true;
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_max_dispatched) = kDispatchBudget;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_callback_reserve) = kCallbackReserve;
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_workers_limit) = kRpcWorkersLimit;
     KVTableTest::SetUp();
   }
@@ -120,6 +128,7 @@ class KVTablePriorityQueueTest : public KVTableTest {
     int64_t dispatched_high = 0;
     int64_t dispatched_normal = 0;
     int64_t dispatched_low = 0;
+    int64_t dispatched_callbacks = 0;
     uint64_t waits = 0;
 
     void Add(const scoped_refptr<MetricEntity>& entity) {
@@ -127,13 +136,16 @@ class KVTablePriorityQueueTest : public KVTableTest {
       dispatched_normal +=
           METRIC_rpc_priority_queue_dispatched_normal.Instantiate(entity)->value();
       dispatched_low += METRIC_rpc_priority_queue_dispatched_low.Instantiate(entity)->value();
+      dispatched_callbacks +=
+          METRIC_rpc_priority_queue_dispatched_callbacks.Instantiate(entity)->value();
       waits += METRIC_rpc_priority_queue_wait_time_high.Instantiate(entity)->TotalCount();
       waits += METRIC_rpc_priority_queue_wait_time_normal.Instantiate(entity)->TotalCount();
       waits += METRIC_rpc_priority_queue_wait_time_low.Instantiate(entity)->TotalCount();
     }
 
     std::string ToString() const {
-      return YB_STRUCT_TO_STRING(dispatched_high, dispatched_normal, dispatched_low, waits);
+      return YB_STRUCT_TO_STRING(
+          dispatched_high, dispatched_normal, dispatched_low, dispatched_callbacks, waits);
     }
   };
 
@@ -154,6 +166,7 @@ class KVTablePriorityQueueTest : public KVTableTest {
       auto* queue = master->messenger()->rpc_priority_queue();
       ASSERT_NE(queue, nullptr) << "master " << i << " messenger has no priority queue";
       ASSERT_EQ(queue->max_dispatched(), kDispatchBudget);
+      ASSERT_EQ(queue->max_dispatched_inbound(), kInboundCap);
       masters.Add(master->metric_entity());
     }
     QueueUsage tservers;
@@ -162,17 +175,22 @@ class KVTablePriorityQueueTest : public KVTableTest {
       auto* queue = tserver->messenger()->rpc_priority_queue();
       ASSERT_NE(queue, nullptr) << "tserver " << i << " messenger has no priority queue";
       ASSERT_EQ(queue->max_dispatched(), kDispatchBudget);
+      ASSERT_EQ(queue->max_dispatched_inbound(), kInboundCap);
       tservers.Add(tserver->metric_entity());
     }
     LOG(INFO) << "Priority queue usage: masters " << masters.ToString()
               << ", tservers " << tservers.ToString();
 
-    // Masters: tserver heartbeats (kHigh) and client/DDL traffic (kNormal).
+    // Masters: tserver heartbeats (kHigh) and client/DDL traffic (kNormal), plus the callbacks
+    // of the master's own outbound RPCs (e.g. to tservers during table creation).
     ASSERT_GT(masters.dispatched_high, 0);
     ASSERT_GT(masters.dispatched_normal, 0);
-    // Tservers: consensus (kHigh), reads/writes (kNormal).
+    ASSERT_GT(masters.dispatched_callbacks, 0);
+    // Tservers: consensus (kHigh), reads/writes (kNormal), and the callbacks of consensus and
+    // client RPCs they issue themselves.
     ASSERT_GT(tservers.dispatched_high, 0);
     ASSERT_GT(tservers.dispatched_normal, 0);
+    ASSERT_GT(tservers.dispatched_callbacks, 0);
     if (expected.tserver_low) {
       ASSERT_GT(tservers.dispatched_low, 0);
     }

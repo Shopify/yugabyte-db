@@ -259,9 +259,7 @@ class Messenger : public ProxyContext {
   const Protocol& DefaultProtocol() override { return listen_protocol_; }
   const Protocol& UncompressedProtocol() override { return uncompressed_protocol_; }
 
-  rpc::ThreadPool& CallbackThreadPool(ServicePriority priority) override {
-    return ThreadPool(priority);
-  }
+  ThreadPoolTaskRecipient& CallbackRecipient(ServicePriority priority) override;
 
   Status QueueEventOnAllReactors(
       ServerEventListPtr server_event, const SourceLocation& source_location);
@@ -470,6 +468,11 @@ class Messenger : public ProxyContext {
   // Created in Init when rpc_priority_queue_enabled. Shut down together with the thread pools it
   // dispatches to, see ShutdownThreadPools.
   std::unique_ptr<RpcPriorityQueue> rpc_priority_queue_;
+  // Route async callbacks of each ServicePriority through rpc_priority_queue_ (kNormal ->
+  // default pool at RpcPriority::kNormal, kHigh -> high-priority pool at RpcPriority::kHigh).
+  // Null when the queue is disabled; callbacks then go straight to the pools.
+  std::unique_ptr<PriorityQueueCallbackRecipient> normal_callback_recipient_;
+  std::unique_ptr<PriorityQueueCallbackRecipient> high_callback_recipient_;
 
   std::unique_ptr<DnsResolver> resolver_;
 

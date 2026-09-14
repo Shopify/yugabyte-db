@@ -160,6 +160,10 @@ extern const MessengerOptions kDefaultServerMessengerOptions;
 struct TestServerOptions {
   MessengerOptions messenger_options = kDefaultServerMessengerOptions;
   size_t n_worker_threads = 3;
+  // Permits of the test server's RpcPriorityQueue (budget n_worker_threads) reserved for
+  // callbacks. Only used when FLAGS_rpc_priority_queue_enabled. 0 keeps the full budget available
+  // to inbound handlers, which most tests expect.
+  size_t priority_queue_callback_reserve = 0;
   Endpoint endpoint;
 };
 

@@ -32,6 +32,7 @@
 
 #include "yb/rpc/rpc-test-base.h"
 
+#include <algorithm>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -1613,7 +1614,19 @@ TEST_F(TestRpc, PriorityQueueDispatchesHighPriorityServiceFirst) {
       }, 30s, "all calls complete"));
 
   std::lock_guard lock(mutex);
-  ASSERT_EQ(completion_order, (std::vector<std::string>{"blocker", "high", "low", "low"}));
+  // The high call was dispatched the instant the blocker released its permit and completes within
+  // microseconds of it, so the relative order in which the client observes those two completions
+  // (callbacks run on client worker threads) is not meaningful. What matters is that high finished
+  // before either low call, each of which runs for 100ms once dispatched.
+  ASSERT_EQ(completion_order.size(), 4);
+  auto position = [&completion_order](const std::string& name) {
+    return std::find(completion_order.begin(), completion_order.end(), name) -
+           completion_order.begin();
+  };
+  ASSERT_LT(position("high"), 2) << AsString(completion_order);
+  ASSERT_LT(position("blocker"), 2) << AsString(completion_order);
+  ASSERT_EQ(completion_order[2], "low") << AsString(completion_order);
+  ASSERT_EQ(completion_order[3], "low") << AsString(completion_order);
   ASSERT_OK(blocker_controller.status());
   ASSERT_OK(high_controller.status());
   ASSERT_EQ(high_resp.value(), 42);

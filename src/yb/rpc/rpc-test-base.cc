@@ -544,7 +544,8 @@ TestServer::TestServer(std::unique_ptr<Messenger>&& messenger,
       })) {
   if (FLAGS_rpc_priority_queue_enabled) {
     priority_queue_ = std::make_unique<RpcPriorityQueue>(
-        "rpc-test", options.n_worker_threads, messenger_->metric_entity());
+        "rpc-test", options.n_worker_threads, options.priority_queue_callback_reserve,
+        messenger_->metric_entity());
   }
 
   EXPECT_OK(messenger_->ListenAddress(
