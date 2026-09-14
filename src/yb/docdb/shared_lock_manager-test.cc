@@ -11,7 +11,9 @@
 // under the License.
 //
 
+#include <algorithm>
 #include <atomic>
+#include <limits>
 #include <mutex>
 #include <stack>
 #include <thread>
@@ -26,6 +28,7 @@
 #include "yb/util/ref_cnt_buffer.h"
 #include "yb/util/result.h"
 #include "yb/util/test_macros.h"
+#include "yb/util/test_thread_holder.h"
 #include "yb/util/test_util.h"
 
 using namespace std::literals;
@@ -236,6 +239,111 @@ TEST_F(SharedLockManagerTest, FreeListBounded) {
   ASSERT_EQ(lm_.TEST_LocksSize(), 0);
   ASSERT_EQ(lm_.TEST_FreeEntriesCount(), 0);
 }
+
+// ===== THROWAWAY BENCHMARK FOR #21013 -- DO NOT COMMIT =====
+// Compares lock/unlock throughput with the entry cache disabled (cap 0), at the proposed default
+// (256), and effectively unbounded (today's behavior). Keys are pre-built outside the timed loop
+// and the LockBatchEntries vector is shuttled via Unlock()/TryLock() so nothing but the lock
+// manager itself allocates in the hot path.
+namespace {
+
+struct BenchScenario {
+  const char* name;
+  size_t num_threads;
+  size_t keys_per_batch;
+  // Number of distinct pre-built batches each thread cycles through. 1 => the same keys every
+  // iteration (hot row). >1 => by the time a batch is reused its keys are no longer in locks_, so
+  // every Reserve misses the map exactly like a genuinely fresh key would.
+  size_t ring_size;
+};
+
+}  // namespace
+
+TEST_F(SharedLockManagerTest, TEMP_PoolBenchmark) {
+  const std::vector<BenchScenario> kScenarios = {
+    {"A  1 thread, same 4 keys",         1,   4,  1},
+    {"B 16 threads, 4 fresh keys",      16,   4, 64},
+    {"C  8 threads, 256 fresh keys",     8, 256, 64},
+  };
+  const std::vector<uint32_t> kCaps = {0, 256, std::numeric_limits<uint32_t>::max()};
+  const auto kDuration = 3s;
+  constexpr int kRepeats = 5;
+
+  const auto intents = IntentTypeSet({IntentType::kStrongWrite, IntentType::kStrongRead});
+
+  auto run_once = [&](const BenchScenario& scenario, uint32_t cap) -> double {
+    // Fresh manager per run so cached entries never carry across variants.
+    SharedLockManager lm;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_shared_lock_manager_max_free_entries) = cap;
+
+    std::vector<size_t> per_thread_keys(scenario.num_threads, 0);
+    TestThreadHolder holder(/* verbose= */ false);
+    for (size_t t = 0; t != scenario.num_threads; ++t) {
+      holder.AddThreadFunctor([&, t] {
+        std::vector<UnlockedBatch> ring;
+        ring.reserve(scenario.ring_size);
+        for (size_t r = 0; r != scenario.ring_size; ++r) {
+          LockBatchEntries<SharedLockManager> entries;
+          entries.reserve(scenario.keys_per_batch);
+          for (size_t k = 0; k != scenario.keys_per_batch; ++k) {
+            entries.push_back({RefCntPrefix(Format("t$0_r$1_k$2", t, r, k)), intents});
+          }
+          ring.emplace_back(std::move(entries), &lm);
+        }
+        size_t count = 0;
+        size_t idx = 0;
+        while (!holder.stop_flag().load(std::memory_order_acquire)) {
+          auto& unlocked = ring[idx];
+          LockBatch lb = unlocked.TryLock(CoarseTimePoint::max());
+          CHECK_OK(lb.status());
+          unlocked = std::move(*lb.Unlock());
+          count += scenario.keys_per_batch;
+          if (++idx == scenario.ring_size) {
+            idx = 0;
+          }
+        }
+        per_thread_keys[t] = count;
+      });
+    }
+    const auto start = MonoTime::Now();
+    holder.WaitAndStop(kDuration);
+    const double elapsed_sec = (MonoTime::Now() - start).ToSeconds();
+    size_t total = 0;
+    for (auto c : per_thread_keys) {
+      total += c;
+    }
+    return total / elapsed_sec;
+  };
+
+  // results[scenario][cap] -> samples. Variants are interleaved per repeat so that slow drift
+  // (thermal, background load) spreads evenly across them instead of biasing one cap.
+  std::vector<std::vector<std::vector<double>>> results(
+      kScenarios.size(), std::vector<std::vector<double>>(kCaps.size()));
+  for (int rep = 0; rep < kRepeats; ++rep) {
+    for (size_t s = 0; s != kScenarios.size(); ++s) {
+      for (size_t c = 0; c != kCaps.size(); ++c) {
+        results[s][c].push_back(run_once(kScenarios[s], kCaps[c]));
+      }
+    }
+  }
+
+  for (size_t s = 0; s != kScenarios.size(); ++s) {
+    for (size_t c = 0; c != kCaps.size(); ++c) {
+      auto& samples = results[s][c];
+      std::sort(samples.begin(), samples.end());
+      std::vector<size_t> rounded;
+      for (auto v : samples) {
+        rounded.push_back(static_cast<size_t>(v));
+      }
+      LOG(INFO) << Format(
+          "BENCH scenario=[$0] cap=$1 median_keys_per_sec=$2 min=$3 max=$4",
+          kScenarios[s].name,
+          kCaps[c] == std::numeric_limits<uint32_t>::max() ? "max" : std::to_string(kCaps[c]),
+          rounded[kRepeats / 2], rounded.front(), rounded.back());
+    }
+  }
+}
+// ===== END THROWAWAY BENCHMARK =====
 
 TEST_F(SharedLockManagerTest, DumpKeys) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_dump_lock_keys) = true;
