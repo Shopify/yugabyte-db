@@ -55,6 +55,7 @@
 #include "yb/rpc/reactor_thread_role.h"
 #include "yb/rpc/rpc_header.pb.h"
 #include "yb/rpc/rpc_metrics.h"
+#include "yb/rpc/rpc_priority_queue.h"
 #include "yb/rpc/rpc_service.h"
 #include "yb/rpc/rpc_util.h"
 #include "yb/rpc/tcp_stream.h"
@@ -86,6 +87,9 @@ using std::string;
 DECLARE_bool(TEST_running_test);
 
 DECLARE_int32(num_connections_to_server);
+DECLARE_bool(rpc_priority_queue_enabled);
+DECLARE_int32(rpc_priority_queue_max_dispatched);
+DECLARE_int32(rpc_priority_queue_callback_reserve);
 DEFINE_UNKNOWN_int32(rpc_default_keepalive_time_ms, 65000,
              "If an RPC connection from a client is idle for this amount of time, the server "
              "will disconnect the client. Setting flag to 0 disables this clean up.");
@@ -419,6 +423,19 @@ rpc::ThreadPool& Messenger::ThreadPool(ServicePriority priority) {
   return *ThreadPoolPtr(priority);
 }
 
+ThreadPoolTaskRecipient& Messenger::CallbackRecipient(ServicePriority priority) {
+  if (rpc_priority_queue_) {
+    switch (priority) {
+      case ServicePriority::kNormal:
+        return *normal_callback_recipient_;
+      case ServicePriority::kHigh:
+        return *high_callback_recipient_;
+    }
+    FATAL_INVALID_ENUM_VALUE(ServicePriority, priority);
+  }
+  return ThreadPool(priority);
+}
+
 const ThreadPoolPtr& Messenger::ThreadPoolPtr(ServicePriority priority) {
   switch (priority) {
     case ServicePriority::kNormal:
@@ -458,10 +475,22 @@ Status Messenger::RegisterService(
 }
 
 void Messenger::ShutdownThreadPools() {
+  // Close the queue first so that waiting work is failed with the same status the pools use for
+  // their own queued tasks, then shut the pools down (which completes or aborts everything the
+  // queue has dispatched), then wait for the queue's dispatched count to drain to zero. Both steps
+  // are idempotent: this is reached from RpcServer::Shutdown as well as from Messenger::Shutdown.
+  if (rpc_priority_queue_) {
+    rpc_priority_queue_->StartShutdown();
+  }
   normal_thread_pools_->Shutdown();
-  std::lock_guard lock(mutex_high_priority_thread_pool_);
-  if (high_priority_thread_pool_) {
-    high_priority_thread_pool_->Shutdown();
+  {
+    std::lock_guard lock(mutex_high_priority_thread_pool_);
+    if (high_priority_thread_pool_) {
+      high_priority_thread_pool_->Shutdown();
+    }
+  }
+  if (rpc_priority_queue_) {
+    rpc_priority_queue_->CompleteShutdown();
   }
 }
 
@@ -658,6 +687,33 @@ Reactor* Messenger::RemoteToReactor(const Endpoint& remote, uint32_t idx) {
 
 Status Messenger::Init(const MessengerBuilder &bld) {
   default_normal_thread_pool_ = VERIFY_RESULT(normal_thread_pools_->Pool(/*tag=*/0));
+
+  if (FLAGS_rpc_priority_queue_enabled) {
+    // Every worker pool this messenger creates (default, tagged, high priority) is sized to
+    // thread_pool_workers_limit_, so that is the largest budget under which every dispatched task
+    // is guaranteed a worker (see the RpcPriorityQueue class comment).
+    size_t budget = FLAGS_rpc_priority_queue_max_dispatched > 0
+        ? static_cast<size_t>(FLAGS_rpc_priority_queue_max_dispatched)
+        : thread_pool_workers_limit_;
+    if (budget > thread_pool_workers_limit_) {
+      LOG_WITH_PREFIX(WARNING)
+          << "rpc_priority_queue_max_dispatched (" << budget << ") exceeds the RPC worker pool "
+          << "size (" << thread_pool_workers_limit_ << "); clamping to the pool size";
+      budget = thread_pool_workers_limit_;
+    }
+    size_t callback_reserve = FLAGS_rpc_priority_queue_callback_reserve < 0
+        ? std::max<size_t>(2, budget / 20)
+        : static_cast<size_t>(FLAGS_rpc_priority_queue_callback_reserve);
+    rpc_priority_queue_ = std::make_unique<RpcPriorityQueue>(
+        name_, budget, callback_reserve, metric_entity_);
+    // Callback recipients dispatch to the same pools the corresponding ServicePriority selects.
+    // The high-priority pool is normally created lazily; create it now so the recipient can hold
+    // it.
+    normal_callback_recipient_ = std::make_unique<PriorityQueueCallbackRecipient>(
+        rpc_priority_queue_.get(), RpcPriority::kNormal, default_normal_thread_pool_);
+    high_callback_recipient_ = std::make_unique<PriorityQueueCallbackRecipient>(
+        rpc_priority_queue_.get(), RpcPriority::kHigh, ThreadPoolPtr(ServicePriority::kHigh));
+  }
 
   reactors_.reserve(bld.num_reactors_);
   ReactorMonitor* reactor_monitor = nullptr;

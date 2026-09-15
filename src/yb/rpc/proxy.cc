@@ -139,7 +139,7 @@ void Proxy::AsyncRequest(const RemoteMethod* method,
       std::move(callback), false /* force_run_callback_on_reactor */, send_metadata);
 }
 
-ThreadPool* Proxy::GetCallbackThreadPool(
+ThreadPoolTaskRecipient* Proxy::GetCallbackRecipient(
     bool force_run_callback_on_reactor, InvokeCallbackMode invoke_callback_mode) {
   if (force_run_callback_on_reactor) {
     return nullptr;
@@ -149,9 +149,9 @@ ThreadPool* Proxy::GetCallbackThreadPool(
       return nullptr;
       break;
     case InvokeCallbackMode::kThreadPoolNormal:
-      return &context_->CallbackThreadPool(ServicePriority::kNormal);
+      return &context_->CallbackRecipient(ServicePriority::kNormal);
     case InvokeCallbackMode::kThreadPoolHigh:
-      return &context_->CallbackThreadPool(ServicePriority::kHigh);
+      return &context_->CallbackRecipient(ServicePriority::kHigh);
   }
   FATAL_INVALID_ENUM_VALUE(InvokeCallbackMode, invoke_callback_mode);
 }
@@ -186,7 +186,7 @@ void Proxy::AsyncLocalCall(
   controller->call_ = std::make_shared<LocalOutboundCall>(
       *method, outbound_call_metrics_, resp, controller, context_->rpc_metrics(),
       std::move(callback),
-      GetCallbackThreadPool(force_run_callback_on_reactor, controller->invoke_callback_mode()));
+      GetCallbackRecipient(force_run_callback_on_reactor, controller->invoke_callback_mode()));
   if (!PrepareCall(req, controller)) {
     return;
   }
@@ -218,7 +218,7 @@ void Proxy::AsyncRemoteCall(
   controller->call_ = std::shared_ptr<OutboundCall>(new OutboundCall(
       *method, outbound_call_metrics_, std::move(method_metrics), resp, controller,
       context_->rpc_metrics(), std::move(callback),
-      GetCallbackThreadPool(force_run_callback_on_reactor, controller->invoke_callback_mode()),
+      GetCallbackRecipient(force_run_callback_on_reactor, controller->invoke_callback_mode()),
       send_metadata ? context_->metadata_serializer_factory() : nullptr));
   if (!PrepareCall(req, controller)) {
     return;

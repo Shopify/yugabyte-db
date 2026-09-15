@@ -46,6 +46,7 @@
 #include "yb/rpc/proxy_base.h"
 #include "yb/rpc/rpc_controller.h"
 #include "yb/rpc/rpc_header.pb.h"
+#include "yb/rpc/thread_pool.h"
 #include "yb/gutil/thread_annotations.h"
 
 #include "yb/util/concurrent_pod.h"
@@ -167,7 +168,8 @@ class Proxy {
   void ResolveDone(const Result<IpAddress>& result);
   void NotifyAllFailed(const Status& status);
   void QueueCall(RpcController* controller, const Endpoint& endpoint);
-  ThreadPool *GetCallbackThreadPool(
+  // Returns null when the callback must run on the reactor thread.
+  ThreadPoolTaskRecipient* GetCallbackRecipient(
       bool force_run_callback_on_reactor, InvokeCallbackMode invoke_callback_mode);
 
   // Implements logic for AsyncRequest function, but allows to force to run callback on

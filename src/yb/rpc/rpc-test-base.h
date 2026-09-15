@@ -142,6 +142,12 @@ class GenericCalculatorService : public ServiceIf {
   std::deque<std::pair<RemoteMethod, Method>> methods_;
 };
 
+// Factories for the generated test services, for tests that need to register services with
+// non-default options (e.g. an RpcPriority) rather than via RpcTestBase::StartTestServer.
+// CalculatorService and AshTestService have distinct service names.
+std::unique_ptr<ServiceIf> MakeCalculatorService(const scoped_refptr<MetricEntity>& entity);
+std::unique_ptr<ServiceIf> MakeAshTestService(const scoped_refptr<MetricEntity>& entity);
+
 struct MessengerOptions {
   int n_reactors;
   std::chrono::milliseconds keep_alive_timeout;
@@ -154,6 +160,10 @@ extern const MessengerOptions kDefaultServerMessengerOptions;
 struct TestServerOptions {
   MessengerOptions messenger_options = kDefaultServerMessengerOptions;
   size_t n_worker_threads = 3;
+  // Permits of the test server's RpcPriorityQueue (budget n_worker_threads) reserved for
+  // callbacks. Only used when FLAGS_rpc_priority_queue_enabled. 0 keeps the full budget available
+  // to inbound handlers, which most tests expect.
+  size_t priority_queue_callback_reserve = 0;
   Endpoint endpoint;
 };
 
@@ -171,14 +181,22 @@ class TestServer {
   const Endpoint& bound_endpoint() const { return bound_endpoint_; }
   Messenger* messenger() const { return messenger_.get(); }
   ServicePool& service_pool() const { return *service_pool_; }
+  // Null unless FLAGS_rpc_priority_queue_enabled was set when this server was constructed.
+  RpcPriorityQueue* priority_queue() const { return priority_queue_.get(); }
 
   Status Start();
 
-  Status RegisterService(std::unique_ptr<ServiceIf> service);
+  Status RegisterService(
+      std::unique_ptr<ServiceIf> service, RpcPriority rpc_priority = RpcPriority::kNormal);
 
  private:
+  void ShutdownWorkers();
+
   std::unique_ptr<Messenger> messenger_;
   ThreadPoolPtr thread_pool_;
+  // Gates dispatch to thread_pool_ (sized to its worker count) when the flag is on. The test
+  // server uses its own pool rather than the messenger's, so it needs its own queue too.
+  std::unique_ptr<RpcPriorityQueue> priority_queue_;
   scoped_refptr<ServicePool> service_pool_;
   Endpoint bound_endpoint_;
 };

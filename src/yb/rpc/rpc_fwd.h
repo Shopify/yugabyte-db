@@ -79,6 +79,8 @@ class RpcCallParams;
 class RpcConnectionPB;
 class RpcContext;
 class RpcController;
+class PriorityQueueCallbackRecipient;
+class RpcPriorityQueue;
 class Rpcs;
 class Scheduler;
 class SecureContext;
@@ -159,6 +161,21 @@ using ProxyPtr = std::shared_ptr<Proxy>;
 using ResponseCallback = std::function<void()>;
 
 YB_DEFINE_ENUM(ServicePriority, (kNormal)(kHigh));
+
+// Priority of RPC work for dispatch ordering, used by RpcPriorityQueue to decide which
+// admitted work is handed to worker thread pools first. Not to be confused with
+// ServicePriority above, which selects the thread pool a service's handlers execute on.
+// Queued kHigh work (cluster health: consensus, heartbeats) is dispatched before kNormal
+// (user-facing queries), which is dispatched before kLow (background: backfill, remote
+// bootstrap, backups, xCluster/CDC).
+YB_DEFINE_ENUM(RpcPriority, (kHigh)(kNormal)(kLow));
+
+// Kind of work submitted to RpcPriorityQueue. kInbound is an inbound service call handler;
+// kCallback is the callback of an outbound (client-side) call. The distinction exists because an
+// inbound handler may block waiting for a callback (e.g. a synchronous YBClient call made from
+// inside an RPC handler), so callbacks must always be able to obtain a dispatch permit even when
+// inbound handlers hold the rest of the budget. See RpcPriorityQueue.
+YB_DEFINE_ENUM(RpcTaskClass, (kInbound)(kCallback));
 
 // Specifies how to run callback for async outbound call.
 YB_DEFINE_ENUM(InvokeCallbackMode,

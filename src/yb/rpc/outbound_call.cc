@@ -253,7 +253,7 @@ OutboundCall::OutboundCall(const RemoteMethod& remote_method,
                            RpcController* controller,
                            std::shared_ptr<RpcMetrics> rpc_metrics,
                            ResponseCallback callback,
-                           ThreadPool* callback_thread_pool,
+                           ThreadPoolTaskRecipient* callback_recipient,
                            MetadataSerializerFactory* metadata_serializer_factory)
     : hostname_(&kEmptyString),
       start_(CoarseMonoClock::Now()),
@@ -263,7 +263,7 @@ OutboundCall::OutboundCall(const RemoteMethod& remote_method,
       call_id_(NextCallId()),
       remote_method_(remote_method),
       callback_(std::move(callback)),
-      callback_thread_pool_(callback_thread_pool),
+      callback_recipient_(callback_recipient),
       outbound_call_metrics_(outbound_call_metrics),
       rpc_metrics_(std::move(rpc_metrics)),
       method_metrics_(std::move(method_metrics)),
@@ -515,9 +515,9 @@ void OutboundCall::InvokeCallback(std::optional<CoarseTimePoint> now_optional) {
   LOG_IF_WITH_PREFIX(DFATAL, !IsFinished())
       << "Invoking callback on an unfinished OutboundCall: " << DebugString();
 
-  if (callback_thread_pool_) {
+  if (callback_recipient_) {
     callback_task_.SetOutboundCall(shared_from(this));
-    if (callback_thread_pool_->Enqueue(&callback_task_)) {
+    if (callback_recipient_->Enqueue(&callback_task_)) {
       TRACE_TO(trace_, "Callback will be called asynchronously.");
     } else {
       // In case of a failure to enqueue, the thread pool invokes Done() on the task, which in this

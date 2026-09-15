@@ -395,8 +395,9 @@ Status RpcServerBase::DumpServerInfo(const string& path,
 
 Status RpcServerBase::RegisterService(size_t queue_limit,
                                       rpc::ServiceIfPtr rpc_impl,
-                                      rpc::ServicePriority priority) {
-  return rpc_server_->RegisterService(queue_limit, std::move(rpc_impl), priority);
+                                      rpc::ServicePriority priority,
+                                      rpc::RpcPriority rpc_priority) {
+  return rpc_server_->RegisterService(queue_limit, std::move(rpc_impl), priority, rpc_priority);
 }
 
 Status RpcServerBase::StartMetricsLogging() {

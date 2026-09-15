@@ -259,9 +259,7 @@ class Messenger : public ProxyContext {
   const Protocol& DefaultProtocol() override { return listen_protocol_; }
   const Protocol& UncompressedProtocol() override { return uncompressed_protocol_; }
 
-  rpc::ThreadPool& CallbackThreadPool(ServicePriority priority) override {
-    return ThreadPool(priority);
-  }
+  ThreadPoolTaskRecipient& CallbackRecipient(ServicePriority priority) override;
 
   Status QueueEventOnAllReactors(
       ServerEventListPtr server_event, const SourceLocation& source_location);
@@ -319,11 +317,20 @@ class Messenger : public ProxyContext {
     return *resolver_;
   }
 
+  // Direct access to the worker pools. Work enqueued on them here bypasses rpc_priority_queue()
+  // (see the "not gated" list in rpc_priority_queue.h); use it only for bounded continuations of
+  // work that has already been admitted. A priority-aware submission helper is a planned follow-up.
   rpc::ThreadPool& ThreadPool(ServicePriority priority = ServicePriority::kNormal);
 
   const rpc::ThreadPoolPtr& ThreadPoolPtr(ServicePriority priority = ServicePriority::kNormal);
 
   Result<rpc::ThreadPoolPtr> TaggedThreadPool(TaggedThreadPools::Tag pool_tag = 0);
+
+  // Priority queue gating dispatch to all of this messenger's worker thread pools, or null when
+  // rpc_priority_queue_enabled is off (work is then submitted to the pools directly).
+  RpcPriorityQueue* rpc_priority_queue() const {
+    return rpc_priority_queue_.get();
+  }
 
   const std::shared_ptr<RpcMetrics>& rpc_metrics() override {
     return rpc_metrics_;
@@ -460,6 +467,15 @@ class Messenger : public ProxyContext {
   // This could be used for high-priority services such as Consensus.
   rpc::ThreadPoolPtr high_priority_thread_pool_;
   std::atomic<bool> high_priority_thread_pool_ready_;
+
+  // Created in Init when rpc_priority_queue_enabled. Shut down together with the thread pools it
+  // dispatches to, see ShutdownThreadPools.
+  std::unique_ptr<RpcPriorityQueue> rpc_priority_queue_;
+  // Route async callbacks of each ServicePriority through rpc_priority_queue_ (kNormal ->
+  // default pool at RpcPriority::kNormal, kHigh -> high-priority pool at RpcPriority::kHigh).
+  // Null when the queue is disabled; callbacks then go straight to the pools.
+  std::unique_ptr<PriorityQueueCallbackRecipient> normal_callback_recipient_;
+  std::unique_ptr<PriorityQueueCallbackRecipient> high_callback_recipient_;
 
   std::unique_ptr<DnsResolver> resolver_;
 

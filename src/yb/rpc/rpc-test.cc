@@ -32,6 +32,7 @@
 
 #include "yb/rpc/rpc-test-base.h"
 
+#include <algorithm>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -53,6 +54,7 @@
 #include "yb/rpc/secure_stream.h"
 #include "yb/rpc/serialization.h"
 #include "yb/rpc/tcp_stream.h"
+#include "yb/rpc/rpc_priority_queue.h"
 #include "yb/rpc/yb_rpc.h"
 
 #include "yb/util/backoff_waiter.h"
@@ -62,6 +64,7 @@
 #include "yb/util/logging_test_util.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/result.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/status_format.h"
 #include "yb/util/status_log.h"
 #include "yb/util/test_macros.h"
@@ -82,6 +85,7 @@ DEFINE_NON_RUNTIME_int32(rpc_test_connection_keepalive_num_iterations, 1,
 
 DECLARE_bool(TEST_pause_calculator_echo_request);
 DECLARE_bool(binary_call_parser_reject_on_mem_tracker_hard_limit);
+DECLARE_bool(rpc_priority_queue_enabled);
 DECLARE_bool(enable_rpc_keepalive);
 DECLARE_int32(num_connections_to_server);
 DECLARE_int64(rpc_throttle_threshold_bytes);
@@ -1534,6 +1538,101 @@ TEST_F(TestRpcSecureCompression, Compression) {
   RunSecureCompressionTest([this](CalculatorServiceProxy* proxy) {
     TestCompression(proxy, metric_entity());
   });
+}
+
+// End-to-end: with rpc_priority_queue_enabled, a server whose single worker is held by a running
+// call dispatches a queued kHigh call (AshTestService) ahead of queued kLow calls
+// (CalculatorService) that were submitted earlier.
+TEST_F(TestRpc, PriorityQueueDispatchesHighPriorityServiceFirst) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_enabled) = true;
+  auto flag_reset = ScopeExit([] {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_enabled) = false;
+  });
+
+  TestServerOptions options;
+  options.n_worker_threads = 1;
+  TestServer server(CreateMessenger("TestServer", options.messenger_options), options);
+  ASSERT_OK(server.RegisterService(MakeCalculatorService(metric_entity()), RpcPriority::kLow));
+  ASSERT_OK(server.RegisterService(MakeAshTestService(metric_entity()), RpcPriority::kHigh));
+  ASSERT_OK(server.Start());
+  auto* queue = server.priority_queue();
+  ASSERT_NE(queue, nullptr);
+  ASSERT_EQ(queue->max_dispatched(), 1);
+
+  auto client_messenger = CreateAutoShutdownMessengerHolder("Client");
+  ProxyCache proxy_cache(client_messenger.get());
+  auto server_hostport = HostPort::FromBoundEndpoint(server.bound_endpoint());
+  rpc_test::CalculatorServiceProxy calculator(&proxy_cache, server_hostport);
+  rpc_test::AshTestServiceProxy ash(&proxy_cache, server_hostport);
+
+  std::mutex mutex;
+  std::vector<std::string> completion_order;
+  auto record = [&mutex, &completion_order](std::string name) {
+    return [&mutex, &completion_order, name = std::move(name)] {
+      std::lock_guard lock(mutex);
+      completion_order.push_back(name);
+    };
+  };
+
+  // Occupy the only permit with a call that blocks its worker.
+  rpc_test::SleepRequestPB blocker_req;
+  blocker_req.set_sleep_micros(500 * 1000 * kTimeMultiplier);
+  rpc_test::SleepResponsePB blocker_resp;
+  RpcController blocker_controller;
+  blocker_controller.set_timeout(30s);
+  calculator.SleepAsync(blocker_req, &blocker_resp, &blocker_controller, record("blocker"));
+  ASSERT_OK(WaitFor(
+      [queue] { return queue->TEST_dispatched() == 1; }, 10s, "blocker dispatched"));
+
+  // Queue two low-priority sleeps first, then one high-priority call.
+  constexpr int kLowCalls = 2;
+  std::vector<rpc_test::SleepResponsePB> low_resps(kLowCalls);
+  std::vector<RpcController> low_controllers(kLowCalls);
+  rpc_test::SleepRequestPB low_req;
+  low_req.set_sleep_micros(100 * 1000);
+  for (int i = 0; i < kLowCalls; ++i) {
+    low_controllers[i].set_timeout(30s);
+    calculator.SleepAsync(low_req, &low_resps[i], &low_controllers[i], record("low"));
+  }
+  ASSERT_OK(WaitFor(
+      [queue] { return queue->TEST_queued(RpcPriority::kLow) == kLowCalls; }, 10s, "low queued"));
+
+  rpc_test::NoAshRequestPB high_req;
+  high_req.set_value(42);
+  rpc_test::NoAshResponsePB high_resp;
+  RpcController high_controller;
+  high_controller.set_timeout(30s);
+  ash.NoAshAsync(high_req, &high_resp, &high_controller, record("high"));
+  ASSERT_OK(WaitFor(
+      [queue] { return queue->TEST_queued(RpcPriority::kHigh) == 1; }, 10s, "high queued"));
+  ASSERT_EQ(queue->TEST_queued(), kLowCalls + 1);
+
+  ASSERT_OK(WaitFor(
+      [&mutex, &completion_order] {
+        std::lock_guard lock(mutex);
+        return completion_order.size() == 1 + kLowCalls + 1;
+      }, 30s, "all calls complete"));
+
+  std::lock_guard lock(mutex);
+  // The high call was dispatched the instant the blocker released its permit and completes within
+  // microseconds of it, so the relative order in which the client observes those two completions
+  // (callbacks run on client worker threads) is not meaningful. What matters is that high finished
+  // before either low call, each of which runs for 100ms once dispatched.
+  ASSERT_EQ(completion_order.size(), 4);
+  auto position = [&completion_order](const std::string& name) {
+    return std::find(completion_order.begin(), completion_order.end(), name) -
+           completion_order.begin();
+  };
+  ASSERT_LT(position("high"), 2) << AsString(completion_order);
+  ASSERT_LT(position("blocker"), 2) << AsString(completion_order);
+  ASSERT_EQ(completion_order[2], "low") << AsString(completion_order);
+  ASSERT_EQ(completion_order[3], "low") << AsString(completion_order);
+  ASSERT_OK(blocker_controller.status());
+  ASSERT_OK(high_controller.status());
+  ASSERT_EQ(high_resp.value(), 42);
+  for (auto& controller : low_controllers) {
+    ASSERT_OK(controller.status());
+  }
 }
 
 } // namespace rpc

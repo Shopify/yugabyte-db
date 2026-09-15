@@ -16,6 +16,7 @@
 #pragma once
 
 #include "yb/rpc/rpc_fwd.h"
+#include "yb/rpc/thread_pool.h"
 
 #include "yb/util/metrics_fwd.h"
 #include "yb/util/net/net_fwd.h"
@@ -39,7 +40,10 @@ class ProxyContext {
   virtual const Protocol& DefaultProtocol() = 0;
   virtual const Protocol& UncompressedProtocol() = 0;
 
-  virtual ThreadPool& CallbackThreadPool(ServicePriority priority = ServicePriority::kNormal) = 0;
+  // Where async outbound-call callbacks of the given priority are executed: the corresponding
+  // worker thread pool, or an adapter that routes them through the RPC priority queue.
+  virtual ThreadPoolTaskRecipient& CallbackRecipient(
+      ServicePriority priority = ServicePriority::kNormal) = 0;
 
   virtual IoService& io_service() = 0;
 

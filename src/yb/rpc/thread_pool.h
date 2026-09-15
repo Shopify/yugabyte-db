@@ -21,4 +21,8 @@ namespace yb::rpc {
 
 using ThreadPoolOptions = yb::ThreadPoolOptions;
 
+// Anything that accepts ThreadPoolTasks: a YBThreadPool, or an adapter that routes tasks through an
+// RpcPriorityQueue. Used for outbound-call callbacks so the dispatch target can be swapped.
+using ThreadPoolTaskRecipient = yb::TaskRecipient<yb::ThreadPoolTask>;
+
 } // namespace yb::rpc

@@ -31,9 +31,14 @@
 #include "yb/integration-tests/mini_cluster.h"
 #include "yb/integration-tests/yb_table_test_base.h"
 
+#include "yb/master/master.h"
 #include "yb/master/mini_master.h"
 
+#include "yb/rpc/messenger.h"
+#include "yb/rpc/rpc_priority_queue.h"
+
 #include "yb/tserver/mini_tablet_server.h"
+#include "yb/tserver/tablet_server.h"
 
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/size_literals.h"
@@ -47,6 +52,18 @@ using std::vector;
 
 DECLARE_int32(log_cache_size_limit_mb);
 DECLARE_int32(global_log_cache_size_limit_mb);
+DECLARE_bool(rpc_priority_queue_enabled);
+DECLARE_int32(rpc_priority_queue_max_dispatched);
+DECLARE_int32(rpc_priority_queue_callback_reserve);
+DECLARE_int32(rpc_workers_limit);
+
+METRIC_DECLARE_counter(rpc_priority_queue_dispatched_high);
+METRIC_DECLARE_counter(rpc_priority_queue_dispatched_normal);
+METRIC_DECLARE_counter(rpc_priority_queue_dispatched_low);
+METRIC_DECLARE_counter(rpc_priority_queue_dispatched_callbacks);
+METRIC_DECLARE_event_stats(rpc_priority_queue_wait_time_high);
+METRIC_DECLARE_event_stats(rpc_priority_queue_wait_time_normal);
+METRIC_DECLARE_event_stats(rpc_priority_queue_wait_time_low);
 
 namespace yb {
 namespace integration_tests {
@@ -76,6 +93,112 @@ class KVTableTest : public YBTableTestBase {
     ASSERT_EQ("value300", result_kvs[2].second);
   }
 
+  // Test bodies shared with the fixtures below that change cluster configuration.
+  void RunLoadTest();
+  void RunRestartTest();
+};
+
+// Runs the cluster with rpc_priority_queue_enabled and a deliberately tiny dispatch budget, so that
+// the queue is saturated and consensus, heartbeats and user traffic all contend for dispatch
+// permits. Verifies that the cluster stays healthy (no write/read errors, consistent row counts,
+// restart recovery) when everything flows through the priority queue, and that the queue was in
+// fact exercised (see VerifyPriorityQueueUsage).
+class KVTablePriorityQueueTest : public KVTableTest {
+ protected:
+  // RPC handlers are mostly asynchronous and release their worker quickly, so with a budget equal
+  // to the worker count a handful of client threads never saturate it. A budget of 2 per server
+  // guarantees contention under the load test while leaving the pools their full worker count.
+  // With one permit reserved for callbacks, at most one inbound handler runs at a time on each
+  // server, which is the harshest possible setting for the deadlock-freedom argument (handlers
+  // blocking on callbacks) while still making progress.
+  static constexpr int kRpcWorkersLimit = 8;
+  static constexpr int kDispatchBudget = 2;
+  static constexpr int kCallbackReserve = 1;
+  static constexpr int kInboundCap = kDispatchBudget - kCallbackReserve;
+
+  void SetUp() override {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_enabled) = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_max_dispatched) = kDispatchBudget;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_callback_reserve) = kCallbackReserve;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_workers_limit) = kRpcWorkersLimit;
+    KVTableTest::SetUp();
+  }
+
+  struct QueueUsage {
+    int64_t dispatched_high = 0;
+    int64_t dispatched_normal = 0;
+    int64_t dispatched_low = 0;
+    int64_t dispatched_callbacks = 0;
+    uint64_t waits = 0;
+
+    void Add(const scoped_refptr<MetricEntity>& entity) {
+      dispatched_high += METRIC_rpc_priority_queue_dispatched_high.Instantiate(entity)->value();
+      dispatched_normal +=
+          METRIC_rpc_priority_queue_dispatched_normal.Instantiate(entity)->value();
+      dispatched_low += METRIC_rpc_priority_queue_dispatched_low.Instantiate(entity)->value();
+      dispatched_callbacks +=
+          METRIC_rpc_priority_queue_dispatched_callbacks.Instantiate(entity)->value();
+      waits += METRIC_rpc_priority_queue_wait_time_high.Instantiate(entity)->TotalCount();
+      waits += METRIC_rpc_priority_queue_wait_time_normal.Instantiate(entity)->TotalCount();
+      waits += METRIC_rpc_priority_queue_wait_time_low.Instantiate(entity)->TotalCount();
+    }
+
+    std::string ToString() const {
+      return YB_STRUCT_TO_STRING(
+          dispatched_high, dispatched_normal, dispatched_low, dispatched_callbacks, waits);
+    }
+  };
+
+  struct ExpectedUsage {
+    // At least one task cluster-wide had to wait for a permit, i.e. the budget was saturated.
+    bool contention = false;
+    // kLow work reached the tservers. Only CreateTablet (TabletServerAdminService) is kLow in this
+    // test, so this holds after table creation but not for servers restarted afterwards.
+    bool tserver_low = false;
+  };
+
+  // Asserts that every master and tserver messenger is actually gated by a queue of the configured
+  // budget, and that RPC work of the expected priorities was dispatched through those queues.
+  void VerifyPriorityQueueUsage(ExpectedUsage expected) {
+    QueueUsage masters;
+    for (size_t i = 0; i < mini_cluster()->num_masters(); ++i) {
+      auto* master = mini_cluster()->mini_master(i)->master();
+      auto* queue = master->messenger()->rpc_priority_queue();
+      ASSERT_NE(queue, nullptr) << "master " << i << " messenger has no priority queue";
+      ASSERT_EQ(queue->max_dispatched(), kDispatchBudget);
+      ASSERT_EQ(queue->max_dispatched_inbound(), kInboundCap);
+      masters.Add(master->metric_entity());
+    }
+    QueueUsage tservers;
+    for (size_t i = 0; i < mini_cluster()->num_tablet_servers(); ++i) {
+      auto* tserver = mini_cluster()->mini_tablet_server(i)->server();
+      auto* queue = tserver->messenger()->rpc_priority_queue();
+      ASSERT_NE(queue, nullptr) << "tserver " << i << " messenger has no priority queue";
+      ASSERT_EQ(queue->max_dispatched(), kDispatchBudget);
+      ASSERT_EQ(queue->max_dispatched_inbound(), kInboundCap);
+      tservers.Add(tserver->metric_entity());
+    }
+    LOG(INFO) << "Priority queue usage: masters " << masters.ToString()
+              << ", tservers " << tservers.ToString();
+
+    // Masters: tserver heartbeats (kHigh) and client/DDL traffic (kNormal), plus the callbacks
+    // of the master's own outbound RPCs (e.g. to tservers during table creation).
+    ASSERT_GT(masters.dispatched_high, 0);
+    ASSERT_GT(masters.dispatched_normal, 0);
+    ASSERT_GT(masters.dispatched_callbacks, 0);
+    // Tservers: consensus (kHigh), reads/writes (kNormal), and the callbacks of consensus and
+    // client RPCs they issue themselves.
+    ASSERT_GT(tservers.dispatched_high, 0);
+    ASSERT_GT(tservers.dispatched_normal, 0);
+    ASSERT_GT(tservers.dispatched_callbacks, 0);
+    if (expected.tserver_low) {
+      ASSERT_GT(tservers.dispatched_low, 0);
+    }
+    if (expected.contention) {
+      ASSERT_GT(masters.waits + tservers.waits, 0)
+          << "no RPC task ever waited for a permit; the budget was never saturated";
+    }
+  }
 };
 
 TEST_F(KVTableTest, SimpleKVTableTest) {
@@ -110,7 +233,7 @@ TEST_F(KVTableTest, Eng135MetricsTest) {
   }
 }
 
-TEST_F(KVTableTest, LoadTest) {
+void KVTableTest::RunLoadTest() {
   std::atomic_bool stop_requested_flag(false);
   int rows = 5000;
   int start_key = 0;
@@ -158,7 +281,7 @@ TEST_F(KVTableTest, LoadTest) {
   ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(table_->name(), ClusterVerifier::EXACTLY, rows));
 }
 
-TEST_F(KVTableTest, Restart) {
+void KVTableTest::RunRestartTest() {
   ASSERT_NO_FATALS(PutSampleKeysValues());
   // Check we've written the data successfully.
   ASSERT_NO_FATALS(CheckSampleKeysValues());
@@ -186,6 +309,28 @@ TEST_F(KVTableTest, Restart) {
 
   ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
   ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(table_->name(), ClusterVerifier::EXACTLY, 3));
+}
+
+TEST_F(KVTableTest, LoadTest) {
+  RunLoadTest();
+}
+
+TEST_F(KVTableTest, Restart) {
+  RunRestartTest();
+}
+
+TEST_F_EX(KVTableTest, LoadTestWithPriorityQueue, KVTablePriorityQueueTest) {
+  ASSERT_NO_FATALS(RunLoadTest());
+  // 8 client threads against a 2-permit budget on each server must have saturated it.
+  ASSERT_NO_FATALS(VerifyPriorityQueueUsage({.contention = true, .tserver_low = true}));
+}
+
+TEST_F_EX(KVTableTest, RestartWithPriorityQueue, KVTablePriorityQueueTest) {
+  ASSERT_NO_FATALS(RunRestartTest());
+  // Verified against the post-restart servers (fresh messengers and metrics), so this also proves
+  // the queue is recreated on restart. Not a load test, so contention is not asserted, and the
+  // tablets were created before the restart, so no kLow work is expected.
+  ASSERT_NO_FATALS(VerifyPriorityQueueUsage({}));
 }
 
 class KVTableSingleTabletTest : public KVTableTest {

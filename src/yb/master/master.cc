@@ -307,16 +307,22 @@ Status Master::RegisterServices() {
 #endif
 
   RETURN_NOT_OK(RegisterService(FLAGS_master_svc_queue_length, MakeMasterAdminService(this)));
-  RETURN_NOT_OK(RegisterService(FLAGS_master_svc_queue_length, MakeMasterBackupService(this)));
+  RETURN_NOT_OK(RegisterService(
+      FLAGS_master_svc_queue_length, MakeMasterBackupService(this),
+      rpc::ServicePriority::kNormal, rpc::RpcPriority::kLow));
   RETURN_NOT_OK(RegisterService(FLAGS_master_svc_queue_length, MakeMasterClientService(this)));
   RETURN_NOT_OK(RegisterService(FLAGS_master_svc_queue_length, MakeMasterClusterService(this)));
   RETURN_NOT_OK(RegisterService(FLAGS_master_svc_queue_length, MakeMasterDclService(this)));
   RETURN_NOT_OK(RegisterService(FLAGS_master_svc_queue_length, MakeMasterDdlService(this)));
   RETURN_NOT_OK(RegisterService(
       FLAGS_master_ysql_lease_svc_queue_length, MakeMasterYsqlLeaseService(this),
-      rpc::ServicePriority::kHigh));
+      rpc::ServicePriority::kHigh, rpc::RpcPriority::kHigh));
   RETURN_NOT_OK(RegisterService(FLAGS_master_svc_queue_length, MakeMasterEncryptionService(this)));
-  RETURN_NOT_OK(RegisterService(FLAGS_master_svc_queue_length, MakeMasterHeartbeatService(this)));
+  // Heartbeats are cluster-health critical: an overloaded master delaying heartbeat
+  // processing can cause tservers to be considered dead.
+  RETURN_NOT_OK(RegisterService(
+      FLAGS_master_svc_queue_length, MakeMasterHeartbeatService(this),
+      rpc::ServicePriority::kNormal, rpc::RpcPriority::kHigh));
   RETURN_NOT_OK(RegisterService(FLAGS_master_svc_queue_length, MakeMasterReplicationService(this)));
   RETURN_NOT_OK(RegisterService(FLAGS_master_svc_queue_length, MakeMasterTestService(this)));
 
@@ -327,19 +333,22 @@ Status Master::RegisterServices() {
   if (FLAGS_ysql_yb_enable_implicit_dynamic_tables_logical_replication) {
     auto cdc_service = master_tablet_server_->CreateCDCService(
         metric_entity(), client_future(), metric_registry());
-    RETURN_NOT_OK(RegisterService(FLAGS_master_xrepl_svc_queue_length, cdc_service));
+    RETURN_NOT_OK(RegisterService(
+        FLAGS_master_xrepl_svc_queue_length, cdc_service,
+        rpc::ServicePriority::kNormal, rpc::RpcPriority::kLow));
   }
 
   RETURN_NOT_OK(RegisterService(
       FLAGS_master_consensus_svc_queue_length,
       std::make_shared<ConsensusServiceImpl>(metric_entity(), catalog_manager_.get()),
-      rpc::ServicePriority::kHigh));
+      rpc::ServicePriority::kHigh, rpc::RpcPriority::kHigh));
 
   RETURN_NOT_OK(RegisterService(
       FLAGS_master_remote_bootstrap_svc_queue_length,
       std::make_shared<tserver::RemoteBootstrapServiceImpl>(
           fs_manager_.get(), catalog_manager_.get(), metric_entity(), opts_.MakeCloudInfoPB(),
-          &this->proxy_cache())));
+          &this->proxy_cache()),
+      rpc::ServicePriority::kNormal, rpc::RpcPriority::kLow));
 
   RETURN_NOT_OK(RegisterService(
       FLAGS_master_svc_queue_length,
