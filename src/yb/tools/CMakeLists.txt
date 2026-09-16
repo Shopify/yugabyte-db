@@ -76,6 +76,15 @@ target_link_libraries(yb-ts-cli
   yb_tools_util
   ${LINK_LIBS})
 
+add_executable(master-heartbeat-bench master_heartbeat_bench.cc)
+target_link_libraries(master-heartbeat-bench
+  master_proto
+  tserver_admin_proto
+  consensus_metadata_proto
+  server_base_proto
+  yb_tools_util
+  ${LINK_LIBS})
+
 add_executable(data-patcher data-patcher.cc)
 target_link_libraries(data-patcher boost_program_options yb_util yb_docdb log_proto log)
 
