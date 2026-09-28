@@ -125,6 +125,8 @@ DEFINE_NON_RUNTIME_int32(master_rpc_port, 21100, "RPC port for the spawned maste
 DEFINE_NON_RUNTIME_int32(master_web_port, 21101, "Webserver port for the spawned master.");
 DEFINE_NON_RUNTIME_string(master_flags, "",
     "Comma-separated extra --flag=value arguments passed to yb-master.");
+DEFINE_NON_RUNTIME_string(master_cpus, "",
+    "Pin the spawned yb-master to these CPUs via taskset -c (Linux only); empty = no pinning.");
 DEFINE_NON_RUNTIME_string(tserver_bin, "",
     "Path to the yb-tserver binary. When set, enables mirror mode: one real tserver's master "
     "traffic is captured through a TCP relay and its heartbeat payloads are resent by the "
@@ -808,14 +810,14 @@ class MirrorState {
 
   void PrintSummary(std::ostream& out) {
     std::lock_guard l(mutex_);
-    out << "mirror: heartbeats_captured=" << heartbeats_captured_
+    out << "captured_from_real_tserver: heartbeats=" << heartbeats_captured_
         << " light_templates=" << light_templates_
         << " metrics_templates=" << metrics_templates_
         << " parse_failures=" << parse_failures_
         << " measured_heartbeat_interval_ms=" << interval_ms_
         << " measured_metrics_period_ms=" << metrics_period_ms_ << "\n";
     for (const auto& [key, c] : methods_) {
-      out << "mirror_method " << key << ": seen=" << c.seen
+      out << "replayed_rpc " << key << ": seen=" << c.seen
           << " replayed_ok=" << c.replayed_ok
           << " replayed_failed=" << c.replayed_failed << "\n";
     }
@@ -1347,7 +1349,12 @@ class HeartbeatBench {
     const std::vector<string> extra_flags =
         strings::Split(FLAGS_master_flags, ",", strings::SkipEmpty());
     argv.insert(argv.end(), extra_flags.begin(), extra_flags.end());
-    master_process_ = std::make_unique<Subprocess>(FLAGS_master_bin, argv);
+    string program = FLAGS_master_bin;
+    if (!FLAGS_master_cpus.empty()) {
+      argv.insert(argv.begin(), {"taskset", "-c", FLAGS_master_cpus});
+      program = "taskset";
+    }
+    master_process_ = std::make_unique<Subprocess>(program, argv);
     RETURN_NOT_OK(master_process_->Start());
     LOG(INFO) << "Started yb-master pid " << master_process_->pid();
     // Lets the next run kill this master if the driver dies without cleaning up.
@@ -1920,6 +1927,23 @@ class HeartbeatBench {
     if (rtt_count > 0) {
       std::cout << "driver_observed_heartbeat_rtt_ms_avg="
                 << delta("bench_heartbeat_rtt_us_sum") / rtt_count / 1000.0 << "\n";
+    }
+    if (window > 0) {
+      double hb_in = 0, hb_out = 0, all_in = 0, all_out = 0;
+      for (const auto& [metric, pair] : steady) {
+        const double d = pair.second.value - pair.first.value;
+        if (metric.starts_with("service_request_bytes_yb_master_")) {
+          all_in += d;
+          if (metric.ends_with("MasterHeartbeat_TSHeartbeat")) hb_in = d;
+        } else if (metric.starts_with("service_response_bytes_yb_master_")) {
+          all_out += d;
+          if (metric.ends_with("MasterHeartbeat_TSHeartbeat")) hb_out = d;
+        }
+      }
+      std::cout << "heartbeat_to_master_mb_per_sec=" << hb_in / window / 1e6
+                << " heartbeat_from_master_mb_per_sec=" << hb_out / window / 1e6 << "\n"
+                << "all_rpc_to_master_mb_per_sec=" << all_in / window / 1e6
+                << " all_rpc_from_master_mb_per_sec=" << all_out / window / 1e6 << "\n";
     }
     for (const auto& [metric, pair] : steady) {
       // With whole-master collection most series are methods that never ran; keep the

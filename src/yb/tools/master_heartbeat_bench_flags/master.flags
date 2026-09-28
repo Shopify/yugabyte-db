@@ -1,0 +1,9 @@
+--allowed_preview_flags_csv=ysql_enable_concurrent_ddl
+--ysql_enable_concurrent_ddl=false
+--enable_ysql_operation_lease=false
+--enable_object_locking_for_table_locks=false
+--catalog_manager_report_batch_size=100
+--enable_heartbeat_pg_catalog_versions_cache=true
+--rpc_workers_limit=4096
+--master_svc_queue_length=5000
+--master_tserver_svc_queue_length=10000
