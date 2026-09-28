@@ -1,0 +1,4 @@
+--allowed_preview_flags_csv=ysql_enable_concurrent_ddl
+--ysql_enable_concurrent_ddl=false
+--enable_ysql_operation_lease=false
+--enable_object_locking_for_table_locks=false
