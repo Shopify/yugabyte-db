@@ -682,6 +682,9 @@ class HollowTSAdminService : public tserver::TabletServerAdminServiceIf {
   HOLLOW_UNSUPPORTED_METHOD(UpdateTransactionTablesVersion,
                             tserver::UpdateTransactionTablesVersionRequestPB,
                             tserver::UpdateTransactionTablesVersionResponsePB)
+  HOLLOW_UNSUPPORTED_METHOD(ApplyXClusterGuardedInfoIfNewer,
+                            tserver::ApplyXClusterGuardedInfoIfNewerRequestPB,
+                            tserver::ApplyXClusterGuardedInfoIfNewerResponsePB)
   HOLLOW_UNSUPPORTED_METHOD(CloneTablet, tablet::CloneTabletRequestPB,
                             tserver::CloneTabletResponsePB)
   HOLLOW_UNSUPPORTED_METHOD(ClonePgSchema, tserver::ClonePgSchemaRequestPB,
