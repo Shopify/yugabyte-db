@@ -2271,7 +2271,15 @@ activate_virtualenv() {
   [[ -f "${YB_SRC_ROOT}/build/requirements_frozen.txt" ]] \
     || ln -sf "${YB_SRC_ROOT}/requirements_frozen.txt" "${YB_SRC_ROOT}/build/"
 
-  yb_activate_virtualenv "${virtualenv_parent_dir}"
+  if [[ ${YB_USE_EXISTING_PYTHON_ENV:-0} == "1" ]]; then
+    # The caller provides a Python interpreter in PATH that already has the packages from
+    # requirements_frozen.txt installed, e.g. because the build environment has no network access
+    # to install them from PyPI into a virtualenv.
+    log "Using the existing Python environment because YB_USE_EXISTING_PYTHON_ENV=1"
+    VIRTUAL_ENV=$( python3 -c 'import sys; print(sys.prefix)' )
+  else
+    yb_activate_virtualenv "${virtualenv_parent_dir}"
+  fi
 
 
   if [[ ${YB_DEBUG_VIRTUALENV:-0} == "1" ]]; then
