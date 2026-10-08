@@ -1951,6 +1951,13 @@ find_or_download_thirdparty() {
 }
 
 find_or_download_ysql_snapshots() {
+  # These snapshots are only used by tests. Allow build environments without network access to
+  # skip downloading them.
+  if [[ ${YB_DOWNLOAD_YSQL_SNAPSHOTS:-1} == "0" ]]; then
+    log "Not downloading YSQL sys catalog snapshots because YB_DOWNLOAD_YSQL_SNAPSHOTS=0"
+    return
+  fi
+
   local repo_url="https://github.com/yugabyte/yugabyte-db-ysql-catalog-snapshots"
   local prefix="initial_sys_catalog_snapshot"
 
