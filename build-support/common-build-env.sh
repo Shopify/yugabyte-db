@@ -113,6 +113,21 @@ initialize_yugabyte_bash_common() {
     exit 1
   fi
 
+  # Allow the caller to provide an already populated copy of yugabyte-bash-common, e.g. an
+  # extracted source archive of the commit in yugabyte-bash-common-sha1.txt. This is used by build
+  # systems that do not allow network access during the build. In this case the directory is used
+  # as is: we do not clone, fetch, or check out anything in it.
+  if [[ -n ${YB_BASH_COMMON_DIR:-} ]]; then
+    if [[ ! -f $YB_BASH_COMMON_DIR/src/yugabyte-bash-common.sh ]]; then
+      echo >&2 "YB_BASH_COMMON_DIR is set to '$YB_BASH_COMMON_DIR' but it does not contain" \
+               "src/yugabyte-bash-common.sh"
+      exit 1
+    fi
+    # Other parts of the build expect the "build" directory to exist at this point.
+    mkdir -p "$YB_SRC_ROOT/build"
+    return
+  fi
+
   # Put this submodule-like directory under "build".
   YB_BASH_COMMON_DIR=$YB_SRC_ROOT/build/yugabyte-bash-common
 
