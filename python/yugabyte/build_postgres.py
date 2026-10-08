@@ -687,12 +687,17 @@ class PostgresBuilder(YbBuildToolBase):
             logging.warning(f"Failed to interpret git version: {e}")
             return None
 
-    def get_build_stamp(self, include_env_vars: bool) -> str:
+    def get_build_stamp(self, include_env_vars: bool) -> Optional[str]:
         """
         Creates a "build stamp" that tries to capture all inputs that might affect the PostgreSQL
         code. This is needed to avoid needlessly rebuilding PostgreSQL, as it takes ~10 seconds
         even if there are no code changes.
+
+        Returns None if the source tree is not a Git checkout (e.g. an extracted source archive),
+        in which case we cannot cheaply tell whether PostgreSQL is up-to-date.
         """
+        if not os.path.exists(os.path.join(YB_SRC_ROOT, '.git')):
+            return None
 
         with WorkDirContext(YB_SRC_ROOT):
             # Postgres files.
@@ -1076,7 +1081,7 @@ class PostgresBuilder(YbBuildToolBase):
                      os.path.relpath(self.build_stamp_path, YB_SRC_ROOT),
                      initial_build_stamp)
 
-        if initial_build_stamp == saved_build_stamp:
+        if initial_build_stamp is not None and initial_build_stamp == saved_build_stamp:
             if self.export_compile_commands and not self.skip_pg_compile_commands:
                 logging.info(
                     "Even though PostgreSQL is already up-to-date in directory %s, we still need "
@@ -1112,7 +1117,10 @@ class PostgresBuilder(YbBuildToolBase):
                 self.verify_pg_config_sanitized()
             # Guard against the code having changed while we were building it.
             final_build_stamp_no_env = self.get_build_stamp(include_env_vars=False)
-            if final_build_stamp_no_env == initial_build_stamp_no_env:
+            if initial_build_stamp is None:
+                logging.info("Not a Git checkout, not writing build stamp file %s",
+                             self.build_stamp_path)
+            elif final_build_stamp_no_env == initial_build_stamp_no_env:
                 logging.info("Updating build stamp file at %s", self.build_stamp_path)
                 with open(self.build_stamp_path, 'w') as build_stamp_file:
                     build_stamp_file.write(initial_build_stamp)

@@ -2202,12 +2202,16 @@ check_python_script_syntax() {
   fi
   pushd "$YB_SRC_ROOT"
   local IFS=$'\n'
-  # Get all .py files in git, ignoring files with skip-worktree bit set (e.g.
-  # through git sparse-checkout), and check their syntax.
-  git ls-files -t '*.py' \
-    | grep -v '^S' \
-    | sed 's/^[[:alpha:]] //' \
-    | xargs -P 8 -n 1 "$YB_SCRIPT_PATH_CHECK_PYTHON_SYNTAX"
+  if [[ -e .git ]]; then
+    # Get all .py files in git, ignoring files with skip-worktree bit set (e.g.
+    # through git sparse-checkout), and check their syntax.
+    git ls-files -t '*.py' \
+      | grep -v '^S' \
+      | sed 's/^[[:alpha:]] //'
+  else
+    # Not a Git checkout, e.g. an extracted source archive.
+    find . -path ./build -prune -o -name '*.py' -type f -print | sed 's#^[.]/##'
+  fi | xargs -P 8 -n 1 "$YB_SCRIPT_PATH_CHECK_PYTHON_SYNTAX"
   popd +0
 }
 
