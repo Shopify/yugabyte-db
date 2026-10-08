@@ -594,8 +594,10 @@ class PostgresBuilder(YbBuildToolBase):
                 '--with-extra-version=-YB-' + self.get_yb_version(),
                 '--enable-depend'
         ]
-        if (not re.search(r'ubuntu2[23]\.04', local_sys_conf().short_os_name_and_version()) or
-                shutil.which('msgfmt')):
+        # Check for msgfmt first: if it is available we do not need to look at the OS version,
+        # which requires /etc/os-release and that is not present in some build sandboxes.
+        if (shutil.which('msgfmt') or
+                not re.search(r'ubuntu2[23]\.04', local_sys_conf().short_os_name_and_version())):
             # With GCC 13 build on Ubuntu 23.04, we run into an error where Postgres configure
             # complains about not finding the msgfmt tool if we try to build Postgres with NLS.
             # This fails on our Ubuntu 23.04 x86_64 build infra Docker image but might work in a
