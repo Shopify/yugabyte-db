@@ -113,6 +113,21 @@ initialize_yugabyte_bash_common() {
     exit 1
   fi
 
+  # Allow the caller to provide an already populated copy of yugabyte-bash-common, e.g. an
+  # extracted source archive of the commit in yugabyte-bash-common-sha1.txt. This is used by build
+  # systems that do not allow network access during the build. In this case the directory is used
+  # as is: we do not clone, fetch, or check out anything in it.
+  if [[ -n ${YB_BASH_COMMON_DIR:-} ]]; then
+    if [[ ! -f $YB_BASH_COMMON_DIR/src/yugabyte-bash-common.sh ]]; then
+      echo >&2 "YB_BASH_COMMON_DIR is set to '$YB_BASH_COMMON_DIR' but it does not contain" \
+               "src/yugabyte-bash-common.sh"
+      exit 1
+    fi
+    # Other parts of the build expect the "build" directory to exist at this point.
+    mkdir -p "$YB_SRC_ROOT/build"
+    return
+  fi
+
   # Put this submodule-like directory under "build".
   YB_BASH_COMMON_DIR=$YB_SRC_ROOT/build/yugabyte-bash-common
 
@@ -1936,6 +1951,13 @@ find_or_download_thirdparty() {
 }
 
 find_or_download_ysql_snapshots() {
+  # These snapshots are only used by tests. Allow build environments without network access to
+  # skip downloading them.
+  if [[ ${YB_DOWNLOAD_YSQL_SNAPSHOTS:-1} == "0" ]]; then
+    log "Not downloading YSQL sys catalog snapshots because YB_DOWNLOAD_YSQL_SNAPSHOTS=0"
+    return
+  fi
+
   local repo_url="https://github.com/yugabyte/yugabyte-db-ysql-catalog-snapshots"
   local prefix="initial_sys_catalog_snapshot"
 
@@ -2187,12 +2209,16 @@ check_python_script_syntax() {
   fi
   pushd "$YB_SRC_ROOT"
   local IFS=$'\n'
-  # Get all .py files in git, ignoring files with skip-worktree bit set (e.g.
-  # through git sparse-checkout), and check their syntax.
-  git ls-files -t '*.py' \
-    | grep -v '^S' \
-    | sed 's/^[[:alpha:]] //' \
-    | xargs -P 8 -n 1 "$YB_SCRIPT_PATH_CHECK_PYTHON_SYNTAX"
+  if [[ -e .git ]]; then
+    # Get all .py files in git, ignoring files with skip-worktree bit set (e.g.
+    # through git sparse-checkout), and check their syntax.
+    git ls-files -t '*.py' \
+      | grep -v '^S' \
+      | sed 's/^[[:alpha:]] //'
+  else
+    # Not a Git checkout, e.g. an extracted source archive.
+    find . -path ./build -prune -o -name '*.py' -type f -print | sed 's#^[.]/##'
+  fi | xargs -P 8 -n 1 "$YB_SCRIPT_PATH_CHECK_PYTHON_SYNTAX"
   popd +0
 }
 
@@ -2245,7 +2271,15 @@ activate_virtualenv() {
   [[ -f "${YB_SRC_ROOT}/build/requirements_frozen.txt" ]] \
     || ln -sf "${YB_SRC_ROOT}/requirements_frozen.txt" "${YB_SRC_ROOT}/build/"
 
-  yb_activate_virtualenv "${virtualenv_parent_dir}"
+  if [[ ${YB_USE_EXISTING_PYTHON_ENV:-0} == "1" ]]; then
+    # The caller provides a Python interpreter in PATH that already has the packages from
+    # requirements_frozen.txt installed, e.g. because the build environment has no network access
+    # to install them from PyPI into a virtualenv.
+    log "Using the existing Python environment because YB_USE_EXISTING_PYTHON_ENV=1"
+    VIRTUAL_ENV=$( python3 -c 'import sys; print(sys.prefix)' )
+  else
+    yb_activate_virtualenv "${virtualenv_parent_dir}"
+  fi
 
 
   if [[ ${YB_DEBUG_VIRTUALENV:-0} == "1" ]]; then

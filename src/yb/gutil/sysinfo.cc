@@ -168,9 +168,14 @@ static bool ReadIntFromFile(const char *file, int *value) {
   return false;
 }
 
+// Returns the maximum CPU index from /sys/devices/system/cpu/present, or -1 if that file is not
+// available (e.g. in a container or build sandbox without /sys mounted). In that case
+// InitializeSystemInfo falls back to the number of CPUs.
 static int ReadMaxCPUIndex() {
   char buf[1024];
-  CHECK(SlurpSmallTextFile("/sys/devices/system/cpu/present", buf, arraysize(buf)));
+  if (!SlurpSmallTextFile("/sys/devices/system/cpu/present", buf, arraysize(buf))) {
+    return -1;
+  }
 
   // On a single-core machine, 'buf' will contain the string '0' with a newline.
   if (strcmp(buf, "0\n") == 0) {
