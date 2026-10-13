@@ -1,0 +1,3 @@
+# Preload: run once with --snapshot_dir=<dir>; later scenarios use --from_snapshot=<dir>.
+# Put the (rewritten-on-the-fly) YSQL dump next to this file as preload.sql.
+sql_file preload.sql
