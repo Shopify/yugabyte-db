@@ -1,0 +1,16 @@
+# Lab box: master pinned to 96 CPUs to match the prod master shape. Run from the repo root:
+#   build/latest/bin/master-load-bench --flagfile=src/yb/tools/master_load_bench/bench-linux.flags \
+#     --num_tservers=100 --sql_file=<roles.sql>,<tablespaces.sql>,<dump.sql> --csv_path=mlb.csv
+# The SQL files and topology come from prepare.py --out-dir; see its --help.
+# Restart on the same data: add --resume (and drop --sql_file).
+--master_bin=build/latest/bin/yb-master
+--tserver_bin=build/latest/bin/yb-tserver
+--data_dir=/tmp/mlb
+--topology=src/yb/tools/master_load_bench/topology.txt
+# Periodic tserver->master RPCs at production cadence (tserver defaults).
+--heartbeat_interval_ms=1000
+--send_lease_refreshes=true
+--connectivity_check_interval_ms=60000
+--master_cpus=0-95
+--master_flags=--flagfile=src/yb/tools/master_load_bench/master.flags,--num_reactor_threads=192
+--tserver_flags=--flagfile=src/yb/tools/master_load_bench/tserver.flags
