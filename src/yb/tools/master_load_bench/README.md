@@ -269,9 +269,17 @@ the bench's own counters `bench_rpc_<Method>_{ok_total,failed_total,latency_us_s
 and `bench_ysql_connect_{...}`. Written immediately rather than per sample: `mark,<label>` and
 `bench_sql_<name|lineN>_latency_ms` per `sql` statement.
 
-`report.py` reads one or more CSVs and prints, per window between marks, master CPU and RSS,
-per-method rate and mean latency, queue depth, failures and `sql` latencies; with two CSVs the
-windows are shown side by side with deltas.
+`report.py` prints, per window between marks, master CPU and RSS, per-method rate and mean
+latency, queue depth, failures and `sql` latencies:
+
+```
+python3 src/yb/tools/master_load_bench/report.py /tmp/mlb-smoke.csv
+python3 src/yb/tools/master_load_bench/report.py before.csv after.csv
+```
+
+The two-file form compares a run before a master change with one after: each window shows both
+runs side by side with the delta per metric. The bench appends to an existing `--csv`, so a file
+can hold several runs; the report takes the last one and says so.
 
 ## Files
 
