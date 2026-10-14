@@ -1,0 +1,79 @@
+# Exercises every scenario directive on a resumed prod-schema cluster.
+database globaldb
+
+mark baseline
+sleep 20s
+
+# sql: once, multi-line block, repetition, sql_file. User tables live on the hollow tservers,
+# which store nothing, so only DDL and catalog queries work. The DDL bumps the catalog
+# version, so the log should show another "Recorded catalog batch" after it.
+mark ddl
+sql: DROP TABLE IF EXISTS mlb_smoke
+sql: CREATE TABLE mlb_smoke (id int PRIMARY KEY, v text) SPLIT INTO 3 TABLETS
+sql: <<
+  SELECT relname, relkind FROM pg_class
+  WHERE relname LIKE 'mlb_smoke%';
+>>
+sql count=5 interval=1s name=smoke_count: SELECT count(*) FROM pg_attribute
+sql_file smoke.sql
+
+# Functions: @iter() in a repeat, @seq() in a counted sql; each creates distinct tables.
+mark functions
+repeat count=3 <<
+  sql: CREATE TABLE mlb_smoke_@iter() (id int PRIMARY KEY) SPLIT INTO 1 TABLETS
+  # Table lookups go by id; catalog tables have fixed ids (pg_class in template1 here).
+  rpc method=GetTableSchema ts=1: table { table_id: "000000010000300080010000000004eb" }
+  rpc method=GetTableLocations ts=1: <<
+    table { table_id: "000000010000300080010000000004eb" } max_returned_locations: @iter()
+  >>
+>>
+sql count=3 interval=1s name=seq_create: CREATE TABLE mlb_smoke_s@seq() (id int PRIMARY KEY)
+sql count=3 interval=1s name=seq_drop: DROP TABLE mlb_smoke_s@seq()
+# @index(): tserver N lists mlb_smoke_N.
+rpc method=ListTables ts=1-3 count=2 interval=1s: <<
+  name_filter: "mlb_smoke_@index()" exclude_system_tables: true
+>>
+repeat count=3 <<
+  sql: DROP TABLE mlb_smoke_@iter()
+>>
+
+# rpc: the three built-in methods, generic ones with an empty request, and bodies in protobuf
+# text format; @uuid() makes each sender's request its own.
+mark storms
+rpc method=ListTabletServers ts=all
+rpc method=ListNamespaces ts=1-5
+rpc method=ListNamespaces ts=1-5: database_type: YQL_DATABASE_PGSQL
+rpc method=GetMasterRegistration ts=3 count=3 interval=500ms
+rpc method=AreNodesSafeToTakeDown ts=1-5: tserver_uuids: "@uuid()" follower_lag_bound_ms: 1000
+parallel <<
+  rpc method=TSHeartbeat ts=1-20 interval=100ms duration=30s
+  rpc method=RefreshYsqlLease ts=21-30 interval=0 duration=30s
+>>
+sleep 5s
+
+# ysql_connect: once from one tserver, once from every tserver, then a 20 s stream from 10.
+mark connections
+ysql_connect ts=1
+ysql_connect ts=all
+ysql_connect ts=1-10 interval=2s duration=20s
+
+# Named runs without duration, stopped from a serial branch; repeat with DDL inside.
+mark mixed
+parallel <<
+  rpc name=hb_storm method=TSHeartbeat ts=31-60 interval=200ms
+  ysql_connect name=conn_storm ts=61-70 interval=1s
+  serial <<
+    repeat count=3 <<
+      sql: ALTER TABLE mlb_smoke ADD COLUMN c int
+      sql: ALTER TABLE mlb_smoke DROP COLUMN c
+      sleep 2s
+    >>
+    stop hb_storm
+    stop conn_storm
+  >>
+>>
+
+mark teardown
+sql: DROP TABLE mlb_smoke
+sleep 10s
+mark end
