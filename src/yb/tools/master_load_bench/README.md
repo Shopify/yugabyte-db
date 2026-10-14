@@ -54,6 +54,32 @@ files into the build (`build/latest`, or `--build-dir`). Postgres only looks in 
 
 The last line printed is the `--topology=… --sql_file=…` pair to pass to the bench.
 
+Neither file has to come from a dump. A topology is one `cloud region zone percent` line per
+zone, `#` comments allowed, percentages adding up to 100; hollow tservers are spread over the
+zones by those percentages and register with these placements. `--sql_file` takes any SQL
+files, run in order through ysqlsh.
+
+```
+# cloud region zone percent
+gcp us-east1 us-east1-b 40
+gcp us-east1 us-east1-c 30
+gcp us-east1 us-east1-d 30
+```
+
+Replication comes from one of two places. A table that names no tablespace gets the cluster
+default: `--replication_factor` (default 7, production's value) spread evenly over the
+topology's regions. A table with a tablespace gets the tablespace's `replica_placement`, which
+is how the production dump sets RF5 or RF7 and pins tables to regions; the zones it names must
+exist in the topology or the master cannot place the replicas:
+
+```
+CREATE TABLESPACE rf5_us_east1 WITH (replica_placement='{"num_replicas":5,"placement_blocks":[
+  {"cloud":"gcp","region":"us-east1","zone":"us-east1-b","min_num_replicas":2},
+  {"cloud":"gcp","region":"us-east1","zone":"us-east1-c","min_num_replicas":1},
+  {"cloud":"gcp","region":"us-east1","zone":"us-east1-d","min_num_replicas":2}]}');
+CREATE TABLE t (id int PRIMARY KEY) TABLESPACE rf5_us_east1;
+```
+
 Options not used today, kept for when the load has to be cut down:
 
 - `--drop-stats`: removes every `SELECT * FROM pg_catalog.pg_restore_*_stats(...)` call
@@ -73,6 +99,9 @@ build/latest/bin/master-load-bench --flagfile=src/yb/tools/master_load_bench/ben
     --sql_file=/tmp/mlb-prep/roles.sql,/tmp/mlb-prep/extracted_YSQLDump_tablespaces,/tmp/mlb-prep/extracted_YSQLDump \
     --csv_path=/tmp/mlb.csv
 ```
+
+`bench.flags` is for a Mac; on Linux use `bench-linux.flags` in every command below, which
+pins the master to 96 cores and sizes the reactors for a 192-core box.
 
 The bench wipes `--data_dir` (`/tmp/mlb` from bench.flags), starts the master and real
 tserver, and spreads `--num_tservers` hollow tservers over the topology zones: each zone gets
@@ -137,10 +166,21 @@ from.
 
 ## 6. Scenario file
 
-`--scenario=<file>` runs after `--sql_file` (or after a resume/restore). One directive per line,
-parameters as `key=value` before any free text, `#` starts a comment. Directives run top to
-bottom and each blocks until done; `parallel` is the only way two overlap. Durations take
-`ms`, `s`, `m`, `h`.
+`--scenario=<file>` runs after `--sql_file`, or after a resume or restore. Scenarios normally
+run from a snapshot so every run starts from the same state:
+
+```
+build/latest/bin/master-load-bench --flagfile=src/yb/tools/master_load_bench/bench.flags \
+    --from_snapshot=/tmp/mlb-snapshot --scenario=src/yb/tools/master_load_bench/smoke.scenario \
+    --csv_path=/tmp/mlb-smoke.csv
+```
+
+or, on the data left by the previous run, with `--resume` in place of `--from_snapshot`. After
+the last directive the cluster idles until Ctrl-C or `--run_seconds`, as after a load.
+
+One directive per line, parameters as `key=value` before any free text, `#` starts a comment.
+Directives run top to bottom and each blocks until done; `parallel` is the only way two
+overlap. Durations take `ms`, `s`, `m`, `h`.
 
 ### Directives
 
