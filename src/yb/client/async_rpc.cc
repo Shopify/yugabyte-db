@@ -81,6 +81,35 @@ METRIC_DEFINE_counter(server, consistent_prefix_failed_reads,
     yb::MetricUnit::kRequests,
     "Number of consistent prefix reads that failed to be served by the closest replica.");
 
+METRIC_DEFINE_counter(server, consistent_prefix_read_local_selections,
+    "Consistent-prefix closest-replica selections targeting the origin tserver",
+    yb::MetricUnit::kRequests,
+    "Origin-side non-null consistent-prefix closest-replica selections matching the known origin "
+    "tserver UUID. Counts selections, not successful serving or SQL statements; excludes "
+    "leader-oriented retries.");
+
+METRIC_DEFINE_counter(server, consistent_prefix_read_local_replica_missing,
+    "Consistent-prefix closest-replica selections with no local replica",
+    yb::MetricUnit::kRequests,
+    "Origin-side non-null consistent-prefix closest-replica selections targeting a remote server "
+    "when the known origin tserver UUID is absent from the selection's replica snapshot. Counts "
+    "selections, not successful serving or SQL statements; excludes leader-oriented retries.");
+
+METRIC_DEFINE_counter(server, consistent_prefix_read_local_replica_excluded,
+    "Consistent-prefix closest-replica selections with an excluded local replica",
+    yb::MetricUnit::kRequests,
+    "Origin-side non-null consistent-prefix closest-replica selections targeting a remote server "
+    "when the known origin replica is present but excluded from eligible candidates in that "
+    "snapshot. Counts selections, not successful serving or SQL statements; excludes "
+    "leader-oriented retries.");
+
+METRIC_DEFINE_counter(server, consistent_prefix_read_locality_unknown,
+    "Consistent-prefix closest-replica selections with unknown locality",
+    yb::MetricUnit::kRequests,
+    "Origin-side non-null consistent-prefix closest-replica selections whose locality or local "
+    "bypass reason cannot be established, including an unknown origin tserver UUID. Counts "
+    "selections, not successful serving or SQL statements; excludes leader-oriented retries.");
+
 METRIC_DEFINE_counter(server, skip_intents_writes,
     "Number of writes that have skipped intents db within a transaction.",
     yb::MetricUnit::kRequests,
@@ -160,6 +189,14 @@ AsyncRpcMetrics::AsyncRpcMetrics(const scoped_refptr<yb::MetricEntity>& entity)
       consistent_prefix_successful_reads(
           METRIC_consistent_prefix_successful_reads.Instantiate(entity)),
       consistent_prefix_failed_reads(METRIC_consistent_prefix_failed_reads.Instantiate(entity)),
+      consistent_prefix_read_local_selections(
+          METRIC_consistent_prefix_read_local_selections.Instantiate(entity)),
+      consistent_prefix_read_local_replica_missing(
+          METRIC_consistent_prefix_read_local_replica_missing.Instantiate(entity)),
+      consistent_prefix_read_local_replica_excluded(
+          METRIC_consistent_prefix_read_local_replica_excluded.Instantiate(entity)),
+      consistent_prefix_read_locality_unknown(
+          METRIC_consistent_prefix_read_locality_unknown.Instantiate(entity)),
       skip_intents_writes(METRIC_skip_intents_writes.Instantiate(entity)) {
 }
 

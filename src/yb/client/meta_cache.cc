@@ -642,8 +642,13 @@ bool RemoteTablet::HasLeader() const {
 }
 
 void RemoteTablet::GetRemoteTabletServers(
-    std::vector<RemoteTabletServer*>* servers, IncludeFailedReplicas include_failed_replicas) {
+    std::vector<RemoteTabletServer*>* servers, IncludeFailedReplicas include_failed_replicas,
+    ReplicaSelectionDiagnostics* diagnostics) {
   DCHECK(servers->empty());
+  if (diagnostics) {
+    diagnostics->local_replica_present = false;
+    diagnostics->local_replica_eligible = false;
+  }
   struct ReplicaUpdate {
     std::shared_ptr<RemoteReplica> replica;
     tablet::RaftGroupStatePB new_state;
@@ -655,6 +660,11 @@ void RemoteTablet::GetRemoteTabletServers(
     int num_alive_live_replicas = 0;
     int num_alive_read_replicas = 0;
     for (auto& replica : replicas_) {
+      if (diagnostics && !diagnostics->local_tserver_uuid.empty() &&
+          replica->ts->permanent_uuid() == diagnostics->local_tserver_uuid) {
+        // Presence must come from the same snapshot as the candidates, before failure filtering.
+        diagnostics->local_replica_present = true;
+      }
       if (replica->Failed()) {
         if (include_failed_replicas) {
           servers->push_back(replica->ts);

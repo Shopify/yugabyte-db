@@ -35,6 +35,7 @@
 #include <shared_mutex>
 #include <map>
 #include <string>
+#include <string_view>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -217,6 +218,14 @@ using TabletServerMap = UnorderedStringMap<TabletServerId, std::unique_ptr<Remot
 YB_STRONGLY_TYPED_BOOL(UpdateLocalTsState);
 YB_STRONGLY_TYPED_BOOL(IncludeFailedReplicas);
 
+struct ReplicaSelectionDiagnostics {
+  // Owned by the client. Empty when the origin or selection semantics are unknown.
+  std::string_view local_tserver_uuid;
+  bool local_replica_present = false;
+  // Filled by SelectTServer after cache and blacklist filtering.
+  bool local_replica_eligible = false;
+};
+
 struct ReplicasCount {
   ReplicasCount(int expected_live_replicas, int expected_read_replicas) {
     SetExpectedReplicas(expected_live_replicas, expected_read_replicas);
@@ -337,7 +346,8 @@ class RemoteTablet : public RefCountedThreadSafe<RemoteTablet> {
   // wait for some time (configurable) before retrying.
   void GetRemoteTabletServers(
       std::vector<RemoteTabletServer*>* servers,
-      IncludeFailedReplicas include_failed_replicas = IncludeFailedReplicas::kFalse);
+      IncludeFailedReplicas include_failed_replicas = IncludeFailedReplicas::kFalse,
+      ReplicaSelectionDiagnostics* diagnostics = nullptr);
 
   std::vector<RemoteTabletServer*> GetRemoteTabletServers(
       IncludeFailedReplicas include_failed_replicas = IncludeFailedReplicas::kFalse) {

@@ -15,6 +15,7 @@
 
 #include "yb/client/tablet_rpc.h"
 
+#include "yb/client/async_rpc.h"
 #include "yb/client/client-internal.h"
 #include "yb/client/client.h"
 #include "yb/client/client_error.h"
@@ -33,6 +34,7 @@
 #include "yb/util/debug-util.h"
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
+#include "yb/util/metrics.h"
 #include "yb/util/result.h"
 #include "yb/util/sync_point.h"
 #include "yb/util/trace.h"
@@ -108,10 +110,27 @@ void TabletInvoker::SelectTabletServerWithConsistentPrefix() {
     }
   }
 
+  const auto* metrics = rpc_ ? rpc_->async_rpc_metrics() : nullptr;
+  ReplicaSelectionDiagnostics diagnostics;
   std::vector<RemoteTabletServer*> candidates;
-  current_ts_ = client_->data_->SelectTServer(tablet_.get(),
-                                              YBClient::ReplicaSelection::CLOSEST_REPLICA, {},
-                                              &candidates);
+  current_ts_ = client_->data_->SelectTServer(
+      tablet_.get(), YBClient::ReplicaSelection::CLOSEST_REPLICA, {}, &candidates,
+      metrics ? &diagnostics : nullptr);
+  if (metrics && current_ts_) {
+    // Record the choice before dispatch: inline completion can destroy the RPC and this invoker.
+    if (diagnostics.local_tserver_uuid.empty()) {
+      IncrementCounter(metrics->consistent_prefix_read_locality_unknown);
+    } else if (current_ts_->permanent_uuid() == diagnostics.local_tserver_uuid) {
+      IncrementCounter(metrics->consistent_prefix_read_local_selections);
+    } else if (!diagnostics.local_replica_present) {
+      IncrementCounter(metrics->consistent_prefix_read_local_replica_missing);
+    } else if (!diagnostics.local_replica_eligible) {
+      IncrementCounter(metrics->consistent_prefix_read_local_replica_excluded);
+    } else {
+      // An eligible local replica should win; do not assign a bypass reason if it did not.
+      IncrementCounter(metrics->consistent_prefix_read_locality_unknown);
+    }
+  }
   VLOG(1) << "Using tserver: " << yb::ToString(current_ts_);
 }
 
