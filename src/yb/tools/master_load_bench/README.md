@@ -10,7 +10,7 @@ All commands run from the repo root.
 ## 1. Get the dump from the backup bucket
 
 The bucket, project and object layout are GlobalDB specific, so the download script lives in
-the globaldb-yugabyte repo:
+the globaldb-yugabyte repo, on its `fetch-backup-ysql-dump` branch until that merges:
 
 ```
 python3 ~/src/github.com/Shopify/globaldb-yugabyte/tools/scripts/fetch_backup_ysql_dump.py \
@@ -99,6 +99,16 @@ same UUIDs and zones (read from `meta.txt`, so `--topology` and `--num_tservers`
 needed) and re-report their tablets. After `Resume complete` the cluster idles as in step 3.
 Changing the fleet means a fresh load, not a resume.
 
+**macOS: keep the fleet small.** A resume or restore with 162 tservers and ~113k tablets hangs the
+master for good. The master logs one INFO line per reported tablet and one per lease grant, so
+during the registration storm every heartbeat handler (up to `--rpc_workers_limit`, 4096 in
+`master.flags`) ends up queued as a writer on glog's lock, a `pthread_rwlock`. Once ~3000 of them
+are queued, macOS loses the handoff: the lock is free, nobody is woken, the master sits at 0% CPU
+and TSHeartbeat/RefreshYsqlLease time out until it is killed. Observed 2026-10-14; lldb showed the
+lock words with the held bit clear and grants minus releases equal to the waiter count. The same
+snapshot resumes fine on Linux, whose futex-based rwlock just gets slow. Use the full fleet on
+Linux; on a Mac stay at a few dozen tservers.
+
 ## 5. Snapshot and start from a snapshot
 
 A snapshot is a copy of the data dir taken after the processes are stopped, so one load can
@@ -125,6 +135,144 @@ This copies the snapshot back into `--data_dir` and then behaves like `--resume`
 metadata stores absolute paths, so a snapshot only restores into the `--data_dir` it was taken
 from.
 
+## 6. Scenario file
+
+`--scenario=<file>` runs after `--sql_file` (or after a resume/restore). One directive per line,
+parameters as `key=value` before any free text, `#` starts a comment. Directives run top to
+bottom and each blocks until done; `parallel` is the only way two overlap. Durations take
+`ms`, `s`, `m`, `h`.
+
+### Directives
+
+| Directive | Meaning |
+|---|---|
+| `sql [keys]: <statement>` | Run the statement through one ysqlsh session on the real tserver. `sql [keys]: << ... >>` runs a multi-line block. The colon is always present. DDL and catalog queries only: user tables live on the hollow tservers, which store nothing, so DML or a SELECT on one fails and aborts the run. |
+| `sql_file <path>` | Run a whole file the same way; relative to the scenario file. |
+| `database <name>` | Database for the following `sql`, `sql_file` and catalog batch recordings. |
+| `rpc method=<Name> ts=<sel> [keys][: <body>]` | Send one master RPC from the selected hollow tservers. `method` is the proto method name, see [RPC methods](#rpc-methods); an unknown name fails the parse. The optional body after the colon is the request in protobuf text format; `: << ... >>` for a multi-line one. |
+| `ysql_connect ts=<sel> [keys]` | Simulate new YSQL connections on the selected hollow tservers: each replays the catalog Read batch recorded from a fresh connection on the real tserver, stamped with its own last-received catalog version and a fresh read time. Every connection sends the batch. |
+| `sleep <dur>` | Pause. |
+| `mark <label>` | Write a `mark` row to the CSV and set the `phase` column for the rows that follow. |
+| `stop <name>` | End the named directive early. |
+| `serial << ... >>` | Run the members in order; a sequential branch inside `parallel`. |
+| `parallel << ... >>` | Start all members together, end when the last one ends. |
+| `repeat count=N << ... >>` | Run the block N times in order. |
+
+Repetition keys, shared by `sql`, `rpc` and `ysql_connect`:
+
+| Key | Meaning |
+|---|---|
+| `count=N` | Send N times. Default 1. |
+| `interval=<dur>` | Spacing between sends; needs `count`, `duration` or `name`. `interval=0` with a `duration` means do not send (`rpc` and `ysql_connect` only). |
+| `duration=<dur>` | Keep sending at `interval` for this long. |
+| `name=<id>` | Lets `stop <id>` end it from another branch of a `parallel`; with `interval` alone the directive runs until stopped. |
+
+`ts=` is required for `rpc` and `ysql_connect` and selects hollow tservers by number, 1 to
+`--num_tservers`, matching the uuid suffix: `all`, `7`, `1-40`, `3,17,90`.
+
+For `rpc` and `ysql_connect` the directive replaces, for its duration, whatever the selected
+tservers were doing with that method; when it ends they return to the default schedule from the
+flags: `TSHeartbeat` and `RefreshYsqlLease` every 1 s, `ListTabletServers` every 60 s,
+`ysql_connect` as `--ysql_connect_interval_ms` (0 = off), nothing for other methods. Other
+methods are sent with an empty request and count as failed when the response carries an error. So
+`rpc method=TSHeartbeat ts=1-40 interval=100ms duration=60s` is a heartbeat storm from 40
+tservers, and `rpc method=RefreshYsqlLease ts=17 interval=0 duration=120s` silences one.
+
+### RPC methods
+
+Three methods are sent the way a real tserver sends them: `TSHeartbeat` with the tserver's
+registration, tablet report and metrics; `RefreshYsqlLease` with its lease state;
+`ListTabletServers` as the periodic connectivity check; they take no body. Any other method of
+the master services (`src/yb/master/master_*.proto`) is accepted too, goes out with the body
+given after the colon (empty without one), and counts as failed when the response carries an
+error. The body is the request message in protobuf text format and is checked at parse time.
+The master cannot look up a YSQL table by name (schemas make it ambiguous), so a
+`TableIdentifierPB` for one needs `table_id`; `ListTables` with a `name_filter` is the way to
+go by name:
+
+```
+rpc method=ListTables ts=1-10 count=100 interval=50ms: <<
+  namespace { name: "core" database_type: YQL_DATABASE_PGSQL }
+  name_filter: "orders"
+>>
+```
+
+### Functions
+
+`@name()` inside a `sql` statement or an `rpc` body is replaced before every send:
+
+| Function | Value |
+|---|---|
+| `@iter()` | Iteration of the innermost enclosing `repeat`, from 1. Parse error outside `repeat`. |
+| `@seq()` | Send number within the directive, from 1; 1 for a directive that sends once. |
+| `@uuid()` | Sending hollow tserver's uuid. `rpc` only. |
+| `@index()` | Sending hollow tserver's `ts=` number. `rpc` only. |
+
+A `@` not followed by one of these names and `()` is left as written, so SQL operators such as
+`@>` are unaffected. `sql_file` contents are not expanded.
+
+```
+repeat count=50 <<
+  sql: CREATE TABLE t_@iter() (k int PRIMARY KEY) SPLIT INTO 3 TABLETS;
+>>
+sql count=20 interval=1s: CREATE TABLE t_@seq() (k int PRIMARY KEY);
+```
+
+Nesting alternates: `parallel` directly inside `parallel`, or `serial` directly inside `serial`,
+is a parse error because it means the same as the flattened block.
+
+### Examples
+
+```
+mark baseline
+sleep 60s
+
+mark ddl_only
+sql count=20 interval=3s: ALTER TABLE core.orders ADD COLUMN c1 int;
+
+mark ddl_with_connections
+parallel <<
+  ysql_connect ts=all interval=1s duration=60s
+  sql count=20 interval=3s: ALTER TABLE core.orders ADD COLUMN c2 int;
+>>
+```
+
+```
+repeat count=3 <<
+  parallel <<
+    rpc name=hb_storm method=TSHeartbeat ts=1-40 interval=100ms duration=300s
+    serial <<
+      sql count=10 interval=2s: ALTER TABLE core.orders ADD COLUMN c int;
+      sql: ALTER TABLE core.orders DROP COLUMN c;
+      stop hb_storm
+    >>
+  >>
+  sleep 60s
+>>
+```
+
+### Catalog batch recording
+
+After the preload (or on restore) the bench opens one fresh connection on the real tserver; the
+relay records the sys catalog Read batch that connection's catalog preload sends to the master.
+Whenever a TSHeartbeat response carries a new catalog version the bench opens another connection
+and re-records, so `ysql_connect` always replays what a backend would read now. The real
+tserver runs with production's `ysql_catalog_preload_additional_table_list` (tserver.flags), so
+the batch has production's shape and the internal relcache-init connection is never involved.
+
+### Output
+
+The CSV is long format, one row per metric per 5 s sample: `epoch_ms, elapsed_sec, phase,
+metric, value`. Per sample: master CPU seconds and RSS, the master Prometheus series matching
+`--metric_substrings` (per-method handler latency, queue depth and time, overflows, bytes), and
+the bench's own counters `bench_rpc_<Method>_{ok_total,failed_total,latency_us_sum,latency_count}`
+and `bench_ysql_connect_{...}`. Written immediately rather than per sample: `mark,<label>` and
+`bench_sql_<name|lineN>_latency_ms` per `sql` statement.
+
+`report.py` reads one or more CSVs and prints, per window between marks, master CPU and RSS,
+per-method rate and mean latency, queue depth, failures and `sql` latencies; with two CSVs the
+windows are shown side by side with deltas.
+
 ## Files
 
 | File | Purpose |
@@ -133,3 +281,4 @@ from.
 | `master.flags`, `tserver.flags` | flags for the spawned master and real tserver |
 | `prepare.py` | step 2 |
 | `preload.scenario` | example `--scenario` file (directives run after `--sql_file`) |
+| `report.py` | step 6 output post-processing |
