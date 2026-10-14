@@ -7,3 +7,4 @@
 --rpc_workers_limit=4096
 --master_svc_queue_length=5000
 --master_tserver_svc_queue_length=10000
+--stack_trace_symbolize=false
