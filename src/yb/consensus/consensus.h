@@ -288,9 +288,14 @@ class Consensus {
 
   // Returns a copy of the committed state of the Consensus system. Also allows returning the
   // leader lease status captured under the same lock.
+  //
+  // deadline bounds the wait for the replica state lock. Past the deadline the committed state
+  // comes from the consensus metadata cache and leader_lease_status, when requested, is
+  // NO_MAJORITY_REPLICATED_LEASE.
   virtual ConsensusStatePB ConsensusState(
       ConsensusConfigType type,
-      LeaderLeaseStatus* leader_lease_status = nullptr) const = 0;
+      LeaderLeaseStatus* leader_lease_status = nullptr,
+      CoarseTimePoint deadline = CoarseTimePoint::max()) const = 0;
 
   // Returns a copy of the committed state of the Consensus system, assuming caller holds the needed
   // locks.

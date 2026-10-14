@@ -40,6 +40,8 @@ DEFINE_RUNTIME_bool(tserver_heartbeat_metrics_add_drive_data, true,
 DEFINE_RUNTIME_bool(tserver_heartbeat_metrics_add_replication_status, true,
             "Add replication status to metrics tserver sends to master");
 
+DECLARE_int32(heartbeat_consensus_lock_wait_ms);
+
 DEFINE_RUNTIME_bool(tserver_heartbeat_metrics_add_leader_info, true,
             "Add leader info to metrics tserver sends to master");
 
@@ -100,7 +102,9 @@ void TServerMetricsHeartbeatDataProvider::DoAddData(
             if (consensus_result) {
               MicrosTime ht_lease_exp;
               consensus::LeaderLeaseStatus leader_lease_status =
-                  consensus_result.get()->GetLeaderLeaseStatusIfLeader(&ht_lease_exp);
+                  consensus_result.get()->GetLeaderLeaseStatusIfLeader(
+                      &ht_lease_exp,
+                      CoarseMonoClock::Now() + FLAGS_heartbeat_consensus_lock_wait_ms * 1ms);
               auto leader_info = req->add_leader_info();
               leader_info->set_tablet_id(tablet_peer->tablet_id());
               leader_info->set_leader_lease_status(leader_lease_status);

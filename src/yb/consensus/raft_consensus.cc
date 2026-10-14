@@ -3514,9 +3514,13 @@ OpId RaftConsensus::GetPendingConfigOpId() const {
   return state_->GetPendingConfigOpIdFromRbsUnlocked();
 }
 
-LeaderLeaseStatus RaftConsensus::GetLeaderLeaseStatusIfLeader(MicrosTime* ht_lease_exp) const {
-  auto lock = state_->LockForRead();
+LeaderLeaseStatus RaftConsensus::GetLeaderLeaseStatusIfLeader(
+    MicrosTime* ht_lease_exp, CoarseTimePoint deadline) const {
   LeaderLeaseStatus leader_lease_status = LeaderLeaseStatus::NO_MAJORITY_REPLICATED_LEASE;
+  auto lock = state_->LockForRead(deadline);
+  if (!lock.owns_lock()) {
+    return leader_lease_status;
+  }
   if (GetRoleUnlocked() == PeerRole::LEADER) {
     leader_lease_status = GetLeaderLeaseStatusUnlocked(ht_lease_exp);
   }
@@ -3541,8 +3545,18 @@ LeaderLeaseStatus RaftConsensus::GetLeaderLeaseStatusUnlocked(MicrosTime* ht_lea
 
 ConsensusStatePB RaftConsensus::ConsensusState(
     ConsensusConfigType type,
-    LeaderLeaseStatus* leader_lease_status) const {
-  auto lock = state_->LockForRead();
+    LeaderLeaseStatus* leader_lease_status,
+    CoarseTimePoint deadline) const {
+  auto lock = state_->LockForRead(deadline);
+  if (!lock.owns_lock()) {
+    // The holder of the lock cannot change the role or the committed config without the lock, so
+    // the cache describes the committed state as the holder left it. Only the lease status is
+    // unknown.
+    if (leader_lease_status) {
+      *leader_lease_status = LeaderLeaseStatus::NO_MAJORITY_REPLICATED_LEASE;
+    }
+    return state_->GetConsensusStateFromCache();
+  }
   return ConsensusStateUnlocked(type, leader_lease_status);
 }
 

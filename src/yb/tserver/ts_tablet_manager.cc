@@ -303,6 +303,12 @@ DEFINE_test_flag(int32, sleep_after_tombstoning_tablet_secs, 0,
 DEFINE_UNKNOWN_bool(enable_restart_transaction_status_tablets_first, true,
             "Set to true to prioritize bootstrapping transaction status tablets first.");
 
+DEFINE_RUNTIME_int32(heartbeat_consensus_lock_wait_ms, 100,
+    "How long the master heartbeat path waits for one tablet's replica state lock. Past this the "
+    "tablet report uses the committed consensus state cache and the leader info reports no "
+    "lease, so a stalled tablet cannot stop the tserver from heartbeating.");
+TAG_FLAG(heartbeat_consensus_lock_wait_ms, advanced);
+
 DEFINE_RUNTIME_int32(bg_superblock_flush_interval_secs, 60,
     "The interval at which tablet superblocks are flushed to disk (if dirty) by a background "
     "thread. Applicable only when lazily_flush_superblock is enabled. 0 indicates that the "
@@ -3234,8 +3240,9 @@ void TSTabletManager::CreateReportedTabletPB(const TabletPeerPtr& tablet_peer,
   auto consensus_result = tablet_peer->GetConsensus();
   if (consensus_result) {
     auto consensus = *consensus_result;
-    *reported_tablet->mutable_committed_consensus_state() =
-        consensus->ConsensusState(consensus::CONSENSUS_CONFIG_COMMITTED);
+    *reported_tablet->mutable_committed_consensus_state() = consensus->ConsensusState(
+        consensus::CONSENSUS_CONFIG_COMMITTED, /* leader_lease_status = */ nullptr,
+        CoarseMonoClock::Now() + FLAGS_heartbeat_consensus_lock_wait_ms * 1ms);
     OpId pending_config_op_id = consensus->GetPendingConfigOpId();
     if (pending_config_op_id.is_valid_not_empty()) {
       pending_config_op_id.ToPB(reported_tablet->mutable_pending_config_op_id());
