@@ -105,6 +105,14 @@ DEFINE_UNKNOWN_double(leader_failure_max_missed_heartbeat_periods, 6.0,
               "The value passed to this flag may be fractional.");
 TAG_FLAG(leader_failure_max_missed_heartbeat_periods, advanced);
 
+DEFINE_RUNTIME_bool(stop_leader_requests_when_update_lock_stalled, true,
+    "When a leader's replica state update lock has been held for longer than the leader failure "
+    "detection period, raft_heartbeat_interval_ms times leader_failure_max_missed_heartbeat_periods, "
+    "stop sending Raft requests to followers so that they elect a new leader for the tablet. "
+    "Requests resume as soon as the lock is released. Off, a stalled leader keeps its followers "
+    "from electing until the lock is released.");
+TAG_FLAG(stop_leader_requests_when_update_lock_stalled, advanced);
+
 DEFINE_test_flag(string, hold_update_lock_tablet_id, "",
     "The prepare thread of this tablet pauses inside DoReplicateBatch while holding the replica "
     "state update lock, until the flag is cleared. Simulates a holder stalled on a page fault.");
@@ -496,6 +504,7 @@ RaftConsensus::RaftConsensus(
       split_parent_tablet_id_(
           cmeta->has_split_parent_tablet_id() ? cmeta->split_parent_tablet_id() : ""),
       clone_source_info_(cmeta->clone_source_info()) {
+  queue_->SetLeaderStallCheck([this] { return UpdateLockStalled(); });
   DCHECK_NOTNULL(log_.get());
 
   if (PREDICT_FALSE(FLAGS_TEST_follower_reject_update_consensus_requests_seconds > 0)) {
@@ -3411,6 +3420,25 @@ PeerRole RaftConsensus::role() const {
 
 LeaderState RaftConsensus::GetLeaderState(bool allow_stale, CoarseTimePoint deadline) const {
   return state_->GetLeaderState(allow_stale, deadline);
+}
+
+bool RaftConsensus::UpdateLockStalled() const {
+  if (!FLAGS_stop_leader_requests_when_update_lock_stalled) {
+    return false;
+  }
+  auto held_since = state_->UpdateLockHeldSince();
+  if (held_since == CoarseTimePoint::max()) {
+    return false;
+  }
+  auto held_for = CoarseMonoClock::Now() - held_since;
+  if (held_for <= ReplicaState::UpdateLockStallThreshold().ToSteadyDuration()) {
+    return false;
+  }
+  YB_LOG_EVERY_N_SECS(WARNING, 1) << state_->LogPrefix()
+      << "Update lock held for " << MonoDelta::FromNanoseconds(
+             std::chrono::duration_cast<std::chrono::nanoseconds>(held_for).count())
+      << ", not sending Raft requests to followers so they can elect a new leader";
+  return true;
 }
 
 std::string RaftConsensus::LogPrefix() {
