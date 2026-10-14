@@ -274,7 +274,7 @@ Result<std::shared_ptr<void>> MasterTabletServiceImpl::AdmitRead(
 Result<std::shared_ptr<tablet::AbstractTablet>> MasterTabletServiceImpl::GetTabletForRead(
   TabletIdView tablet_id, tablet::TabletPeerPtr tablet_peer,
   YBConsistencyLevel consistency_level, tserver::AllowSplitTablet allow_split_tablet,
-  tserver::ReadResponseMsg* resp) {
+  tserver::ReadResponseMsg* resp, CoarseTimePoint deadline) {
   // Ignore looked_up_tablet_peer.
   return master_->catalog_manager()->GetSystemTablet(tablet_id);
 }

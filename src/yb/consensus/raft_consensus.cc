@@ -105,6 +105,10 @@ DEFINE_UNKNOWN_double(leader_failure_max_missed_heartbeat_periods, 6.0,
               "The value passed to this flag may be fractional.");
 TAG_FLAG(leader_failure_max_missed_heartbeat_periods, advanced);
 
+DEFINE_test_flag(string, hold_update_lock_tablet_id, "",
+    "The prepare thread of this tablet pauses inside DoReplicateBatch while holding the replica "
+    "state update lock, until the flag is cleared. Simulates a holder stalled on a page fault.");
+
 DEFINE_UNKNOWN_int32(leader_failure_exp_backoff_max_delta_ms, 20 * 1000,
              "Maximum time to sleep in between leader election retries, in addition to the "
              "regular timeout. When leader election fails the interval in between retries "
@@ -1289,6 +1293,11 @@ Status RaftConsensus::DoReplicateBatch(const ConsensusRounds& rounds, size_t* pr
     }
 #endif
     RETURN_NOT_OK(state_->LockForReplicate(&lock));
+    while (PREDICT_FALSE(!FLAGS_TEST_hold_update_lock_tablet_id.empty()) &&
+           FLAGS_TEST_hold_update_lock_tablet_id == tablet_id()) {
+      YB_LOG_EVERY_N_SECS(INFO, 5) << LogPrefix() << "Holding the update lock for the test";
+      SleepFor(10ms);
+    }
     auto current_term = state_->GetCurrentTermUnlocked();
     if (current_term == delayed_step_down_.term) {
       return STATUS_EC_FORMAT(
@@ -3400,8 +3409,8 @@ PeerRole RaftConsensus::role() const {
   return GetRoleUnlocked();
 }
 
-LeaderState RaftConsensus::GetLeaderState(bool allow_stale) const {
-  return state_->GetLeaderState(allow_stale);
+LeaderState RaftConsensus::GetLeaderState(bool allow_stale, CoarseTimePoint deadline) const {
+  return state_->GetLeaderState(allow_stale, deadline);
 }
 
 std::string RaftConsensus::LogPrefix() {

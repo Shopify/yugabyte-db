@@ -286,7 +286,7 @@ class TabletServiceImpl : public TabletServerServiceIf, public ReadTabletProvide
   Result<std::shared_ptr<tablet::AbstractTablet>> GetTabletForRead(
     TabletIdView tablet_id, tablet::TabletPeerPtr tablet_peer,
     YBConsistencyLevel consistency_level, tserver::AllowSplitTablet allow_split_tablet,
-    tserver::ReadResponseMsg* resp) override;
+    tserver::ReadResponseMsg* resp, CoarseTimePoint deadline) override;
 
   Result<uint64_t> DoChecksum(const ChecksumRequestPB* req, CoarseTimePoint deadline);
 

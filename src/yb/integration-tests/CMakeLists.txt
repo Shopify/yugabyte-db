@@ -298,6 +298,7 @@ YB_TEST_TARGET_LINK_LIBRARIES(xcluster_secondary_oid_space-test pg_wrapper_test_
 ADD_YB_TEST(xcluster/xcluster_guarded_lease-test)
 YB_TEST_TARGET_LINK_LIBRARIES(xcluster_guarded_lease-test pg_wrapper_test_base)
 ADD_YB_TEST(retryable_request-test)
+ADD_YB_TEST(update_lock_stall-itest)
 ADD_YB_TEST(upgrade-tests/ash_metadata_upgrade-test)
 ADD_YB_TEST(upgrade-tests/auto_flag_upgrade-test)
 ADD_YB_TEST(upgrade-tests/backup_upgrade-test)

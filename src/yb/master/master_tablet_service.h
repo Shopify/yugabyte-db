@@ -79,7 +79,7 @@ class MasterTabletServiceImpl : public tserver::TabletServiceImpl {
   Result<std::shared_ptr<tablet::AbstractTablet>> GetTabletForRead(
     TabletIdView tablet_id, tablet::TabletPeerPtr tablet_peer,
     YBConsistencyLevel consistency_level, tserver::AllowSplitTablet allow_split_tablet,
-    tserver::ReadResponseMsg* resp) override;
+    tserver::ReadResponseMsg* resp, CoarseTimePoint deadline) override;
 
   // Bounds how many catalog prefetches the leader serves at a time. A fleet-wide event such as a
   // DDL sends every tserver here at once; without a bound they all queue on the leader's RPC

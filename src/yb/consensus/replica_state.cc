@@ -73,6 +73,9 @@ TAG_FLAG(inject_delay_commit_pre_voter_to_voter_secs, hidden);
 
 DEFINE_RUNTIME_bool(enable_lease_revocation, true, "Enables Raft lease revocation mechanism");
 
+DECLARE_int32(raft_heartbeat_interval_ms);
+DECLARE_double(leader_failure_max_missed_heartbeat_periods);
+
 DEFINE_test_flag(bool, follower_fail_retryable_register, false,
                  "Whether the follower will fail on the retryable register");
 
@@ -142,7 +145,7 @@ Status ReplicaState::LockForStart(UniqueLock* lock) const {
 }
 
 bool ReplicaState::IsLocked() const {
-  std::unique_lock<std::mutex> lock(update_lock_, std::try_to_lock);
+  UniqueLock lock(update_lock_, std::try_to_lock);
   return !lock.owns_lock();
 }
 
@@ -150,6 +153,28 @@ ReplicaState::UniqueLock ReplicaState::LockForRead() const {
   SCOPED_WAIT_STATUS(ReplicaState_TakeUpdateLock);
   ThreadRestrictions::AssertWaitAllowed();
   return UniqueLock(update_lock_);
+}
+
+ReplicaState::UniqueLock ReplicaState::LockForRead(CoarseTimePoint deadline) const {
+  SCOPED_WAIT_STATUS(ReplicaState_TakeUpdateLock);
+  ThreadRestrictions::AssertWaitAllowed();
+  return LockMutex(&update_lock_, deadline);
+}
+
+CoarseTimePoint ReplicaState::UpdateLockHeldSince() const {
+  return update_lock_.held_since();
+}
+
+MonoDelta ReplicaState::UpdateLockStallThreshold() {
+  return MonoDelta::FromMilliseconds(static_cast<int64_t>(
+      FLAGS_raft_heartbeat_interval_ms * FLAGS_leader_failure_max_missed_heartbeat_periods));
+}
+
+CoarseTimePoint ReplicaState::UpdateLockWaitDeadline(CoarseTimePoint deadline) {
+  if (deadline == CoarseTimePoint::max()) {
+    return deadline;
+  }
+  return std::min(deadline, CoarseMonoClock::Now() + UpdateLockStallThreshold().ToSteadyDuration());
 }
 
 Status ReplicaState::LockForReplicate(UniqueLock* lock, const ReplicateMsg& msg) const {
@@ -195,13 +220,20 @@ Status ReplicaState::LockForMajorityReplicatedIndexUpdate(UniqueLock* lock) cons
   return Status::OK();
 }
 
-LeaderState ReplicaState::GetLeaderState(bool allow_stale) const {
+LeaderState ReplicaState::GetLeaderState(bool allow_stale, CoarseTimePoint deadline) const {
   auto cache = leader_state_cache_.load(boost::memory_order_acquire);
 
   if (!allow_stale) {
     CoarseTimePoint now = CoarseMonoClock::Now();
     if (now >= cache.expire_at) {
-      auto lock = LockForRead();
+      auto lock = LockForRead(UpdateLockWaitDeadline(deadline));
+      if (!lock.owns_lock()) {
+        return LeaderState {
+          .status = LeaderStatus::LEADER_BUT_NO_MAJORITY_REPLICATED_LEASE,
+          .term = 0,
+          .remaining_old_leader_lease = MonoDelta(),
+        };
+      }
       return RefreshLeaderStateCacheUnlocked(now);
     }
   }
@@ -1472,8 +1504,12 @@ Result<MicrosTime> ReplicaState::MajorityReplicatedHtLeaseExpiration(
   }
 
   if (result != PhysicalComponentLease::NoneValue()) {
-    // Slow path
-    UniqueLock l(update_lock_);
+    // Slow path. The lock wait is bounded like every other wait on the read path, the lease wait
+    // below keeps the caller's own deadline.
+    auto l = LockForRead(UpdateLockWaitDeadline(deadline));
+    if (!l.owns_lock()) {
+      return STATUS_FORMAT(TimedOut, "Timed out waiting for the update lock: $0", min_allowed);
+    }
     auto predicate = [this, &result, min_allowed] {
       // Stop waiting once shutdown starts: the lease may never advance again, and LockForShutdown
       // notifies cond_ so we are woken here.

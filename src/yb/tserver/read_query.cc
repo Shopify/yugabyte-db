@@ -326,7 +326,8 @@ Status ReadQuery::PreferLeaderNotReady(const Status& status) {
       leader_peer_.leader_term != OpId::kUnknownTerm) {
     return status;
   }
-  auto leader_status = ResultToStatus(LeaderTerm(*leader_peer_.peer));
+  auto leader_status =
+      ResultToStatus(LeaderTerm(*leader_peer_.peer, context_.GetClientDeadline()));
   return leader_status.ok() ? status : leader_status;
 }
 
@@ -396,7 +397,7 @@ Status ReadQuery::DoPerform() {
     // carried its isolation inline) and fill in its term.
     leader_peer_ = VERIFY_RESULT(LookupLeaderTablet(
         server_.tablet_peer_lookup(), req_->tablet_id(), resp_,
-        TabletPeerTablet{leader_peer_.peer, leader_peer_.tablet}));
+        TabletPeerTablet{leader_peer_.peer, leader_peer_.tablet}, context_.GetClientDeadline()));
     abstract_tablet_ = VERIFY_RESULT(leader_peer_.peer->shared_tablet());
 
     if (serializable_isolation || has_row_mark) {
@@ -413,7 +414,7 @@ Status ReadQuery::DoPerform() {
   } else {
     abstract_tablet_ = VERIFY_RESULT(read_tablet_provider_.GetTabletForRead(
         req_->tablet_id(), leader_peer_.peer, req_->consistency_level(),
-        AllowSplitTablet::kFalse, resp_));
+        AllowSplitTablet::kFalse, resp_, context_.GetClientDeadline()));
     leader_peer_.leader_term = OpId::kUnknownTerm;
   }
 
@@ -453,7 +454,8 @@ Status ReadQuery::DoPerform() {
       }
     }
   }
-  reading_from_non_leader_ = tablet_peer && !CheckPeerIsLeader(*tablet_peer).ok();
+  reading_from_non_leader_ =
+      tablet_peer && !CheckPeerIsLeader(*tablet_peer, context_.GetClientDeadline()).ok();
   if (PREDICT_FALSE(FLAGS_TEST_assert_reads_served_by_follower)) {
     CHECK_NE(req_->consistency_level(), YBConsistencyLevel::STRONG)
         << "--TEST_assert_reads_served_by_follower is true but consistency level is "
