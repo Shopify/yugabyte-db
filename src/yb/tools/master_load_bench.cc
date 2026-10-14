@@ -33,6 +33,7 @@
 #include <atomic>
 #include <cmath>
 #include <cctype>
+#include <condition_variable>
 #include <deque>
 #include <functional>
 #include <fstream>
@@ -44,6 +45,8 @@
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/dynamic_message.h>
 #include <google/protobuf/io/coded_stream.h>
+#include <google/protobuf/io/tokenizer.h>
+#include <google/protobuf/text_format.h>
 
 #include "yb/client/client.h"
 #include "yb/client/schema.h"
@@ -54,6 +57,7 @@
 #include "yb/common/entity_ids.h"
 #include "yb/common/read_hybrid_time.h"
 #include "yb/common/hybrid_time.h"
+#include "yb/common/pg_catversions.h"
 #include "yb/common/transaction.h"
 #include "yb/common/wire_protocol.h"
 
@@ -68,12 +72,14 @@
 #include "yb/master/master_defaults.h"
 #include "yb/master/master_heartbeat.proxy.h"
 #include "yb/master/master_ysql_lease.proxy.h"
+#include "yb/master/sys_catalog_constants.h"
 
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/proxy.h"
 #include "yb/rpc/remote_method.h"
 #include "yb/rpc/rpc_controller.h"
 #include "yb/rpc/rpc_header.pb.h"
+#include "yb/rpc/service.pb.h"
 #include "yb/rpc/service_pool.h"
 #include "yb/rpc/sidecars.h"
 #include "yb/rpc/thread_pool.h"
@@ -83,6 +89,7 @@
 #include "yb/server/server_base.service.h"
 
 #include "yb/tserver/tserver_admin.service.h"
+#include "yb/tserver/tserver_service.proxy.h"
 #include "yb/tserver/tserver_service.service.h"
 
 #include "yb/util/curl_util.h"
@@ -116,8 +123,15 @@ DEFINE_NON_RUNTIME_string(sql_file, "",
     "Comma-separated SQL files to load in order through ysqlsh once the cluster is up, run "
     "exactly as given; e.g. roles, tablespaces dump, database dump.");
 DEFINE_NON_RUNTIME_string(scenario, "",
-    "Optional directive file run after --sql_file: sql <stmt> | sql << ... >> | "
-    "sql_file <path> | sleep <dur> | database <name> | parallel << ... >>. '#' starts a comment.");
+    "Optional directive file run after --sql_file; one directive per line, key=value parameters "
+    "before free text, '#' comments. sql [keys]: <stmt> | sql [keys]: << ... >> | "
+    "sql_file <path> | rpc method=<Name> ts=<sel> [keys] | ysql_connect ts=<sel> [keys] | "
+    "sleep <dur> | mark <label> | stop <name> | database <name> | serial << ... >> | "
+    "parallel << ... >> | repeat count=N << ... >>. Keys: count, interval, duration, name. "
+    "See master_load_bench/README.md section 6.");
+DEFINE_NON_RUNTIME_int32(ysql_connect_interval_ms, 0,
+    "Default ysql_connect stream: each hollow tserver replays the recorded catalog Read batch "
+    "of a fresh YSQL connection this often; 0 = only when a scenario directive asks for it.");
 DEFINE_NON_RUNTIME_bool(resume, false,
     "Reuse --data_dir from the previous run as-is: master and tserver data are kept, the hollow "
     "tablet registry is reloaded, placement and transactions-table setup are skipped. The fleet "
@@ -213,6 +227,47 @@ CloudInfoPB MakeCloudInfo(const string& zone) {
   cloud.set_placement_zone(zone);
   return cloud;
 }
+
+const char* const kYsqlConnect = "ysql_connect";
+
+// A running rpc/ysql_connect directive: the directive thread waits on it while the scheduler
+// thread executes it on each selected tserver.
+struct ScheduledRun {
+  string method;
+  string name;
+  MonoDelta interval;   // uninitialized: back-to-back / once; kZero: send nothing
+  int64_t count = -1;   // sends per tserver; -1 = until duration or stop
+  MonoDelta duration;   // uninitialized = none
+  string body;          // rpc: request in protobuf text format, functions unexpanded
+  int64_t iter = 1;     // innermost repeat iteration the directive runs in, for @iter()
+  std::shared_ptr<std::atomic<bool>> stop_flag = std::make_shared<std::atomic<bool>>(false);
+  std::atomic<int> active_tservers{0};   // tservers still running this override
+  std::atomic<int64_t> outstanding{0};   // sends in flight attributed to this run
+  std::mutex mutex;
+  std::condition_variable cv;
+
+  bool Done() const { return active_tservers.load() == 0 && outstanding.load() == 0; }
+
+  void Notify() {
+    std::lock_guard l(mutex);
+    cv.notify_all();
+  }
+};
+
+// Scheduler-thread state of one master RPC method (or ysql_connect) on one hollow tserver.
+struct MethodSchedule {
+  MonoTime next;
+  int64_t remaining = -1;             // sends left in the active override; -1 = unlimited
+  int64_t sent = 0;                   // sends started in the active override, for @seq()
+  MonoTime end = MonoTime::Max();     // when the override reverts to the default schedule
+  std::shared_ptr<ScheduledRun> run;  // active override; null = default schedule
+  std::atomic<bool> in_flight{false};
+};
+
+struct CatalogVersion {
+  uint64_t current_version = 0;
+  uint64_t last_breaking_version = 0;
+};
 
 // One fake tserver: identity, hosted tablet replicas, and heartbeat/report/lease state.
 class HollowTServer {
@@ -423,6 +478,16 @@ class HollowTServer {
     if (resp.has_tablet_report_limit()) {
       tablet_report_limit_ = resp.tablet_report_limit();
     }
+    if (resp.has_ysql_catalog_version()) {
+      ysql_catalog_version_ = resp.ysql_catalog_version();
+    }
+    if (resp.has_db_catalog_version_data()) {
+      db_catalog_versions_.clear();
+      for (const auto& v : resp.db_catalog_version_data().db_catalog_versions()) {
+        db_catalog_versions_[v.db_oid()] =
+            CatalogVersion{v.current_version(), v.last_breaking_version()};
+      }
+    }
     if (resp.has_tablet_report()) {
       for (const auto& update : resp.tablet_report().tablets()) {
         dirty_.erase(update.tablet_id());
@@ -464,16 +529,29 @@ class HollowTServer {
 
   uint64_t instance_seqno() const { return instance_seqno_; }
 
+  // Stamps a recorded catalog Read with the versions this tserver last received, as a backend
+  // on it would; fields stay as recorded until the first heartbeat response carried versions.
+  void StampCatalogVersions(tserver::ReadRequestPB* req) {
+    std::lock_guard l(mutex_);
+    for (auto& read : *req->mutable_pgsql_batch()) {
+      if (read.has_ysql_catalog_version() && ysql_catalog_version_ > 0) {
+        read.set_ysql_catalog_version(ysql_catalog_version_);
+      }
+      if (read.has_ysql_db_catalog_version() && read.has_ysql_db_oid()) {
+        auto it = db_catalog_versions_.find(read.ysql_db_oid());
+        if (it != db_catalog_versions_.end()) {
+          read.set_ysql_db_catalog_version(it->second.current_version);
+        }
+      }
+    }
+  }
+
   // Scheduler-thread-only state.
-  MonoTime next_heartbeat;
-  MonoTime next_lease_refresh;
-  MonoTime next_connectivity_check;
+  std::map<string, MethodSchedule> schedules;
   MonoTime last_metrics_beat;
   MonoTime heartbeat_sent_time;
   MonoTime lease_sent_time;
-  std::atomic<bool> heartbeat_in_flight{false};
-  std::atomic<bool> lease_in_flight{false};
-  std::atomic<bool> connectivity_in_flight{false};
+  MonoTime connectivity_sent_time;
 
   // Reused across calls; safe because at most one of each RPC is in flight.
   master::TSHeartbeatRequestPB hb_req;
@@ -506,6 +584,14 @@ class HollowTServer {
     instance->set_permanent_uuid(uuid_);
     instance->set_instance_seqno(instance_seqno_);
     req->clear_registration();
+    // The template carries the real tserver's fingerprint; ours decides whether the master
+    // sends us catalog versions, exactly as for a real tserver.
+    if (db_catalog_versions_.empty()) {
+      req->clear_ysql_db_catalog_versions_fingerprint();
+    } else {
+      req->set_ysql_db_catalog_versions_fingerprint(
+          FingerprintCatalogVersions(db_catalog_versions_));
+    }
     if (!universe_uuid.empty()) {
       req->set_universe_uuid(universe_uuid);
     }
@@ -686,6 +772,8 @@ class HollowTServer {
   std::optional<uint64_t> lease_epoch_ GUARDED_BY(mutex_);
   int64_t last_rtt_us_ GUARDED_BY(mutex_) = 0;
   uint64_t hb_seq_ GUARDED_BY(mutex_) = 0;
+  uint64_t ysql_catalog_version_ GUARDED_BY(mutex_) = 0;
+  std::map<uint32_t, CatalogVersion> db_catalog_versions_ GUARDED_BY(mutex_);
 
  public:
   bool MarkRegistrationInFlight() {
@@ -1107,6 +1195,17 @@ class MirrorState {
       ObserveHeartbeat(body);
       return;
     }
+    if (method == "Read") {
+      last_read_seen_ = MonoTime::Now();
+      if (capturing_) {
+        if (header.sidecar_offsets_size() > 0) {
+          ++capture_skipped_;
+        } else {
+          capture_.push_back(body.ToBuffer());
+        }
+      }
+      return;
+    }
     if (header.sidecar_offsets_size() > 0) {
       return;
     }
@@ -1152,6 +1251,32 @@ class MirrorState {
     ++parse_failures_;
   }
 
+  // Bumps whenever the real tserver's heartbeat carries a new catalog versions fingerprint,
+  // i.e. whenever a fresh backend would read a different catalog.
+  uint64_t CatalogGeneration() {
+    std::lock_guard l(mutex_);
+    return catalog_generation_;
+  }
+
+  MonoTime LastReadSeen() {
+    std::lock_guard l(mutex_);
+    return last_read_seen_;
+  }
+
+  void StartCapture() {
+    std::lock_guard l(mutex_);
+    capture_.clear();
+    capture_skipped_ = 0;
+    capturing_ = true;
+  }
+
+  std::vector<string> StopCapture(size_t* skipped) {
+    std::lock_guard l(mutex_);
+    capturing_ = false;
+    *skipped = capture_skipped_;
+    return std::move(capture_);
+  }
+
   void PrintSummary(std::ostream& out) {
     std::lock_guard l(mutex_);
     out << "captured_from_real_tserver: heartbeats=" << heartbeats_captured_
@@ -1182,6 +1307,11 @@ class MirrorState {
     }
     const auto now = MonoTime::Now();
     ++heartbeats_captured_;
+    if (req.has_ysql_db_catalog_versions_fingerprint() &&
+        req.ysql_db_catalog_versions_fingerprint() != catalog_fingerprint_) {
+      catalog_fingerprint_ = req.ysql_db_catalog_versions_fingerprint();
+      ++catalog_generation_;
+    }
     if (last_heartbeat_.Initialized()) {
       Ewma(&interval_ms_, (now - last_heartbeat_).ToSeconds() * 1000.0);
     }
@@ -1225,6 +1355,12 @@ class MirrorState {
   MonoTime last_metrics_heartbeat_ GUARDED_BY(mutex_);
   double interval_ms_ GUARDED_BY(mutex_) = 0;
   double metrics_period_ms_ GUARDED_BY(mutex_) = 0;
+  uint64_t catalog_fingerprint_ GUARDED_BY(mutex_) = 0;
+  uint64_t catalog_generation_ GUARDED_BY(mutex_) = 0;
+  MonoTime last_read_seen_ GUARDED_BY(mutex_);
+  bool capturing_ GUARDED_BY(mutex_) = false;
+  std::vector<string> capture_ GUARDED_BY(mutex_);
+  size_t capture_skipped_ GUARDED_BY(mutex_) = 0;
 };
 
 // Reassembles the client->master byte stream of one relay connection into RPC calls.
@@ -1453,15 +1589,148 @@ class TcpRelay {
   std::vector<std::thread> pump_threads_;
 };
 
-struct BenchStats {
-  std::atomic<uint64_t> heartbeats_ok{0};
-  std::atomic<uint64_t> heartbeats_failed{0};
-  std::atomic<uint64_t> lease_refreshes_ok{0};
-  std::atomic<uint64_t> lease_refreshes_failed{0};
-  std::atomic<uint64_t> connectivity_checks_ok{0};
-  std::atomic<uint64_t> connectivity_checks_failed{0};
-  std::atomic<uint64_t> heartbeat_rtt_us_sum{0};
-  std::atomic<uint64_t> heartbeat_rtt_count{0};
+// Driver-side counters of one master RPC method (or ysql_connect), sampled into the CSV.
+struct MethodStats {
+  std::atomic<uint64_t> ok{0};
+  std::atomic<uint64_t> failed{0};
+  std::atomic<uint64_t> latency_us_sum{0};
+  std::atomic<uint64_t> latency_count{0};
+
+  void Record(bool success, int64_t latency_us) {
+    (success ? ok : failed).fetch_add(1, std::memory_order_relaxed);
+    latency_us_sum.fetch_add(latency_us, std::memory_order_relaxed);
+    latency_count.fetch_add(1, std::memory_order_relaxed);
+  }
+};
+
+string StatsMetricPrefix(const string& method) {
+  return method == kYsqlConnect ? "bench_ysql_connect_" : "bench_rpc_" + method + "_";
+}
+
+struct MasterMethod {
+  string wire_service;  // custom_service_name shared by the split master services
+  const google::protobuf::MethodDescriptor* descriptor;
+};
+
+// Master RPC methods by proto method name. Names are unique across the master's services, so a
+// scenario names only the method. Services whose descriptors are not linked in are absent.
+const std::map<string, MasterMethod>& MasterMethods() {
+  static const auto* const methods = [] {
+    auto* out = new std::map<string, MasterMethod>();
+    const auto* pool = google::protobuf::DescriptorPool::generated_pool();
+    for (const char* name : {
+             "yb.master.MasterAdmin", "yb.master.MasterBackup", "yb.master.MasterClient",
+             "yb.master.MasterCluster", "yb.master.MasterDcl", "yb.master.MasterDdl",
+             "yb.master.MasterEncryption", "yb.master.MasterHeartbeat",
+             "yb.master.MasterReplication", "yb.master.MasterTest",
+             "yb.master.MasterYsqlLease"}) {
+      const auto* service = pool->FindServiceByName(name);
+      if (service == nullptr) {
+        continue;
+      }
+      auto wire = service->options().GetExtension(rpc::custom_service_name);
+      if (wire.empty()) {
+        wire = service->full_name();
+      }
+      for (int i = 0; i < service->method_count(); ++i) {
+        (*out)[service->method(i)->name()] = MasterMethod{wire, service->method(i)};
+      }
+    }
+    return out;
+  }();
+  return *methods;
+}
+
+bool HasBuiltinSender(const string& method) {
+  return method == "TSHeartbeat" || method == "RefreshYsqlLease" ||
+         method == "ListTabletServers";
+}
+
+google::protobuf::DynamicMessageFactory& DynamicFactory() {
+  static auto* const factory = new google::protobuf::DynamicMessageFactory();
+  return *factory;
+}
+
+// Values of the per-send functions in sql statements and rpc bodies.
+struct SendContext {
+  int64_t iter = 1;                 // innermost repeat iteration, 1-based
+  int64_t seq = 1;                  // send number within the directive, 1-based
+  string uuid = string(32, '0');    // sender's uuid, rpc only
+  int index = 1;                    // sender's ts= number, rpc only
+};
+
+// Replaces every `@name()`. A bare '@' or one followed by anything but `name()` stays as
+// written, so SQL operators like `@>` pass through. `used` collects the names found.
+Result<string> ExpandFunctions(const string& text, const SendContext& ctx,
+                               std::set<string>* used) {
+  string out;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    const auto at = text.find('@', pos);
+    if (at == string::npos) {
+      break;
+    }
+    out.append(text, pos, at - pos);
+    size_t end = at + 1;
+    while (end < text.size() && std::isalpha(static_cast<unsigned char>(text[end]))) {
+      ++end;
+    }
+    const auto name = text.substr(at + 1, end - at - 1);
+    if (name.empty() || text.compare(end, 2, "()") != 0) {
+      out += '@';
+      pos = at + 1;
+      continue;
+    }
+    if (name == "iter") {
+      out += std::to_string(ctx.iter);
+    } else if (name == "seq") {
+      out += std::to_string(ctx.seq);
+    } else if (name == "uuid") {
+      out += ctx.uuid;
+    } else if (name == "index") {
+      out += std::to_string(ctx.index);
+    } else {
+      return STATUS_FORMAT(InvalidArgument, "unknown function @$0()", name);
+    }
+    if (used) {
+      used->insert(name);
+    }
+    pos = end + 2;
+  }
+  out.append(text, pos, string::npos);
+  return out;
+}
+
+class TextFormatErrors : public google::protobuf::io::ErrorCollector {
+ public:
+  void AddError(int line, google::protobuf::io::ColumnNumber column,
+                const std::string& message) override {
+    text += Format("$0$1:$2: $3", text.empty() ? "" : "; ", line + 1, column + 1, message);
+  }
+  string text;
+};
+
+// The body with the functions expanded, parsed into the method's request message.
+Result<std::unique_ptr<google::protobuf::Message>> ParseRequestBody(
+    const MasterMethod& info, const string& body, const SendContext& ctx) {
+  const auto text = VERIFY_RESULT(ExpandFunctions(body, ctx, nullptr));
+  std::unique_ptr<google::protobuf::Message> request(
+      DynamicFactory().GetPrototype(info.descriptor->input_type())->New());
+  google::protobuf::TextFormat::Parser parser;
+  TextFormatErrors errors;
+  parser.RecordErrorsTo(&errors);
+  SCHECK_FORMAT(parser.ParseFromString(text, request.get()), InvalidArgument,
+                "body is not a $0 in protobuf text format: $1",
+                info.descriptor->input_type()->full_name(), errors.text);
+  return request;
+}
+
+// The Read batch a fresh YSQL connection on the real tserver sent to the sys catalog tablet.
+struct CatalogBatch {
+  uint64_t generation = 0;
+  std::vector<tserver::ReadRequestPB> reads;
+  size_t ops = 0;
+  size_t bytes = 0;
 };
 
 struct Sample {
@@ -1573,12 +1842,21 @@ void ParsePrometheusMetrics(
   }
 }
 
-// One line of the scenario file, or a parallel block.
+// One scenario directive; blocks carry their members in children.
 struct Directive {
   string kind;
-  string arg;
+  string arg;                       // statement, path, duration, label or name
+  std::map<string, string> params;  // key=value as written
+  string name;
+  int64_t count = -1;      // -1 = not given
+  MonoDelta interval;      // uninitialized = not given; kZero = "do not send"
+  MonoDelta duration;      // uninitialized = not given
+  string method;           // rpc: proto method name; ysql_connect: kYsqlConnect
+  std::vector<int> ts;     // rpc / ysql_connect: selected hollow tserver indices (0-based)
   std::vector<Directive> children;
   int line = 0;
+
+  bool paused() const { return interval.Initialized() && interval == MonoDelta::kZero; }
 };
 
 string Trim(const string& s) {
@@ -1614,8 +1892,158 @@ Result<MonoDelta> ParseDuration(const string& text) {
   return STATUS_FORMAT(InvalidArgument, "Bad duration unit in '$0'", text);
 }
 
+Result<int64_t> ParseCount(const string& text, int line_no) {
+  const auto value = CheckedStoll(text);
+  SCHECK_FORMAT(value.ok() && *value > 0, InvalidArgument,
+                "Line $0: count must be a positive integer, got '$1'", line_no, text);
+  return *value;
+}
+
+// "all", "7", "1-40", "3,17,90" (lists of numbers and ranges). Tservers are numbered 1..N,
+// matching their uuids.
+Result<std::vector<int>> ParseTsSelector(const string& text, int num_tservers, int line_no) {
+  std::set<int> picked;
+  if (text == "all") {
+    for (int i = 0; i < num_tservers; ++i) {
+      picked.insert(i);
+    }
+  }
+  const string list = text == "all" ? "" : text;
+  for (const auto& part : strings::Split(list, ",", strings::SkipEmpty())) {
+    const auto range = part.ToString();
+    const auto dash = range.find('-');
+    const auto lo = CheckedStoll(dash == string::npos ? range : range.substr(0, dash));
+    const auto hi = dash == string::npos ? lo : CheckedStoll(range.substr(dash + 1));
+    SCHECK_FORMAT(lo.ok() && hi.ok() && *lo >= 1 && *hi >= *lo && *hi <= num_tservers,
+                  InvalidArgument, "Line $0: ts='$1' is not within 1..$2", line_no, text,
+                  num_tservers);
+    for (int64_t i = *lo; i <= *hi; ++i) {
+      picked.insert(narrow_cast<int>(i - 1));
+    }
+  }
+  SCHECK_FORMAT(!picked.empty(), InvalidArgument, "Line $0: ts='$1' selects nothing", line_no,
+                text);
+  return std::vector<int>(picked.begin(), picked.end());
+}
+
+// kind, key=value parameters and the trailing free text of one line. For sql the parameters
+// end at ':' and the free text is the statement; elsewhere they end at the first token
+// without '='.
+struct SplitLine {
+  string kind;
+  std::map<string, string> params;
+  string rest;
+  bool colon = false;  // rest follows a ':' (sql statement or rpc body)
+};
+
+Result<SplitLine> SplitDirectiveLine(const string& line, int line_no) {
+  SplitLine out;
+  size_t pos = 0;
+  auto is_space = [&](size_t i) { return std::isspace(static_cast<unsigned char>(line[i])); };
+  auto skip_spaces = [&] {
+    while (pos < line.size() && is_space(pos)) {
+      ++pos;
+    }
+  };
+  size_t start = pos;
+  while (pos < line.size() && !is_space(pos) && line[pos] != ':') {
+    ++pos;
+  }
+  out.kind = line.substr(start, pos - start);
+  const bool sql = out.kind == "sql";
+  const bool takes_colon = sql || out.kind == "rpc";
+  while (true) {
+    skip_spaces();
+    if (pos >= line.size()) {
+      break;
+    }
+    if (line[pos] == ':') {
+      SCHECK_FORMAT(takes_colon, InvalidArgument, "Line $0: only sql and rpc take ':'", line_no);
+      out.colon = true;
+      ++pos;
+      out.rest = Trim(line.substr(pos));
+      break;
+    }
+    start = pos;
+    while (pos < line.size() && !is_space(pos) && !(takes_colon && line[pos] == ':')) {
+      ++pos;
+    }
+    const auto token = line.substr(start, pos - start);
+    const auto eq = token.find('=');
+    if (eq == string::npos || eq == 0) {
+      SCHECK_FORMAT(!sql, InvalidArgument,
+                    "Line $0: sql takes key=value parameters, then ':' and the statement",
+                    line_no);
+      out.rest = Trim(line.substr(start));
+      break;
+    }
+    const auto key = token.substr(0, eq);
+    SCHECK_FORMAT(out.params.emplace(key, token.substr(eq + 1)).second, InvalidArgument,
+                  "Line $0: duplicate parameter '$1'", line_no, key);
+  }
+  SCHECK_FORMAT(!sql || out.colon, InvalidArgument,
+                "Line $0: sql needs ':' before the statement", line_no);
+  return out;
+}
+
+Status CheckKeys(const Directive& d, const std::set<string>& allowed) {
+  for (const auto& [key, _] : d.params) {
+    SCHECK_FORMAT(allowed.count(key) > 0, InvalidArgument, "Line $0: $1 does not take '$2='",
+                  d.line, d.kind, key);
+  }
+  return Status::OK();
+}
+
+const std::set<string> kRepetitionKeys = {"count", "interval", "duration", "name"};
+
+// count / interval / duration / name, shared by sql, rpc and ysql_connect.
+Status ParseRepetitionKeys(Directive* d) {
+  if (auto it = d->params.find("name"); it != d->params.end()) {
+    SCHECK_FORMAT(!it->second.empty(), InvalidArgument, "Line $0: empty name", d->line);
+    d->name = it->second;
+  }
+  if (auto it = d->params.find("count"); it != d->params.end()) {
+    d->count = VERIFY_RESULT(ParseCount(it->second, d->line));
+  }
+  if (auto it = d->params.find("interval"); it != d->params.end()) {
+    d->interval = VERIFY_RESULT(ParseDuration(it->second));
+  }
+  if (auto it = d->params.find("duration"); it != d->params.end()) {
+    d->duration = VERIFY_RESULT(ParseDuration(it->second));
+    SCHECK_FORMAT(d->duration > MonoDelta::kZero, InvalidArgument,
+                  "Line $0: duration must be positive", d->line);
+  }
+  if (d->paused()) {
+    SCHECK_FORMAT(d->kind != "sql", InvalidArgument, "Line $0: sql cannot take interval=0",
+                  d->line);
+    SCHECK_FORMAT(d->duration.Initialized() && d->count < 0, InvalidArgument,
+                  "Line $0: interval=0 needs duration and no count", d->line);
+  }
+  SCHECK_FORMAT(!d->duration.Initialized() || d->interval.Initialized(), InvalidArgument,
+                "Line $0: duration needs interval", d->line);
+  SCHECK_FORMAT(!d->interval.Initialized() || d->paused() || d->duration.Initialized() ||
+                    d->count > 0 || !d->name.empty(),
+                InvalidArgument,
+                "Line $0: interval needs duration, count or name, otherwise it never ends",
+                d->line);
+  return Status::OK();
+}
+
+// Functions the directive cannot supply: @iter() outside repeat, sender functions outside rpc.
+Status CheckFunctions(const Directive& d, bool in_repeat) {
+  std::set<string> used;
+  RETURN_NOT_OK_PREPEND(ExpandFunctions(d.arg, SendContext(), &used), Format("Line $0", d.line));
+  SCHECK_FORMAT(in_repeat || used.count("iter") == 0, InvalidArgument,
+                "Line $0: @iter() outside repeat", d.line);
+  SCHECK_FORMAT(d.kind == "rpc" || (used.count("uuid") == 0 && used.count("index") == 0),
+                InvalidArgument, "Line $0: @uuid() and @index() only in rpc bodies", d.line);
+  return Status::OK();
+}
+
 Result<std::vector<Directive>> ParseDirectives(
-    std::vector<string>& lines, size_t* idx, bool in_block, const string& base_dir) {
+    std::vector<string>& lines, size_t* idx, const string& parent_kind, bool in_repeat,
+    const string& base_dir) {
+  const bool in_block = !parent_kind.empty();
   std::vector<Directive> out;
   while (*idx < lines.size()) {
     const int line_no = narrow_cast<int>(*idx + 1);
@@ -1627,48 +2055,161 @@ Result<std::vector<Directive>> ParseDirectives(
       SCHECK(in_block, InvalidArgument, "Line $0: '>>' without an open block", line_no);
       return out;
     }
+    auto split = VERIFY_RESULT(SplitDirectiveLine(line, line_no));
     Directive d;
     d.line = line_no;
-    const auto space = line.find_first_of(" \t");
-    d.kind = line.substr(0, space);
-    d.arg = space == string::npos ? "" : Trim(line.substr(space));
+    d.kind = std::move(split.kind);
+    d.params = std::move(split.params);
+    d.arg = std::move(split.rest);
     const bool block = d.arg == "<<";
-    if (d.kind == "sql") {
-      if (block) {
-        d.arg.clear();
-        while (true) {
-          SCHECK_FORMAT(*idx < lines.size(), InvalidArgument,
-                        "Line $0: sql block never closed", line_no);
-          const auto& raw = lines[(*idx)++];
-          if (Trim(raw) == ">>") {
-            break;
-          }
-          d.arg += raw + "\n";
+    auto parse_block = [&]() -> Status {
+      SCHECK_FORMAT(block, InvalidArgument, "Line $0: $1 needs '<<'", line_no, d.kind);
+      d.arg.clear();
+      d.children = VERIFY_RESULT(
+          ParseDirectives(lines, idx, d.kind, in_repeat || d.kind == "repeat", base_dir));
+      SCHECK_FORMAT(!d.children.empty(), InvalidArgument, "Line $0: empty $1 block", line_no,
+                    d.kind);
+      return Status::OK();
+    };
+    // `kind ...: <<` followed by free text up to a line holding only `>>`.
+    auto read_text_block = [&]() -> Status {
+      d.arg.clear();
+      while (true) {
+        SCHECK_FORMAT(*idx < lines.size(), InvalidArgument, "Line $0: $1 block never closed",
+                      line_no, d.kind);
+        const auto& raw = lines[(*idx)++];
+        if (Trim(raw) == ">>") {
+          return Status::OK();
         }
+        d.arg += raw + "\n";
+      }
+    };
+    if (d.kind == "sql") {
+      RETURN_NOT_OK(CheckKeys(d, kRepetitionKeys));
+      RETURN_NOT_OK(ParseRepetitionKeys(&d));
+      if (block) {
+        RETURN_NOT_OK(read_text_block());
       }
       SCHECK(!Trim(d.arg).empty(), InvalidArgument, "Line $0: empty sql", line_no);
+      RETURN_NOT_OK(CheckFunctions(d, in_repeat));
     } else if (d.kind == "sql_file") {
+      RETURN_NOT_OK(CheckKeys(d, {}));
       SCHECK(!d.arg.empty(), InvalidArgument, "Line $0: sql_file needs a path", line_no);
       if (d.arg[0] != '/') {
         d.arg = JoinPathSegments(base_dir, d.arg);
       }
       SCHECK(Env::Default()->FileExists(d.arg), NotFound, "Line $0: $1 not found", line_no,
              d.arg);
+    } else if (d.kind == "rpc" || d.kind == kYsqlConnect) {
+      auto allowed = kRepetitionKeys;
+      allowed.insert("ts");
+      if (d.kind == "rpc") {
+        allowed.insert("method");
+      }
+      RETURN_NOT_OK(CheckKeys(d, allowed));
+      RETURN_NOT_OK(ParseRepetitionKeys(&d));
+      if (split.colon) {
+        if (block) {
+          RETURN_NOT_OK(read_text_block());
+        }
+        SCHECK(!Trim(d.arg).empty(), InvalidArgument, "Line $0: empty rpc body", line_no);
+      } else {
+        SCHECK_FORMAT(d.arg.empty(), InvalidArgument,
+                      "Line $0: $1 takes only key=value parameters, got '$2'", line_no, d.kind,
+                      d.arg);
+      }
+      if (d.kind == "rpc") {
+        auto it = d.params.find("method");
+        SCHECK_FORMAT(it != d.params.end(), InvalidArgument, "Line $0: rpc needs method=",
+                      line_no);
+        SCHECK_FORMAT(MasterMethods().count(it->second) > 0, InvalidArgument,
+                      "Line $0: unknown master RPC method '$1'", line_no, it->second);
+        d.method = it->second;
+        if (split.colon) {
+          SCHECK_FORMAT(!HasBuiltinSender(d.method), InvalidArgument,
+                        "Line $0: $1 is built from the tserver's state and takes no body",
+                        line_no, d.method);
+          RETURN_NOT_OK(CheckFunctions(d, in_repeat));
+          RETURN_NOT_OK_PREPEND(ParseRequestBody(MasterMethods().at(d.method), d.arg,
+                                                 SendContext()),
+                                Format("Line $0", line_no));
+        }
+      } else {
+        d.method = kYsqlConnect;
+      }
+      auto ts = d.params.find("ts");
+      SCHECK_FORMAT(ts != d.params.end(), InvalidArgument, "Line $0: $1 needs ts=", line_no,
+                    d.kind);
+      d.ts = VERIFY_RESULT(ParseTsSelector(ts->second, FLAGS_num_tservers, line_no));
     } else if (d.kind == "sleep") {
+      RETURN_NOT_OK(CheckKeys(d, {}));
       RETURN_NOT_OK(ParseDuration(d.arg));
-    } else if (d.kind == "database") {
-      SCHECK(!d.arg.empty(), InvalidArgument, "Line $0: database needs a name", line_no);
-    } else if (d.kind == "parallel") {
-      SCHECK(block, InvalidArgument, "Line $0: parallel needs '<<'", line_no);
-      d.arg.clear();
-      d.children = VERIFY_RESULT(ParseDirectives(lines, idx, /* in_block= */ true, base_dir));
+    } else if (d.kind == "mark" || d.kind == "stop" || d.kind == "database") {
+      RETURN_NOT_OK(CheckKeys(d, {}));
+      SCHECK_FORMAT(!d.arg.empty() && d.arg.find_first_of(" \t,") == string::npos,
+                    InvalidArgument, "Line $0: $1 needs one word", line_no, d.kind);
+    } else if (d.kind == "serial" || d.kind == "parallel") {
+      RETURN_NOT_OK(CheckKeys(d, {}));
+      // The same as the flattened block, so almost certainly a mistake.
+      SCHECK_FORMAT(parent_kind != d.kind, InvalidArgument,
+                    "Line $0: $1 directly inside $1; merge the blocks", line_no, d.kind);
+      RETURN_NOT_OK(parse_block());
+    } else if (d.kind == "repeat") {
+      RETURN_NOT_OK(CheckKeys(d, {"count"}));
+      auto it = d.params.find("count");
+      SCHECK_FORMAT(it != d.params.end(), InvalidArgument, "Line $0: repeat needs count=",
+                    line_no);
+      d.count = VERIFY_RESULT(ParseCount(it->second, line_no));
+      RETURN_NOT_OK(parse_block());
     } else {
       return STATUS_FORMAT(InvalidArgument, "Line $0: unknown directive '$1'", line_no, d.kind);
     }
     out.push_back(std::move(d));
   }
-  SCHECK(!in_block, InvalidArgument, "parallel block never closed");
+  SCHECK_FORMAT(!in_block, InvalidArgument, "$0 block never closed", parent_kind);
   return out;
+}
+
+Status CollectNames(
+    const std::vector<Directive>& directives, std::set<string>* names,
+    std::vector<const Directive*>* stops) {
+  for (const auto& d : directives) {
+    if (!d.name.empty()) {
+      SCHECK_FORMAT(names->insert(d.name).second, InvalidArgument,
+                    "Line $0: duplicate name '$1'", d.line, d.name);
+    }
+    if (d.kind == "stop") {
+      stops->push_back(&d);
+    }
+    RETURN_NOT_OK(CollectNames(d.children, names, stops));
+  }
+  return Status::OK();
+}
+
+Status ValidateScenario(const std::vector<Directive>& directives) {
+  std::set<string> names;
+  std::vector<const Directive*> stops;
+  RETURN_NOT_OK(CollectNames(directives, &names, &stops));
+  for (const auto* stop : stops) {
+    SCHECK_FORMAT(names.count(stop->arg) > 0, InvalidArgument,
+                  "Line $0: stop '$1' names no directive with name=$1", stop->line, stop->arg);
+  }
+  return Status::OK();
+}
+
+void CollectMethods(const std::vector<Directive>& directives, std::set<string>* methods) {
+  for (const auto& d : directives) {
+    if (!d.method.empty()) {
+      methods->insert(d.method);
+    }
+    CollectMethods(d.children, methods);
+  }
+}
+
+bool UsesYsqlConnect(const std::vector<Directive>& directives) {
+  std::set<string> methods;
+  CollectMethods(directives, &methods);
+  return methods.count(kYsqlConnect) > 0;
 }
 
 Result<std::vector<Directive>> ParseScenarioFile(const string& path) {
@@ -1679,7 +2220,8 @@ Result<std::vector<Directive>> ParseScenarioFile(const string& path) {
     lines.push_back(line);
   }
   size_t idx = 0;
-  return ParseDirectives(lines, &idx, /* in_block= */ false, DirName(path));
+  return ParseDirectives(lines, &idx, /* parent_kind= */ "", /* in_repeat= */ false,
+                         DirName(path));
 }
 
 // One --topology line: where a share of the hollow fleet registers.
@@ -1825,16 +2367,29 @@ class MasterLoadBench {
     for (const auto& file : strings::Split(FLAGS_sql_file, ",", strings::SkipEmpty())) {
       const auto path = file.ToString();
       SCHECK_FORMAT(Env::Default()->FileExists(path), NotFound, "$0 not found", path);
-      scenario_.push_back(Directive{.kind = "sql_file", .arg = path, .children = {}, .line = 0});
+      Directive d;
+      d.kind = "sql_file";
+      d.arg = path;
+      scenario_.push_back(std::move(d));
     }
     if (!FLAGS_scenario.empty()) {
       auto parsed = VERIFY_RESULT(ParseScenarioFile(FLAGS_scenario));
       scenario_.insert(scenario_.end(), std::make_move_iterator(parsed.begin()),
                        std::make_move_iterator(parsed.end()));
     }
+    RETURN_NOT_OK(ValidateScenario(scenario_));
+    // Counters exist for every method that can be sent, so the map is read-only once threads run.
+    std::set<string> methods = {"TSHeartbeat", "RefreshYsqlLease", "ListTabletServers",
+                                kYsqlConnect};
+    CollectMethods(scenario_, &methods);
+    for (const auto& method : methods) {
+      method_stats_[method] = std::make_unique<MethodStats>();
+    }
+    want_catalog_batch_ = FLAGS_ysql_connect_interval_ms > 0 || UsesYsqlConnect(scenario_);
 
     master_addr_ = HostPort("127.0.0.1", FLAGS_master_rpc_port);
     start_time_ = MonoTime::Now();
+    RETURN_NOT_OK(OpenCsv());
 
     RETURN_NOT_OK(StartMaster());
     if (!restoring_) {
@@ -1871,10 +2426,13 @@ class MasterLoadBench {
       RETURN_NOT_OK(SetClusterPlacement(HollowReplication()));
     }
 
-    if (!scenario_.empty()) {
+    if (!scenario_.empty() || want_catalog_batch_) {
       RETURN_NOT_OK(WaitForYsql());
+      recorder_thread_ = std::thread([this] { RecorderLoop(); });
+    }
+    if (!scenario_.empty()) {
       SetPhase("load");
-      RETURN_NOT_OK(RunDirectives(scenario_));
+      RETURN_NOT_OK(RunDirectives(scenario_, /* iter= */ 1));
       LOG(INFO) << "Load complete " << (MonoTime::Now() - start_time_).ToSeconds()
                 << "s after start";
     }
@@ -2076,6 +2634,8 @@ class MasterLoadBench {
           proxy_cache_.get(), master_addr_);
       registry_.Add(std::move(ts));
     }
+    read_proxy_ = std::make_unique<tserver::TabletServerServiceProxy>(
+        proxy_cache_.get(), master_addr_);
 
     service_thread_pool_ = std::make_shared<rpc::ThreadPool>(rpc::ThreadPoolOptions{
         .name = "hollow_ts",
@@ -2107,54 +2667,160 @@ class MasterLoadBench {
     return Status::OK();
   }
 
+  // --- hollow tserver RPC scheduling ----------------------------------------------------------
+
+  // The flag-driven schedule a method returns to when no directive overrides it; uninitialized
+  // means the method is only ever sent by a directive.
+  MonoDelta DefaultInterval(const string& method) {
+    if (method == "TSHeartbeat") {
+      // In mirror mode follow the real tserver's measured interval so tserver-side interval
+      // changes propagate to the hollow fleet.
+      const auto measured = mirror_state_ ? mirror_state_->MeasuredIntervalMs() : 0;
+      return MonoDelta::FromMilliseconds(
+          measured > 0 ? static_cast<int64_t>(measured) : FLAGS_heartbeat_interval_ms);
+    }
+    if (method == "RefreshYsqlLease") {
+      return FLAGS_send_lease_refreshes ? MonoDelta(1000ms) : MonoDelta();
+    }
+    if (method == "ListTabletServers") {
+      return MonoDelta::FromMilliseconds(FLAGS_connectivity_check_interval_ms);
+    }
+    if (method == kYsqlConnect) {
+      return FLAGS_ysql_connect_interval_ms > 0
+          ? MonoDelta::FromMilliseconds(FLAGS_ysql_connect_interval_ms) : MonoDelta();
+    }
+    return MonoDelta();
+  }
+
   void SchedulerLoop() {
-    const auto hb_interval = MonoDelta::FromMilliseconds(FLAGS_heartbeat_interval_ms);
-    const auto lease_interval = 1000ms;
-    const auto connectivity_interval =
-        MonoDelta::FromMilliseconds(FLAGS_connectivity_check_interval_ms);
-    // Stagger initial sends across the interval so load is even, as in a real cluster; metrics
-    // beats and connectivity checks are staggered across their own periods the same way.
+    static const char* const kDefaultMethods[] = {
+        "TSHeartbeat", "RefreshYsqlLease", "ListTabletServers", kYsqlConnect};
+    // Stagger initial sends across each interval so load is even, as in a real cluster; metrics
+    // beats are staggered across their own period the same way.
     const auto& tservers = registry_.tservers();
     auto now = MonoTime::Now();
-    const auto metrics_period = hb_interval * FLAGS_full_metrics_beat_period;
+    const auto metrics_period =
+        MonoDelta::FromMilliseconds(FLAGS_heartbeat_interval_ms) * FLAGS_full_metrics_beat_period;
     for (size_t i = 0; i < tservers.size(); ++i) {
-      tservers[i]->next_heartbeat = now + hb_interval * i / tservers.size();
-      tservers[i]->next_lease_refresh =
-          now + lease_interval * i / tservers.size() + lease_interval / 2;
-      tservers[i]->next_connectivity_check = now + connectivity_interval * i / tservers.size();
-      tservers[i]->last_metrics_beat = now - metrics_period + metrics_period * i / tservers.size();
+      auto& ts = *tservers[i];
+      for (const char* method : kDefaultMethods) {
+        const auto interval = DefaultInterval(method);
+        auto& schedule = ts.schedules[method];
+        schedule.next = interval.Initialized()
+            ? now + interval * i / tservers.size() : MonoTime::Max();
+      }
+      ts.last_metrics_beat = now - metrics_period + metrics_period * i / tservers.size();
     }
     while (running_.load(std::memory_order_acquire)) {
       now = MonoTime::Now();
-      // In mirror mode, follow the real tserver's measured cadence so tserver-side interval
-      // changes propagate to the hollow fleet.
-      auto interval = hb_interval;
-      if (mirror_state_) {
-        const auto measured = mirror_state_->MeasuredIntervalMs();
-        if (measured > 0) {
-          interval = MonoDelta::FromMilliseconds(static_cast<int64_t>(measured));
-        }
-      }
+      ApplyPendingOverrides(now);
       for (const auto& ts : tservers) {
-        if (now >= ts->next_heartbeat && !ts->heartbeat_in_flight.exchange(true)) {
-          ts->next_heartbeat = now + interval;
-          SendHeartbeat(ts.get());
-        }
-        if (FLAGS_send_lease_refreshes && now >= ts->next_lease_refresh &&
-            !ts->lease_in_flight.exchange(true)) {
-          ts->next_lease_refresh = now + lease_interval;
-          SendLeaseRefresh(ts.get());
-        }
-        if (now >= ts->next_connectivity_check && !ts->connectivity_in_flight.exchange(true)) {
-          ts->next_connectivity_check = now + connectivity_interval;
-          SendConnectivityCheck(ts.get());
+        for (auto& [method, schedule] : ts->schedules) {
+          if (schedule.run &&
+              (schedule.run->stop_flag->load() || now >= schedule.end ||
+               (schedule.remaining == 0 && !schedule.in_flight.load()))) {
+            Revert(method, &schedule, now);
+          }
+          const auto interval = schedule.run ? schedule.run->interval : DefaultInterval(method);
+          if (schedule.run) {
+            const bool paused = interval.Initialized() && interval == MonoDelta::kZero;
+            if (schedule.remaining == 0 || paused) {
+              continue;  // count exhausted (waiting for the last response) or paused
+            }
+          } else if (!interval.Initialized()) {
+            continue;
+          }
+          if (now < schedule.next) {
+            continue;
+          }
+          // One in flight per tserver and method, as the real tserver's synchronous senders;
+          // ysql_connect connections are independent of each other.
+          if (method != kYsqlConnect && schedule.in_flight.exchange(true)) {
+            continue;
+          }
+          schedule.next = interval.Initialized() ? now + interval : now;
+          if (schedule.remaining > 0) {
+            --schedule.remaining;
+          }
+          ++schedule.sent;
+          Send(ts.get(), method, &schedule, schedule.run);
         }
       }
       SleepFor(10ms);
     }
   }
 
-  void SendHeartbeat(HollowTServer* ts) {
+  // Scheduler thread only.
+  void ApplyPendingOverrides(MonoTime now) {
+    std::vector<OverrideRequest> batch;
+    {
+      std::lock_guard l(overrides_mutex_);
+      batch.swap(pending_overrides_);
+    }
+    for (auto& request : batch) {
+      for (const int index : request.ts) {
+        auto& schedule = registry_.tservers()[index]->schedules[request.run->method];
+        if (schedule.run) {
+          Revert(request.run->method, &schedule, now);
+        }
+        schedule.run = request.run;
+        schedule.remaining = request.run->count;
+        schedule.sent = 0;
+        schedule.end = request.run->duration.Initialized()
+            ? now + request.run->duration : MonoTime::Max();
+        schedule.next = now;
+      }
+    }
+  }
+
+  // Scheduler thread only: back to the default schedule, counting the tserver out of the run.
+  void Revert(const string& method, MethodSchedule* schedule, MonoTime now) {
+    auto run = std::move(schedule->run);
+    schedule->remaining = -1;
+    schedule->end = MonoTime::Max();
+    const auto interval = DefaultInterval(method);
+    schedule->next = interval.Initialized() ? now + interval : MonoTime::Max();
+    if (run->active_tservers.fetch_sub(1) == 1) {
+      run->Notify();
+    }
+  }
+
+  void Send(HollowTServer* ts, const string& method, MethodSchedule* schedule,
+            std::shared_ptr<ScheduledRun> run) {
+    if (run) {
+      run->outstanding.fetch_add(1);
+    }
+    if (method == "TSHeartbeat") {
+      SendHeartbeat(ts, schedule, std::move(run));
+    } else if (method == "RefreshYsqlLease") {
+      SendLeaseRefresh(ts, schedule, std::move(run));
+    } else if (method == "ListTabletServers") {
+      SendConnectivityCheck(ts, schedule, std::move(run));
+    } else if (method == kYsqlConnect) {
+      StartConnectReplay(ts, std::move(run));
+    } else {
+      SendGenericRpc(ts, method, schedule, std::move(run));
+    }
+  }
+
+  MethodStats& StatsFor(const string& method) {
+    auto it = method_stats_.find(method);
+    return it == method_stats_.end() ? other_stats_ : *it->second;
+  }
+
+  void FinishSend(const string& method, bool ok, int64_t latency_us, MethodSchedule* schedule,
+                  const std::shared_ptr<ScheduledRun>& run) {
+    StatsFor(method).Record(ok, latency_us);
+    if (schedule) {
+      schedule->in_flight.store(false, std::memory_order_release);
+    }
+    if (run && run->outstanding.fetch_sub(1) == 1) {
+      run->Notify();
+    }
+  }
+
+  void SendHeartbeat(HollowTServer* ts, MethodSchedule* schedule,
+                     std::shared_ptr<ScheduledRun> run) {
     string universe_uuid;
     {
       std::lock_guard l(universe_uuid_mutex_);
@@ -2185,21 +2851,21 @@ class MasterLoadBench {
     ts->hb_controller.set_timeout(15s);
     ts->heartbeat_sent_time = MonoTime::Now();
     ts->heartbeat_proxy->TSHeartbeatAsync(
-        ts->hb_req, &ts->hb_resp, &ts->hb_controller, [this, ts] {
-          HandleHeartbeatResponse(ts);
+        ts->hb_req, &ts->hb_resp, &ts->hb_controller, [this, ts, schedule, run] {
+          HandleHeartbeatResponse(ts, schedule, run);
         });
   }
 
-  void HandleHeartbeatResponse(HollowTServer* ts) {
+  void HandleHeartbeatResponse(HollowTServer* ts, MethodSchedule* schedule,
+                               const std::shared_ptr<ScheduledRun>& run) {
     const auto rtt_us =
         (MonoTime::Now() - ts->heartbeat_sent_time).ToMicroseconds();
     const auto status = ts->hb_controller.status();
     if (!status.ok()) {
-      stats_.heartbeats_failed.fetch_add(1, std::memory_order_relaxed);
       YB_LOG_EVERY_N_SECS(WARNING, 10)
           << "Heartbeat from " << ts->uuid() << " failed: " << status;
       ts->HandleHeartbeatFailure();
-      ts->heartbeat_in_flight.store(false, std::memory_order_release);
+      FinishSend("TSHeartbeat", false, rtt_us, schedule, run);
       return;
     }
     const auto& resp = ts->hb_resp;
@@ -2213,22 +2879,19 @@ class MasterLoadBench {
       }
     }
     if (resp.has_error()) {
-      stats_.heartbeats_failed.fetch_add(1, std::memory_order_relaxed);
       YB_LOG_EVERY_N_SECS(WARNING, 10)
           << "Heartbeat from " << ts->uuid() << " rejected: "
           << resp.error().ShortDebugString();
       ts->HandleHeartbeatFailure();
-      ts->heartbeat_in_flight.store(false, std::memory_order_release);
+      FinishSend("TSHeartbeat", false, rtt_us, schedule, run);
       return;
     }
-    stats_.heartbeats_ok.fetch_add(1, std::memory_order_relaxed);
-    stats_.heartbeat_rtt_us_sum.fetch_add(rtt_us, std::memory_order_relaxed);
-    stats_.heartbeat_rtt_count.fetch_add(1, std::memory_order_relaxed);
     ts->HandleHeartbeatSuccess(resp, rtt_us);
-    ts->heartbeat_in_flight.store(false, std::memory_order_release);
+    FinishSend("TSHeartbeat", true, rtt_us, schedule, run);
   }
 
-  void SendLeaseRefresh(HollowTServer* ts) {
+  void SendLeaseRefresh(HollowTServer* ts, MethodSchedule* schedule,
+                        std::shared_ptr<ScheduledRun> run) {
     auto& req = ts->lease_req;
     req.Clear();
     auto* instance = req.mutable_instance();
@@ -2241,47 +2904,235 @@ class MasterLoadBench {
     req.set_local_request_send_time_ms(GetCurrentTimeMicros() / 1000);
     ts->lease_controller.Reset();
     ts->lease_controller.set_timeout(10s);
+    ts->lease_sent_time = MonoTime::Now();
     ts->lease_proxy->RefreshYsqlLeaseAsync(
-        req, &ts->lease_resp, &ts->lease_controller, [this, ts] {
-          HandleLeaseResponse(ts);
+        req, &ts->lease_resp, &ts->lease_controller, [this, ts, schedule, run] {
+          const auto latency_us = (MonoTime::Now() - ts->lease_sent_time).ToMicroseconds();
+          const auto status = ts->lease_controller.status();
+          const bool ok = status.ok() && !ts->lease_resp.has_error();
+          if (!ok) {
+            YB_LOG_EVERY_N_SECS(WARNING, 10)
+                << "Lease refresh from " << ts->uuid() << " failed: "
+                << (status.ok() ? ts->lease_resp.error().ShortDebugString() : status.ToString());
+          } else if (ts->lease_resp.has_info() && ts->lease_resp.info().has_lease_epoch()) {
+            ts->SetLeaseEpoch(ts->lease_resp.info().lease_epoch());
+          }
+          FinishSend("RefreshYsqlLease", ok, latency_us, schedule, run);
         });
-  }
-
-  void HandleLeaseResponse(HollowTServer* ts) {
-    const auto status = ts->lease_controller.status();
-    if (!status.ok() || ts->lease_resp.has_error()) {
-      stats_.lease_refreshes_failed.fetch_add(1, std::memory_order_relaxed);
-      YB_LOG_EVERY_N_SECS(WARNING, 10)
-          << "Lease refresh from " << ts->uuid() << " failed: "
-          << (status.ok() ? ts->lease_resp.error().ShortDebugString() : status.ToString());
-    } else {
-      stats_.lease_refreshes_ok.fetch_add(1, std::memory_order_relaxed);
-      if (ts->lease_resp.has_info() && ts->lease_resp.info().has_lease_epoch()) {
-        ts->SetLeaseEpoch(ts->lease_resp.info().lease_epoch());
-      }
-    }
-    ts->lease_in_flight.store(false, std::memory_order_release);
   }
 
   // The real tserver's connectivity poller lists all tservers once a minute and pings them;
   // only the master call is reproduced.
-  void SendConnectivityCheck(HollowTServer* ts) {
+  void SendConnectivityCheck(HollowTServer* ts, MethodSchedule* schedule,
+                             std::shared_ptr<ScheduledRun> run) {
     ts->connectivity_controller.Reset();
     ts->connectivity_controller.set_timeout(15s);
+    ts->connectivity_sent_time = MonoTime::Now();
     ts->cluster_proxy->ListTabletServersAsync(
-        ts->connectivity_req, &ts->connectivity_resp, &ts->connectivity_controller, [this, ts] {
+        ts->connectivity_req, &ts->connectivity_resp, &ts->connectivity_controller,
+        [this, ts, schedule, run] {
+          const auto latency_us =
+              (MonoTime::Now() - ts->connectivity_sent_time).ToMicroseconds();
           const auto status = ts->connectivity_controller.status();
-          if (!status.ok() || ts->connectivity_resp.has_error()) {
-            stats_.connectivity_checks_failed.fetch_add(1, std::memory_order_relaxed);
+          const bool ok = status.ok() && !ts->connectivity_resp.has_error();
+          if (!ok) {
             YB_LOG_EVERY_N_SECS(WARNING, 10)
                 << "ListTabletServers from " << ts->uuid() << " failed: "
                 << (status.ok() ? ts->connectivity_resp.error().ShortDebugString()
                                 : status.ToString());
-          } else {
-            stats_.connectivity_checks_ok.fetch_add(1, std::memory_order_relaxed);
           }
-          ts->connectivity_in_flight.store(false, std::memory_order_release);
+          FinishSend("ListTabletServers", ok, latency_us, schedule, run);
         });
+  }
+
+  // Any other master method, with an empty request: enough for the list/get calls a scenario
+  // storms with. The response counts as failed when the master filled its error field.
+  void SendGenericRpc(HollowTServer* ts, const string& method, MethodSchedule* schedule,
+                      std::shared_ptr<ScheduledRun> run) {
+    const auto& info = MasterMethods().at(method);
+    struct Call {
+      Call(const string& service, const string& method) : remote_method(service, method) {}
+      rpc::RemoteMethod remote_method;
+      std::unique_ptr<google::protobuf::Message> request;
+      std::unique_ptr<google::protobuf::Message> response;
+      rpc::RpcController controller;
+      MonoTime sent;
+    };
+    auto call = std::make_shared<Call>(info.wire_service, method);
+    if (run && !run->body.empty()) {
+      SendContext ctx;
+      ctx.iter = run->iter;
+      ctx.seq = schedule ? schedule->sent : 1;
+      ctx.uuid = ts->uuid();
+      ctx.index = ts->index() + 1;
+      auto request = ParseRequestBody(info, run->body, ctx);
+      if (!request.ok()) {
+        YB_LOG_EVERY_N_SECS(WARNING, 10) << method << " from " << ts->uuid() << ": "
+                                         << request.status();
+        FinishSend(method, false, 0, schedule, run);
+        return;
+      }
+      call->request = std::move(*request);
+    } else {
+      call->request.reset(DynamicFactory().GetPrototype(info.descriptor->input_type())->New());
+    }
+    call->response.reset(DynamicFactory().GetPrototype(info.descriptor->output_type())->New());
+    call->controller.set_timeout(15s);
+    call->sent = MonoTime::Now();
+    generic_proxy_->AsyncRequest(
+        &call->remote_method, /* method_metrics= */ nullptr, *call->request,
+        call->response.get(), &call->controller, [this, ts, method, call, schedule, run] {
+          const auto latency_us = (MonoTime::Now() - call->sent).ToMicroseconds();
+          const auto status = call->controller.status();
+          const auto* error_field = call->response->GetDescriptor()->FindFieldByName("error");
+          const bool has_error = error_field != nullptr &&
+              call->response->GetReflection()->HasField(*call->response, error_field);
+          const bool ok = status.ok() && !has_error;
+          if (!ok) {
+            YB_LOG_EVERY_N_SECS(WARNING, 10)
+                << method << " from " << ts->uuid() << " failed: "
+                << (status.ok() ? call->response->ShortDebugString() : status.ToString());
+          }
+          FinishSend(method, ok, latency_us, schedule, run);
+        });
+  }
+
+  // --- ysql_connect: replay of a fresh connection's catalog reads ----------------------------
+
+  std::shared_ptr<const CatalogBatch> CurrentCatalogBatch() {
+    std::lock_guard l(catalog_batch_mutex_);
+    return catalog_batch_;
+  }
+
+  struct ConnectReplay {
+    HollowTServer* ts;
+    std::shared_ptr<const CatalogBatch> batch;
+    std::shared_ptr<ScheduledRun> run;
+    size_t index = 0;
+    MonoTime started;
+    tserver::ReadRequestPB req;
+    tserver::ReadResponsePB resp;
+    rpc::RpcController controller;
+  };
+
+  // One simulated connection: the recorded Reads in order, each sent when the previous one
+  // answered, as a backend's prefetch does.
+  void StartConnectReplay(HollowTServer* ts, std::shared_ptr<ScheduledRun> run) {
+    auto replay = std::make_shared<ConnectReplay>();
+    replay->ts = ts;
+    replay->batch = CurrentCatalogBatch();
+    replay->run = std::move(run);
+    replay->started = MonoTime::Now();
+    if (!replay->batch) {
+      YB_LOG_EVERY_N_SECS(WARNING, 10) << "ysql_connect: no catalog batch recorded yet";
+      FinishSend(kYsqlConnect, false, 0, nullptr, replay->run);
+      return;
+    }
+    SendNextRead(std::move(replay));
+  }
+
+  void SendNextRead(std::shared_ptr<ConnectReplay> replay) {
+    if (replay->index == replay->batch->reads.size()) {
+      FinishSend(kYsqlConnect, true, (MonoTime::Now() - replay->started).ToMicroseconds(),
+                 nullptr, replay->run);
+      return;
+    }
+    auto& req = replay->req;
+    req.CopyFrom(replay->batch->reads[replay->index++]);
+    // Fresh read time and clock; the recorded ones are from the recording's moment.
+    req.clear_read_time();
+    req.clear_transaction();
+    req.clear_subtransaction();
+    const auto now_micros = GetCurrentTimeMicros();
+    req.set_propagated_hybrid_time(HybridTime::FromMicros(now_micros).ToUint64());
+    if (req.has_start_time_micros()) {
+      req.set_start_time_micros(now_micros);
+    }
+    replay->ts->StampCatalogVersions(&req);
+    replay->controller.Reset();
+    replay->controller.set_timeout(15s);
+    read_proxy_->ReadAsync(req, &replay->resp, &replay->controller, [this, replay] {
+      const auto status = replay->controller.status();
+      if (!status.ok() || replay->resp.has_error()) {
+        YB_LOG_EVERY_N_SECS(WARNING, 10)
+            << "ysql_connect read " << replay->index << "/" << replay->batch->reads.size()
+            << " from " << replay->ts->uuid() << " failed: "
+            << (status.ok() ? replay->resp.error().ShortDebugString() : status.ToString());
+        FinishSend(kYsqlConnect, false, (MonoTime::Now() - replay->started).ToMicroseconds(),
+                   nullptr, replay->run);
+        return;
+      }
+      SendNextRead(replay);
+    });
+  }
+
+  // Keeps the recorded batch current with the real tserver's catalog versions fingerprint.
+  void RecorderLoop() {
+    while (running_.load(std::memory_order_acquire)) {
+      if (want_catalog_batch_) {
+        const auto generation = mirror_state_->CatalogGeneration();
+        const auto current = CurrentCatalogBatch();
+        if (!current || current->generation != generation) {
+          WARN_NOT_OK(RecordCatalogBatch(generation), "Catalog batch recording failed");
+        }
+      }
+      for (int i = 0; i < 5 && running_.load(std::memory_order_acquire); ++i) {
+        SleepFor(100ms);
+      }
+    }
+  }
+
+  // Opens one fresh connection on the real tserver and keeps the sys catalog Reads the relay
+  // saw meanwhile. Reads of other backends in that window cannot be told apart on the wire, so
+  // recording waits for the relay to go quiet first and logs the batch size for comparison.
+  Status RecordCatalogBatch(uint64_t generation) {
+    const auto quiet_deadline = MonoTime::Now() + 5s;
+    while (MonoTime::Now() < quiet_deadline) {
+      const auto last = mirror_state_->LastReadSeen();
+      if (!last.Initialized() || MonoTime::Now() - last > 300ms) {
+        break;
+      }
+      SleepFor(50ms);
+    }
+    const auto db = CurrentDb();
+    mirror_state_->StartCapture();
+    const auto exit_code = Ysqlsh(db, {"-o", "/dev/null", "-c", "SELECT 1"});
+    SleepFor(200ms);  // let the last frames reach the tap
+    size_t skipped = 0;
+    const auto bodies = mirror_state_->StopCapture(&skipped);
+    RETURN_NOT_OK(exit_code);
+    SCHECK_FORMAT(*exit_code == 0, RuntimeError, "ysqlsh -d $0 exited with $1", db, *exit_code);
+    auto batch = std::make_shared<CatalogBatch>();
+    batch->generation = generation;
+    for (const auto& body : bodies) {
+      tserver::ReadRequestPB req;
+      SCHECK(req.ParseFromString(body), Corruption, "Captured Read does not parse");
+      if (req.tablet_id() != master::kSysCatalogTabletId) {
+        continue;
+      }
+      batch->ops += req.pgsql_batch_size();
+      batch->bytes += body.size();
+      batch->reads.push_back(std::move(req));
+    }
+    SCHECK_FORMAT(!batch->reads.empty(), NotFound,
+                  "No sys catalog Read captured for a fresh connection to $0 ($1 captured)", db,
+                  bodies.size());
+    LOG(INFO) << "Recorded catalog batch (generation " << generation << ", db " << db << "): "
+              << batch->reads.size() << " Read RPCs, " << batch->ops << " ops, " << batch->bytes
+              << " bytes" << (skipped > 0 ? Format(", $0 with sidecars skipped", skipped) : "");
+    std::lock_guard l(catalog_batch_mutex_);
+    catalog_batch_ = std::move(batch);
+    return Status::OK();
+  }
+
+  Status WaitForCatalogBatch() {
+    const auto deadline = MonoTime::Now() + MonoDelta::FromSeconds(FLAGS_register_timeout_sec);
+    while (!CurrentCatalogBatch()) {
+      SCHECK(MonoTime::Now() < deadline, TimedOut, "No catalog batch recorded");
+      SCHECK(running_.load(std::memory_order_acquire), Aborted, "Bench stopping");
+      SleepFor(100ms);
+    }
+    return Status::OK();
   }
 
   void ReplayLoop() {
@@ -2508,34 +3359,54 @@ class MasterLoadBench {
 
   // --- scenario -------------------------------------------------------------------------------
 
-  Status RunDirectives(const std::vector<Directive>& directives) {
+  // `iter` is the innermost enclosing repeat's iteration, 1-based, for @iter().
+  Status RunDirectives(const std::vector<Directive>& directives, int64_t iter) {
     for (const auto& d : directives) {
-      RETURN_NOT_OK(RunDirective(d));
+      RETURN_NOT_OK(RunDirective(d, iter));
     }
     return Status::OK();
   }
 
-  Status RunDirective(const Directive& d) {
+  Status RunDirective(const Directive& d, int64_t iter) {
     const auto started = MonoTime::Now();
     LOG(INFO) << "Directive line " << d.line << ": " << d.kind
               << (d.arg.empty() ? "" : " " + d.arg.substr(0, 80));
     Status status;
     if (d.kind == "sleep") {
-      SleepFor(VERIFY_RESULT(ParseDuration(d.arg)));
+      status = SleepInterruptible(VERIFY_RESULT(ParseDuration(d.arg)), nullptr);
     } else if (d.kind == "database") {
       std::lock_guard l(db_mutex_);
       current_db_ = d.arg;
     } else if (d.kind == "sql") {
-      const auto path = JoinPathSegments(SqlDir(), Format("line$0.sql", d.line));
-      std::ofstream(path, std::ios::trunc) << d.arg << "\n";
-      status = RunYsqlsh(CurrentDb(), path);
+      status = RunSql(d, iter);
     } else if (d.kind == "sql_file") {
       status = RunSqlFile(d.arg);
+    } else if (d.kind == "rpc" || d.kind == kYsqlConnect) {
+      status = RunScheduled(d, iter);
+    } else if (d.kind == "mark") {
+      WriteCsvRow("mark", d.arg);
+      SetPhase(d.arg);
+    } else if (d.kind == "stop") {
+      std::lock_guard l(stops_mutex_);
+      auto it = active_stops_.find(d.arg);
+      if (it == active_stops_.end()) {
+        LOG(WARNING) << "Line " << d.line << ": stop " << d.arg << ": nothing by that name is "
+                     << "running";
+      } else {
+        it->second->store(true);
+      }
+    } else if (d.kind == "serial") {
+      status = RunDirectives(d.children, iter);
+    } else if (d.kind == "repeat") {
+      for (int64_t i = 1; i <= d.count && status.ok(); ++i) {
+        status = RunDirectives(d.children, i);
+      }
     } else if (d.kind == "parallel") {
       std::vector<std::thread> threads;
       std::vector<Status> results(d.children.size());
       for (size_t i = 0; i < d.children.size(); ++i) {
-        threads.emplace_back([this, &d, &results, i] { results[i] = RunDirective(d.children[i]); });
+        threads.emplace_back(
+            [this, &d, &results, i, iter] { results[i] = RunDirective(d.children[i], iter); });
       }
       for (auto& t : threads) {
         t.join();
@@ -2551,10 +3422,234 @@ class MasterLoadBench {
     return status;
   }
 
-  string SqlDir() {
-    const auto dir = JoinPathSegments(FLAGS_data_dir, "sql");
-    WARN_NOT_OK(Env::Default()->CreateDirs(dir), "Cannot create " + dir);
-    return dir;
+  // Sleeps in slices so a stop or shutdown is seen promptly.
+  Status SleepInterruptible(MonoDelta delay, const std::shared_ptr<std::atomic<bool>>& stop) {
+    const auto until = MonoTime::Now() + delay;
+    while (MonoTime::Now() < until) {
+      SCHECK(running_.load(std::memory_order_acquire), Aborted, "Bench stopping");
+      if (stop && stop->load()) {
+        return Status::OK();
+      }
+      SleepFor(std::min(until - MonoTime::Now(), MonoDelta(100ms)));
+    }
+    return Status::OK();
+  }
+
+  // A `name=` lets `stop <name>` reach the directive from another parallel branch.
+  std::shared_ptr<std::atomic<bool>> RegisterStop(const string& name) {
+    auto flag = std::make_shared<std::atomic<bool>>(false);
+    if (!name.empty()) {
+      std::lock_guard l(stops_mutex_);
+      active_stops_[name] = flag;
+    }
+    return flag;
+  }
+
+  void UnregisterStop(const string& name, const std::shared_ptr<std::atomic<bool>>& flag) {
+    if (name.empty()) {
+      return;
+    }
+    std::lock_guard l(stops_mutex_);
+    auto it = active_stops_.find(name);
+    if (it != active_stops_.end() && it->second == flag) {
+      active_stops_.erase(it);
+    }
+  }
+
+  // rpc / ysql_connect: hands the override to the scheduler and waits until every selected
+  // tserver reverted and the last response arrived.
+  Status RunScheduled(const Directive& d, int64_t iter) {
+    if (d.method == kYsqlConnect) {
+      RETURN_NOT_OK(WaitForCatalogBatch());
+    }
+    auto run = std::make_shared<ScheduledRun>();
+    run->method = d.method;
+    run->name = d.name;
+    run->body = d.arg;
+    run->iter = iter;
+    run->interval = d.interval;
+    // Bare = once; interval alone = until duration or stop.
+    run->count = d.count > 0 ? d.count : (d.interval.Initialized() ? -1 : 1);
+    run->duration = d.duration;
+    run->stop_flag = RegisterStop(d.name);
+    run->active_tservers.store(narrow_cast<int>(d.ts.size()));
+    {
+      std::lock_guard l(overrides_mutex_);
+      pending_overrides_.push_back(OverrideRequest{d.ts, run});
+    }
+    std::unique_lock l(run->mutex);
+    while (!run->Done() && running_.load(std::memory_order_acquire)) {
+      run->cv.wait_for(l, 100ms);
+    }
+    l.unlock();
+    UnregisterStop(d.name, run->stop_flag);
+    SCHECK(running_.load(std::memory_order_acquire), Aborted, "Bench stopping");
+    return Status::OK();
+  }
+
+  // One ysqlsh session kept open across the statements of a sql directive. Completion of each
+  // statement is detected by a `\warn` marker: stderr is unbuffered, stdout is not on a pipe.
+  class YsqlshSession {
+   public:
+    YsqlshSession(string ysqlsh_bin, string db)
+        : ysqlsh_bin_(std::move(ysqlsh_bin)), db_(std::move(db)) {}
+
+    ~YsqlshSession() {
+      if (process_) {
+        WARN_NOT_OK(Close(), "ysqlsh session close failed");
+      }
+    }
+
+    Status Start() {
+      std::vector<string> argv = {
+          ysqlsh_bin_, "-h", "127.0.0.1", "-p", std::to_string(FLAGS_pg_port),
+          "-U", "yugabyte", "-d", db_, "-v", "ON_ERROR_STOP=1", "-q", "-o", "/dev/null",
+      };
+      process_ = std::make_unique<Subprocess>(ysqlsh_bin_, argv);
+      process_->PipeParentStdin();
+      process_->PipeParentStderr();
+      process_->DisableStdout();
+      RETURN_NOT_OK(process_->Start());
+      stdin_fd_ = process_->ReleaseChildStdinFd();
+      stderr_fd_ = process_->ReleaseChildStderrFd();
+      return Status::OK();
+    }
+
+    Status Execute(const string& statement) {
+      static const char* const kMarker = "__mlb_statement_done__";
+      auto text = statement;
+      const auto trimmed = Trim(text);
+      // A statement without ';' would stay in psql's buffer while the marker runs.
+      if (!trimmed.empty() && trimmed.back() != ';') {
+        text += ";";
+      }
+      text += Format("\n\\warn $0\n", kMarker);
+      RETURN_NOT_OK(WriteAll(text));
+      string noise;
+      while (true) {
+        auto line = VERIFY_RESULT(ReadStderrLine());
+        if (!line) {
+          int exit_code = -1;
+          RETURN_NOT_OK(process_->Wait(&exit_code));
+          process_.reset();
+          return STATUS_FORMAT(RuntimeError, "ysqlsh exited with $0: $1", exit_code,
+                               Trim(noise));
+        }
+        if (*line == kMarker) {
+          return Status::OK();
+        }
+        noise += *line + "\n";
+      }
+    }
+
+    Status Close() {
+      if (stdin_fd_ >= 0) {
+        close(stdin_fd_);
+        stdin_fd_ = -1;
+      }
+      if (stderr_fd_ >= 0) {
+        close(stderr_fd_);
+        stderr_fd_ = -1;
+      }
+      auto process = std::move(process_);
+      if (!process) {
+        return Status::OK();
+      }
+      int exit_code = -1;
+      RETURN_NOT_OK(process->Wait(&exit_code));
+      SCHECK_FORMAT(exit_code == 0, RuntimeError, "ysqlsh exited with $0", exit_code);
+      return Status::OK();
+    }
+
+   private:
+    Status WriteAll(const string& text) {
+      size_t written = 0;
+      while (written < text.size()) {
+        const auto n = write(stdin_fd_, text.data() + written, text.size() - written);
+        if (n < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          return STATUS_FORMAT(IOError, "write to ysqlsh failed: $0", strerror(errno));
+        }
+        written += static_cast<size_t>(n);
+      }
+      return Status::OK();
+    }
+
+    // nullopt on EOF.
+    Result<std::optional<string>> ReadStderrLine() {
+      while (true) {
+        const auto eol = buffer_.find('\n');
+        if (eol != string::npos) {
+          std::optional<string> line = buffer_.substr(0, eol);
+          buffer_.erase(0, eol + 1);
+          return line;
+        }
+        char buf[4096];
+        const auto n = read(stderr_fd_, buf, sizeof(buf));
+        if (n < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          return STATUS_FORMAT(IOError, "read from ysqlsh failed: $0", strerror(errno));
+        }
+        if (n == 0) {
+          std::optional<string> line;
+          if (!buffer_.empty()) {
+            line = std::move(buffer_);
+            buffer_.clear();
+          }
+          return line;
+        }
+        buffer_.append(buf, static_cast<size_t>(n));
+      }
+    }
+
+    const string ysqlsh_bin_;
+    const string db_;
+    std::unique_ptr<Subprocess> process_;
+    int stdin_fd_ = -1;
+    int stderr_fd_ = -1;
+    string buffer_;
+  };
+
+  Status RunSql(const Directive& d, int64_t iter) {
+    const auto stop = RegisterStop(d.name);
+    auto status = RunSqlStatements(d, stop, iter);
+    UnregisterStop(d.name, stop);
+    return status;
+  }
+
+  Status RunSqlStatements(const Directive& d, const std::shared_ptr<std::atomic<bool>>& stop,
+                          int64_t iter) {
+    const auto label = d.name.empty() ? Format("line$0", d.line) : d.name;
+    YsqlshSession session(ysqlsh_bin_, CurrentDb());
+    RETURN_NOT_OK(session.Start());
+    const auto end = d.duration.Initialized() ? MonoTime::Now() + d.duration : MonoTime::Max();
+    // Bare = once; interval alone = until duration or stop.
+    const int64_t count = d.count > 0 ? d.count : (d.interval.Initialized() ? -1 : 1);
+    for (int64_t sent = 0; count < 0 || sent < count; ++sent) {
+      SCHECK(running_.load(std::memory_order_acquire), Aborted, "Bench stopping");
+      if (stop->load() || MonoTime::Now() >= end) {
+        break;
+      }
+      SendContext ctx;
+      ctx.iter = iter;
+      ctx.seq = sent + 1;
+      const auto started = MonoTime::Now();
+      RETURN_NOT_OK(session.Execute(VERIFY_RESULT(ExpandFunctions(d.arg, ctx, nullptr))));
+      const auto latency = MonoTime::Now() - started;
+      WriteCsvRow("bench_sql_" + label + "_latency_ms",
+                  std::to_string(latency.ToMicroseconds() / 1000.0));
+      if (!d.interval.Initialized()) {
+        continue;
+      }
+      if (latency < d.interval) {
+        RETURN_NOT_OK(SleepInterruptible(d.interval - latency, stop));
+      }
+    }
+    return session.Close();
   }
 
   string CurrentDb() {
@@ -2758,30 +3853,47 @@ class MasterLoadBench {
     }
   }
 
-  void CollectorLoop() {
-    std::ofstream csv;
-    if (!FLAGS_csv_path.empty()) {
-      const bool existed = Env::Default()->FileExists(FLAGS_csv_path);
-      csv.open(FLAGS_csv_path, std::ios::app);
-      if (!existed) {
-        csv << "epoch_ms,elapsed_sec,phase,metric,value\n";
-      }
+  Status OpenCsv() {
+    if (FLAGS_csv_path.empty()) {
+      return Status::OK();
     }
+    const bool existed = Env::Default()->FileExists(FLAGS_csv_path);
+    std::lock_guard l(samples_mutex_);
+    csv_.open(FLAGS_csv_path, std::ios::app);
+    SCHECK_FORMAT(csv_.is_open(), IOError, "Cannot open $0", FLAGS_csv_path);
+    if (!existed) {
+      csv_ << "epoch_ms,elapsed_sec,phase,metric,value\n";
+    }
+    return Status::OK();
+  }
+
+  // An immediate row outside the sampling loop: marks and per-statement sql latencies.
+  void WriteCsvRow(const string& metric, const string& value) {
+    const auto epoch_ms = GetCurrentTimeMicros() / 1000;
+    const auto elapsed = (MonoTime::Now() - start_time_).ToSeconds();
+    const auto phase = GetPhase();
+    std::lock_guard l(samples_mutex_);
+    if (csv_.is_open()) {
+      csv_ << epoch_ms << "," << elapsed << "," << phase << "," << metric << "," << value
+           << "\n";
+      csv_.flush();
+    }
+  }
+
+  void CollectorLoop() {
     const std::vector<string> substrings =
         strings::Split(FLAGS_metric_substrings, ",", strings::SkipEmpty());
     const auto url =
         Format("http://127.0.0.1:$0/prometheus-metrics", FLAGS_master_web_port);
     while (running_.load(std::memory_order_acquire)) {
       std::map<string, double> values;
-      values["bench_heartbeats_ok_total"] = stats_.heartbeats_ok.load();
-      values["bench_heartbeats_failed_total"] = stats_.heartbeats_failed.load();
-      values["bench_lease_refreshes_ok_total"] = stats_.lease_refreshes_ok.load();
-      values["bench_lease_refreshes_failed_total"] = stats_.lease_refreshes_failed.load();
-      values["bench_connectivity_checks_ok_total"] = stats_.connectivity_checks_ok.load();
-      values["bench_connectivity_checks_failed_total"] =
-          stats_.connectivity_checks_failed.load();
-      values["bench_heartbeat_rtt_us_sum"] = stats_.heartbeat_rtt_us_sum.load();
-      values["bench_heartbeat_rtt_count"] = stats_.heartbeat_rtt_count.load();
+      for (const auto& [method, stats] : method_stats_) {
+        const auto prefix = StatsMetricPrefix(method);
+        values[prefix + "ok_total"] = stats->ok.load();
+        values[prefix + "failed_total"] = stats->failed.load();
+        values[prefix + "latency_us_sum"] = stats->latency_us_sum.load();
+        values[prefix + "latency_count"] = stats->latency_count.load();
+      }
 
       const auto pid = master_process_ ? master_process_->pid() : 0;
       if (pid > 0) {
@@ -2811,14 +3923,14 @@ class MasterLoadBench {
         std::lock_guard l(samples_mutex_);
         for (const auto& [metric, value] : values) {
           samples_.push_back(Sample{epoch_ms, elapsed, phase, metric, value});
-          if (csv.is_open()) {
-            csv << epoch_ms << "," << elapsed << "," << phase << "," << metric << ","
-                << value << "\n";
+          if (csv_.is_open()) {
+            csv_ << epoch_ms << "," << elapsed << "," << phase << "," << metric << ","
+                 << value << "\n";
           }
         }
-      }
-      if (csv.is_open()) {
-        csv.flush();
+        if (csv_.is_open()) {
+          csv_.flush();
+        }
       }
       for (int i = 0; i < FLAGS_metrics_interval_sec * 10 &&
                       running_.load(std::memory_order_acquire); ++i) {
@@ -2859,10 +3971,10 @@ class MasterLoadBench {
       std::cout << "master_cpu_pct="
                 << 100.0 * delta("master_cpu_seconds_total") / window << "\n";
     }
-    const auto rtt_count = delta("bench_heartbeat_rtt_count");
+    const auto rtt_count = delta("bench_rpc_TSHeartbeat_latency_count");
     if (rtt_count > 0) {
       std::cout << "driver_observed_heartbeat_rtt_ms_avg="
-                << delta("bench_heartbeat_rtt_us_sum") / rtt_count / 1000.0 << "\n";
+                << delta("bench_rpc_TSHeartbeat_latency_us_sum") / rtt_count / 1000.0 << "\n";
     }
     if (window > 0) {
       double hb_in = 0, hb_out = 0, all_in = 0, all_out = 0;
@@ -2919,6 +4031,9 @@ class MasterLoadBench {
     if (replay_thread_.joinable()) {
       replay_thread_.join();
     }
+    if (recorder_thread_.joinable()) {
+      recorder_thread_.join();
+    }
     if (collector_thread_.joinable()) {
       collector_thread_.join();
     }
@@ -2972,6 +4087,7 @@ class MasterLoadBench {
   std::unique_ptr<rpc::Messenger> messenger_;
   std::unique_ptr<rpc::ProxyCache> proxy_cache_;
   std::unique_ptr<master::MasterClusterProxy> cluster_proxy_;
+  std::unique_ptr<tserver::TabletServerServiceProxy> read_proxy_;
   rpc::ThreadPoolPtr service_thread_pool_;
   scoped_refptr<rpc::ServicePool> service_pool_;
   scoped_refptr<rpc::ServicePool> ts_service_pool_;
@@ -2981,12 +4097,28 @@ class MasterLoadBench {
   std::mutex universe_uuid_mutex_;
   string universe_uuid_ GUARDED_BY(universe_uuid_mutex_);
 
-  BenchStats stats_;
+  // Filled before the threads start, read-only afterwards.
+  std::map<string, std::unique_ptr<MethodStats>> method_stats_;
+  MethodStats other_stats_;
   std::atomic<bool> running_{true};
   bool shut_down_ = false;
   std::thread scheduler_thread_;
   std::thread collector_thread_;
   std::thread replay_thread_;
+  std::thread recorder_thread_;
+
+  struct OverrideRequest {
+    std::vector<int> ts;
+    std::shared_ptr<ScheduledRun> run;
+  };
+  std::mutex overrides_mutex_;
+  std::vector<OverrideRequest> pending_overrides_ GUARDED_BY(overrides_mutex_);
+  std::mutex stops_mutex_;
+  std::map<string, std::shared_ptr<std::atomic<bool>>> active_stops_ GUARDED_BY(stops_mutex_);
+
+  bool want_catalog_batch_ = false;
+  std::mutex catalog_batch_mutex_;
+  std::shared_ptr<const CatalogBatch> catalog_batch_ GUARDED_BY(catalog_batch_mutex_);
 
   std::unique_ptr<client::YBClient> client_;
   string ysqlsh_bin_;
@@ -3001,6 +4133,7 @@ class MasterLoadBench {
   string phase_ GUARDED_BY(phase_mutex_) = "start";
   std::mutex samples_mutex_;
   std::vector<Sample> samples_ GUARDED_BY(samples_mutex_);
+  std::ofstream csv_ GUARDED_BY(samples_mutex_);
 };
 
 }  // namespace
