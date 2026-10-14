@@ -264,6 +264,16 @@ Status ReadQuery::WaitForSafeTime() {
       // waiting for the safe time to catch up, which may be better for follower reads.
       // When the read time was picked on this tserver (allow_retry_), the client has nothing to
       // retry with, so wait even at a follower.
+      if (auto* metrics = this->metrics()) {
+        metrics->Increment(tablet::TabletCounters::kConsistentPrefixReadRejected);
+        // Sentinel times do not represent a physical deficit; is_special() excludes kInitial.
+        if (safe_ht_to_read_ > HybridTime::kInitial && !safe_ht_to_read_.is_special() &&
+            !read_time_.read.is_special()) {
+          metrics->Increment(
+              tablet::TabletEventStats::kConsistentPrefixReadRejectedSafeTimeDeficitUs,
+              read_time_.read.GetPhysicalValueMicros() - safe_ht_to_read_.GetPhysicalValueMicros());
+        }
+      }
       return STATUS(IllegalState, "Requested read time is not safe at this follower.");
     }
     auto* metrics = this->metrics();

@@ -632,6 +632,8 @@ const char *yb_metric_counter_label[] = {
 	BUILD_METRIC_LABEL("docdb_obsolete_keys_found_past_cutoff"),
 	[YB_STORAGE_COUNTER_BACKFILL_READS_REJECTED_BELOW_HISTORY_CUTOFF] =
 	BUILD_METRIC_LABEL("backfill_reads_rejected_below_history_cutoff"),
+	[YB_STORAGE_COUNTER_CONSISTENT_PREFIX_READ_REJECTED] =
+	BUILD_METRIC_LABEL("consistent_prefix_read_rejected"),
 };
 
 const char *yb_metric_event_label[] = {
@@ -719,6 +721,8 @@ const char *yb_metric_event_label[] = {
 	BUILD_METRIC_LABEL("read_time_wait"),
 	[YB_STORAGE_EVENT_TOTAL_WAIT_QUEUE_TIME] =
 	BUILD_METRIC_LABEL("total_wait_queue_time"),
+	[YB_STORAGE_EVENT_CONSISTENT_PREFIX_READ_REJECTED_SAFE_TIME_DEFICIT_US] =
+	BUILD_METRIC_LABEL("consistent_prefix_read_rejected_safe_time_deficit_us"),
 };
 
 #undef BUILD_METRIC_LABEL
