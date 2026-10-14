@@ -3,3 +3,7 @@
 --enable_ysql_operation_lease=false
 --enable_object_locking_for_table_locks=false
 --ysql_beta_features=true
+# Production's catalog preload list: every new backend reads the full catalog itself and the
+# internal relcache-init connection is never used.
+--ysql_catalog_preload_additional_tables=true
+--ysql_catalog_preload_additional_table_list=pg_statistic,pg_amop,pg_operator,pg_namespace,pg_auth_members,pg_range
