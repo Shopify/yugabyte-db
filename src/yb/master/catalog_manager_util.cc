@@ -733,8 +733,6 @@ Status CatalogManagerUtil::FillTableLoadState(
 
 template Status CatalogManagerUtil::FillTableLoadState(
     const scoped_refptr<TableInfo>& table_info, CMPerTableLoadState* state);
-template Status CatalogManagerUtil::FillTableLoadState(
-    const scoped_refptr<TableInfo>& table_info, CMGlobalLoadState* state);
 
 } // namespace master
 } // namespace yb
