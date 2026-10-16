@@ -225,9 +225,9 @@ bool UseYbController();
 
 void AddExtraFlagsFromEnvVar(const char* env_var_name, std::vector<std::string>* args_dest);
 
-// gflags keeps only the last --undefok, so a later one drops the names of an earlier one.
-// Replaces every --undefok=... in args with one final --undefok holding all of the names.
-void MergeUndefokFlags(std::vector<std::string>* args);
+// gflags keeps only the last value of a flag, so a later --<name>=a,b drops the items of an
+// earlier one. Replaces every --<name>=... in args with one final --<name> holding all items.
+void MergeCsvFlag(std::vector<std::string>* args, const std::string& name);
 
 int CalcNumTablets(size_t num_tablet_servers);
 

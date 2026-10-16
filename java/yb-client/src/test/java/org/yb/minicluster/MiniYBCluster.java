@@ -222,25 +222,25 @@ public class MiniYBCluster implements AutoCloseable {
   }
 
   /**
-   * gflags keeps only the last --undefok, so a later one drops the names of an earlier one.
-   * Replaces every --undefok=... in args with one final --undefok holding all of the names.
+   * gflags keeps only the last value of a flag, so a later --name=a,b drops the items of an
+   * earlier one. Replaces every --name=... in args with one final --name holding all items.
    */
-  private static void mergeUndefokFlags(List<String> args) {
-    final String prefix = "--undefok=";
-    final List<String> names = new ArrayList<>();
+  private static void mergeCsvFlag(List<String> args, String name) {
+    final String prefix = "--" + name + "=";
+    final List<String> items = new ArrayList<>();
     for (Iterator<String> it = args.iterator(); it.hasNext();) {
       final String arg = it.next();
       if (arg.startsWith(prefix)) {
-        for (String name : arg.substring(prefix.length()).split(",")) {
-          if (!name.isEmpty()) {
-            names.add(name);
+        for (String item : arg.substring(prefix.length()).split(",")) {
+          if (!item.isEmpty()) {
+            items.add(item);
           }
         }
         it.remove();
       }
     }
-    if (!names.isEmpty()) {
-      args.add(prefix + String.join(",", names));
+    if (!items.isEmpty()) {
+      args.add(prefix + String.join(",", items));
     }
   }
 
@@ -1005,7 +1005,9 @@ public class MiniYBCluster implements AutoCloseable {
         args.add("--tablet_replicas_per_gib_limit=0");
       }
       if (System.getenv("YB_DEFAULT_DAEMON_FLAGS") != null) {
-        mergeUndefokFlags(args);
+        // Keep the list items from YB_DEFAULT_DAEMON_FLAGS when a test sets its own list.
+        mergeCsvFlag(args, "undefok");
+        mergeCsvFlag(args, "allowed_preview_flags_csv");
       }
       command = args.toArray(new String[0]);
     }

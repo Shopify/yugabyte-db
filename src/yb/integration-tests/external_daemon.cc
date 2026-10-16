@@ -335,8 +335,10 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
   argv.insert(argv.end(), extra_flags_.begin(), extra_flags_.end());
   AddExtraFlagsFromEnvVar("YB_EXTRA_DAEMON_FLAGS", &argv);
   if (getenv("YB_DEFAULT_DAEMON_FLAGS")) {
-    // Keep the --undefok names from YB_DEFAULT_DAEMON_FLAGS when a test sets its own --undefok.
-    MergeUndefokFlags(&argv);
+    // Keep the list items from YB_DEFAULT_DAEMON_FLAGS when a test sets its own list.
+    for (const auto* name : {"undefok", "allowed_preview_flags_csv"}) {
+      MergeCsvFlag(&argv, name);
+    }
   }
 
   auto p = std::make_unique<Subprocess>(exe_, argv);

@@ -59,17 +59,17 @@ namespace yb {
 class FlagsTest : public YBTest {
 };
 
-TEST_F(FlagsTest, MergeUndefokFlagsKeepsEveryName) {
+TEST_F(FlagsTest, MergeCsvFlagKeepsEveryItem) {
   std::vector<std::string> args = {
-      "yb-master", "--undefok=a,b", "--x=1", "--undefok=c", "--undefok=", "--y=2"};
-  MergeUndefokFlags(&args);
+      "yb-master", "--undefok=a,b", "--undefok_x=1", "--undefok=c", "--undefok=", "--y=2"};
+  MergeCsvFlag(&args, "undefok");
   ASSERT_EQ(
-      (std::vector<std::string>{"yb-master", "--x=1", "--y=2", "--undefok=a,b,c"}), args);
+      (std::vector<std::string>{"yb-master", "--undefok_x=1", "--y=2", "--undefok=a,b,c"}), args);
 }
 
-TEST_F(FlagsTest, MergeUndefokFlagsLeavesArgsWithoutUndefok) {
+TEST_F(FlagsTest, MergeCsvFlagLeavesArgsWithoutTheFlag) {
   std::vector<std::string> args = {"yb-master", "--x=1"};
-  MergeUndefokFlags(&args);
+  MergeCsvFlag(&args, "undefok");
   ASSERT_EQ((std::vector<std::string>{"yb-master", "--x=1"}), args);
 }
 
