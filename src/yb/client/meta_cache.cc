@@ -133,6 +133,28 @@ METRIC_DEFINE_event_stats(
   yb::MetricUnit::kMicroseconds,
   "Microseconds spent resolving DNS requests during MetaCache::InitProxy");
 
+METRIC_DEFINE_counter(
+    server, meta_cache_tserver_marked_failed,
+    "Tablet Servers Marked Failed in Meta Cache",
+    yb::MetricUnit::kUnits,
+    "Number of whole-tablet-server failure sweeps in client meta caches. Network connect "
+    "failures trigger these sweeps when update_all_tablets_upon_network_failure is enabled.");
+
+METRIC_DEFINE_counter(
+    server, meta_cache_replicas_marked_failed,
+    "Replicas Marked Failed by Meta Cache Tablet Server Sweeps",
+    yb::MetricUnit::kUnits,
+    "Number of cached tablet replica entries matched by whole-tablet-server failure sweeps. "
+    "Repeated sweeps count already-failed entries again.");
+
+METRIC_DEFINE_gauge_uint64(
+    server, meta_cache_failed_replicas,
+    "Failed Replica Entries in Meta Cache",
+    yb::MetricUnit::kUnits,
+    "Current failed replica entries in instrumented live RemoteTablet objects across client "
+    "meta caches, including objects retained by in-flight RPCs. Counts cache exclusions, not "
+    "unique tablet servers or serving readiness.");
+
 DECLARE_string(placement_cloud);
 DECLARE_string(placement_region);
 DECLARE_bool(TEST_always_return_consensus_info_for_succeeded_rpc);
@@ -368,16 +390,46 @@ std::string ReplicasCount::ToString() {
 
 ////////////////////////////////////////////////////////////
 
+RemoteReplica::RemoteReplica(RemoteTabletServer* ts_, PeerRole role_)
+    : ts(ts_), role(role_) {}
+
+RemoteReplica::~RemoteReplica() {
+  ReleaseFailedReplicaMetric();
+}
+
+void RemoteReplica::MarkFailed(
+    const scoped_refptr<AtomicGauge<uint64_t>>& failed_replicas_metric) {
+  if (!failed_replicas_metric_ && failed_replicas_metric) {
+    failed_replicas_metric_ = failed_replicas_metric;
+    failed_replicas_metric_->Increment();
+  }
+  last_failed_time = MonoTime::Now();
+}
+
+void RemoteReplica::ClearFailed() {
+  last_failed_time = MonoTime::kUninitialized;
+  ReleaseFailedReplicaMetric();
+}
+
+void RemoteReplica::ReleaseFailedReplicaMetric() {
+  if (failed_replicas_metric_) {
+    failed_replicas_metric_->Decrement();
+    failed_replicas_metric_.reset();
+  }
+}
+
 RemoteTablet::RemoteTablet(
     std::string tablet_id, dockv::Partition partition,
     std::optional<PartitionListVersion> partition_list_version, uint64 split_depth,
-    const TabletId& split_parent_tablet_id, int64_t raft_config_opid_index)
+    const TabletId& split_parent_tablet_id, int64_t raft_config_opid_index,
+    AtomicGauge<uint64_t>* failed_replicas_metric)
     : tablet_id_(std::move(tablet_id)),
       log_prefix_(Format("T $0: ", tablet_id_)),
       partition_(std::move(partition)),
       partition_list_version_(partition_list_version),
       split_depth_(split_depth),
       split_parent_tablet_id_(split_parent_tablet_id),
+      failed_replicas_metric_(failed_replicas_metric),
       stale_(false),
       raft_config_opid_index_(raft_config_opid_index) {}
 
@@ -392,6 +444,9 @@ RemoteTablet::~RemoteTablet() {
                                << " is marked as failed";
       }
     }
+  }
+  for (const auto& replica : replicas_) {
+    replica->ReleaseFailedReplicaMetric();
   }
 }
 
@@ -439,6 +494,9 @@ Status RemoteTablet::RefreshFromRaftConfigIfNewer(
     }
     new_replicas.emplace_back(std::make_shared<RemoteReplica>((*tserver).get(), role));
   }
+  for (const auto& replica : replicas_) {
+    replica->ReleaseFailedReplicaMetric();
+  }
   replicas_ = std::move(new_replicas);
   const auto new_opid_index = consensus_state.config().committed_op_index();
   raft_config_opid_index_.store(new_opid_index);
@@ -461,6 +519,7 @@ void RemoteTablet::Refresh(
   old_uuids.reserve(replicas_.size());
   for (const auto& replica : replicas_) {
     old_uuids.push_back(replica->ts->permanent_uuid());
+    replica->ReleaseFailedReplicaMetric();
   }
   std::sort(old_uuids.begin(), old_uuids.end());
   replicas_.clear();
@@ -513,7 +572,7 @@ bool RemoteTablet::MarkReplicaFailed(RemoteTabletServer *ts, const Status& statu
                       << " has failed: " << status.ToString();
   for (auto& rep : replicas_) {
     if (rep->ts == ts) {
-      rep->MarkFailed();
+      rep->MarkFailed(failed_replicas_metric_);
       return true;
     }
   }
@@ -817,6 +876,13 @@ MetaCache::MetaCache(YBClient* client)
   : client_(client),
     master_lookup_sem_(FLAGS_max_concurrent_master_lookups),
     log_prefix_(Format("MetaCache($0)(client_id: $1): ", static_cast<void*>(this), client_->id())) {
+  if (const auto& metric_entity = client_->metric_entity()) {
+    tserver_marked_failed_metric_ =
+        METRIC_meta_cache_tserver_marked_failed.Instantiate(metric_entity);
+    replicas_marked_failed_metric_ =
+        METRIC_meta_cache_replicas_marked_failed.Instantiate(metric_entity);
+    failed_replicas_metric_ = METRIC_meta_cache_failed_replicas.Instantiate(metric_entity, 0);
+  }
 }
 
 MetaCache::~MetaCache() {
@@ -1246,7 +1312,8 @@ Result<RemoteTabletPtr> MetaCache::ProcessTabletLocation(
       // we will be able to update the committed opid.
       remote = new RemoteTablet(
           tablet_id, partition, lookup_context.table_partition_list_version, location.split_depth(),
-          location.split_parent_tablet_id(), RemoteTablet::kUnknownOpIdIndex);
+          location.split_parent_tablet_id(), RemoteTablet::kUnknownOpIdIndex,
+          failed_replicas_metric_.get());
 
       CHECK(tablets_by_id_.emplace(tablet_id, remote).second);
     }
@@ -2533,16 +2600,24 @@ void MetaCache::RefreshTablePartitions(
 void MetaCache::MarkTSFailed(RemoteTabletServer* ts,
                              const Status& status) {
   LOG_WITH_PREFIX(INFO) << "Marking tablet server " << ts->ToString() << " as failed.";
-  SharedLock<decltype(mutex_)> lock(mutex_);
+  int64_t replicas_marked_failed = 0;
+  {
+    SharedLock<decltype(mutex_)> lock(mutex_);
 
-  Status ts_status = status.CloneAndPrepend("TS failed");
+    Status ts_status = status.CloneAndPrepend("TS failed");
 
-  // TODO: replace with a ts->tablet multimap for faster lookup?
-  for (const auto& tablet : tablets_by_id_) {
-    // We just loop on all tablets; if a tablet does not have a replica on this
-    // TS, MarkReplicaFailed() returns false and we ignore the return value.
-    tablet.second->MarkReplicaFailed(ts, ts_status);
+    // TODO: replace with a ts->tablet multimap for faster lookup?
+    for (const auto& tablet : tablets_by_id_) {
+      if (tablet.second->MarkReplicaFailed(ts, ts_status)) {
+        ++replicas_marked_failed;
+      }
+    }
   }
+  LOG_WITH_PREFIX(INFO) << "Marked " << replicas_marked_failed
+                        << " cached replicas on tablet server " << ts->permanent_uuid()
+                        << " as failed.";
+  IncrementCounter(tserver_marked_failed_metric_);
+  IncrementCounterBy(replicas_marked_failed_metric_, replicas_marked_failed);
 }
 
 void MetaCache::MarkTServersAsFollowers(const std::vector<std::string>& ts_uuids) {

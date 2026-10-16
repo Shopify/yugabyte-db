@@ -67,6 +67,7 @@
 #include "yb/util/format.h"
 #include "yb/util/locks.h"
 #include "yb/util/lockfree.h"
+#include "yb/util/metrics_fwd.h"
 #include "yb/util/monotime.h"
 #include "yb/util/semaphore.h"
 #include "yb/util/shared_lock.h"
@@ -82,6 +83,7 @@ class JsonWriter;
 
 namespace client {
 
+class ClientTest_MetaCacheFailureMetrics_Test;
 class ClientTest_TestMasterLookupPermits_Test;
 class ClientTest_TestMetacacheRefreshWhenSentToWrongLeader_Test;
 class YBClient;
@@ -187,22 +189,27 @@ struct RemoteReplica {
   // The state of this replica. Only updated after calling GetTabletStatus.
   tablet::RaftGroupStatePB state = tablet::RaftGroupStatePB::UNKNOWN;
 
-  RemoteReplica(RemoteTabletServer* ts_, PeerRole role_)
-      : ts(ts_), role(role_) {}
+  RemoteReplica(RemoteTabletServer* ts_, PeerRole role_);
+  ~RemoteReplica();
 
-  void MarkFailed() {
-    last_failed_time = MonoTime::Now();
-  }
+  void MarkFailed(const scoped_refptr<AtomicGauge<uint64_t>>& failed_replicas_metric);
+  void ClearFailed();
 
-  void ClearFailed() {
-    last_failed_time = MonoTime::kUninitialized;
-  }
+  // Release accounting on removal without changing a retained replica's failed marker.
+  void ReleaseFailedReplicaMetric();
 
   bool Failed() const {
     return last_failed_time.Initialized();
   }
 
   std::string ToString() const;
+
+ private:
+  // A non-null reference owns exactly one gauge contribution. Protected by RemoteTablet::mutex_,
+  // like the failed marker; destruction occurs only after the last replica reference is released.
+  scoped_refptr<AtomicGauge<uint64_t>> failed_replicas_metric_;
+
+  DISALLOW_COPY_AND_ASSIGN(RemoteReplica);
 };
 
 using TabletServerMap = UnorderedStringMap<TabletServerId, std::unique_ptr<RemoteTabletServer>>;
@@ -254,7 +261,8 @@ class RemoteTablet : public RefCountedThreadSafe<RemoteTablet> {
   RemoteTablet(
       std::string tablet_id, dockv::Partition partition,
       std::optional<PartitionListVersion> partition_list_version, uint64 split_depth,
-      const TabletId& split_parent_tablet_id, int64_t raft_config_opid_index);
+      const TabletId& split_parent_tablet_id, int64_t raft_config_opid_index,
+      AtomicGauge<uint64_t>* failed_replicas_metric = nullptr);
 
   ~RemoteTablet();
 
@@ -388,6 +396,7 @@ class RemoteTablet : public RefCountedThreadSafe<RemoteTablet> {
   std::string current_leader_uuid() const;
 
  private:
+  FRIEND_TEST(client::ClientTest, MetaCacheFailureMetrics);
   FRIEND_TEST(client::ClientTest, TestMetacacheRefreshWhenSentToWrongLeader);
 
   // Same as ReplicasAsString(), except that the caller must hold mutex_.
@@ -403,6 +412,7 @@ class RemoteTablet : public RefCountedThreadSafe<RemoteTablet> {
   const std::optional<PartitionListVersion> partition_list_version_;
   const uint64 split_depth_;
   const TabletId split_parent_tablet_id_;
+  const scoped_refptr<AtomicGauge<uint64_t>> failed_replicas_metric_;
 
   // All non-const members are protected by 'mutex_'.
   mutable rw_spinlock mutex_;
@@ -823,6 +833,10 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
   Semaphore master_lookup_sem_;
 
   const std::string log_prefix_;
+
+  scoped_refptr<Counter> tserver_marked_failed_metric_;
+  scoped_refptr<Counter> replicas_marked_failed_metric_;
+  scoped_refptr<AtomicGauge<uint64_t>> failed_replicas_metric_;
 
   DISALLOW_COPY_AND_ASSIGN(MetaCache);
 };
