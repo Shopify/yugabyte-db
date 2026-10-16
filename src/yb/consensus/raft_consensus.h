@@ -188,7 +188,8 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
 
   PeerRole role() const override;
 
-  LeaderState GetLeaderState(bool allow_stale = false) const override;
+  LeaderState GetLeaderState(
+      bool allow_stale = false, CoarseTimePoint deadline = CoarseTimePoint::max()) const override;
 
   const std::string& peer_uuid() const override;
 

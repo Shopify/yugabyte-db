@@ -32,6 +32,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <string>
@@ -52,6 +53,7 @@
 
 #include "yb/gutil/port.h"
 #include "yb/util/locks.h"
+#include "yb/util/monotime.h"
 #include "yb/util/status_fwd.h"
 #include "yb/util/enums.h"
 
@@ -112,7 +114,68 @@ class ReplicaState {
     kShutDown
   };
 
-  typedef std::unique_lock<std::mutex> UniqueLock;
+  // The update lock is a timed mutex that records when its current holder acquired it. Callers
+  // on an RPC deadline take it with LockForRead(deadline) and get back a lock that owns nothing
+  // when the deadline passes. Code that never takes the lock reads UpdateLockHeldSince() to tell
+  // whether the current holder has stalled.
+  class UpdateLock {
+   public:
+    void lock() {
+      mutex_.lock();
+      MarkAcquired();
+    }
+
+    bool try_lock() {
+      if (!mutex_.try_lock()) {
+        return false;
+      }
+      MarkAcquired();
+      return true;
+    }
+
+    template <class Rep, class Period>
+    bool try_lock_for(const std::chrono::duration<Rep, Period>& duration) {
+      if (!mutex_.try_lock_for(duration)) {
+        return false;
+      }
+      MarkAcquired();
+      return true;
+    }
+
+    template <class Clock, class Duration>
+    bool try_lock_until(const std::chrono::time_point<Clock, Duration>& deadline) {
+      if (!mutex_.try_lock_until(deadline)) {
+        return false;
+      }
+      MarkAcquired();
+      return true;
+    }
+
+    void unlock() {
+      held_since_.store(kNotHeld, std::memory_order_relaxed);
+      mutex_.unlock();
+    }
+
+    // Time the current holder acquired the lock, or CoarseTimePoint::max() when it is free.
+    CoarseTimePoint held_since() const {
+      auto value = held_since_.load(std::memory_order_relaxed);
+      return value == kNotHeld ? CoarseTimePoint::max()
+                               : CoarseTimePoint(CoarseTimePoint::duration(value));
+    }
+
+   private:
+    static constexpr int64_t kNotHeld = 0;
+
+    void MarkAcquired() {
+      held_since_.store(
+          CoarseMonoClock::Now().time_since_epoch().count(), std::memory_order_relaxed);
+    }
+
+    std::timed_mutex mutex_;
+    std::atomic<int64_t> held_since_{kNotHeld};
+  };
+
+  typedef std::unique_lock<UpdateLock> UniqueLock;
 
   ReplicaState(
       ConsensusOptions options, std::string peer_uuid, std::unique_ptr<ConsensusMetadata> cmeta,
@@ -160,6 +223,26 @@ class ReplicaState {
   // Obtains the lock for a state read, does not check state.
   UniqueLock LockForRead() const;
 
+  // Same as LockForRead, but gives up at deadline. The returned lock owns the mutex only when
+  // owns_lock() is true. A deadline of CoarseTimePoint::max() waits without bound.
+  UniqueLock LockForRead(CoarseTimePoint deadline) const;
+
+  // Time the current holder of the update lock acquired it, or CoarseTimePoint::max() when the
+  // lock is free. Never takes the lock.
+  CoarseTimePoint UpdateLockHeldSince() const;
+
+  // How long one thread may hold update_lock_ before waiters with a deadline give up on it: the
+  // leader failure detection period, raft_heartbeat_interval_ms times
+  // leader_failure_max_missed_heartbeat_periods. A crashed leader is replaced after that long, so
+  // a holder that keeps the lock longer is treated the same way.
+  static MonoDelta UpdateLockStallThreshold();
+
+  // The deadline a caller with an RPC deadline waits on update_lock_ with: the earlier of its own
+  // deadline and now plus UpdateLockStallThreshold(). A holder that keeps the lock longer than
+  // that has stalled, and the caller is better off failing now than parking its worker until its
+  // own deadline. CoarseTimePoint::max() stays max(), so callers without a deadline wait as before.
+  static CoarseTimePoint UpdateLockWaitDeadline(CoarseTimePoint deadline);
+
   // Obtains the lock so that we can advance the majority replicated
   // index and possibly the committed index.
   // Requires that this peer is leader.
@@ -170,7 +253,12 @@ class ReplicaState {
   // Returns OK if leader, IllegalState otherwise.
   Status CheckActiveLeaderUnlocked(LeaderLeaseCheckMode lease_check_mode) const;
 
-  LeaderState GetLeaderState(bool allow_stale = false) const;
+  // Returns the leader state from the cache while the cache is valid. When the cache has expired
+  // it takes the update lock to refresh it, waiting at most until deadline. Past the deadline it
+  // reports LEADER_BUT_NO_MAJORITY_REPLICATED_LEASE, which is what is known at that point: the
+  // last lease this replica saw has expired and the lock that would show a newer one is held.
+  LeaderState GetLeaderState(
+      bool allow_stale = false, CoarseTimePoint deadline = CoarseTimePoint::max()) const;
 
   // now is used as a cache for current time. It is in/out parameter and could contain or receive
   // current time if it was used during leader state calculation.
@@ -502,8 +590,8 @@ class ReplicaState {
   // The UUID of the local peer.
   const std::string peer_uuid_;
 
-  mutable std::mutex update_lock_;
-  mutable std::condition_variable cond_;
+  mutable UpdateLock update_lock_;
+  mutable std::condition_variable_any cond_;
 
   // Consensus metadata persistence object.
   std::unique_ptr<ConsensusMetadata> cmeta_;
