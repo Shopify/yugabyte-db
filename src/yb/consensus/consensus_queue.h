@@ -32,6 +32,7 @@
 
 #pragma once
 
+#include <functional>
 #include <iosfwd>
 #include <string>
 #include <unordered_map>
@@ -425,6 +426,13 @@ class PeerMessageQueue {
     context_ = context;
   }
 
+  // While check returns true, RequestForPeer fails with ServiceUnavailable and nothing is sent to
+  // followers, so that they stop hearing from a leader that cannot serve. Set once, before the
+  // queue is used.
+  void SetLeaderStallCheck(std::function<bool()> check) {
+    leader_stall_check_ = std::move(check);
+  }
+
   const CloudInfoPB& local_cloud_info() const {
     return local_peer_pb_.cloud_info();
   }
@@ -684,6 +692,8 @@ class PeerMessageQueue {
   server::ClockPtr clock_;
 
   ConsensusContext* context_ = nullptr;
+
+  std::function<bool()> leader_stall_check_;
   bool installed_num_sst_files_changed_listener_ = false;
 
   // Used to protect cdc_consumer_op_id_ and cdc_consumer_op_id_last_updated_.
