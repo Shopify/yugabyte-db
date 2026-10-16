@@ -324,13 +324,20 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
   argv.push_back(Format("--minicluster_daemon_id=$0", daemon_id_));
 
   // Finally, extra flags to override.
+  // - YB_DEFAULT_DAEMON_FLAGS sets defaults for a whole test run, such as a production flag
+  //   profile. It comes before extra_flags_, so flags a test sets take precedence over it.
   // - extra_flags_ is taken from ExternalMiniCluster.opts_, which is often set by test subclasses'
   //   UpdateMiniClusterOptions.
   // - extra daemon flags is supplied by the user, either through environment variable or
   //   yb_build.sh --extra_daemon_flags (or --extra_daemon_args), so it should take highest
   //   precedence.
+  AddExtraFlagsFromEnvVar("YB_DEFAULT_DAEMON_FLAGS", &argv);
   argv.insert(argv.end(), extra_flags_.begin(), extra_flags_.end());
   AddExtraFlagsFromEnvVar("YB_EXTRA_DAEMON_FLAGS", &argv);
+  if (getenv("YB_DEFAULT_DAEMON_FLAGS")) {
+    // Keep the --undefok names from YB_DEFAULT_DAEMON_FLAGS when a test sets its own --undefok.
+    MergeUndefokFlags(&argv);
+  }
 
   auto p = std::make_unique<Subprocess>(exe_, argv);
   p->PipeParentStdout();

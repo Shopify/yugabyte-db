@@ -221,6 +221,29 @@ public class MiniYBCluster implements AutoCloseable {
     return clusterParameters;
   }
 
+  /**
+   * gflags keeps only the last --undefok, so a later one drops the names of an earlier one.
+   * Replaces every --undefok=... in args with one final --undefok holding all of the names.
+   */
+  private static void mergeUndefokFlags(List<String> args) {
+    final String prefix = "--undefok=";
+    final List<String> names = new ArrayList<>();
+    for (Iterator<String> it = args.iterator(); it.hasNext();) {
+      final String arg = it.next();
+      if (arg.startsWith(prefix)) {
+        for (String name : arg.substring(prefix.length()).split(",")) {
+          if (!name.isEmpty()) {
+            names.add(name);
+          }
+        }
+        it.remove();
+      }
+    }
+    if (!names.isEmpty()) {
+      args.add(prefix + String.join(",", names));
+    }
+  }
+
   private static void addFlagsFromEnv(List<String> dest, String envVarName) {
     final String extraFlagsFromEnv = System.getenv(envVarName);
     if (extraFlagsFromEnv != null) {
@@ -710,6 +733,8 @@ public class MiniYBCluster implements AutoCloseable {
         "--callhome_enabled=false",
         "--TEST_process_info_dir=" + getProcessInfoDir(),
         "--never_fsync=true");
+    // Before the test's tserverFlags, so flags a test sets take precedence over these defaults.
+    addFlagsFromEnv(tsCmdLine, "YB_DEFAULT_DAEMON_FLAGS");
     addFlagsFromEnv(tsCmdLine, "YB_EXTRA_TSERVER_FLAGS");
 
     if (clusterParameters.startYsqlProxy) {
@@ -792,6 +817,8 @@ public class MiniYBCluster implements AutoCloseable {
       masterCmdLine.add("--replication_factor=" + clusterParameters.replicationFactor);
     }
 
+    // Callers add the test's master flags after this, so those take precedence over these defaults.
+    addFlagsFromEnv(masterCmdLine, "YB_DEFAULT_DAEMON_FLAGS");
     addFlagsFromEnv(masterCmdLine, "YB_EXTRA_MASTER_FLAGS");
     return masterCmdLine;
   }
@@ -977,7 +1004,10 @@ public class MiniYBCluster implements AutoCloseable {
         // here checking if we have too many tablets for the allocated amount of per-tablet memory.
         args.add("--tablet_replicas_per_gib_limit=0");
       }
-      command = args.toArray(command);
+      if (System.getenv("YB_DEFAULT_DAEMON_FLAGS") != null) {
+        mergeUndefokFlags(args);
+      }
+      command = args.toArray(new String[0]);
     }
 
     ProcessBuilder procBuilder = new ProcessBuilder(command).redirectErrorStream(true);

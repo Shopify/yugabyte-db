@@ -344,6 +344,26 @@ void AddExtraFlagsFromEnvVar(const char* env_var_name, std::vector<std::string>*
   }
 }
 
+void MergeUndefokFlags(std::vector<std::string>* args) {
+  static const std::string kPrefix = "--undefok=";
+  std::vector<std::string> names;
+  std::erase_if(*args, [&names](const std::string& arg) {
+    if (!arg.starts_with(kPrefix)) {
+      return false;
+    }
+    std::istringstream list(arg.substr(kPrefix.size()));
+    for (std::string name; std::getline(list, name, ',');) {
+      if (!name.empty()) {
+        names.push_back(std::move(name));
+      }
+    }
+    return true;
+  });
+  if (!names.empty()) {
+    args->push_back(kPrefix + JoinStrings(names, ","));
+  }
+}
+
 string GetCertsDir() {
   const auto sub_dir = "test_certs";
   return JoinPathSegments(env_util::GetRootDir(sub_dir), sub_dir);

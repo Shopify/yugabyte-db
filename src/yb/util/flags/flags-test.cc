@@ -59,6 +59,20 @@ namespace yb {
 class FlagsTest : public YBTest {
 };
 
+TEST_F(FlagsTest, MergeUndefokFlagsKeepsEveryName) {
+  std::vector<std::string> args = {
+      "yb-master", "--undefok=a,b", "--x=1", "--undefok=c", "--undefok=", "--y=2"};
+  MergeUndefokFlags(&args);
+  ASSERT_EQ(
+      (std::vector<std::string>{"yb-master", "--x=1", "--y=2", "--undefok=a,b,c"}), args);
+}
+
+TEST_F(FlagsTest, MergeUndefokFlagsLeavesArgsWithoutUndefok) {
+  std::vector<std::string> args = {"yb-master", "--x=1"};
+  MergeUndefokFlags(&args);
+  ASSERT_EQ((std::vector<std::string>{"yb-master", "--x=1"}), args);
+}
+
 TEST_F(FlagsTest, TestRefreshFlagsFile) {
   ASSERT_EQ(0, FLAGS_flagstest_testflag);
   std::string flagsfile = GetTestPath("flagsfile");
