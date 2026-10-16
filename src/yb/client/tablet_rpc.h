@@ -87,6 +87,8 @@ class TabletRpc {
 
   virtual void SetRequestRaftConfigOpidIndex(int64_t opid_index) {}
 
+  virtual const AsyncRpcMetrics* async_rpc_metrics() const { return nullptr; }
+
  protected:
   ~TabletRpc() {}
 };

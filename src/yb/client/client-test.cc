@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <limits>
 #include <regex>
 #include <set>
 #include <thread>
@@ -39,6 +40,7 @@
 
 #include <gtest/gtest.h>
 
+#include "yb/client/async_rpc.h"
 #include "yb/client/client-internal.h"
 #include "yb/client/client-test-util.h"
 #include "yb/client/client.h"
@@ -3012,6 +3014,83 @@ RefreshBurstResult ApplyConsensusInfoConcurrently(
 }
 
 }  // namespace
+
+TEST_F(ClientTest, ConsistentPrefixReadSelectionMetrics) {
+  // Keep failed remote-proxy entries excluded for the duration of the test without sleeping.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_retry_failed_replica_ms) =
+      std::numeric_limits<int32_t>::max();
+  const auto tablet_id = GetFirstTabletId(client_table2_.table().get());
+  auto initial_tablet = ASSERT_RESULT(GetRemoteTablet(tablet_id, false, client_.get()));
+  auto* leader = initial_tablet->LeaderTServer();
+  ASSERT_ONLY_NOTNULL(leader);
+  const auto local_uuid = leader->permanent_uuid();
+
+  struct TestCase {
+    const char* name;
+    std::string origin_uuid;
+    bool fail_local;
+  };
+  const std::vector<TestCase> cases = {
+      {"healthy-local", local_uuid, false},
+      {"absent-local", "non-replica-origin", false},
+      {"failed-local", local_uuid, true},
+      {"unknown-source", "", false}};
+  MetricRegistry registry;
+  for (size_t case_idx = 0; case_idx != cases.size(); ++case_idx) {
+    const auto& test_case = cases[case_idx];
+    SCOPED_TRACE(test_case.name);
+    auto entity = METRIC_ENTITY_server.Instantiate(&registry, test_case.name);
+    auto metric_client = ASSERT_RESULT(YBClientBuilder()
+        .add_master_server_addr(ToString(cluster_->mini_master()->bound_rpc_addr()))
+        .set_tserver_uuid(test_case.origin_uuid)
+        .set_metric_entity(entity)
+        .Build());
+    TableHandle table;
+    ASSERT_OK(table.Open(client_table2_.name(), metric_client.get()));
+    auto tablet = ASSERT_RESULT(GetRemoteTablet(tablet_id, false, metric_client.get()));
+    if (test_case.fail_local) {
+      // Match the source UUID, not RemoteTabletServer::IsLocal(): this client uses remote proxies.
+      auto servers = tablet->GetRemoteTabletServers();
+      ASSERT_GT(servers.size(), 1);
+      auto local = std::find_if(servers.begin(), servers.end(), [&](const auto* ts) {
+        return ts->permanent_uuid() == local_uuid;
+      });
+      ASSERT_NE(local, servers.end());
+      ASSERT_TRUE(tablet->MarkReplicaFailed(*local, STATUS(NetworkError, "test failure")));
+    }
+
+    auto session = metric_client->NewSession(60s);
+    const auto& metrics = session->async_rpc_metrics();
+    ASSERT_TRUE(metrics);
+    const std::vector<scoped_refptr<Counter>> counters = {
+        metrics->consistent_prefix_read_local_selections,
+        metrics->consistent_prefix_read_local_replica_missing,
+        metrics->consistent_prefix_read_local_replica_excluded,
+        metrics->consistent_prefix_read_locality_unknown};
+    for (const auto& counter : counters) {
+      ASSERT_TRUE(counter);
+      ASSERT_EQ(counter->value(), 0);
+    }
+    auto op = table.NewReadOp(session->arena());
+    table.AddColumns({"key"}, op->mutable_request());
+    op->set_yb_consistency_level(YBConsistencyLevel::CONSISTENT_PREFIX);
+    op->SetTablet(tablet);
+    ASSERT_OK(session->TEST_ApplyAndFlush(op));
+    ASSERT_EQ(op->response().status(), QLResponsePB::YQL_STATUS_OK);
+    for (size_t counter_idx = 0; counter_idx != counters.size(); ++counter_idx) {
+      ASSERT_EQ(counters[counter_idx]->value(), counter_idx == case_idx ? 1 : 0);
+    }
+  }
+
+  auto session = client_->NewSession(60s);
+  ASSERT_FALSE(session->async_rpc_metrics());
+  auto op = client_table2_.NewReadOp(session->arena());
+  client_table2_.AddColumns({"key"}, op->mutable_request());
+  op->set_yb_consistency_level(YBConsistencyLevel::CONSISTENT_PREFIX);
+  op->SetTablet(initial_tablet);
+  ASSERT_OK(session->TEST_ApplyAndFlush(op));
+  ASSERT_EQ(op->response().status(), QLResponsePB::YQL_STATUS_OK);
+}
 
 TEST_F(ClientTest, MetaCacheFailureMetrics) {
   MetricRegistry registry;

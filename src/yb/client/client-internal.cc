@@ -401,12 +401,17 @@ YBClient::Data::~Data() {
   rpcs_.Shutdown();
 }
 
-RemoteTabletServer* YBClient::Data::SelectTServer(RemoteTablet* rt,
-                                                  const ReplicaSelection selection,
-                                                  const set<string>& blacklist,
-                                                  vector<RemoteTabletServer*>* candidates) {
+RemoteTabletServer* YBClient::Data::SelectTServer(
+    RemoteTablet* rt, const ReplicaSelection selection, const set<string>& blacklist,
+    vector<RemoteTabletServer*>* candidates, internal::ReplicaSelectionDiagnostics* diagnostics) {
   RemoteTabletServer* ret = nullptr;
   candidates->clear();
+  if (diagnostics) {
+    *diagnostics = {};
+    if (selection == CLOSEST_REPLICA) {
+      diagnostics->local_tserver_uuid = uuid_;
+    }
+  }
   if (PREDICT_FALSE(FLAGS_TEST_assert_local_tablet_server_selected ||
                     !FLAGS_TEST_assert_tablet_server_select_is_in_zone.empty()) &&
       selection != CLOSEST_REPLICA) {
@@ -427,9 +432,11 @@ RemoteTabletServer* YBClient::Data::SelectTServer(RemoteTablet* rt,
     case CLOSEST_REPLICA:
     case FIRST_REPLICA: {
       if (PREDICT_TRUE(FLAGS_TEST_assert_tablet_server_select_is_in_zone.empty())) {
-        rt->GetRemoteTabletServers(candidates);
+        rt->GetRemoteTabletServers(
+            candidates, internal::IncludeFailedReplicas::kFalse, diagnostics);
       } else {
-        rt->GetRemoteTabletServers(candidates, internal::IncludeFailedReplicas::kTrue);
+        rt->GetRemoteTabletServers(
+            candidates, internal::IncludeFailedReplicas::kTrue, diagnostics);
       }
 
       // Filter out all the blacklisted candidates.
@@ -437,6 +444,10 @@ RemoteTabletServer* YBClient::Data::SelectTServer(RemoteTablet* rt,
       for (RemoteTabletServer* rts : *candidates) {
         if (!ContainsKey(blacklist, rts->permanent_uuid())) {
           filtered.push_back(rts);
+          if (diagnostics && !diagnostics->local_tserver_uuid.empty() &&
+              rts->permanent_uuid() == diagnostics->local_tserver_uuid) {
+            diagnostics->local_replica_eligible = true;
+          }
         } else {
           VLOG(1) << "Excluding blacklisted tserver " << rts->permanent_uuid();
         }
