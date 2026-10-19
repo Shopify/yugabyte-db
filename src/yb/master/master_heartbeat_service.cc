@@ -160,6 +160,45 @@ using tablet::RaftGroupStatePB;
 using tablet::TABLET_DATA_DELETED;
 using tablet::TABLET_DATA_TOMBSTONED;
 
+// Peer addresses and cloud info are skipped: they are logged at registration, and the full
+// ShortDebugString was 2.3 KB per line, once per replica after every table creation.
+std::string ConsensusStateChangeToString(const ConsensusStatePB& cstate) {
+  static constexpr std::pair<PeerMemberType, const char*> kGroups[] = {
+      {PeerMemberType::VOTER, "voters"},
+      {PeerMemberType::PRE_VOTER, "pre_voters"},
+      {PeerMemberType::OBSERVER, "observers"},
+      {PeerMemberType::PRE_OBSERVER, "pre_observers"},
+      {PeerMemberType::UNKNOWN_MEMBER_TYPE, "unknown"},
+  };
+  std::string out = Format(
+      "term $0, leader $1, committed_op_index $2", cstate.current_term(), cstate.leader_uuid(),
+      cstate.config().committed_op_index());
+  for (const auto& [type, name] : kGroups) {
+    const char* sep = nullptr;
+    for (const auto& peer : cstate.config().peers()) {
+      if (peer.member_type() != type) {
+        continue;
+      }
+      if (sep == nullptr) {
+        out += ", ";
+        out += name;
+        out += " [";
+        sep = "";
+      }
+      out += sep;
+      out += peer.permanent_uuid();
+      sep = ", ";
+    }
+    if (sep != nullptr) {
+      out += "]";
+    }
+  }
+  if (cstate.config().unsafe_config_change()) {
+    out += ", unsafe_config_change";
+  }
+  return out;
+}
+
 class MasterHeartbeatServiceImpl : public MasterServiceBase, public MasterHeartbeatIf {
  public:
   explicit MasterHeartbeatServiceImpl(Master* master)
@@ -1280,9 +1319,8 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
     UpdateTabletReplicasAfterConfigChange(tablet, ts_desc->permanent_uuid(), cstate, report, epoch);
 
     // 6d(iv). Update the consensus state. Don't use 'prev_cstate' after this.
-    LOG(INFO) << "Tablet: " << tablet->tablet_id() << " reported consensus state change."
-              << " New consensus state: " << cstate.ShortDebugString()
-              << " from " << ts_desc->permanent_uuid();
+    LOG(INFO) << "Tablet " << tablet->tablet_id() << " reported consensus state change: "
+              << ConsensusStateChangeToString(cstate) << ", from " << ts_desc->permanent_uuid();
     *tablet_lock.mutable_data()->pb.mutable_committed_consensus_state() = cstate;
     tablet_was_mutated = true;
   } else {
