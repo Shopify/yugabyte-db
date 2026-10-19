@@ -60,6 +60,9 @@ struct PgProcessConf : public ProcessWrapperCommonConfig {
   // If this is true, we will not log to the file, even if the log file is specified.
   bool force_disable_log_file = false;
 
+  // Disable when the caller must fail rather than kill an existing postmaster or port owner.
+  bool cleanup_previous_postgres = true;
+
   // Start the PostgreSQL server in binary upgrade mode.
   bool run_in_binary_upgrade = false;
 };
