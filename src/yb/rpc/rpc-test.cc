@@ -36,6 +36,7 @@
 #include <condition_variable>
 #include <functional>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -1638,8 +1639,9 @@ TEST_F(TestRpc, PriorityQueueDispatchesHighPriorityServiceFirst) {
 // A caller's requested priority can demote a call below its service's default and is ignored when
 // it would promote it. Both services are registered kNormal on a single-permit server; a blocker
 // holds the permit, then: a call requesting kLow, a plain call, and a call requesting kHigh are
-// queued. Dispatch order must be plain + "high" (both effectively kNormal, FIFO) before the demoted
-// one, and the queue's kLow band must have held exactly the demoted call.
+// queued. Both the plain and the "promoted" call must run before the demoted one (they are both
+// effectively kNormal; their mutual order depends on which connection delivered them first), and
+// the kHigh band must never have held anything.
 TEST_F(TestRpc, PriorityQueueHonoursRequestedDemotionOnly) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_enabled) = true;
   auto flag_reset = ScopeExit([] {
@@ -1702,8 +1704,8 @@ TEST_F(TestRpc, PriorityQueueHonoursRequestedDemotionOnly) {
       }, 30s, "all calls complete"));
   std::lock_guard lock(mutex);
   ASSERT_EQ(completion_order[0], "blocker") << AsString(completion_order);
-  ASSERT_EQ(completion_order[1], "plain") << AsString(completion_order);
-  ASSERT_EQ(completion_order[2], "promoted") << AsString(completion_order);
+  ASSERT_EQ((std::set<std::string>{completion_order[1], completion_order[2]}),
+            (std::set<std::string>{"plain", "promoted"})) << AsString(completion_order);
   ASSERT_EQ(completion_order[3], "demoted") << AsString(completion_order);
   for (auto* controller : {&blocker_controller, &demoted, &plain, &promoted}) {
     ASSERT_OK(controller->status());
