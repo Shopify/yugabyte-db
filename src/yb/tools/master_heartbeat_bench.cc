@@ -695,6 +695,10 @@ class HollowTSAdminService : public tserver::TabletServerAdminServiceIf {
                             tserver::GetPgSocketDirResponsePB)
   HOLLOW_UNSUPPORTED_METHOD(GetActiveRbsInfo, tserver::GetActiveRbsInfoRequestPB,
                             tserver::GetActiveRbsInfoResponsePB)
+  HOLLOW_UNSUPPORTED_METHOD(AlterTabletTier, tserver::AlterTabletTierRequestPB,
+                            tserver::AlterTabletTierResponsePB)
+  HOLLOW_UNSUPPORTED_METHOD(GetTabletTierInfo, tserver::GetTabletTierInfoRequestPB,
+                            tserver::GetTabletTierInfoResponsePB)
 #undef HOLLOW_UNSUPPORTED_METHOD
 
  private:
