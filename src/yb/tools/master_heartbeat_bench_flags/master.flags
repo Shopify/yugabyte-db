@@ -2,6 +2,7 @@
 --ysql_enable_concurrent_ddl=false
 --enable_ysql_operation_lease=false
 --enable_object_locking_for_table_locks=false
+--ysql_yb_ddl_transaction_block_enabled=false
 --catalog_manager_report_batch_size=100
 --enable_heartbeat_pg_catalog_versions_cache=true
 --rpc_workers_limit=4096
