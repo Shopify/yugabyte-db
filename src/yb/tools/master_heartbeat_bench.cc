@@ -1623,14 +1623,13 @@ class HeartbeatBench {
   }
 
   void ReplayLoop() {
-    google::protobuf::DynamicMessageFactory factory;
     while (running_.load(std::memory_order_acquire)) {
       MirrorState::ReplayItem item;
       if (!mirror_state_->PopReplayItem(&item)) {
         SleepFor(100ms);
         continue;
       }
-      ReplayToHollowTservers(item, &factory);
+      ReplayToHollowTservers(item, &replay_factory_);
     }
   }
 
@@ -2036,6 +2035,9 @@ class HeartbeatBench {
   std::unique_ptr<Subprocess> tserver_process_;
   std::unique_ptr<MirrorState> mirror_state_;
   std::unique_ptr<TcpRelay> relay_;
+  // Owns the DynamicMessages of in-flight replay calls, whose callbacks run from
+  // messenger_->Shutdown(); must outlive the messenger, not the replay thread.
+  google::protobuf::DynamicMessageFactory replay_factory_;
   rpc::ProxyPtr generic_proxy_;
   std::unique_ptr<rpc::Messenger> messenger_;
   std::unique_ptr<rpc::ProxyCache> proxy_cache_;
