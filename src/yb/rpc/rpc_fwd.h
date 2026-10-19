@@ -18,6 +18,7 @@
 #include <chrono>
 #include <functional>
 #include <unordered_map>
+#include <utility>
 
 #include <boost/functional/hash.hpp>
 #include <boost/container/small_vector.hpp>
@@ -169,6 +170,12 @@ YB_DEFINE_ENUM(ServicePriority, (kNormal)(kHigh));
 // (user-facing queries), which is dispatched before kLow (background: backfill, remote
 // bootstrap, backups, xCluster/CDC).
 YB_DEFINE_ENUM(RpcPriority, (kHigh)(kNormal)(kLow));
+
+// Lower priority is the larger enum value; the service default and a caller's request combine to
+// the lower of the two.
+inline RpcPriority LowerPriority(RpcPriority a, RpcPriority b) {
+  return std::to_underlying(a) >= std::to_underlying(b) ? a : b;
+}
 
 // Kind of work submitted to RpcPriorityQueue. kInbound is an inbound service call handler;
 // kCallback is the callback of an outbound (client-side) call. The distinction exists because an

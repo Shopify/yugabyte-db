@@ -14,6 +14,7 @@
 #pragma once
 
 #include <future>
+#include <optional>
 #include <unordered_set>
 
 #include "yb/client/batcher.h"
@@ -127,6 +128,10 @@ class YBSession : public std::enable_shared_from_this<YBSession> {
   void SetDeadline(CoarseTimePoint deadline);
 
   void SetPoolTag(rpc::ThreadPoolTag tag);
+
+  // Requests this priority for every RPC the session issues; the server takes the lower of this
+  // and the service default.
+  void SetPriority(rpc::RpcPriority priority);
 
   // TODO: add "doAs" ability here for proxy servers to be able to act on behalf of
   // other users, assuming access rights.
@@ -293,6 +298,7 @@ class YBSession : public std::enable_shared_from_this<YBSession> {
   MonoDelta timeout_;
 
   rpc::ThreadPoolTag pool_tag_ = 0;
+  std::optional<rpc::RpcPriority> priority_;
 
   internal::AsyncRpcMetricsPtr async_rpc_metrics_;
 

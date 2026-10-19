@@ -31,6 +31,7 @@
 //
 #pragma once
 
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -191,6 +192,8 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
   void SetDeadline(CoarseTimePoint deadline);
 
   void SetPoolTag(rpc::ThreadPoolTag tag);
+
+  void SetPriority(rpc::RpcPriority priority);
 
   // Add a new operation to the batch. Requires that the batch has not yet been flushed.
   // TODO: in other flush modes, this may not be the case -- need to
@@ -405,6 +408,7 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
   CoarseTimePoint deadline_;
 
   rpc::ThreadPoolTag pool_tag_ = 0;
+  std::optional<rpc::RpcPriority> priority_;
 
   // Number of outstanding lookups across all in-flight ops.
   std::atomic<size_t> outstanding_lookups_{0};

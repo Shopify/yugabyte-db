@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <boost/functional/hash.hpp>
@@ -357,6 +358,9 @@ Status OutboundCall::SetRequestParam(
   auto sidecars_size = sidecars_ ? sidecars_->size() : 0;
   size_t message_size = SerializedMessageSize(req_size, sidecars_size);
   auto pool_tag = FLAGS_enable_rpc_pool_tags ? controller_->pool_tag() : 0;
+  // RpcPriorityPB: kHigh -> 1, kNormal -> 2, kLow -> 3; 0 (unset) is never written.
+  const uint32_t priority = controller_->priority()
+      ? static_cast<uint32_t>(std::to_underlying(*controller_->priority())) + 1 : 0;
 
   using Output = google::protobuf::io::CodedOutputStream;
   using google::protobuf::internal::WireFormatLite;
@@ -379,6 +383,9 @@ Status OutboundCall::SetRequestParam(
                          metadata_size; // AshMetadataPB metadata = 5
   if (pool_tag) {
     header_pb_len += 1 + Output::VarintSize64(pool_tag); // uint64 pool_tag = 7
+  }
+  if (priority) {
+    header_pb_len += 1 + Output::VarintSize32(priority); // RpcPriorityPB priority = 8
   }
   if (use_crc) {
     header_pb_len += 1 + sizeof(uint32_t); // fixed32 crc = 15
@@ -429,6 +436,10 @@ Status OutboundCall::SetRequestParam(
   if (pool_tag) {
     dst = CodedOutputStream::WriteTagToArray(RequestHeader::kPoolTagFieldNumber << 3, dst);
     dst = Output::WriteVarint64ToArray(pool_tag, dst);
+  }
+  if (priority) {
+    dst = CodedOutputStream::WriteTagToArray(RequestHeader::kPriorityFieldNumber << 3, dst);
+    dst = Output::WriteVarint32ToArray(priority, dst);
   }
 
   // CRC should be at the end of header, otherwise adjust CRC filling logic below.

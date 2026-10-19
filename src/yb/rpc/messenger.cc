@@ -90,6 +90,7 @@ DECLARE_int32(num_connections_to_server);
 DECLARE_bool(rpc_priority_queue_enabled);
 DECLARE_int32(rpc_priority_queue_max_dispatched);
 DECLARE_int32(rpc_priority_queue_callback_reserve);
+DECLARE_int32(rpc_priority_queue_low_max_dispatched);
 DEFINE_UNKNOWN_int32(rpc_default_keepalive_time_ms, 65000,
              "If an RPC connection from a client is idle for this amount of time, the server "
              "will disconnect the client. Setting flag to 0 disables this clean up.");
@@ -698,8 +699,10 @@ Status Messenger::Init(const MessengerBuilder &bld) {
     size_t callback_reserve = FLAGS_rpc_priority_queue_callback_reserve < 0
         ? std::max<size_t>(2, budget / 20)
         : static_cast<size_t>(FLAGS_rpc_priority_queue_callback_reserve);
+    const size_t low_cap = FLAGS_rpc_priority_queue_low_max_dispatched > 0
+        ? static_cast<size_t>(FLAGS_rpc_priority_queue_low_max_dispatched) : 0;
     rpc_priority_queue_ = std::make_unique<RpcPriorityQueue>(
-        name_, budget, callback_reserve, metric_entity_);
+        name_, budget, callback_reserve, metric_entity_, low_cap);
     // Callback recipients dispatch to the same pools the corresponding ServicePriority selects.
     // The high-priority pool is normally created lazily; create it now so the recipient can hold
     // it.

@@ -82,8 +82,20 @@ message RequestHeader {
 
   optional uint64 pool_tag = 7;
 
+  // Priority the caller requests for this call. The server combines it with the service's
+  // registered priority and takes the lower of the two: a caller may demote its own work
+  // (e.g. index backfill writes) but never promote it. Unset means the service default.
+  optional RpcPriorityPB priority = 8;
+
   // CRC32C for message body and header without CRC field. Use 15 as max 1 byte tag.
   optional fixed32 crc = 15;
+}
+
+enum RpcPriorityPB {
+  RPC_PRIORITY_UNSPECIFIED = 0;
+  RPC_PRIORITY_HIGH = 1;
+  RPC_PRIORITY_NORMAL = 2;
+  RPC_PRIORITY_LOW = 3;
 }
 
 message ResponseHeader {

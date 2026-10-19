@@ -32,6 +32,8 @@
 
 #include "yb/rpc/serialization.h"
 
+#include <utility>
+
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/message.h>
 
@@ -218,6 +220,18 @@ Status ParseHeader(
           parsed_header->pool_tag = pool_tag;
         }
         break;
+      case RequestHeader::kPriorityFieldNumber: {
+          uint32_t value;
+          if (!in->ReadVarint32(&value)) {
+            return STATUS(Corruption, "Unable to decode priority field");
+          }
+          // RpcPriorityPB values 1..3 map onto RpcPriority 0..2; anything else is ignored so an
+          // old or malformed client falls back to the service default.
+          if (value >= 1 && value <= kRpcPriorityMapSize) {
+            parsed_header->priority = static_cast<RpcPriority>(value - 1);
+          }
+        }
+        break;
       case RequestHeader::kCrcFieldNumber: {
           uint32_t crc;
           if (!in->ReadLittleEndian32(&crc)) {
@@ -397,6 +411,9 @@ void ParsedRequestHeader::ToPB(RequestHeader* out) const {
   if (pool_tag) {
     out->set_pool_tag(pool_tag);
   }
+  if (priority) {
+    out->set_priority(static_cast<RpcPriorityPB>(std::to_underlying(*priority) + 1));
+  }
   if (crc) {
     out->set_crc(*crc);
   }
@@ -404,7 +421,8 @@ void ParsedRequestHeader::ToPB(RequestHeader* out) const {
 
 std::string ParsedRequestHeader::ToString() const {
   return YB_STRUCT_TO_STRING(
-      (remote_method, RemoteMethodAsString()), call_id, timeout_ms, sidecar_offsets, pool_tag, crc);
+      (remote_method, RemoteMethodAsString()), call_id, timeout_ms, sidecar_offsets, pool_tag,
+      priority, crc);
 }
 
 Status ParseMetadata(Slice buf, AnyMessagePtr out) {

@@ -31,6 +31,7 @@
 //
 #pragma once
 
+#include <optional>
 #include <string>
 
 #include "yb/ash/wait_state.h"
@@ -172,6 +173,11 @@ class InboundCall : public RpcCall, public MPSCQueueEntry<InboundCall> {
 
   virtual ThreadPoolTag pool_tag() const {
     return 0;
+  }
+
+  // Priority the caller asked for, if any; combined with the service default by ServicePool.
+  virtual std::optional<RpcPriority> requested_priority() const {
+    return std::nullopt;
   }
 
   virtual Slice serialized_remote_method() const = 0;

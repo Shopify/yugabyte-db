@@ -3794,7 +3794,11 @@ Result<std::shared_ptr<YBSession>> Tablet::GetSessionForVerifyOrBackfill(
   }
 
   auto client = client_future_.get();
-  return client->NewSession(deadline);
+  auto session = client->NewSession(deadline);
+  // Backfill and verification writes are background work: dispatched behind user-facing RPCs
+  // when the receiving tserver's RPC priority queue is enabled.
+  session->SetPriority(rpc::RpcPriority::kLow);
+  return session;
 }
 
 Status Tablet::FlushWriteIndexBatchIfRequired(

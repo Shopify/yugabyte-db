@@ -154,6 +154,13 @@ void YBSession::SetPoolTag(rpc::ThreadPoolTag tag) {
   }
 }
 
+void YBSession::SetPriority(rpc::RpcPriority priority) {
+  priority_ = priority;
+  if (batcher_) {
+    batcher_->SetPriority(priority);
+  }
+}
+
 namespace {
 
 internal::BatcherPtr CreateBatcher(
@@ -335,6 +342,9 @@ internal::Batcher& YBSession::Batcher() {
       batcher_->SetDeadline(CoarseMonoClock::now() + timeout);
     }
     batcher_->SetPoolTag(pool_tag_);
+    if (priority_) {
+      batcher_->SetPriority(*priority_);
+    }
   }
   return *batcher_;
 }

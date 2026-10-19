@@ -157,6 +157,10 @@ class YBInboundCall : public InboundCall {
     return header_.pool_tag;
   }
 
+  std::optional<RpcPriority> requested_priority() const override {
+    return header_.priority;
+  }
+
   // Serializes 'response' into the InboundCall's internal buffer, and marks
   // the call as a success. Enqueues the response back to the connection
   // that made the call.

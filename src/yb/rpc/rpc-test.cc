@@ -1635,5 +1635,80 @@ TEST_F(TestRpc, PriorityQueueDispatchesHighPriorityServiceFirst) {
   }
 }
 
+// A caller's requested priority can demote a call below its service's default and is ignored when
+// it would promote it. Both services are registered kNormal on a single-permit server; a blocker
+// holds the permit, then: a call requesting kLow, a plain call, and a call requesting kHigh are
+// queued. Dispatch order must be plain + "high" (both effectively kNormal, FIFO) before the demoted
+// one, and the queue's kLow band must have held exactly the demoted call.
+TEST_F(TestRpc, PriorityQueueHonoursRequestedDemotionOnly) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_enabled) = true;
+  auto flag_reset = ScopeExit([] {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_enabled) = false;
+  });
+
+  TestServerOptions options;
+  options.n_worker_threads = 1;
+  TestServer server(CreateMessenger("TestServer", options.messenger_options), options);
+  ASSERT_OK(server.RegisterService(MakeCalculatorService(metric_entity()), RpcPriority::kNormal));
+  ASSERT_OK(server.Start());
+  auto* queue = server.priority_queue();
+  ASSERT_NE(queue, nullptr);
+
+  auto client_messenger = CreateAutoShutdownMessengerHolder("Client");
+  ProxyCache proxy_cache(client_messenger.get());
+  rpc_test::CalculatorServiceProxy calculator(
+      &proxy_cache, HostPort::FromBoundEndpoint(server.bound_endpoint()));
+
+  std::mutex mutex;
+  std::vector<std::string> completion_order;
+  auto record = [&mutex, &completion_order](std::string name) {
+    return [&mutex, &completion_order, name = std::move(name)] {
+      std::lock_guard lock(mutex);
+      completion_order.push_back(name);
+    };
+  };
+
+  rpc_test::SleepRequestPB blocker_req;
+  blocker_req.set_sleep_micros(500 * 1000 * kTimeMultiplier);
+  rpc_test::SleepResponsePB blocker_resp;
+  RpcController blocker_controller;
+  blocker_controller.set_timeout(30s);
+  calculator.SleepAsync(blocker_req, &blocker_resp, &blocker_controller, record("blocker"));
+  ASSERT_OK(WaitFor(
+      [queue] { return queue->TEST_dispatched() == 1; }, 10s, "blocker dispatched"));
+
+  rpc_test::SleepRequestPB req;
+  req.set_sleep_micros(100 * 1000);
+  rpc_test::SleepResponsePB demoted_resp, plain_resp, promoted_resp;
+  RpcController demoted, plain, promoted;
+  for (auto* controller : {&demoted, &plain, &promoted}) {
+    controller->set_timeout(30s);
+  }
+  demoted.set_priority(RpcPriority::kLow);
+  promoted.set_priority(RpcPriority::kHigh);
+  calculator.SleepAsync(req, &demoted_resp, &demoted, record("demoted"));
+  ASSERT_OK(WaitFor(
+      [queue] { return queue->TEST_queued(RpcPriority::kLow) == 1; }, 10s, "demoted queued"));
+  calculator.SleepAsync(req, &plain_resp, &plain, record("plain"));
+  calculator.SleepAsync(req, &promoted_resp, &promoted, record("promoted"));
+  ASSERT_OK(WaitFor(
+      [queue] { return queue->TEST_queued(RpcPriority::kNormal) == 2; }, 10s, "normal queued"));
+  ASSERT_EQ(queue->TEST_queued(RpcPriority::kHigh), 0) << "promotion must be ignored";
+
+  ASSERT_OK(WaitFor(
+      [&mutex, &completion_order] {
+        std::lock_guard lock(mutex);
+        return completion_order.size() == 4;
+      }, 30s, "all calls complete"));
+  std::lock_guard lock(mutex);
+  ASSERT_EQ(completion_order[0], "blocker") << AsString(completion_order);
+  ASSERT_EQ(completion_order[1], "plain") << AsString(completion_order);
+  ASSERT_EQ(completion_order[2], "promoted") << AsString(completion_order);
+  ASSERT_EQ(completion_order[3], "demoted") << AsString(completion_order);
+  for (auto* controller : {&blocker_controller, &demoted, &plain, &promoted}) {
+    ASSERT_OK(controller->status());
+  }
+}
+
 } // namespace rpc
 } // namespace yb

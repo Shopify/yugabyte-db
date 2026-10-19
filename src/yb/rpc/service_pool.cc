@@ -207,6 +207,11 @@ class ServicePoolImpl final : public InboundCallHandler {
       return;
     }
 
+    // A caller may demote its call below the service default (index backfill writes do), never
+    // promote it: untrusted clients cannot claim kHigh.
+    const auto requested = call->requested_priority();
+    const auto priority = requested ? LowerPriority(rpc_priority_, *requested) : rpc_priority_;
+
     auto call_deadline = call->GetClientDeadline();
     if (call_deadline != CoarseTimePoint::max()) {
       pre_check_timeout_queue_.Push(new WeakInboundCall(std::move(call)));
@@ -216,7 +221,7 @@ class ServicePoolImpl final : public InboundCallHandler {
     // Either submission path ends with the task's Done() being invoked exactly once, so the
     // failure handling in InboundCallTask::Done (-> Failure below) is the same for both.
     if (priority_queue_) {
-      priority_queue_->Enqueue(task, rpc_priority_, RpcTaskClass::kInbound, thread_pool);
+      priority_queue_->Enqueue(task, priority, RpcTaskClass::kInbound, thread_pool);
     } else {
       thread_pool->Enqueue(task);
     }

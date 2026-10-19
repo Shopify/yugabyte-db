@@ -18,6 +18,7 @@
 #include <utility>
 
 #include "yb/gutil/port.h"
+#include "yb/gutil/thread_annotations.h"
 
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
@@ -52,6 +53,13 @@ DEFINE_NON_RUNTIME_int32(rpc_priority_queue_callback_reserve, -1,
     "processing on the node. -1 means max(2, 5% of the permit budget). 0 disables the reserve. "
     "Only used when rpc_priority_queue_enabled is true.");
 TAG_FLAG(rpc_priority_queue_callback_reserve, advanced);
+
+DEFINE_NON_RUNTIME_int32(rpc_priority_queue_low_max_dispatched, 0,
+    "Maximum number of RpcPriorityQueue permits that kLow tasks (background work such as index "
+    "backfill chunks) may hold at once. A permit is held for a handler's whole run and strict "
+    "priority cannot reclaim it, so without this cap long-running kLow handlers can occupy the "
+    "budget. 0 means no separate cap. Only used when rpc_priority_queue_enabled is true.");
+TAG_FLAG(rpc_priority_queue_low_max_dispatched, advanced);
 
 DEFINE_RUNTIME_bool(rpc_priority_queue_check_callbacks_do_not_wait, true,
     "In debug builds, crash if a callback task dispatched by the RpcPriorityQueue blocks on a "
@@ -227,7 +235,7 @@ class RpcPriorityQueue::Task : public ThreadPoolTask {
       inner_->Done(status);
     }
     // inner_ may have deleted itself in Done(); do not touch it afterwards.
-    queue_->TaskFinished(task_class_);
+    queue_->TaskFinished(task_class_, priority_);
     delete this;
   }
 
@@ -241,14 +249,18 @@ class RpcPriorityQueue::Task : public ThreadPoolTask {
 
 RpcPriorityQueue::RpcPriorityQueue(
     std::string name, size_t max_dispatched, size_t callback_reserve,
-    const scoped_refptr<MetricEntity>& metric_entity)
+    const scoped_refptr<MetricEntity>& metric_entity, size_t low_max_dispatched)
     : name_(std::move(name)),
       max_dispatched_(max_dispatched),
       max_dispatched_inbound_(
-          max_dispatched > callback_reserve ? max_dispatched - callback_reserve : 1) {
+          max_dispatched > callback_reserve ? max_dispatched - callback_reserve : 1),
+      low_max_dispatched_(std::min(low_max_dispatched, max_dispatched)) {
   CHECK_GT(max_dispatched_, 0) << name_ << ": permit budget must be positive";
   CHECK_LE(max_dispatched_, kMaxDispatchedLimit)
       << name_ << ": permit budget does not fit in the packed state word";
+  CHECK_LE(low_max_dispatched_, kMaxLowDispatchedLimit)
+      << name_ << ": kLow permit cap does not fit in the packed state word";
+  // dispatched_low is only accounted when a cap is configured (0 = no cap, no accounting).
   if (metric_entity) {
     queued_gauges_[Index(RpcPriority::kHigh)] =
         METRIC_rpc_priority_queue_queued_high.Instantiate(metric_entity, 0);
@@ -274,7 +286,7 @@ RpcPriorityQueue::RpcPriorityQueue(
     rejected_full_counter_ = METRIC_rpc_priority_queue_rejected_full.Instantiate(metric_entity);
   }
   LOG(INFO) << "RpcPriorityQueue " << name_ << " created with permit budget " << max_dispatched_
-            << ", inbound cap " << max_dispatched_inbound_;
+            << ", inbound cap " << max_dispatched_inbound_ << ", kLow cap " << low_max_dispatched_;
   if (max_dispatched_inbound_ == max_dispatched_) {
     LOG(WARNING) << "RpcPriorityQueue " << name_ << " has no permits reserved for callbacks; "
                  << "inbound handlers that block on outbound-call callbacks can stall the node "
@@ -288,19 +300,23 @@ RpcPriorityQueue::~RpcPriorityQueue() {
 }
 
 uint64_t RpcPriorityQueue::Pack(State state) {
-  DCHECK_LE(state.dispatched, kFieldMask);
-  DCHECK_LE(state.dispatched_inbound, kFieldMask);
+  DCHECK_LE(state.dispatched, kDispatchedMask);
+  DCHECK_LE(state.dispatched_inbound, kDispatchedMask);
+  DCHECK_LE(state.dispatched_low, kLowMask);
   DCHECK_LE(state.queued, kFieldMask);
   return (state.closed ? kClosedBit : 0) |
-         (static_cast<uint64_t>(state.dispatched) << (2 * kFieldBits)) |
-         (static_cast<uint64_t>(state.dispatched_inbound) << kFieldBits) |
+         (static_cast<uint64_t>(state.dispatched) << (kFieldBits + kLowBits + kDispatchedBits)) |
+         (static_cast<uint64_t>(state.dispatched_inbound) << (kFieldBits + kLowBits)) |
+         (static_cast<uint64_t>(state.dispatched_low) << kFieldBits) |
          state.queued;
 }
 
 RpcPriorityQueue::State RpcPriorityQueue::Unpack(uint64_t value) {
   return State{
-    .dispatched = static_cast<uint32_t>((value >> (2 * kFieldBits)) & kFieldMask),
-    .dispatched_inbound = static_cast<uint32_t>((value >> kFieldBits) & kFieldMask),
+    .dispatched = static_cast<uint32_t>(
+        (value >> (kFieldBits + kLowBits + kDispatchedBits)) & kDispatchedMask),
+    .dispatched_inbound = static_cast<uint32_t>((value >> (kFieldBits + kLowBits)) & kDispatchedMask),
+    .dispatched_low = static_cast<uint32_t>((value >> kFieldBits) & kLowMask),
     .queued = static_cast<uint32_t>(value & kFieldMask),
     .closed = (value & kClosedBit) != 0,
   };
@@ -310,10 +326,14 @@ RpcPriorityQueue::State RpcPriorityQueue::LoadState() const {
   return Unpack(state_.load(std::memory_order_acquire));
 }
 
-bool RpcPriorityQueue::CanClaim(const State& state, RpcTaskClass task_class) const {
+bool RpcPriorityQueue::CanClaim(
+    const State& state, RpcTaskClass task_class, RpcPriority priority) const {
   // The closed check inside the same CAS as the claim is what makes shutdown safe against
   // concurrent enqueues.
   if (state.closed || state.dispatched >= max_dispatched_) {
+    return false;
+  }
+  if (priority == RpcPriority::kLow && LowCapped(state)) {
     return false;
   }
   switch (task_class) {
@@ -333,14 +353,17 @@ bool RpcPriorityQueue::CanClaim(const State& state, RpcTaskClass task_class) con
   FATAL_INVALID_ENUM_VALUE(RpcTaskClass, task_class);
 }
 
-bool RpcPriorityQueue::TryClaimPermitFastPath(RpcTaskClass task_class) {
-  return UpdateState([this, task_class](State* state) {
-    if (!CanClaim(*state, task_class)) {
+bool RpcPriorityQueue::TryClaimPermitFastPath(RpcTaskClass task_class, RpcPriority priority) {
+  return UpdateState([this, task_class, priority](State* state) {
+    if (!CanClaim(*state, task_class, priority)) {
       return false;
     }
     ++state->dispatched;
     if (task_class == RpcTaskClass::kInbound) {
       ++state->dispatched_inbound;
+    }
+    if (priority == RpcPriority::kLow && low_max_dispatched_ != 0) {
+      ++state->dispatched_low;
     }
     return true;
   });
@@ -388,7 +411,7 @@ bool RpcPriorityQueue::Enqueue(
   auto* task = new Task(this, inner, priority, task_class, target_pool);
 
   // Fast path: nothing waiting and a permit available. No lock, no band traffic.
-  if (TryClaimPermitFastPath(task_class)) {
+  if (TryClaimPermitFastPath(task_class, priority)) {
     IncrementCounter(dispatched_counters_[Index(priority)]);
     if (task_class == RpcTaskClass::kCallback) {
       IncrementCounter(dispatched_callbacks_counter_);
@@ -404,7 +427,7 @@ bool RpcPriorityQueue::Enqueue(
   auto outcome = AdmitOutcome::kQueued;
   {
     std::lock_guard lock(mutex_);
-    outcome = ClaimOrRegisterQueued(task_class);
+    outcome = ClaimOrRegisterQueued(task_class, priority);
     if (outcome == AdmitOutcome::kQueued) {
       // The band push happens after queued was incremented, which is safe because the only
       // consumers of the bands (PopEligibleLocked, StartShutdown's drain) run under this same lock
@@ -446,7 +469,8 @@ bool RpcPriorityQueue::Enqueue(
   LOG(FATAL) << "Unexpected AdmitOutcome: " << std::to_underlying(outcome);
 }
 
-RpcPriorityQueue::AdmitOutcome RpcPriorityQueue::ClaimOrRegisterQueued(RpcTaskClass task_class) {
+RpcPriorityQueue::AdmitOutcome RpcPriorityQueue::ClaimOrRegisterQueued(
+    RpcTaskClass task_class, RpcPriority priority) {
   // Deciding between "claim a permit" and "register as waiting" must be one CAS on the state word.
   // If they were separate steps, a completion's release (queued == 0 -> dispatched--) could land
   // between them, leaving dispatched below the budget with a task registered as waiting and no
@@ -454,15 +478,34 @@ RpcPriorityQueue::AdmitOutcome RpcPriorityQueue::ClaimOrRegisterQueued(RpcTaskCl
   // on the whole word, the two are linearizable: either we register first and the release retries
   // and hands off to us, or the release happens first and we observe the free permit and claim it.
   auto outcome = AdmitOutcome::kQueued;
-  UpdateState([this, task_class, &outcome](State* state) {
+  // Unlike the lock-free fast path, which refuses whenever anything waits, here (under mutex_, with
+  // the bands stable) a free permit may be taken past waiting tasks that cannot use it: kLow tasks
+  // held back by the kLow cap, or inbound tasks held back by the inbound cap. Without this a single
+  // capped kLow waiter would idle every free permit until the next completion. Eligibility depends
+  // on the dispatched counters, so it is evaluated for the state each CAS attempt sees; the bands
+  // themselves cannot change while mutex_ is held.
+  const bool inbound = task_class == RpcTaskClass::kInbound;
+  const bool low = priority == RpcPriority::kLow && low_max_dispatched_ != 0;
+  auto blocked_by_waiter = [this, priority](const State& state) NO_THREAD_SAFETY_ANALYSIS {
+    return EligibleWaiterAtOrAboveLocked(
+        priority, state.dispatched_inbound < max_dispatched_inbound_, !LowCapped(state));
+  };
+  UpdateState([this, inbound, low, &blocked_by_waiter, &outcome](State* state) {
     if (state->closed) {
       outcome = AdmitOutcome::kClosed;
       return false;
     }
-    if (CanClaim(*state, task_class)) {
+    const bool permit_available =
+        state->dispatched < max_dispatched_ &&
+        !(inbound && state->dispatched_inbound >= max_dispatched_inbound_) &&
+        !(low && LowCapped(*state));
+    if (permit_available && !blocked_by_waiter(*state)) {
       ++state->dispatched;
-      if (task_class == RpcTaskClass::kInbound) {
+      if (inbound) {
         ++state->dispatched_inbound;
+      }
+      if (low) {
+        ++state->dispatched_low;
       }
       outcome = AdmitOutcome::kClaimed;
       return true;
@@ -478,7 +521,25 @@ RpcPriorityQueue::AdmitOutcome RpcPriorityQueue::ClaimOrRegisterQueued(RpcTaskCl
   return outcome;
 }
 
-RpcPriorityQueue::Task* RpcPriorityQueue::PopEligibleLocked(bool inbound_eligible) {
+bool RpcPriorityQueue::EligibleWaiterAtOrAboveLocked(
+    RpcPriority priority, bool inbound_eligible, bool low_eligible) const {
+  for (size_t i = 0; i <= Index(priority); ++i) {
+    if (!low_eligible && static_cast<RpcPriority>(i) == RpcPriority::kLow) {
+      continue;
+    }
+    const auto& band = bands_[i];
+    if (!band[Index(RpcTaskClass::kCallback)].empty()) {
+      return true;
+    }
+    if (inbound_eligible && !band[Index(RpcTaskClass::kInbound)].empty()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+RpcPriorityQueue::Task* RpcPriorityQueue::PopEligibleLocked(
+    bool inbound_eligible, bool low_eligible) {
   // Strict priority: the first band with an eligible task, kHigh -> kNormal -> kLow, always wins.
   // Within a band, the older of the inbound and callback heads goes first, so arrival order is
   // preserved between the two classes unless the inbound cap makes inbound work ineligible. Under
@@ -496,7 +557,11 @@ RpcPriorityQueue::Task* RpcPriorityQueue::PopEligibleLocked(bool inbound_eligibl
   //    idle node, leaving headroom for a burst of user-facing work.
   //  - Per-pool-tag (per-database) sub-queues inside the kNormal band with round-robin dispatch,
   //    for gate-level fairness between databases.
-  for (auto& band : bands_) {
+  for (size_t i = 0; i < bands_.size(); ++i) {
+    if (!low_eligible && static_cast<RpcPriority>(i) == RpcPriority::kLow) {
+      continue;
+    }
+    auto& band = bands_[i];
     auto& inbound = band[Index(RpcTaskClass::kInbound)];
     auto& callbacks = band[Index(RpcTaskClass::kCallback)];
     std::deque<Task*>* chosen = nullptr;
@@ -516,42 +581,55 @@ RpcPriorityQueue::Task* RpcPriorityQueue::PopEligibleLocked(bool inbound_eligibl
   return nullptr;
 }
 
-void RpcPriorityQueue::TaskFinished(RpcTaskClass task_class) {
+void RpcPriorityQueue::TaskFinished(RpcTaskClass task_class, RpcPriority priority) {
   // Single-drainer protocol. If another thread is already draining, registering the completion is
   // all we need to do; that thread will process it before it leaves. This bounds stack depth when
   // a dispatch fails synchronously (the target pool refusing the task invokes Done() inline, which
   // lands here while the drainer is still inside next->Dispatch()).
   // The class counter is incremented before the total so the drainer always finds a class to
   // attribute each total unit to.
-  pending_completions_by_class_[Index(task_class)].fetch_add(1, std::memory_order_acq_rel);
+  pending_completions_by_kind_[Index(task_class)][Index(priority)].fetch_add(
+      1, std::memory_order_acq_rel);
   if (pending_completions_.fetch_add(1, std::memory_order_acq_rel) != 0) {
     return;
   }
   do {
     RpcTaskClass finished_class = RpcTaskClass::kInbound;
-    for (auto cls : RpcTaskClassList()) {
-      auto& counter = pending_completions_by_class_[Index(cls)];
-      if (counter.load(std::memory_order_acquire) != 0) {
-        // Only the drainer decrements, so the observed value cannot drop under us.
-        counter.fetch_sub(1, std::memory_order_acq_rel);
-        finished_class = cls;
-        break;
+    RpcPriority finished_priority = RpcPriority::kNormal;
+    [&] {
+      for (auto cls : RpcTaskClassList()) {
+        for (auto prio : RpcPriorityList()) {
+          auto& counter = pending_completions_by_kind_[Index(cls)][Index(prio)];
+          if (counter.load(std::memory_order_acquire) != 0) {
+            // Only the drainer decrements, so the observed value cannot drop under us.
+            counter.fetch_sub(1, std::memory_order_acq_rel);
+            finished_class = cls;
+            finished_priority = prio;
+            return;
+          }
+        }
       }
-    }
-    ProcessOneCompletion(finished_class);
+    }();
+    ProcessOneCompletion(finished_class, finished_priority);
     // The decrement below is the last access to this object by the drainer; CompleteShutdown waits
     // for pending_completions_ to reach zero for that reason.
   } while (pending_completions_.fetch_sub(1, std::memory_order_acq_rel) != 1);
 }
 
-void RpcPriorityQueue::ProcessOneCompletion(RpcTaskClass finished_class) {
+void RpcPriorityQueue::ProcessOneCompletion(
+    RpcTaskClass finished_class, RpcPriority finished_priority) {
   const bool finished_inbound = finished_class == RpcTaskClass::kInbound;
-  auto release_permit = [finished_inbound](State* state) {
+  const bool finished_low = finished_priority == RpcPriority::kLow && low_max_dispatched_ != 0;
+  auto release_permit = [finished_inbound, finished_low](State* state) {
     DCHECK_GT(state->dispatched, 0) << "permit released that was never claimed";
     --state->dispatched;
     if (finished_inbound) {
       DCHECK_GT(state->dispatched_inbound, 0) << "inbound permit accounting underflow";
       --state->dispatched_inbound;
+    }
+    if (finished_low) {
+      DCHECK_GT(state->dispatched_low, 0) << "kLow permit accounting underflow";
+      --state->dispatched_low;
     }
   };
 
@@ -592,24 +670,33 @@ void RpcPriorityQueue::ProcessOneCompletion(RpcTaskClass finished_class) {
       // An inbound task may take over this permit if, once the finished task's own inbound slot
       // (if any) is returned, the inbound cap still has room.
       const size_t inbound_after = state.dispatched_inbound - (finished_inbound ? 1 : 0);
-      next = PopEligibleLocked(inbound_after < max_dispatched_inbound_);
+      const size_t low_after = state.dispatched_low - (finished_low ? 1 : 0);
+      next = PopEligibleLocked(
+          inbound_after < max_dispatched_inbound_,
+          low_max_dispatched_ == 0 || low_after < low_max_dispatched_);
       if (next != nullptr) {
-        // queued--, and move the inbound slot between the finished and the popped task.
+        // queued--, and move the inbound and kLow slots between the finished and the popped task.
         const bool next_inbound = next->task_class() == RpcTaskClass::kInbound;
-        UpdateState([finished_inbound, next_inbound](State* s) {
+        const bool next_low = next->priority() == RpcPriority::kLow && low_max_dispatched_ != 0;
+        UpdateState([finished_inbound, next_inbound, finished_low, next_low](State* s) {
           --s->queued;
           if (finished_inbound && !next_inbound) {
             --s->dispatched_inbound;
           } else if (!finished_inbound && next_inbound) {
             ++s->dispatched_inbound;
           }
+          if (finished_low && !next_low) {
+            --s->dispatched_low;
+          } else if (!finished_low && next_low) {
+            ++s->dispatched_low;
+          }
           return true;
         });
       } else if (state.queued != 0) {
-        // Work is waiting but none of it may run: it is all inbound and the inbound cap is
-        // saturated. Release the permit so a callback can claim it (CanClaim lets callbacks bypass
-        // waiting inbound work in exactly this situation). Done under the lock so no task can
-        // register as waiting between our decision and the release.
+        // Work is waiting but none of it may run: it is all inbound with the inbound cap
+        // saturated, or all kLow with the kLow cap saturated. Release the permit so a callback (or,
+        // for the kLow case, the next arrival of any class) can claim it. Done under the lock so no
+        // task can register as waiting between our decision and the release.
         UpdateState([&release_permit](State* s) {
           release_permit(s);
           return true;
@@ -761,6 +848,14 @@ size_t RpcPriorityQueue::TEST_dispatched() const {
 
 size_t RpcPriorityQueue::TEST_dispatched_inbound() const {
   return LoadState().dispatched_inbound;
+}
+
+bool RpcPriorityQueue::LowCapped(const State& state) const {
+  return low_max_dispatched_ != 0 && state.dispatched_low >= low_max_dispatched_;
+}
+
+size_t RpcPriorityQueue::TEST_dispatched_low() const {
+  return LoadState().dispatched_low;
 }
 
 size_t RpcPriorityQueue::TEST_queued() const {

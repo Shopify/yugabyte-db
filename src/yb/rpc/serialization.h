@@ -79,6 +79,8 @@ struct ParsedRequestHeader {
   boost::iterator_range<const uint32_t*> sidecar_offsets;
   Slice metadata;
   ThreadPoolTag pool_tag = 0;
+  // Requested priority; nullopt when the header carries none or an unknown value.
+  std::optional<RpcPriority> priority;
   std::optional<uint32_t> crc;
 
   std::string RemoteMethodAsString() const;

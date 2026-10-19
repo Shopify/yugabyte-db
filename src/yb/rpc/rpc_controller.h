@@ -32,6 +32,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 
 #include "yb/util/logging.h"
 
@@ -173,6 +174,11 @@ class RpcController {
 
   ThreadPoolTag pool_tag() const { return pool_tag_; }
 
+  // Priority requested for the call; the server takes the lower of this and the service default.
+  void set_priority(RpcPriority priority) { priority_ = priority; }
+
+  const std::optional<RpcPriority>& priority() const { return priority_; }
+
  private:
   friend class OutboundCall;
   friend class Proxy;
@@ -193,6 +199,7 @@ class RpcController {
   bool TEST_disable_outbound_call_response_processing = false;
 
   ThreadPoolTag pool_tag_ = 0;
+  std::optional<RpcPriority> priority_;
 
   DISALLOW_COPY_AND_ASSIGN(RpcController);
 };

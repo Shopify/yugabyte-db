@@ -238,6 +238,84 @@ TEST_F(RpcPriorityQueueTest, StrictPriorityOrderingUnderSaturation) {
   pool->Shutdown();
 }
 
+// With a kLow cap, background work can hold at most that many permits while the rest of the budget
+// stays available to higher priorities, and a kLow task waiting for a kLow permit does not block
+// a later higher-priority arrival from taking a free permit.
+TEST_F(RpcPriorityQueueTest, LowCapBoundsLowPriorityPermits) {
+  auto pool = MakePool("lowcap", 4);
+  RpcPriorityQueue queue("lowcap", 4, /* callback_reserve= */ 0, metric_entity_,
+                         /* low_max_dispatched= */ 1);
+  ASSERT_EQ(queue.low_max_dispatched(), 1);
+
+  BlockingTask low1(1, &recorder_), low2(2, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(&low1, RpcPriority::kLow, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(low1.WaitStarted());
+  ASSERT_TRUE(queue.Enqueue(&low2, RpcPriority::kLow, RpcTaskClass::kInbound, pool));
+  // Second kLow task waits even though three permits are free.
+  ASSERT_EQ(queue.TEST_dispatched(), 1);
+  ASSERT_EQ(queue.TEST_dispatched_low(), 1);
+  ASSERT_EQ(queue.TEST_queued(RpcPriority::kLow), 1);
+
+  // Higher priorities are not blocked by the waiting kLow task.
+  InstantTask normal(3, &recorder_), high(4, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(&normal, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(queue.Enqueue(&high, RpcPriority::kHigh, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(normal.WaitDone());
+  ASSERT_TRUE(high.WaitDone());
+  ASSERT_EQ(queue.TEST_queued(RpcPriority::kLow), 1);
+  ASSERT_EQ(queue.TEST_dispatched_low(), 1);
+
+  // Releasing the running kLow task hands its kLow slot to the waiting one.
+  low1.Release();
+  ASSERT_TRUE(low1.WaitDone());
+  ASSERT_TRUE(low2.WaitStarted());
+  ASSERT_EQ(queue.TEST_dispatched_low(), 1);
+  ASSERT_EQ(queue.TEST_queued(), 0);
+  low2.Release();
+  ASSERT_TRUE(low2.WaitDone());
+  ASSERT_OK(WaitFor(
+      [&queue] { return queue.TEST_dispatched() == 0 && queue.TEST_dispatched_low() == 0; },
+      kWaitTimeout, "permits released"));
+  ASSERT_EQ(recorder_.RunOrder(), (std::vector<int>{1, 3, 4, 2}));
+
+  queue.StartShutdown();
+  queue.CompleteShutdown();
+  pool->Shutdown();
+}
+
+// A kLow task finishing while only capped kLow work waits releases its permit instead of leaving
+// it stranded, and a later kNormal arrival takes the fast path.
+TEST_F(RpcPriorityQueueTest, LowCapReleasesPermitWhenOnlyCappedLowWaits) {
+  auto pool = MakePool("lowcap2", 4);
+  RpcPriorityQueue queue("lowcap2", 2, /* callback_reserve= */ 0, metric_entity_,
+                         /* low_max_dispatched= */ 1);
+  BlockingTask low1(1, &recorder_), low2(2, &recorder_), normal(3, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(&low1, RpcPriority::kLow, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(low1.WaitStarted());
+  ASSERT_TRUE(queue.Enqueue(&normal, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(normal.WaitStarted());
+  ASSERT_TRUE(queue.Enqueue(&low2, RpcPriority::kLow, RpcTaskClass::kInbound, pool));
+  ASSERT_EQ(queue.TEST_dispatched(), 2);
+  ASSERT_EQ(queue.TEST_queued(), 1);
+  // The kNormal task finishes: low2 is still capped (low1 runs), so the permit is released.
+  normal.Release();
+  ASSERT_TRUE(normal.WaitDone());
+  ASSERT_OK(WaitFor([&queue] { return queue.TEST_dispatched() == 1; }, kWaitTimeout, "released"));
+  ASSERT_EQ(queue.TEST_queued(RpcPriority::kLow), 1);
+  InstantTask normal2(4, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(&normal2, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(normal2.WaitDone());
+  low1.Release();
+  ASSERT_TRUE(low1.WaitDone());
+  ASSERT_TRUE(low2.WaitStarted());
+  low2.Release();
+  ASSERT_TRUE(low2.WaitDone());
+  ASSERT_OK(WaitFor([&queue] { return queue.TEST_dispatched() == 0; }, kWaitTimeout, "drained"));
+  queue.StartShutdown();
+  queue.CompleteShutdown();
+  pool->Shutdown();
+}
+
 // A permit released by a completing task goes to the waiting task, not to a concurrently arriving
 // new task, even if the new arrival would have taken the fast path on an empty queue.
 TEST_F(RpcPriorityQueueTest, WaitingTaskIsNotOvertakenByNewArrival) {
@@ -571,7 +649,8 @@ TEST_F(RpcPriorityQueueTest, ConcurrentStressDoesNotLeakPermits) {
   constexpr int kTotalTasks = kProducers * kTasksPerProducer;
 
   auto pool = MakePool("stress", kBudget);
-  RpcPriorityQueue queue("stress", kBudget, /* callback_reserve= */ 1, metric_entity_);
+  RpcPriorityQueue queue("stress", kBudget, /* callback_reserve= */ 1, metric_entity_,
+                         /* low_max_dispatched= */ 2);
 
   std::atomic<int> running{0};
   std::atomic<int> max_running{0};

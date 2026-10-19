@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <optional>
 #include <boost/range/iterator_range_core.hpp>
 #include <boost/version.hpp>
 
@@ -73,6 +74,8 @@ struct AsyncRpcData {
   bool need_metadata = false;
   bool use_async_write = false;
   OpId pending_async_write_op_id = OpId::Invalid();
+  // Requested RPC priority for the batch (e.g. kLow for index backfill writes); unset = default.
+  std::optional<rpc::RpcPriority> priority;
 };
 
 struct FlushExtraResult {

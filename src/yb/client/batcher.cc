@@ -207,6 +207,10 @@ void Batcher::SetPoolTag(rpc::ThreadPoolTag pool_tag) {
   pool_tag_ = pool_tag;
 }
 
+void Batcher::SetPriority(rpc::RpcPriority priority) {
+  priority_ = priority;
+}
+
 bool Batcher::HasPendingOperations() const {
   return !ops_.empty();
 }
@@ -733,7 +737,8 @@ Result<std::shared_ptr<AsyncRpc>> Batcher::CreateRpc(
     .skip_intents = SkipIntents(),
     .arena = arena_,
     .ops = InFlightOps(group.begin, group.end),
-    .need_metadata = group.need_metadata
+    .need_metadata = group.need_metadata,
+    .priority = priority_,
   };
 
   const auto& first_op = group.begin->yb_op;

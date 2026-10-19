@@ -100,10 +100,14 @@ class RpcPriorityQueue {
   // callback_reserve: permits that inbound handlers may never occupy, so they stay available to
   // callbacks. The inbound cap is max(1, max_dispatched - callback_reserve); with 0 there is no
   // reserve (and no deadlock protection).
+  // low_max_dispatched: permits kLow tasks may hold at once (0 = no separate cap, and dispatched_low
+  // is then not accounted). Bounds how much
+  // of the budget long-running background handlers (index backfill chunks) can occupy, since a
+  // permit is held for the whole handler and strict priority cannot take it back.
   // metric_entity may be null (no metrics).
   RpcPriorityQueue(
       std::string name, size_t max_dispatched, size_t callback_reserve,
-      const scoped_refptr<MetricEntity>& metric_entity);
+      const scoped_refptr<MetricEntity>& metric_entity, size_t low_max_dispatched = 0);
   ~RpcPriorityQueue();
 
   RpcPriorityQueue(const RpcPriorityQueue&) = delete;
@@ -146,12 +150,14 @@ class RpcPriorityQueue {
   const std::string& name() const { return name_; }
   size_t max_dispatched() const { return max_dispatched_; }
   size_t max_dispatched_inbound() const { return max_dispatched_inbound_; }
+  size_t low_max_dispatched() const { return low_max_dispatched_; }
   // Bound on the number of waiting tasks. Enqueue fails with ServiceUnavailable beyond it.
   static constexpr size_t max_queued() { return kFieldMask; }
 
   // Point-in-time counters, primarily for tests and introspection.
   size_t TEST_dispatched() const;
   size_t TEST_dispatched_inbound() const;
+  size_t TEST_dispatched_low() const;
   size_t TEST_queued() const;
   size_t TEST_queued(RpcPriority priority) const;
   // Overwrites the queued counter (bands are untouched). Only for exercising the counter's bound;
@@ -169,17 +175,24 @@ class RpcPriorityQueue {
   // lets a completion atomically decide between "release permit" and "hand permit to a waiting
   // task".
   //
-  // Layout (bit 63 -> 0): closed:1 | dispatched:21 | dispatched_inbound:21 | queued:21.
+  // Layout (bit 63 -> 0): closed:1 | dispatched:16 | dispatched_inbound:16 | dispatched_low:10 |
+  // queued:21.
   struct State {
     uint32_t dispatched = 0;
     uint32_t dispatched_inbound = 0;
+    uint32_t dispatched_low = 0;
     uint32_t queued = 0;
     bool closed = false;
   };
-  static constexpr int kFieldBits = 21;
+  static constexpr int kDispatchedBits = 16;
+  static constexpr int kLowBits = 10;
+  static constexpr int kFieldBits = 21;  // queued
+  static constexpr uint32_t kDispatchedMask = (1u << kDispatchedBits) - 1;
+  static constexpr uint32_t kLowMask = (1u << kLowBits) - 1;
   static constexpr uint32_t kFieldMask = (1u << kFieldBits) - 1;
   static constexpr uint64_t kClosedBit = 1ULL << 63;
-  static constexpr uint32_t kMaxDispatchedLimit = kFieldMask;
+  static constexpr uint32_t kMaxDispatchedLimit = kDispatchedMask;
+  static constexpr uint32_t kMaxLowDispatchedLimit = kLowMask;
   static uint64_t Pack(State state);
   static State Unpack(uint64_t value);
   State LoadState() const;
@@ -202,8 +215,10 @@ class RpcPriorityQueue {
     }
   }
 
-  // Whether a task of task_class may claim a permit right now, given state.
-  bool CanClaim(const State& state, RpcTaskClass task_class) const;
+  // Whether a task of task_class/priority may claim a permit right now, given state.
+  bool CanClaim(const State& state, RpcTaskClass task_class, RpcPriority priority) const;
+  // Whether the kLow cap is configured and saturated.
+  bool LowCapped(const State& state) const;
 
   // Called by Task when the underlying task has finished (successfully or not) to return the
   // permit or hand it to the highest-priority waiting task. Completions are processed by a single
@@ -211,23 +226,30 @@ class RpcPriorityQueue {
   // and loops until it has processed every completion registered meanwhile. A completion that
   // happens synchronously inside a dispatch (target pool refusing the task) therefore only bumps
   // the counters and returns, instead of nesting another dispatch on the same stack.
-  void TaskFinished(RpcTaskClass task_class);
-  void ProcessOneCompletion(RpcTaskClass finished_class);
+  void TaskFinished(RpcTaskClass task_class, RpcPriority priority);
+  void ProcessOneCompletion(RpcTaskClass finished_class, RpcPriority finished_priority);
 
-  // Lock-free attempt to claim a permit for a task of task_class. Returns true if claimed.
-  bool TryClaimPermitFastPath(RpcTaskClass task_class);
+  // Lock-free attempt to claim a permit for a task of task_class/priority. Returns true if claimed.
+  bool TryClaimPermitFastPath(RpcTaskClass task_class, RpcPriority priority);
 
   // Slow-path admission: in a single CAS either claims a permit or increments queued. kOverloaded
   // means the queued counter is at its bound and the task must be rejected rather than counted.
   // REQUIRES(mutex_) so that the subsequent band push is ordered against the consumers of the
   // bands.
   enum class AdmitOutcome { kClaimed, kQueued, kClosed, kOverloaded };
-  AdmitOutcome ClaimOrRegisterQueued(RpcTaskClass task_class) REQUIRES(mutex_);
+  AdmitOutcome ClaimOrRegisterQueued(RpcTaskClass task_class, RpcPriority priority) REQUIRES(mutex_);
+
+  // Whether some waiting task of equal or higher priority could take a permit, given that inbound
+  // (resp. kLow) waiters are eligible. A slow-path arrival must not overtake such a task; it may
+  // take a free permit past tasks that are waiting only because their own cap is saturated.
+  bool EligibleWaiterAtOrAboveLocked(
+      RpcPriority priority, bool inbound_eligible, bool low_eligible) const REQUIRES(mutex_);
 
   // Pops the highest-priority waiting task that may run given inbound_eligible (whether an inbound
-  // task may currently take a permit). Returns null if nothing eligible waits. Does not touch
-  // state_; the caller applies the corresponding queued/dispatched_inbound changes.
-  Task* PopEligibleLocked(bool inbound_eligible) REQUIRES(mutex_);
+  // task may currently take a permit) and low_eligible (whether a kLow task may). Returns null if
+  // nothing eligible waits. Does not touch state_; the caller applies the corresponding
+  // queued/dispatched_inbound/dispatched_low changes.
+  Task* PopEligibleLocked(bool inbound_eligible, bool low_eligible) REQUIRES(mutex_);
 
   void RecordQueueTime(Task* task);
   void OnQueued(RpcPriority priority);
@@ -236,6 +258,7 @@ class RpcPriorityQueue {
   const std::string name_;
   const size_t max_dispatched_;
   const size_t max_dispatched_inbound_;
+  const size_t low_max_dispatched_;
 
   std::atomic<uint64_t> state_{0};
 
@@ -259,7 +282,8 @@ class RpcPriorityQueue {
   // incremented before the total, so when the drainer observes total > 0 some class counter is
   // > 0 as well. Non-zero total also means some thread is still inside TaskFinished and may touch
   // this object.
-  std::array<std::atomic<uint32_t>, kRpcTaskClassMapSize> pending_completions_by_class_{};
+  std::array<std::array<std::atomic<uint32_t>, kRpcPriorityMapSize>, kRpcTaskClassMapSize>
+      pending_completions_by_kind_{};
   std::atomic<uint32_t> pending_completions_{0};
 
   // Guards bands_. Adaptive lock (bounded spin, then futex): the critical sections here are a
