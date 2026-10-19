@@ -13,6 +13,8 @@
 
 #pragma once
 
+#include "yb/common/common_fwd.h"
+#include "yb/master/master_heartbeat.fwd.h"
 #include "yb/server/server_fwd.h"
 #include "yb/tserver/tserver_fwd.h"
 
@@ -24,7 +26,14 @@ namespace yb::tserver {
 
 class ConnectivityPoller {
  public:
-  explicit ConnectivityPoller(server::RpcServerBase& server, const std::string& uuid);
+  // Receives the live tservers of each successful ListTabletServers poll while
+  // live_tservers_from_connectivity_check is set.
+  using LiveTServersCallback =
+      std::function<void(const google::protobuf::RepeatedPtrField<master::TSInformationPB>&)>;
+
+  ConnectivityPoller(
+      server::RpcServerBase& server, const std::string& uuid,
+      LiveTServersCallback live_tservers_callback);
   ~ConnectivityPoller();
 
   Status Start(Cgroup* cgroup = nullptr);

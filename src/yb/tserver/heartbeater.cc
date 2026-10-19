@@ -400,6 +400,9 @@ Status HeartbeatPoller::TryHeartbeat() {
   }
 
   req.set_auto_flags_config_version(server_.GetAutoFlagConfigVersion());
+  if (server_.SkipHeartbeatTServerList()) {
+    req.set_skip_tservers(true);
+  }
 
   {
     VLOG_WITH_PREFIX(2) << "Sending heartbeat:\n" << req.DebugString();
@@ -616,8 +619,11 @@ Status HeartbeatPoller::TryHeartbeat() {
   }
   server_.HandleMasterHeartbeatResponse(heartbeat_send_time, std::move(new_config));
 
-  // Update the live tserver list.
-  return server_.PopulateLiveTServers(last_hb_response_);
+  // Update the live tserver list, unless this tserver keeps it from the connectivity check.
+  if (req.skip_tservers()) {
+    return Status::OK();
+  }
+  return server_.PopulateLiveTServers(last_hb_response_.tservers());
 }
 
 Status HeartbeatPoller::SetupRegistration(master::TSRegistrationPB* reg) {

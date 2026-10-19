@@ -225,7 +225,11 @@ class TabletServer : public DbServerBase, public TabletServerIf {
     return object_lock_shared_state_manager_.get();
   }
 
-  Status PopulateLiveTServers(const master::TSHeartbeatResponsePB& heartbeat_resp) EXCLUDES(lock_);
+  Status PopulateLiveTServers(
+      const google::protobuf::RepeatedPtrField<master::TSInformationPB>& tservers) EXCLUDES(lock_);
+  // True once the connectivity check keeps live_tservers_ current, so heartbeats can ask the
+  // master to leave its tserver list out of the response.
+  bool SkipHeartbeatTServerList() const;
   Result<YSQLLeaseInfo> GetYSQLLeaseInfo() const override;
   Status RestartPG() const override;
   Status KillPg() const override;
@@ -572,7 +576,8 @@ class TabletServer : public DbServerBase, public TabletServerIf {
 
   // Map of tserver connection info, keyed by the tserver uuid, that are alive from the master's
   // perspective. It is refreshed on every successfull heartbeat exchange between the current
-  // tserver and the master leader.
+  // tserver and the master leader, or on every connectivity check when
+  // live_tservers_from_connectivity_check is set.
   std::unordered_map<std::string, master::TSInformationPB> live_tservers_ GUARDED_BY(lock_);
 
   // Map of 'RemoteTablerServer' shared ptrs keyed by the corresponding tsever uuid. This is used
@@ -580,6 +585,9 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   // 'live_tservers_'.
   std::unordered_map<std::string, client::internal::RemoteTabletServerPtr>
       remote_tservers_ GUARDED_BY(lock_);
+
+  // Set once the connectivity check has filled live_tservers_ at least once.
+  std::atomic<bool> live_tservers_from_connectivity_check_{false};
 
   // Lock to protect live_tservers_, cluster_uuid_.
   mutable rw_spinlock lock_;
@@ -675,6 +683,9 @@ class TabletServer : public DbServerBase, public TabletServerIf {
 
   // Auto initialize some of the service flags that are defaulted to -1.
   void AutoInitServiceFlags();
+
+  void PopulateLiveTServersFromConnectivityCheck(
+      const google::protobuf::RepeatedPtrField<master::TSInformationPB>& tservers) EXCLUDES(lock_);
 
   void InvalidatePgTableCache();
   void InvalidatePgTableCache(const std::unordered_map<uint32_t, uint64_t>& db_oids_updated,

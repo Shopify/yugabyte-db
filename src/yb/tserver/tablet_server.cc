@@ -183,6 +183,7 @@ DEFINE_NON_RUNTIME_int32(cql_proxy_webserver_port, 0, "Webserver port for CQL pr
 
 DEFINE_NON_RUNTIME_string(pgsql_proxy_bind_address, "", "Address to bind the PostgreSQL proxy to");
 DECLARE_int32(pgsql_proxy_webserver_port);
+DECLARE_bool(live_tservers_from_connectivity_check);
 
 DEFINE_NON_RUNTIME_bool(enable_ysql_conn_mgr, false,
     "Enable Ysql Connection Manager for the cluster. Tablet Server will start a "
@@ -582,7 +583,9 @@ Status TabletServer::Init() {
   heartbeater_ = CreateHeartbeater(opts_, this);
 
   ysql_lease_manager_.emplace(*this);
-  connectivity_poller_.emplace(*this, permanent_uuid());
+  connectivity_poller_.emplace(*this, permanent_uuid(), [this](const auto& tservers) {
+    PopulateLiveTServersFromConnectivityCheck(tservers);
+  });
   DoUpdateMasterAddresses();
 
   if (FLAGS_allow_encryption_at_rest) {
@@ -1078,7 +1081,8 @@ Status TabletServer::KillPg() const {
   return STATUS(IllegalState, "Pg killer callback not registered, cannot restart PG");
 }
 
-Status TabletServer::PopulateLiveTServers(const master::TSHeartbeatResponsePB& heartbeat_resp) {
+Status TabletServer::PopulateLiveTServers(
+    const google::protobuf::RepeatedPtrField<master::TSInformationPB>& tservers) {
   std::lock_guard l(lock_);
   // We reset the list each time, since we want to keep the tservers that are live from the
   // master's perspective.
@@ -1086,7 +1090,7 @@ Status TabletServer::PopulateLiveTServers(const master::TSHeartbeatResponsePB& h
   // from the master and compare it with information stored here. Based on this information, we
   // can only send diff updates CQL clients about whether a node came up or went down.
   live_tservers_.clear();
-  for (const auto& ts_info_pb : heartbeat_resp.tservers()) {
+  for (const auto& ts_info_pb : tservers) {
     const auto& ts_uuid = ts_info_pb.tserver_instance().permanent_uuid();
     live_tservers_[ts_uuid] = ts_info_pb;
     if (!remote_tservers_.contains(ts_uuid)) {
@@ -1098,6 +1102,17 @@ Status TabletServer::PopulateLiveTServers(const master::TSHeartbeatResponsePB& h
     return !live_tservers_.contains(remote_ts_pair.first);
   });
   return Status::OK();
+}
+
+void TabletServer::PopulateLiveTServersFromConnectivityCheck(
+    const google::protobuf::RepeatedPtrField<master::TSInformationPB>& tservers) {
+  WARN_NOT_OK(PopulateLiveTServers(tservers), "Failed to populate live tservers");
+  live_tservers_from_connectivity_check_.store(true, std::memory_order_release);
+}
+
+bool TabletServer::SkipHeartbeatTServerList() const {
+  return FLAGS_live_tservers_from_connectivity_check &&
+         live_tservers_from_connectivity_check_.load(std::memory_order_acquire);
 }
 
 Status TabletServer::GetLiveTServers(std::vector<master::TSInformationPB> *live_tservers) const {

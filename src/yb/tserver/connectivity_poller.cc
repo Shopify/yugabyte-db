@@ -16,6 +16,7 @@
 #include "yb/common/wire_protocol.h"
 
 #include "yb/master/master_cluster.proxy.h"
+#include "yb/master/master_heartbeat.pb.h"
 
 #include "yb/server/server_base.proxy.h"
 #include "yb/server/server_base.h"
@@ -28,6 +29,10 @@
 
 DEFINE_RUNTIME_uint64(connectivity_check_interval_ms, 60000,
     "Milliseconds interval to check connectivity between cluster nodes");
+
+DEFINE_RUNTIME_bool(live_tservers_from_connectivity_check, false,
+    "Maintain the live tserver list from the connectivity check's ListTabletServers response "
+    "instead of receiving it in every heartbeat response.");
 
 namespace yb::tserver {
 
@@ -108,10 +113,12 @@ class PingRequest : public std::enable_shared_from_this<PingRequest> {
 
 class ConnectivityPoller::Impl : public MasterLeaderPollerInterface {
  public:
-  Impl(server::RpcServerBase& server, const std::string& uuid)
+  Impl(server::RpcServerBase& server, const std::string& uuid,
+       LiveTServersCallback live_tservers_callback)
       : uuid_(uuid),
         cloud_info_(server.MakeCloudInfoPB()),
         log_prefix_(server::MakeServerLogPrefix(uuid)),
+        live_tservers_callback_(std::move(live_tservers_callback)),
         finder_(server.messenger(), server.proxy_cache(), nullptr),
         poll_scheduler_(finder_, *this) {
   }
@@ -156,6 +163,19 @@ class ConnectivityPoller::Impl : public MasterLeaderPollerInterface {
       proxy_->proxy().remote().ToPB(master_node_info.mutable_endpoint());
 
       cluster_state_->UpdateNode(master_node_info);
+    }
+
+    if (FLAGS_live_tservers_from_connectivity_check) {
+      google::protobuf::RepeatedPtrField<master::TSInformationPB> live_tservers;
+      for (const auto& server : resp.servers()) {
+        if (!server.alive()) {
+          continue;
+        }
+        auto* ts_info = live_tservers.Add();
+        *ts_info->mutable_tserver_instance() = server.instance_id();
+        *ts_info->mutable_registration() = server.registration();
+      }
+      live_tservers_callback_(live_tservers);
     }
 
     for (const auto& server : resp.servers()) {
@@ -207,6 +227,7 @@ class ConnectivityPoller::Impl : public MasterLeaderPollerInterface {
   const std::string uuid_;
   const CloudInfoPB cloud_info_;
   const std::string log_prefix_;
+  const LiveTServersCallback live_tservers_callback_;
 
   bool first_poll_ = true;
   ClusterStatePtr cluster_state_ = std::make_shared<ClusterState>();
@@ -215,8 +236,10 @@ class ConnectivityPoller::Impl : public MasterLeaderPollerInterface {
   std::optional<master::MasterClusterProxy> proxy_;
 };
 
-ConnectivityPoller::ConnectivityPoller(server::RpcServerBase& server, const std::string& uuid)
-    : impl_(new Impl(server, uuid)) {
+ConnectivityPoller::ConnectivityPoller(
+    server::RpcServerBase& server, const std::string& uuid,
+    LiveTServersCallback live_tservers_callback)
+    : impl_(new Impl(server, uuid, std::move(live_tservers_callback))) {
 }
 
 ConnectivityPoller::~ConnectivityPoller() = default;

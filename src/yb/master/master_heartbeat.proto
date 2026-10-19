@@ -265,6 +265,10 @@ message TSHeartbeatRequestPB {
   // Per-database oldest read HybridTime pinned by live PG transactions on this tserver.
   // map[db_oid] -> earliest local live transaction registered for that db.
   map<uint32, YsqlDbOldestPinnedReadTime> ts_ysql_db_oldest_pinned_read_times = 24;
+
+  // The tserver keeps its live tserver list from ListTabletServers (see tserver flag
+  // live_tservers_from_connectivity_check), so the master leaves `tservers` out of the response.
+  optional bool skip_tservers = 25;
 }
 
 // Load levels are defined by the admission thresholds in master_tablet_service: BUSY means new

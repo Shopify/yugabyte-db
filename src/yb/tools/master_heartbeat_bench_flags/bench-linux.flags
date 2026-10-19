@@ -9,3 +9,4 @@
 --master_cpus=0-95
 --master_flags=--flagfile=src/yb/tools/master_heartbeat_bench_flags/master.flags,--num_reactor_threads=192
 --tserver_flags=--flagfile=src/yb/tools/master_heartbeat_bench_flags/tserver.flags
+--live_tservers_from_connectivity_check=true

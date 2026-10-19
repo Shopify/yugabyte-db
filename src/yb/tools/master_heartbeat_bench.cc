@@ -115,6 +115,9 @@ DEFINE_NON_RUNTIME_int32(heartbeat_interval_ms, 1000, "Hollow tserver heartbeat 
 DEFINE_NON_RUNTIME_int32(full_metrics_beat_period, 5,
     "Send the tablet metrics payload (storage_metadata + leader_info) every Nth heartbeat, "
     "matching the real tserver's 5s metrics cadence.");
+DEFINE_NON_RUNTIME_bool(live_tservers_from_connectivity_check, false,
+    "Same as the tserver flag: hollow heartbeats set skip_tservers so the master omits the live "
+    "tserver list from every response, and the real tserver is started with the flag.");
 DEFINE_NON_RUNTIME_bool(send_lease_refreshes, true,
     "Send the per-second RefreshYsqlLease RPC from every hollow tserver.");
 DEFINE_NON_RUNTIME_string(master_bin, "", "Path to the yb-master binary (required).");
@@ -276,6 +279,9 @@ class HollowTServer {
     }
     req->set_num_live_tablets(narrow_cast<int32_t>(tablets_.size()));
     req->set_leader_count(leader_count);
+    if (FLAGS_live_tservers_from_connectivity_check) {
+      req->set_skip_tservers(true);
+    }
 
     if (metrics_beat) {
       constexpr uint64_t kSstBytes = 64ULL << 20;
@@ -416,6 +422,9 @@ class HollowTServer {
     instance->set_permanent_uuid(uuid_);
     instance->set_instance_seqno(instance_seqno_);
     req->clear_registration();
+    if (FLAGS_live_tservers_from_connectivity_check) {
+      req->set_skip_tservers(true);
+    }
     if (!universe_uuid.empty()) {
       req->set_universe_uuid(universe_uuid);
     }
@@ -1437,6 +1446,8 @@ class HeartbeatBench {
         // Heartbeats reach the master through the relay, where they are captured.
         Format("--tserver_master_addrs=127.0.0.1:$0", FLAGS_relay_port),
         Format("--heartbeat_interval_ms=$0", FLAGS_heartbeat_interval_ms),
+        Format("--live_tservers_from_connectivity_check=$0",
+               FLAGS_live_tservers_from_connectivity_check),
         "--enable_ysql=false",
         "--placement_cloud=cloud1",
         "--placement_region=region1",

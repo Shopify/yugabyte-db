@@ -564,9 +564,11 @@ void MasterHeartbeatServiceImpl::TSHeartbeat(
 
     // Retrieve all the nodes known by the master.
     std::vector<std::shared_ptr<TSDescriptor>> descs;
-    server_->ts_manager()->GetAllLiveDescriptors(&descs);
-    for (const auto& desc : descs) {
-      *resp->add_tservers() = desc->GetTSInformationPB();
+    if (!req->skip_tservers()) {
+      server_->ts_manager()->GetAllLiveDescriptors(&descs);
+      for (const auto& desc : descs) {
+        *resp->add_tservers() = desc->GetTSInformationPB();
+      }
     }
 
     auto cluster_config = server_->catalog_manager()->GetClusterConfig();
@@ -578,6 +580,9 @@ void MasterHeartbeatServiceImpl::TSHeartbeat(
 
       uint32_t leader_drain_version = ts_desc->pending_leader_drain_notification();
       if (leader_drain_version && FLAGS_send_leader_blacklisted_tservers_on_heartbeat) {
+        if (descs.empty()) {
+          server_->ts_manager()->GetAllLiveDescriptors(&descs);
+        }
         auto leader_blacklist = ToBlacklistSet(
             GetBlacklist(*cluster_config, /*blacklist_leader=*/ true));
         auto leaders_drained = !std::any_of(descs.begin(), descs.end(), [&](const auto& desc) {
