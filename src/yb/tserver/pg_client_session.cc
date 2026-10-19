@@ -3447,6 +3447,21 @@ class PgClientSession::Impl {
       const PgTablesQueryResult& tables, const PerformQueryDataPtr& data, CoarseTimePoint deadline,
       rpc::RpcContext* context = nullptr) {
     data->TEST_mock_service = context_.TEST_mock_service;
+    if (PREDICT_FALSE(context_.TEST_mock_service != nullptr)) {
+      PgClientMockCallContext mock_context{
+          .deadline = deadline, .rpc = context, .sidecars = &data->sidecars};
+      auto handled = context_.TEST_mock_service->DispatchPerformAfterSequencing(
+          &data->req, &data->resp, &mock_context);
+      if (!handled.ok()) {
+        data->sidecars.Reset();
+        data->resp.Clear();
+        return handled.status();
+      }
+      if (*handled) {
+        data->SendResponse();
+        return Status::OK();
+      }
+    }
     auto& options = *data->req.mutable_options();
     if (VLOG_IS_ON(3)) {
       std::stringstream ss;

@@ -234,10 +234,12 @@ class PgClientServiceImpl : public PgClientServiceIf {
     /**/
 
 // Context passed to PgClientService mock callbacks.
-// Network RPCs populate `rpc`. Shared-memory mocks populate only `deadline`.
+// `rpc` is absent for shared-memory calls and after-response callbacks. The post-sequencing
+// Perform hook supplies `sidecars` for either transport.
 struct PgClientMockCallContext {
   CoarseTimePoint deadline = CoarseTimePoint::max();
   rpc::RpcContext* rpc = nullptr;
+  rpc::Sidecars* sidecars = nullptr;  // Available for the post-sequencing Perform hook.
 
   CoarseTimePoint GetClientDeadline() const;
   void CloseConnection();
@@ -266,6 +268,25 @@ class PgClientServiceMockImpl : public PgClientServiceIf {
       const std::function<Status( \
           const YB_PG_CLIENT_METHOD_ARG(data, method, Request)*, \
           YB_PG_CLIENT_METHOD_ARG(data, method, Response)*, PgClientMockCallContext*)>& mock);
+
+  using PerformAfterSequencingHook = std::function<Result<bool>(
+      const PgPerformRequestMsg*, PgPerformResponseMsg*, PgClientMockCallContext*)>;
+
+  class PerformHookHandle {
+    explicit PerformHookHandle(std::shared_ptr<PerformAfterSequencingHook> hook)
+        : hook_(std::move(hook)) {}
+    std::shared_ptr<PerformAfterSequencingHook> hook_;
+
+    friend class PgClientServiceMockImpl;
+  };
+
+  // Runs under the session lock after sequencing, for either transport. False must leave the
+  // response/sidecars untouched and falls through; true/error must not execute the real Perform.
+  // Holding the handle keeps the hook installed, without affecting service-level mocks.
+  [[nodiscard]] PerformHookHandle MockPerformAfterSequencing(
+      PerformAfterSequencingHook hook);
+  Result<bool> DispatchPerformAfterSequencing(
+      const PgPerformRequestMsg* req, PgPerformResponseMsg* resp, PgClientMockCallContext* context);
 
   BOOST_PP_SEQ_FOR_EACH(YB_PG_CLIENT_METHOD_DECLARE, BOOST_PP_NIL, YB_PG_CLIENT_MOCKABLE_METHODS);
   BOOST_PP_SEQ_FOR_EACH(YB_PG_CLIENT_METHOD_DECLARE, (LW), YB_PG_CLIENT_MOCKABLE_LW_METHODS);
@@ -310,6 +331,7 @@ class PgClientServiceMockImpl : public PgClientServiceIf {
  private:
   PgClientServiceIf* impl_;
   std::unordered_map<std::string, SharedFunctor::weak_type> mocks_;
+  std::weak_ptr<PerformAfterSequencingHook> perform_after_sequencing_;
   rw_spinlock mutex_;
 
   Handle SetMock(const std::string& method, SharedFunctor&& mock);

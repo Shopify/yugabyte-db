@@ -1022,7 +1022,9 @@ Status PgWrapper::PreflightCheck() {
 }
 
 Status PgWrapper::Start() {
-  RETURN_NOT_OK(CleanupPreviousPostgres());
+  if (conf_.cleanup_previous_postgres) {
+    RETURN_NOT_OK(CleanupPreviousPostgres());
+  }
 
   auto postgres_executable = PgWrapper::GetPostgresExecutablePath();
   RETURN_NOT_OK(CheckExecutableValid(postgres_executable));

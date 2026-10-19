@@ -3396,6 +3396,24 @@ BOOST_PP_SEQ_FOR_EACH(
 BOOST_PP_SEQ_FOR_EACH(
     YB_PG_CLIENT_MOCK_METHOD_SETTER_DEFINE, (LW), YB_PG_CLIENT_MOCKABLE_LW_METHODS);
 
+PgClientServiceMockImpl::PerformHookHandle PgClientServiceMockImpl::MockPerformAfterSequencing(
+    PerformAfterSequencingHook hook) {
+  auto shared = std::make_shared<PerformAfterSequencingHook>(std::move(hook));
+  std::lock_guard lock(mutex_);
+  perform_after_sequencing_ = shared;
+  return PerformHookHandle(std::move(shared));
+}
+
+Result<bool> PgClientServiceMockImpl::DispatchPerformAfterSequencing(
+    const PgPerformRequestMsg* req, PgPerformResponseMsg* resp, PgClientMockCallContext* context) {
+  std::shared_ptr<PerformAfterSequencingHook> hook;
+  {
+    SharedLock lock(mutex_);
+    hook = perform_after_sequencing_.lock();
+  }
+  return hook ? (*hook)(req, resp, context) : Result<bool>(false);
+}
+
 #define YB_PG_CLIENT_MOCK_BEFORE_SETTER_DEFINE(r, data, method) \
   PgClientServiceMockImpl::Handle BOOST_PP_CAT(BOOST_PP_CAT( \
       PgClientServiceMockImpl::Mock, method), Before)( \

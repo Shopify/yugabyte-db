@@ -603,6 +603,7 @@ message PgGetXClusterRoleResponsePB {
 
 message PgGetDatabaseInfoRequestPB {
   uint32 oid = 1;
+  uint64 session_id = 2;
 }
 
 message PgGetDatabaseInfoResponsePB {
@@ -788,6 +789,8 @@ message PgOpenTableRequestPB {
   bool include_hidden = 4;
   reserved 5; // ASH metadata is now passed in RequestHeader PB
   uint64 ysql_catalog_version = 6;
+  // Owner-scoped metadata providers use this identity; zero must not expose private descriptors.
+  uint64 session_id = 7;
 }
 
 message PgTablePartitionsPB {
@@ -805,6 +808,7 @@ message PgOpenTableResponsePB {
 message PgGetTablePartitionListRequestPB {
   string table_id = 1;
   reserved 2; // ASH metadata is now passed in RequestHeader PB
+  uint64 session_id = 3;
 }
 
 message PgGetTablePartitionListResponsePB {
@@ -912,6 +916,10 @@ message PgPerformOptionsPB {
 
   // Origination time of the current PG transaction (see OriginationInfoPB); 0 when unknown.
   fixed64 origination_ht = 38;
+
+  // SQL lifetime is distinct from effective DocDB isolation and catalog read-point lifetime.
+  // Local transaction schedulers must not retain a SQL lease for backend-startup reads.
+  bool sql_transaction_active = 39;
 }
 
 message PgRequestSequenceNumPB {

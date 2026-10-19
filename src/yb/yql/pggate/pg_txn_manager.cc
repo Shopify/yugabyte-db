@@ -932,6 +932,7 @@ Status PgTxnManager::SetupPerformOptions(
   options.set_yb_non_ddl_txn_for_sys_tables_allowed(yb_non_ddl_txn_for_sys_tables_allowed);
   options.set_trace_requested(enable_tracing_);
   options.set_txn_serial_no(serial_no_.txn());
+  options.set_sql_transaction_active(txn_in_progress_);
   options.set_active_sub_transaction_id(active_sub_transaction_id_);
   options.set_xcluster_target_ddl_bypass(yb_xcluster_target_ddl_bypass);
   options.set_pg_txn_start_us(pg_txn_start_us_);
