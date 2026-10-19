@@ -28,6 +28,7 @@
 #include "yb/master/master_defaults.h"
 #include "yb/master/master_error.h"
 
+#include "yb/rpc/rpc_context.h"
 #include "yb/rpc/rpc_controller.h"
 
 #include "yb/util/format.h"
@@ -279,6 +280,17 @@ Status SetupError(MasterErrorPB* error, MasterErrorPB::Code code, const Status& 
 
 Status SetupError(MasterErrorPB* error, const Status& s) {
   return SetupError(error, MasterErrorPB::UNKNOWN_ERROR, s);
+}
+
+void SetupErrorAndRespond(
+    LWMasterErrorPB* error, const Status& s, MasterErrorPB_Code code, rpc::RpcContext* context) {
+  if (code == MasterErrorPB::UNKNOWN_ERROR && s.IsServiceUnavailable()) {
+    context->RespondRpcFailure(rpc::ErrorStatusPB::ERROR_SERVER_TOO_BUSY, s);
+    return;
+  }
+  StatusToPB(s, error->mutable_status());
+  error->set_code(code);
+  context->RespondSuccess();
 }
 
 bool IsBlacklisted(const ServerRegistrationPB& registration, const BlacklistSet& blacklist) {

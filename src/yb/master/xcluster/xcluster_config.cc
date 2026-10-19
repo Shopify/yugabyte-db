@@ -20,7 +20,7 @@
 
 #include "yb/master/catalog_entity_info.pb.h"
 #include "yb/master/catalog_manager-internal.h"
-#include "yb/master/master_heartbeat.pb.h"
+#include "yb/master/master_heartbeat.messages.h"
 #include "yb/master/sys_catalog.h"
 #include "yb/master/xcluster/xcluster_catalog_entity.h"
 
@@ -92,7 +92,7 @@ Result<SysXClusterConfigEntryPB> XClusterConfig::GetXClusterConfigEntryPB() cons
 }
 
 Status XClusterConfig::FillHeartbeatResponse(
-    const TSHeartbeatRequestPB& req, TSHeartbeatResponsePB* resp) const {
+    const LWTSHeartbeatRequestPB& req, LWTSHeartbeatResponsePB* resp) const {
   SharedLock mutex_lock(mutex_);
   SCHECK(xcluster_config_info_, IllegalState, "XCluster config is not initialized");
   auto l = xcluster_config_info_->LockForRead();
@@ -106,8 +106,8 @@ Status XClusterConfig::FillHeartbeatResponse(
   if (!FLAGS_skip_fields_moved_to_xcluster_guarded_info) {
     auto& xcluster_info_per_namespace =
         *resp->mutable_deprecated_xcluster_heartbeat_info()->mutable_xcluster_info_per_namespace();
-    for (const auto& [namespace_id, xcluster_info] : config_pb.xcluster_info_per_namespace()) {
-      xcluster_info_per_namespace[namespace_id] = xcluster_info;
+    for (const auto& entry : config_pb.xcluster_info_per_namespace()) {
+      xcluster_info_per_namespace.emplace_back(entry);
     }
   }
 

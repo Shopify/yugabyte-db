@@ -33,7 +33,7 @@
 #include "yb/master/master.h"
 #include "yb/master/master_ddl.pb.h"
 #include "yb/master/master_error.h"
-#include "yb/master/master_heartbeat.pb.h"
+#include "yb/master/master_heartbeat.messages.h"
 #include "yb/master/master_replication.pb.h"
 #include "yb/master/xcluster/add_index_to_bidirectional_xcluster_target_task.h"
 #include "yb/master/xcluster/add_table_to_xcluster_target_task.h"
@@ -330,10 +330,10 @@ Status XClusterTargetManager::SetXClusterNamespaceToSafeTimeMap(
 }
 
 Status XClusterTargetManager::FillHeartbeatResponse(
-    const TSHeartbeatRequestPB& req, TSHeartbeatResponsePB* resp) const {
+    const LWTSHeartbeatRequestPB& req, LWTSHeartbeatResponsePB* resp) const {
   auto l = safe_time_info_.LockForRead();
-  if (!l->pb.safe_time_map().empty()) {
-    *resp->mutable_xcluster_namespace_to_safe_time() = l->pb.safe_time_map();
+  for (const auto& entry : l->pb.safe_time_map()) {
+    resp->mutable_xcluster_namespace_to_safe_time()->emplace_back(entry);
   }
 
   return Status::OK();

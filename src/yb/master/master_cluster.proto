@@ -22,6 +22,7 @@ import "yb/common/wire_protocol.proto";
 import "yb/consensus/metadata.proto";
 import "yb/master/catalog_entity_info.proto";
 import "yb/master/master_types.proto";
+import "yb/rpc/lightweight_message.proto";
 import "yb/rpc/service.proto";
 
 message ListTabletServersRequestPB {
@@ -345,7 +346,9 @@ service MasterCluster {
   option (yb.rpc.custom_service_name) = "yb.master.MasterService";
 
   // Administrative/monitoring RPCs
-  rpc ListTabletServers(ListTabletServersRequestPB) returns (ListTabletServersResponsePB);
+  rpc ListTabletServers(ListTabletServersRequestPB) returns (ListTabletServersResponsePB) {
+    option (yb.rpc.lightweight_method).sides = SERVICE;
+  }
   rpc ListLiveTabletServers(ListLiveTabletServersRequestPB)
       returns (ListLiveTabletServersResponsePB);
   rpc RemoveTabletServer(RemoveTabletServerRequestPB) returns (RemoveTabletServerResponsePB);

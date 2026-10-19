@@ -43,7 +43,7 @@
 #include "yb/master/catalog_entity_info.h"
 #include "yb/master/leader_epoch.h"
 #include "yb/master/master_error.h"
-#include "yb/master/master_heartbeat.pb.h"
+#include "yb/master/master_heartbeat.messages.h"
 #include "yb/master/sys_catalog.h"
 #include "yb/master/ts_descriptor.h"
 
@@ -122,10 +122,11 @@ Status UpsertIfRequired(const LeaderEpoch& epoch, SysCatalogTable& sys_catalog, 
 
 TSManager::TSManager(SysCatalogTable& sys_catalog) noexcept : sys_catalog_(sys_catalog) {}
 
-Result<TSDescriptorPtr> TSManager::LookupTS(const NodeInstancePB& instance) const {
+template <class Instance>
+Result<TSDescriptorPtr> TSManager::LookupTS(const Instance& instance) const {
   SharedLock<decltype(map_lock_)> l(map_lock_);
 
-  auto maybe_desc = LookupTSInternalUnlocked(instance.permanent_uuid());
+  auto maybe_desc = LookupTSInternalUnlocked(std::string(instance.permanent_uuid()));
   if (!maybe_desc) {
     return STATUS_FORMAT(
         NotFound, "Unknown tablet server ID not in map, instance data: $0",
@@ -148,6 +149,9 @@ Result<TSDescriptorPtr> TSManager::LookupTS(const NodeInstancePB& instance) cons
 
   return desc;
 }
+
+template Result<TSDescriptorPtr> TSManager::LookupTS(const NodeInstancePB& instance) const;
+template Result<TSDescriptorPtr> TSManager::LookupTS(const LWNodeInstancePB& instance) const;
 
 Result<TSDescriptorPtr> TSManager::LookupTSByUUID(const std::string& uuid) {
   SharedLock<decltype(map_lock_)> l(map_lock_);
@@ -235,7 +239,7 @@ Status TSManager::RegisterFromRaftConfig(
 }
 
 Result<TSDescriptorPtr> TSManager::LookupAndUpdateTSFromHeartbeat(
-    const TSHeartbeatRequestPB& heartbeat_request, const LeaderEpoch& epoch) const {
+    const LWTSHeartbeatRequestPB& heartbeat_request, const LeaderEpoch& epoch) const {
   auto desc = VERIFY_RESULT(LookupTS(heartbeat_request.common().ts_instance()));
   auto lock = desc->LockForWrite();
   RETURN_NOT_OK(desc->UpdateFromHeartbeat(heartbeat_request, lock));
@@ -245,16 +249,17 @@ Result<TSDescriptorPtr> TSManager::LookupAndUpdateTSFromHeartbeat(
 }
 
 Result<TSDescriptorPtr> TSManager::RegisterFromHeartbeat(
-    const TSHeartbeatRequestPB& heartbeat_request, const LeaderEpoch& epoch,
+    const LWTSHeartbeatRequestPB& heartbeat_request, const LeaderEpoch& epoch,
     CloudInfoPB&& local_master_cloud_info, rpc::ProxyCache* proxy_cache) {
   return RegisterInternal(
-      heartbeat_request.common().ts_instance(), heartbeat_request.registration(),
+      heartbeat_request.common().ts_instance().ToGoogleProtobuf(),
+      heartbeat_request.registration().ToGoogleProtobuf(),
       std::cref(heartbeat_request), std::move(local_master_cloud_info), epoch, proxy_cache);
 }
 
 Result<TSDescriptorPtr> TSManager::RegisterInternal(
     const NodeInstancePB& instance, const TSRegistrationPB& registration,
-    std::optional<std::reference_wrapper<const TSHeartbeatRequestPB>> request,
+    std::optional<std::reference_wrapper<const LWTSHeartbeatRequestPB>> request,
     CloudInfoPB&& local_master_cloud_info, const LeaderEpoch& epoch,
     rpc::ProxyCache* proxy_cache) {
   TSCountCallback callback;

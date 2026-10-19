@@ -34,7 +34,7 @@
 #include "yb/master/master.h"
 #include "yb/master/master_error.h"
 #include "yb/master/master_ddl.pb.h"
-#include "yb/master/master_ysql_lease.pb.h"
+#include "yb/master/master_ysql_lease.messages.h"
 #include "yb/master/scoped_leader_shared_lock.h"
 #include "yb/master/sys_catalog.h"
 #include "yb/master/ts_manager.h"
@@ -218,8 +218,8 @@ class ObjectLockInfoManager::Impl {
       EXCLUDES(mutex_);
   bool IsDdlVerificationInProgress(const TransactionId& txn) const;
 
-  Status RefreshYsqlLease(const RefreshYsqlLeaseRequestPB& req,
-                          RefreshYsqlLeaseResponsePB& resp,
+  Status RefreshYsqlLease(const LWRefreshYsqlLeaseRequestPB& req,
+                          LWRefreshYsqlLeaseResponsePB& resp,
                           rpc::RpcContext& rpc,
                           const LeaderEpoch& epoch);
 
@@ -716,7 +716,8 @@ void ObjectLockInfoManager::ReleaseLocksForTxn(const TransactionId& txn_id) {
 }
 
 Status ObjectLockInfoManager::RefreshYsqlLease(
-    const RefreshYsqlLeaseRequestPB& req, RefreshYsqlLeaseResponsePB& resp, rpc::RpcContext& rpc,
+    const LWRefreshYsqlLeaseRequestPB& req, LWRefreshYsqlLeaseResponsePB& resp,
+    rpc::RpcContext& rpc,
     const LeaderEpoch& epoch) {
   return impl_->RefreshYsqlLease(req, resp, rpc, epoch);
 }
@@ -1333,8 +1334,8 @@ void ObjectLockInfoManager::Impl::WaitForLockersMultipleGlobal(
 }
 
 Status ObjectLockInfoManager::Impl::RefreshYsqlLease(
-    const RefreshYsqlLeaseRequestPB& req, RefreshYsqlLeaseResponsePB& resp, rpc::RpcContext& rpc,
-    const LeaderEpoch& epoch) {
+    const LWRefreshYsqlLeaseRequestPB& req, LWRefreshYsqlLeaseResponsePB& resp,
+    rpc::RpcContext& rpc, const LeaderEpoch& epoch) {
   if (!req.has_local_request_send_time_ms()) {
     return STATUS(InvalidArgument, "Missing required local_request_send_time_ms");
   }
@@ -1345,7 +1346,7 @@ Status ObjectLockInfoManager::Impl::RefreshYsqlLease(
       req.local_request_send_time_ms() + master_ttl - buffer);
   // Sanity check that the tserver has already registered with the same instance_seqno.
   RETURN_NOT_OK(master_.ts_manager()->LookupTS(req.instance()));
-  auto object_lock_info = GetOrCreateObjectLockInfo(req.instance().permanent_uuid());
+  auto object_lock_info = GetOrCreateObjectLockInfo(req.instance().permanent_uuid().ToBuffer());
   auto lock_variant = VERIFY_RESULT(
       object_lock_info->RefreshYsqlOperationLease(req, MonoDelta::FromMilliseconds(master_ttl)));
   if (auto* lease_info = std::get_if<SysObjectLockEntryPB::LeaseInfoPB>(&lock_variant)) {

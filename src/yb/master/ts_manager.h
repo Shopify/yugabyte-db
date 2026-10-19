@@ -102,7 +102,8 @@ class TSManager {
   // If the TS has never registered, or this instance doesn't match the
   // current instance ID for the TS, then a NotFound status is returned.
   // Otherwise, *desc is set and OK is returned.
-  Result<TSDescriptorPtr> LookupTS(const NodeInstancePB& instance) const;
+  template <class Instance>
+  Result<TSDescriptorPtr> LookupTS(const Instance& instance) const;
 
   // Lookup the tablet server descriptor for the given UUID.
   // Returns false if the TS has never registered.
@@ -120,10 +121,10 @@ class TSManager {
   // Lookup an existing TS descriptor from a heartbeat request. If found, update the TSDescriptor
   // using the metadata in the heartbeat request.
   Result<TSDescriptorPtr> LookupAndUpdateTSFromHeartbeat(
-      const TSHeartbeatRequestPB& heartbeat_request, const LeaderEpoch& epoch) const;
+      const LWTSHeartbeatRequestPB& heartbeat_request, const LeaderEpoch& epoch) const;
 
   Result<TSDescriptorPtr> RegisterFromHeartbeat(
-      const TSHeartbeatRequestPB& heartbeat_request, const LeaderEpoch& epoch,
+      const LWTSHeartbeatRequestPB& heartbeat_request, const LeaderEpoch& epoch,
       CloudInfoPB&& local_master_cloud_info, rpc::ProxyCache* proxy_cache);
 
   // Return all of the currently registered TS descriptors into the provided list.
@@ -215,7 +216,7 @@ class TSManager {
   // through membership in a tablet group that is heartbeating to the master.
   Result<TSDescriptorPtr> RegisterInternal(
       const NodeInstancePB& instance, const TSRegistrationPB& registration,
-      std::optional<std::reference_wrapper<const TSHeartbeatRequestPB>> request,
+      std::optional<std::reference_wrapper<const LWTSHeartbeatRequestPB>> request,
       CloudInfoPB&& local_master_cloud_info, const LeaderEpoch& epoch,
       rpc::ProxyCache* proxy_cache);
 

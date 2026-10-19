@@ -63,6 +63,7 @@
 namespace yb {
 
 class NodeInstancePB;
+class LWNodeInstancePB;
 
 namespace consensus {
 class ConsensusServiceProxy;
@@ -149,7 +150,8 @@ class TSDescriptor : public MetadataCowWrapper<PersistentTServerInfo> {
   // from the heartbeat request. This method also validates that this is the latest heartbeat
   // request received from the tserver. If not, this method does no mutations and returns an error
   // status.
-  Status UpdateFromHeartbeat(const TSHeartbeatRequestPB& req, const TSDescriptor::WriteLock& lock);
+  Status UpdateFromHeartbeat(
+      const LWTSHeartbeatRequestPB& req, const TSDescriptor::WriteLock& lock);
 
   // Return the amount of time since the last heartbeat received from this TS.
   MonoDelta TimeSinceHeartbeat() const;
@@ -331,16 +333,16 @@ class TSDescriptor : public MetadataCowWrapper<PersistentTServerInfo> {
     return ts_metrics_.disable_tablet_split_if_default_ttl;
   }
 
-  void UpdateMetrics(const TServerMetricsPB& metrics);
+  void UpdateMetrics(const LWTServerMetricsPB& metrics);
 
-  void GetMetrics(TServerMetricsPB* metrics);
+  void GetMetrics(LWTServerMetricsPB* metrics);
 
   void ClearMetrics() {
     std::lock_guard l(mutex_);
     ts_metrics_.ClearMetrics();
   }
 
-  Status IsReportCurrent(const NodeInstancePB& ts_instance, const TabletReportPB& report);
+  Status IsReportCurrent(const LWNodeInstancePB& ts_instance, const LWTabletReportPB& report);
 
   // Set of methods to keep track of pending tablet deletes for a tablet server.
   bool HasTabletDeletePending() const;
@@ -393,8 +395,8 @@ class TSDescriptor : public MetadataCowWrapper<PersistentTServerInfo> {
 
   template <typename LockType>
   Status IsReportCurrentUnlocked(
-      const NodeInstancePB& ts_instance,
-      std::optional<std::reference_wrapper<const TabletReportPB>> report, const LockType& lock)
+      const LWNodeInstancePB& ts_instance,
+      std::optional<std::reference_wrapper<const LWTabletReportPB>> report, const LockType& lock)
       REQUIRES_SHARED(mutex_);
 
   struct TSMetrics {

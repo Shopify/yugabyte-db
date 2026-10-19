@@ -39,7 +39,7 @@
 
 #include "yb/master/catalog_manager_util.h"
 #include "yb/master/master_fwd.h"
-#include "yb/master/master_heartbeat.pb.h"
+#include "yb/master/master_heartbeat.messages.h"
 #include "yb/master/master_util.h"
 #include "yb/master/master_ysql_lease.pb.h"
 
@@ -182,7 +182,7 @@ std::string TSDescriptor::placement_id() const {
 }
 
 Status TSDescriptor::UpdateFromHeartbeat(
-    const TSHeartbeatRequestPB& req, const TSDescriptor::WriteLock& lock) {
+    const LWTSHeartbeatRequestPB& req, const TSDescriptor::WriteLock& lock) {
   DCHECK_GE(req.num_live_tablets(), 0);
   DCHECK_GE(req.leader_count(), 0);
   {
@@ -206,10 +206,10 @@ Status TSDescriptor::UpdateFromHeartbeat(
 
     // Populate local per-tserver database pins from tserver heartbeat
     ts_ysql_db_oldest_pinned_read_times_.clear();
-    for (const auto& [db_oid, pin] : req.ts_ysql_db_oldest_pinned_read_times()) {
-      HybridTime pin_ht = HybridTime::FromPB(pin.db_level_oldest_read_time());
+    for (const auto& entry : req.ts_ysql_db_oldest_pinned_read_times()) {
+      HybridTime pin_ht = HybridTime::FromPB(entry.value().db_level_oldest_read_time());
       if (pin_ht.is_valid()) {
-        ts_ysql_db_oldest_pinned_read_times_.emplace(static_cast<PgOid>(db_oid), pin_ht);
+        ts_ysql_db_oldest_pinned_read_times_.emplace(static_cast<PgOid>(entry.key()), pin_ht);
       }
     }
     has_ysql_db_pins_ = true;
@@ -417,7 +417,7 @@ bool TSDescriptor::IsAcceptingLeaderLoad(const ReplicationInfoPB& replication_in
   return false;
 }
 
-void TSDescriptor::UpdateMetrics(const TServerMetricsPB& metrics) {
+void TSDescriptor::UpdateMetrics(const LWTServerMetricsPB& metrics) {
   std::lock_guard l(mutex_);
   ts_metrics_.total_memory_usage = metrics.total_ram_usage();
   ts_metrics_.total_sst_file_size = metrics.total_sst_file_size();
@@ -428,16 +428,17 @@ void TSDescriptor::UpdateMetrics(const TServerMetricsPB& metrics) {
   ts_metrics_.uptime_seconds = metrics.uptime_seconds();
   ts_metrics_.path_metrics.clear();
   for (const auto& path_metric : metrics.path_metrics()) {
-    ts_metrics_.path_metrics[path_metric.path_id()] = {
+    ts_metrics_.path_metrics[path_metric.path_id().ToBuffer()] = {
         .used_space = path_metric.used_space(),
         .total_space = path_metric.total_space(),
-        .storage_tier = path_metric.has_storage_tier() ? path_metric.storage_tier() : std::string(),
+        .storage_tier =
+            path_metric.has_storage_tier() ? path_metric.storage_tier().ToBuffer() : std::string(),
     };
   }
   ts_metrics_.disable_tablet_split_if_default_ttl = metrics.disable_tablet_split_if_default_ttl();
 }
 
-void TSDescriptor::GetMetrics(TServerMetricsPB* metrics) {
+void TSDescriptor::GetMetrics(LWTServerMetricsPB* metrics) {
   CHECK(metrics);
   SharedLock<decltype(mutex_)> l(mutex_);
   metrics->set_total_ram_usage(ts_metrics_.total_memory_usage);
@@ -449,18 +450,18 @@ void TSDescriptor::GetMetrics(TServerMetricsPB* metrics) {
   metrics->set_uptime_seconds(ts_metrics_.uptime_seconds);
   for (const auto& path_metric : ts_metrics_.path_metrics) {
     auto* new_path_metric = metrics->add_path_metrics();
-    new_path_metric->set_path_id(path_metric.first);
+    new_path_metric->dup_path_id(path_metric.first);
     new_path_metric->set_used_space(path_metric.second.used_space);
     new_path_metric->set_total_space(path_metric.second.total_space);
     if (!path_metric.second.storage_tier.empty()) {
-      new_path_metric->set_storage_tier(path_metric.second.storage_tier);
+      new_path_metric->dup_storage_tier(path_metric.second.storage_tier);
     }
   }
   metrics->set_disable_tablet_split_if_default_ttl(ts_metrics_.disable_tablet_split_if_default_ttl);
 }
 
 Status TSDescriptor::IsReportCurrent(
-    const NodeInstancePB& ts_instance, const TabletReportPB& report) {
+    const LWNodeInstancePB& ts_instance, const LWTabletReportPB& report) {
   auto cow_lock = LockForRead();
   SharedLock<decltype(mutex_)> l(mutex_);
   return IsReportCurrentUnlocked(ts_instance, std::cref(report), cow_lock);
@@ -468,8 +469,8 @@ Status TSDescriptor::IsReportCurrent(
 
 template <typename LockType>
 Status TSDescriptor::IsReportCurrentUnlocked(
-    const NodeInstancePB& ts_instance,
-    std::optional<std::reference_wrapper<const TabletReportPB>> report, const LockType& l) {
+    const LWNodeInstancePB& ts_instance,
+    std::optional<std::reference_wrapper<const LWTabletReportPB>> report, const LockType& l) {
   // Check instance seqno: did this tserver restart and send us another tablet report before we
   // finished with this one?
   if (l->pb.instance_seqno() != ts_instance.instance_seqno()) {

@@ -34,7 +34,7 @@
 #include "yb/master/catalog_entity_info.h"
 #include "yb/master/catalog_manager.h"
 #include "yb/master/master_error.h"
-#include "yb/master/master_heartbeat.pb.h"
+#include "yb/master/master_heartbeat.messages.h"
 #include "yb/master/master_types.pb.h"
 #include "yb/master/master_util.h"
 #include "yb/master/restoration_state.h"
@@ -895,7 +895,7 @@ class MasterSnapshotCoordinator::Impl {
     return Status::OK();
   }
 
-  Status FillHeartbeatResponse(TSHeartbeatResponsePB* resp) {
+  Status FillHeartbeatResponse(LWTSHeartbeatResponsePB* resp) {
     std::lock_guard lock(mutex_);
     auto* out = resp->mutable_snapshots_info();
     for (const auto& schedule : schedules_) {
@@ -905,7 +905,7 @@ class MasterSnapshotCoordinator::Impl {
       }
       const auto& id = schedule->id();
       auto* out_schedule = out->add_schedules();
-      out_schedule->set_id(id.data(), id.size());
+      out_schedule->dup_id(Slice(id.data(), id.size()));
       auto time = LastSnapshotTime(id);
       if (time) {
         out_schedule->set_last_snapshot_hybrid_time(time.ToUint64());
@@ -916,7 +916,7 @@ class MasterSnapshotCoordinator::Impl {
     for (const auto& restoration : restorations_) {
       auto* out_restoration = out->add_restorations();
       const auto& id = restoration->restoration_id();
-      out_restoration->set_id(id.data(), id.size());
+      out_restoration->dup_id(Slice(id.data(), id.size()));
       auto complete_time = restoration->complete_time();
       if (complete_time) {
         out_restoration->set_complete_time_ht(complete_time.ToUint64());
@@ -2647,7 +2647,7 @@ Status MasterSnapshotCoordinator::ApplyWritePair(const Slice& key, const Slice& 
   return impl_->ApplyWritePair(key, value);
 }
 
-Status MasterSnapshotCoordinator::FillHeartbeatResponse(TSHeartbeatResponsePB* resp) {
+Status MasterSnapshotCoordinator::FillHeartbeatResponse(LWTSHeartbeatResponsePB* resp) {
   return impl_->FillHeartbeatResponse(resp);
 }
 

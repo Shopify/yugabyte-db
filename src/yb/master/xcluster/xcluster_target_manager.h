@@ -27,8 +27,8 @@
 
 namespace yb::master {
 
-class TSHeartbeatRequestPB;
-class TSHeartbeatResponsePB;
+class LWTSHeartbeatRequestPB;
+class LWTSHeartbeatResponsePB;
 
 class PostTabletCreateTaskBase;
 class UniverseReplicationInfo;
@@ -106,7 +106,8 @@ class XClusterTargetManager {
 
   void DumpState(std::ostream& out, bool on_disk_dump) const;
 
-  Status FillHeartbeatResponse(const TSHeartbeatRequestPB& req, TSHeartbeatResponsePB* resp) const;
+  Status FillHeartbeatResponse(
+      const LWTSHeartbeatRequestPB& req, LWTSHeartbeatResponsePB* resp) const;
 
   // After a table is marked for drop we remove them from replication. If master leader failed over
   // after persisting the table state but before the xcluster cleanup we will have deletes tables in

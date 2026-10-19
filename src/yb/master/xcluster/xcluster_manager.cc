@@ -246,7 +246,7 @@ void XClusterManager::DumpState(std::ostream* out, bool on_disk_dump) const {
 }
 
 Status XClusterManager::FillHeartbeatResponse(
-    const TSHeartbeatRequestPB& req, TSHeartbeatResponsePB* resp) const {
+    const LWTSHeartbeatRequestPB& req, LWTSHeartbeatResponsePB* resp) const {
   RETURN_NOT_OK(XClusterTargetManager::FillHeartbeatResponse(req, resp));
 
   return xcluster_config_->FillHeartbeatResponse(req, resp);

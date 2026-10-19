@@ -30,8 +30,8 @@ class GetMasterXClusterConfigResponsePB;
 class PauseResumeXClusterProducerStreamsRequestPB;
 class PauseResumeXClusterProducerStreamsResponsePB;
 class PostTabletCreateTaskBase;
-class TSHeartbeatRequestPB;
-class TSHeartbeatResponsePB;
+class LWTSHeartbeatRequestPB;
+class LWTSHeartbeatResponsePB;
 class XClusterConfig;
 class XClusterSafeTimeService;
 struct SysCatalogLoadingState;
@@ -73,7 +73,8 @@ class XClusterManager : public XClusterManagerIf,
 
   Status PrepareDefaultXClusterConfig(int64_t term, bool recreate);
 
-  Status FillHeartbeatResponse(const TSHeartbeatRequestPB& req, TSHeartbeatResponsePB* resp) const;
+  Status FillHeartbeatResponse(
+      const LWTSHeartbeatRequestPB& req, LWTSHeartbeatResponsePB* resp) const;
 
   Status FillXClusterGuardedInfo(int64_t leader_term, XClusterGuardedInfoPB& info) override
       EXCLUDES(xcluster_guarded_info_version_mutex_);

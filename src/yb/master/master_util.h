@@ -21,6 +21,7 @@
 
 #include "yb/master/master_client.fwd.h"
 #include "yb/master/master_fwd.h"
+#include "yb/master/master_types.messages.h"
 
 #include "yb/rpc/rpc_fwd.h"
 
@@ -86,6 +87,10 @@ Result<bool> TableMatchesIdentifier(const TableId& id,
 
 Status SetupError(MasterErrorPB* error, const Status& s);
 Status SetupError(MasterErrorPB* error, MasterErrorPB_Code code, const Status& s);
+
+// Lightweight counterpart of the generic yb::SetupErrorAndRespond, which needs PB enum constants.
+void SetupErrorAndRespond(
+    LWMasterErrorPB* error, const Status& s, MasterErrorPB_Code code, rpc::RpcContext* context);
 
 // TODO(alex): Merge with stuff in entity_ids?
 

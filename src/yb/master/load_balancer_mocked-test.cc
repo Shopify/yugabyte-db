@@ -20,6 +20,7 @@
 #include "yb/consensus/metadata.pb.h"
 #include "yb/gutil/dynamic_annotations.h"
 #include "yb/master/load_balancer_mocked-test_base.h"
+#include "yb/master/master_heartbeat.messages.h"
 #include "yb/tablet/tablet_types.pb.h"
 
 namespace yb {
@@ -45,7 +46,8 @@ class LoadBalancerMockedTest : public LoadBalancerMockedBase {
     path_metrics->set_path_id("/data");
     path_metrics->set_used_space(used_space);
     path_metrics->set_total_space(total_space);
-    ts_desc->UpdateMetrics(metrics);
+    ThreadSafeArena arena;
+    ts_desc->UpdateMetrics(LWTServerMetricsPB(&arena, metrics));
   }
 };
 

@@ -59,7 +59,7 @@
 #include "yb/master/master_client.pb.h"
 #include "yb/master/master_ddl.pb.h"
 #include "yb/master/master_error.h"
-#include "yb/master/master_heartbeat.pb.h"
+#include "yb/master/master_heartbeat.messages.h"
 #include "yb/master/master_replication.pb.h"
 #include "yb/master/master_snapshot_coordinator.h"
 #include "yb/master/master_util.h"
@@ -3681,8 +3681,8 @@ bool ShouldResendRegistry(
   return should_resend_registry;
 }
 
-Status CatalogManager::FillHeartbeatResponse(const TSHeartbeatRequestPB& req,
-                                             TSHeartbeatResponsePB* resp) {
+Status CatalogManager::FillHeartbeatResponse(const LWTSHeartbeatRequestPB& req,
+                                             LWTSHeartbeatResponsePB* resp) {
   SysClusterConfigEntryPB cluster_config = VERIFY_RESULT(GetClusterConfig());
   RETURN_NOT_OK(FillHeartbeatResponseEncryption(cluster_config, req, resp));
   FillHeartbeatResponseClusterConfig(cluster_config, req, resp);
@@ -3692,9 +3692,9 @@ Status CatalogManager::FillHeartbeatResponse(const TSHeartbeatRequestPB& req,
 
 Status CatalogManager::FillHeartbeatResponseEncryption(
     const SysClusterConfigEntryPB& cluster_config,
-    const TSHeartbeatRequestPB& req,
-    TSHeartbeatResponsePB* resp) {
-  const auto& ts_uuid = req.common().ts_instance().permanent_uuid();
+    const LWTSHeartbeatRequestPB& req,
+    LWTSHeartbeatResponsePB* resp) {
+  const auto ts_uuid = req.common().ts_instance().permanent_uuid().ToBuffer();
   if (!cluster_config.has_encryption_info() ||
       !ShouldResendRegistry(ts_uuid, req.has_registration(), &should_send_universe_key_registry_,
                             &should_send_universe_key_registry_mutex_)) {
@@ -3709,8 +3709,8 @@ Status CatalogManager::FillHeartbeatResponseEncryption(
 
 void CatalogManager::FillHeartbeatResponseClusterConfig(
   const SysClusterConfigEntryPB& cluster_config,
-  const TSHeartbeatRequestPB& req,
-  TSHeartbeatResponsePB* resp) {
+  const LWTSHeartbeatRequestPB& req,
+  LWTSHeartbeatResponsePB* resp) {
   if (req.cluster_config_version() < cluster_config.version()) {
     resp->set_cluster_config_version(cluster_config.version());
     *resp->mutable_cluster_replication_info() = cluster_config.replication_info();

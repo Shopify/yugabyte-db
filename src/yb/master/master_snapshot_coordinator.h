@@ -186,7 +186,7 @@ class MasterSnapshotCoordinator : public tablet::SnapshotCoordinator {
   // key and value are entry from the write batch.
   Status ApplyWritePair(const Slice& key, const Slice& value) override;
 
-  Status FillHeartbeatResponse(TSHeartbeatResponsePB* resp);
+  Status FillHeartbeatResponse(LWTSHeartbeatResponsePB* resp);
 
   docdb::HistoryCutoff AllowedHistoryCutoffProvider(
       tablet::RaftGroupMetadata* metadata);

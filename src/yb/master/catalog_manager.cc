@@ -6617,8 +6617,8 @@ Status CatalogManager::TruncateTable(const TruncateTableRequestPB* req,
   return Status::OK();
 }
 
-Status CatalogManager::RefreshYsqlLease(const RefreshYsqlLeaseRequestPB* req,
-                                        RefreshYsqlLeaseResponsePB* resp,
+Status CatalogManager::RefreshYsqlLease(const LWRefreshYsqlLeaseRequestPB* req,
+                                        LWRefreshYsqlLeaseResponsePB* resp,
                                         rpc::RpcContext* rpc,
                                         const LeaderEpoch& epoch) {
   return object_lock_info_manager_->RefreshYsqlLease(*req, *resp, *rpc, epoch);

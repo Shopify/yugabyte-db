@@ -24,6 +24,7 @@
 #include "yb/master/master_heartbeat.pb.h"
 #include "yb/master/master_service_base-internal.h"
 #include "yb/master/master_service_base.h"
+#include "yb/master/master_util.h"
 #include "yb/master/object_lock_info_manager.h"
 #include "yb/master/ts_descriptor.h"
 #include "yb/master/ts_manager.h"
@@ -58,11 +59,11 @@ class MasterClusterServiceImpl : public MasterServiceBase, public MasterClusterI
   explicit MasterClusterServiceImpl(Master* master)
       : MasterServiceBase(master), MasterClusterIf(master->metric_entity()) {}
 
-  void ListTabletServers(const ListTabletServersRequestPB* req,
-                         ListTabletServersResponsePB* resp,
+  void ListTabletServers(const LWListTabletServersRequestPB* req,
+                         LWListTabletServersResponsePB* resp,
                          rpc::RpcContext rpc) override {
     SCOPED_LEADER_SHARED_LOCK(l, server_->catalog_manager_impl());
-    resp->set_master_uuid(server_->permanent_uuid());
+    resp->dup_master_uuid(server_->permanent_uuid());
     if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, &rpc)) {
       return;
     }
@@ -89,7 +90,7 @@ class MasterClusterServiceImpl : public MasterServiceBase, public MasterClusterI
         LOG(INFO) << "Retrieve placement info from tablespace ID";
         auto result =
             server_->catalog_manager_impl()->
-                GetTablespaceReplicationInfoWithRetry(req->tablespace_id());
+                GetTablespaceReplicationInfoWithRetry(req->tablespace_id().ToBuffer());
         if (!result.ok()) {
           SetupErrorAndRespond(resp->mutable_error(), result.status(),
                               MasterErrorPB_Code_UNKNOWN_ERROR, &rpc);
@@ -114,7 +115,7 @@ class MasterClusterServiceImpl : public MasterServiceBase, public MasterClusterI
       } else if (req->has_replication_info()) {
         LOG(INFO) << "Retrieve placement info from user request";
         replication_info =
-            std::make_unique<ReplicationInfoPB>(req->replication_info());
+            std::make_unique<ReplicationInfoPB>(req->replication_info().ToGoogleProtobuf());
       }
     }
 
@@ -146,7 +147,7 @@ class MasterClusterServiceImpl : public MasterServiceBase, public MasterClusterI
         LOG(INFO) << "Placement info has matched against placement "
                   << replication_info->live_replicas().placement_uuid();
       }
-      ListTabletServersResponsePB::Entry* entry = resp->add_servers();
+      auto* entry = resp->add_servers();
       *entry->mutable_instance_id() = desc->GetNodeInstancePB();
       *entry->mutable_registration() = desc->GetTSRegistrationPB();
       auto last_heartbeat = desc->LastHeartbeatTime();

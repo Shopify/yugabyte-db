@@ -414,8 +414,8 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   Status IsTruncateTableDone(const IsTruncateTableDoneRequestPB* req,
                              IsTruncateTableDoneResponsePB* resp);
 
-  Status RefreshYsqlLease(const RefreshYsqlLeaseRequestPB* req,
-                          RefreshYsqlLeaseResponsePB* resp,
+  Status RefreshYsqlLease(const LWRefreshYsqlLeaseRequestPB* req,
+                          LWRefreshYsqlLeaseResponsePB* resp,
                           rpc::RpcContext* rpc,
                           const LeaderEpoch& epoch);
 
@@ -929,7 +929,7 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
 
   Status WaitForTransactionTableVersionUpdateToPropagate();
 
-  Status FillHeartbeatResponse(const TSHeartbeatRequestPB& req, TSHeartbeatResponsePB* resp);
+  Status FillHeartbeatResponse(const LWTSHeartbeatRequestPB& req, LWTSHeartbeatResponsePB* resp);
 
   SysCatalogTable* sys_catalog() override { return sys_catalog_; }
 
@@ -3272,18 +3272,18 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
 
   Status FillHeartbeatResponseEncryption(
       const SysClusterConfigEntryPB& cluster_config,
-      const TSHeartbeatRequestPB& req,
-      TSHeartbeatResponsePB* resp);
+      const LWTSHeartbeatRequestPB& req,
+      LWTSHeartbeatResponsePB* resp);
 
   void FillHeartbeatResponseClusterConfig(
       const SysClusterConfigEntryPB& cluster_config,
-      const TSHeartbeatRequestPB& req,
-      TSHeartbeatResponsePB* resp);
+      const LWTSHeartbeatRequestPB& req,
+      LWTSHeartbeatResponsePB* resp);
 
   Status FillHeartbeatResponseCDC(
       const SysClusterConfigEntryPB& cluster_config,
-      const TSHeartbeatRequestPB& req,
-      TSHeartbeatResponsePB* resp);
+      const LWTSHeartbeatRequestPB& req,
+      LWTSHeartbeatResponsePB* resp);
 
   Status AddSchemaVersionMappingToUniverseReplication(
       scoped_refptr<UniverseReplicationInfo> universe,
