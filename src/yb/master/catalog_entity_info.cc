@@ -137,25 +137,6 @@ void TabletReplica::UpdateDriveInfo(const TabletReplicaDriveInfo& info) {
   drive_info = info;
 }
 
-void TabletReplica::UpdateLeaderLeaseInfo(const TabletLeaderLeaseInfo& info) {
-  const bool initialized = leader_lease_info.initialized;
-  const auto old_lease_exp = leader_lease_info.ht_lease_expiration;
-  leader_lease_info = info;
-  leader_lease_info.ht_lease_expiration = 0;
-  if (info.leader_lease_status == consensus::LeaderLeaseStatus::HAS_LEASE) {
-    if (old_lease_exp == consensus::kInfiniteHybridTimeLeaseExpiration) {
-      // It's originally RF-1, so there are two possibilities:
-      // 1. It's still RF-1, and the new lease expiration is the same as the old one.
-      // 2. It's changed to RF>1, and the new lease expiration is less than the old one.
-      // In both cases, we can accept the new lease expiration.
-      leader_lease_info.ht_lease_expiration = info.ht_lease_expiration;
-    } else {
-      leader_lease_info.ht_lease_expiration = std::max(info.ht_lease_expiration, old_lease_exp);
-    }
-  }
-  leader_lease_info.initialized = initialized || info.initialized;
-}
-
 bool TabletReplica::IsStarting() const {
   return (state == tablet::NOT_STARTED || state == tablet::BOOTSTRAPPING);
 }
@@ -277,17 +258,6 @@ Result<TabletReplicaDriveInfo> TabletInfo::GetLeaderReplicaDriveInfo() const {
   return GetLeaderNotFoundStatus();
 }
 
-// Return leader lease info of the replica with ts_uuid if it's is the current leader.
-Result<TabletLeaderLeaseInfo> TabletInfo::GetLeaderLeaseInfoIfLeader(
-    const std::string& ts_uuid) const {
-  std::lock_guard l(lock_);
-  auto it = replica_locations_->find(ts_uuid);
-  if (it == replica_locations_->end() || it->second.role != PeerRole::LEADER) {
-    return GetLeaderNotFoundStatus();
-  }
-  return it->second.leader_lease_info;
-}
-
 Result<TSDescriptorPtr> TabletInfo::GetLeaderUnlocked() const {
   for (const auto& pair : *replica_locations_) {
     if (pair.second.role == PeerRole::LEADER) {
@@ -326,8 +296,7 @@ void TabletInfo::UpdateReplicaLocations(const std::string& ts_uuid, const Tablet
 }
 
 void TabletInfo::UpdateReplicaInfo(const std::string& ts_uuid,
-                                   const TabletReplicaDriveInfo& drive_info,
-                                   const TabletLeaderLeaseInfo& leader_lease_info) {
+                                   const TabletReplicaDriveInfo& drive_info) {
   std::lock_guard l(lock_);
   // Make a new shared_ptr, copying the data, to ensure we don't race against access to data from
   // clients that already have the old shared_ptr.
@@ -338,7 +307,6 @@ void TabletInfo::UpdateReplicaInfo(const std::string& ts_uuid,
   }
   VLOG_WITH_FUNC(3) << "T " << id() << " P " << ts_uuid << ": " << drive_info.ToString();
   it->second.UpdateDriveInfo(drive_info);
-  it->second.UpdateLeaderLeaseInfo(leader_lease_info);
 }
 
 std::unordered_map<xrepl::StreamId, uint64_t> TabletInfo::GetReplicationStatus() {
@@ -356,9 +324,17 @@ MonoTime TabletInfo::last_update_time() const {
   return last_update_time_;
 }
 
-void TabletInfo::UpdateLastTimeWithValidLeader() {
+void TabletInfo::MarkLeaderWithoutLease(const std::string& ts_uuid) {
   std::lock_guard l(lock_);
-  last_time_with_valid_leader_ = MonoTime::Now();
+  auto it = replica_locations_->find(ts_uuid);
+  if (it != replica_locations_->end() && it->second.role == PeerRole::LEADER) {
+    last_time_leader_without_lease_ = MonoTime::Now();
+  }
+}
+
+MonoTime TabletInfo::last_time_leader_without_lease() const {
+  std::lock_guard l(lock_);
+  return last_time_leader_without_lease_;
 }
 
 MonoTime TabletInfo::last_time_with_valid_leader() const {

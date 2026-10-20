@@ -118,10 +118,6 @@ DEFINE_RUNTIME_bool(master_tombstone_evicted_tablet_replicas, true,
     "are no longer part of the latest reported raft config.");
 TAG_FLAG(master_tombstone_evicted_tablet_replicas, hidden);
 
-DEFINE_RUNTIME_uint32(maximum_tablet_leader_lease_expired_secs, 2 * 60,
-    "If the leader lease in master's view has expired for this amount of seconds, "
-    "treat the lease as expired for too long time.");
-
 DEFINE_RUNTIME_bool(use_create_table_leader_hint, true,
     "Whether the Master should hint which replica for each tablet should "
     "be leader initially on tablet creation.");
@@ -1548,7 +1544,6 @@ void MasterHeartbeatServiceImpl::UpdateTabletReplicasAfterConfigChange(
         ts_desc, &consensus_state, leader_uuid, report, replica_state);
     if (existing_replica) {
       replica.UpdateDriveInfo(existing_replica->drive_info);
-      replica.UpdateLeaderLeaseInfo(existing_replica->leader_lease_info);
     }
     auto result = replica_locations.get()->insert({ts_desc->id(), replica});
     LOG_IF(FATAL, !result.second) << "duplicate uuid: " << ts_desc->id();
@@ -1616,15 +1611,6 @@ bool MasterHeartbeatServiceImpl::ReplicaMapDiffersFromConsensusState(
   return false;
 }
 
-// Return true if the received ht_lease_exp from the leader peer has been expired for too
-// long time when the ts metrics heartbeat reaches the master.
-bool IsHtLeaseExpiredForTooLong(MicrosTime now, MicrosTime ht_lease_exp) {
-  const auto now_usec = boost::posix_time::microseconds(now);
-  const auto ht_lease_exp_usec = boost::posix_time::microseconds(ht_lease_exp);
-  return (now_usec - ht_lease_exp_usec).total_seconds() >
-      FLAGS_maximum_tablet_leader_lease_expired_secs;
-}
-
 void MasterHeartbeatServiceImpl::ProcessTabletMetadata(
     const std::string& ts_uuid,
     const TabletInfoPtr& tablet,
@@ -1635,47 +1621,12 @@ void MasterHeartbeatServiceImpl::ProcessTabletMetadata(
     VLOG(1) << Format("Tablet $0 not found", tablet_id);
     return;
   }
-  MicrosTime new_ht_lease_exp = 0;
-  uint64 new_heartbeats_without_leader_lease = 0;
-  consensus::LeaderLeaseStatus leader_lease_status =
-      consensus::LeaderLeaseStatus::NO_MAJORITY_REPLICATED_LEASE;
-  bool leader_lease_info_initialized = false;
-  if (leader_metrics) {
-    auto existing_leader_lease_info = tablet->GetLeaderLeaseInfoIfLeader(ts_uuid);
-    // If the peer is the current leader, update the counter to track heartbeats that
-    // the tablet doesn't have a valid lease.
-    if (existing_leader_lease_info) {
-      const auto& leader_info = *leader_metrics;
-      leader_lease_status = leader_info.leader_lease_status();
-      leader_lease_info_initialized = true;
-      if (leader_info.leader_lease_status() == consensus::LeaderLeaseStatus::HAS_LEASE) {
-        auto ht_lease_exp = leader_info.ht_lease_expiration();
-        auto current_ht_lease_exp = existing_leader_lease_info->ht_lease_expiration;
-        // If the reported ht lease from the leader is expired for more than
-        // FLAGS_maximum_tablet_leader_lease_expired_secs, the leader shouldn't be treated
-        // as a valid leader.
-        // If the tablet has been changed from RF1 to any RF>1, the newly reported ht_lease_exp
-        // is always less than that reported when it was RF1 (kInfiniteHybridTimeLeaseExpiration).
-        // We should also treat such ht_lease_exp as valid.
-        // See https://github.com/yugabyte/yugabyte-db/issues/24575.
-        if ((ht_lease_exp >= current_ht_lease_exp ||
-                 current_ht_lease_exp == consensus::kInfiniteHybridTimeLeaseExpiration) &&
-            !IsHtLeaseExpiredForTooLong(
-                master_->clock()->Now().GetPhysicalValueMicros(), ht_lease_exp)) {
-          new_ht_lease_exp = ht_lease_exp;
-          tablet->UpdateLastTimeWithValidLeader();
-        }
-      } else {
-        new_heartbeats_without_leader_lease =
-            existing_leader_lease_info->heartbeats_without_leader_lease + 1;
-      }
-    }
+  // Only a leader without a lease has anything to report; old tservers still send HAS_LEASE
+  // and follower entries, which carry nothing to record.
+  if (leader_metrics &&
+      leader_metrics->leader_lease_status() != consensus::LeaderLeaseStatus::HAS_LEASE) {
+    tablet->MarkLeaderWithoutLease(ts_uuid);
   }
-  TabletLeaderLeaseInfo leader_lease_info{
-        leader_lease_info_initialized,
-        leader_lease_status,
-        new_ht_lease_exp,
-        new_heartbeats_without_leader_lease};
   auto drive_info = TabletReplicaDriveInfo {
     .sst_files_size = storage_metadata.sst_file_size(),
     .wal_files_size = storage_metadata.wal_file_size(),
@@ -1685,7 +1636,7 @@ void MasterHeartbeatServiceImpl::ProcessTabletMetadata(
     .vector_index_size = storage_metadata.vector_index_size(),
     .has_active_vector_index_backfill = storage_metadata.has_active_vector_index_backfill(),
   };
-  tablet->UpdateReplicaInfo(ts_uuid, drive_info, leader_lease_info);
+  tablet->UpdateReplicaInfo(ts_uuid, drive_info);
 }
 
 void MasterHeartbeatServiceImpl::ProcessTabletReplicaFullCompactionStatus(
