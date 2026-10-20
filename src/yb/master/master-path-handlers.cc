@@ -2240,7 +2240,7 @@ void MasterPathHandlers::HandleTablePage(const Webserver::WebRequest& req,
         EscapeForHtmlToString(
             partition_schema.PartitionDebugString(partition, *partition_keys_schema)),
         l->pb.split_depth(),
-        ReplicaInfoToHtml(sorted_locations, tablet->tablet_id()),
+        ReplicaInfoToHtml(sorted_locations, *tablet),
         state,
         l->is_hidden(),
         EscapeForHtmlToString(l->pb.state_msg()));
@@ -2697,14 +2697,32 @@ MasterPathHandlers::GetLeaderlessTablets() {
     if (t.get()->LockForRead()->is_deleted()) {
       continue;
     }
-    const auto time_since_valid_leader_secs =
-        MonoTime::Now().GetDeltaSince(t->last_time_with_valid_leader()).ToSeconds();
-    if (time_since_valid_leader_secs >
-            FLAGS_leaderless_tablet_alert_delay_secs) {
+    const auto now = MonoTime::Now();
+    const auto delay_secs = FLAGS_leaderless_tablet_alert_delay_secs;
+    auto leader = t->GetLeader();
+    if (!leader.ok()) {
+      // Give a fresh or just-changed replica map the alert delay to elect a leader.
+      const auto secs = now.GetDeltaSince(t->last_update_time()).ToSeconds();
+      if (secs > delay_secs) {
+        leaderless_tablets.push_back(std::make_pair(
+            t, Format("No leader in the replica map for $0 seconds", secs)));
+      }
+      continue;
+    }
+    const auto secs_since_heartbeat = (*leader)->TimeSinceHeartbeat().ToSeconds();
+    if (secs_since_heartbeat > delay_secs) {
       leaderless_tablets.push_back(std::make_pair(
-          t,
-          Format("No valid leader reported for $0 seconds",
-                 time_since_valid_leader_secs)));
+          t, Format("Leader $0 has not heartbeated for $1 seconds",
+                    (*leader)->permanent_uuid(), secs_since_heartbeat)));
+      continue;
+    }
+    const auto last_without_lease = t->last_time_leader_without_lease();
+    if (last_without_lease.Initialized()) {
+      const auto secs = now.GetDeltaSince(last_without_lease).ToSeconds();
+      if (secs <= delay_secs) {
+        leaderless_tablets.push_back(std::make_pair(
+            t, Format("Leader reported no lease $0 seconds ago", secs)));
+      }
     }
   }
   return leaderless_tablets;
@@ -4037,38 +4055,21 @@ Status MasterPathHandlers::Register(Webserver* server) {
 }
 
 string MasterPathHandlers::ReplicaInfoToHtml(
-    const std::vector<TsUuidAndTabletReplica>& locations, const std::string& tablet_id) const {
+    const std::vector<TsUuidAndTabletReplica>& locations, const TabletInfo& tablet) const {
   stringstream html;
+  const auto& tablet_id = tablet.tablet_id();
 
   html << "<ul>\n";
   for (const auto& [ts_uuid, replica] : locations) {
     auto ts_desc_ptr = replica.ts_desc.lock();
     string location_html = TSDescriptorToHtml(ts_uuid.get(), opt_cref(ts_desc_ptr), tablet_id);
     if (replica.role == PeerRole::LEADER) {
-      auto leader_lease_info = replica.leader_lease_info;
-      // The master might haven't received any heartbeats containing this leader yet.
-      // Set the status to UNKNOWN.
-      auto leader_lease_status = leader_lease_info.initialized
-          ? LeaderLeaseStatus_Name(leader_lease_info.leader_lease_status)
-          : "UNKNOWN";
-      html << Format("  <li><b>LEADER: $0 ($1)</b></li>\n", location_html, leader_lease_status);
-      if (leader_lease_info.leader_lease_status == consensus::LeaderLeaseStatus::HAS_LEASE) {
-        auto ht_lease_exp = leader_lease_info.ht_lease_expiration;
-        if (ht_lease_exp == consensus::kInfiniteHybridTimeLeaseExpiration) {
-          html << "Remaining ht_lease: +INF(RF1)<br>\n";
-        } else {
-          // Get the remaining milliseconds of the current valid lease.
-          const auto now_usec = boost::posix_time::microseconds(
-              master_->clock()->Now().GetPhysicalValueMicros());
-          auto ht_lease_usec = boost::posix_time::microseconds(ht_lease_exp);
-          auto diff = ht_lease_usec - now_usec;
-          html << Format("Remaining ht_lease (may be stale): $0 ms<br>\n",
-                         diff.total_milliseconds());
-        }
-      } else if (leader_lease_info.heartbeats_without_leader_lease > 0) {
+      html << Format("  <li><b>LEADER: $0</b></li>\n", location_html);
+      const auto last_without_lease = tablet.last_time_leader_without_lease();
+      if (last_without_lease.Initialized()) {
         html << Format(
-            "Cannot replicate lease for past <b><font color='red'>$0</font></b> heartbeats<br>",
-            leader_lease_info.heartbeats_without_leader_lease);
+            "Leader last reported no lease <b><font color='red'>$0</font></b> seconds ago<br>",
+            MonoTime::Now().GetDeltaSince(last_without_lease).ToSeconds());
       }
     } else {
       html << Format("  <li>$0: $1</li>\n",

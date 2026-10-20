@@ -119,6 +119,9 @@ DEFINE_NON_RUNTIME_int32(full_metrics_beat_period, 5,
 DEFINE_NON_RUNTIME_bool(live_tservers_from_connectivity_check, false,
     "Same as the tserver flag: hollow heartbeats set skip_tservers so the master omits the live "
     "tserver list from every response, and the real tserver is started with the flag.");
+DEFINE_NON_RUNTIME_bool(leader_info_only_without_lease, false,
+    "Same as the tserver flag: hollow leaders always hold a lease, so hollow heartbeats carry "
+    "no leader_info, and the real tserver is started with the flag.");
 DEFINE_NON_RUNTIME_bool(send_lease_refreshes, true,
     "Send the per-second RefreshYsqlLease RPC from every hollow tserver.");
 DEFINE_NON_RUNTIME_string(master_bin, "", "Path to the yb-master binary (required).");
@@ -308,16 +311,18 @@ class HollowTServer {
         storage->set_vector_index_size(0);
         storage->set_has_active_vector_index_backfill(false);
         storage->set_may_have_orphaned_post_split_data(false);
-        // The real provider adds leader_info for every hosted tablet, not just led ones;
-        // followers report NO_MAJORITY_REPLICATED_LEASE without an expiration.
-        auto* leader = req->add_leader_info();
-        leader->dup_tablet_id(tablet_id);
-        if (info.leader_uuid == uuid_) {
-          leader->set_leader_lease_status(consensus::LeaderLeaseStatus::HAS_LEASE);
-          leader->set_ht_lease_expiration((now_micros + 2 * 1000 * 1000) << 12);
-        } else {
-          leader->set_leader_lease_status(
-              consensus::LeaderLeaseStatus::NO_MAJORITY_REPLICATED_LEASE);
+        // Without the flag the real provider adds leader_info for every hosted tablet, not just
+        // led ones; followers report NO_MAJORITY_REPLICATED_LEASE without an expiration.
+        if (!FLAGS_leader_info_only_without_lease) {
+          auto* leader = req->add_leader_info();
+          leader->dup_tablet_id(tablet_id);
+          if (info.leader_uuid == uuid_) {
+            leader->set_leader_lease_status(consensus::LeaderLeaseStatus::HAS_LEASE);
+            leader->set_ht_lease_expiration((now_micros + 2 * 1000 * 1000) << 12);
+          } else {
+            leader->set_leader_lease_status(
+                consensus::LeaderLeaseStatus::NO_MAJORITY_REPLICATED_LEASE);
+          }
         }
         auto* compaction = req->add_full_compaction_statuses();
         compaction->dup_tablet_id(tablet_id);
@@ -495,7 +500,7 @@ class HollowTServer {
         *compaction = tmpl_compactions.Get(i % tmpl_compactions.size());
         compaction->dup_tablet_id(tablet_id);
       }
-      if (!tmpl_leaders.empty()) {
+      if (!tmpl_leaders.empty() && !FLAGS_leader_info_only_without_lease) {
         auto* leader = req->add_leader_info();
         if (info.leader_uuid == uuid_ && leader_tmpl_idx >= 0) {
           *leader = tmpl_leaders.Get(leader_tmpl_idx);
@@ -1451,6 +1456,8 @@ class HeartbeatBench {
         Format("--heartbeat_interval_ms=$0", FLAGS_heartbeat_interval_ms),
         Format("--live_tservers_from_connectivity_check=$0",
                FLAGS_live_tservers_from_connectivity_check),
+        Format("--tserver_heartbeat_metrics_leader_info_only_without_lease=$0",
+               FLAGS_leader_info_only_without_lease),
         "--enable_ysql=false",
         "--placement_cloud=cloud1",
         "--placement_region=region1",
