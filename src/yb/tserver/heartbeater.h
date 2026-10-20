@@ -55,6 +55,9 @@ class HeartbeatDataProvider {
   // Called on every heartbeat from Heartbeater::Impl::TryHeartbeat.
   virtual void AddData(bool needs_full_tablet_report, master::LWTSHeartbeatRequestPB* req) = 0;
 
+  // Called with the successful response to the heartbeat the provider last added data to.
+  virtual void OnHeartbeatResponse(const master::LWTSHeartbeatResponsePB& resp) {}
+
   const std::string& LogPrefix() const;
 
   TabletServer& server() { return server_; }

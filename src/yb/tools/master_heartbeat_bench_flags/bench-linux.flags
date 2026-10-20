@@ -11,3 +11,4 @@
 --tserver_flags=--flagfile=src/yb/tools/master_heartbeat_bench_flags/tserver.flags
 --live_tservers_from_connectivity_check=true
 --leader_info_only_without_lease=true
+--tserver_heartbeat_metrics_send_storage_metadata_on_change=true
