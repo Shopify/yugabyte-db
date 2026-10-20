@@ -201,12 +201,16 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
 
   OpId GetPendingConfigOpId() const override;
 
-  LeaderLeaseStatus GetLeaderLeaseStatusIfLeader(MicrosTime* ht_lease_exp) const;
+  // Waits for the replica state lock at most until deadline. Past the deadline the result is
+  // NO_MAJORITY_REPLICATED_LEASE.
+  LeaderLeaseStatus GetLeaderLeaseStatusIfLeader(
+      MicrosTime* ht_lease_exp, CoarseTimePoint deadline = CoarseTimePoint::max()) const;
   LeaderLeaseStatus GetLeaderLeaseStatusUnlocked(MicrosTime* ht_lease_exp) const;
 
   ConsensusStatePB ConsensusState(
       ConsensusConfigType type,
-      LeaderLeaseStatus* leader_lease_status) const override;
+      LeaderLeaseStatus* leader_lease_status = nullptr,
+      CoarseTimePoint deadline = CoarseTimePoint::max()) const override;
 
   ConsensusStatePB ConsensusStateUnlocked(
       ConsensusConfigType type,

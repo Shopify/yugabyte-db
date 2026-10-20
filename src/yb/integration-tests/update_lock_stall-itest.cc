@@ -13,10 +13,11 @@
 
 // A single tablet replica whose ReplicaState update lock is held for a long time must not take
 // the rest of the tablet server down with it. These tests hold the lock on one tablet and check
-// that reads of that tablet fail at their deadline instead of parking an RPC worker, and that
-// reads of other tablets keep working. The small pool tests fill the leader's RPC worker pool
-// with reads of the stalled tablet and check that reads of a healthy tablet on the same server
-// still get a worker, which is what the stall threshold is for.
+// that reads of that tablet fail at their deadline instead of parking an RPC worker, that reads
+// of other tablets keep working, and that the tablet server keeps heartbeating to the master. The
+// small pool tests fill the leader's RPC worker pool with reads of the stalled tablet and check
+// that reads of a healthy tablet on the same server still get a worker, which is what the stall
+// threshold is for.
 
 #include <atomic>
 #include <thread>
@@ -46,6 +47,11 @@
 
 #include "yb/qlexpr/ql_rowblock.h"
 
+#include "yb/master/master.h"
+#include "yb/master/mini_master.h"
+#include "yb/master/ts_descriptor.h"
+#include "yb/master/ts_manager.h"
+
 #include "yb/rpc/rpc_controller.h"
 
 #include "yb/tablet/tablet.h"
@@ -73,7 +79,10 @@ using namespace std::literals;
 METRIC_DECLARE_histogram(handler_latency_yb_tserver_TabletServerService_Read);
 
 DECLARE_string(TEST_hold_update_lock_tablet_id);
+DECLARE_bool(tserver_heartbeat_metrics_add_leader_info);
+DECLARE_int32(heartbeat_interval_ms);
 DECLARE_int32(leader_lease_duration_ms);
+DECLARE_int32(tserver_heartbeat_metrics_interval_ms);
 DECLARE_int32(raft_heartbeat_interval_ms);
 DECLARE_double(leader_failure_max_missed_heartbeat_periods);
 DECLARE_bool(enable_load_balancing);
@@ -95,6 +104,9 @@ class UpdateLockStallTest : public client::KeyValueTableTest<MiniCluster> {
  public:
   void SetUp() override {
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_load_balancing) = false;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_heartbeat_metrics_add_leader_info) = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_heartbeat_interval_ms) = 500;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_heartbeat_metrics_interval_ms) = 500;
     // A 1 s failure detection period, which is also the stall threshold the fix derives from it.
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_raft_heartbeat_interval_ms) = 250;
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_leader_failure_max_missed_heartbeat_periods) = 4;
@@ -232,6 +244,11 @@ class UpdateLockStallTest : public client::KeyValueTableTest<MiniCluster> {
     return row_block->row(0).column(0).int32_value();
   }
 
+  Result<master::TSDescriptorPtr> LeaderDescriptor() {
+    auto* master = VERIFY_RESULT(cluster_->GetLeaderMiniMaster())->master();
+    return master->ts_manager()->LookupTSByUUID(leader_uuid_);
+  }
+
  protected:
   client::TableHandle other_table_;
   std::string stalled_tablet_id_;
@@ -283,6 +300,27 @@ TEST_F(UpdateLockStallTest, ReadsFailAtDeadline) {
   ASSERT_EQ(ASSERT_RESULT(SelectRow(NewSession(), kKey)), kValue);
   ASSERT_EQ(ASSERT_RESULT(
       client::kv_table_test::SelectRow(&other_table_, NewSession(), kKey)), kValue);
+}
+
+// The tablet server keeps heartbeating to the master while one tablet holds its update lock.
+TEST_F(UpdateLockStallTest, HeartbeatsContinue) {
+  ASSERT_NO_FATALS(HoldLock());
+
+  // Several heartbeat periods. Without the fix the heartbeater parks on the lock inside
+  // CreateReportedTabletPB or the metrics provider and the master stops hearing from the server.
+  const auto deadline = CoarseMonoClock::Now() + 6s;
+  MonoDelta max_gap = MonoDelta::kZero;
+  while (CoarseMonoClock::Now() < deadline) {
+    auto descriptor = ASSERT_RESULT(LeaderDescriptor());
+    max_gap = std::max(max_gap, descriptor->TimeSinceHeartbeat());
+    SleepFor(200ms);
+  }
+  LOG(INFO) << "Longest gap between heartbeats while stalled: " << max_gap;
+  ASSERT_LT(max_gap, MonoDelta::FromMilliseconds(FLAGS_heartbeat_interval_ms * 4));
+  ASSERT_GT(UpdateLockHeldFor(), MonoDelta::FromSeconds(5));
+
+  ReleaseLock();
+  ASSERT_EQ(ASSERT_RESULT(SelectRow(NewSession(), kKey)), kValue);
 }
 
 // The same cluster with a small RPC worker pool on every server, so a few reads parked on the
