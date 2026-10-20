@@ -9,3 +9,4 @@
 --master_flags=--flagfile=src/yb/tools/master_heartbeat_bench_flags/master.flags
 --tserver_flags=--flagfile=src/yb/tools/master_heartbeat_bench_flags/tserver.flags
 --live_tservers_from_connectivity_check=true
+--tserver_heartbeat_metrics_send_storage_metadata_on_change=true

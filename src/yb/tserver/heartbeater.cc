@@ -520,6 +520,10 @@ Status HeartbeatPoller::TryHeartbeat() {
     heartbeat_rtt_ = end_time.GetDeltaSince(start_time);
   }
 
+  for (auto& data_provider : data_providers_) {
+    data_provider->OnHeartbeatResponse(resp);
+  }
+
   if (resp.has_cluster_uuid() && !resp.cluster_uuid().empty()) {
     server_.set_cluster_uuid(resp.cluster_uuid().ToBuffer());
   }

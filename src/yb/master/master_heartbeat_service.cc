@@ -571,9 +571,25 @@ void MasterHeartbeatServiceImpl::TSHeartbeat(
         (!req->has_tablet_report() || req->tablet_report().is_incremental()) &&
         rpc.GetClientDeadline() > safe_time_left &&
         PREDICT_TRUE(!ANNOTATE_UNPROTECTED_READ(FLAGS_TEST_skip_processing_tablet_metadata));
+    std::unordered_map<Slice, const LWTabletLeaderMetricsPB*, Slice::Hash> id_to_leader_metrics;
+    std::vector<const LWTabletLeaderMetricsPB*> storage_leader_metrics;
     if (process_metadata) {
+      for (const auto& info : req->leader_info()) {
+        id_to_leader_metrics[info.tablet_id()] = &info;
+      }
       for (const auto& metadata : req->storage_metadata()) {
         tablet_ids.push_back(metadata.tablet_id().ToBuffer());
+        auto iter = id_to_leader_metrics.find(metadata.tablet_id());
+        storage_leader_metrics.push_back(
+            iter != id_to_leader_metrics.end() ? iter->second : nullptr);
+        if (iter != id_to_leader_metrics.end()) {
+          id_to_leader_metrics.erase(iter);
+        }
+      }
+      // With storage metadata sent on change, a leader without a lease may have no storage
+      // entry to ride on.
+      for (const auto& [_, info] : id_to_leader_metrics) {
+        tablet_ids.push_back(info->tablet_id().ToBuffer());
       }
       for (const auto& full_compaction_status : req->full_compaction_statuses()) {
         tablet_ids.push_back(full_compaction_status.tablet_id().ToBuffer());
@@ -599,18 +615,20 @@ void MasterHeartbeatServiceImpl::TSHeartbeat(
       // Re-check the deadline: the tablet report may have used up the time.
       safe_time_left = CoarseMonoClock::Now() + (FLAGS_heartbeat_rpc_timeout_ms * 1ms / 2);
       if (process_metadata && rpc.GetClientDeadline() > safe_time_left) {
-        std::unordered_map<Slice, const LWTabletLeaderMetricsPB*, Slice::Hash>
-            id_to_leader_metrics;
-        for (const auto& info : req->leader_info()) {
-          id_to_leader_metrics[info.tablet_id()] = &info;
-        }
         size_t idx = num_reported_tablets;
+        size_t storage_idx = 0;
         for (const auto& metadata : req->storage_metadata()) {
-          auto iter = id_to_leader_metrics.find(metadata.tablet_id());
           ProcessTabletMetadata(
-              ts_desc->id(), tablets[idx++], metadata,
-              iter != id_to_leader_metrics.end() ? iter->second : nullptr);
+              ts_desc->id(), tablets[idx++], metadata, storage_leader_metrics[storage_idx++]);
         }
+        for (const auto& [_, info] : id_to_leader_metrics) {
+          const auto& tablet = tablets[idx++];
+          if (tablet &&
+              info->leader_lease_status() != consensus::LeaderLeaseStatus::HAS_LEASE) {
+            tablet->MarkLeaderWithoutLease(ts_desc->id());
+          }
+        }
+        resp->set_tablet_metadata_processed(true);
 
         // Only process the full compaction statuses if we have plenty of time to process the work
         // (> 50% of timeout).
