@@ -212,6 +212,10 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
       LeaderLeaseStatus* leader_lease_status = nullptr,
       CoarseTimePoint deadline = CoarseTimePoint::max()) const override;
 
+  // True when the current holder of the replica state update lock has held it for longer than
+  // the stall threshold. See UpdateLockStallThreshold().
+  bool UpdateLockStalled() const;
+
   ConsensusStatePB ConsensusStateUnlocked(
       ConsensusConfigType type,
       LeaderLeaseStatus* leader_lease_status) const override;
