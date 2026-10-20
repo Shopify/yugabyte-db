@@ -73,6 +73,7 @@
 #include "yb/master/master_ysql_lease.proxy.h"
 
 #include "yb/rpc/messenger.h"
+#include "yb/rpc/outbound_call.h"
 #include "yb/rpc/proxy.h"
 #include "yb/rpc/remote_method.h"
 #include "yb/rpc/rpc_controller.h"
@@ -1843,8 +1844,17 @@ class HeartbeatBench {
         strings::Split(FLAGS_metric_substrings, ",", strings::SkipEmpty());
     const auto url =
         Format("http://127.0.0.1:$0/prometheus-metrics", FLAGS_master_web_port);
+    // Same registered histograms the driver's proxies increment: queued to a reactor, written
+    // to the socket, response received. Splits the observed RTT into client, wire and master.
+    rpc::OutboundCallMetrics call_metrics(metric_entity_);
     while (running_.load(std::memory_order_acquire)) {
       std::map<string, double> values;
+      values["bench_outbound_queue_us_sum"] = call_metrics.queue_time->TotalSum();
+      values["bench_outbound_queue_count"] = call_metrics.queue_time->TotalCount();
+      values["bench_outbound_send_us_sum"] = call_metrics.send_time->TotalSum();
+      values["bench_outbound_send_count"] = call_metrics.send_time->TotalCount();
+      values["bench_outbound_response_us_sum"] = call_metrics.time_to_response->TotalSum();
+      values["bench_outbound_response_count"] = call_metrics.time_to_response->TotalCount();
       values["bench_heartbeats_ok_total"] = stats_.heartbeats_ok.load();
       values["bench_heartbeats_failed_total"] = stats_.heartbeats_failed.load();
       values["bench_lease_refreshes_ok_total"] = stats_.lease_refreshes_ok.load();
