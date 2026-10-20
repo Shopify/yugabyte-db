@@ -302,6 +302,7 @@ ADD_YB_TEST(xcluster/xcluster_persistence_block_map-test)
 YB_TEST_TARGET_LINK_LIBRARIES(
   xcluster_persistence_block_map-test pg_wrapper_test_base admin-test-base)
 ADD_YB_TEST(retryable_request-test)
+ADD_YB_TEST(update_lock_stall-itest)
 ADD_YB_TEST(upgrade-tests/ash_metadata_upgrade-test)
 ADD_YB_TEST(upgrade-tests/auto_flag_upgrade-test)
 ADD_YB_TEST(upgrade-tests/backup_upgrade-test)

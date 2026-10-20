@@ -68,7 +68,10 @@ void SetupErrorAndRespond(LWTabletServerErrorPB* error,
                           const Status& s,
                           rpc::RpcContext* context);
 
-Result<int64_t> LeaderTerm(const tablet::TabletPeer& tablet_peer);
+// deadline bounds the wait for the tablet's replica state lock. Past it the result is
+// NOT_THE_LEADER, so the caller never parks an RPC worker on a lock held by a stalled thread.
+Result<int64_t> LeaderTerm(
+    const tablet::TabletPeer& tablet_peer, CoarseTimePoint deadline = CoarseTimePoint::max());
 
 std::shared_ptr<TabletConsensusInfoPB> GetTabletConsensusInfoFromTabletPeer(
     const tablet::TabletPeerPtr& peer);
@@ -228,7 +231,7 @@ struct LeaderTabletPeer {
     return !peer || !tablet;
   }
 
-  Status FillTerm();
+  Status FillTerm(CoarseTimePoint deadline = CoarseTimePoint::max());
   void FillTabletPeer(TabletPeerTablet source);
 };
 
@@ -258,7 +261,7 @@ void FillTabletConsensusInfo(Resp* resp, TabletIdView tablet_id, tablet::TabletP
 template <class Resp>
 Result<LeaderTabletPeer> LookupLeaderTablet(
     TabletPeerLookupIf* tablet_manager, TabletIdView tablet_id, Resp* resp,
-    TabletPeerTablet peer = TabletPeerTablet()) {
+    TabletPeerTablet peer = TabletPeerTablet(), CoarseTimePoint deadline = CoarseTimePoint::max()) {
   if (peer.tablet_peer) {
     LOG_IF(DFATAL, peer.tablet_peer->tablet_id() != tablet_id)
         << "Mismatching table ids: peer " << peer.tablet_peer->tablet_id() << " vs " << tablet_id;
@@ -268,7 +271,7 @@ Result<LeaderTabletPeer> LookupLeaderTablet(
   }
   LeaderTabletPeer result;
   result.FillTabletPeer(std::move(peer));
-  auto status = result.FillTerm();
+  auto status = result.FillTerm(deadline);
   if(!status.ok()) {
     if(IsErrorCodeNotTheLeader(status)) {
       FillTabletConsensusInfo(resp, tablet_id, result.peer);
@@ -310,7 +313,8 @@ LeaderTabletPeer LookupLeaderTabletOrRespond(
     RespClass* resp,
     rpc::RpcContext* context,
     TabletPeerTablet peer = TabletPeerTablet()) {
-  auto result = LookupLeaderTablet(tablet_manager, tablet_id, resp, std::move(peer));
+  auto result = LookupLeaderTablet(
+      tablet_manager, tablet_id, resp, std::move(peer), context->GetClientDeadline());
   if (!result.ok()) {
     SetupErrorAndRespond(resp->mutable_error(), result.status(), context);
     return LeaderTabletPeer();
@@ -320,7 +324,8 @@ LeaderTabletPeer LookupLeaderTabletOrRespond(
   return *result;
 }
 
-Status CheckPeerIsLeader(const tablet::TabletPeer& tablet_peer);
+Status CheckPeerIsLeader(
+    const tablet::TabletPeer& tablet_peer, CoarseTimePoint deadline = CoarseTimePoint::max());
 
 // Checks if the peer is ready for servicing IOs.
 // allow_split_tablet specifies whether to reject requests to tablets which have been already
@@ -331,7 +336,8 @@ Status CheckPeerIsReady(
 Result<std::shared_ptr<tablet::AbstractTablet>> GetTablet(
     TabletPeerLookupIf* tablet_manager, TabletIdView tablet_id,
     tablet::TabletPeerPtr tablet_peer, YBConsistencyLevel consistency_level,
-    AllowSplitTablet allow_split_tablet, ReadResponseMsg* resp = nullptr);
+    AllowSplitTablet allow_split_tablet, ReadResponseMsg* resp = nullptr,
+    CoarseTimePoint deadline = CoarseTimePoint::max());
 
 Status CheckWriteThrottling(double score, tablet::TabletPeer* tablet_peer);
 
