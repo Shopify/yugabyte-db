@@ -2916,7 +2916,8 @@ master::DbOidToHybridTimeMap TabletServer::GetYsqlDbOldestPinnedReadTimes() {
   if (!pg_client_service) {
     return {};
   }
-  return pg_client_service->impl.GetDatabasePins();
+  auto pins = pg_client_service->impl.GetDatabasePins();
+  return {pins.begin(), pins.end()};
 }
 
 void TabletServer::UpdateClusterYsqlDbOldestPinnedReadTimes(
@@ -2927,7 +2928,6 @@ void TabletServer::UpdateClusterYsqlDbOldestPinnedReadTimes(
     return;
   }
   master::DbOidToHybridTimeMap pins;
-  pins.reserve(resp.cluster_ysql_db_oldest_pinned_read_times().size());
   for (const auto& entry : resp.cluster_ysql_db_oldest_pinned_read_times()) {
     auto pin = HybridTime::FromPB(entry.value().db_level_oldest_read_time());
     if (pin.is_valid()) {
@@ -2951,7 +2951,6 @@ Status TabletServer::LoadClusterYsqlDbOldestPinnedReadTimes() {
   }
 
   master::DbOidToHybridTimeMap pins;
-  pins.reserve(pb.db_oldest_pinned_read_times().size());
   for (const auto& [db_oid, pin_value] : pb.db_oldest_pinned_read_times()) {
     auto pin = HybridTime::FromPB(pin_value);
     if (pin.is_valid()) {

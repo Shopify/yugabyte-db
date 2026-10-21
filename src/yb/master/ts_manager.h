@@ -32,6 +32,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,7 @@
 #include "yb/master/catalog_loading_state.h"
 #include "yb/master/master_fwd.h"
 #include "yb/master/ts_descriptor.h"
+#include "yb/master/ysql_db_pin_index.h"
 
 #include "yb/rpc/rpc_fwd.h"
 
@@ -88,6 +90,7 @@ using LeaseExpiredCallback = std::function<void(const std::string&, uint64_t, Le
 //     4. TSDescriptor::WriteLock before exclusive(TSDescriptor::mutex_)
 //     5. For TSDescriptor objects TS1 and TS2, the locking order between them is whichever is first
 //     in servers_by_id_.
+//     6. exclusive(TSDescriptor::mutex_) before YsqlDbPinIndex::mutex_, which is a leaf lock.
 //
 //   More simply, for exclusive locks following this total order won't result in deadlocks:
 //       all shared locks, registration_lock_, map_lock_, descriptor writelock, descriptor spinlock
@@ -192,6 +195,9 @@ class TSManager {
   // load balancer's initial delay.
   ClusterYsqlDbPins GetClusterYsqlDbPinsForPublishing(MonoDelta time_since_elected_leader) const;
 
+  // For leader load: descriptors re-report their pins before the cluster map is ready again.
+  void ResetClusterYsqlDbPins();
+
   // Find TServers that are currently in the state LIVE but have not heartbeated for a long time.
   // Transition all such TServers into the UNRESPONSIVE state.  Similarly, transition TServers that
   // can no longer have a xCluster-guarded information lease to DEFINITELY_NO_LEASE.
@@ -286,6 +292,11 @@ class TSManager {
   Mutex registration_lock_;
 
   TSDescriptorMap servers_by_id_ GUARDED_BY(map_lock_);
+
+  mutable YsqlDbPinIndex ysql_db_pin_index_;
+  // Latched once every live descriptor has reported pins: a descriptor only becomes live through
+  // a heartbeat, which reports them, so only a leader load can make this false again.
+  mutable std::atomic<bool> ysql_db_pins_all_reported_{false};
 
   // This callback will be called when the number of tablet servers reaches the given number.
   TSCountCallback ts_count_callback_ GUARDED_BY(registration_lock_);
