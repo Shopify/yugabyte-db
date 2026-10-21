@@ -158,7 +158,8 @@ class TSDescriptor : public MetadataCowWrapper<PersistentTServerInfo> {
   // request received from the tserver. If not, this method does no mutations and returns an error
   // status.
   Status UpdateFromHeartbeat(
-      const LWTSHeartbeatRequestPB& req, const TSDescriptor::WriteLock& lock);
+      const LWTSHeartbeatRequestPB& req, const TSDescriptor::WriteLock& lock,
+      YsqlDbPinIndex& pin_index);
 
   // Return the amount of time since the last heartbeat received from this TS.
   MonoDelta TimeSinceHeartbeat() const;
@@ -282,10 +283,10 @@ class TSDescriptor : public MetadataCowWrapper<PersistentTServerInfo> {
     return hybrid_time_;
   }
 
-  DbOidToHybridTimeMap GetYsqlDbOldestPinnedReadTimes() const;
-
   bool has_ysql_db_pins() const;
   void ResetYsqlDbPins();
+  // Drops this tserver's pins from the cluster index; for a tserver that stops being live.
+  void ClearYsqlDbPins(YsqlDbPinIndex& pin_index) EXCLUDES(mutex_);
 
   MonoDelta heartbeat_rtt() const {
     SharedLock<decltype(mutex_)> l(mutex_);
@@ -388,7 +389,8 @@ class TSDescriptor : public MetadataCowWrapper<PersistentTServerInfo> {
 
   // Transition this TServer to UNRESPONSIVE and/or DEFINITELY_NO_LEASE if enough time has passed
   // since its last heartbeat.
-  std::optional<TSDescriptor::WriteLock> MaybeUpdateLiveness(MonoTime time) EXCLUDES(mutex_);
+  std::optional<TSDescriptor::WriteLock> MaybeUpdateLiveness(
+      MonoTime time, YsqlDbPinIndex& pin_index) EXCLUDES(mutex_);
 
  private:
   mutable rw_spinlock mutex_;
@@ -403,6 +405,8 @@ class TSDescriptor : public MetadataCowWrapper<PersistentTServerInfo> {
   Result<TSDescriptor::WriteLock> DoUpdateRegistration(
       const Instance& instance, const Registration& registration,
       RegisteredThroughHeartbeat registered_through_heartbeat);
+
+  void ClearYsqlDbPinsUnlocked(YsqlDbPinIndex& pin_index) REQUIRES(mutex_);
 
   template <class TProxy>
   Status GetOrCreateProxy(std::shared_ptr<TProxy>* result, std::shared_ptr<TProxy>* result_cache);
