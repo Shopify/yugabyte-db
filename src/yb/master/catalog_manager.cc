@@ -2499,9 +2499,13 @@ ReplicationInfoPB CatalogManager::GetTableReplicationInfoWithDefault(
     const TableInfoPtr& table) const {
   ReplicationInfoPB cluster_replication_info =
       ClusterConfig()->LockForRead()->pb.replication_info();
+  // Reporting-only callers: a tablespace that failed validation still describes what its tablets
+  // were placed with, which is what callers want to report (e.g. expected replica counts in
+  // tablet locations). Only a lookup failure falls back to the cluster placement.
   return ResultToValue(
       CatalogManagerUtil::GetTableReplicationInfo(
-          table, GetTablespaceManager(), cluster_replication_info),
+          table, GetTablespaceManager(), cluster_replication_info,
+          IncludeInvalidTablespaces::kTrue),
       cluster_replication_info);
 }
 
@@ -2529,7 +2533,9 @@ Result<std::optional<ReplicationInfoPB>> CatalogManager::GetTablespaceReplicatio
   auto tablespace_manager = GetTablespaceManager();
   auto replication_info_result = tablespace_manager->GetTablespaceReplicationInfo(tablespace_id);
 
-  if (replication_info_result) {
+  // Only a missing tablespace can be fixed by a refresh; an invalid placement is a persistent
+  // error that we return as-is.
+  if (replication_info_result.ok() || !replication_info_result.status().IsNotFound()) {
     return replication_info_result;
   }
 
@@ -2658,10 +2664,10 @@ Result<shared_ptr<TablespaceIdToReplicationInfoMap>> CatalogManager::GetYsqlTabl
   }
 
   for (auto& iter : *tablespace_map) {
-    if (!iter.second) {
+    if (!iter.second.replication_info) {
       continue;
     }
-    auto& replication_info = iter.second.value();
+    auto& replication_info = *iter.second.replication_info;
     if (!live_placement_uuid.empty()) {
       replication_info.mutable_live_replicas()->set_placement_uuid(live_placement_uuid);
     }
@@ -2674,18 +2680,21 @@ Result<shared_ptr<TablespaceIdToReplicationInfoMap>> CatalogManager::GetYsqlTabl
     }
   }
 
-  // Before updating the tablespace placement map, validate the
-  // placement policies. If validation fails, mark the tablespace as invalid (nullopt) so that
-  // tables in this tablespace will fail to be placed, but other tablespaces continue to work.
+  // Validate the placement policies. A tablespace that fails validation keeps both its declared
+  // placement and the error (rather than being dropped or reset to nullopt): placing a table in it
+  // fails with that error instead of silently using the cluster placement, while reporting paths
+  // can still describe what its existing tablets were placed with. Other tablespaces are
+  // unaffected.
   for (auto& iter : *tablespace_map) {
-    if (iter.second) {
-      auto status = ValidateTableReplicationInfo(iter.second.value());
-      if (!status.ok()) {
-        LOG(WARNING) << "Tablespace " << iter.first
-                     << " has invalid replication info: " << status
-                     << ". Marking it as invalid.";
-        iter.second = std::nullopt;
-      }
+    if (!iter.second.replication_info) {
+      continue;
+    }
+    auto status = ValidateTableReplicationInfo(*iter.second.replication_info);
+    if (!status.ok()) {
+      LOG(WARNING) << "Tablespace " << iter.first << " has invalid replication info: " << status
+                   << ". Tables in this tablespace cannot be placed until it is fixed.";
+      iter.second.validation_status = status.CloneAndPrepend(
+          Format("Tablespace $0 has invalid replication info", iter.first));
     }
   }
 
@@ -2875,7 +2884,7 @@ Status CatalogManager::CreateTransactionStatusTablesForTablespaces(
     }
   }
   for (const auto& entry : tablespace_info) {
-    if (!entry.second) {
+    if (!entry.second.validation_status.ok() || !entry.second.replication_info) {
       valid_tablespaces.erase(entry.first);
     }
   }

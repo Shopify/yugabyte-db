@@ -155,8 +155,14 @@ YB_DEFINE_ENUM(CollectFlag,
 using CollectFlags = EnumBitSet<CollectFlag>;
 
 using TableToTablespaceIdMap = std::unordered_map<TableId, std::optional<TablespaceId>>;
+struct TablespaceReplicationInfo;
 using TablespaceIdToReplicationInfoMap =
-    std::unordered_map<TablespaceId, std::optional<ReplicationInfoPB>>;
+    std::unordered_map<TablespaceId, TablespaceReplicationInfo>;
+
+// Whether a lookup of a table's replication info may return the placement declared by a
+// tablespace that failed master-side validation. Callers that act on the placement (create,
+// move) must not; callers that report what existing tablets were placed with should.
+YB_STRONGLY_TYPED_BOOL(IncludeInvalidTablespaces);
 
 using LeaderStepDownFailureTimes = std::unordered_map<TabletServerId, MonoTime>;
 using TabletReplicaMap = std::unordered_map<TabletServerId, TabletReplica>;
