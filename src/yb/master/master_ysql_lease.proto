@@ -59,7 +59,7 @@ service MasterYsqlLease {
 
   rpc RefreshYsqlLease(RefreshYsqlLeaseRequestPB)
       returns (RefreshYsqlLeaseResponsePB) {
-    option (yb.rpc.lightweight_method).sides = SERVICE;
+    option (yb.rpc.lightweight_method).sides = BOTH;
   }
   rpc RelinquishYsqlLease(RelinquishYsqlLeaseRequestPB)
       returns (RelinquishYsqlLeaseResponsePB);

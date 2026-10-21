@@ -406,6 +406,6 @@ service MasterHeartbeat {
 
   // TS->Master RPCs
   rpc TSHeartbeat(TSHeartbeatRequestPB) returns (TSHeartbeatResponsePB) {
-    option (yb.rpc.lightweight_method).sides = SERVICE;
+    option (yb.rpc.lightweight_method).sides = BOTH;
   }
 }

@@ -450,6 +450,22 @@ const HostPortPB& DesiredHostPort(const ServerRegistrationPB& registration,
       registration.cloud_info(), connect_from);
 }
 
+HostPortPB DesiredHostPort(const LWServerRegistrationPB& registration,
+                           const CloudInfoPB& connect_from) {
+  const LWHostPortPB* host_port = nullptr;
+  if (!registration.broadcast_addresses().empty() &&
+      UsePublicIp(registration.cloud_info().ToGoogleProtobuf(), connect_from)) {
+    host_port = &registration.broadcast_addresses().front();
+  } else if (!registration.private_rpc_addresses().empty()) {
+    host_port = &registration.private_rpc_addresses().front();
+  }
+  HostPortPB result;
+  if (host_port) {
+    host_port->ToGoogleProtobuf(&result);
+  }
+  return result;
+}
+
 std::string SplitChildTabletIdsTag::ToMessage(const Value& value) {
   return Format("Split child tablet IDs: $0", value);
 }

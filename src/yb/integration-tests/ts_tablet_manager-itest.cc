@@ -52,6 +52,7 @@
 #include "yb/integration-tests/mini_cluster.h"
 
 #include "yb/master/master_cluster.proxy.h"
+#include "yb/master/master_heartbeat.messages.h"
 #include "yb/master/master_heartbeat.pb.h"
 #include "yb/master/mini_master.h"
 
@@ -69,6 +70,7 @@
 #include "yb/tserver/tserver_service.proxy.h"
 
 #include "yb/util/format.h"
+#include "yb/util/memory/arena.h"
 #include "yb/util/test_util.h"
 #include "yb/util/flags.h"
 
@@ -216,14 +218,17 @@ TEST_F(TsTabletManagerITest, TestReportNewLeaderOnLeaderChange) {
       }
 
       // Ensure that our tablet reports are consistent.
-      TabletReportPB report;
+      ThreadSafeArena arena;
+      master::LWTabletReportPB report(&arena);
       tablet_manager->GenerateTabletReport(&report);
-      ASSERT_EQ(1, report.updated_tablets_size()) << "Wrong report size:\n" << report.DebugString();
-      ReportedTabletPB reported_tablet = report.updated_tablets(0);
+      ASSERT_EQ(1, report.updated_tablets_size())
+          << "Wrong report size:\n" << report.ShortDebugString();
+      const auto& reported_tablet = report.updated_tablets().front();
       ASSERT_TRUE(reported_tablet.has_committed_consensus_state());
 
       string uuid = tablet_peers[replica]->permanent_uuid();
-      PeerRole role = GetConsensusRole(uuid, reported_tablet.committed_consensus_state());
+      PeerRole role = GetConsensusRole(
+          uuid, reported_tablet.committed_consensus_state().ToGoogleProtobuf());
       if (replica == new_leader_idx) {
         ASSERT_EQ(PeerRole::LEADER, role)
             << "Tablet report: " << report.ShortDebugString();

@@ -20,6 +20,7 @@
 #include "yb/consensus/consensus_error.h"
 #include "yb/consensus/raft_consensus.h"
 
+#include "yb/master/master_heartbeat.messages.h"
 #include "yb/master/master_heartbeat.pb.h"
 
 #include "yb/tablet/tablet.h"
@@ -175,10 +176,11 @@ Result<int64_t> LeaderTerm(const tablet::TabletPeer& tablet_peer) {
   return leader_state.term;
 }
 
-std::string CatalogInvalMessagesDataDebugString(const master::TSHeartbeatResponsePB& resp) {
+std::string CatalogInvalMessagesDataDebugString(const master::LWTSHeartbeatResponsePB& resp) {
   std::string str;
   if (resp.has_db_catalog_inval_messages_data()) {
-    str = CatalogInvalMessagesDataDebugString(resp.db_catalog_inval_messages_data());
+    str = CatalogInvalMessagesDataDebugString(
+        resp.db_catalog_inval_messages_data().ToGoogleProtobuf());
   }
   return str;
 }

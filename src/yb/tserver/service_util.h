@@ -73,7 +73,7 @@ Result<int64_t> LeaderTerm(const tablet::TabletPeer& tablet_peer);
 std::shared_ptr<TabletConsensusInfoPB> GetTabletConsensusInfoFromTabletPeer(
     const tablet::TabletPeerPtr& peer);
 
-std::string CatalogInvalMessagesDataDebugString(const master::TSHeartbeatResponsePB& resp);
+std::string CatalogInvalMessagesDataDebugString(const master::LWTSHeartbeatResponsePB& resp);
 std::string CatalogInvalMessagesDataDebugString(
     const tserver::DBCatalogInvalMessagesDataPB& db_catalog_inval_messages_data);
 

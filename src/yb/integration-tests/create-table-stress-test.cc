@@ -74,6 +74,7 @@
 
 #include "yb/util/format.h"
 #include "yb/util/hdr_histogram.h"
+#include "yb/util/memory/arena.h"
 #include "yb/util/metrics.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/spinlock_profiling.h"
@@ -478,7 +479,10 @@ TEST_F(CreateTableStressTest, YB_DISABLE_TEST_ON_MACOS(TestHeartbeatDeadline)) {
     auto ts_server = cluster_->mini_tablet_server(0)->server();
     hb_req.mutable_common()->mutable_ts_instance()->CopyFrom(ts_server->instance_pb());
     hb_req.set_universe_uuid(universe_uuid);
-    ts_server->tablet_manager()->StartFullTabletReport(hb_req.mutable_tablet_report());
+    ThreadSafeArena arena;
+    master::LWTabletReportPB report(&arena);
+    ts_server->tablet_manager()->StartFullTabletReport(&report);
+    report.ToGoogleProtobuf(hb_req.mutable_tablet_report());
     ASSERT_GT(
         hb_req.tablet_report().updated_tablets_size(),
         FLAGS_heartbeat_rpc_timeout_ms / FLAGS_TEST_inject_latency_during_tablet_report_ms);

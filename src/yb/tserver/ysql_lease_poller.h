@@ -26,7 +26,7 @@
 namespace yb::tserver {
 
 using YsqlLeaderClientListener = std::function<
-    Status(const master::RefreshYsqlLeaseInfoPB& lease_refresh_info)>;
+    Status(const master::LWRefreshYsqlLeaseInfoPB& lease_refresh_info)>;
 
 class YsqlLeaseClient {
  public:

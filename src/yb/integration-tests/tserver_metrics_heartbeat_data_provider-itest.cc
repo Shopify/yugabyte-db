@@ -14,6 +14,7 @@
 #include "yb/fs/fs_manager.h"
 
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/memory/arena.h"
 #include "yb/util/storage_tier.h"
 #include "yb/util/tsan_util.h"
 
@@ -32,6 +33,7 @@
 #include "yb/master/catalog_entity_info.h"
 #include "yb/master/catalog_manager_if.h"
 #include "yb/master/master_defaults.h"
+#include "yb/master/master_heartbeat.messages.h"
 #include "yb/master/master_heartbeat.pb.h"
 #include "yb/master/mini_master.h"
 
@@ -69,12 +71,12 @@ class TServerMetricsHeartbeatDataProviderITest : public MiniClusterTestWithClien
     for (const auto& tablet_server : cluster_->mini_tablet_servers()) {
       auto metrics_heartbeat_provider =
           TServerMetricsHeartbeatDataProvider(tablet_server->server());
-      const master::TSHeartbeatResponsePB resp;
-      master::TSHeartbeatRequestPB req;
+      ThreadSafeArena arena;
+      master::LWTSHeartbeatRequestPB req(&arena);
 
-      metrics_heartbeat_provider.AddData(resp, &req);
+      metrics_heartbeat_provider.AddData(/* needs_full_tablet_report = */ false, &req);
 
-      if (!VERIFY_RESULT(metrics_check(req))) {
+      if (!VERIFY_RESULT(metrics_check(req.ToGoogleProtobuf()))) {
         return false;
       }
     }

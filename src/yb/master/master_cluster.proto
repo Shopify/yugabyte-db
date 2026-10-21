@@ -347,7 +347,7 @@ service MasterCluster {
 
   // Administrative/monitoring RPCs
   rpc ListTabletServers(ListTabletServersRequestPB) returns (ListTabletServersResponsePB) {
-    option (yb.rpc.lightweight_method).sides = SERVICE;
+    option (yb.rpc.lightweight_method).sides = BOTH;
   }
   rpc ListLiveTabletServers(ListLiveTabletServersRequestPB)
       returns (ListLiveTabletServersResponsePB);

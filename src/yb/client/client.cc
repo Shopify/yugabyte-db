@@ -348,7 +348,8 @@ void FillFromRepeatedTabletLocations(
 
 #define CALL_SYNC_LEADER_MASTER_RPC_WITH_DEADLINE(service, req, resp, deadline, method) \
   do { \
-    RETURN_NOT_OK(data_->SyncLeaderMasterRpc( \
+    RETURN_NOT_OK(data_->SyncLeaderMasterRpc<master::BOOST_PP_CAT( \
+        BOOST_PP_CAT(Master, service), Proxy)>( \
         deadline, req, &resp, BOOST_PP_STRINGIZE(method), \
         &master::BOOST_PP_CAT(BOOST_PP_CAT(Master, service), Proxy)::            \
             BOOST_PP_CAT(method, Async))); \

@@ -30,6 +30,7 @@
 #include "yb/util/async_util.h"
 #include "yb/util/condition_variable.h"
 #include "yb/util/flags/flag_tags.h"
+#include "yb/util/memory/arena.h"
 #include "yb/util/mutex.h"
 #include "yb/util/status.h"
 #include "yb/util/status_format.h"
@@ -165,8 +166,9 @@ Status YsqlLeasePoller::Poll() {
     proxy_ = VERIFY_RESULT(finder_.CreateProxy<master::MasterYsqlLeaseProxy>(timeout));
   }
 
-  master::RefreshYsqlLeaseRequestPB req;
-  *req.mutable_instance() = server_.instance_pb();
+  ThreadSafeArena arena;
+  master::LWRefreshYsqlLeaseRequestPB req(&arena);
+  req.mutable_instance()->CopyFrom(server_.instance_pb());
   auto current_lease_info = VERIFY_RESULT(server_.GetYSQLLeaseInfo());
   if (current_lease_info.is_live) {
     req.set_current_lease_epoch(current_lease_info.lease_epoch);
@@ -176,7 +178,7 @@ Status YsqlLeasePoller::Poll() {
                                          .count());
   rpc::RpcController rpc;
   rpc.set_timeout(timeout);
-  master::RefreshYsqlLeaseResponsePB resp;
+  master::LWRefreshYsqlLeaseResponsePB resp(&arena);
   RETURN_NOT_OK(proxy_->RefreshYsqlLease(req, &resp, &rpc));
   if (RandomActWithProbability(
           FLAGS_TEST_tserver_ysql_lease_refresh_failure_prob)) {

@@ -24,6 +24,7 @@
 #include "yb/tserver/master_leader_poller.h"
 #include "yb/tserver/tserver_service.pb.h"
 
+#include "yb/util/memory/arena.h"
 #include "yb/util/physical_time.h"
 #include "yb/util/status_log.h"
 
@@ -141,8 +142,9 @@ class ConnectivityPoller::Impl : public MasterLeaderPollerInterface {
       proxy_ = VERIFY_RESULT(finder_.CreateProxy<master::MasterClusterProxy>(timeout));
     }
 
-    master::ListTabletServersRequestPB req;
-    master::ListTabletServersResponsePB resp;
+    ThreadSafeArena arena;
+    master::LWListTabletServersRequestPB req(&arena);
+    master::LWListTabletServersResponsePB resp(&arena);
     rpc::RpcController rpc_controller;
     rpc_controller.set_timeout(timeout);
 
@@ -157,7 +159,7 @@ class ConnectivityPoller::Impl : public MasterLeaderPollerInterface {
 
       ConnectivityEntryPB master_node_info;
       master_node_info.set_server_type(ServerType::MASTER);
-      master_node_info.set_uuid(resp.master_uuid());
+      master_node_info.set_uuid(resp.master_uuid().ToBuffer());
       master_node_info.set_alive(true);
       master_node_info.set_ping_us(ping.ToMicroseconds());
       proxy_->proxy().remote().ToPB(master_node_info.mutable_endpoint());
@@ -172,19 +174,19 @@ class ConnectivityPoller::Impl : public MasterLeaderPollerInterface {
           continue;
         }
         auto* ts_info = live_tservers.Add();
-        *ts_info->mutable_tserver_instance() = server.instance_id();
-        *ts_info->mutable_registration() = server.registration();
+        server.instance_id().ToGoogleProtobuf(ts_info->mutable_tserver_instance());
+        server.registration().ToGoogleProtobuf(ts_info->mutable_registration());
       }
       live_tservers_callback_(live_tservers);
     }
 
     for (const auto& server : resp.servers()) {
-      if (server.instance_id().permanent_uuid() == uuid_) {
+      if (server.instance_id().permanent_uuid() == Slice(uuid_)) {
         continue;
       }
       ConnectivityEntryPB node_info;
       node_info.set_server_type(ServerType::TABLET_SERVER);
-      node_info.set_uuid(server.instance_id().permanent_uuid());
+      node_info.set_uuid(server.instance_id().permanent_uuid().ToBuffer());
       node_info.set_alive(server.alive());
       *node_info.mutable_endpoint() = DesiredHostPort(server.registration().common(), cloud_info_);
       auto request = std::make_shared<PingRequest>(

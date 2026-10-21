@@ -1353,7 +1353,7 @@ Status ClusterAdminClient::GetTabletPeer(const TabletId& tablet_id,
 
 Status ClusterAdminClient::ListTabletServers(
     RepeatedPtrField<ListTabletServersResponsePB::Entry>* servers) {
-  auto resp = VERIFY_RESULT(InvokeRpc(
+  auto resp = VERIFY_RESULT(InvokeRpc<ListTabletServersResponsePB>(
       &master::MasterClusterProxy::ListTabletServers, *master_cluster_proxy_,
       ListTabletServersRequestPB()));
   *servers = std::move(*resp.mutable_servers());

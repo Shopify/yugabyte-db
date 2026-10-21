@@ -93,6 +93,7 @@
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
+#include "yb/util/memory/arena.h"
 #include "yb/util/metrics.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/net_util.h"
@@ -221,8 +222,7 @@ class HollowTServer {
   // the real tserver's registration; only the addresses and the zone are rewritten.
   void FillHeartbeat(const string& universe_uuid, const master::TSHeartbeatRequestPB* mirror_tmpl,
                      const master::TSRegistrationPB* reg_tmpl,
-                     std::optional<bool> metrics_override, master::TSHeartbeatRequestPB* req) {
-    req->Clear();
+                     std::optional<bool> metrics_override, master::LWTSHeartbeatRequestPB* req) {
     std::lock_guard l(mutex_);
     const bool metrics_beat = metrics_override.has_value()
         ? *metrics_override
@@ -235,10 +235,10 @@ class HollowTServer {
     }
 
     auto* instance = req->mutable_common()->mutable_ts_instance();
-    instance->set_permanent_uuid(uuid_);
+    instance->dup_permanent_uuid(uuid_);
     instance->set_instance_seqno(instance_seqno_);
     if (!universe_uuid.empty()) {
-      req->set_universe_uuid(universe_uuid);
+      req->dup_universe_uuid(universe_uuid);
     }
     const auto now_micros = GetCurrentTimeMicros();
     req->set_ts_physical_time(now_micros);
@@ -260,13 +260,13 @@ class HollowTServer {
       reg->clear_private_rpc_addresses();
       reg->clear_broadcast_addresses();
       auto* addr = reg->add_private_rpc_addresses();
-      addr->set_host(host_port_.host());
+      addr->dup_host(host_port_.host());
       addr->set_port(host_port_.port());
       *reg->add_broadcast_addresses() = *addr;
       auto* cloud = reg->mutable_cloud_info();
-      cloud->set_placement_cloud("cloud1");
-      cloud->set_placement_region("region1");
-      cloud->set_placement_zone(Format("zone$0", index_ % 3));
+      cloud->dup_placement_cloud("cloud1");
+      cloud->dup_placement_region("region1");
+      cloud->dup_placement_zone(Format("zone$0", index_ % 3));
     }
 
     FillTabletReport(req);
@@ -295,12 +295,12 @@ class HollowTServer {
       metrics->set_write_ops_per_sec(0);
       metrics->set_uptime_seconds(hb_seq_ * FLAGS_heartbeat_interval_ms / 1000);
       auto* path_metric = metrics->add_path_metrics();
-      path_metric->set_path_id(Format("/data/hollow-ts-$0", index_));
+      path_metric->dup_path_id(Format("/data/hollow-ts-$0", index_));
       path_metric->set_used_space(tablets_.size() * (kSstBytes + kWalBytes));
       path_metric->set_total_space(1ULL << 40);
       for (const auto& [tablet_id, info] : tablets_) {
         auto* storage = req->add_storage_metadata();
-        storage->set_tablet_id(tablet_id);
+        storage->dup_tablet_id(tablet_id);
         storage->set_sst_file_size(kSstBytes);
         storage->set_wal_file_size(kWalBytes);
         storage->set_uncompressed_sst_file_size(kSstBytes * 3 / 2);
@@ -311,7 +311,7 @@ class HollowTServer {
         // The real provider adds leader_info for every hosted tablet, not just led ones;
         // followers report NO_MAJORITY_REPLICATED_LEASE without an expiration.
         auto* leader = req->add_leader_info();
-        leader->set_tablet_id(tablet_id);
+        leader->dup_tablet_id(tablet_id);
         if (info.leader_uuid == uuid_) {
           leader->set_leader_lease_status(consensus::LeaderLeaseStatus::HAS_LEASE);
           leader->set_ht_lease_expiration((now_micros + 2 * 1000 * 1000) << 12);
@@ -320,14 +320,14 @@ class HollowTServer {
               consensus::LeaderLeaseStatus::NO_MAJORITY_REPLICATED_LEASE);
         }
         auto* compaction = req->add_full_compaction_statuses();
-        compaction->set_tablet_id(tablet_id);
+        compaction->dup_tablet_id(tablet_id);
         compaction->set_full_compaction_state(tablet::IDLE);
         compaction->set_last_full_compaction_time(0);
       }
     }
   }
 
-  void HandleHeartbeatSuccess(const master::TSHeartbeatResponsePB& resp, int64_t rtt_us) {
+  void HandleHeartbeatSuccess(const master::LWTSHeartbeatResponsePB& resp, int64_t rtt_us) {
     std::lock_guard l(mutex_);
     last_rtt_us_ = rtt_us;
     if (registration_in_flight_) {
@@ -348,7 +348,7 @@ class HollowTServer {
     }
     if (resp.has_tablet_report()) {
       for (const auto& update : resp.tablet_report().tablets()) {
-        dirty_.erase(update.tablet_id());
+        dirty_.erase(update.tablet_id().ToBuffer());
       }
     }
     if (resp.needs_full_tablet_report()) {
@@ -396,12 +396,14 @@ class HollowTServer {
   std::atomic<bool> heartbeat_in_flight{false};
   std::atomic<bool> lease_in_flight{false};
 
-  // Reused across calls; safe because at most one of each RPC is in flight.
-  master::TSHeartbeatRequestPB hb_req;
-  master::TSHeartbeatResponsePB hb_resp;
+  // At most one of each RPC is in flight; its arena is reset and the messages rebuilt per call.
+  ThreadSafeArena hb_arena;
+  master::LWTSHeartbeatRequestPB* hb_req = nullptr;
+  master::LWTSHeartbeatResponsePB* hb_resp = nullptr;
   rpc::RpcController hb_controller;
-  master::RefreshYsqlLeaseRequestPB lease_req;
-  master::RefreshYsqlLeaseResponsePB lease_resp;
+  ThreadSafeArena lease_arena;
+  master::LWRefreshYsqlLeaseRequestPB* lease_req = nullptr;
+  master::LWRefreshYsqlLeaseResponsePB* lease_resp = nullptr;
   rpc::RpcController lease_controller;
   std::unique_ptr<master::MasterHeartbeatProxy> heartbeat_proxy;
   std::unique_ptr<master::MasterYsqlLeaseProxy> lease_proxy;
@@ -416,17 +418,17 @@ class HollowTServer {
   // and report state; every other field stays byte-faithful to the real request.
   void FillFromTemplate(
       const master::TSHeartbeatRequestPB& tmpl, const string& universe_uuid,
-      master::TSHeartbeatRequestPB* req) REQUIRES(mutex_) {
+      master::LWTSHeartbeatRequestPB* req) REQUIRES(mutex_) {
     req->CopyFrom(tmpl);
     auto* instance = req->mutable_common()->mutable_ts_instance();
-    instance->set_permanent_uuid(uuid_);
+    instance->dup_permanent_uuid(uuid_);
     instance->set_instance_seqno(instance_seqno_);
     req->clear_registration();
     if (FLAGS_live_tservers_from_connectivity_check) {
       req->set_skip_tservers(true);
     }
     if (!universe_uuid.empty()) {
-      req->set_universe_uuid(universe_uuid);
+      req->dup_universe_uuid(universe_uuid);
     }
     const auto now_micros = GetCurrentTimeMicros();
     req->set_ts_physical_time(now_micros);
@@ -465,9 +467,9 @@ class HollowTServer {
 
     // Per-tablet sections must list our tablet ids; entries are cloned from the template
     // round-robin so per-entry content and sizes stay real.
-    const auto tmpl_storage = req->storage_metadata();
-    const auto tmpl_compactions = req->full_compaction_statuses();
-    const auto tmpl_leaders = req->leader_info();
+    const auto& tmpl_storage = tmpl.storage_metadata();
+    const auto& tmpl_compactions = tmpl.full_compaction_statuses();
+    const auto& tmpl_leaders = tmpl.leader_info();
     req->clear_storage_metadata();
     req->clear_full_compaction_statuses();
     req->clear_leader_info();
@@ -486,12 +488,12 @@ class HollowTServer {
       if (!tmpl_storage.empty()) {
         auto* storage = req->add_storage_metadata();
         *storage = tmpl_storage.Get(i % tmpl_storage.size());
-        storage->set_tablet_id(tablet_id);
+        storage->dup_tablet_id(tablet_id);
       }
       if (!tmpl_compactions.empty()) {
         auto* compaction = req->add_full_compaction_statuses();
         *compaction = tmpl_compactions.Get(i % tmpl_compactions.size());
-        compaction->set_tablet_id(tablet_id);
+        compaction->dup_tablet_id(tablet_id);
       }
       if (!tmpl_leaders.empty()) {
         auto* leader = req->add_leader_info();
@@ -501,13 +503,13 @@ class HollowTServer {
           leader->set_leader_lease_status(
               consensus::LeaderLeaseStatus::NO_MAJORITY_REPLICATED_LEASE);
         }
-        leader->set_tablet_id(tablet_id);
+        leader->dup_tablet_id(tablet_id);
       }
       ++i;
     }
   }
 
-  void FillTabletReport(master::TSHeartbeatRequestPB* req) REQUIRES(mutex_) {
+  void FillTabletReport(master::LWTSHeartbeatRequestPB* req) REQUIRES(mutex_) {
     const int32_t limit = tablet_report_limit_;
     if (full_report_active_) {
       auto* report = req->mutable_tablet_report();
@@ -558,7 +560,7 @@ class HollowTServer {
       ++added;
     }
     for (const auto& tablet_id : removed_) {
-      report->add_removed_tablet_ids(tablet_id);
+      report->add_dup_removed_tablet_ids(tablet_id);
     }
     removed_.clear();
     report->set_remaining_tablet_count(
@@ -569,15 +571,15 @@ class HollowTServer {
 
   void AddReportedTablet(
       const string& tablet_id, const TabletInfo& info,
-      master::TabletReportPB* report) REQUIRES(mutex_) {
+      master::LWTabletReportPB* report) REQUIRES(mutex_) {
     auto* tablet = report->add_updated_tablets();
-    tablet->set_tablet_id(tablet_id);
+    tablet->dup_tablet_id(tablet_id);
     tablet->set_state(tablet::RUNNING);
     tablet->set_tablet_data_state(tablet::TABLET_DATA_READY);
     tablet->set_schema_version(0);
     auto* cstate = tablet->mutable_committed_consensus_state();
     cstate->set_current_term(1);
-    cstate->set_leader_uuid(info.leader_uuid);
+    cstate->dup_leader_uuid(info.leader_uuid);
     *cstate->mutable_config() = info.config;
   }
 
@@ -1410,8 +1412,9 @@ class HeartbeatBench {
     }
     const auto deadline = MonoTime::Now() + 60s;
     while (true) {
-      master::ListTabletServersRequestPB req;
-      master::ListTabletServersResponsePB resp;
+      ThreadSafeArena arena;
+      master::LWListTabletServersRequestPB req(&arena);
+      master::LWListTabletServersResponsePB resp(&arena);
       rpc::RpcController controller;
       controller.set_timeout(5s);
       auto status = cluster_proxy_->ListTabletServers(req, &resp, &controller);
@@ -1576,12 +1579,15 @@ class HeartbeatBench {
       }
     }
     ts->MarkRegistrationInFlight();
-    ts->FillHeartbeat(universe_uuid, tmpl.get(), reg_tmpl.get(), metrics_override, &ts->hb_req);
+    ts->hb_arena.Reset(ResetMode::kKeepLast);
+    ts->hb_req = ts->hb_arena.NewArenaObject<master::LWTSHeartbeatRequestPB>();
+    ts->hb_resp = ts->hb_arena.NewArenaObject<master::LWTSHeartbeatResponsePB>();
+    ts->FillHeartbeat(universe_uuid, tmpl.get(), reg_tmpl.get(), metrics_override, ts->hb_req);
     ts->hb_controller.Reset();
     ts->hb_controller.set_timeout(15s);
     ts->heartbeat_sent_time = MonoTime::Now();
     ts->heartbeat_proxy->TSHeartbeatAsync(
-        ts->hb_req, &ts->hb_resp, &ts->hb_controller, [this, ts] {
+        *ts->hb_req, ts->hb_resp, &ts->hb_controller, [this, ts] {
           HandleHeartbeatResponse(ts);
         });
   }
@@ -1598,13 +1604,13 @@ class HeartbeatBench {
       ts->heartbeat_in_flight.store(false, std::memory_order_release);
       return;
     }
-    const auto& resp = ts->hb_resp;
+    const auto& resp = *ts->hb_resp;
     // A first heartbeat without universe_uuid fails with INVALID_REQUEST but returns the
     // master's uuid for adoption; every later heartbeat echoes it.
     if (!resp.universe_uuid().empty()) {
       std::lock_guard l(universe_uuid_mutex_);
       if (universe_uuid_.empty()) {
-        universe_uuid_ = resp.universe_uuid();
+        universe_uuid_ = resp.universe_uuid().ToBuffer();
         LOG(INFO) << "Adopted universe uuid " << universe_uuid_;
       }
     }
@@ -1625,10 +1631,12 @@ class HeartbeatBench {
   }
 
   void SendLeaseRefresh(HollowTServer* ts) {
-    auto& req = ts->lease_req;
-    req.Clear();
+    ts->lease_arena.Reset(ResetMode::kKeepLast);
+    ts->lease_req = ts->lease_arena.NewArenaObject<master::LWRefreshYsqlLeaseRequestPB>();
+    ts->lease_resp = ts->lease_arena.NewArenaObject<master::LWRefreshYsqlLeaseResponsePB>();
+    auto& req = *ts->lease_req;
     auto* instance = req.mutable_instance();
-    instance->set_permanent_uuid(ts->uuid());
+    instance->dup_permanent_uuid(ts->uuid());
     instance->set_instance_seqno(ts->instance_seqno());
     const auto epoch = ts->lease_epoch();
     if (epoch) {
@@ -1638,22 +1646,23 @@ class HeartbeatBench {
     ts->lease_controller.Reset();
     ts->lease_controller.set_timeout(10s);
     ts->lease_proxy->RefreshYsqlLeaseAsync(
-        req, &ts->lease_resp, &ts->lease_controller, [this, ts] {
+        req, ts->lease_resp, &ts->lease_controller, [this, ts] {
           HandleLeaseResponse(ts);
         });
   }
 
   void HandleLeaseResponse(HollowTServer* ts) {
     const auto status = ts->lease_controller.status();
-    if (!status.ok() || ts->lease_resp.has_error()) {
+    const auto& resp = *ts->lease_resp;
+    if (!status.ok() || resp.has_error()) {
       stats_.lease_refreshes_failed.fetch_add(1, std::memory_order_relaxed);
       YB_LOG_EVERY_N_SECS(WARNING, 10)
           << "Lease refresh from " << ts->uuid() << " failed: "
-          << (status.ok() ? ts->lease_resp.error().ShortDebugString() : status.ToString());
+          << (status.ok() ? resp.error().ShortDebugString() : status.ToString());
     } else {
       stats_.lease_refreshes_ok.fetch_add(1, std::memory_order_relaxed);
-      if (ts->lease_resp.has_info() && ts->lease_resp.info().has_lease_epoch()) {
-        ts->SetLeaseEpoch(ts->lease_resp.info().lease_epoch());
+      if (resp.has_info() && resp.info().has_lease_epoch()) {
+        ts->SetLeaseEpoch(resp.info().lease_epoch());
       }
     }
     ts->lease_in_flight.store(false, std::memory_order_release);
@@ -1675,6 +1684,10 @@ class HeartbeatBench {
   void ReplayToHollowTservers(
       const MirrorState::ReplayItem& item, google::protobuf::DynamicMessageFactory* factory) {
     const auto key = item.service + "." + item.method;
+    if (item.method == "ListTabletServers") {
+      ReplayListTabletServers(item, key);
+      return;
+    }
     const auto* pool = google::protobuf::DescriptorPool::generated_pool();
     const auto* service_desc = pool->FindServiceByName(item.service);
     const auto* method_desc =
@@ -1728,13 +1741,40 @@ class HeartbeatBench {
     }
   }
 
+  // The one replayed method with a large response: 2000 copies of a 400 KB message per minute,
+  // so each call parses into its own arena instead of DynamicMessage heap objects.
+  void ReplayListTabletServers(const MirrorState::ReplayItem& item, const string& key) {
+    struct ReplayCall {
+      ThreadSafeArena arena;
+      master::LWListTabletServersRequestPB request{&arena};
+      master::LWListTabletServersResponsePB response{&arena};
+      rpc::RpcController controller;
+    };
+    for (int i = 0; i < FLAGS_num_tservers && running_.load(std::memory_order_acquire); ++i) {
+      auto call = std::make_shared<ReplayCall>();
+      if (!call->request.ParseFromSlice(item.body).ok()) {
+        mirror_state_->RecordReplay(key, false, FLAGS_num_tservers);
+        return;
+      }
+      call->controller.set_timeout(15s);
+      cluster_proxy_->ListTabletServersAsync(
+          call->request, &call->response, &call->controller, [this, call, key] {
+            mirror_state_->RecordReplay(key, call->controller.status().ok());
+          });
+      if (i % 32 == 31) {
+        SleepFor(1ms);
+      }
+    }
+  }
+
   Status WaitForRegistration() {
     const auto deadline = MonoTime::Now() + MonoDelta::FromSeconds(FLAGS_register_timeout_sec);
     auto next_log = MonoTime::Now();
     const int expected = FLAGS_num_tservers + (mirror_state_ ? 1 : 0);
     while (true) {
-      master::ListTabletServersRequestPB req;
-      master::ListTabletServersResponsePB resp;
+      ThreadSafeArena arena;
+      master::LWListTabletServersRequestPB req(&arena);
+      master::LWListTabletServersResponsePB resp(&arena);
       rpc::RpcController controller;
       controller.set_timeout(10s);
       auto status = cluster_proxy_->ListTabletServers(req, &resp, &controller);

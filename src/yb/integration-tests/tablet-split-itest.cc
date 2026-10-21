@@ -63,6 +63,7 @@
 #include "yb/master/master_defaults.h"
 #include "yb/master/master_error.h"
 #include "yb/master/master_fwd.h"
+#include "yb/master/master_heartbeat.messages.h"
 #include "yb/master/master_heartbeat.pb.h"
 #include "yb/master/tablet_split_manager.h"
 #include "yb/master/ts_descriptor.h"
@@ -95,6 +96,7 @@
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/format.h"
 #include "yb/util/logging_test_util.h"
+#include "yb/util/memory/arena.h"
 #include "yb/util/metrics.h"
 #include "yb/util/monotime.h"
 #include "yb/util/protobuf_util.h"
@@ -664,10 +666,11 @@ TEST_F(TabletSplitITest, TestLoadBalancerAndSplit) {
   for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
     auto* ts_manager = cluster_->mini_tablet_server(i)->server()->tablet_manager();
 
-    master::TabletReportPB report;
+    ThreadSafeArena arena;
+    master::LWTabletReportPB report(&arena);
     ts_manager->GenerateTabletReport(&report);
     for (const auto& reported_tablet : report.updated_tablets()) {
-      if (test_tablet_ids.count(reported_tablet.tablet_id()) == 0) {
+      if (test_tablet_ids.count(reported_tablet.tablet_id().ToBuffer()) == 0) {
         continue;
       }
       ASSERT_TRUE(reported_tablet.should_disable_lb_move());
