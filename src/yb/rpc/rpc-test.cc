@@ -1801,5 +1801,77 @@ TEST_F(TestRpc, PriorityQueueContinuationPrecedence) {
   ASSERT_EQ(NestedCallContinuationHops(), 0) << "scope must restore the thread-local";
 }
 
+// Local calls (same messenger, no serialized header) must carry the same scheduling fields as
+// remote ones: requested priority from the controller and continuation hops from the controller or
+// the in-handler thread-local.
+TEST_F(TestRpc, PriorityQueueLocalCallsCarrySchedulingFields) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_enabled) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_continuation_max_hops) = 2;
+  auto flag_reset = ScopeExit([] {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_enabled) = false;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_continuation_max_hops) = 0;
+  });
+
+  TestServerOptions options;
+  options.n_worker_threads = 1;
+  TestServer server(CreateMessenger("TestServer", options.messenger_options), options);
+  ASSERT_OK(server.RegisterService(MakeCalculatorService(metric_entity()), RpcPriority::kNormal));
+  ASSERT_OK(server.Start());
+  auto* queue = server.priority_queue();
+  ASSERT_NE(queue, nullptr);
+
+  HostPort empty_addr;
+  Proxy local(server.messenger(), empty_addr);
+
+  rpc_test::SleepRequestPB blocker_req;
+  blocker_req.set_sleep_micros(500 * 1000 * kTimeMultiplier);
+  rpc_test::SleepResponsePB blocker_resp;
+  RpcController blocker_controller;
+  blocker_controller.set_timeout(30s);
+  CountDownLatch blocker_latch(1);
+  local.AsyncRequest(
+      CalculatorServiceMethods::SleepMethod(), nullptr, blocker_req, &blocker_resp,
+      &blocker_controller, blocker_latch.CountDownCallback());
+  ASSERT_OK(WaitFor(
+      [queue] { return queue->TEST_dispatched() == 1; }, 10s, "blocker dispatched"));
+
+  rpc_test::SleepRequestPB req;
+  req.set_sleep_micros(10 * 1000);
+  rpc_test::SleepResponsePB fresh_resp, cont_resp, nested_resp, demoted_resp;
+  RpcController fresh, cont, nested, demoted;
+  for (auto* controller : {&fresh, &cont, &nested, &demoted}) {
+    controller->set_timeout(30s);
+  }
+  CountDownLatch latch(4);
+  local.AsyncRequest(
+      CalculatorServiceMethods::SleepMethod(), nullptr, req, &fresh_resp, &fresh,
+      latch.CountDownCallback());
+  cont.set_continuation_hops(1);
+  local.AsyncRequest(
+      CalculatorServiceMethods::SleepMethod(), nullptr, req, &cont_resp, &cont,
+      latch.CountDownCallback());
+  {
+    ScopedInboundCallHops in_handler(1);  // nested call stamped with hops 2: still within the cap
+    local.AsyncRequest(
+        CalculatorServiceMethods::SleepMethod(), nullptr, req, &nested_resp, &nested,
+        latch.CountDownCallback());
+  }
+  demoted.set_priority(RpcPriority::kLow);
+  local.AsyncRequest(
+      CalculatorServiceMethods::SleepMethod(), nullptr, req, &demoted_resp, &demoted,
+      latch.CountDownCallback());
+
+  ASSERT_OK(WaitFor([queue] { return queue->TEST_queued() == 4; }, 10s, "all queued"));
+  ASSERT_EQ(queue->TEST_queued(RpcPriority::kNormal), 3);
+  ASSERT_EQ(queue->TEST_queued(RpcPriority::kLow), 1) << "local call must honour demotion";
+  ASSERT_EQ(queue->TEST_queued_continuations(), 2) << "local call must carry hops";
+
+  ASSERT_TRUE(blocker_latch.WaitFor(30s));
+  ASSERT_TRUE(latch.WaitFor(30s));
+  for (auto* controller : {&blocker_controller, &fresh, &cont, &nested, &demoted}) {
+    ASSERT_OK(controller->status());
+  }
+}
+
 } // namespace rpc
 } // namespace yb

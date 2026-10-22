@@ -84,6 +84,12 @@ class LocalYBInboundCall : public YBInboundCall, public RpcCallParams {
 
   ThreadPoolTag pool_tag() const override;
 
+  // A local call has no serialized header, so the scheduling fields the remote path would read
+  // from RequestHeader come from the controller (priority) or were captured at creation on the
+  // issuing thread (continuation hops, including the implicit in-handler value).
+  std::optional<RpcPriority> requested_priority() const override;
+  uint32_t continuation_hops() const override { return continuation_hops_; }
+
   Status ParseParam(RpcCallParams* params) override;
 
   size_t ObjectSize() const override { return sizeof(*this); }
@@ -106,6 +112,8 @@ class LocalYBInboundCall : public YBInboundCall, public RpcCallParams {
 
   Status ParseRequest(Slice param, const RefCntBuffer& buffer) override;
   AnyMessageConstPtr SerializableResponse() override;
+
+  const uint32_t continuation_hops_;
 
   // Weak pointer back to the outbound call owning this inbound call to avoid circular reference.
   std::weak_ptr<LocalOutboundCall> outbound_call_;

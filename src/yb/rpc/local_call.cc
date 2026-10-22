@@ -88,6 +88,13 @@ LocalYBInboundCall::LocalYBInboundCall(
     CoarseTimePoint deadline,
     CallStateListenerFactory* call_state_listener_factory)
     : YBInboundCall(rpc_metrics, remote_method, call_state_listener_factory),
+      continuation_hops_([&outbound_call]() -> uint32_t {
+        auto call = outbound_call.lock();
+        if (call && call->controller()->continuation_hops()) {
+          return *call->controller()->continuation_hops();
+        }
+        return NestedCallContinuationHops();
+      }()),
       outbound_call_(outbound_call),
       deadline_(deadline) {
   UpdateWaitStateInfo();
@@ -148,6 +155,11 @@ AnyMessageConstPtr LocalYBInboundCall::SerializableResponse() {
 
 TaggedThreadPools::Tag LocalYBInboundCall::pool_tag() const {
   return outbound_call()->pool_tag();
+}
+
+std::optional<RpcPriority> LocalYBInboundCall::requested_priority() const {
+  auto call = outbound_call();
+  return call ? call->controller()->priority() : std::nullopt;
 }
 
 void LocalYBInboundCallTracker::CallProcessed(InboundCall* call) {
