@@ -887,6 +887,11 @@ message PgPerformOptionsPB {
   bool is_using_table_locks = 32;
 
   ReadTimeOptionsPB read_time_options = 34;
+
+  // Number of Perform requests this statement has already completed (0 for its first). Stamped on
+  // the tablet RPCs this Perform issues as RequestHeader.continuation_hops so the tserver's
+  // RpcPriorityQueue can dispatch later fetch pages ahead of fresh work.
+  uint32 continuation_hops = 35;
 }
 
 message PgPerformRequestPB {

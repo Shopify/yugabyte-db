@@ -117,6 +117,18 @@ METRIC_DEFINE_counter(server, rpc_priority_queue_dispatched_callbacks,
     "Number of kCallback tasks (of any priority) handed to a worker pool by the RPC priority "
     "queue. The per-priority dispatched counters include these.");
 
+METRIC_DEFINE_counter(server, rpc_priority_queue_dispatched_continuations,
+    "RPC priority queue: continuation tasks dispatched",
+    yb::MetricUnit::kTasks,
+    "Inbound tasks flagged as continuations of admitted work that the RPC priority queue "
+    "dispatched (fast path or from the continuation lane of a band).");
+
+METRIC_DEFINE_event_stats(server, rpc_priority_queue_wait_time_continuation,
+    "RPC priority queue: continuation wait time",
+    yb::MetricUnit::kMicroseconds,
+    "Time continuation tasks spent waiting in the RPC priority queue before dispatch. Only tasks "
+    "that waited are counted.");
+
 METRIC_DEFINE_counter(server, rpc_priority_queue_rejected_full,
     "RPC tasks rejected because the RPC priority queue's waiting-task counter was at its bound.",
     yb::MetricUnit::kTasks,
@@ -167,6 +179,13 @@ size_t Index(RpcTaskClass task_class) {
 
 } // namespace
 
+RpcPriorityQueue::Lane RpcPriorityQueue::LaneOf(RpcTaskClass task_class, bool continuation) {
+  if (task_class == RpcTaskClass::kCallback) {
+    return kLaneCallback;
+  }
+  return continuation ? kLaneInboundContinuation : kLaneInbound;
+}
+
 // Wraps a caller-provided task so the queue observes its completion. The pool contract guarantees
 // Done() is invoked exactly once on every path (after Run(), or directly on failure to run), so the
 // permit release in Done() cannot leak. Heap-allocated per submission; the fast path pays one
@@ -176,12 +195,14 @@ size_t Index(RpcTaskClass task_class) {
 class RpcPriorityQueue::Task : public ThreadPoolTask {
  public:
   Task(RpcPriorityQueue* queue, ThreadPoolTask* inner, RpcPriority priority,
-       RpcTaskClass task_class, ThreadPoolPtr pool)
+       RpcTaskClass task_class, bool continuation, ThreadPoolPtr pool)
       : queue_(queue), inner_(inner), priority_(priority), task_class_(task_class),
-        pool_(std::move(pool)) {}
+        continuation_(continuation), pool_(std::move(pool)) {}
 
   RpcPriority priority() const { return priority_; }
   RpcTaskClass task_class() const { return task_class_; }
+  bool continuation() const { return continuation_; }
+  Lane lane() const { return LaneOf(task_class_, continuation_); }
   const ThreadPoolPtr& pool() const { return pool_; }
 
   // Records that this task is about to wait in a band, so its wait time can be measured.
@@ -243,6 +264,7 @@ class RpcPriorityQueue::Task : public ThreadPoolTask {
   ThreadPoolTask* const inner_;
   const RpcPriority priority_;
   const RpcTaskClass task_class_;
+  const bool continuation_;
   const ThreadPoolPtr pool_;
   MonoTime queued_at_;
 };
@@ -282,6 +304,10 @@ RpcPriorityQueue::RpcPriorityQueue(
         METRIC_rpc_priority_queue_wait_time_low.Instantiate(metric_entity);
     dispatched_callbacks_counter_ =
         METRIC_rpc_priority_queue_dispatched_callbacks.Instantiate(metric_entity);
+    dispatched_continuations_counter_ =
+        METRIC_rpc_priority_queue_dispatched_continuations.Instantiate(metric_entity);
+    continuation_queue_time_stats_ =
+        METRIC_rpc_priority_queue_wait_time_continuation.Instantiate(metric_entity);
     aborted_counter_ = METRIC_rpc_priority_queue_aborted.Instantiate(metric_entity);
     rejected_full_counter_ = METRIC_rpc_priority_queue_rejected_full.Instantiate(metric_entity);
   }
@@ -371,7 +397,7 @@ bool RpcPriorityQueue::TryClaimPermitFastPath(RpcTaskClass task_class, RpcPriori
 
 bool RpcPriorityQueue::Enqueue(
     ThreadPoolTask* inner, RpcPriority priority, RpcTaskClass task_class,
-    const ThreadPoolPtr& target_pool) {
+    const ThreadPoolPtr& target_pool, bool continuation) {
   DCHECK_ONLY_NOTNULL(inner);
   DCHECK_ONLY_NOTNULL(target_pool.get());
 
@@ -408,14 +434,21 @@ bool RpcPriorityQueue::Enqueue(
     return false;
   }
 
-  auto* task = new Task(this, inner, priority, task_class, target_pool);
-
-  // Fast path: nothing waiting and a permit available. No lock, no band traffic.
-  if (TryClaimPermitFastPath(task_class, priority)) {
+  continuation = continuation && task_class == RpcTaskClass::kInbound;
+  auto* task = new Task(this, inner, priority, task_class, continuation, target_pool);
+  auto count_dispatch = [this, priority, task_class, continuation] {
     IncrementCounter(dispatched_counters_[Index(priority)]);
     if (task_class == RpcTaskClass::kCallback) {
       IncrementCounter(dispatched_callbacks_counter_);
     }
+    if (continuation) {
+      IncrementCounter(dispatched_continuations_counter_);
+    }
+  };
+
+  // Fast path: nothing waiting and a permit available. No lock, no band traffic.
+  if (TryClaimPermitFastPath(task_class, priority)) {
+    count_dispatch();
     release_active();
     task->Dispatch();
     return true;
@@ -433,7 +466,7 @@ bool RpcPriorityQueue::Enqueue(
       // consumers of the bands (PopEligibleLocked, StartShutdown's drain) run under this same lock
       // and therefore cannot observe the incremented count before the push.
       task->MarkQueued();
-      bands_[Index(priority)][Index(task_class)].push_back(task);
+      bands_[Index(priority)][task->lane()].push_back(task);
       OnQueued(priority);
     }
   }
@@ -442,10 +475,7 @@ bool RpcPriorityQueue::Enqueue(
       release_active();
       return true;
     case AdmitOutcome::kClaimed:
-      IncrementCounter(dispatched_counters_[Index(priority)]);
-      if (task_class == RpcTaskClass::kCallback) {
-        IncrementCounter(dispatched_callbacks_counter_);
-      }
+      count_dispatch();
       release_active();
       task->Dispatch();
       return true;
@@ -528,10 +558,11 @@ bool RpcPriorityQueue::EligibleWaiterAtOrAboveLocked(
       continue;
     }
     const auto& band = bands_[i];
-    if (!band[Index(RpcTaskClass::kCallback)].empty()) {
+    if (!band[kLaneCallback].empty()) {
       return true;
     }
-    if (inbound_eligible && !band[Index(RpcTaskClass::kInbound)].empty()) {
+    if (inbound_eligible &&
+        (!band[kLaneInbound].empty() || !band[kLaneInboundContinuation].empty())) {
       return true;
     }
   }
@@ -541,8 +572,10 @@ bool RpcPriorityQueue::EligibleWaiterAtOrAboveLocked(
 RpcPriorityQueue::Task* RpcPriorityQueue::PopEligibleLocked(
     bool inbound_eligible, bool low_eligible) {
   // Strict priority: the first band with an eligible task, kHigh -> kNormal -> kLow, always wins.
-  // Within a band, the older of the inbound and callback heads goes first, so arrival order is
-  // preserved between the two classes unless the inbound cap makes inbound work ineligible. Under
+  // Within a band, the inbound candidate is the continuation lane's head while that lane is
+  // non-empty (fresh inbound arrivals wait behind every waiting continuation), and the older of
+  // the inbound candidate and the callback head goes first, so arrival order is preserved between
+  // inbound work and callbacks unless the inbound cap makes inbound work ineligible. Under
   // sustained kNormal load this can starve kLow indefinitely; waiting kLow tasks eventually fail
   // via their client deadline (ServicePool's early timeout check) and are retried by the caller.
   // That is the intended v1 behavior: during overload it is preferable to fail background work.
@@ -562,11 +595,16 @@ RpcPriorityQueue::Task* RpcPriorityQueue::PopEligibleLocked(
       continue;
     }
     auto& band = bands_[i];
-    auto& inbound = band[Index(RpcTaskClass::kInbound)];
-    auto& callbacks = band[Index(RpcTaskClass::kCallback)];
+    auto& continuations = band[kLaneInboundContinuation];
+    auto& inbound = band[kLaneInbound];
+    auto& callbacks = band[kLaneCallback];
     std::deque<Task*>* chosen = nullptr;
-    if (inbound_eligible && !inbound.empty()) {
-      chosen = &inbound;
+    if (inbound_eligible) {
+      if (!continuations.empty()) {
+        chosen = &continuations;
+      } else if (!inbound.empty()) {
+        chosen = &inbound;
+      }
     }
     if (!callbacks.empty() &&
         (chosen == nullptr || callbacks.front()->queued_at() < chosen->front()->queued_at())) {
@@ -714,6 +752,9 @@ void RpcPriorityQueue::ProcessOneCompletion(
       IncrementCounter(dispatched_counters_[Index(next->priority())]);
       if (next->task_class() == RpcTaskClass::kCallback) {
         IncrementCounter(dispatched_callbacks_counter_);
+      }
+      if (next->continuation()) {
+        IncrementCounter(dispatched_continuations_counter_);
       }
       next->Dispatch();
       return;
@@ -871,6 +912,15 @@ size_t RpcPriorityQueue::TEST_queued(RpcPriority priority) const {
   return result;
 }
 
+size_t RpcPriorityQueue::TEST_queued_continuations() const {
+  std::lock_guard lock(mutex_);
+  size_t result = 0;
+  for (const auto& band : bands_) {
+    result += band[kLaneInboundContinuation].size();
+  }
+  return result;
+}
+
 void RpcPriorityQueue::TEST_SetQueuedCount(uint32_t value) {
   UpdateState([value](State* state) {
     state->queued = value;
@@ -882,9 +932,13 @@ void RpcPriorityQueue::RecordQueueTime(Task* task) {
   if (!task->waited()) {
     return;
   }
+  const auto waited_us = (MonoTime::Now() - task->queued_at()).ToMicroseconds();
   const auto& stats = queue_time_stats_[Index(task->priority())];
   if (stats) {
-    stats->Increment((MonoTime::Now() - task->queued_at()).ToMicroseconds());
+    stats->Increment(waited_us);
+  }
+  if (task->continuation() && continuation_queue_time_stats_) {
+    continuation_queue_time_stats_->Increment(waited_us);
   }
 }
 

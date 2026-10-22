@@ -76,6 +76,9 @@ struct AsyncRpcData {
   OpId pending_async_write_op_id = OpId::Invalid();
   // Requested RPC priority for the batch (e.g. kLow for index backfill writes); unset = default.
   std::optional<rpc::RpcPriority> priority;
+  // Hops already completed by the operation these ops continue; 0 = fresh (then the controller
+  // falls back to the inbound call being handled on the sending thread, if any).
+  uint32_t continuation_hops = 0;
 };
 
 struct FlushExtraResult {

@@ -150,8 +150,10 @@ class Sender {
       // TODO: Explain why is this the case because it differs from requirement 1 in
       // src/yb/yql/pggate/README
       DCHECK(!PgSession::RunOptions{}.in_txn_limit);
+      auto comparable_options = options;
+      comparable_options.continuation_hops = 0;  // Statement progress is irrelevant here.
       RSTATUS_DCHECK(
-          options == PgSession::RunOptions{},
+          comparable_options == PgSession::RunOptions{},
           IllegalState, "Only default run options is expected, got $0", options);
       return (*collector_)(ops, table);
     }

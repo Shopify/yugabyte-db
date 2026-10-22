@@ -764,6 +764,9 @@ WriteRpc::WriteRpc(const AsyncRpcData& data, rpc::ThreadPoolTag pool_tag)
   if (data.priority) {
     mutable_retrier()->mutable_controller()->set_priority(*data.priority);
   }
+  if (data.continuation_hops) {
+    mutable_retrier()->mutable_controller()->set_continuation_hops(data.continuation_hops);
+  }
 }
 
 WriteRpc::~WriteRpc() {
@@ -914,6 +917,9 @@ ReadRpc::ReadRpc(
   mutable_retrier()->mutable_controller()->set_pool_tag(pool_tag);
   if (data.priority) {
     mutable_retrier()->mutable_controller()->set_priority(*data.priority);
+  }
+  if (data.continuation_hops) {
+    mutable_retrier()->mutable_controller()->set_continuation_hops(data.continuation_hops);
   }
   VLOG(3) << "Created batch for " << data.tablet->tablet_id() << ":\n"
           << req_.ShortDebugString();

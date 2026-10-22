@@ -195,6 +195,8 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
 
   void SetPriority(rpc::RpcPriority priority);
 
+  void SetContinuationHops(uint32_t hops);
+
   // Add a new operation to the batch. Requires that the batch has not yet been flushed.
   // TODO: in other flush modes, this may not be the case -- need to
   // update this when they're implemented.
@@ -409,6 +411,7 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
 
   rpc::ThreadPoolTag pool_tag_ = 0;
   std::optional<rpc::RpcPriority> priority_;
+  uint32_t continuation_hops_ = 0;
 
   // Number of outstanding lookups across all in-flight ops.
   std::atomic<size_t> outstanding_lookups_{0};

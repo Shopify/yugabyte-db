@@ -179,6 +179,12 @@ class RpcController {
 
   const std::optional<RpcPriority>& priority() const { return priority_; }
 
+  // Hops already completed by the operation this call continues (RequestHeader.continuation_hops).
+  // Unset: derived from the inbound call being handled on the sending thread, if any.
+  void set_continuation_hops(uint32_t hops) { continuation_hops_ = hops; }
+
+  const std::optional<uint32_t>& continuation_hops() const { return continuation_hops_; }
+
  private:
   friend class OutboundCall;
   friend class Proxy;
@@ -200,6 +206,7 @@ class RpcController {
 
   ThreadPoolTag pool_tag_ = 0;
   std::optional<RpcPriority> priority_;
+  std::optional<uint32_t> continuation_hops_;
 
   DISALLOW_COPY_AND_ASSIGN(RpcController);
 };

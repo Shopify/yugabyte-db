@@ -3378,6 +3378,9 @@ class PgClientSession::Impl {
         data->req.options(), deadline, arena, in_txn_limit, locality));
     auto* session = setup_session_result.session_data.session.get();
     auto& transaction = setup_session_result.session_data.transaction;
+    // Later fetch pages of a statement continue admitted work: their tablet RPCs get continuation
+    // precedence in the tservers' priority queues. Reset explicitly, the session is reused.
+    session->SetContinuationHops(options.continuation_hops());
 
     if (transaction && options.xrepl_origin_id()) {
       transaction->SetOriginId(options.xrepl_origin_id());

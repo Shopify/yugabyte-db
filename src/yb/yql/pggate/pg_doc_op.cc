@@ -248,6 +248,7 @@ PgDocOp::PgDocOp(const PgSessionPtr& pg_session, PgTable* table, const Sender& s
 
 Status PgDocOp::ExecuteInit(const YbcPgExecParameters *exec_params) {
   end_of_data_ = false;
+  performs_sent_ = 0;
   if (exec_params) {
     exec_params_ = *exec_params;
   }
@@ -392,9 +393,15 @@ Status PgDocOp::SendRequestImpl(ForceNonBufferable force_non_bufferable) {
   }
 
   VLOG(1) << "Number of " << table_type << " operations to send: " << send_count;
+  PgSession::RunOptions run_options{
+      .in_txn_limit = HybridTime::FromPB(GetInTxnLimitHt()),
+      .force_non_bufferable = force_non_bufferable,
+      .continuation_hops = performs_sent_};
   response_ = VERIFY_RESULT(sender_(
-      pg_session_.get(), {pgsql_ops_.begin(), send_count}, *table_,
-      {HybridTime::FromPB(GetInTxnLimitHt()), force_non_bufferable}, is_write));
+      pg_session_.get(), {pgsql_ops_.begin(), send_count}, *table_, run_options, is_write));
+  if (response_.Valid()) {
+    ++performs_sent_;
+  }
   if (!result_stream_) {
     // Default PgDocOpFetchStream
     result_stream_ = std::make_unique<ParallelPgDocOpFetchStream>(

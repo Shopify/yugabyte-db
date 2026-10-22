@@ -408,6 +408,10 @@ class PgDocOp {
   // Only one RunAsync() can be called to sent to DocDB at a time.
   PgDocResponse response_;
 
+  // Perform requests this operation has sent so far; the next one is stamped with it as
+  // continuation_hops so the tservers can favour an in-progress statement's later pages.
+  uint32_t performs_sent_ = 0;
+
   // Executed row count.
   int32_t rows_affected_count_ = 0;
 

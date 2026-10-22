@@ -161,6 +161,10 @@ class YBInboundCall : public InboundCall {
     return header_.priority;
   }
 
+  uint32_t continuation_hops() const override {
+    return header_.continuation_hops;
+  }
+
   // Serializes 'response' into the InboundCall's internal buffer, and marks
   // the call as a success. Enqueues the response back to the connection
   // that made the call.

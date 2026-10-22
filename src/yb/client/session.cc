@@ -161,6 +161,13 @@ void YBSession::SetPriority(rpc::RpcPriority priority) {
   }
 }
 
+void YBSession::SetContinuationHops(uint32_t hops) {
+  continuation_hops_ = hops;
+  if (batcher_) {
+    batcher_->SetContinuationHops(hops);
+  }
+}
+
 namespace {
 
 internal::BatcherPtr CreateBatcher(
@@ -345,6 +352,7 @@ internal::Batcher& YBSession::Batcher() {
     if (priority_) {
       batcher_->SetPriority(*priority_);
     }
+    batcher_->SetContinuationHops(continuation_hops_);
   }
   return *batcher_;
 }

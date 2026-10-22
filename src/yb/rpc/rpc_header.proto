@@ -87,6 +87,14 @@ message RequestHeader {
   // (e.g. index backfill writes) but never promote it. Unset means the service default.
   optional RpcPriorityPB priority = 8;
 
+  // Number of RPC hops the originating operation has already completed before this call: a tablet
+  // read issued by a statement's third fetch page carries 2, a fresh request carries nothing. The
+  // server's RpcPriorityQueue dispatches calls with 1 <= hops <= rpc_priority_queue_continuation_max_hops
+  // ahead of fresh arrivals of the same priority (never ahead of a higher priority). Set
+  // explicitly by clients that track statement progress (pggate via PgPerformOptionsPB) and
+  // implicitly for outbound calls made from inside an inbound handler (parent hops + 1).
+  optional uint32 continuation_hops = 9;
+
   // CRC32C for message body and header without CRC field. Use 15 as max 1 byte tag.
   optional fixed32 crc = 15;
 }

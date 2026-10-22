@@ -361,6 +361,10 @@ Status OutboundCall::SetRequestParam(
   // RpcPriorityPB: kHigh -> 1, kNormal -> 2, kLow -> 3; 0 (unset) is never written.
   const uint32_t priority = controller_->priority()
       ? static_cast<uint32_t>(std::to_underlying(*controller_->priority())) + 1 : 0;
+  // Explicit controller value wins; otherwise a call made from inside an inbound handler is one
+  // hop further along than the call being handled. 0 is never written.
+  const uint32_t continuation_hops = controller_->continuation_hops()
+      ? *controller_->continuation_hops() : NestedCallContinuationHops();
 
   using Output = google::protobuf::io::CodedOutputStream;
   using google::protobuf::internal::WireFormatLite;
@@ -386,6 +390,9 @@ Status OutboundCall::SetRequestParam(
   }
   if (priority) {
     header_pb_len += 1 + Output::VarintSize32(priority); // RpcPriorityPB priority = 8
+  }
+  if (continuation_hops) {
+    header_pb_len += 1 + Output::VarintSize32(continuation_hops); // uint32 continuation_hops = 9
   }
   if (use_crc) {
     header_pb_len += 1 + sizeof(uint32_t); // fixed32 crc = 15
@@ -440,6 +447,11 @@ Status OutboundCall::SetRequestParam(
   if (priority) {
     dst = CodedOutputStream::WriteTagToArray(RequestHeader::kPriorityFieldNumber << 3, dst);
     dst = Output::WriteVarint32ToArray(priority, dst);
+  }
+  if (continuation_hops) {
+    dst = CodedOutputStream::WriteTagToArray(
+        RequestHeader::kContinuationHopsFieldNumber << 3, dst);
+    dst = Output::WriteVarint32ToArray(continuation_hops, dst);
   }
 
   // CRC should be at the end of header, otherwise adjust CRC filling logic below.

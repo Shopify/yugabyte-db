@@ -81,6 +81,8 @@ struct ParsedRequestHeader {
   ThreadPoolTag pool_tag = 0;
   // Requested priority; nullopt when the header carries none or an unknown value.
   std::optional<RpcPriority> priority;
+  // Hops completed by the originating operation; 0 when the header carries none.
+  uint32_t continuation_hops = 0;
   std::optional<uint32_t> crc;
 
   std::string RemoteMethodAsString() const;

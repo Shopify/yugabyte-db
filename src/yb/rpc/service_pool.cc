@@ -74,6 +74,13 @@ DEFINE_RUNTIME_int64(backpressure_recovery_period_ms, 600000,
     "Once we hit a backpressure/service-overflow we will consider dropping stale requests "
     "for this duration (in ms)");
 TAG_FLAG(backpressure_recovery_period_ms, advanced);
+DEFINE_RUNTIME_uint32(rpc_priority_queue_continuation_max_hops, 0,
+    "Inbound calls whose RequestHeader.continuation_hops is between 1 and this value are "
+    "dispatched by the RpcPriorityQueue ahead of fresh arrivals of the same priority (never ahead "
+    "of a higher priority). Bounds how many hops of one operation get that precedence so a "
+    "long-running statement cannot hold the front of its band indefinitely. 0 disables "
+    "continuation precedence. Only used when rpc_priority_queue_enabled is true.");
+TAG_FLAG(rpc_priority_queue_continuation_max_hops, advanced);
 DEFINE_test_flag(bool, enable_backpressure_mode_for_testing, false,
             "For testing purposes. Enables the rpc's to be considered timed out in the queue even "
             "when we have not had any backpressure in the recent past.");
@@ -211,6 +218,12 @@ class ServicePoolImpl final : public InboundCallHandler {
     // promote it: untrusted clients cannot claim kHigh.
     const auto requested = call->requested_priority();
     const auto priority = requested ? LowerPriority(rpc_priority_, *requested) : rpc_priority_;
+    // A call that continues already-admitted work goes ahead of fresh arrivals of its priority,
+    // but only for a bounded number of hops so one long-running statement cannot hold the front
+    // of the band indefinitely. 0 disables the lane.
+    const auto hops = call->continuation_hops();
+    const auto max_hops = FLAGS_rpc_priority_queue_continuation_max_hops;
+    const bool continuation = max_hops > 0 && hops > 0 && hops <= max_hops;
 
     auto call_deadline = call->GetClientDeadline();
     if (call_deadline != CoarseTimePoint::max()) {
@@ -221,7 +234,7 @@ class ServicePoolImpl final : public InboundCallHandler {
     // Either submission path ends with the task's Done() being invoked exactly once, so the
     // failure handling in InboundCallTask::Done (-> Failure below) is the same for both.
     if (priority_queue_) {
-      priority_queue_->Enqueue(task, priority, RpcTaskClass::kInbound, thread_pool);
+      priority_queue_->Enqueue(task, priority, RpcTaskClass::kInbound, thread_pool, continuation);
     } else {
       thread_pool->Enqueue(task);
     }
@@ -302,6 +315,8 @@ class ServicePoolImpl final : public InboundCallHandler {
     } else {
       if (incoming->TryStartProcessing()) {
         TRACE_TO(incoming->trace(), "Handling call $0", AsString(incoming->method_name()));
+        // Outbound calls the handler makes synchronously inherit this call's hops + 1.
+        ScopedInboundCallHops nested_hops(incoming->continuation_hops());
         service_->Handle(std::move(incoming));
       }
       return;

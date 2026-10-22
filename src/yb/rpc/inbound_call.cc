@@ -314,4 +314,24 @@ void InboundCall::Serialize(ByteBlocks* output) {
   }
 }
 
+namespace {
+
+// Hops of the inbound call being handled on this thread, +1 (so 0 means "not in a handler").
+thread_local uint32_t current_inbound_call_hops_plus_one = 0;
+
+} // namespace
+
+uint32_t NestedCallContinuationHops() {
+  return current_inbound_call_hops_plus_one;
+}
+
+ScopedInboundCallHops::ScopedInboundCallHops(uint32_t hops)
+    : previous_(current_inbound_call_hops_plus_one) {
+  current_inbound_call_hops_plus_one = hops + 1;
+}
+
+ScopedInboundCallHops::~ScopedInboundCallHops() {
+  current_inbound_call_hops_plus_one = previous_;
+}
+
 } // namespace yb::rpc

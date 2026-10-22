@@ -211,6 +211,10 @@ void Batcher::SetPriority(rpc::RpcPriority priority) {
   priority_ = priority;
 }
 
+void Batcher::SetContinuationHops(uint32_t hops) {
+  continuation_hops_ = hops;
+}
+
 bool Batcher::HasPendingOperations() const {
   return !ops_.empty();
 }
@@ -739,6 +743,7 @@ Result<std::shared_ptr<AsyncRpc>> Batcher::CreateRpc(
     .ops = InFlightOps(group.begin, group.end),
     .need_metadata = group.need_metadata,
     .priority = priority_,
+    .continuation_hops = continuation_hops_,
   };
 
   const auto& first_op = group.begin->yb_op;

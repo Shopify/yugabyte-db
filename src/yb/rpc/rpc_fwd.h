@@ -177,6 +177,24 @@ inline RpcPriority LowerPriority(RpcPriority a, RpcPriority b) {
   return std::to_underlying(a) >= std::to_underlying(b) ? a : b;
 }
 
+// continuation_hops to stamp on an outbound call made from the current thread when the caller did
+// not set one: hops of the inbound call being handled here plus one, or 0 outside a handler. Only
+// covers calls issued synchronously from the handler thread; calls issued later from reactor or
+// callback threads are fresh unless their controller says otherwise.
+uint32_t NestedCallContinuationHops();
+
+// Marks the current thread as handling an inbound call with the given hops for its lifetime.
+class ScopedInboundCallHops {
+ public:
+  explicit ScopedInboundCallHops(uint32_t hops);
+  ~ScopedInboundCallHops();
+  ScopedInboundCallHops(const ScopedInboundCallHops&) = delete;
+  void operator=(const ScopedInboundCallHops&) = delete;
+
+ private:
+  const uint32_t previous_;
+};
+
 // Kind of work submitted to RpcPriorityQueue. kInbound is an inbound service call handler;
 // kCallback is the callback of an outbound (client-side) call. The distinction exists because an
 // inbound handler may block waiting for a callback (e.g. a synchronous YBClient call made from

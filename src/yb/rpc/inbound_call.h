@@ -180,6 +180,11 @@ class InboundCall : public RpcCall, public MPSCQueueEntry<InboundCall> {
     return std::nullopt;
   }
 
+  // RequestHeader.continuation_hops; 0 when absent (a fresh request).
+  virtual uint32_t continuation_hops() const {
+    return 0;
+  }
+
   virtual Slice serialized_remote_method() const = 0;
   virtual Slice method_name() const = 0;
 

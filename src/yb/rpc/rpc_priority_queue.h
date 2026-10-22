@@ -92,6 +92,14 @@ namespace yb::rpc {
 // higher-priority task is waiting. Consequences and intended follow-ups are documented at
 // PopEligibleLocked().
 //
+// Continuations. Within a band, inbound tasks flagged as continuations (RPCs that carry on work
+// this node or a client has already admitted: a tablet read issued by an in-progress Perform, a
+// later fetch page of the same statement) are dispatched before fresh inbound arrivals of the same
+// priority. A user query is several dependent RPCs; without this each hop re-enters the band
+// behind every fresh arrival and under saturation the query times out after the server has done
+// most of its work. The flag is derived by the caller (ServicePool, from RequestHeader
+// continuation_hops bounded by rpc_priority_queue_continuation_max_hops); the queue only orders.
+//
 // Thread safety: all public methods may be called from any thread.
 class RpcPriorityQueue {
  public:
@@ -126,9 +134,10 @@ class RpcPriorityQueue {
   // Task code (Run() or Done(), on any of these paths) may use the queue and may call
   // StartShutdown on it; it must not call CompleteShutdown synchronously, see below.
   // target_pool->options().max_workers must be >= max_dispatched() (see class comment).
+  // continuation: see the class comment; only meaningful for kInbound tasks.
   bool Enqueue(
       ThreadPoolTask* task, RpcPriority priority, RpcTaskClass task_class,
-      const ThreadPoolPtr& target_pool);
+      const ThreadPoolPtr& target_pool, bool continuation = false);
 
   // Two-phase shutdown.
   // StartShutdown atomically closes admission (no permit can be claimed after it returns, even by
@@ -160,6 +169,7 @@ class RpcPriorityQueue {
   size_t TEST_dispatched_low() const;
   size_t TEST_queued() const;
   size_t TEST_queued(RpcPriority priority) const;
+  size_t TEST_queued_continuations() const;
   // Overwrites the queued counter (bands are untouched). Only for exercising the counter's bound;
   // the caller must restore it to the real band size before shutdown.
   void TEST_SetQueuedCount(uint32_t value);
@@ -291,9 +301,14 @@ class RpcPriorityQueue {
   // is cheaper than parking. The lock is only taken when work is actually waiting (queued > 0);
   // the unsaturated path never touches it.
   mutable simple_spinlock mutex_;
-  // bands_[priority][class]. Two FIFOs per band so that a callback can be dispatched past inbound
-  // tasks of the same priority that are blocked by the inbound cap.
-  using Band = std::array<std::deque<Task*>, kRpcTaskClassMapSize>;
+  // bands_[priority][lane]. Three FIFOs per band: inbound continuations, fresh inbound tasks and
+  // callbacks. Separate inbound and callback lanes let a callback be dispatched past inbound
+  // tasks of the same priority that are blocked by the inbound cap; the continuation lane is
+  // served before the fresh lane (class comment).
+  enum Lane : size_t { kLaneInboundContinuation = 0, kLaneInbound = 1, kLaneCallback = 2 };
+  static constexpr size_t kLaneCount = 3;
+  static Lane LaneOf(RpcTaskClass task_class, bool continuation);
+  using Band = std::array<std::deque<Task*>, kLaneCount>;
   std::array<Band, kRpcPriorityMapSize> bands_ GUARDED_BY(mutex_);
 
   // Metrics. Per-band entries are indexed by std::to_underlying(RpcPriority).
@@ -301,6 +316,8 @@ class RpcPriorityQueue {
   std::array<scoped_refptr<Counter>, kRpcPriorityMapSize> dispatched_counters_;
   std::array<scoped_refptr<EventStats>, kRpcPriorityMapSize> queue_time_stats_;
   scoped_refptr<Counter> dispatched_callbacks_counter_;
+  scoped_refptr<Counter> dispatched_continuations_counter_;
+  scoped_refptr<EventStats> continuation_queue_time_stats_;
   scoped_refptr<Counter> aborted_counter_;
   scoped_refptr<Counter> rejected_full_counter_;
 };

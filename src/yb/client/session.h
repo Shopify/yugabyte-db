@@ -133,6 +133,11 @@ class YBSession : public std::enable_shared_from_this<YBSession> {
   // and the service default.
   void SetPriority(rpc::RpcPriority priority);
 
+  // Stamps every RPC the session issues as continuing an operation that has already completed
+  // this many hops (RequestHeader.continuation_hops); 0 marks them fresh. Applies to the current
+  // batcher and to batchers created later, until changed.
+  void SetContinuationHops(uint32_t hops);
+
   // TODO: add "doAs" ability here for proxy servers to be able to act on behalf of
   // other users, assuming access rights.
 
@@ -299,6 +304,7 @@ class YBSession : public std::enable_shared_from_this<YBSession> {
 
   rpc::ThreadPoolTag pool_tag_ = 0;
   std::optional<rpc::RpcPriority> priority_;
+  uint32_t continuation_hops_ = 0;
 
   internal::AsyncRpcMetricsPtr async_rpc_metrics_;
 

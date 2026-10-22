@@ -38,6 +38,8 @@ METRIC_DECLARE_entity(server);
 METRIC_DECLARE_event_stats(rpc_priority_queue_wait_time_normal);
 METRIC_DECLARE_counter(rpc_priority_queue_dispatched_low);
 METRIC_DECLARE_counter(rpc_priority_queue_aborted);
+METRIC_DECLARE_counter(rpc_priority_queue_dispatched_continuations);
+METRIC_DECLARE_event_stats(rpc_priority_queue_wait_time_continuation);
 
 DECLARE_bool(rpc_priority_queue_check_callbacks_do_not_wait);
 
@@ -852,6 +854,88 @@ TEST_F(RpcPriorityQueueTest, ArrivalOrderPreservedAcrossClassesWithinBand) {
     ASSERT_TRUE(task->WaitDone());
   }
   ASSERT_EQ(recorder_.RunOrder(), (std::vector<int>{0, 1, 2, 3}));
+
+  queue.StartShutdown();
+  queue.CompleteShutdown();
+  pool->Shutdown();
+}
+
+// Within a band, inbound continuations go ahead of fresh inbound arrivals regardless of arrival
+// order, but never ahead of a higher band; callbacks still interleave with the inbound candidate
+// by age.
+TEST_F(RpcPriorityQueueTest, ContinuationsPrecedeFreshInboundWithinBand) {
+  auto pool = MakePool("cont", 4);
+  RpcPriorityQueue queue("cont", 1, /* callback_reserve= */ 0, metric_entity_);
+
+  BlockingTask blocker(0, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(&blocker, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(blocker.WaitStarted());
+
+  InstantTask fresh1(1, &recorder_), fresh2(2, &recorder_), cont1(3, &recorder_),
+      cont2(4, &recorder_), low_cont(5, &recorder_), high_fresh(6, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(&fresh1, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(queue.Enqueue(&fresh2, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  // A kLow continuation must not overtake kNormal work of any kind.
+  ASSERT_TRUE(queue.Enqueue(
+      &low_cont, RpcPriority::kLow, RpcTaskClass::kInbound, pool, /* continuation= */ true));
+  ASSERT_TRUE(queue.Enqueue(
+      &cont1, RpcPriority::kNormal, RpcTaskClass::kInbound, pool, /* continuation= */ true));
+  ASSERT_TRUE(queue.Enqueue(
+      &cont2, RpcPriority::kNormal, RpcTaskClass::kInbound, pool, /* continuation= */ true));
+  // A fresh kHigh arrival still beats every kNormal continuation.
+  ASSERT_TRUE(queue.Enqueue(&high_fresh, RpcPriority::kHigh, RpcTaskClass::kInbound, pool));
+  ASSERT_EQ(queue.TEST_queued(), 6);
+  ASSERT_EQ(queue.TEST_queued_continuations(), 3);
+
+  blocker.Release();
+  ASSERT_TRUE(blocker.WaitDone());
+  for (auto* task : {&fresh1, &fresh2, &cont1, &cont2, &low_cont, &high_fresh}) {
+    ASSERT_TRUE(task->WaitDone());
+  }
+  ASSERT_EQ(recorder_.RunOrder(), (std::vector<int>{0, 6, 3, 4, 1, 2, 5}));
+  ASSERT_EQ(queue.TEST_queued_continuations(), 0);
+
+  auto dispatched = METRIC_rpc_priority_queue_dispatched_continuations.Instantiate(metric_entity_);
+  ASSERT_EQ(dispatched->value(), 3);
+  auto wait_stats = METRIC_rpc_priority_queue_wait_time_continuation.Instantiate(metric_entity_);
+  ASSERT_EQ(wait_stats->TotalCount(), 3);
+
+  queue.StartShutdown();
+  queue.CompleteShutdown();
+  pool->Shutdown();
+}
+
+// The continuation flag is only meaningful for inbound tasks: a callback flagged as one stays in
+// the callback lane and the fresh-vs-continuation decision between inbound lanes is unaffected.
+// Also covers age ordering between a continuation and an older callback.
+TEST_F(RpcPriorityQueueTest, ContinuationFlagIgnoredForCallbacks) {
+  auto pool = MakePool("cont-cb", 4);
+  RpcPriorityQueue queue("cont-cb", 1, /* callback_reserve= */ 0, metric_entity_);
+
+  BlockingTask blocker(0, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(&blocker, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  ASSERT_TRUE(blocker.WaitStarted());
+
+  InstantTask callback(1, &recorder_), fresh(2, &recorder_), cont(3, &recorder_);
+  ASSERT_TRUE(queue.Enqueue(
+      &callback, RpcPriority::kNormal, RpcTaskClass::kCallback, pool, /* continuation= */ true));
+  SleepFor(1ms);
+  ASSERT_TRUE(queue.Enqueue(&fresh, RpcPriority::kNormal, RpcTaskClass::kInbound, pool));
+  SleepFor(1ms);
+  ASSERT_TRUE(queue.Enqueue(
+      &cont, RpcPriority::kNormal, RpcTaskClass::kInbound, pool, /* continuation= */ true));
+  ASSERT_EQ(queue.TEST_queued(), 3);
+  ASSERT_EQ(queue.TEST_queued_continuations(), 1);
+
+  blocker.Release();
+  ASSERT_TRUE(blocker.WaitDone());
+  for (auto* task : {&callback, &fresh, &cont}) {
+    ASSERT_TRUE(task->WaitDone());
+  }
+  // Oldest callback first; then the continuation jumps the older fresh inbound task.
+  ASSERT_EQ(recorder_.RunOrder(), (std::vector<int>{0, 1, 3, 2}));
+  auto dispatched = METRIC_rpc_priority_queue_dispatched_continuations.Instantiate(metric_entity_);
+  ASSERT_EQ(dispatched->value(), 1);
 
   queue.StartShutdown();
   queue.CompleteShutdown();

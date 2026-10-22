@@ -87,6 +87,7 @@ DEFINE_NON_RUNTIME_int32(rpc_test_connection_keepalive_num_iterations, 1,
 DECLARE_bool(TEST_pause_calculator_echo_request);
 DECLARE_bool(binary_call_parser_reject_on_mem_tracker_hard_limit);
 DECLARE_bool(rpc_priority_queue_enabled);
+DECLARE_uint32(rpc_priority_queue_continuation_max_hops);
 DECLARE_bool(enable_rpc_keepalive);
 DECLARE_int32(num_connections_to_server);
 DECLARE_int64(rpc_throttle_threshold_bytes);
@@ -1710,6 +1711,94 @@ TEST_F(TestRpc, PriorityQueueHonoursRequestedDemotionOnly) {
   for (auto* controller : {&blocker_controller, &demoted, &plain, &promoted}) {
     ASSERT_OK(controller->status());
   }
+}
+
+// Calls carrying continuation_hops within the configured cap are dispatched ahead of fresh calls
+// of the same priority; hops beyond the cap count as fresh. Covers the explicit controller field
+// and the implicit one for calls issued from inside an inbound handler (thread-local).
+TEST_F(TestRpc, PriorityQueueContinuationPrecedence) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_enabled) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_continuation_max_hops) = 2;
+  auto flag_reset = ScopeExit([] {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_enabled) = false;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_priority_queue_continuation_max_hops) = 0;
+  });
+
+  TestServerOptions options;
+  options.n_worker_threads = 1;
+  TestServer server(CreateMessenger("TestServer", options.messenger_options), options);
+  ASSERT_OK(server.RegisterService(MakeCalculatorService(metric_entity()), RpcPriority::kNormal));
+  ASSERT_OK(server.Start());
+  auto* queue = server.priority_queue();
+  ASSERT_NE(queue, nullptr);
+
+  auto client_messenger = CreateAutoShutdownMessengerHolder("Client");
+  ProxyCache proxy_cache(client_messenger.get());
+  rpc_test::CalculatorServiceProxy calculator(
+      &proxy_cache, HostPort::FromBoundEndpoint(server.bound_endpoint()));
+
+  std::mutex mutex;
+  std::vector<std::string> completion_order;
+  auto record = [&mutex, &completion_order](std::string name) {
+    return [&mutex, &completion_order, name = std::move(name)] {
+      std::lock_guard lock(mutex);
+      completion_order.push_back(name);
+    };
+  };
+
+  rpc_test::SleepRequestPB blocker_req;
+  blocker_req.set_sleep_micros(500 * 1000 * kTimeMultiplier);
+  rpc_test::SleepResponsePB blocker_resp;
+  RpcController blocker_controller;
+  blocker_controller.set_timeout(30s);
+  calculator.SleepAsync(blocker_req, &blocker_resp, &blocker_controller, record("blocker"));
+  ASSERT_OK(WaitFor(
+      [queue] { return queue->TEST_dispatched() == 1; }, 10s, "blocker dispatched"));
+
+  rpc_test::SleepRequestPB req;
+  req.set_sleep_micros(100 * 1000);
+  rpc_test::SleepResponsePB fresh_resp, over_cap_resp, cont_resp, nested_resp;
+  RpcController fresh, over_cap, cont, nested;
+  for (auto* controller : {&fresh, &over_cap, &cont, &nested}) {
+    controller->set_timeout(30s);
+  }
+  // Fresh arrivals first, so that continuation precedence (not arrival order) must explain the
+  // completion order.
+  calculator.SleepAsync(req, &fresh_resp, &fresh, record("fresh"));
+  over_cap.set_continuation_hops(3);  // beyond the cap of 2: treated as fresh
+  calculator.SleepAsync(req, &over_cap_resp, &over_cap, record("over_cap"));
+  ASSERT_OK(WaitFor(
+      [queue] { return queue->TEST_queued(RpcPriority::kNormal) == 2; }, 10s, "fresh queued"));
+  ASSERT_EQ(queue->TEST_queued_continuations(), 0);
+
+  cont.set_continuation_hops(2);
+  calculator.SleepAsync(req, &cont_resp, &cont, record("cont"));
+  {
+    // Issued as if from inside a handler for a fresh call: stamped with hops 0 + 1 = 1.
+    ScopedInboundCallHops in_handler(0);
+    calculator.SleepAsync(req, &nested_resp, &nested, record("nested"));
+  }
+  ASSERT_OK(WaitFor(
+      [queue] { return queue->TEST_queued(RpcPriority::kNormal) == 4; }, 10s, "all queued"));
+  ASSERT_EQ(queue->TEST_queued_continuations(), 2);
+
+  ASSERT_OK(WaitFor(
+      [&mutex, &completion_order] {
+        std::lock_guard lock(mutex);
+        return completion_order.size() == 5;
+      }, 30s, "all calls complete"));
+  std::lock_guard lock(mutex);
+  ASSERT_EQ(completion_order[0], "blocker") << AsString(completion_order);
+  // Both continuations before both fresh calls; order within each pair is not asserted since the
+  // two calls of a pair may reach the server in either order.
+  ASSERT_EQ((std::set<std::string>{completion_order[1], completion_order[2]}),
+            (std::set<std::string>{"cont", "nested"})) << AsString(completion_order);
+  ASSERT_EQ((std::set<std::string>{completion_order[3], completion_order[4]}),
+            (std::set<std::string>{"fresh", "over_cap"})) << AsString(completion_order);
+  for (auto* controller : {&blocker_controller, &fresh, &over_cap, &cont, &nested}) {
+    ASSERT_OK(controller->status());
+  }
+  ASSERT_EQ(NestedCallContinuationHops(), 0) << "scope must restore the thread-local";
 }
 
 } // namespace rpc

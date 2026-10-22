@@ -232,6 +232,11 @@ Status ParseHeader(
           }
         }
         break;
+      case RequestHeader::kContinuationHopsFieldNumber:
+        if (!in->ReadVarint32(&parsed_header->continuation_hops)) {
+          return STATUS(Corruption, "Unable to decode continuation_hops field");
+        }
+        break;
       case RequestHeader::kCrcFieldNumber: {
           uint32_t crc;
           if (!in->ReadLittleEndian32(&crc)) {
@@ -414,6 +419,9 @@ void ParsedRequestHeader::ToPB(RequestHeader* out) const {
   if (priority) {
     out->set_priority(static_cast<RpcPriorityPB>(std::to_underlying(*priority) + 1));
   }
+  if (continuation_hops) {
+    out->set_continuation_hops(continuation_hops);
+  }
   if (crc) {
     out->set_crc(*crc);
   }
@@ -422,7 +430,7 @@ void ParsedRequestHeader::ToPB(RequestHeader* out) const {
 std::string ParsedRequestHeader::ToString() const {
   return YB_STRUCT_TO_STRING(
       (remote_method, RemoteMethodAsString()), call_id, timeout_ms, sidecar_offsets, pool_tag,
-      priority, crc);
+      priority, continuation_hops, crc);
 }
 
 Status ParseMetadata(Slice buf, AnyMessagePtr out) {

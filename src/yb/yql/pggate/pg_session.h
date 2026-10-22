@@ -54,11 +54,14 @@ struct PgSessionRunOptions {
   HybridTime in_txn_limit{};
   ForceNonBufferable force_non_bufferable{ForceNonBufferable::kFalse};
   std::optional<PgSessionRunOperationMarker> marker{};
+  // Perform requests the issuing statement has already completed; see
+  // PgPerformOptionsPB.continuation_hops.
+  uint32_t continuation_hops = 0;
 
   friend bool operator==(const PgSessionRunOptions&, const PgSessionRunOptions&) = default;
 
   std::string ToString() const {
-      return YB_STRUCT_TO_STRING(in_txn_limit, force_non_bufferable, marker);
+      return YB_STRUCT_TO_STRING(in_txn_limit, force_non_bufferable, marker, continuation_hops);
   }
 };
 
@@ -239,6 +242,7 @@ class PgSession final : public std::enable_shared_from_this<PgSession> {
     std::optional<ReadTimeAction> read_time_action = {};
     std::optional<CacheOptions> cache_options = std::nullopt;
     HybridTime in_txn_limit = {};
+    uint32_t continuation_hops = 0;
   };
 
   Result<PerformFuture> Perform(BufferableOperations&& ops, PerformOptions&& options);

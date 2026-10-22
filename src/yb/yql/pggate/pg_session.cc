@@ -412,11 +412,12 @@ class PgSession::RunHelper {
  public:
   RunHelper(
       PgSession* pg_session, SessionType session_type, HybridTime in_txn_limit,
-      ForceNonBufferable force_non_bufferable)
+      ForceNonBufferable force_non_bufferable, uint32_t continuation_hops = 0)
       : pg_session_(*pg_session),
         session_type_(session_type),
         in_txn_limit_(in_txn_limit),
-        force_non_bufferable_(force_non_bufferable) {
+        force_non_bufferable_(force_non_bufferable),
+        continuation_hops_(continuation_hops) {
     VLOG(2) << "RunHelper session_type: " << ToString(session_type_)
             << ", in_txn_limit: " << ToString(in_txn_limit_)
             << ", force_non_bufferable: " << force_non_bufferable_;
@@ -538,7 +539,8 @@ class PgSession::RunHelper {
         std::move(ops_info_.ops), {.use_legacy_catalog_session = IsLegacyCatalog(),
                                    .has_catalog_ops = has_catalog_ops_,
                                    .cache_options = std::move(cache_options),
-                                   .in_txn_limit = in_txn_limit_});
+                                   .in_txn_limit = in_txn_limit_,
+                                   .continuation_hops = continuation_hops_});
   }
 
  private:
@@ -605,6 +607,7 @@ class PgSession::RunHelper {
   const SessionType session_type_;
   const HybridTime in_txn_limit_;
   const ForceNonBufferable force_non_bufferable_;
+  const uint32_t continuation_hops_;
   bool has_catalog_ops_ = false;
 };
 
@@ -1000,6 +1003,9 @@ Result<PerformFuture> PgSession::Perform(BufferableOperations&& ops, PerformOpti
     }
   }
   options.set_trace_requested(pg_txn_manager_->ShouldEnableTracing());
+  if (ops_options.continuation_hops) {
+    options.set_continuation_hops(ops_options.continuation_hops);
+  }
 
   if (ops_options.cache_options) {
     auto& cache_options = *ops_options.cache_options;
@@ -1228,7 +1234,8 @@ Result<PerformFuture> PgSession::DoRunAsync(
         first_table.pg_table_id().object_oid)));
   }
   RunHelper runner(
-      this, group_session_type, options.in_txn_limit, force_non_bufferable);
+      this, group_session_type, options.in_txn_limit, force_non_bufferable,
+      options.continuation_hops);
   const auto ddl_force_catalog_mod_opt = pg_txn_manager_->GetDdlForceCatalogModification();
   auto processor =
       [this,
