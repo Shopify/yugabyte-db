@@ -214,8 +214,10 @@ class HollowTServer {
   }
 
   // mirror_tmpl, when set, is a captured real-tserver request used as the payload; the metrics
-  // shape then follows metrics_override instead of the hb_seq_ cadence.
+  // shape then follows metrics_override instead of the hb_seq_ cadence. reg_tmpl, when set, is
+  // the real tserver's registration; only the addresses and the zone are rewritten.
   void FillHeartbeat(const string& universe_uuid, const master::TSHeartbeatRequestPB* mirror_tmpl,
+                     const master::TSRegistrationPB* reg_tmpl,
                      std::optional<bool> metrics_override, master::TSHeartbeatRequestPB* req) {
     req->Clear();
     std::lock_guard l(mutex_);
@@ -248,7 +250,12 @@ class HollowTServer {
     }
 
     if (needs_registration_) {
+      if (reg_tmpl != nullptr) {
+        req->mutable_registration()->CopyFrom(*reg_tmpl);
+      }
       auto* reg = req->mutable_registration()->mutable_common();
+      reg->clear_private_rpc_addresses();
+      reg->clear_broadcast_addresses();
       auto* addr = reg->add_private_rpc_addresses();
       addr->set_host(host_port_.host());
       addr->set_port(host_port_.port());
@@ -784,6 +791,11 @@ class MirrorState {
     return metrics ? metrics_template_ : light_template_;
   }
 
+  std::shared_ptr<const master::TSRegistrationPB> RegistrationTemplate() {
+    std::lock_guard l(mutex_);
+    return registration_template_;
+  }
+
   // Milliseconds, 0 until at least two beats of the kind were seen.
   double MeasuredIntervalMs() {
     std::lock_guard l(mutex_);
@@ -857,6 +869,10 @@ class MirrorState {
       }
       last_metrics_heartbeat_ = now;
     }
+    if (req.has_registration()) {
+      registration_template_ =
+          std::make_shared<const master::TSRegistrationPB>(req.registration());
+    }
     // Registration and full-report beats are one-offs, not steady-state payload shapes.
     if (req.has_registration() ||
         (req.has_tablet_report() && !req.tablet_report().is_incremental())) {
@@ -880,6 +896,7 @@ class MirrorState {
   std::map<string, MethodCounters> methods_ GUARDED_BY(mutex_);
   std::shared_ptr<const master::TSHeartbeatRequestPB> light_template_ GUARDED_BY(mutex_);
   std::shared_ptr<const master::TSHeartbeatRequestPB> metrics_template_ GUARDED_BY(mutex_);
+  std::shared_ptr<const master::TSRegistrationPB> registration_template_ GUARDED_BY(mutex_);
   std::deque<ReplayItem> replay_queue_ GUARDED_BY(mutex_);
   uint64_t heartbeats_captured_ GUARDED_BY(mutex_) = 0;
   uint64_t light_templates_ GUARDED_BY(mutex_) = 0;
@@ -1433,6 +1450,12 @@ class HeartbeatBench {
     RETURN_NOT_OK(tserver_process_->Start());
     LOG(INFO) << "Started yb-tserver pid " << tserver_process_->pid();
     std::ofstream(PidFilePath("tserver")) << tserver_process_->pid() << "\n";
+    // Hollow registrations are copies of the real one, so it has to arrive first.
+    const auto deadline = MonoTime::Now() + 60s;
+    while (!mirror_state_->RegistrationTemplate()) {
+      SCHECK(MonoTime::Now() < deadline, TimedOut, "Real tserver did not register");
+      SleepFor(100ms);
+    }
     return Status::OK();
   }
 
@@ -1521,6 +1544,7 @@ class HeartbeatBench {
       universe_uuid = universe_uuid_;
     }
     std::shared_ptr<const master::TSHeartbeatRequestPB> tmpl;
+    std::shared_ptr<const master::TSRegistrationPB> reg_tmpl;
     std::optional<bool> metrics_override;
     if (mirror_state_) {
       const auto now = MonoTime::Now();
@@ -1532,6 +1556,7 @@ class HeartbeatBench {
       const bool want_metrics =
           !ts->last_metrics_beat.Initialized() || now >= ts->last_metrics_beat + period;
       tmpl = mirror_state_->TemplateFor(want_metrics);
+      reg_tmpl = mirror_state_->RegistrationTemplate();
       if (tmpl) {
         metrics_override = want_metrics;
         if (want_metrics) {
@@ -1540,7 +1565,7 @@ class HeartbeatBench {
       }
     }
     ts->MarkRegistrationInFlight();
-    ts->FillHeartbeat(universe_uuid, tmpl.get(), metrics_override, &ts->hb_req);
+    ts->FillHeartbeat(universe_uuid, tmpl.get(), reg_tmpl.get(), metrics_override, &ts->hb_req);
     ts->hb_controller.Reset();
     ts->hb_controller.set_timeout(15s);
     ts->heartbeat_sent_time = MonoTime::Now();
