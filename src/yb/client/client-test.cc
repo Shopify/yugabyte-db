@@ -130,8 +130,9 @@ DECLARE_int32(log_inject_latency_ms_mean);
 DECLARE_int32(log_inject_latency_ms_stddev);
 DECLARE_int32(master_inject_latency_on_tablet_lookups_ms);
 DECLARE_int32(max_create_tablets_per_ts);
-DECLARE_int32(tablet_server_svc_queue_length);
 DECLARE_int32(replication_factor);
+DECLARE_int32(retry_failed_replica_ms);
+DECLARE_int32(tablet_server_svc_queue_length);
 
 DEFINE_NON_RUNTIME_int32(test_scan_num_rows, 1000, "Number of rows to insert and scan");
 DECLARE_int32(min_backoff_ms_exponent);
@@ -145,6 +146,9 @@ DECLARE_int32(pgsql_proxy_webserver_port);
 DECLARE_int32(scheduled_full_compaction_frequency_hours);
 DECLARE_int32(rocksdb_level0_file_num_compaction_trigger);
 
+METRIC_DECLARE_gauge_uint64(meta_cache_failed_replicas);
+METRIC_DECLARE_counter(meta_cache_replicas_marked_failed);
+METRIC_DECLARE_counter(meta_cache_tserver_marked_failed);
 METRIC_DECLARE_counter(rpcs_queue_overflow);
 
 DECLARE_bool(enable_metacache_partial_refresh);
@@ -2795,8 +2799,9 @@ TEST_F(ClientTest, RefreshPartitions) {
   LOG(INFO) << "num_lookups_done: " << num_lookups_done;
 }
 
+template <class ClientOrCache>
 Result<client::internal::RemoteTabletPtr> GetRemoteTablet(
-    const TabletId& tablet_id, bool use_cache, YBClient* client) {
+    const TabletId& tablet_id, bool use_cache, ClientOrCache* client) {
   std::promise<Result<client::internal::RemoteTabletPtr>> tablet_lookup_promise;
   auto future = tablet_lookup_promise.get_future();
   client->LookupTabletById(
@@ -3007,6 +3012,150 @@ RefreshBurstResult ApplyConsensusInfoConcurrently(
 }
 
 }  // namespace
+
+TEST_F(ClientTest, MetaCacheFailureMetrics) {
+  MetricRegistry registry;
+  auto entity = METRIC_ENTITY_server.Instantiate(&registry, "metacache-test");
+  auto metric_client = ASSERT_RESULT(YBClientBuilder()
+      .add_master_server_addr(ToString(cluster_->mini_master()->bound_rpc_addr()))
+      .set_metric_entity(entity)
+      .Build());
+  scoped_refptr<internal::MetaCache> cache(new internal::MetaCache(metric_client.get()));
+  auto failed = METRIC_meta_cache_failed_replicas.Instantiate(entity, 0);
+  auto sweeps = METRIC_meta_cache_tserver_marked_failed.Instantiate(entity);
+  auto swept_replicas = METRIC_meta_cache_replicas_marked_failed.Instantiate(entity);
+
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> locations;
+  ASSERT_OK(client_->GetTabletsFromTableId(client_table_.table()->id(), 0, &locations));
+  ASSERT_EQ(locations.size(), kNumTablets);
+  const auto context = ASSERT_RESULT(internal::LookupContext::Create(nullptr, std::nullopt));
+  ASSERT_OK(cache->ProcessTabletLocations(locations, internal::AllowSplitTablet::kFalse, context));
+  std::vector<internal::RemoteTabletPtr> tablets;
+  for (const auto& location : locations) {
+    tablets.push_back(ASSERT_RESULT(GetRemoteTablet(location.tablet_id(), true, cache.get())));
+  }
+  auto& tablet = tablets.front();
+  auto servers = tablet->GetRemoteTabletServers();
+  ASSERT_EQ(servers.size(), NumTabletServers());
+  auto* ts = servers.front();
+  const auto failure = STATUS(NetworkError, "test failure");
+  ASSERT_EQ(failed->value(), 0);
+  ASSERT_TRUE(tablet->MarkReplicaFailed(ts, failure));
+  ASSERT_TRUE(tablet->MarkReplicaFailed(ts, failure));
+  ASSERT_EQ(failed->value(), 1);
+  ASSERT_EQ(sweeps->value(), 0);
+  ASSERT_EQ(swept_replicas->value(), 0);
+
+  // Sweeps count matching entries again, but the gauge counts each failed entry only once.
+  for (int i = 1; i <= 2; ++i) {
+    cache->MarkTSFailed(ts, failure);
+    ASSERT_EQ(sweeps->value(), i);
+    ASSERT_EQ(swept_replicas->value(), i * kNumTablets);
+    ASSERT_EQ(failed->value(), kNumTablets);
+    for (const auto& remote : tablets) {
+      ASSERT_EQ(remote->GetNumFailedReplicas(), 1);
+    }
+  }
+
+  const auto retry_failed_replica_ms = FLAGS_retry_failed_replica_ms;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_retry_failed_replica_ms) = 0;
+  ASSERT_EQ(tablet->GetRemoteTabletServers().size(), servers.size());
+  ASSERT_EQ(tablet->GetNumFailedReplicas(), 0);
+  ASSERT_EQ(failed->value(), kNumTablets - 1);
+  tablet->GetRemoteTabletServers();
+  ASSERT_EQ(failed->value(), kNumTablets - 1);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_retry_failed_replica_ms) = retry_failed_replica_ms;
+  ASSERT_OK(cache->ProcessTabletLocations(locations, internal::AllowSplitTablet::kFalse, context));
+  ASSERT_EQ(failed->value(), 0);
+
+  for (const bool from_raft : {false, true}) {
+    SCOPED_TRACE(from_raft ? "raft refresh" : "master refresh");
+    ASSERT_TRUE(tablet->MarkReplicaFailed(ts, failure));
+    std::shared_ptr<internal::RemoteReplica> retained_replica;
+    {
+      SharedLock lock(tablet->mutex_);
+      retained_replica = tablet->replicas_.front();
+    }
+    ASSERT_EQ(failed->value(), 1);
+    if (from_raft) {
+      const auto info = MakeTabletConsensusInfo(
+          locations.Get(0), tablet->current_leader_uuid(), tablet->raft_config_opid_index() + 1);
+      ASSERT_OK(cache->RefreshTabletInfoWithConsensusInfo(info));
+    } else {
+      ASSERT_OK(cache->ProcessTabletLocations(
+          locations, internal::AllowSplitTablet::kFalse, context));
+    }
+    ASSERT_EQ(failed->value(), 0);
+    ASSERT_TRUE(tablet->MarkReplicaFailed(ts, failure));
+    ASSERT_EQ(failed->value(), 1);
+    {
+      // Recovery can retain an old replica across refresh, then clear it under the tablet lock.
+      std::lock_guard lock(tablet->mutex_);
+      ASSERT_TRUE(retained_replica->Failed());
+      retained_replica->ClearFailed();
+      retained_replica->ClearFailed();
+    }
+    retained_replica.reset();
+    ASSERT_EQ(failed->value(), 1);
+    ASSERT_EQ(tablet->GetNumFailedReplicas(), 1);
+    ASSERT_OK(cache->ProcessTabletLocations(
+        locations, internal::AllowSplitTablet::kFalse, context));
+    ASSERT_EQ(failed->value(), 0);
+  }
+  ASSERT_EQ(sweeps->value(), 2);
+  ASSERT_EQ(swept_replicas->value(), 2 * kNumTablets);
+}
+
+TEST_F(ClientTest, MetaCacheFailureMetricLifetime) {
+  MetricRegistry registry;
+  auto entity = METRIC_ENTITY_server.Instantiate(&registry, "metacache-lifetime-test");
+  auto build_client = [&] {
+    return YBClientBuilder()
+        .add_master_server_addr(ToString(cluster_->mini_master()->bound_rpc_addr()))
+        .set_metric_entity(entity)
+        .Build();
+  };
+  auto first_client = ASSERT_RESULT(build_client());
+  auto failed = METRIC_meta_cache_failed_replicas.Instantiate(entity, 0);
+  const auto tablet_id = GetFirstTabletId(client_table_.table().get());
+  auto first_tablet = ASSERT_RESULT(GetRemoteTablet(tablet_id, false, first_client.get()));
+  const auto failure = STATUS(NetworkError, "test failure");
+  auto* first_leader = first_tablet->LeaderTServer();
+  ASSERT_ONLY_NOTNULL(first_leader);
+  ASSERT_TRUE(first_tablet->MarkReplicaFailed(first_leader, failure));
+  ASSERT_EQ(failed->value(), 1);
+
+  // A second cache using the same entity must not reset the first cache's contribution.
+  auto second_client = ASSERT_RESULT(build_client());
+  ASSERT_EQ(failed->value(), 1);
+  auto second_tablet = ASSERT_RESULT(GetRemoteTablet(tablet_id, false, second_client.get()));
+  auto* second_leader = second_tablet->LeaderTServer();
+  ASSERT_ONLY_NOTNULL(second_leader);
+  ASSERT_TRUE(second_tablet->MarkReplicaFailed(second_leader, failure));
+  ASSERT_EQ(failed->value(), 2);
+
+  first_client->ClearAllMetaCachesOnServer();
+  ASSERT_EQ(failed->value(), 2);
+  ASSERT_EQ(first_tablet->GetNumFailedReplicas(), 1);
+  auto replacement = ASSERT_RESULT(GetRemoteTablet(tablet_id, false, first_client.get()));
+  ASSERT_NE(first_tablet.get(), replacement.get());
+  auto* replacement_leader = replacement->LeaderTServer();
+  ASSERT_ONLY_NOTNULL(replacement_leader);
+  ASSERT_TRUE(replacement->MarkReplicaFailed(replacement_leader, failure));
+  ASSERT_EQ(failed->value(), 3);
+  replacement.reset();
+  ASSERT_EQ(failed->value(), 3);
+  first_client.reset();
+  ASSERT_EQ(failed->value(), 2);
+  first_tablet.reset();
+  ASSERT_EQ(failed->value(), 1);
+
+  // An in-flight RPC's reference can outlive the cache; the contribution follows that reference.
+  second_client.reset();
+  ASSERT_EQ(failed->value(), 1);
+  second_tablet.reset();
+  ASSERT_EQ(failed->value(), 0);
+}
 
 // A burst of identical consensus info refreshes should apply exactly once, with the rest
 // discarded without taking the exclusive lock.
