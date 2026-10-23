@@ -1382,7 +1382,7 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
     // replica is reporting the same consensus configuration we already know about, but we
     // haven't yet heard from all the tservers in the config, update the in-memory
     // ReplicaLocations.
-    LOG(INFO) << "Tablet server " << ts_desc->permanent_uuid() << " sent "
+    VLOG(1) << "Tablet server " << ts_desc->permanent_uuid() << " sent "
             << (is_incremental ? "incremental" : "full tablet")
             << " report for " << tablet->tablet_id()
             << ", prev state op id: " << prev_cstate.config().committed_op_index()
@@ -1391,7 +1391,7 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
             << ". Consensus state: " << cstate.ShortDebugString();
     if (FLAGS_enable_register_ts_from_raft &&
         ReplicaMapDiffersFromConsensusState(tablet, cstate)) {
-      LOG(INFO) << Format("Tablet replica map differs from reported consensus state. Replica map: "
+      VLOG(1) << Format("Tablet replica map differs from reported consensus state. Replica map: "
           "$0. Reported consensus state: $1.", *tablet->GetReplicaLocations(),
           cstate.ShortDebugString());
       UpdateTabletReplicasAfterConfigChange(
