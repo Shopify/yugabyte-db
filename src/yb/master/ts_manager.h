@@ -220,8 +220,9 @@ class TSManager {
   // Performs all mutations necessary to register a new tserver or update the registration of an
   // existing tserver. There are two registration pathways, one through heartbeats and the other
   // through membership in a tablet group that is heartbeating to the master.
+  template <class Instance, class Registration>
   Result<TSDescriptorPtr> RegisterInternal(
-      const NodeInstancePB& instance, const TSRegistrationPB& registration,
+      const Instance& instance, const Registration& registration,
       std::optional<std::reference_wrapper<const LWTSHeartbeatRequestPB>> request,
       CloudInfoPB&& local_master_cloud_info, const LeaderEpoch& epoch,
       rpc::ProxyCache* proxy_cache);
@@ -242,8 +243,9 @@ class TSManager {
   //
   // This function does not perform the mutations itself because interleaving the IO of sys catalog
   // writes with various locks is complex.
+  template <class Instance, class Registration>
   Result<RegistrationMutationData> ComputeRegistrationMutationData(
-      const NodeInstancePB& instance, const TSRegistrationPB& registration,
+      const Instance& instance, const Registration& registration,
       CloudInfoPB&& local_master_cloud_info, rpc::ProxyCache* proxy_cache,
       RegisteredThroughHeartbeat registered_through_heartbeat) REQUIRES(registration_lock_);
 
@@ -253,8 +255,9 @@ class TSManager {
   //
   // This function does not call the callback but instead returns it if it should be called. Callers
   // must call the callback if it is not empty.
+  template <class Instance, class Registration>
   Result<std::pair<TSDescriptorPtr, TSCountCallback>> DoRegistrationMutation(
-      const NodeInstancePB& new_ts_instance, const TSRegistrationPB& registration,
+      const Instance& new_ts_instance, const Registration& registration,
       RegistrationMutationData&& registration_data, const LeaderEpoch& epoch)
       REQUIRES(registration_lock_);
 

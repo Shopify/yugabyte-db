@@ -102,7 +102,7 @@ size_t MajoritySize(size_t num_voters);
 // Determines the member type that the peer with uuid 'uuid' plays in the cluster.
 // If the peer uuid is not a voter in the configuration, this function will return
 // UNKNOWN_MEMBER_TYPE.
-PeerMemberType GetConsensusMemberType(const std::string& uuid, const ConsensusStatePB& cstate);
+PeerMemberType GetConsensusMemberType(const std::string& uuid, const LWConsensusStatePB& cstate);
 
 // Verifies that the provided configuration is well formed.
 // If type == COMMITTED_QUORUM, we enforce that opid_index is set.

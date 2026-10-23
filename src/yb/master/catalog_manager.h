@@ -730,7 +730,7 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
       const std::set<TabletId>& new_running_tablets = {});
 
   void StartElectionIfReady(
-      const consensus::ConsensusStatePB& cstate, const LeaderEpoch& epoch,
+      const consensus::LWConsensusStatePB& cstate, const LeaderEpoch& epoch,
       const TabletInfoPtr& tablet);
 
   Result<bool> IsTableUndergoingPitrRestore(const TableInfo& table_info);

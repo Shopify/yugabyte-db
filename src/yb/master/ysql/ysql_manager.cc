@@ -327,7 +327,7 @@ Status YsqlManager::ValidateWriteToCatalogTableAllowed(
   return Status::OK();
 }
 
-Status YsqlManager::ValidateTServerVersion(const VersionInfoPB& version) const {
+Status YsqlManager::ValidateTServerVersion(const LWVersionInfoPB& version) const {
   return ysql_initdb_and_major_upgrade_helper_->ValidateTServerVersion(version);
 }
 

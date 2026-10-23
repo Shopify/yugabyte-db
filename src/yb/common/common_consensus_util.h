@@ -54,5 +54,8 @@ bool IsRaftConfigVoter(std::string_view tserver_uuid, const LWRaftConfigPB& conf
 // NON_PARTICIPANT, regardless of whether it is listed as leader in cstate.
 PeerRole GetConsensusRole(std::string_view permanent_uuid, const ConsensusStatePB& cstate);
 PeerRole GetConsensusRole(std::string_view permanent_uuid, const LWConsensusStatePB& cstate);
+// Same, with the leader taken from the caller rather than from the message.
+PeerRole GetConsensusRole(
+    std::string_view permanent_uuid, std::string_view leader_uuid, const LWRaftConfigPB& config);
 
 } // namespace yb::consensus

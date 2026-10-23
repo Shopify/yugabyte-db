@@ -84,18 +84,54 @@ TSDescriptor::TSDescriptor(const std::string& permanent_uuid,
     last_replica_creations_decay_(MonoTime::Now()),
     num_live_replicas_(0) {}
 
+namespace {
+
+// LW messages have no assignment into their protobuf counterparts.
+template <class PB>
+void CopyTo(const PB& src, PB* dst) {
+  *dst = src;
+}
+
+template <class LW, class PB>
+void CopyTo(const LW& src, PB* dst) {
+  src.ToGoogleProtobuf(dst);
+}
+
+}  // namespace
+
+template <class Instance, class Registration>
+Result<std::pair<TSDescriptorPtr, TSDescriptor::WriteLock>> TSDescriptor::DoCreateNew(
+    const Instance& instance, const Registration& registration,
+    CloudInfoPB&& local_master_cloud_info, rpc::ProxyCache* proxy_cache,
+    RegisteredThroughHeartbeat registered_through_heartbeat) {
+  auto desc = std::make_shared<TSDescriptor>(
+      std::string(instance.permanent_uuid()), registered_through_heartbeat,
+      std::move(local_master_cloud_info), proxy_cache);
+  auto lock = VERIFY_RESULT(desc->DoUpdateRegistration(
+      instance, registration, registered_through_heartbeat));
+  return std::make_pair(std::move(desc), std::move(lock));
+}
+
 Result<std::pair<TSDescriptorPtr, TSDescriptor::WriteLock>> TSDescriptor::CreateNew(
     const NodeInstancePB& instance,
     const TSRegistrationPB& registration,
     CloudInfoPB&& local_master_cloud_info,
     rpc::ProxyCache* proxy_cache,
     RegisteredThroughHeartbeat registered_through_heartbeat) {
-  auto desc = std::make_shared<TSDescriptor>(
-      instance.permanent_uuid(), registered_through_heartbeat, std::move(local_master_cloud_info),
-      proxy_cache);
-  auto lock = VERIFY_RESULT(desc->UpdateRegistration(
-      instance, registration, registered_through_heartbeat));
-  return std::make_pair(std::move(desc), std::move(lock));
+  return DoCreateNew(
+      instance, registration, std::move(local_master_cloud_info), proxy_cache,
+      registered_through_heartbeat);
+}
+
+Result<std::pair<TSDescriptorPtr, TSDescriptor::WriteLock>> TSDescriptor::CreateNew(
+    const LWNodeInstancePB& instance,
+    const LWTSRegistrationPB& registration,
+    CloudInfoPB&& local_master_cloud_info,
+    rpc::ProxyCache* proxy_cache,
+    RegisteredThroughHeartbeat registered_through_heartbeat) {
+  return DoCreateNew(
+      instance, registration, std::move(local_master_cloud_info), proxy_cache,
+      registered_through_heartbeat);
 }
 
 TSDescriptorPtr TSDescriptor::LoadFromEntry(
@@ -120,7 +156,20 @@ TSDescriptorPtr TSDescriptor::LoadFromEntry(
 Result<TSDescriptor::WriteLock> TSDescriptor::UpdateRegistration(
     const NodeInstancePB& instance, const TSRegistrationPB& registration,
     RegisteredThroughHeartbeat registered_through_heartbeat) {
-  CHECK_EQ(instance.permanent_uuid(), permanent_uuid());
+  return DoUpdateRegistration(instance, registration, registered_through_heartbeat);
+}
+
+Result<TSDescriptor::WriteLock> TSDescriptor::UpdateRegistration(
+    const LWNodeInstancePB& instance, const LWTSRegistrationPB& registration,
+    RegisteredThroughHeartbeat registered_through_heartbeat) {
+  return DoUpdateRegistration(instance, registration, registered_through_heartbeat);
+}
+
+template <class Instance, class Registration>
+Result<TSDescriptor::WriteLock> TSDescriptor::DoUpdateRegistration(
+    const Instance& instance, const Registration& registration,
+    RegisteredThroughHeartbeat registered_through_heartbeat) {
+  CHECK_EQ(Slice(instance.permanent_uuid()), Slice(permanent_uuid()));
 
   auto l = LockForWrite();
   int64_t latest_seqno = l->pb.instance_seqno();
@@ -144,10 +193,10 @@ Result<TSDescriptor::WriteLock> TSDescriptor::UpdateRegistration(
   if (instance.has_start_time_us()) {
     l.mutable_data()->pb.set_start_time_us(instance.start_time_us());
   }
-  *l.mutable_data()->pb.mutable_registration() = registration.common();
-  *l.mutable_data()->pb.mutable_resources() = registration.resources();
+  CopyTo(registration.common(), l.mutable_data()->pb.mutable_registration());
+  CopyTo(registration.resources(), l.mutable_data()->pb.mutable_resources());
   if (registration.has_version_info()) {
-    *l.mutable_data()->pb.mutable_version_info() = registration.version_info();
+    CopyTo(registration.version_info(), l.mutable_data()->pb.mutable_version_info());
   } else {
     l.mutable_data()->pb.clear_version_info();
   }
@@ -160,7 +209,7 @@ Result<TSDescriptor::WriteLock> TSDescriptor::UpdateRegistration(
       registered_through_heartbeat ? SysTabletServerEntryPB::MAYBE_HAS_LEASE
                                    : SysTabletServerEntryPB::DEFINITELY_NO_LEASE);
   latest_report_seqno_ = std::numeric_limits<int32_t>::min();
-  placement_id_ = generate_placement_id(registration.common().cloud_info());
+  placement_id_ = generate_placement_id(l.mutable_data()->pb.registration().cloud_info());
   proxies_.reset();
   // Once a tserver is marked as faulty it remains that way until it reregisters here.
   // If it is still faulty, then it will be marked again as part of UpdateFromHeartbeat afterwards.

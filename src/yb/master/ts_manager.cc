@@ -77,24 +77,29 @@ namespace yb::master {
 namespace {
 
 bool HasSameHostPort(const HostPortPB& lhs, const HostPortPB& rhs);
+bool HasSameHostPort(const HostPortPB& lhs, const LWHostPortPB& rhs);
 
-bool HasSameHostPort(const google::protobuf::RepeatedPtrField<HostPortPB>& lhs,
-                     const google::protobuf::RepeatedPtrField<HostPortPB>& rhs);
-
+template <class HostPorts>
 bool HasSameHostPort(
-    const ServerRegistrationPB& lhs, const ServerRegistrationPB& rhs,
-    const CloudInfoPB& cloud_info);
+    const google::protobuf::RepeatedPtrField<HostPortPB>& lhs, const HostPorts& rhs);
 
-bool HasSameHostPort(const ServerRegistrationPB& lhs, const ServerRegistrationPB& rhs);
-
+template <class Registration>
 bool HasSameHostPort(
-    const ServerRegistrationPB& lhs, const ServerRegistrationPB& rhs,
+    const ServerRegistrationPB& lhs, const Registration& rhs, const CloudInfoPB& cloud_info);
+
+template <class Registration>
+bool HasSameHostPort(const ServerRegistrationPB& lhs, const Registration& rhs);
+
+template <class Registration>
+bool HasSameHostPort(
+    const ServerRegistrationPB& lhs, const Registration& rhs,
     const std::vector<CloudInfoPB>& perspectives);
 
 // Returns a function to determine whether a registered ts matches the host port of the registering
 // ts.
+template <class Registration>
 std::function<bool(const ServerRegistrationPB&)> GetHostPortCheckerFunction(
-    const TSRegistrationPB& registration, const CloudInfoPB& local_master_cloud_info);
+    const Registration& registration, const CloudInfoPB& local_master_cloud_info);
 
 class TSDescriptorLoader : public Visitor<PersistentTServerInfo> {
  public:
@@ -174,15 +179,16 @@ std::optional<TSDescriptorPtr> TSManager::LookupTSInternalUnlocked(
   return *found_ptr;
 }
 
+template <class Instance, class Registration>
 Result<TSManager::RegistrationMutationData> TSManager::ComputeRegistrationMutationData(
-    const NodeInstancePB& instance, const TSRegistrationPB& registration,
+    const Instance& instance, const Registration& registration,
     CloudInfoPB&& local_master_cloud_info, rpc::ProxyCache* proxy_cache,
     RegisteredThroughHeartbeat registered_through_heartbeat) {
   TSManager::RegistrationMutationData reg_data;
   {
     auto hostport_checker = GetHostPortCheckerFunction(registration, local_master_cloud_info);
     SharedLock<decltype(map_lock_)> map_l(map_lock_);
-    const std::string& uuid = instance.permanent_uuid();
+    const std::string uuid(instance.permanent_uuid());
 
     for (auto it = servers_by_id_.begin();; ++it) {
       auto ts_desc = it != servers_by_id_.end() ? it->second : nullptr;
@@ -254,13 +260,13 @@ Result<TSDescriptorPtr> TSManager::RegisterFromHeartbeat(
     const LWTSHeartbeatRequestPB& heartbeat_request, const LeaderEpoch& epoch,
     CloudInfoPB&& local_master_cloud_info, rpc::ProxyCache* proxy_cache) {
   return RegisterInternal(
-      heartbeat_request.common().ts_instance().ToGoogleProtobuf(),
-      heartbeat_request.registration().ToGoogleProtobuf(),
+      heartbeat_request.common().ts_instance(), heartbeat_request.registration(),
       std::cref(heartbeat_request), std::move(local_master_cloud_info), epoch, proxy_cache);
 }
 
+template <class Instance, class Registration>
 Result<TSDescriptorPtr> TSManager::RegisterInternal(
-    const NodeInstancePB& instance, const TSRegistrationPB& registration,
+    const Instance& instance, const Registration& registration,
     std::optional<std::reference_wrapper<const LWTSHeartbeatRequestPB>> request,
     CloudInfoPB&& local_master_cloud_info, const LeaderEpoch& epoch,
     rpc::ProxyCache* proxy_cache) {
@@ -284,8 +290,9 @@ Result<TSDescriptorPtr> TSManager::RegisterInternal(
   return ts_desc;
 }
 
+template <class Instance, class Registration>
 Result<std::pair<TSDescriptorPtr, TSCountCallback>> TSManager::DoRegistrationMutation(
-    const NodeInstancePB& new_ts_instance, const TSRegistrationPB& registration,
+    const Instance& new_ts_instance, const Registration& registration,
     TSManager::RegistrationMutationData&& registration_data,
     const LeaderEpoch& epoch) {
   TSCountCallback callback;
@@ -300,7 +307,8 @@ Result<std::pair<TSDescriptorPtr, TSCountCallback>> TSManager::DoRegistrationMut
   }
   if (registration_data.insert_into_map) {
     std::lock_guard map_l(map_lock_);
-    InsertOrDie(&servers_by_id_, new_ts_instance.permanent_uuid(), registration_data.desc);
+    InsertOrDie(
+        &servers_by_id_, std::string(new_ts_instance.permanent_uuid()), registration_data.desc);
     LOG(INFO) << "Registered new tablet server { " << new_ts_instance.ShortDebugString()
               << " } with Master, full list: " << yb::ToString(servers_by_id_);
     if (ts_count_callback_) {
@@ -609,8 +617,13 @@ bool HasSameHostPort(const HostPortPB& lhs, const HostPortPB& rhs) {
   return lhs.host() == rhs.host() && lhs.port() == rhs.port();
 }
 
-bool HasSameHostPort(const google::protobuf::RepeatedPtrField<HostPortPB>& lhs,
-                     const google::protobuf::RepeatedPtrField<HostPortPB>& rhs) {
+bool HasSameHostPort(const HostPortPB& lhs, const LWHostPortPB& rhs) {
+  return Slice(lhs.host()) == rhs.host() && lhs.port() == rhs.port();
+}
+
+template <class HostPorts>
+bool HasSameHostPort(
+    const google::protobuf::RepeatedPtrField<HostPortPB>& lhs, const HostPorts& rhs) {
   for (const auto& lhs_hp : lhs) {
     for (const auto& rhs_hp : rhs) {
       if (HasSameHostPort(lhs_hp, rhs_hp)) {
@@ -621,19 +634,21 @@ bool HasSameHostPort(const google::protobuf::RepeatedPtrField<HostPortPB>& lhs,
   return false;
 }
 
+template <class Registration>
 bool HasSameHostPort(
-    const ServerRegistrationPB& lhs, const ServerRegistrationPB& rhs,
-    const CloudInfoPB& cloud_info) {
+    const ServerRegistrationPB& lhs, const Registration& rhs, const CloudInfoPB& cloud_info) {
   return HasSameHostPort(DesiredHostPort(lhs, cloud_info), DesiredHostPort(rhs, cloud_info));
 }
 
-bool HasSameHostPort(const ServerRegistrationPB& lhs, const ServerRegistrationPB& rhs) {
+template <class Registration>
+bool HasSameHostPort(const ServerRegistrationPB& lhs, const Registration& rhs) {
   return HasSameHostPort(lhs.private_rpc_addresses(), rhs.private_rpc_addresses()) ||
          HasSameHostPort(lhs.broadcast_addresses(), rhs.broadcast_addresses());
 }
 
+template <class Registration>
 bool HasSameHostPort(
-    const ServerRegistrationPB& lhs, const ServerRegistrationPB& rhs,
+    const ServerRegistrationPB& lhs, const Registration& rhs,
     const std::vector<CloudInfoPB>& perspectives) {
   auto find_it = std::find_if(
       perspectives.begin(), perspectives.end(), [&lhs, &rhs](const CloudInfoPB& cloud_info) {
@@ -642,8 +657,12 @@ bool HasSameHostPort(
   return find_it != perspectives.end();
 }
 
+const CloudInfoPB& ToCloudInfoPB(const CloudInfoPB& cloud_info) { return cloud_info; }
+CloudInfoPB ToCloudInfoPB(const LWCloudInfoPB& cloud_info) { return cloud_info.ToGoogleProtobuf(); }
+
+template <class Registration>
 std::function<bool(const ServerRegistrationPB&)> GetHostPortCheckerFunction(
-    const TSRegistrationPB& registration, const CloudInfoPB& local_master_cloud_info) {
+    const Registration& registration, const CloudInfoPB& local_master_cloud_info) {
   // This pivots on a runtime flag so we cannot return a static function.
   if (PREDICT_TRUE(FLAGS_master_register_ts_check_desired_host_port)) {
     // When desired host-port check is enabled, we do the following checks:
@@ -651,12 +670,13 @@ std::function<bool(const ServerRegistrationPB&)> GetHostPortCheckerFunction(
     // 2. The existing and registering tservers have distinct host-port from each others
     // perspective.
     return
-        [&registration,
-         &local_master_cloud_info](const ServerRegistrationPB& existing_ts_registration) {
+        [&registration, &local_master_cloud_info,
+         registering_cloud_info = ToCloudInfoPB(registration.common().cloud_info())](
+            const ServerRegistrationPB& existing_ts_registration) {
           auto cloud_info_perspectives = {
               local_master_cloud_info,                // master's perspective
               existing_ts_registration.cloud_info(),  // existing ts' perspective
-              registration.common().cloud_info()};    // registering ts' perspective
+              registering_cloud_info};                // registering ts' perspective
           return HasSameHostPort(
               existing_ts_registration, registration.common(), cloud_info_perspectives);
         };

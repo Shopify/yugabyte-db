@@ -176,20 +176,12 @@ Result<int64_t> LeaderTerm(const tablet::TabletPeer& tablet_peer) {
   return leader_state.term;
 }
 
-std::string CatalogInvalMessagesDataDebugString(const master::LWTSHeartbeatResponsePB& resp) {
-  std::string str;
-  if (resp.has_db_catalog_inval_messages_data()) {
-    str = CatalogInvalMessagesDataDebugString(
-        resp.db_catalog_inval_messages_data().ToGoogleProtobuf());
-  }
-  return str;
-}
+namespace {
 
-std::string CatalogInvalMessagesDataDebugString(
-    const tserver::DBCatalogInvalMessagesDataPB& db_catalog_inval_messages_data) {
+template <class Data>
+std::string DoCatalogInvalMessagesDataDebugString(const Data& data) {
   std::map<uint32_t, std::vector<std::pair<uint64_t, size_t>>> dbg_map;
-  for (int i = 0; i < db_catalog_inval_messages_data.db_catalog_inval_messages_size(); ++i) {
-    const auto& db_inval_messages = db_catalog_inval_messages_data.db_catalog_inval_messages(i);
+  for (const auto& db_inval_messages : data.db_catalog_inval_messages()) {
     const uint32_t db_oid = db_inval_messages.db_oid();
     const uint64_t current_version = db_inval_messages.current_version();
     const size_t msg_sz =
@@ -197,6 +189,26 @@ std::string CatalogInvalMessagesDataDebugString(
     dbg_map[db_oid].emplace_back(current_version, msg_sz);
   }
   return yb::ToString(dbg_map);
+}
+
+}  // namespace
+
+std::string CatalogInvalMessagesDataDebugString(const master::LWTSHeartbeatResponsePB& resp) {
+  std::string str;
+  if (resp.has_db_catalog_inval_messages_data()) {
+    str = CatalogInvalMessagesDataDebugString(resp.db_catalog_inval_messages_data());
+  }
+  return str;
+}
+
+std::string CatalogInvalMessagesDataDebugString(
+    const tserver::DBCatalogInvalMessagesDataPB& db_catalog_inval_messages_data) {
+  return DoCatalogInvalMessagesDataDebugString(db_catalog_inval_messages_data);
+}
+
+std::string CatalogInvalMessagesDataDebugString(
+    const tserver::LWDBCatalogInvalMessagesDataPB& db_catalog_inval_messages_data) {
+  return DoCatalogInvalMessagesDataDebugString(db_catalog_inval_messages_data);
 }
 
 void LeaderTabletPeer::FillTabletPeer(TabletPeerTablet source) {
