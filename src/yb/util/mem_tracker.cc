@@ -33,6 +33,7 @@
 #include "yb/util/mem_tracker.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <limits>
 #include <sstream>
 #include <utility>
@@ -61,6 +62,7 @@
 #include "yb/util/tcmalloc_trace.h"
 #include "yb/util/tcmalloc_util.h"
 #include "yb/util/tcmalloc_impl_util.h"
+#include "yb/util/thread.h"
 
 using namespace std::literals;
 
@@ -140,6 +142,50 @@ namespace {
 // Total amount of memory from calls to Release() since the last GC. If this
 // is greater than mem_tracker_tcmalloc_gc_release_bytes, this will trigger a tcmalloc gc.
 Atomic64 released_memory_since_gc;
+
+#if YB_TCMALLOC_ENABLED
+// ReleaseMemoryToSystem takes tcmalloc's page-heap lock once per MB, so running it on the
+// releasing thread (often a reactor) stalls it behind every allocating worker. One thread does it.
+class TcmallocGcThread {
+ public:
+  static TcmallocGcThread& Instance() {
+    static auto* instance = [] {
+      auto* result = new TcmallocGcThread();
+      CHECK_OK(Thread::Create(
+          "mem_tracker", "tcmalloc_gc", &TcmallocGcThread::Run, result, &result->thread_));
+      return result;
+    }();
+    return *instance;
+  }
+
+  void Request() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      requested_ = true;
+    }
+    cond_.notify_one();
+  }
+
+ private:
+  void Run() {
+    for (;;) {
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cond_.wait(lock, [this] { return requested_; });
+        requested_ = false;
+      }
+      if (MemTracker::GcTcmallocIfNeeded()) {
+        MemTracker::GetRootTracker()->MaybeUpdateConsumption(true /* force */);
+      }
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cond_;
+  bool requested_ = false;
+  scoped_refptr<Thread> thread_;
+};
+#endif  // YB_TCMALLOC_ENABLED
 
 DEFINE_validator(default_memory_limit_to_ram_ratio, &::yb::internal::ValidateMemoryLimitToRamRatio);
 
@@ -620,11 +666,12 @@ void MemTracker::Release(int64_t bytes) {
     return;
   }
 
-  bool do_force_update_consumption = false;
   if (PREDICT_FALSE(base::subtle::Barrier_AtomicIncrement(&released_memory_since_gc, bytes) >
                     FLAGS_mem_tracker_tcmalloc_gc_release_bytes)) {
-    // Force updating consumption to reflect real consumption if GC happened.
-    do_force_update_consumption = GcTcmallocIfNeeded();
+#if YB_TCMALLOC_ENABLED
+    released_memory_since_gc = 0;
+    TcmallocGcThread::Instance().Request();
+#endif
   }
 
   if (PREDICT_FALSE(enable_logging_)) {
@@ -632,7 +679,7 @@ void MemTracker::Release(int64_t bytes) {
   }
 
   for (auto& tracker : all_trackers_) {
-    if (!tracker->MaybeUpdateConsumption(do_force_update_consumption)) {
+    if (!tracker->MaybeUpdateConsumption()) {
       tracker->IncrementBy(-bytes);
       // If a UDF calls FunctionContext::TrackAllocation() but allocates less than the
       // reported amount, the subsequent call to FunctionContext::Free() may cause the
