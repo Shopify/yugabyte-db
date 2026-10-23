@@ -148,8 +148,12 @@ class MasterClusterServiceImpl : public MasterServiceBase, public MasterClusterI
                   << replication_info->live_replicas().placement_uuid();
       }
       auto* entry = resp->add_servers();
-      *entry->mutable_instance_id() = desc->GetNodeInstancePB();
-      *entry->mutable_registration() = desc->GetTSRegistrationPB();
+      auto* instance_id = entry->mutable_instance_id();
+      instance_id->dup_permanent_uuid(desc->permanent_uuid());
+      instance_id->set_instance_seqno(l->pb.instance_seqno());
+      auto* registration = entry->mutable_registration();
+      registration->mutable_common()->CopyFrom(l->pb.registration());
+      registration->mutable_resources()->CopyFrom(l->pb.resources());
       auto last_heartbeat = desc->LastHeartbeatTime();
       if (last_heartbeat) {
         auto ms_since_heartbeat = MonoTime::Now().GetDeltaSince(last_heartbeat).ToMilliseconds();
