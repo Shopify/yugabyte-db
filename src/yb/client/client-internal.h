@@ -401,12 +401,14 @@ class YBClient::Data {
   // state, we will update the internal state of the local tablet server if the tablet is in the
   // RUNNING state.
   //
-  // Returns NULL if there are no valid tablet servers.
+  // Returns NULL if there are no valid tablet servers. Optional diagnostics describe local replica
+  // presence and eligibility in this selection's snapshot, not subsequent cache state.
   internal::RemoteTabletServer* SelectTServer(
       internal::RemoteTablet* rt,
       const ReplicaSelection selection,
       const std::set<std::string>& blacklist,
-      std::vector<internal::RemoteTabletServer*>* candidates);
+      std::vector<internal::RemoteTabletServer*>* candidates,
+      internal::ReplicaSelectionDiagnostics* diagnostics = nullptr);
 
   // Sets 'master_proxy_' from the address specified by
   // 'leader_master_hostport_'.  Called by

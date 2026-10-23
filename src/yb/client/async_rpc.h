@@ -57,6 +57,10 @@ struct AsyncRpcMetrics {
   scoped_refptr<EventStats> time_to_send;
   scoped_refptr<Counter> consistent_prefix_successful_reads;
   scoped_refptr<Counter> consistent_prefix_failed_reads;
+  scoped_refptr<Counter> consistent_prefix_read_local_selections;
+  scoped_refptr<Counter> consistent_prefix_read_local_replica_missing;
+  scoped_refptr<Counter> consistent_prefix_read_local_replica_excluded;
+  scoped_refptr<Counter> consistent_prefix_read_locality_unknown;
   scoped_refptr<Counter> skip_intents_writes;
 };
 
@@ -105,6 +109,8 @@ class AsyncRpc : public rpc::Rpc, public TabletRpc {
   std::shared_ptr<const YBTable> table() const;
   const RemoteTablet& tablet() const { return *tablet_invoker_.tablet(); }
   const InFlightOps& ops() const { return ops_; }
+
+  const AsyncRpcMetrics* async_rpc_metrics() const override { return async_rpc_metrics_.get(); }
 
   const ash::WaitStateInfoPtr& wait_state() const { return wait_state_; }
 
