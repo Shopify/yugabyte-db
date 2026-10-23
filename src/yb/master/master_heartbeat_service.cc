@@ -155,6 +155,7 @@ using namespace std::literals;
 using namespace std::placeholders;
 
 using consensus::ConsensusStatePB;
+using consensus::LWConsensusStatePB;
 using consensus::PeerMemberType;
 using tablet::RaftGroupStatePB;
 using tablet::TABLET_DATA_DELETED;
@@ -228,27 +229,32 @@ class MasterHeartbeatServiceImpl : public MasterServiceBase, public MasterHeartb
       std::map<TableId, scoped_refptr<TableInfo>>* tables,
       std::vector<RetryingTSRpcTaskWithTablePtr>* rpcs);
 
+  // leader_uuid is the leader after ProcessCommittedConsensusState's adjustments, which the
+  // reported message does not carry.
   void UpdateTabletReplicasAfterConfigChange(
       const TabletInfoPtr& tablet,
       const std::string& sender_uuid,
-      const ConsensusStatePB& consensus_state,
+      const LWConsensusStatePB& consensus_state,
+      const std::string& leader_uuid,
       const LWReportedTabletPB& report,
       const LeaderEpoch& epoch);
 
   void UpdateTabletReplicaInLocalMemory(
       const TSDescriptorPtr& ts_desc,
-      const ConsensusStatePB* consensus_state,
+      const LWConsensusStatePB* consensus_state,
+      const std::string& leader_uuid,
       const LWReportedTabletPB& report,
       const TabletInfoPtr& tablet);
 
   TabletReplica CreateNewReplicaForLocalMemory(
       const TSDescriptorPtr& ts_desc,
-      const ConsensusStatePB* consensus_state,
+      const LWConsensusStatePB* consensus_state,
+      const std::string& leader_uuid,
       const LWReportedTabletPB& report,
       const RaftGroupStatePB& state);
 
   bool ReplicaMapDiffersFromConsensusState(
-      const TabletInfoPtr& tablet, const ConsensusStatePB& cstate);
+      const TabletInfoPtr& tablet, const LWConsensusStatePB& cstate);
 
   void ProcessTabletMetadata(
       const std::string& ts_uuid,
@@ -415,10 +421,7 @@ void MasterHeartbeatServiceImpl::PopulatePgCatalogVersionInfo(
     << ") db catalog versions: "
     << resp.db_catalog_version_data().ShortDebugString()
     << ") db inval messages: "
-    << (resp.has_db_catalog_inval_messages_data()
-            ? tserver::CatalogInvalMessagesDataDebugString(
-                  resp.db_catalog_inval_messages_data().ToGoogleProtobuf())
-            : "");
+    << tserver::CatalogInvalMessagesDataDebugString(resp);
 }
 
 void MasterHeartbeatServiceImpl::PopulateYsqlDbOldestPinnedReadTimes(
@@ -498,14 +501,12 @@ void MasterHeartbeatServiceImpl::TSHeartbeat(
     TSDescriptorPtr& ts_desc = *desc_result;
 
     // Correctness requires that this occur after UpdateAndReturnTSDescriptorOrRespond.
-    XClusterGuardedInfoPB xcluster_guarded_info;
     auto fill_status = catalog_manager_->GetXClusterManager()->FillXClusterGuardedInfo(
-        leader_term, xcluster_guarded_info);
+        leader_term, *resp->mutable_xcluster_guarded_info());
     if (!fill_status.ok()) {
       rpc.RespondFailure(fill_status.CloneAndPrepend("Failed to fill xCluster-guarded info"));
       return;
     }
-    *resp->mutable_xcluster_guarded_info() = xcluster_guarded_info;
 
     resp->set_tablet_report_limit(FLAGS_tablet_report_limit);
 
@@ -551,7 +552,7 @@ void MasterHeartbeatServiceImpl::TSHeartbeat(
 
       for (const auto& consumer_replication_state : req->xcluster_consumer_replication_status()) {
         catalog_manager_->GetXClusterManager()->StoreConsumerReplicationStatus(
-            consumer_replication_state.ToGoogleProtobuf());
+            consumer_replication_state);
       }
 
       // Only process the full compaction statuses if we have plenty of time to process the work (>
@@ -1072,7 +1073,7 @@ Status MasterHeartbeatServiceImpl::ProcessTabletReportBatch(
       // When a tablet server is restarted, it sends a full tablet report with all of its tablets
       // in the NOT_STARTED state, so this would make the cluster balancer think that all the
       // tablets are being remote bootstrapped at once, so only process incremental reports here.
-      UpdateTabletReplicaInLocalMemory(ts_desc, nullptr /* consensus */, report, tablet);
+      UpdateTabletReplicaInLocalMemory(ts_desc, nullptr /* consensus */, "", report, tablet);
     }
   } // Finished one round of batch processing.
 
@@ -1153,7 +1154,9 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
     std::map<TableId, scoped_refptr<TableInfo>>* tables,
     std::vector<RetryingTSRpcTaskWithTablePtr>* rpcs) {
   const ConsensusStatePB& prev_cstate = tablet_lock->pb.committed_consensus_state();
-  ConsensusStatePB cstate = report.committed_consensus_state().ToGoogleProtobuf();
+  const auto& cstate = report.committed_consensus_state();
+  // Adjusted below instead of the reported message, which is read-only.
+  std::string leader_uuid = cstate.leader_uuid().ToBuffer();
   bool tablet_was_mutated = false;
 
   // 6a. The master only processes reports for replicas with committed
@@ -1190,9 +1193,8 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
 
   // 6b. Disregard the leader state if the reported leader is not a member
   // of the committed config.
-  if (cstate.leader_uuid().empty() ||
-      !IsRaftConfigMember(cstate.leader_uuid(), cstate.config())) {
-    cstate.clear_leader_uuid();
+  if (leader_uuid.empty() || !IsRaftConfigMember(leader_uuid, cstate.config())) {
+    leader_uuid.clear();
     tablet_was_mutated = true;
   }
 
@@ -1205,7 +1207,7 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
   // - FLAG added to avoid waiting during mock tests.
   if (!tablet_lock->is_running() &&
       report.state() == tablet::RUNNING &&
-        (cstate.has_leader_uuid() ||
+        (!leader_uuid.empty() ||
         !FLAGS_catalog_manager_wait_for_new_tablets_to_elect_leader)) {
     DCHECK_EQ(SysTabletsEntryPB::CREATING, tablet_lock->pb.state())
         << "Tablet in unexpected state: " << tablet->ToString()
@@ -1222,7 +1224,7 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
   // - The new cstate has a leader, and either the old cstate didn't, or
   //   there was a term change.
   if (cstate.config().committed_op_index() > prev_cstate.config().committed_op_index() ||
-      (cstate.has_leader_uuid() &&
+      (!leader_uuid.empty() &&
           (!prev_cstate.has_leader_uuid() ||
               cstate.current_term() > prev_cstate.current_term()))) {
 
@@ -1235,11 +1237,11 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
     // the previous leader if the reported cstate has the same term as the
     // previous cstate, and the leader was known for that term.
     if (cstate.current_term() == prev_cstate.current_term()) {
-      if (!cstate.has_leader_uuid() && prev_cstate.has_leader_uuid()) {
-        cstate.set_leader_uuid(prev_cstate.leader_uuid());
+      if (leader_uuid.empty() && prev_cstate.has_leader_uuid()) {
+        leader_uuid = prev_cstate.leader_uuid();
         // Sanity check to detect consensus divergence bugs.
-      } else if (cstate.has_leader_uuid() && prev_cstate.has_leader_uuid() &&
-          cstate.leader_uuid() != prev_cstate.leader_uuid()) {
+      } else if (!leader_uuid.empty() && prev_cstate.has_leader_uuid() &&
+          leader_uuid != prev_cstate.leader_uuid()) {
         string msg = Format("Previously reported cstate for tablet $0 gave "
                             "a different leader for term $1 than the current cstate. "
                             "Previous cstate: $2. Current cstate: $3.",
@@ -1253,8 +1255,8 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
     // 6d(ii). Delete any replicas from the previous config that are not in the new one.
     if (FLAGS_master_tombstone_evicted_tablet_replicas) {
       std::unordered_set<string> current_member_uuids;
-      for (const consensus::RaftPeerPB &peer : cstate.config().peers()) {
-        InsertOrDie(&current_member_uuids, peer.permanent_uuid());
+      for (const auto& peer : cstate.config().peers()) {
+        InsertOrDie(&current_member_uuids, peer.permanent_uuid().ToBuffer());
       }
       for (const consensus::RaftPeerPB &prev_peer : prev_cstate.config().peers()) {
         const string& peer_uuid = prev_peer.permanent_uuid();
@@ -1277,13 +1279,20 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
           << " using config reported by " << ts_desc->permanent_uuid()
           << " to that committed in log index " << cstate.config().committed_op_index()
           << " with leader state from term " << cstate.current_term();
-    UpdateTabletReplicasAfterConfigChange(tablet, ts_desc->permanent_uuid(), cstate, report, epoch);
+    UpdateTabletReplicasAfterConfigChange(
+        tablet, ts_desc->permanent_uuid(), cstate, leader_uuid, report, epoch);
 
     // 6d(iv). Update the consensus state. Don't use 'prev_cstate' after this.
     LOG(INFO) << "Tablet: " << tablet->tablet_id() << " reported consensus state change."
               << " New consensus state: " << cstate.ShortDebugString()
               << " from " << ts_desc->permanent_uuid();
-    *tablet_lock.mutable_data()->pb.mutable_committed_consensus_state() = cstate;
+    auto* stored_cstate = tablet_lock.mutable_data()->pb.mutable_committed_consensus_state();
+    cstate.ToGoogleProtobuf(stored_cstate);
+    if (leader_uuid.empty()) {
+      stored_cstate->clear_leader_uuid();
+    } else {
+      stored_cstate->set_leader_uuid(leader_uuid);
+    }
     tablet_was_mutated = true;
   } else {
     // Report opid_index is equal to the previous opid_index. If some
@@ -1291,25 +1300,25 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
     // haven't yet heard from all the tservers in the config, update the in-memory
     // ReplicaLocations.
     LOG(INFO) << "Tablet server " << ts_desc->permanent_uuid() << " sent "
-              << (is_incremental ? "incremental" : "full tablet")
-              << " report for " << tablet->tablet_id()
-              << ", prev state op id: " << prev_cstate.config().committed_op_index()
-              << ", prev state term: " << prev_cstate.current_term()
-              << ", prev state has_leader_uuid: " << prev_cstate.has_leader_uuid()
-              << ". Consensus state: " << cstate.ShortDebugString();
+            << (is_incremental ? "incremental" : "full tablet")
+            << " report for " << tablet->tablet_id()
+            << ", prev state op id: " << prev_cstate.config().committed_op_index()
+            << ", prev state term: " << prev_cstate.current_term()
+            << ", prev state has_leader_uuid: " << prev_cstate.has_leader_uuid()
+            << ". Consensus state: " << cstate.ShortDebugString();
     if (FLAGS_enable_register_ts_from_raft &&
         ReplicaMapDiffersFromConsensusState(tablet, cstate)) {
       LOG(INFO) << Format("Tablet replica map differs from reported consensus state. Replica map: "
           "$0. Reported consensus state: $1.", *tablet->GetReplicaLocations(),
           cstate.ShortDebugString());
       UpdateTabletReplicasAfterConfigChange(
-          tablet, ts_desc->permanent_uuid(), cstate, report, epoch);
+          tablet, ts_desc->permanent_uuid(), cstate, leader_uuid, report, epoch);
     } else {
-      UpdateTabletReplicaInLocalMemory(ts_desc, &cstate, report, tablet);
+      UpdateTabletReplicaInLocalMemory(ts_desc, &cstate, leader_uuid, report, tablet);
     }
   }
 
-  if (FLAGS_use_create_table_leader_hint && !cstate.has_leader_uuid()) {
+  if (FLAGS_use_create_table_leader_hint && leader_uuid.empty()) {
     catalog_manager_->StartElectionIfReady(cstate, epoch, tablet);
   }
 
@@ -1416,18 +1425,20 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
 void MasterHeartbeatServiceImpl::UpdateTabletReplicasAfterConfigChange(
     const TabletInfoPtr& tablet,
     const std::string& sender_uuid,
-    const ConsensusStatePB& consensus_state,
+    const LWConsensusStatePB& consensus_state,
+    const std::string& leader_uuid,
     const LWReportedTabletPB& report,
     const LeaderEpoch& epoch) {
   auto replica_locations = std::make_shared<TabletReplicaMap>();
   auto prev_rl = tablet->GetReplicaLocations();
 
-  for (const consensus::RaftPeerPB& peer : consensus_state.config().peers()) {
+  for (const auto& peer : consensus_state.config().peers()) {
     if (!peer.has_permanent_uuid()) {
       LOG(WARNING) << "Missing UUID for peer" << peer.ShortDebugString();
       continue;
     }
-    auto ts_desc_result = master_->ts_manager()->LookupTSByUUID(peer.permanent_uuid());
+    const auto peer_uuid = peer.permanent_uuid().ToBuffer();
+    auto ts_desc_result = master_->ts_manager()->LookupTSByUUID(peer_uuid);
     if (!ts_desc_result.ok()) {
       if (!FLAGS_enable_register_ts_from_raft) {
         LOG(WARNING) << "Tablet server has never reported in. "
@@ -1440,7 +1451,7 @@ void MasterHeartbeatServiceImpl::UpdateTabletReplicasAfterConfigChange(
       LOG(INFO) << "Tablet server has never reported in. Registering the ts using "
                 << "the raft config. Peer: " << peer.ShortDebugString()
                 << "; Tablet: " << tablet->ToString();
-      Status s = catalog_manager_->RegisterTsFromRaftConfig(peer, epoch);
+      Status s = catalog_manager_->RegisterTsFromRaftConfig(peer.ToGoogleProtobuf(), epoch);
       if (!s.ok()) {
         LOG(WARNING) << "Could not register ts from raft config: " << s
                     << " Skip updating the replica map.";
@@ -1448,9 +1459,9 @@ void MasterHeartbeatServiceImpl::UpdateTabletReplicasAfterConfigChange(
       }
 
       // Guaranteed to find the ts since we just registered.
-      ts_desc_result = master_->ts_manager()->LookupTSByUUID(peer.permanent_uuid());
+      ts_desc_result = master_->ts_manager()->LookupTSByUUID(peer_uuid);
       if (!ts_desc_result.ok()) {
-        LOG(WARNING) << "Could not find ts with uuid " << peer.permanent_uuid()
+        LOG(WARNING) << "Could not find ts with uuid " << peer_uuid
                     << " after registering from raft config. Skip updating the replica"
                     << " map.";
         continue;
@@ -1464,7 +1475,8 @@ void MasterHeartbeatServiceImpl::UpdateTabletReplicasAfterConfigChange(
     const RaftGroupStatePB replica_state =
         (sender_uuid == ts_desc->permanent_uuid()) ? report.state() : RaftGroupStatePB::UNKNOWN;
 
-    auto replica = CreateNewReplicaForLocalMemory(ts_desc, &consensus_state, report, replica_state);
+    auto replica = CreateNewReplicaForLocalMemory(
+        ts_desc, &consensus_state, leader_uuid, report, replica_state);
     if (existing_replica) {
       replica.UpdateDriveInfo(existing_replica->drive_info);
       replica.UpdateLeaderLeaseInfo(existing_replica->leader_lease_info);
@@ -1479,16 +1491,19 @@ void MasterHeartbeatServiceImpl::UpdateTabletReplicasAfterConfigChange(
 
 void MasterHeartbeatServiceImpl::UpdateTabletReplicaInLocalMemory(
     const TSDescriptorPtr& ts_desc,
-    const ConsensusStatePB* consensus_state,
+    const LWConsensusStatePB* consensus_state,
+    const std::string& leader_uuid,
     const LWReportedTabletPB& report,
     const TabletInfoPtr& tablet) {
-  auto replica = CreateNewReplicaForLocalMemory(ts_desc, consensus_state, report, report.state());
+  auto replica = CreateNewReplicaForLocalMemory(
+      ts_desc, consensus_state, leader_uuid, report, report.state());
   catalog_manager_->UpdateTabletReplicaLocations(tablet, ts_desc->id(), replica);
 }
 
 TabletReplica MasterHeartbeatServiceImpl::CreateNewReplicaForLocalMemory(
     const TSDescriptorPtr& ts_desc,
-    const ConsensusStatePB* consensus_state,
+    const LWConsensusStatePB* consensus_state,
+    const std::string& leader_uuid,
     const LWReportedTabletPB& report,
     const RaftGroupStatePB& state) {
   TabletReplica replica;
@@ -1499,7 +1514,8 @@ TabletReplica MasterHeartbeatServiceImpl::CreateNewReplicaForLocalMemory(
   } else {
     CHECK(consensus_state != nullptr) << "No cstate: " << ts_desc->permanent_uuid()
                                       << " - " << state;
-    replica.role = GetConsensusRole(ts_desc->permanent_uuid(), *consensus_state);
+    replica.role = GetConsensusRole(
+        ts_desc->permanent_uuid(), leader_uuid, consensus_state->config());
     replica.member_type = GetConsensusMemberType(ts_desc->permanent_uuid(), *consensus_state);
   }
   if (report.has_should_disable_lb_move()) {
@@ -1518,13 +1534,13 @@ TabletReplica MasterHeartbeatServiceImpl::CreateNewReplicaForLocalMemory(
 }
 
 bool MasterHeartbeatServiceImpl::ReplicaMapDiffersFromConsensusState(
-    const TabletInfoPtr& tablet, const ConsensusStatePB& cstate) {
+    const TabletInfoPtr& tablet, const LWConsensusStatePB& cstate) {
   auto locs = tablet->GetReplicaLocations();
-  if (locs->size() != implicit_cast<size_t>(cstate.config().peers_size())) {
+  if (locs->size() != cstate.config().peers_size()) {
     return true;
   }
-  for (auto iter = cstate.config().peers().begin(); iter != cstate.config().peers().end(); iter++) {
-    if (locs->find(iter->permanent_uuid()) == locs->end()) {
+  for (const auto& peer : cstate.config().peers()) {
+    if (locs->find(peer.permanent_uuid().ToBuffer()) == locs->end()) {
       return true;
     }
   }
@@ -1721,8 +1737,7 @@ MasterHeartbeatServiceImpl::RegisterTServerOrRespond(
     rpc::RpcContext* rpc) {
   if (!FLAGS_skip_tserver_version_checks && req.registration().has_version_info()) {
     const auto& registration = req.registration();
-    auto status = server_->ysql_manager().ValidateTServerVersion(
-        registration.version_info().ToGoogleProtobuf());
+    auto status = server_->ysql_manager().ValidateTServerVersion(registration.version_info());
     if (!status.ok()) {
       LOG(WARNING) << "yb-tserver " << registration.common().ShortDebugString()
                    << " running invalid version: "

@@ -82,6 +82,7 @@ class CDCServiceProxy;
 namespace master {
 
 class TSRegistrationPB;
+class LWTSRegistrationPB;
 class TSInformationPB;
 class TServerMetricsPB;
 class RefreshYsqlLeaseInfoPB;
@@ -133,6 +134,12 @@ class TSDescriptor : public MetadataCowWrapper<PersistentTServerInfo> {
       // TServer, the master will attempt to register the tserver even if it hasn't received a
       // heartbeat from it.
       RegisteredThroughHeartbeat registered_through_heartbeat = RegisteredThroughHeartbeat::kTrue);
+  static Result<std::pair<TSDescriptorPtr, TSDescriptor::WriteLock>> CreateNew(
+      const LWNodeInstancePB& instance,
+      const LWTSRegistrationPB& registration,
+      CloudInfoPB&& local_master_cloud_info,
+      rpc::ProxyCache* proxy_cache,
+      RegisteredThroughHeartbeat registered_through_heartbeat = RegisteredThroughHeartbeat::kTrue);
 
   static TSDescriptorPtr LoadFromEntry(
       const std::string& permanent_uuid, const SysTabletServerEntryPB& metadata,
@@ -159,6 +166,9 @@ class TSDescriptor : public MetadataCowWrapper<PersistentTServerInfo> {
 
   Result<TSDescriptor::WriteLock> UpdateRegistration(
       const NodeInstancePB& instance, const TSRegistrationPB& registration,
+      RegisteredThroughHeartbeat registered_through_heartbeat);
+  Result<TSDescriptor::WriteLock> UpdateRegistration(
+      const LWNodeInstancePB& instance, const LWTSRegistrationPB& registration,
       RegisteredThroughHeartbeat registered_through_heartbeat);
 
   const std::string& permanent_uuid() const { return permanent_uuid_; }
@@ -382,6 +392,18 @@ class TSDescriptor : public MetadataCowWrapper<PersistentTServerInfo> {
 
  private:
   mutable rw_spinlock mutex_;
+
+  template <class Instance, class Registration>
+  static Result<std::pair<TSDescriptorPtr, TSDescriptor::WriteLock>> DoCreateNew(
+      const Instance& instance, const Registration& registration,
+      CloudInfoPB&& local_master_cloud_info, rpc::ProxyCache* proxy_cache,
+      RegisteredThroughHeartbeat registered_through_heartbeat);
+
+  template <class Instance, class Registration>
+  Result<TSDescriptor::WriteLock> DoUpdateRegistration(
+      const Instance& instance, const Registration& registration,
+      RegisteredThroughHeartbeat registered_through_heartbeat);
+
   template <class TProxy>
   Status GetOrCreateProxy(std::shared_ptr<TProxy>* result, std::shared_ptr<TProxy>* result_cache);
 

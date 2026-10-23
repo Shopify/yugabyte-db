@@ -20,7 +20,7 @@
 
 namespace yb {
 
-class VersionInfoPB;
+class LWVersionInfoPB;
 
 namespace master {
 
@@ -44,7 +44,7 @@ class YsqlManagerIf {
 
   virtual bool IsMajorUpgradeInProgress() const = 0;
 
-  virtual Status ValidateTServerVersion(const VersionInfoPB& version) const = 0;
+  virtual Status ValidateTServerVersion(const LWVersionInfoPB& version) const = 0;
 
   virtual Result<std::string> GetCachedPgSchemaName(
       const PgTableAllOids& oids, PgDbRelNamespaceMap& cache) const = 0;

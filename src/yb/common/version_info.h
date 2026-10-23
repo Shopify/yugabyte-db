@@ -43,6 +43,8 @@
 
 namespace yb {
 
+class LWVersionInfoPB;
+
 struct VersionData {
   VersionInfoPB pb;
   std::string json;
@@ -81,7 +83,12 @@ class VersionInfo {
     return ValidateVersion(std::optional(std::cref(version)), op);
   }
 
+  static bool ValidateVersion(const LWVersionInfoPB& version, ValidateVersionInfoOp op);
+
  private:
+  template <class Version>
+  static bool DoValidateVersion(const Version& version, ValidateVersionInfoOp op);
+
   // Get the git hash for this build. If the working directory was dirty when
   // YB was built, also appends "-dirty".
   static std::string GetGitHash();

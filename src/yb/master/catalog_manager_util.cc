@@ -17,6 +17,7 @@
 #include <numeric>
 
 #include "yb/common/common_net.h"
+#include "yb/common/common_net.messages.h"
 #include "yb/common/schema_pbutil.h"
 #include "yb/common/wire_protocol.h"
 
@@ -289,29 +290,48 @@ Status CatalogManagerUtil::CheckIfCanDeleteSingleTablet(
   return Status::OK();
 }
 
-CatalogManagerUtil::CloudInfoSimilarity CatalogManagerUtil::ComputeCloudInfoSimilarity(
-    const CloudInfoPB& ci1, const CloudInfoPB& ci2) {
+namespace {
+
+template <class CloudInfo>
+CatalogManagerUtil::CloudInfoSimilarity DoComputeCloudInfoSimilarity(
+    const CloudInfoPB& ci1, const CloudInfo& ci2) {
   if (ci1.has_placement_cloud() &&
       ci2.has_placement_cloud() &&
       ci1.placement_cloud() != ci2.placement_cloud()) {
-      return NO_MATCH;
+      return CatalogManagerUtil::NO_MATCH;
   }
 
   if (ci1.has_placement_region() &&
       ci2.has_placement_region() &&
       ci1.placement_region() != ci2.placement_region()) {
-      return CLOUD_MATCH;
+      return CatalogManagerUtil::CLOUD_MATCH;
   }
 
   if (ci1.has_placement_zone() &&
       ci2.has_placement_zone() &&
       ci1.placement_zone() != ci2.placement_zone()) {
-      return REGION_MATCH;
+      return CatalogManagerUtil::REGION_MATCH;
   }
-  return ZONE_MATCH;
+  return CatalogManagerUtil::ZONE_MATCH;
+}
+
+}  // namespace
+
+CatalogManagerUtil::CloudInfoSimilarity CatalogManagerUtil::ComputeCloudInfoSimilarity(
+    const CloudInfoPB& ci1, const CloudInfoPB& ci2) {
+  return DoComputeCloudInfoSimilarity(ci1, ci2);
+}
+
+CatalogManagerUtil::CloudInfoSimilarity CatalogManagerUtil::ComputeCloudInfoSimilarity(
+    const CloudInfoPB& ci1, const LWCloudInfoPB& ci2) {
+  return DoComputeCloudInfoSimilarity(ci1, ci2);
 }
 
 bool CatalogManagerUtil::IsCloudInfoPrefix(const CloudInfoPB& ci1, const CloudInfoPB& ci2) {
+  return ComputeCloudInfoSimilarity(ci1, ci2) == ZONE_MATCH;
+}
+
+bool CatalogManagerUtil::IsCloudInfoPrefix(const CloudInfoPB& ci1, const LWCloudInfoPB& ci2) {
   return ComputeCloudInfoSimilarity(ci1, ci2) == ZONE_MATCH;
 }
 

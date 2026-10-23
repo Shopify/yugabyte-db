@@ -122,6 +122,18 @@ Status XClusterConfig::FillXClusterInfoPerNamespace(XClusterGuardedInfoPB& info)
   return Status::OK();
 }
 
+Status XClusterConfig::FillXClusterInfoPerNamespace(LWXClusterGuardedInfoPB& info) const {
+  SharedLock mutex_lock(mutex_);
+  SCHECK(xcluster_config_info_, IllegalState, "XCluster config is not initialized");
+  auto l = xcluster_config_info_->LockForRead();
+  for (const auto& [namespace_id, namespace_info] : l->pb.xcluster_info_per_namespace()) {
+    auto* entry = info.add_xcluster_info_per_namespace();
+    entry->dup_key(namespace_id);
+    *entry->mutable_value() = namespace_info;
+  }
+  return Status::OK();
+}
+
 Status XClusterConfig::BumpVersionUpsertAndCommit(
     const LeaderEpoch& epoch, CowWriteLock<PersistentXClusterConfigInfo>& l) {
   auto& config_pb = l.mutable_data()->pb;

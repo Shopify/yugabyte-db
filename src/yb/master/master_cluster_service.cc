@@ -84,7 +84,7 @@ class MasterClusterServiceImpl : public MasterServiceBase, public MasterClusterI
     bool is_ysql_replication_info_required =
         FLAGS_enable_ysql_tablespaces_for_placement &&
         (req->has_tablespace_id() || req->has_replication_info());
-    std::unique_ptr<ReplicationInfoPB> replication_info;
+    std::optional<ReplicationInfoPB> tablespace_replication_info;
     if (is_ysql_replication_info_required) {
       if (req->has_tablespace_id()) {
         LOG(INFO) << "Retrieve placement info from tablespace ID";
@@ -96,8 +96,8 @@ class MasterClusterServiceImpl : public MasterServiceBase, public MasterClusterI
                               MasterErrorPB_Code_UNKNOWN_ERROR, &rpc);
           return;
         }
-        auto tablespace_replication_pb = std::move(*result);
-        if (!tablespace_replication_pb.has_value()) {
+        tablespace_replication_info = std::move(*result);
+        if (!tablespace_replication_info.has_value()) {
           LOG(INFO) << "Could not retrieve placement info from tablespace ID "
                     << req->tablespace_id() << ". "
                     << "Default to returning all tablet servers";
@@ -108,44 +108,45 @@ class MasterClusterServiceImpl : public MasterServiceBase, public MasterClusterI
           // GetAllLiveDescriptorsInCluster() which filters placement ID's
           // based on master primary cluster's placement ID.
           is_ysql_replication_info_required = false;
-        } else {
-          replication_info =
-              std::make_unique<ReplicationInfoPB>(*tablespace_replication_pb);
         }
       } else if (req->has_replication_info()) {
         LOG(INFO) << "Retrieve placement info from user request";
-        replication_info =
-            std::make_unique<ReplicationInfoPB>(req->replication_info().ToGoogleProtobuf());
       }
     }
+    auto matches_placement = [](
+        const ServerRegistrationPB& registration, const auto& replication_info) {
+      LOG(INFO) << "Filter TServers based on placement ID "
+                << "and cloud info against placement "
+                << replication_info.ShortDebugString();
+      // Filter based on placement ID
+      if (registration.placement_uuid() != replication_info.live_replicas().placement_uuid()) {
+        return false;
+      }
+
+      // Filter based on cloud, region, zone IDs (all IDs must match)
+      bool is_cloud_match = false;
+      const auto& placement_blocks = replication_info.live_replicas().placement_blocks();
+      for (const auto& pb : placement_blocks) {
+        if (CatalogManagerUtil::IsCloudInfoPrefix(registration.cloud_info(), pb.cloud_info())) {
+          is_cloud_match = true;
+          break;
+        }
+      }
+      if (!is_cloud_match) return false;
+      LOG(INFO) << "Placement info has matched against placement "
+                << replication_info.live_replicas().placement_uuid();
+      return true;
+    };
 
     auto ysql_lease_infos =
         server_->catalog_manager_impl()->object_lock_info_manager()->GetLeaseInfos();
     for (const auto& desc : descs) {
       auto l = desc->LockForRead();
       if (is_ysql_replication_info_required) {
-        LOG(INFO) << "Filter TServers based on placement ID "
-                  << "and cloud info against placement "
-                  << replication_info->ShortDebugString();
-        // Filter based on placement ID
-        if (l->pb.registration().placement_uuid() !=
-            replication_info->live_replicas().placement_uuid())
-          continue;
-
-        // Filter based on cloud, region, zone IDs (all IDs must match)
-        bool is_cloud_match = false;
-        const auto& placement_blocks =
-            replication_info->live_replicas().placement_blocks();
-        for (const auto& pb : placement_blocks) {
-          if (CatalogManagerUtil::IsCloudInfoPrefix(
-                  l->pb.registration().cloud_info(), pb.cloud_info())) {
-            is_cloud_match = true;
-            break;
-          }
-        }
-        if (!is_cloud_match) continue;
-        LOG(INFO) << "Placement info has matched against placement "
-                  << replication_info->live_replicas().placement_uuid();
+        bool matches = tablespace_replication_info
+            ? matches_placement(l->pb.registration(), *tablespace_replication_info)
+            : matches_placement(l->pb.registration(), req->replication_info());
+        if (!matches) continue;
       }
       auto* entry = resp->add_servers();
       auto* instance_id = entry->mutable_instance_id();

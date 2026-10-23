@@ -32,6 +32,8 @@
 
 #include "yb/common/version_info.h"
 
+#include "yb/common/version_info.messages.h"
+
 #include <fstream>
 #include <string>
 
@@ -244,6 +246,15 @@ bool VersionInfo::ValidateVersion(
   }
 
   const VersionInfoPB& version = *version_opt;
+  return DoValidateVersion(version, op);
+}
+
+bool VersionInfo::ValidateVersion(const LWVersionInfoPB& version, ValidateVersionInfoOp op) {
+  return DoValidateVersion(version, op);
+}
+
+template <class Version>
+bool VersionInfo::DoValidateVersion(const Version& version, ValidateVersionInfoOp op) {
   const auto& current_version = GetVersionData()->pb;
   bool result = false;
   switch (op) {

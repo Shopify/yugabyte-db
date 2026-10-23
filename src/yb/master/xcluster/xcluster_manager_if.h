@@ -23,6 +23,7 @@ namespace yb {
 class HybridTime;
 class IsOperationDoneResult;
 class JsonWriter;
+class LWXClusterGuardedInfoPB;
 class XClusterGuardedInfoPB;
 
 namespace rpc {
@@ -39,7 +40,7 @@ class GetXClusterSafeTimeRequestPB;
 class GetXClusterSafeTimeResponsePB;
 struct LeaderEpoch;
 class UniverseReplicationInfo;
-class XClusterConsumerReplicationStatusPB;
+class LWXClusterConsumerReplicationStatusPB;
 struct XClusterStatus;
 
 class XClusterManagerIf {
@@ -72,7 +73,7 @@ class XClusterManagerIf {
   virtual void NotifyAutoFlagsConfigChanged() = 0;
 
   virtual void StoreConsumerReplicationStatus(
-      const XClusterConsumerReplicationStatusPB& consumer_replication_status) = 0;
+      const LWXClusterConsumerReplicationStatusPB& consumer_replication_status) = 0;
 
   virtual void SyncConsumerReplicationStatusMap(
       const xcluster::ReplicationGroupId& replication_group_id,
@@ -123,6 +124,7 @@ class XClusterManagerIf {
   // Fills info with a copy of the xCluster-guarded information stamped with a version newer than
   // that of any earlier copy.
   virtual Status FillXClusterGuardedInfo(int64_t leader_term, XClusterGuardedInfoPB& info) = 0;
+  virtual Status FillXClusterGuardedInfo(int64_t leader_term, LWXClusterGuardedInfoPB& info) = 0;
 
  protected:
   virtual ~XClusterManagerIf() = default;

@@ -29,6 +29,7 @@
 namespace yb {
 
 class Schema;
+class LWCloudInfoPB;
 
 namespace dockv {
 class PartitionSchema;
@@ -98,10 +99,13 @@ class CatalogManagerUtil {
   // 3: same cloud and region and zone, or prefix matches
   static CloudInfoSimilarity ComputeCloudInfoSimilarity(const CloudInfoPB& ci1,
                                                         const CloudInfoPB& ci2);
+  static CloudInfoSimilarity ComputeCloudInfoSimilarity(const CloudInfoPB& ci1,
+                                                        const LWCloudInfoPB& ci2);
 
   // Checks if one cloudinfo is a prefix of another. This assumes that ci1 and ci2 are
   // prefixes.
   static bool IsCloudInfoPrefix(const CloudInfoPB& ci1, const CloudInfoPB& ci2);
+  static bool IsCloudInfoPrefix(const CloudInfoPB& ci1, const LWCloudInfoPB& ci2);
 
   // Validate if the specified placement information conforms to the rules.
   // Currently, the following assumption about placement blocks is made.

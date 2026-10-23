@@ -22,6 +22,7 @@
 
 namespace yb {
 
+class LWXClusterGuardedInfoPB;
 class XClusterGuardedInfoPB;
 
 template<class State>
@@ -61,6 +62,7 @@ class XClusterConfig {
 
   // Copies xcluster_info_per_namespace into info.
   Status FillXClusterInfoPerNamespace(XClusterGuardedInfoPB& info) const EXCLUDES(mutex_);
+  Status FillXClusterInfoPerNamespace(LWXClusterGuardedInfoPB& info) const EXCLUDES(mutex_);
 
   Status SetXClusterRole(
       const LeaderEpoch& epoch, const NamespaceId& namespace_id,
