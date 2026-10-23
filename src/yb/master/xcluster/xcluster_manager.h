@@ -37,6 +37,8 @@ class XClusterSafeTimeService;
 struct SysCatalogLoadingState;
 struct XClusterSetupUniverseReplicationData;
 
+struct XClusterGuardedInfoSnapshot;
+
 // The XClusterManager class is responsible for managing all yb-master related control logic of
 // XCluster. All XCluster related RPCs and APIs are handled by this class.
 // TODO(#19714): Move XCluster related code from CatalogManager to this class.
@@ -367,11 +369,18 @@ class XClusterManager : public XClusterManagerIf,
   Status DoFillXClusterGuardedInfo(int64_t leader_term, Info& info)
       EXCLUDES(xcluster_guarded_info_version_mutex_);
 
-  // Guards the version counter below and serializes copies of the xCluster-guarded information so
-  // that a copy with a higher version never carries older information.  Lock order: this mutex,
-  // then XClusterConfig::mutex_ or the cluster config COW lock.  Never held across RPCs.
+  Result<std::shared_ptr<const XClusterGuardedInfoSnapshot>> RebuildXClusterGuardedInfoSnapshot(
+      int64_t leader_term) EXCLUDES(xcluster_guarded_info_version_mutex_);
+
+  // The last xCluster-guarded information copied out, with the inputs it was built from. Heartbeats
+  // reuse it while those inputs are unchanged, so the version counter only moves when the content
+  // does. Accessed via std::atomic_load/std::atomic_store.
+  std::shared_ptr<const XClusterGuardedInfoSnapshot> xcluster_guarded_info_snapshot_;
+  // Serializes snapshot rebuilds so that a snapshot with a higher version never carries older
+  // information.  Lock order: this mutex, then XClusterConfig::mutex_ or the cluster config COW
+  // lock.  Never held across RPCs.
   std::mutex xcluster_guarded_info_version_mutex_;
-  // Number of copies made by this process; see XClusterGuardedInfoVersionPB.
+  // Number of snapshots built by this process; see XClusterGuardedInfoVersionPB.
   uint64_t xcluster_guarded_info_copy_count_ GUARDED_BY(xcluster_guarded_info_version_mutex_) = 0;
 
   CoarseTimePoint time_of_last_clean_tables_task_run_;

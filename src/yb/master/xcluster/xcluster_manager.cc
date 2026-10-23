@@ -253,18 +253,59 @@ Status XClusterManager::FillHeartbeatResponse(
   return xcluster_config_->FillHeartbeatResponse(req, resp);
 }
 
+struct XClusterGuardedInfoSnapshot {
+  int64_t term;
+  uint32_t xcluster_config_version;
+  uint32_t oid_cache_invalidations_count;
+  XClusterGuardedInfoPB info;
+
+  bool BuiltFrom(int64_t for_term, uint32_t for_version, uint32_t for_oid_count) const {
+    return term == for_term && xcluster_config_version == for_version &&
+           oid_cache_invalidations_count == for_oid_count;
+  }
+};
+
 template <class Info>
 Status XClusterManager::DoFillXClusterGuardedInfo(int64_t leader_term, Info& info) {
+  auto xcluster_config_version = VERIFY_RESULT(xcluster_config_->GetVersion());
+  auto oid_cache_invalidations_count =
+      VERIFY_RESULT(catalog_manager_.GetOidCacheInvalidationsCount());
+  auto snapshot = std::atomic_load(&xcluster_guarded_info_snapshot_);
+  if (!snapshot ||
+      !snapshot->BuiltFrom(leader_term, xcluster_config_version, oid_cache_invalidations_count)) {
+    snapshot = VERIFY_RESULT(RebuildXClusterGuardedInfoSnapshot(leader_term));
+  }
+  info = snapshot->info;
+  return Status::OK();
+}
+
+Result<std::shared_ptr<const XClusterGuardedInfoSnapshot>>
+XClusterManager::RebuildXClusterGuardedInfoSnapshot(int64_t leader_term) {
   std::lock_guard l(xcluster_guarded_info_version_mutex_);
+  auto snapshot = std::make_shared<XClusterGuardedInfoSnapshot>();
+  snapshot->term = leader_term;
+  snapshot->xcluster_config_version =
+      VERIFY_RESULT(xcluster_config_->FillXClusterInfoPerNamespace(snapshot->info));
+  snapshot->oid_cache_invalidations_count =
+      VERIFY_RESULT(catalog_manager_.GetOidCacheInvalidationsCount());
+  snapshot->info.set_oid_cache_invalidations_count(snapshot->oid_cache_invalidations_count);
+
+  // Another rebuild may have published the same content while we waited for the mutex.
+  auto current = std::atomic_load(&xcluster_guarded_info_snapshot_);
+  if (current &&
+      current->BuiltFrom(
+          leader_term, snapshot->xcluster_config_version,
+          snapshot->oid_cache_invalidations_count)) {
+    return current;
+  }
+
   ++xcluster_guarded_info_copy_count_;
-  auto& version = *info.mutable_xcluster_guarded_info_version();
+  auto& version = *snapshot->info.mutable_xcluster_guarded_info_version();
   version.set_term(leader_term);
   version.set_count(xcluster_guarded_info_copy_count_);
-
-  RETURN_NOT_OK(xcluster_config_->FillXClusterInfoPerNamespace(info));
-  info.set_oid_cache_invalidations_count(
-      VERIFY_RESULT(catalog_manager_.GetOidCacheInvalidationsCount()));
-  return Status::OK();
+  std::shared_ptr<const XClusterGuardedInfoSnapshot> result = std::move(snapshot);
+  std::atomic_store(&xcluster_guarded_info_snapshot_, result);
+  return result;
 }
 
 Status XClusterManager::FillXClusterGuardedInfo(

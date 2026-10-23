@@ -61,8 +61,9 @@ class XClusterConfig {
       EXCLUDES(mutex_);
 
   // Copies xcluster_info_per_namespace into info.
-  Status FillXClusterInfoPerNamespace(XClusterGuardedInfoPB& info) const EXCLUDES(mutex_);
-  Status FillXClusterInfoPerNamespace(LWXClusterGuardedInfoPB& info) const EXCLUDES(mutex_);
+  // Returns the config version the copied info belongs to, read under the same lock.
+  Result<uint32_t> FillXClusterInfoPerNamespace(XClusterGuardedInfoPB& info) const
+      EXCLUDES(mutex_);
 
   Status SetXClusterRole(
       const LeaderEpoch& epoch, const NamespaceId& namespace_id,

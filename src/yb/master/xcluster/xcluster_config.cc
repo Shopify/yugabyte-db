@@ -114,24 +114,12 @@ Status XClusterConfig::FillHeartbeatResponse(
   return Status::OK();
 }
 
-Status XClusterConfig::FillXClusterInfoPerNamespace(XClusterGuardedInfoPB& info) const {
+Result<uint32_t> XClusterConfig::FillXClusterInfoPerNamespace(XClusterGuardedInfoPB& info) const {
   SharedLock mutex_lock(mutex_);
   SCHECK(xcluster_config_info_, IllegalState, "XCluster config is not initialized");
   auto l = xcluster_config_info_->LockForRead();
   *info.mutable_xcluster_info_per_namespace() = l->pb.xcluster_info_per_namespace();
-  return Status::OK();
-}
-
-Status XClusterConfig::FillXClusterInfoPerNamespace(LWXClusterGuardedInfoPB& info) const {
-  SharedLock mutex_lock(mutex_);
-  SCHECK(xcluster_config_info_, IllegalState, "XCluster config is not initialized");
-  auto l = xcluster_config_info_->LockForRead();
-  for (const auto& [namespace_id, namespace_info] : l->pb.xcluster_info_per_namespace()) {
-    auto* entry = info.add_xcluster_info_per_namespace();
-    entry->dup_key(namespace_id);
-    *entry->mutable_value() = namespace_info;
-  }
-  return Status::OK();
+  return l->pb.version();
 }
 
 Status XClusterConfig::BumpVersionUpsertAndCommit(
