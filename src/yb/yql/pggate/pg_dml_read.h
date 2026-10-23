@@ -110,8 +110,9 @@ class PgDmlRead : public PgDml {
   // the subsequent values. Prefer shorter col_values.
   // The values are not required to make a valid key, meaning the hash code does not have to be
   // the result of yb_hash_code calculated on the hash key values.
-  // The is_inclusive flag is only effective if the col_values make a full valid key, a prefix is
-  // effectively inclusive.
+  // A bound on a prefix of the key covers every key with that prefix when is_inclusive is true and
+  // none of them when it is false. A NULL value or a nullptr ends the bound like the end of
+  // col_values does; for a row comparison a NULL member decides it on the members before it.
   // The col_values must contain at least one key column value, for bare hash code bounds use the
   // BindHashCode method.
   Status AddRowLowerBound(std::span<PgExpr*> col_values, bool is_inclusive);

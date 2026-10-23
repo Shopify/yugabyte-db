@@ -1477,8 +1477,15 @@ YbBindRowComparisonKeys(YbOpaque ybScan, YbScanPlan scan_plan,
 	bool		gt = (strategy == BTGreaterEqualStrategyNumber ||
 					  strategy == BTGreaterStrategyNumber);
 
+	/*
+	 * PgGate treats a strict bound as excluding every key that starts with
+	 * the bound values, so a strict comparison can only be passed as strict
+	 * when the whole row is pushed down. Truncated to a prefix it is
+	 * inclusive: (r1, r2) > (10, 100) only implies (r1) >= (10).
+	 */
 	bool		is_inclusive = (strategy != BTGreaterStrategyNumber &&
-								strategy != BTLessStrategyNumber);
+								strategy != BTLessStrategyNumber) ||
+							   pushdown_subkey_count < subkey_count;
 
 	/* Whether or not the RHS values make up a DocDB upper bound */
 	bool		is_upper_bound = gt ^ is_direction_asc;
