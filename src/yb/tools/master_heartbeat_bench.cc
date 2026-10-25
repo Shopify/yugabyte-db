@@ -250,6 +250,7 @@ class HollowTServer {
     if (auto_flags_config_version_ >= 0) {
       req->set_auto_flags_config_version(narrow_cast<uint32_t>(auto_flags_config_version_));
     }
+    req->set_tserver_list_version(tserver_list_version_);
 
     if (needs_registration_) {
       if (reg_tmpl != nullptr) {
@@ -341,6 +342,9 @@ class HollowTServer {
     }
     if (resp.has_tablet_report_limit()) {
       tablet_report_limit_ = resp.tablet_report_limit();
+    }
+    if (resp.has_tserver_list_update()) {
+      ApplyTServerListUpdateUnlocked(resp.tserver_list_update());
     }
     if (resp.has_tablet_report()) {
       for (const auto& update : resp.tablet_report().tablets()) {
@@ -435,6 +439,7 @@ class HollowTServer {
     } else {
       req->clear_auto_flags_config_version();
     }
+    req->set_tserver_list_version(tserver_list_version_);
 
     const bool tmpl_had_report = req->has_tablet_report();
     req->clear_tablet_report();
@@ -574,6 +579,23 @@ class HollowTServer {
     *cstate->mutable_config() = info.config;
   }
 
+  // Same rules as TabletServer::ApplyTServerListUpdate; a stale delta has nothing new.
+  void ApplyTServerListUpdateUnlocked(const master::TServerListUpdatePB& update) REQUIRES(mutex_) {
+    if (!update.full() && update.version() <= tserver_list_version_) {
+      return;
+    }
+    if (update.full()) {
+      known_tservers_.clear();
+    }
+    for (const auto& uuid : update.removed()) {
+      known_tservers_.erase(uuid);
+    }
+    for (const auto& entry : update.tservers()) {
+      known_tservers_[entry.instance().permanent_uuid()] = entry.alive();
+    }
+    tserver_list_version_ = update.version();
+  }
+
   const int index_;
   const string uuid_;
   const uint64_t instance_seqno_;
@@ -597,6 +619,8 @@ class HollowTServer {
   std::optional<uint64_t> lease_epoch_ GUARDED_BY(mutex_);
   int64_t last_rtt_us_ GUARDED_BY(mutex_) = 0;
   uint64_t hb_seq_ GUARDED_BY(mutex_) = 0;
+  uint64_t tserver_list_version_ GUARDED_BY(mutex_) = 0;
+  std::unordered_map<string, bool> known_tservers_ GUARDED_BY(mutex_);  // uuid -> alive
 
  public:
   bool MarkRegistrationInFlight() {
