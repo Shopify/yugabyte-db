@@ -24,14 +24,13 @@ namespace yb::tserver {
 
 class ConnectivityPoller {
  public:
-  explicit ConnectivityPoller(server::RpcServerBase& server, const std::string& uuid);
+  explicit ConnectivityPoller(TabletServer& server, const std::string& uuid);
   ~ConnectivityPoller();
 
   Status Start(Cgroup* cgroup = nullptr);
 
   void Shutdown();
 
-  void UpdateMasterAddresses(server::MasterAddressesPtr master_addresses);
   ConnectivityStateResponsePB State();
 
  private:
