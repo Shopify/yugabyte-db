@@ -272,6 +272,9 @@ Status HeartbeatPoller::Poll() {
     if (!status.ok() && status.IsTryAgain()) {
       continue;
     }
+    if (!status.ok()) {
+      server_.SetMasterHeartbeatFailure(status);
+    }
     return status;
   }
 
@@ -509,6 +512,12 @@ Status HeartbeatPoller::TryHeartbeat() {
     // below (hence using the nested scope for resp until here).
     last_hb_response_.Swap(&resp);
     heartbeat_rtt_ = end_time.GetDeltaSince(start_time);
+    server_.SetMasterHeartbeatInfo({
+        .uuid = last_hb_response_.master_instance().permanent_uuid(),
+        .host_port = finder_.get_master_leader_hostport(),
+        .time = end_time,
+        .rtt = heartbeat_rtt_,
+        .last_failure = Status::OK()});
   }
 
   if (last_hb_response_.has_cluster_uuid() && !last_hb_response_.cluster_uuid().empty()) {
