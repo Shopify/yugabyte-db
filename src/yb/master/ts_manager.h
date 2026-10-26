@@ -208,7 +208,7 @@ class TSManager {
   void MarkTServersForLeaderBlacklistNotification();
 
   // Fills the tserver list for a tserver holding since_version: the changes since then, or the
-  // full list when the version is from another leader, unset, or older than the kept removals.
+  // full list when that version is unset, from another leader, aged out, or ahead of the master.
   void FillTServerListUpdate(uint64_t since_version, TServerListUpdatePB* update) const;
 
   // Make sure all live tservers are on the expected version.
