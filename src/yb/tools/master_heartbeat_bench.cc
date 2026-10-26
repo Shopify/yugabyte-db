@@ -61,6 +61,7 @@
 
 #include "yb/common/common_net.pb.h"
 #include "yb/common/wire_protocol.h"
+#include "yb/common/ysql_operation_lease.h"
 
 #include "yb/consensus/metadata.pb.h"
 
@@ -111,12 +112,9 @@ DEFINE_NON_RUNTIME_int32(replication_factor, 7, "Replication factor for created 
 DEFINE_NON_RUNTIME_int32(tablets_per_table, 2000,
     "Max tablets per created table; total tablet count is split into tables of this size.");
 DEFINE_NON_RUNTIME_int32(run_seconds, 300, "Steady-state measurement window.");
-DEFINE_NON_RUNTIME_int32(heartbeat_interval_ms, 1000, "Hollow tserver heartbeat interval.");
 DEFINE_NON_RUNTIME_int32(full_metrics_beat_period, 5,
     "Send the tablet metrics payload (storage_metadata + leader_info) every Nth heartbeat, "
     "matching the real tserver's 5s metrics cadence.");
-DEFINE_NON_RUNTIME_bool(send_lease_refreshes, true,
-    "Send the per-second RefreshYsqlLease RPC from every hollow tserver.");
 DEFINE_NON_RUNTIME_string(master_bin, "", "Path to the yb-master binary (required).");
 DEFINE_NON_RUNTIME_string(data_dir, "",
     "Fresh scratch directory for master data and logs (required).");
@@ -159,6 +157,10 @@ DEFINE_NON_RUNTIME_string(metric_substrings,
     "service_response_bytes_yb_master_",
     "Master prometheus metrics to collect: comma-separated substrings; matching series are "
     "summed per metric name.");
+
+DECLARE_int32(heartbeat_interval_ms);
+DECLARE_bool(enable_ysql_operation_lease);
+DECLARE_uint64(ysql_lease_refresher_interval_ms);
 
 METRIC_DECLARE_entity(server);
 
@@ -1374,6 +1376,7 @@ class HeartbeatBench {
     const std::vector<string> extra_flags =
         strings::Split(FLAGS_master_flags, ",", strings::SkipEmpty());
     argv.insert(argv.end(), extra_flags.begin(), extra_flags.end());
+    argv.push_back(Format("--enable_ysql_operation_lease=$0", FLAGS_enable_ysql_operation_lease));
     string program = FLAGS_master_bin;
     if (!FLAGS_master_cpus.empty()) {
       argv.insert(argv.begin(), {"taskset", "-c", FLAGS_master_cpus});
@@ -1446,6 +1449,9 @@ class HeartbeatBench {
     const std::vector<string> extra_flags =
         strings::Split(FLAGS_tserver_flags, ",", strings::SkipEmpty());
     argv.insert(argv.end(), extra_flags.begin(), extra_flags.end());
+    argv.push_back(Format("--enable_ysql_operation_lease=$0", FLAGS_enable_ysql_operation_lease));
+    argv.push_back(
+        Format("--ysql_lease_refresher_interval_ms=$0", FLAGS_ysql_lease_refresher_interval_ms));
     tserver_process_ = std::make_unique<Subprocess>(FLAGS_tserver_bin, argv);
     RETURN_NOT_OK(tserver_process_->Start());
     LOG(INFO) << "Started yb-tserver pid " << tserver_process_->pid();
@@ -1499,7 +1505,7 @@ class HeartbeatBench {
 
   void SchedulerLoop() {
     const auto hb_interval = MonoDelta::FromMilliseconds(FLAGS_heartbeat_interval_ms);
-    const auto lease_interval = 1000ms;
+    const auto lease_interval = MonoDelta::FromMilliseconds(FLAGS_ysql_lease_refresher_interval_ms);
     // Stagger initial sends across the interval so load is even, as in a real cluster; metrics
     // beats are staggered across their own period the same way.
     const auto& tservers = registry_.tservers();
@@ -1527,7 +1533,7 @@ class HeartbeatBench {
           ts->next_heartbeat = now + interval;
           SendHeartbeat(ts.get());
         }
-        if (FLAGS_send_lease_refreshes && now >= ts->next_lease_refresh &&
+        if (IsYsqlLeaseEnabled() && now >= ts->next_lease_refresh &&
             !ts->lease_in_flight.exchange(true)) {
           ts->next_lease_refresh = now + lease_interval;
           SendLeaseRefresh(ts.get());
