@@ -5,6 +5,5 @@
 --tserver_bin=build/latest/bin/yb-tserver
 --data_dir=/tmp/hb-bench
 --tablet_replicas_per_tserver=100
---send_lease_refreshes=false
 --master_flags=--flagfile=src/yb/tools/master_heartbeat_bench_flags/master.flags
 --tserver_flags=--flagfile=src/yb/tools/master_heartbeat_bench_flags/tserver.flags
