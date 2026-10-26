@@ -78,6 +78,7 @@ DECLARE_int32(heartbeat_rpc_timeout_ms);
 DECLARE_int32(tserver_heartbeat_metrics_interval_ms);
 DECLARE_int32(tablet_report_limit);
 DECLARE_int32(replication_factor);
+DECLARE_uint64(connectivity_check_interval_ms);
 
 METRIC_DECLARE_histogram(handler_latency_yb_master_MasterHeartbeat_TSHeartbeat);
 
@@ -1263,6 +1264,82 @@ TEST_F(MasterHeartbeatITest, TServerListDeltaOnUnresponsiveAndRemove) {
       ASSERT_NE(known.info.tserver_instance().permanent_uuid(), new_uuid);
     }
   }
+}
+
+class MasterHeartbeatITestConnectivity : public MasterHeartbeatITest {
+ public:
+  void SetUp() override {
+    // Set before the tservers start so the poller runs at this interval from its first pass.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_connectivity_check_interval_ms) = 6000;
+    MasterHeartbeatITest::SetUp();
+  }
+
+  Result<std::optional<tserver::ConnectivityEntryPB>> GetConnectivityEntry(
+      tserver::MiniTabletServer& ts, const std::string& uuid) {
+    tserver::TabletServerServiceProxy proxy(proxy_cache_.get(), HostPort(ts.bound_rpc_addr()));
+    tserver::ConnectivityStateRequestPB req;
+    tserver::ConnectivityStateResponsePB resp;
+    rpc::RpcController controller;
+    controller.set_timeout(10s);
+    RETURN_NOT_OK(proxy.ConnectivityState(req, &resp, &controller));
+    for (const auto& entry : resp.entries()) {
+      if (entry.uuid() == uuid) {
+        return entry;
+      }
+    }
+    return std::nullopt;
+  }
+
+  Status WaitForMasterEntry(
+      tserver::MiniTabletServer& ts, const std::string& uuid, bool alive, MonoDelta timeout) {
+    return WaitFor(
+        [&]() -> Result<bool> {
+          auto entry = VERIFY_RESULT(GetConnectivityEntry(ts, uuid));
+          if (!entry || entry->server_type() != tserver::ServerType::MASTER ||
+              entry->alive() != alive) {
+            return false;
+          }
+          // A live master carries no failure text; a dead one must say why.
+          return entry->last_failure().empty() == alive;
+        },
+        timeout, Format("Wait for master $0 to be reported alive=$1", uuid, alive));
+  }
+};
+
+class MasterHeartbeatITestConnectivity3Masters : public MasterHeartbeatITestConnectivity {
+ public:
+  size_t num_masters() override { return 3; }
+};
+
+TEST_F_EX(MasterHeartbeatITest, ConnectivityMasterDown, MasterHeartbeatITestConnectivity) {
+  auto& ts = *mini_cluster_->mini_tablet_server(0);
+  auto* master = mini_cluster_->mini_master();
+  const auto master_uuid = master->permanent_uuid();
+  ASSERT_OK(WaitForMasterEntry(ts, master_uuid, /*alive=*/true, 30s * kTimeMultiplier));
+
+  master->Shutdown();
+  ASSERT_OK(WaitForMasterEntry(ts, master_uuid, /*alive=*/false, 30s * kTimeMultiplier));
+
+  ASSERT_OK(master->Start());
+  ASSERT_OK(WaitForMasterEntry(ts, master_uuid, /*alive=*/true, 60s * kTimeMultiplier));
+}
+
+TEST_F_EX(
+    MasterHeartbeatITest, ConnectivityMasterLeaderChange,
+    MasterHeartbeatITestConnectivity3Masters) {
+  auto& ts = *mini_cluster_->mini_tablet_server(0);
+  const auto old_leader = ASSERT_RESULT(mini_cluster_->GetLeaderMiniMaster())->permanent_uuid();
+  ASSERT_OK(WaitForMasterEntry(ts, old_leader, /*alive=*/true, 30s * kTimeMultiplier));
+
+  std::string new_leader;
+  for (size_t i = 0; i < mini_cluster_->num_masters(); ++i) {
+    new_leader = mini_cluster_->mini_master(i)->permanent_uuid();
+    if (new_leader != old_leader) {
+      break;
+    }
+  }
+  ASSERT_EQ(ASSERT_RESULT(mini_cluster_->StepDownMasterLeader(new_leader)), new_leader);
+  ASSERT_OK(WaitForMasterEntry(ts, new_leader, /*alive=*/true, 60s * kTimeMultiplier));
 }
 
 }  // namespace yb::integration_tests
