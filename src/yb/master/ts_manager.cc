@@ -471,9 +471,15 @@ Status TSManager::MarkUnresponsiveTServers(const LeaderEpoch& epoch) {
     SharedLock<decltype(map_lock_)> l(map_lock_);
     std::vector<TSDescriptor*> updated_descs;
     std::vector<TSDescriptor::WriteLock> cow_locks;
+    // Only a state change is visible to tservers; a lease-only change is not stamped.
+    std::vector<TSDescriptor*> newly_unresponsive_descs;
     for (const auto& [id, desc] : servers_by_id_) {
+      const bool was_live = desc->IsLive();
       auto lock_opt = desc->MaybeUpdateLiveness(current_time);
       if (lock_opt) {
+        if (was_live && !(*lock_opt)->IsLive()) {
+          newly_unresponsive_descs.push_back(desc.get());
+        }
         updated_descs.push_back(desc.get());
         cow_locks.push_back(std::move(lock_opt).value());
       }
@@ -482,7 +488,7 @@ Status TSManager::MarkUnresponsiveTServers(const LeaderEpoch& epoch) {
     for (auto& l : cow_locks) {
       l.Commit();
     }
-    for (auto* desc : updated_descs) {
+    for (auto* desc : newly_unresponsive_descs) {
       StampTServerListChange(*desc);
     }
   }
@@ -633,7 +639,8 @@ void TSManager::FillTServerListUpdate(
     std::lock_guard l(version_lock_);
     version = tserver_list_version_;
     full = since_version == 0 || (since_version >> 32) != (version >> 32) ||
-           static_cast<uint32_t>(since_version) < tserver_list_horizon_;
+           static_cast<uint32_t>(since_version) < tserver_list_horizon_ ||
+           static_cast<uint32_t>(since_version) > static_cast<uint32_t>(version);
     if (!full) {
       for (auto it = tserver_list_changes_.upper_bound(static_cast<uint32_t>(since_version));
            it != tserver_list_changes_.end(); ++it) {
