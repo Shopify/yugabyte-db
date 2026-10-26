@@ -79,6 +79,7 @@ target_link_libraries(yb-ts-cli
 add_executable(master-heartbeat-bench master_heartbeat_bench.cc)
 target_link_libraries(master-heartbeat-bench
   master_proto
+  tserver
   tserver_admin_proto
   consensus_metadata_proto
   server_base_proto
