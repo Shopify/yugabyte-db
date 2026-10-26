@@ -30,6 +30,8 @@
 DEFINE_RUNTIME_uint64(connectivity_check_interval_ms, 60000,
     "Milliseconds interval to check connectivity between cluster nodes");
 
+DECLARE_int32(heartbeat_interval_ms);
+
 using namespace std::literals;
 
 namespace yb::tserver {
@@ -150,25 +152,21 @@ class ConnectivityPoller::Impl {
   }
 
   Status Poll() {
-    // The heartbeater exchanges with the master every second; its recorded outcome is the entry.
-    // The master is alive if a heartbeat succeeded within half the poll interval.
+    // Alive if a heartbeat succeeded within half the poll interval, at least a few heartbeats.
     Status result;
     const auto master = server_.GetMasterHeartbeatInfo();
     if (!master.uuid.empty()) {
       const auto since_heartbeat = MonoTime::Now() - master.time;
+      const auto alive_window = MonoDelta::FromMilliseconds(std::max<uint64_t>(
+          FLAGS_connectivity_check_interval_ms / 2, 3 * FLAGS_heartbeat_interval_ms));
       ConnectivityEntryPB master_node_info;
       master_node_info.set_server_type(ServerType::MASTER);
       master_node_info.set_uuid(master.uuid);
-      master_node_info.set_alive(
-          since_heartbeat < MonoDelta::FromMilliseconds(FLAGS_connectivity_check_interval_ms / 2));
-      if (!master.last_failure.ok()) {
-        master_node_info.set_last_failure(Format(
-            "$0; no successful heartbeat for $1", master.last_failure, since_heartbeat));
-      } else if (!master_node_info.alive()) {
-        master_node_info.set_last_failure(
-            Format("No successful heartbeat for $0", since_heartbeat));
-      }
+      master_node_info.set_alive(since_heartbeat < alive_window);
       if (!master_node_info.alive()) {
+        master_node_info.set_last_failure(master.last_failure.ok()
+            ? Format("No successful heartbeat for $0", since_heartbeat)
+            : Format("$0; no successful heartbeat for $1", master.last_failure, since_heartbeat));
         result = STATUS_FORMAT(
             ServiceUnavailable, "Master heartbeats failing: $0", master_node_info.last_failure());
       }
