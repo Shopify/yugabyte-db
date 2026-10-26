@@ -110,6 +110,7 @@ class HeartbeatPoller : public MasterLeaderPollerInterface {
   const std::string& LogPrefix() const override;
 
  private:
+  Status DoPoll();
   Status TryHeartbeat();
   Status SetupRegistration(master::TSRegistrationPB* reg);
   void SetupCommonField(master::TSToMasterCommonPB* common);
@@ -261,6 +262,14 @@ Status HeartbeatPoller::Poll() {
     return Status::OK();
   }
 
+  auto status = DoPoll();
+  if (!status.ok()) {
+    server_.SetMasterHeartbeatFailure(status);
+  }
+  return status;
+}
+
+Status HeartbeatPoller::DoPoll() {
   if (!proxy_) {
     VLOG_WITH_PREFIX(1) << "No valid master proxy. Connecting...";
     proxy_ = VERIFY_RESULT(finder_.CreateProxy<master::MasterHeartbeatProxy>(
@@ -271,9 +280,6 @@ Status HeartbeatPoller::Poll() {
     auto status = TryHeartbeat();
     if (!status.ok() && status.IsTryAgain()) {
       continue;
-    }
-    if (!status.ok()) {
-      server_.SetMasterHeartbeatFailure(status);
     }
     return status;
   }
