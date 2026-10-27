@@ -115,7 +115,7 @@ DEFINE_NON_RUNTIME_int32(run_seconds, 300, "Steady-state measurement window.");
 DEFINE_NON_RUNTIME_int32(full_metrics_beat_period, 5,
     "Send the tablet metrics payload (storage_metadata + leader_info) every Nth heartbeat, "
     "matching the real tserver's 5s metrics cadence.");
-DEFINE_NON_RUNTIME_bool(tserver_heartbeat_metrics_send_storage_metadata_on_change, false,
+DEFINE_NON_RUNTIME_bool(send_storage_metadata_on_change, false,
     "Same as the tserver flag: hollow tservers send a tablet's storage_metadata once and again "
     "only after a full report or a response that did not confirm processing it, and the real "
     "tserver is started with the flag.");
@@ -217,7 +217,7 @@ class HollowTServer {
 
   // Hollow tablet sizes never change, so acked entries are only resent after a full report.
   bool SendStorageMetadata(const string& tablet_id) REQUIRES(mutex_) {
-    if (FLAGS_tserver_heartbeat_metrics_send_storage_metadata_on_change &&
+    if (FLAGS_send_storage_metadata_on_change &&
         storage_acked_.contains(tablet_id)) {
       return false;
     }
@@ -1482,7 +1482,7 @@ class HeartbeatBench {
         Format("--tserver_master_addrs=127.0.0.1:$0", FLAGS_relay_port),
         Format("--heartbeat_interval_ms=$0", FLAGS_heartbeat_interval_ms),
         Format("--tserver_heartbeat_metrics_send_storage_metadata_on_change=$0",
-               FLAGS_tserver_heartbeat_metrics_send_storage_metadata_on_change),
+               FLAGS_send_storage_metadata_on_change),
         "--enable_ysql=false",
         "--placement_cloud=cloud1",
         "--placement_region=region1",
