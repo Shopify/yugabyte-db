@@ -115,6 +115,10 @@ DEFINE_NON_RUNTIME_int32(run_seconds, 300, "Steady-state measurement window.");
 DEFINE_NON_RUNTIME_int32(full_metrics_beat_period, 5,
     "Send the tablet metrics payload (storage_metadata + leader_info) every Nth heartbeat, "
     "matching the real tserver's 5s metrics cadence.");
+DEFINE_NON_RUNTIME_bool(tserver_heartbeat_metrics_send_storage_metadata_on_change, false,
+    "Same as the tserver flag: hollow tservers send a tablet's storage_metadata once and again "
+    "only after a full report or a response that did not confirm processing it, and the real "
+    "tserver is started with the flag.");
 DEFINE_NON_RUNTIME_string(master_bin, "", "Path to the yb-master binary (required).");
 DEFINE_NON_RUNTIME_string(data_dir, "",
     "Fresh scratch directory for master data and logs (required).");
@@ -208,6 +212,17 @@ class HollowTServer {
     tablets_.erase(tablet_id);
     dirty_.erase(tablet_id);
     removed_.insert(tablet_id);
+    storage_acked_.erase(tablet_id);
+  }
+
+  // Hollow tablet sizes never change, so acked entries are only resent after a full report.
+  bool SendStorageMetadata(const string& tablet_id) REQUIRES(mutex_) {
+    if (FLAGS_tserver_heartbeat_metrics_send_storage_metadata_on_change &&
+        storage_acked_.contains(tablet_id)) {
+      return false;
+    }
+    storage_pending_.insert(tablet_id);
+    return true;
   }
 
   size_t NumTablets() {
@@ -223,6 +238,7 @@ class HollowTServer {
                      std::optional<bool> metrics_override, master::TSHeartbeatRequestPB* req) {
     req->Clear();
     std::lock_guard l(mutex_);
+    storage_pending_.clear();
     const bool metrics_beat = metrics_override.has_value()
         ? *metrics_override
         : hb_seq_ % FLAGS_full_metrics_beat_period == 0;
@@ -296,15 +312,17 @@ class HollowTServer {
       path_metric->set_used_space(tablets_.size() * (kSstBytes + kWalBytes));
       path_metric->set_total_space(1ULL << 40);
       for (const auto& [tablet_id, info] : tablets_) {
-        auto* storage = req->add_storage_metadata();
-        storage->set_tablet_id(tablet_id);
-        storage->set_sst_file_size(kSstBytes);
-        storage->set_wal_file_size(kWalBytes);
-        storage->set_uncompressed_sst_file_size(kSstBytes * 3 / 2);
-        storage->set_total_size(kSstBytes + kWalBytes);
-        storage->set_vector_index_size(0);
-        storage->set_has_active_vector_index_backfill(false);
-        storage->set_may_have_orphaned_post_split_data(false);
+        if (SendStorageMetadata(tablet_id)) {
+          auto* storage = req->add_storage_metadata();
+          storage->set_tablet_id(tablet_id);
+          storage->set_sst_file_size(kSstBytes);
+          storage->set_wal_file_size(kWalBytes);
+          storage->set_uncompressed_sst_file_size(kSstBytes * 3 / 2);
+          storage->set_total_size(kSstBytes + kWalBytes);
+          storage->set_vector_index_size(0);
+          storage->set_has_active_vector_index_backfill(false);
+          storage->set_may_have_orphaned_post_split_data(false);
+        }
         // The real provider adds leader_info only for tablets this tserver leads.
         if (info.leader_uuid == uuid_) {
           auto* leader = req->add_leader_info();
@@ -347,7 +365,12 @@ class HollowTServer {
         dirty_.erase(update.tablet_id());
       }
     }
+    if (resp.tablet_metadata_processed()) {
+      storage_acked_.insert(storage_pending_.begin(), storage_pending_.end());
+    }
+    storage_pending_.clear();
     if (resp.needs_full_tablet_report()) {
+      storage_acked_.clear();
       full_report_queue_.clear();
       for (const auto& [tablet_id, _] : tablets_) {
         full_report_queue_.push_back(tablet_id);
@@ -477,7 +500,7 @@ class HollowTServer {
     }
     int i = 0;
     for (const auto& [tablet_id, info] : tablets_) {
-      if (!tmpl_storage.empty()) {
+      if (!tmpl_storage.empty() && SendStorageMetadata(tablet_id)) {
         auto* storage = req->add_storage_metadata();
         *storage = tmpl_storage.Get(i % tmpl_storage.size());
         storage->set_tablet_id(tablet_id);
@@ -597,6 +620,8 @@ class HollowTServer {
   std::map<string, TabletInfo> tablets_ GUARDED_BY(mutex_);
   std::set<string> dirty_ GUARDED_BY(mutex_);
   std::set<string> removed_ GUARDED_BY(mutex_);
+  std::set<string> storage_acked_ GUARDED_BY(mutex_);
+  std::set<string> storage_pending_ GUARDED_BY(mutex_);
   std::deque<string> full_report_queue_ GUARDED_BY(mutex_);
   bool full_report_active_ GUARDED_BY(mutex_) = false;
   bool full_report_started_ GUARDED_BY(mutex_) = false;
@@ -1456,6 +1481,8 @@ class HeartbeatBench {
         // Heartbeats reach the master through the relay, where they are captured.
         Format("--tserver_master_addrs=127.0.0.1:$0", FLAGS_relay_port),
         Format("--heartbeat_interval_ms=$0", FLAGS_heartbeat_interval_ms),
+        Format("--tserver_heartbeat_metrics_send_storage_metadata_on_change=$0",
+               FLAGS_tserver_heartbeat_metrics_send_storage_metadata_on_change),
         "--enable_ysql=false",
         "--placement_cloud=cloud1",
         "--placement_region=region1",
