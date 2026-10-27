@@ -43,6 +43,10 @@ DEFINE_RUNTIME_bool(tserver_heartbeat_metrics_add_replication_status, true,
 DEFINE_RUNTIME_bool(tserver_heartbeat_metrics_add_leader_info, true,
             "Add leader info to metrics tserver sends to master");
 
+DEFINE_RUNTIME_bool(tserver_heartbeat_metrics_leader_info_only_without_lease, false,
+            "Send leader info only for tablets this tserver leads without holding a lease; "
+            "the master treats a missing entry as a healthy leader or a follower.");
+
 DECLARE_uint64(rocksdb_max_file_size_for_compaction);
 
 using namespace std::literals;
@@ -101,6 +105,12 @@ void TServerMetricsHeartbeatDataProvider::DoAddData(
               MicrosTime ht_lease_exp;
               consensus::LeaderLeaseStatus leader_lease_status =
                   consensus_result.get()->GetLeaderLeaseStatusIfLeader(&ht_lease_exp);
+              // Followers also report NO_MAJORITY_REPLICATED_LEASE, so the role check is needed.
+              if (FLAGS_tserver_heartbeat_metrics_leader_info_only_without_lease &&
+                  (leader_lease_status == consensus::LeaderLeaseStatus::HAS_LEASE ||
+                   consensus_result.get()->role() != PeerRole::LEADER)) {
+                continue;
+              }
               auto leader_info = req->add_leader_info();
               leader_info->set_tablet_id(tablet_peer->tablet_id());
               leader_info->set_leader_lease_status(leader_lease_status);

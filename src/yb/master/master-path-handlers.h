@@ -321,7 +321,7 @@ class MasterPathHandlers {
   std::string ReplicaInfoToHtml(
       const std::vector<TsUuidAndTabletReplica>&
           locations,
-      const std::string& tablet_id) const;
+      const TabletInfo& tablet) const;
 
   Master* master_;
 

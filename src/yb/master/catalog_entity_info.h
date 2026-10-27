@@ -130,22 +130,6 @@ struct TableDescription {
   TabletInfos tablet_infos;
 };
 
-struct TabletLeaderLeaseInfo {
-  bool initialized = false;
-  consensus::LeaderLeaseStatus leader_lease_status =
-      consensus::LeaderLeaseStatus::NO_MAJORITY_REPLICATED_LEASE;
-  // Expiration time of leader ht lease, invalid when leader_lease_status != HAS_LEASE.
-  MicrosTime ht_lease_expiration = 0;
-  // Number of heartbeats that current tablet leader doesn't have a valid lease.
-  uint64 heartbeats_without_leader_lease = 0;
-
-  std::string ToString() const {
-    return YB_STRUCT_TO_STRING(
-        initialized, (leader_lease_status, consensus::LeaderLeaseStatus_Name(leader_lease_status)),
-        ht_lease_expiration, heartbeats_without_leader_lease);
-  }
-};
-
 // Drive usage information on a current replica of a tablet.
 // This allows us to look at individual resource usage per replica of a tablet.
 struct TabletReplicaDriveInfo {
@@ -190,8 +174,6 @@ struct TabletReplica {
 
   TabletReplicaDriveInfo drive_info;
 
-  TabletLeaderLeaseInfo leader_lease_info;
-
   FullCompactionStatus full_compaction_status;
 
   uint32_t last_attempted_clone_seq_no;
@@ -201,8 +183,6 @@ struct TabletReplica {
   void UpdateFrom(const TabletReplica& source);
 
   void UpdateDriveInfo(const TabletReplicaDriveInfo& info);
-
-  void UpdateLeaderLeaseInfo(const TabletLeaderLeaseInfo& info);
 
   bool IsStarting() const;
 
@@ -329,15 +309,12 @@ class TabletInfo : public MetadataCowWrapper<PersistentTabletInfo> {
   std::shared_ptr<const TabletReplicaMap> GetReplicaLocations() const;
   Result<TSDescriptorPtr> GetLeader() const;
   Result<TabletReplicaDriveInfo> GetLeaderReplicaDriveInfo() const;
-  Result<TabletLeaderLeaseInfo> GetLeaderLeaseInfoIfLeader(const std::string& ts_uuid) const;
 
   // Replaces a replica in replica_locations_ map if it exists. Otherwise, it adds it to the map.
   void UpdateReplicaLocations(const std::string& ts_uuid, const TabletReplica& replica);
 
   // Updates a replica in replica_locations_ map if it exists.
-  void UpdateReplicaInfo(const std::string& ts_uuid,
-                         const TabletReplicaDriveInfo& drive_info,
-                         const TabletLeaderLeaseInfo& leader_lease_info);
+  void UpdateReplicaInfo(const std::string& ts_uuid, const TabletReplicaDriveInfo& drive_info);
 
   // Returns the per-stream replication status bitmasks.
   std::unordered_map<xrepl::StreamId, uint64_t> GetReplicationStatus();
@@ -346,8 +323,10 @@ class TabletInfo : public MetadataCowWrapper<PersistentTabletInfo> {
   void set_last_update_time(const MonoTime& ts);
   MonoTime last_update_time() const;
 
-  // Update last_time_with_valid_leader_ to the Now().
-  void UpdateLastTimeWithValidLeader();
+  // Records that ts_uuid reported leading this tablet without a lease; ignored unless the
+  // replica map has it as LEADER.
+  void MarkLeaderWithoutLease(const std::string& ts_uuid);
+  MonoTime last_time_leader_without_lease() const;
   MonoTime last_time_with_valid_leader() const;
   void TEST_set_last_time_with_valid_leader(const MonoTime& time);
 
@@ -420,6 +399,10 @@ class TabletInfo : public MetadataCowWrapper<PersistentTabletInfo> {
   // 1. with peer role LEADER.
   // 2. has not-expired lease.
   MonoTime last_time_with_valid_leader_ GUARDED_BY(lock_);
+
+  // Last time the current leader heartbeated without holding a lease. Healthy leaders send
+  // nothing, so this is the only lease signal the master keeps.
+  MonoTime last_time_leader_without_lease_ GUARDED_BY(lock_);
 
   // The locations in the latest Raft config where this tablet has been
   // reported. The map is keyed by tablet server UUID.
