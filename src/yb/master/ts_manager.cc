@@ -81,22 +81,18 @@ namespace {
 
 bool HasSameHostPort(const HostPortPB& lhs, const HostPortPB& rhs);
 bool HasSameHostPort(const HostPortPB& lhs, const LWHostPortPB& rhs);
+bool HasSameHostPort(const HostPortPB& lhs, const LWHostPortPB* rhs);
 
 template <class HostPorts>
 bool HasSameHostPort(
     const google::protobuf::RepeatedPtrField<HostPortPB>& lhs, const HostPorts& rhs);
 
-template <class Registration>
+template <class Registration, class CloudInfo>
 bool HasSameHostPort(
-    const ServerRegistrationPB& lhs, const Registration& rhs, const CloudInfoPB& cloud_info);
+    const ServerRegistrationPB& lhs, const Registration& rhs, const CloudInfo& cloud_info);
 
 template <class Registration>
 bool HasSameHostPort(const ServerRegistrationPB& lhs, const Registration& rhs);
-
-template <class Registration>
-bool HasSameHostPort(
-    const ServerRegistrationPB& lhs, const Registration& rhs,
-    const std::vector<CloudInfoPB>& perspectives);
 
 // Returns a function to determine whether a registered ts matches the host port of the registering
 // ts.
@@ -736,6 +732,11 @@ bool HasSameHostPort(const HostPortPB& lhs, const LWHostPortPB& rhs) {
   return Slice(lhs.host()) == rhs.host() && lhs.port() == rhs.port();
 }
 
+// The PB DesiredHostPort returns an empty HostPortPB where the LW one returns nullptr.
+bool HasSameHostPort(const HostPortPB& lhs, const LWHostPortPB* rhs) {
+  return rhs ? HasSameHostPort(lhs, *rhs) : lhs.host().empty() && lhs.port() == 0;
+}
+
 template <class HostPorts>
 bool HasSameHostPort(
     const google::protobuf::RepeatedPtrField<HostPortPB>& lhs, const HostPorts& rhs) {
@@ -749,9 +750,9 @@ bool HasSameHostPort(
   return false;
 }
 
-template <class Registration>
+template <class Registration, class CloudInfo>
 bool HasSameHostPort(
-    const ServerRegistrationPB& lhs, const Registration& rhs, const CloudInfoPB& cloud_info) {
+    const ServerRegistrationPB& lhs, const Registration& rhs, const CloudInfo& cloud_info) {
   return HasSameHostPort(DesiredHostPort(lhs, cloud_info), DesiredHostPort(rhs, cloud_info));
 }
 
@@ -762,20 +763,6 @@ bool HasSameHostPort(const ServerRegistrationPB& lhs, const Registration& rhs) {
 }
 
 template <class Registration>
-bool HasSameHostPort(
-    const ServerRegistrationPB& lhs, const Registration& rhs,
-    const std::vector<CloudInfoPB>& perspectives) {
-  auto find_it = std::find_if(
-      perspectives.begin(), perspectives.end(), [&lhs, &rhs](const CloudInfoPB& cloud_info) {
-        return HasSameHostPort(lhs, rhs, cloud_info);
-      });
-  return find_it != perspectives.end();
-}
-
-const CloudInfoPB& ToCloudInfoPB(const CloudInfoPB& cloud_info) { return cloud_info; }
-CloudInfoPB ToCloudInfoPB(const LWCloudInfoPB& cloud_info) { return cloud_info.ToGoogleProtobuf(); }
-
-template <class Registration>
 std::function<bool(const ServerRegistrationPB&)> GetHostPortCheckerFunction(
     const Registration& registration, const CloudInfoPB& local_master_cloud_info) {
   // This pivots on a runtime flag so we cannot return a static function.
@@ -784,17 +771,14 @@ std::function<bool(const ServerRegistrationPB&)> GetHostPortCheckerFunction(
     // 1. For master, the host-port for existing and registering tservers are different.
     // 2. The existing and registering tservers have distinct host-port from each others
     // perspective.
-    return
-        [&registration, &local_master_cloud_info,
-         registering_cloud_info = ToCloudInfoPB(registration.common().cloud_info())](
-            const ServerRegistrationPB& existing_ts_registration) {
-          auto cloud_info_perspectives = {
-              local_master_cloud_info,                // master's perspective
-              existing_ts_registration.cloud_info(),  // existing ts' perspective
-              registering_cloud_info};                // registering ts' perspective
-          return HasSameHostPort(
-              existing_ts_registration, registration.common(), cloud_info_perspectives);
-        };
+    return [&registration, &local_master_cloud_info](
+               const ServerRegistrationPB& existing_ts_registration) {
+      const auto& registering = registration.common();
+      return HasSameHostPort(existing_ts_registration, registering, local_master_cloud_info) ||
+             HasSameHostPort(
+                 existing_ts_registration, registering, existing_ts_registration.cloud_info()) ||
+             HasSameHostPort(existing_ts_registration, registering, registering.cloud_info());
+    };
   } else {
     return [&registration](const ServerRegistrationPB& existing_ts_registration) {
       return HasSameHostPort(existing_ts_registration, registration.common());

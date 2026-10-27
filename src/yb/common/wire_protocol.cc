@@ -401,25 +401,29 @@ UsePrivateIpMode GetMode() {
   return UsePrivateIpMode::never;
 }
 
-PublicAddressAllowed UsePublicIp(const CloudInfoPB& connect_to, const CloudInfoPB& connect_from) {
+template <class ConnectTo, class ConnectFrom>
+PublicAddressAllowed UsePublicIp(const ConnectTo& connect_to, const ConnectFrom& connect_from) {
   auto mode = GetMode();
 
   if (mode == UsePrivateIpMode::never) {
     return PublicAddressAllowed::kTrue;
   }
-  if (connect_to.placement_cloud() != connect_from.placement_cloud()) {
+  if (std::string_view(connect_to.placement_cloud()) !=
+      std::string_view(connect_from.placement_cloud())) {
     return PublicAddressAllowed::kTrue;
   }
   if (mode == UsePrivateIpMode::cloud) {
     return PublicAddressAllowed::kFalse;
   }
-  if (connect_to.placement_region() != connect_from.placement_region()) {
+  if (std::string_view(connect_to.placement_region()) !=
+      std::string_view(connect_from.placement_region())) {
     return PublicAddressAllowed::kTrue;
   }
   if (mode == UsePrivateIpMode::region) {
     return PublicAddressAllowed::kFalse;
   }
-  if (connect_to.placement_zone() != connect_from.placement_zone()) {
+  if (std::string_view(connect_to.placement_zone()) !=
+      std::string_view(connect_from.placement_zone())) {
     return PublicAddressAllowed::kTrue;
   }
   return mode == UsePrivateIpMode::zone
@@ -450,20 +454,34 @@ const HostPortPB& DesiredHostPort(const ServerRegistrationPB& registration,
       registration.cloud_info(), connect_from);
 }
 
-HostPortPB DesiredHostPort(const LWServerRegistrationPB& registration,
-                           const CloudInfoPB& connect_from) {
-  const LWHostPortPB* host_port = nullptr;
+const HostPortPB& DesiredHostPort(const ServerRegistrationPB& registration,
+                                  const LWCloudInfoPB& connect_from) {
+  return GetHostPort(
+      registration.broadcast_addresses(), registration.private_rpc_addresses(),
+      UsePublicIp(registration.cloud_info(), connect_from));
+}
+
+template <class CloudInfo>
+const LWHostPortPB* DoDesiredHostPort(
+    const LWServerRegistrationPB& registration, const CloudInfo& connect_from) {
   if (!registration.broadcast_addresses().empty() &&
-      UsePublicIp(registration.cloud_info().ToGoogleProtobuf(), connect_from)) {
-    host_port = &registration.broadcast_addresses().front();
-  } else if (!registration.private_rpc_addresses().empty()) {
-    host_port = &registration.private_rpc_addresses().front();
+      UsePublicIp(registration.cloud_info(), connect_from)) {
+    return &registration.broadcast_addresses().front();
   }
-  HostPortPB result;
-  if (host_port) {
-    host_port->ToGoogleProtobuf(&result);
+  if (!registration.private_rpc_addresses().empty()) {
+    return &registration.private_rpc_addresses().front();
   }
-  return result;
+  return nullptr;
+}
+
+const LWHostPortPB* DesiredHostPort(
+    const LWServerRegistrationPB& registration, const CloudInfoPB& connect_from) {
+  return DoDesiredHostPort(registration, connect_from);
+}
+
+const LWHostPortPB* DesiredHostPort(
+    const LWServerRegistrationPB& registration, const LWCloudInfoPB& connect_from) {
+  return DoDesiredHostPort(registration, connect_from);
 }
 
 std::string SplitChildTabletIdsTag::ToMessage(const Value& value) {
