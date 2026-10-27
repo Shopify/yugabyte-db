@@ -39,6 +39,7 @@
 
 #include "yb/consensus/consensus_meta.h"
 #include "yb/consensus/consensus.pb.h"
+#include "yb/consensus/metadata.messages.h"
 
 #include "yb/gutil/map-util.h"
 
@@ -163,8 +164,8 @@ size_t MajoritySize(size_t num_voters) {
 }
 
 PeerMemberType GetConsensusMemberType(const std::string& permanent_uuid,
-                                      const ConsensusStatePB& cstate) {
-  for (const RaftPeerPB& peer : cstate.config().peers()) {
+                                      const LWConsensusStatePB& cstate) {
+  for (const auto& peer : cstate.config().peers()) {
     if (peer.permanent_uuid() == permanent_uuid) {
       return peer.member_type();
     }

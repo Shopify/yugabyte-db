@@ -63,6 +63,7 @@
 namespace yb {
 
 class NodeInstancePB;
+class LWNodeInstancePB;
 
 namespace consensus {
 class ConsensusServiceProxy;
@@ -81,6 +82,7 @@ class CDCServiceProxy;
 namespace master {
 
 class TSRegistrationPB;
+class LWTSRegistrationPB;
 class TSInformationPB;
 class TServerMetricsPB;
 class RefreshYsqlLeaseInfoPB;
@@ -132,6 +134,12 @@ class TSDescriptor : public MetadataCowWrapper<PersistentTServerInfo> {
       // TServer, the master will attempt to register the tserver even if it hasn't received a
       // heartbeat from it.
       RegisteredThroughHeartbeat registered_through_heartbeat = RegisteredThroughHeartbeat::kTrue);
+  static Result<std::pair<TSDescriptorPtr, TSDescriptor::WriteLock>> CreateNew(
+      const LWNodeInstancePB& instance,
+      const LWTSRegistrationPB& registration,
+      CloudInfoPB&& local_master_cloud_info,
+      rpc::ProxyCache* proxy_cache,
+      RegisteredThroughHeartbeat registered_through_heartbeat = RegisteredThroughHeartbeat::kTrue);
 
   static TSDescriptorPtr LoadFromEntry(
       const std::string& permanent_uuid, const SysTabletServerEntryPB& metadata,
@@ -150,7 +158,7 @@ class TSDescriptor : public MetadataCowWrapper<PersistentTServerInfo> {
   // request received from the tserver. If not, this method does no mutations and returns an error
   // status.
   Status UpdateFromHeartbeat(
-      const TSHeartbeatRequestPB& req, const TSDescriptor::WriteLock& lock,
+      const LWTSHeartbeatRequestPB& req, const TSDescriptor::WriteLock& lock,
       YsqlDbPinIndex& pin_index);
 
   // Return the amount of time since the last heartbeat received from this TS.
@@ -159,6 +167,9 @@ class TSDescriptor : public MetadataCowWrapper<PersistentTServerInfo> {
 
   Result<TSDescriptor::WriteLock> UpdateRegistration(
       const NodeInstancePB& instance, const TSRegistrationPB& registration,
+      RegisteredThroughHeartbeat registered_through_heartbeat);
+  Result<TSDescriptor::WriteLock> UpdateRegistration(
+      const LWNodeInstancePB& instance, const LWTSRegistrationPB& registration,
       RegisteredThroughHeartbeat registered_through_heartbeat);
 
   const std::string& permanent_uuid() const { return permanent_uuid_; }
@@ -333,7 +344,7 @@ class TSDescriptor : public MetadataCowWrapper<PersistentTServerInfo> {
     return ts_metrics_.disable_tablet_split_if_default_ttl;
   }
 
-  void UpdateMetrics(const TServerMetricsPB& metrics);
+  void UpdateMetrics(const LWTServerMetricsPB& metrics);
 
   void GetMetrics(TServerMetricsPB* metrics);
 
@@ -342,7 +353,7 @@ class TSDescriptor : public MetadataCowWrapper<PersistentTServerInfo> {
     ts_metrics_.ClearMetrics();
   }
 
-  Status IsReportCurrent(const NodeInstancePB& ts_instance, const TabletReportPB& report);
+  Status IsReportCurrent(const LWNodeInstancePB& ts_instance, const LWTabletReportPB& report);
 
   // Set of methods to keep track of pending tablet deletes for a tablet server.
   bool HasTabletDeletePending() const;
@@ -394,6 +405,17 @@ class TSDescriptor : public MetadataCowWrapper<PersistentTServerInfo> {
   mutable rw_spinlock mutex_;
   std::atomic<uint32_t> tserver_list_stamp_{0};
 
+  template <class Instance, class Registration>
+  static Result<std::pair<TSDescriptorPtr, TSDescriptor::WriteLock>> DoCreateNew(
+      const Instance& instance, const Registration& registration,
+      CloudInfoPB&& local_master_cloud_info, rpc::ProxyCache* proxy_cache,
+      RegisteredThroughHeartbeat registered_through_heartbeat);
+
+  template <class Instance, class Registration>
+  Result<TSDescriptor::WriteLock> DoUpdateRegistration(
+      const Instance& instance, const Registration& registration,
+      RegisteredThroughHeartbeat registered_through_heartbeat);
+
   void ClearYsqlDbPinsUnlocked(YsqlDbPinIndex& pin_index) REQUIRES(mutex_);
 
   template <class TProxy>
@@ -409,8 +431,8 @@ class TSDescriptor : public MetadataCowWrapper<PersistentTServerInfo> {
 
   template <typename LockType>
   Status IsReportCurrentUnlocked(
-      const NodeInstancePB& ts_instance,
-      std::optional<std::reference_wrapper<const TabletReportPB>> report, const LockType& lock)
+      const LWNodeInstancePB& ts_instance,
+      std::optional<std::reference_wrapper<const LWTabletReportPB>> report, const LockType& lock)
       REQUIRES_SHARED(mutex_);
 
   struct TSMetrics {

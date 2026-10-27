@@ -78,6 +78,7 @@
 #include "yb/hnsw/hnsw_block_cache.h"
 
 #include "yb/master/master_defaults.h"
+#include "yb/master/master_heartbeat.messages.h"
 #include "yb/master/master_heartbeat.pb.h"
 #include "yb/master/sys_catalog.h"
 
@@ -3228,19 +3229,23 @@ void TSTabletManager::InitLocalRaftPeerPB() {
 }
 
 void TSTabletManager::CreateReportedTabletPB(const TabletPeerPtr& tablet_peer,
-                                             ReportedTabletPB* reported_tablet) {
-  reported_tablet->set_tablet_id(tablet_peer->tablet_id());
+                                             master::LWReportedTabletPB* reported_tablet) {
+  reported_tablet->dup_tablet_id(tablet_peer->tablet_id());
   reported_tablet->set_state(tablet_peer->state());
   reported_tablet->set_tablet_data_state(tablet_peer->tablet_metadata()->tablet_data_state());
   if (tablet_peer->state() == tablet::FAILED) {
-    AppStatusPB* error_status = reported_tablet->mutable_error();
-    StatusToPB(tablet_peer->error(), error_status);
+    StatusToPB(tablet_peer->error(), reported_tablet->mutable_error());
   }
   reported_tablet->set_schema_version(
       tablet_peer->tablet_metadata()->primary_table_schema_version());
 
-  tablet_peer->tablet_metadata()->GetTableIdToSchemaVersionMap(
-      reported_tablet->mutable_table_to_version());
+  google::protobuf::Map<std::string, uint32_t> table_to_version;
+  tablet_peer->tablet_metadata()->GetTableIdToSchemaVersionMap(&table_to_version);
+  for (const auto& [table_id, schema_version] : table_to_version) {
+    auto* entry = reported_tablet->add_table_to_version();
+    entry->dup_key(table_id);
+    entry->set_value(schema_version);
+  }
 
   {
     auto tablet_ptr = tablet_peer->shared_tablet_maybe_null();
@@ -3248,14 +3253,14 @@ void TSTabletManager::CreateReportedTabletPB(const TabletPeerPtr& tablet_peer,
       reported_tablet->set_should_disable_lb_move(tablet_ptr->ShouldDisableLbMove());
     }
   }
-  reported_tablet->set_fs_data_dir(tablet_peer->tablet_metadata()->data_root_dir());
+  reported_tablet->dup_fs_data_dir(tablet_peer->tablet_metadata()->data_root_dir());
 
   // We cannot get consensus state information unless the TabletPeer is running.
   auto consensus_result = tablet_peer->GetConsensus();
   if (consensus_result) {
     auto consensus = *consensus_result;
-    *reported_tablet->mutable_committed_consensus_state() =
-        consensus->ConsensusState(consensus::CONSENSUS_CONFIG_COMMITTED);
+    reported_tablet->mutable_committed_consensus_state()->CopyFrom(
+        consensus->ConsensusState(consensus::CONSENSUS_CONFIG_COMMITTED));
     OpId pending_config_op_id = consensus->GetPendingConfigOpId();
     if (pending_config_op_id.is_valid_not_empty()) {
       pending_config_op_id.ToPB(reported_tablet->mutable_pending_config_op_id());
@@ -3266,7 +3271,8 @@ void TSTabletManager::CreateReportedTabletPB(const TabletPeerPtr& tablet_peer,
   reported_tablet->set_is_hidden(tablet_peer->tablet_metadata()->hidden());
 }
 
-void TSTabletManager::GenerateTabletReport(TabletReportPB* report, bool include_bootstrap) {
+void TSTabletManager::GenerateTabletReport(
+    master::LWTabletReportPB* report, bool include_bootstrap) {
   report->Clear();
   // Creating the tablet report can be slow in the case that it is in the
   // middle of flushing its consensus metadata. We don't want to hold
@@ -3332,7 +3338,7 @@ void TSTabletManager::GenerateTabletReport(TabletReportPB* report, bool include_
         to_report.push_back(*tablet_peer);
       } else {
         // Tell the Master that this tablet was removed from the TServer side.
-        report->add_removed_tablet_ids(tablet_id);
+        report->add_dup_removed_tablet_ids(tablet_id);
         // Don't count this as a 'dirty_tablet_' because the Master may not have it either.
         dirty_tablets_.erase(tablet_id);
       }
@@ -3349,7 +3355,7 @@ void TSTabletManager::GenerateTabletReport(TabletReportPB* report, bool include_
       narrow_cast<int>(dirty_count - report->updated_tablets_size()));
 }
 
-void TSTabletManager::StartFullTabletReport(TabletReportPB* report) {
+void TSTabletManager::StartFullTabletReport(master::LWTabletReportPB* report) {
   report->Clear();
   // Creating the tablet report can be slow in the case that it is in the
   // middle of flushing its consensus metadata. We don't want to hold
@@ -3380,7 +3386,7 @@ void TSTabletManager::StartFullTabletReport(TabletReportPB* report) {
 }
 
 void TSTabletManager::MarkTabletReportAcknowledged(uint32_t acked_seq,
-                                                   const TabletReportUpdatesPB& updates,
+                                                   const master::LWTabletReportUpdatesPB& updates,
                                                    bool dirty_check) {
   std::lock_guard l(mutex_);
 
@@ -3388,7 +3394,7 @@ void TSTabletManager::MarkTabletReportAcknowledged(uint32_t acked_seq,
 
   // Clear the "dirty" state for any tablets processed in this report.
   for (auto const & tablet : updates.tablets()) {
-    auto it = dirty_tablets_.find(tablet.tablet_id());
+    auto it = dirty_tablets_.find(tablet.tablet_id().ToBuffer());
     if (it != dirty_tablets_.end()) {
       const TabletReportState& state = it->second;
       if (state.change_seq <= acked_seq) {

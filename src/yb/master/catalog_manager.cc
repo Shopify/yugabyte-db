@@ -99,6 +99,7 @@
 #include "yb/consensus/consensus_util.h"
 #include "yb/consensus/consensus.h"
 #include "yb/consensus/consensus.pb.h"
+#include "yb/consensus/metadata.messages.h"
 #include "yb/consensus/metadata.pb.h"
 #include "yb/consensus/opid_util.h"
 #include "yb/consensus/quorum_util.h"
@@ -12767,7 +12768,7 @@ Status CatalogManager::SendCreateTabletRequests(
 // If responses have been received from sufficient replicas (including hinted leader),
 // pick proposed leader and start election.
 void CatalogManager::StartElectionIfReady(
-    const consensus::ConsensusStatePB& cstate, const LeaderEpoch& epoch,
+    const consensus::LWConsensusStatePB& cstate, const LeaderEpoch& epoch,
     const TabletInfoPtr& tablet) {
   auto replicas = tablet->GetReplicaLocations();
   bool initial_election = cstate.current_term() == kMinimumTerm;
@@ -12825,8 +12826,8 @@ void CatalogManager::StartElectionIfReady(
     std::string min_lexicographic;
     for (const auto& peer : cstate.config().peers()) {
       if (peer.member_type() == PeerMemberType::VOTER) {
-        if (min_lexicographic.empty() || peer.permanent_uuid() < min_lexicographic) {
-          min_lexicographic = peer.permanent_uuid();
+        if (min_lexicographic.empty() || peer.permanent_uuid() < Slice(min_lexicographic)) {
+          min_lexicographic = peer.permanent_uuid().ToBuffer();
         }
       }
     }

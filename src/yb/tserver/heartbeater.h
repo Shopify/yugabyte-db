@@ -53,11 +53,10 @@ class HeartbeatDataProvider {
   // Add data to heartbeat, provider could skip and do nothing if is it too early for example for
   // periodical provider.
   // Called on every heartbeat from Heartbeater::Impl::TryHeartbeat.
-  virtual void AddData(
-      const master::TSHeartbeatResponsePB& last_resp, master::TSHeartbeatRequestPB* req) = 0;
+  virtual void AddData(bool needs_full_tablet_report, master::LWTSHeartbeatRequestPB* req) = 0;
 
   // Called with the successful response to the heartbeat the provider last added data to.
-  virtual void OnHeartbeatResponse(const master::TSHeartbeatResponsePB& resp) {}
+  virtual void OnHeartbeatResponse(const master::LWTSHeartbeatResponsePB& resp) {}
 
   const std::string& LogPrefix() const;
 
@@ -98,13 +97,12 @@ class PeriodicalHeartbeatDataProvider : public HeartbeatDataProvider {
  public:
   explicit PeriodicalHeartbeatDataProvider(TabletServer* server) : HeartbeatDataProvider(server) {}
 
-  void AddData(
-      const master::TSHeartbeatResponsePB& last_resp, master::TSHeartbeatRequestPB* req) override;
+  void AddData(bool needs_full_tablet_report, master::LWTSHeartbeatRequestPB* req) override;
 
   CoarseTimePoint prev_run_time() const { return prev_run_time_; }
 
  private:
-  virtual void DoAddData(bool needs_full_tablet_report, master::TSHeartbeatRequestPB* req) = 0;
+  virtual void DoAddData(bool needs_full_tablet_report, master::LWTSHeartbeatRequestPB* req) = 0;
   virtual MonoDelta Period() const = 0;
 
   CoarseTimePoint prev_run_time_;

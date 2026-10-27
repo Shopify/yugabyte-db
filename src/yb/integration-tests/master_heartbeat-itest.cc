@@ -39,7 +39,7 @@
 #include "yb/master/master_cluster.proxy.h"
 #include "yb/master/master_cluster_client.h"
 #include "yb/master/master_heartbeat.proxy.h"
-#include "yb/master/master_types.pb.h"
+#include "yb/master/master_types.messages.h"
 #include "yb/master/ts_descriptor.h"
 #include "yb/master/ts_manager.h"
 
@@ -1086,10 +1086,10 @@ TEST_F_EX(MasterHeartbeatITest, MaybeHasXClusterGuardedLease, MasterHeartbeatITe
 
 namespace {
 
-std::vector<std::string> SortedUuids(const master::TServerListUpdatePB& update) {
+std::vector<std::string> SortedUuids(const master::LWTServerListUpdatePB& update) {
   std::vector<std::string> uuids;
   for (const auto& entry : update.tservers()) {
-    uuids.push_back(entry.instance().permanent_uuid());
+    uuids.push_back(entry.instance().permanent_uuid().ToBuffer());
   }
   std::ranges::sort(uuids);
   return uuids;
@@ -1144,8 +1144,9 @@ void CheckLiveTServers(MiniCluster& cluster, const std::vector<std::string>& exp
 
 TEST_F(MasterHeartbeatITest, TServerListFullAndEmptyDelta) {
   auto& ts_manager = ASSERT_RESULT(mini_cluster_->GetLeaderMiniMaster())->ts_manager();
+  ThreadSafeArena arena;
 
-  master::TServerListUpdatePB full;
+  master::LWTServerListUpdatePB full(&arena);
   ts_manager.FillTServerListUpdate(/*since_version=*/0, &full);
   ASSERT_TRUE(full.full());
   ASSERT_NE(full.version(), 0);
@@ -1157,7 +1158,7 @@ TEST_F(MasterHeartbeatITest, TServerListFullAndEmptyDelta) {
     ASSERT_GT(entry.registration().common().private_rpc_addresses_size(), 0);
   }
 
-  master::TServerListUpdatePB delta;
+  master::LWTServerListUpdatePB delta(&arena);
   ts_manager.FillTServerListUpdate(full.version(), &delta);
   ASSERT_FALSE(delta.full());
   ASSERT_EQ(delta.version(), full.version());
@@ -1170,19 +1171,20 @@ TEST_F(MasterHeartbeatITest, TServerListFullAndEmptyDelta) {
 
 TEST_F(MasterHeartbeatITest, TServerListDeltaOnAdd) {
   auto& ts_manager = ASSERT_RESULT(mini_cluster_->GetLeaderMiniMaster())->ts_manager();
-  master::TServerListUpdatePB before;
+  ThreadSafeArena arena;
+  master::LWTServerListUpdatePB before(&arena);
   ts_manager.FillTServerListUpdate(/*since_version=*/0, &before);
 
   ASSERT_OK(mini_cluster_->AddTabletServer());
   ASSERT_OK(mini_cluster_->WaitForTabletServerCount(4));
   const auto new_uuid = mini_cluster_->mini_tablet_server(3)->server()->permanent_uuid();
 
-  master::TServerListUpdatePB delta;
+  master::LWTServerListUpdatePB delta(&arena);
   ts_manager.FillTServerListUpdate(before.version(), &delta);
   ASSERT_FALSE(delta.full());
   ASSERT_GT(delta.version(), before.version());
   ASSERT_EQ(SortedUuids(delta), std::vector<std::string>{new_uuid});
-  ASSERT_TRUE(delta.tservers(0).alive());
+  ASSERT_TRUE(delta.tservers().front().alive());
   ASSERT_EQ(delta.removed_size(), 0);
 
   ASSERT_OK(WaitForTServerListVersion(*mini_cluster_, delta.version()));
@@ -1203,8 +1205,9 @@ TEST_F(MasterHeartbeatITest, TServerListDeltaOnUnresponsiveAndRemove) {
 
   auto* leader = ASSERT_RESULT(mini_cluster_->GetLeaderMiniMaster());
   auto& ts_manager = leader->ts_manager();
+  ThreadSafeArena arena;
   auto new_desc = ASSERT_RESULT(ts_manager.LookupTS(new_ts->server()->instance_pb()));
-  master::TServerListUpdatePB before;
+  master::LWTServerListUpdatePB before(&arena);
   ts_manager.FillTServerListUpdate(/*since_version=*/0, &before);
   ASSERT_OK(WaitForTServerListVersion(*mini_cluster_, before.version()));
 
@@ -1213,12 +1216,12 @@ TEST_F(MasterHeartbeatITest, TServerListDeltaOnUnresponsiveAndRemove) {
       [&]() -> Result<bool> { return !new_desc->IsLive(); }, 30s * kTimeMultiplier,
       "Wait for tserver to become unresponsive"));
 
-  master::TServerListUpdatePB unresponsive;
+  master::LWTServerListUpdatePB unresponsive(&arena);
   ts_manager.FillTServerListUpdate(before.version(), &unresponsive);
   ASSERT_FALSE(unresponsive.full());
   ASSERT_GT(unresponsive.version(), before.version());
   ASSERT_EQ(SortedUuids(unresponsive), std::vector<std::string>{new_uuid});
-  ASSERT_FALSE(unresponsive.tservers(0).alive());
+  ASSERT_FALSE(unresponsive.tservers().front().alive());
   ASSERT_EQ(unresponsive.removed_size(), 0);
 
   ASSERT_OK(WaitForTServerListVersion(*mini_cluster_, unresponsive.version()));
@@ -1238,21 +1241,21 @@ TEST_F(MasterHeartbeatITest, TServerListDeltaOnUnresponsiveAndRemove) {
       },
       30s * kTimeMultiplier, "Wait for tserver removal"));
 
-  master::TServerListUpdatePB removed;
+  master::LWTServerListUpdatePB removed(&arena);
   ts_manager.FillTServerListUpdate(unresponsive.version(), &removed);
   ASSERT_FALSE(removed.full());
   ASSERT_GT(removed.version(), unresponsive.version());
   ASSERT_EQ(removed.tservers_size(), 0);
   ASSERT_EQ(removed.removed_size(), 1);
-  ASSERT_EQ(removed.removed(0), new_uuid);
+  ASSERT_EQ(removed.removed()[0], new_uuid);
 
   // A tserver still holding the pre-shutdown version sees only the removal.
-  master::TServerListUpdatePB since_before;
+  master::LWTServerListUpdatePB since_before(&arena);
   ts_manager.FillTServerListUpdate(before.version(), &since_before);
   ASSERT_FALSE(since_before.full());
   ASSERT_EQ(since_before.tservers_size(), 0);
   ASSERT_EQ(since_before.removed_size(), 1);
-  ASSERT_EQ(since_before.removed(0), new_uuid);
+  ASSERT_EQ(since_before.removed()[0], new_uuid);
 
   ASSERT_OK(WaitForTServerListVersion(*mini_cluster_, removed.version()));
   ASSERT_NO_FATALS(CheckLiveTServers(*mini_cluster_, RunningTServerUuids(*mini_cluster_)));

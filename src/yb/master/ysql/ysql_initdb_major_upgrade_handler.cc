@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "yb/common/version_info.h"
+#include "yb/common/version_info.messages.h"
 
 #include "yb/master/catalog_manager.h"
 #include "yb/master/leader_epoch.h"
@@ -870,7 +871,7 @@ Status YsqlInitDBAndMajorUpgradeHandler::CleanupPreviousYsqlMajorCatalog(const L
 }
 
 Status YsqlInitDBAndMajorUpgradeHandler::ValidateTServerVersion(
-    const VersionInfoPB& ts_version) const {
+    const LWVersionInfoPB& ts_version) const {
   if (!FLAGS_enable_ysql) {
     return Status::OK();
   }

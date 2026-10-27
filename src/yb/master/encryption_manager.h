@@ -67,7 +67,7 @@ class EncryptionManager {
       const EncryptionInfoPB& encryption_info, IsEncryptionEnabledResponsePB* encryption_resp);
 
   Status FillHeartbeatResponseEncryption(const EncryptionInfoPB& encryption_info,
-                                         TSHeartbeatResponsePB* resp);
+                                         LWTSHeartbeatResponsePB* resp);
 
   Status GetUniverseKeyRegistry(rpc::ProxyCache* proxy_cache);
 

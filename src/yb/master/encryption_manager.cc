@@ -21,7 +21,7 @@
 
 #include "yb/master/master_encryption.pb.h"
 #include "yb/master/master_cluster.pb.h"
-#include "yb/master/master_heartbeat.pb.h"
+#include "yb/master/master_heartbeat.messages.h"
 #include "yb/master/master_replication.pb.h"
 #include "yb/master/universe_key_registry_service.h"
 
@@ -188,7 +188,7 @@ EncryptionManager::EncryptionState EncryptionManager::GetEncryptionState(
 }
 
 Status EncryptionManager::FillHeartbeatResponseEncryption(
-    const EncryptionInfoPB& encryption_info, TSHeartbeatResponsePB* resp) {
+    const EncryptionInfoPB& encryption_info, LWTSHeartbeatResponsePB* resp) {
   Slice decrypted_registry(encryption_info.universe_key_registry_encoded());
   std::string decrypted;
   if (encryption_info.encryption_enabled()) {

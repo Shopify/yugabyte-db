@@ -33,7 +33,7 @@
 #include "yb/master/master.h"
 #include "yb/master/master_ddl.pb.h"
 #include "yb/master/master_error.h"
-#include "yb/master/master_heartbeat.pb.h"
+#include "yb/master/master_heartbeat.messages.h"
 #include "yb/master/master_replication.pb.h"
 #include "yb/master/xcluster/add_index_to_bidirectional_xcluster_target_task.h"
 #include "yb/master/xcluster/add_table_to_xcluster_target_task.h"
@@ -330,10 +330,10 @@ Status XClusterTargetManager::SetXClusterNamespaceToSafeTimeMap(
 }
 
 Status XClusterTargetManager::FillHeartbeatResponse(
-    const TSHeartbeatRequestPB& req, TSHeartbeatResponsePB* resp) const {
+    const LWTSHeartbeatRequestPB& req, LWTSHeartbeatResponsePB* resp) const {
   auto l = safe_time_info_.LockForRead();
-  if (!l->pb.safe_time_map().empty()) {
-    *resp->mutable_xcluster_namespace_to_safe_time() = l->pb.safe_time_map();
+  for (const auto& entry : l->pb.safe_time_map()) {
+    resp->mutable_xcluster_namespace_to_safe_time()->emplace_back(entry);
   }
 
   return Status::OK();
@@ -1077,8 +1077,8 @@ void XClusterTargetManager::SyncReplicationStatusMap(
 }
 
 void XClusterTargetManager::StoreReplicationStatus(
-    const XClusterConsumerReplicationStatusPB& consumer_replication_status) {
-  const auto& replication_group_id = consumer_replication_status.replication_group_id();
+    const LWXClusterConsumerReplicationStatusPB& consumer_replication_status) {
+  const auto replication_group_id = consumer_replication_status.replication_group_id().ToBuffer();
 
   std::lock_guard lock(replication_error_map_mutex_);
   // Heartbeats can report stale entries. So we skip anything that is not in
@@ -1092,7 +1092,7 @@ void XClusterTargetManager::StoreReplicationStatus(
   }
 
   for (const auto& table_status : consumer_replication_status.table_status()) {
-    const auto& consumer_table_id = table_status.consumer_table_id();
+    const auto consumer_table_id = table_status.consumer_table_id().ToBuffer();
     auto* consumer_table_map = FindOrNull(*replication_error_map, consumer_table_id);
     if (!consumer_table_map) {
       VLOG_WITH_FUNC(2) << "Skipping removed table " << consumer_table_id
@@ -1101,7 +1101,7 @@ void XClusterTargetManager::StoreReplicationStatus(
     }
 
     for (const auto& stream_tablet_status : table_status.stream_tablet_status()) {
-      const auto& producer_tablet_id = stream_tablet_status.producer_tablet_id();
+      const auto producer_tablet_id = stream_tablet_status.producer_tablet_id().ToBuffer();
       auto* tablet_status_map = FindOrNull(*consumer_table_map, producer_tablet_id);
       if (!tablet_status_map) {
         VLOG_WITH_FUNC(2) << "Skipping removed tablet " << producer_tablet_id
@@ -1116,7 +1116,7 @@ void XClusterTargetManager::StoreReplicationStatus(
             stream_tablet_status.error(), ReplicationErrorPb::REPLICATION_ERROR_UNINITIALIZED);
         tablet_status_map->consumer_term = stream_tablet_status.consumer_term();
         tablet_status_map->error = stream_tablet_status.error();
-        tablet_status_map->error_detail = stream_tablet_status.error_detail();
+        tablet_status_map->error_detail = stream_tablet_status.error_detail().ToBuffer();
         VLOG_WITH_FUNC(2) << "Storing error for replication group: " << replication_group_id
                           << ", consumer table: " << consumer_table_id
                           << ", tablet: " << producer_tablet_id

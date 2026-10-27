@@ -22,6 +22,7 @@
 
 namespace yb {
 
+class LWXClusterGuardedInfoPB;
 class XClusterGuardedInfoPB;
 
 template<class State>
@@ -32,8 +33,8 @@ namespace master {
 class CDCStreamInfo;
 class SysCatalogTable;
 class SysXClusterConfigEntryPB;
-class TSHeartbeatRequestPB;
-class TSHeartbeatResponsePB;
+class LWTSHeartbeatRequestPB;
+class LWTSHeartbeatResponsePB;
 class XClusterConfigInfo;
 struct PersistentXClusterConfigInfo;
 
@@ -55,11 +56,13 @@ class XClusterConfig {
 
   Result<SysXClusterConfigEntryPB> GetXClusterConfigEntryPB() const EXCLUDES(mutex_);
 
-  Status FillHeartbeatResponse(const TSHeartbeatRequestPB& req, TSHeartbeatResponsePB* resp) const
+  Status FillHeartbeatResponse(
+      const LWTSHeartbeatRequestPB& req, LWTSHeartbeatResponsePB* resp) const
       EXCLUDES(mutex_);
 
   // Copies xcluster_info_per_namespace into info.
   Status FillXClusterInfoPerNamespace(XClusterGuardedInfoPB& info) const EXCLUDES(mutex_);
+  Status FillXClusterInfoPerNamespace(LWXClusterGuardedInfoPB& info) const EXCLUDES(mutex_);
 
   Status SetXClusterRole(
       const LeaderEpoch& epoch, const NamespaceId& namespace_id,

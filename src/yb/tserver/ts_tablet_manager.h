@@ -313,17 +313,17 @@ class TSTabletManager : public tserver::TabletPeerLookupIf, public tablet::Table
   //
   // This is thread-safe to call along with tablet modification, but not safe
   // to call from multiple threads at the same time.
-  void GenerateTabletReport(master::TabletReportPB* report, bool include_bootstrap = true);
+  void GenerateTabletReport(master::LWTabletReportPB* report, bool include_bootstrap = true);
 
   // Start a full tablet report and reset any incremental state tracking.
-  void StartFullTabletReport(master::TabletReportPB* report);
+  void StartFullTabletReport(master::LWTabletReportPB* report);
 
   // Mark that the master successfully received and processed the given tablet report.
   // 'seq_num' - only remove tablets unchanged since the acknowledged report sequence number.
   // 'updates' - explicitly ACK'd updates from the Master, may be a subset of request tablets.
   // 'dirty_check' - DEBUG. Confirm we've processed all dirty tablets after a full sweep.
   void MarkTabletReportAcknowledged(uint32_t seq_num,
-                                    const master::TabletReportUpdatesPB& updates,
+                                    const master::LWTabletReportUpdatesPB& updates,
                                     bool dirty_check = false);
 
   // Adjust the max number of tablets that will be included in a single report.
@@ -621,7 +621,7 @@ class TSTabletManager : public tserver::TabletPeerLookupIf, public tablet::Table
 
   // Helper to generate the report for a single tablet.
   void CreateReportedTabletPB(const std::shared_ptr<tablet::TabletPeer>& tablet_peer,
-                              master::ReportedTabletPB* reported_tablet);
+                              master::LWReportedTabletPB* reported_tablet);
 
   // Mark that the provided TabletPeer's state has changed. That should be taken into
   // account in the next report.

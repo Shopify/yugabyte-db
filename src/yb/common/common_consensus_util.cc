@@ -68,16 +68,17 @@ bool IsRaftConfigVoter(std::string_view tserver_uuid, const LWRaftConfigPB& conf
   return peer && peer->member_type() == PeerMemberType::VOTER;
 }
 
-template <class PB>
-PeerRole DoGetConsensusRole(std::string_view permanent_uuid, const PB& cstate) {
-  if (std::string_view(cstate.leader_uuid()) == permanent_uuid) {
-    if (IsRaftConfigVoter(permanent_uuid, cstate.config())) {
+template <class Config>
+PeerRole DoGetConsensusRole(
+    std::string_view permanent_uuid, std::string_view leader_uuid, const Config& config) {
+  if (leader_uuid == permanent_uuid) {
+    if (IsRaftConfigVoter(permanent_uuid, config)) {
       return PeerRole::LEADER;
     }
     return PeerRole::NON_PARTICIPANT;
   }
 
-  for (const auto& peer : cstate.config().peers()) {
+  for (const auto& peer : config.peers()) {
     if (std::string_view(peer.permanent_uuid()) == permanent_uuid) {
       switch (peer.member_type()) {
         case PeerMemberType::VOTER:
@@ -100,11 +101,16 @@ PeerRole DoGetConsensusRole(std::string_view permanent_uuid, const PB& cstate) {
 }
 
 PeerRole GetConsensusRole(std::string_view permanent_uuid, const ConsensusStatePB& cstate) {
-  return DoGetConsensusRole(permanent_uuid, cstate);
+  return DoGetConsensusRole(permanent_uuid, cstate.leader_uuid(), cstate.config());
 }
 
 PeerRole GetConsensusRole(std::string_view permanent_uuid, const LWConsensusStatePB& cstate) {
-  return DoGetConsensusRole(permanent_uuid, cstate);
+  return DoGetConsensusRole(permanent_uuid, cstate.leader_uuid(), cstate.config());
+}
+
+PeerRole GetConsensusRole(
+    std::string_view permanent_uuid, std::string_view leader_uuid, const LWRaftConfigPB& config) {
+  return DoGetConsensusRole(permanent_uuid, leader_uuid, config);
 }
 
 }  // namespace yb::consensus

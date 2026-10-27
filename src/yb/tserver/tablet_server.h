@@ -57,6 +57,7 @@
 #include "yb/gutil/macros.h"
 
 #include "yb/master/master_fwd.h"
+#include "yb/master/master_heartbeat.fwd.h"
 #include "yb/master/master_heartbeat.pb.h"
 
 #include "yb/rpc/rpc_fwd.h"
@@ -225,7 +226,8 @@ class TabletServer : public DbServerBase, public TabletServerIf {
     return object_lock_shared_state_manager_.get();
   }
 
-  void PopulateLiveTServers(const master::TSHeartbeatResponsePB& heartbeat_resp) EXCLUDES(lock_);
+  void PopulateLiveTServers(const master::LWTSHeartbeatResponsePB& heartbeat_resp)
+      EXCLUDES(lock_);
 
   // The master's view of a tserver, as last sent to this one.
   struct KnownTServer {
@@ -234,7 +236,7 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   };
 
   // Applies the tserver list delta from a TSHeartbeat response.
-  void ApplyTServerListUpdate(const master::TServerListUpdatePB& update) EXCLUDES(lock_);
+  void ApplyTServerListUpdate(const master::LWTServerListUpdatePB& update) EXCLUDES(lock_);
   uint64_t tserver_list_version() const EXCLUDES(lock_);
   std::vector<KnownTServer> GetKnownTServers() const EXCLUDES(lock_);
 
@@ -437,12 +439,12 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   encryption::UniverseKeyManager* GetUniverseKeyManager();
 
   Status XClusterPopulateMasterHeartbeatRequest(
-      master::TSHeartbeatRequestPB& req, bool needs_full_tablet_report);
+      master::LWTSHeartbeatRequestPB& req, bool needs_full_tablet_report);
 
-  Status ClusterConfigHandleMasterHeartbeatResponse(const master::TSHeartbeatResponsePB& resp);
+  Status ClusterConfigHandleMasterHeartbeatResponse(const master::LWTSHeartbeatResponsePB& resp);
 
   Status XClusterHandleMasterHeartbeatResponse(
-      const master::TSHeartbeatResponsePB& resp, MonoTime lease_expiration_time);
+      const master::LWTSHeartbeatResponsePB& resp, MonoTime lease_expiration_time);
 
   void ApplyXClusterGuardedInfoIfNewer(const XClusterGuardedInfoPB& info)
       EXCLUDES(xcluster_guarded_info_version_mutex_);
@@ -503,7 +505,7 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   // Stores the cluster-wide per-database history retention pins aggregated by the master across
   // all live tservers and returned in the heartbeat response locally. If the response sets
   // cluster_ysql_db_pins_ready to false, the local map is left unchanged.
-  void UpdateClusterYsqlDbOldestPinnedReadTimes(const master::TSHeartbeatResponsePB& resp)
+  void UpdateClusterYsqlDbOldestPinnedReadTimes(const master::LWTSHeartbeatResponsePB& resp)
       EXCLUDES(cluster_ysql_db_oldest_pinned_read_times_mutex_);
 
   // Returns the cluster-wide history retention pin for the given database, or HybridTime::kInvalid

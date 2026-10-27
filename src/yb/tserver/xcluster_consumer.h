@@ -113,7 +113,7 @@ class XClusterConsumer : public XClusterConsumerIf {
       const TableId& table_id, const ColocationId& colocation_id) override;
 
   void PopulateMasterHeartbeatRequest(
-      master::TSHeartbeatRequestPB* req, bool needs_full_tablet_report) override;
+      master::LWTSHeartbeatRequestPB* req, bool needs_full_tablet_report) override;
 
   void StoreReplicationError(
       const XClusterPollerId& poller_id, ReplicationErrorPb error,

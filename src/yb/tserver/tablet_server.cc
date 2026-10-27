@@ -61,6 +61,7 @@
 #include "yb/fs/fs_manager.h"
 
 #include "yb/master/master_ddl.pb.h"
+#include "yb/master/master_heartbeat.messages.h"
 #include "yb/master/master_heartbeat.pb.h"
 
 #include "yb/rocksutil/rocksdb_encrypted_file_factory.h"
@@ -1077,12 +1078,13 @@ Status TabletServer::KillPg() const {
   return STATUS(IllegalState, "Pg killer callback not registered, cannot restart PG");
 }
 
-void TabletServer::PopulateLiveTServers(const master::TSHeartbeatResponsePB& heartbeat_resp) {
+void TabletServer::PopulateLiveTServers(const master::LWTSHeartbeatResponsePB& heartbeat_resp) {
   if (heartbeat_resp.has_tserver_list_update()) {
     ApplyTServerListUpdate(heartbeat_resp.tserver_list_update());
-  } else if (heartbeat_resp.tservers_size() > 0) {
+  } else if (!heartbeat_resp.tservers().empty()) {
     // A master that predates versioned lists sends every live tserver on every heartbeat.
-    master::TServerListUpdatePB full;
+    ThreadSafeArena arena;
+    master::LWTServerListUpdatePB full(&arena);
     full.set_full(true);
     for (const auto& ts_info_pb : heartbeat_resp.tservers()) {
       auto* entry = full.add_tservers();
@@ -1094,7 +1096,7 @@ void TabletServer::PopulateLiveTServers(const master::TSHeartbeatResponsePB& hea
   }
 }
 
-void TabletServer::ApplyTServerListUpdate(const master::TServerListUpdatePB& update) {
+void TabletServer::ApplyTServerListUpdate(const master::LWTServerListUpdatePB& update) {
   std::lock_guard l(lock_);
   // A delta is relative to the version this tserver sent; a stale one has nothing new.
   if (!update.full() && update.version() <= tserver_list_version_) {
@@ -1104,7 +1106,7 @@ void TabletServer::ApplyTServerListUpdate(const master::TServerListUpdatePB& upd
     known_tservers_.clear();
   }
   for (const auto& ts_uuid : update.removed()) {
-    known_tservers_.erase(ts_uuid);
+    known_tservers_.erase(ts_uuid.ToBuffer());
   }
   for (const auto& entry : update.tservers()) {
     if (!entry.has_instance() || !entry.has_registration()) {
@@ -1112,10 +1114,10 @@ void TabletServer::ApplyTServerListUpdate(const master::TServerListUpdatePB& upd
                   << entry.ShortDebugString();
       continue;
     }
-    const auto& ts_uuid = entry.instance().permanent_uuid();
+    const auto ts_uuid = entry.instance().permanent_uuid().ToBuffer();
     auto& known = known_tservers_[ts_uuid];
-    *known.info.mutable_tserver_instance() = entry.instance();
-    *known.info.mutable_registration() = entry.registration();
+    entry.instance().ToGoogleProtobuf(known.info.mutable_tserver_instance());
+    entry.registration().ToGoogleProtobuf(known.info.mutable_registration());
     known.alive = entry.alive();
     if (known.alive && !remote_tservers_.contains(ts_uuid)) {
       remote_tservers_[ts_uuid] = std::make_shared<RemoteTabletServer>(known.info);
@@ -2536,7 +2538,7 @@ Status TabletServer::CreateXClusterConsumer() {
 }
 
 Status TabletServer::XClusterPopulateMasterHeartbeatRequest(
-    master::TSHeartbeatRequestPB& req, bool needs_full_tablet_report) {
+    master::LWTSHeartbeatRequestPB& req, bool needs_full_tablet_report) {
   // If a full report is needed, we will populate it via the metric data provider.
   if (!needs_full_tablet_report && FLAGS_tserver_heartbeat_add_replication_status) {
     auto xcluster_consumer = GetXClusterConsumer();
@@ -2549,7 +2551,7 @@ Status TabletServer::XClusterPopulateMasterHeartbeatRequest(
 }
 
 Status TabletServer::ClusterConfigHandleMasterHeartbeatResponse(
-  const master::TSHeartbeatResponsePB& resp) {
+  const master::LWTSHeartbeatResponsePB& resp) {
   if (!resp.has_cluster_config_version() || !resp.has_cluster_replication_info()) {
     return Status::OK();
   }
@@ -2557,7 +2559,7 @@ Status TabletServer::ClusterConfigHandleMasterHeartbeatResponse(
   if (v > cluster_config_.version.load(std::memory_order_acquire)) {
     std::lock_guard l(cluster_config_.mutex);
     if (v > cluster_config_.version.load(std::memory_order_acquire)) {
-      cluster_config_.replication_info = resp.cluster_replication_info();
+      resp.cluster_replication_info().ToGoogleProtobuf(&cluster_config_.replication_info);
       cluster_config_.version.store(v, std::memory_order_release);
     }
   }
@@ -2587,13 +2589,17 @@ void TabletServer::ApplyXClusterGuardedInfoIfNewer(const XClusterGuardedInfoPB& 
 }
 
 Status TabletServer::XClusterHandleMasterHeartbeatResponse(
-    const master::TSHeartbeatResponsePB& resp, MonoTime lease_expiration_time) {
-  xcluster_context_->UpdateSafeTimeMap(resp.xcluster_namespace_to_safe_time());
+    const master::LWTSHeartbeatResponsePB& resp, MonoTime lease_expiration_time) {
+  XClusterNamespaceToSafeTimePBMap safe_time_map;
+  for (const auto& entry : resp.xcluster_namespace_to_safe_time()) {
+    safe_time_map[entry.key().ToBuffer()] = entry.value();
+  }
+  xcluster_context_->UpdateSafeTimeMap(safe_time_map);
   // A master with auto flag skip_fields_moved_to_xcluster_guarded_info off sends both the
   // deprecated fields and xcluster_guarded_info; prefer the latter.  See TryHeartbeat.
   if (!resp.has_xcluster_guarded_info() && !FLAGS_skip_fields_moved_to_xcluster_guarded_info) {
     xcluster_context_->UpdateXClusterInfoPerNamespace(
-        resp.deprecated_xcluster_heartbeat_info().xcluster_info_per_namespace());
+        resp.deprecated_xcluster_heartbeat_info().ToGoogleProtobuf().xcluster_info_per_namespace());
   }
   // Update lease now that we have already updated the information it protects with fresh info.
   // (ApplyXClusterGuardedInfoIfNewer is called by the heartbeater right before this function.)
@@ -2607,9 +2613,11 @@ Status TabletServer::XClusterHandleMasterHeartbeatResponse(
   auto* xcluster_consumer = GetXClusterConsumer();
 
   // Only create a xcluster consumer if consumer_registry is not null.
+  cdc::ConsumerRegistryPB consumer_registry_pb;
   const cdc::ConsumerRegistryPB* consumer_registry = nullptr;
   if (resp.has_consumer_registry()) {
-    consumer_registry = &resp.consumer_registry();
+    resp.consumer_registry().ToGoogleProtobuf(&consumer_registry_pb);
+    consumer_registry = &consumer_registry_pb;
 
     if (!xcluster_consumer) {
       RETURN_NOT_OK(CreateXClusterConsumer());
@@ -2633,7 +2641,7 @@ Status TabletServer::XClusterHandleMasterHeartbeatResponse(
 
   if (resp.has_xcluster_producer_registry() && resp.has_xcluster_config_version()) {
     RETURN_NOT_OK(SetPausedXClusterProducerStreams(
-        resp.xcluster_producer_registry().paused_producer_stream_ids(),
+        resp.xcluster_producer_registry().ToGoogleProtobuf().paused_producer_stream_ids(),
         resp.xcluster_config_version()));
   }
 
@@ -2959,7 +2967,7 @@ master::DbOidToHybridTimeMap TabletServer::GetYsqlDbOldestPinnedReadTimes() {
 }
 
 void TabletServer::UpdateClusterYsqlDbOldestPinnedReadTimes(
-  const master::TSHeartbeatResponsePB& resp) {
+  const master::LWTSHeartbeatResponsePB& resp) {
   // The master's aggregated map may be incomplete (e.g. after failover, before every live tserver
   // has heartbeated). Keep the last complete map until it is ready again.
   if (!resp.cluster_ysql_db_pins_ready()) {
@@ -2967,10 +2975,10 @@ void TabletServer::UpdateClusterYsqlDbOldestPinnedReadTimes(
   }
   master::DbOidToHybridTimeMap pins;
   pins.reserve(resp.cluster_ysql_db_oldest_pinned_read_times().size());
-  for (const auto& [db_oid, db_pins] : resp.cluster_ysql_db_oldest_pinned_read_times()) {
-    auto pin = HybridTime::FromPB(db_pins.db_level_oldest_read_time());
+  for (const auto& entry : resp.cluster_ysql_db_oldest_pinned_read_times()) {
+    auto pin = HybridTime::FromPB(entry.value().db_level_oldest_read_time());
     if (pin.is_valid()) {
-      pins.emplace(static_cast<PgOid>(db_oid), pin);
+      pins.emplace(static_cast<PgOid>(entry.key()), pin);
     }
   }
   PersistClusterYsqlDbOldestPinnedReadTimesIfNeeded(pins);

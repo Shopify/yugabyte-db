@@ -64,7 +64,7 @@ namespace master {
 struct LeaderEpoch;
 class SysCatalogTable;
 class TSInformationPB;
-class TServerListUpdatePB;
+class LWTServerListUpdatePB;
 
 // A callback that is called when the number of tablet servers reaches a certain number.
 using TSCountCallback = std::function<void()>;
@@ -105,7 +105,8 @@ class TSManager {
   // If the TS has never registered, or this instance doesn't match the
   // current instance ID for the TS, then a NotFound status is returned.
   // Otherwise, *desc is set and OK is returned.
-  Result<TSDescriptorPtr> LookupTS(const NodeInstancePB& instance) const;
+  template <class Instance>
+  Result<TSDescriptorPtr> LookupTS(const Instance& instance) const;
 
   // Lookup the tablet server descriptor for the given UUID.
   // Returns false if the TS has never registered.
@@ -123,10 +124,10 @@ class TSManager {
   // Lookup an existing TS descriptor from a heartbeat request. If found, update the TSDescriptor
   // using the metadata in the heartbeat request.
   Result<TSDescriptorPtr> LookupAndUpdateTSFromHeartbeat(
-      const TSHeartbeatRequestPB& heartbeat_request, const LeaderEpoch& epoch);
+      const LWTSHeartbeatRequestPB& heartbeat_request, const LeaderEpoch& epoch);
 
   Result<TSDescriptorPtr> RegisterFromHeartbeat(
-      const TSHeartbeatRequestPB& heartbeat_request, const LeaderEpoch& epoch,
+      const LWTSHeartbeatRequestPB& heartbeat_request, const LeaderEpoch& epoch,
       CloudInfoPB&& local_master_cloud_info, rpc::ProxyCache* proxy_cache);
 
   // Return all of the currently registered TS descriptors into the provided list.
@@ -214,7 +215,7 @@ class TSManager {
 
   // Fills the tserver list for a tserver holding since_version: the changes since then, or the
   // full list when that version is unset, from another leader, aged out, or ahead of the master.
-  void FillTServerListUpdate(uint64_t since_version, TServerListUpdatePB* update) const;
+  void FillTServerListUpdate(uint64_t since_version, LWTServerListUpdatePB* update) const;
 
   // Make sure all live tservers are on the expected version.
   Status ValidateAllTserverVersions(ValidateVersionInfoOp op) const;
@@ -223,9 +224,10 @@ class TSManager {
   // Performs all mutations necessary to register a new tserver or update the registration of an
   // existing tserver. There are two registration pathways, one through heartbeats and the other
   // through membership in a tablet group that is heartbeating to the master.
+  template <class Instance, class Registration>
   Result<TSDescriptorPtr> RegisterInternal(
-      const NodeInstancePB& instance, const TSRegistrationPB& registration,
-      std::optional<std::reference_wrapper<const TSHeartbeatRequestPB>> request,
+      const Instance& instance, const Registration& registration,
+      std::optional<std::reference_wrapper<const LWTSHeartbeatRequestPB>> request,
       CloudInfoPB&& local_master_cloud_info, const LeaderEpoch& epoch,
       rpc::ProxyCache* proxy_cache);
 
@@ -245,8 +247,9 @@ class TSManager {
   //
   // This function does not perform the mutations itself because interleaving the IO of sys catalog
   // writes with various locks is complex.
+  template <class Instance, class Registration>
   Result<RegistrationMutationData> ComputeRegistrationMutationData(
-      const NodeInstancePB& instance, const TSRegistrationPB& registration,
+      const Instance& instance, const Registration& registration,
       CloudInfoPB&& local_master_cloud_info, rpc::ProxyCache* proxy_cache,
       RegisteredThroughHeartbeat registered_through_heartbeat) REQUIRES(registration_lock_);
 
@@ -256,8 +259,9 @@ class TSManager {
   //
   // This function does not call the callback but instead returns it if it should be called. Callers
   // must call the callback if it is not empty.
+  template <class Instance, class Registration>
   Result<std::pair<TSDescriptorPtr, TSCountCallback>> DoRegistrationMutation(
-      const NodeInstancePB& new_ts_instance, const TSRegistrationPB& registration,
+      const Instance& new_ts_instance, const Registration& registration,
       RegistrationMutationData&& registration_data, const LeaderEpoch& epoch)
       REQUIRES(registration_lock_);
 

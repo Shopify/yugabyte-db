@@ -121,6 +121,9 @@ const HostPortPB& DesiredHostPort(
 const HostPortPB& DesiredHostPort(
     const ServerRegistrationPB& registration, const CloudInfoPB& connect_from);
 
+HostPortPB DesiredHostPort(
+    const LWServerRegistrationPB& registration, const CloudInfoPB& connect_from);
+
 HAS_MEMBER_FUNCTION(error);
 HAS_MEMBER_FUNCTION(status);
 

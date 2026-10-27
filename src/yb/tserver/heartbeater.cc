@@ -60,6 +60,7 @@
 
 #include "yb/util/cgroups.h"
 #include "yb/util/logging.h"
+#include "yb/util/memory/arena.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/slice.h"
@@ -113,7 +114,7 @@ class HeartbeatPoller : public MasterLeaderPollerInterface {
   Status DoPoll();
   Status TryHeartbeat();
   Status SetupRegistration(master::TSRegistrationPB* reg);
-  void SetupCommonField(master::TSToMasterCommonPB* common);
+  void SetupCommonField(master::LWTSToMasterCommonPB* common);
   MonoDelta GetMinimumHeartbeatMillis(int32_t consecutive_failures) const;
 
   TabletServer& server_;
@@ -123,8 +124,9 @@ class HeartbeatPoller : public MasterLeaderPollerInterface {
   // Roundtrip time of previous heartbeat to yb-master.
   MonoDelta heartbeat_rtt_ = MonoDelta::kZero;
 
-  // The most recent response from a heartbeat.
-  master::TSHeartbeatResponsePB last_hb_response_;
+  // What the most recent successful heartbeat response asked for.
+  bool needs_reregister_ = false;
+  bool needs_full_tablet_report_ = false;
 
   // Full reports can take multiple heartbeats.
   // This field has value of the sequence number of the first heartbeat in this scenario.
@@ -232,9 +234,9 @@ const std::string& HeartbeatDataProvider::LogPrefix() const {
 }
 
 void PeriodicalHeartbeatDataProvider::AddData(
-    const master::TSHeartbeatResponsePB& last_resp, master::TSHeartbeatRequestPB* req) {
+    bool needs_full_tablet_report, master::LWTSHeartbeatRequestPB* req) {
   // Save that fact that we will need to send a full report the next time we run.
-  needs_full_tablet_report_ |= last_resp.needs_full_tablet_report();
+  needs_full_tablet_report_ |= needs_full_tablet_report;
 
   if (prev_run_time_ + Period() < CoarseMonoClock::Now()) {
     DoAddData(needs_full_tablet_report_, req);
@@ -288,8 +290,7 @@ Status HeartbeatPoller::DoPoll() {
 }
 
 MonoDelta HeartbeatPoller::IntervalToNextPoll(int32_t consecutive_failures) {
-  if (full_report_seq_no_ || last_hb_response_.needs_reregister() ||
-      last_hb_response_.needs_full_tablet_report()) {
+  if (full_report_seq_no_ || needs_reregister_ || needs_full_tablet_report_) {
     return GetMinimumHeartbeatMillis(consecutive_failures);
   }
 
@@ -299,10 +300,10 @@ MonoDelta HeartbeatPoller::IntervalToNextPoll(int32_t consecutive_failures) {
 void HeartbeatPoller::Init() {
   // Config the "last heartbeat response" to indicate that we need to register
   // -- since we've never registered before, we know this to be true.
-  last_hb_response_.set_needs_reregister(true);
+  needs_reregister_ = true;
 
   // Have the Master request a full tablet report on 2nd HB.
-  last_hb_response_.set_needs_full_tablet_report(false);
+  needs_full_tablet_report_ = false;
 }
 
 void HeartbeatPoller::ResetProxy() { proxy_ = std::nullopt; }
@@ -314,17 +315,19 @@ std::string HeartbeatPoller::name() {
 const std::string& HeartbeatPoller::LogPrefix() const { return server_.LogPrefix(); }
 
 Status HeartbeatPoller::TryHeartbeat() {
-  master::TSHeartbeatRequestPB req;
+  ThreadSafeArena arena;
+  master::LWTSHeartbeatRequestPB req(&arena);
 
   SetupCommonField(req.mutable_common());
-  if (last_hb_response_.needs_reregister()) {
+  if (needs_reregister_) {
     LOG_WITH_PREFIX(INFO) << "Registering TS with master...";
-    RETURN_NOT_OK_PREPEND(SetupRegistration(req.mutable_registration()),
-                          "Unable to set up registration");
+    master::TSRegistrationPB registration;
+    RETURN_NOT_OK_PREPEND(SetupRegistration(&registration), "Unable to set up registration");
+    req.mutable_registration()->CopyFrom(registration);
   }
 
   auto& tablet_report = *req.mutable_tablet_report();
-  if (last_hb_response_.needs_full_tablet_report()) {
+  if (needs_full_tablet_report_) {
     LOG_WITH_PREFIX(INFO) << "Sending a full tablet report to master...";
     server_.tablet_manager()->StartFullTabletReport(&tablet_report);
     full_report_seq_no_ = tablet_report.sequence_number();
@@ -343,7 +346,7 @@ Status HeartbeatPoller::TryHeartbeat() {
   auto universe_uuid = VERIFY_RESULT(
       server_.fs_manager()->GetUniverseUuidFromTserverInstanceMetadata());
   if (!universe_uuid.empty()) {
-    req.set_universe_uuid(universe_uuid);
+    req.dup_universe_uuid(universe_uuid);
   }
 
   tablet_report.set_is_incremental(!full_report_seq_no_);
@@ -359,18 +362,17 @@ Status HeartbeatPoller::TryHeartbeat() {
   // Load local database history retention pins onto heartbeat for
   // master to aggregate and calculate global history retention pins
   if (FLAGS_enable_db_history_retention_pins) {
-    auto* pins = req.mutable_ts_ysql_db_oldest_pinned_read_times();
-    pins->clear();
     for (const auto& [db_oid, pin] : server_.GetYsqlDbOldestPinnedReadTimes()) {
-      (*pins)[db_oid].set_db_level_oldest_read_time(pin.ToPB());
+      auto* entry = req.add_ts_ysql_db_oldest_pinned_read_times();
+      entry->set_key(db_oid);
+      entry->mutable_value()->set_db_level_oldest_read_time(pin.ToPB());
     }
   }
 
-  RETURN_NOT_OK(server_.XClusterPopulateMasterHeartbeatRequest(
-      req, last_hb_response_.needs_full_tablet_report()));
+  RETURN_NOT_OK(server_.XClusterPopulateMasterHeartbeatRequest(req, needs_full_tablet_report_));
 
   for (auto& data_provider : data_providers_) {
-    data_provider->AddData(last_hb_response_, &req);
+    data_provider->AddData(needs_full_tablet_report_, &req);
   }
 
   RpcController rpc;
@@ -411,17 +413,17 @@ Status HeartbeatPoller::TryHeartbeat() {
   req.set_auto_flags_config_version(server_.GetAutoFlagConfigVersion());
   req.set_tserver_list_version(server_.tserver_list_version());
 
+  master::LWTSHeartbeatResponsePB resp(&arena);
   {
-    VLOG_WITH_PREFIX(2) << "Sending heartbeat:\n" << req.DebugString();
+    VLOG_WITH_PREFIX(2) << "Sending heartbeat:\n" << req.ShortDebugString();
     heartbeat_rtt_ = MonoDelta::kZero;
     MonoTime start_time = MonoTime::Now();
-    master::TSHeartbeatResponsePB resp;
     RETURN_NOT_OK_PREPEND(proxy_->TSHeartbeat(req, &resp, &rpc),
                           "Failed to send heartbeat");
     MonoTime end_time = MonoTime::Now();
     if (!resp.universe_uuid().empty()) {
       RETURN_NOT_OK(server_.ValidateAndMaybeSetUniverseUuid(
-          VERIFY_RESULT(UniverseUuid::FromString(resp.universe_uuid()))));
+          VERIFY_RESULT(UniverseUuid::FromString(resp.universe_uuid().ToBuffer()))));
     }
 
     if (resp.has_error()) {
@@ -446,11 +448,13 @@ Status HeartbeatPoller::TryHeartbeat() {
       }
     }
 
-    VLOG_WITH_PREFIX(2) << "Received heartbeat response:\n" << resp.DebugString();
+    VLOG_WITH_PREFIX(2) << "Received heartbeat response:\n" << resp.ShortDebugString();
     if (resp.has_master_config()) {
-      LOG_WITH_PREFIX(INFO) << "Received heartbeat response with config " << resp.DebugString();
+      LOG_WITH_PREFIX(INFO) << "Received heartbeat response with config "
+                            << resp.ShortDebugString();
 
-      RETURN_NOT_OK(server_.UpdateMasterAddresses(resp.master_config(), resp.leader_master()));
+      RETURN_NOT_OK(server_.UpdateMasterAddresses(
+          resp.master_config().ToGoogleProtobuf(), resp.leader_master()));
     }
 
     if (!resp.leader_master()) {
@@ -458,12 +462,15 @@ Status HeartbeatPoller::TryHeartbeat() {
       // determine the master and attempt to heartbeat during in the
       // next heartbeat interval.
       proxy_.reset();
-      return STATUS_FORMAT(ServiceUnavailable, "Master is no longer the leader: $0", resp.error());
+      return STATUS_FORMAT(
+          ServiceUnavailable, "Master is no longer the leader: $0",
+          resp.error().ShortDebugString());
     }
 
     // Check for a universe key registry for encryption.
     if (resp.has_universe_key_registry()) {
-      RETURN_NOT_OK(server_.SetUniverseKeyRegistry(resp.universe_key_registry()));
+      RETURN_NOT_OK(server_.SetUniverseKeyRegistry(
+          resp.universe_key_registry().ToGoogleProtobuf()));
     }
 
     if (!resp.has_xcluster_guarded_info() && !FLAGS_skip_fields_moved_to_xcluster_guarded_info) {
@@ -497,7 +504,7 @@ Status HeartbeatPoller::TryHeartbeat() {
       // has xCluster-guarded information at least as current as when that lease was
       // issued.
       if (resp.has_xcluster_guarded_info()) {
-        server_.ApplyXClusterGuardedInfoIfNewer(resp.xcluster_guarded_info());
+        server_.ApplyXClusterGuardedInfoIfNewer(resp.xcluster_guarded_info().ToGoogleProtobuf());
       }
       RETURN_NOT_OK(server_.XClusterHandleMasterHeartbeatResponse(resp, lease_expiration_time));
     }
@@ -507,19 +514,19 @@ Status HeartbeatPoller::TryHeartbeat() {
       // removed from the blacklist, we don't receive any reset signal from the master. The
       // meta cache would eventually figure out when a peer sends the latest consensus config
       // or it makes a GatTabletLocations call to the master.
-      std::vector<std::string> blacklisted_uuids(
-          resp.leader_blacklisted_tservers_with_no_leaders().begin(),
-          resp.leader_blacklisted_tservers_with_no_leaders().end());
+      std::vector<std::string> blacklisted_uuids;
+      for (const auto& uuid : resp.leader_blacklisted_tservers_with_no_leaders()) {
+        blacklisted_uuids.push_back(uuid.ToBuffer());
+      }
       server_.MarkTServersAsFollowers(blacklisted_uuids);
     }
 
-    // At this point we know resp is a successful heartbeat response from the master so set it as
-    // the last heartbeat response. This invalidates resp so we should use last_hb_response_ instead
-    // below (hence using the nested scope for resp until here).
-    last_hb_response_.Swap(&resp);
+    // At this point we know resp is a successful heartbeat response from the master.
+    needs_reregister_ = resp.needs_reregister();
+    needs_full_tablet_report_ = resp.needs_full_tablet_report();
     heartbeat_rtt_ = end_time.GetDeltaSince(start_time);
     server_.SetMasterHeartbeatInfo({
-        .uuid = last_hb_response_.master_instance().permanent_uuid(),
+        .uuid = resp.master_instance().permanent_uuid().ToBuffer(),
         .host_port = finder_.get_master_leader_hostport(),
         .time = end_time,
         .rtt = heartbeat_rtt_,
@@ -527,27 +534,27 @@ Status HeartbeatPoller::TryHeartbeat() {
   }
 
   for (auto& data_provider : data_providers_) {
-    data_provider->OnHeartbeatResponse(last_hb_response_);
+    data_provider->OnHeartbeatResponse(resp);
   }
 
-  if (last_hb_response_.has_cluster_uuid() && !last_hb_response_.cluster_uuid().empty()) {
-    server_.set_cluster_uuid(last_hb_response_.cluster_uuid());
+  if (resp.has_cluster_uuid() && !resp.cluster_uuid().empty()) {
+    server_.set_cluster_uuid(resp.cluster_uuid().ToBuffer());
   }
 
   // The Master responds with the max entries for a single Tablet Report to avoid overwhelming it.
-  if (last_hb_response_.has_tablet_report_limit()) {
-    server_.tablet_manager()->SetReportLimit(last_hb_response_.tablet_report_limit());
+  if (resp.has_tablet_report_limit()) {
+    server_.tablet_manager()->SetReportLimit(resp.tablet_report_limit());
   }
 
-  if (last_hb_response_.needs_full_tablet_report()) {
+  if (resp.needs_full_tablet_report()) {
     return STATUS(TryAgain, "");
   }
 
   // Handle TSHeartbeatResponsePB (e.g. tablets ack'd by master as processed)
   bool all_processed = req.tablet_report().remaining_tablet_count() == 0 &&
-                       !last_hb_response_.tablet_report().processing_truncated();
+                       !resp.tablet_report().processing_truncated();
   server_.tablet_manager()->MarkTabletReportAcknowledged(
-      req.tablet_report().sequence_number(), last_hb_response_.tablet_report(), all_processed);
+      req.tablet_report().sequence_number(), resp.tablet_report(), all_processed);
 
   // Trigger another heartbeat ASAP if we didn't process all tablets on this request.
   if (all_processed) {
@@ -557,27 +564,27 @@ Status HeartbeatPoller::TryHeartbeat() {
   // Applied even when the response does not carry the field, which an old master's never does:
   // the default is UNKNOWN, so masters rolled back to a version that does not report load stop
   // the pacing instead of freezing it at the last level the new ones reported.
-  server_.SetYsqlCatalogPrefetchLoad(last_hb_response_.ysql_catalog_prefetch_load());
+  server_.SetYsqlCatalogPrefetchLoad(resp.ysql_catalog_prefetch_load());
 
   // Update the master's YSQL catalog version (i.e. if there were schema changes for YSQL objects).
   if (FLAGS_enable_ysql &&
       PREDICT_TRUE(!FLAGS_TEST_tserver_disable_catalog_refresh_on_heartbeat)) {
     // In per-db catalog version mode (the only supported mode) we never use ysql_catalog_version.
-    DCHECK(!last_hb_response_.has_ysql_catalog_version());
-    if (last_hb_response_.has_db_catalog_version_data()) {
+    DCHECK(!resp.has_ysql_catalog_version());
+    if (resp.has_db_catalog_version_data()) {
       if (FLAGS_log_ysql_catalog_versions) {
         VLOG_WITH_FUNC(1) << "got master db catalog version data: "
-                          << last_hb_response_.db_catalog_version_data().ShortDebugString()
+                          << resp.db_catalog_version_data().ShortDebugString()
                           << " db inval messages: "
-                          << tserver::CatalogInvalMessagesDataDebugString(last_hb_response_);
+                          << tserver::CatalogInvalMessagesDataDebugString(resp);
       }
       if (FLAGS_ysql_yb_enable_invalidation_messages) {
-        if (last_hb_response_.has_db_catalog_inval_messages_data()) {
+        if (resp.has_db_catalog_inval_messages_data()) {
           server_.SetYsqlDBCatalogVersionsWithInvalMessages(
-              last_hb_response_.db_catalog_version_data(),
-              last_hb_response_.db_catalog_inval_messages_data());
+              resp.db_catalog_version_data().ToGoogleProtobuf(),
+              resp.db_catalog_inval_messages_data().ToGoogleProtobuf());
         } else {
-          server_.SetYsqlDBCatalogVersions(last_hb_response_.db_catalog_version_data());
+          server_.SetYsqlDBCatalogVersions(resp.db_catalog_version_data().ToGoogleProtobuf());
           // If we only have catalog versions but not invalidation messages, it means that the last
           // heartbeat response was only able to read pg_yb_catalog_version, but the reading of
           // pg_yb_invalidation_messages failed. Clear the fingerprint so that next heartbeat
@@ -585,7 +592,7 @@ Status HeartbeatPoller::TryHeartbeat() {
           server_.ResetCatalogVersionsFingerprint();
         }
       } else {
-        server_.SetYsqlDBCatalogVersions(last_hb_response_.db_catalog_version_data());
+        server_.SetYsqlDBCatalogVersions(resp.db_catalog_version_data().ToGoogleProtobuf());
       }
     } else {
       // The master does not pass back any catalog versions. This can happen in
@@ -600,44 +607,45 @@ Status HeartbeatPoller::TryHeartbeat() {
       //   ignored by the heartbeat service at the master side.
       VLOG_WITH_FUNC(2) << "got no master catalog version data";
     }
-  } else if (last_hb_response_.has_ysql_catalog_version()) {
+  } else if (resp.has_ysql_catalog_version()) {
     // YSQL is disabled on this tserver but the master sent back the legacy single shared
     // ysql_catalog_version field; record it so the tserver still tracks it.
-    DCHECK(!last_hb_response_.has_db_catalog_version_data());
+    DCHECK(!resp.has_db_catalog_version_data());
     if (FLAGS_log_ysql_catalog_versions) {
       VLOG_WITH_FUNC(1) << "got master catalog version: "
-                        << last_hb_response_.ysql_catalog_version()
+                        << resp.ysql_catalog_version()
                         << ", breaking version: "
-                        << (last_hb_response_.has_ysql_last_breaking_catalog_version()
-                            ? Format("$0", last_hb_response_.ysql_last_breaking_catalog_version())
+                        << (resp.has_ysql_last_breaking_catalog_version()
+                            ? Format("$0", resp.ysql_last_breaking_catalog_version())
                             : "(none)");
     }
-    if (last_hb_response_.has_ysql_last_breaking_catalog_version()) {
-      server_.SetYsqlCatalogVersion(last_hb_response_.ysql_catalog_version(),
-                                     last_hb_response_.ysql_last_breaking_catalog_version());
+    if (resp.has_ysql_last_breaking_catalog_version()) {
+      server_.SetYsqlCatalogVersion(resp.ysql_catalog_version(),
+                                     resp.ysql_last_breaking_catalog_version());
     } else {
       /* Assuming all changes are breaking if last breaking version not explicitly set. */
-      server_.SetYsqlCatalogVersion(last_hb_response_.ysql_catalog_version(),
-                                     last_hb_response_.ysql_catalog_version());
+      server_.SetYsqlCatalogVersion(resp.ysql_catalog_version(),
+                                     resp.ysql_catalog_version());
     }
   }
 
-  RETURN_NOT_OK(server_.tablet_manager()->UpdateSnapshotsInfo(last_hb_response_.snapshots_info()));
+  RETURN_NOT_OK(server_.tablet_manager()->UpdateSnapshotsInfo(
+      resp.snapshots_info().ToGoogleProtobuf()));
 
-  server_.UpdateClusterYsqlDbOldestPinnedReadTimes(last_hb_response_);
+  server_.UpdateClusterYsqlDbOldestPinnedReadTimes(resp);
 
-  if (last_hb_response_.has_transaction_tables_version()) {
-    server_.UpdateTransactionTablesVersion(last_hb_response_.transaction_tables_version());
+  if (resp.has_transaction_tables_version()) {
+    server_.UpdateTransactionTablesVersion(resp.transaction_tables_version());
   }
 
   std::optional<AutoFlagsConfigPB> new_config;
-  if (last_hb_response_.has_auto_flags_config()) {
-    new_config = last_hb_response_.auto_flags_config();
+  if (resp.has_auto_flags_config()) {
+    new_config = resp.auto_flags_config().ToGoogleProtobuf();
   }
   server_.HandleMasterHeartbeatResponse(heartbeat_send_time, std::move(new_config));
 
   // Update the live tserver list.
-  server_.PopulateLiveTServers(last_hb_response_);
+  server_.PopulateLiveTServers(resp);
   return Status::OK();
 }
 
@@ -654,7 +662,7 @@ Status HeartbeatPoller::SetupRegistration(master::TSRegistrationPB* reg) {
   return Status::OK();
 }
 
-void HeartbeatPoller::SetupCommonField(master::TSToMasterCommonPB* common) {
+void HeartbeatPoller::SetupCommonField(master::LWTSToMasterCommonPB* common) {
   common->mutable_ts_instance()->CopyFrom(server_.instance_pb());
 }
 

@@ -52,7 +52,7 @@
 
 #include "yb/gutil/bits.h"
 
-#include "yb/master/master_heartbeat.pb.h"
+#include "yb/master/master_heartbeat.messages.h"
 
 #include "yb/rocksdb/cache.h"
 #include "yb/rocksdb/db.h"
@@ -71,6 +71,7 @@
 #include "yb/tserver/tserver_types.pb.h"
 
 #include "yb/util/format.h"
+#include "yb/util/memory/arena.h"
 #include "yb/util/random_util.h"
 #include "yb/util/status_format.h"
 #include "yb/util/test_util.h"
@@ -106,9 +107,8 @@ using consensus::RaftConfigPB;
 using consensus::ConsensusRound;
 using consensus::ConsensusRoundPtr;
 using docdb::RateLimiterSharingMode;
-using master::ReportedTabletPB;
-using master::TabletReportPB;
-using master::TabletReportUpdatesPB;
+using master::LWTabletReportPB;
+using master::LWTabletReportUpdatesPB;
 using tablet::TabletPeer;
 using gflags::FlagSaver;
 
@@ -461,17 +461,17 @@ TEST_F(TsTabletManagerTest, TestProperBackgroundFlushOnStartup) {
 }
 
 static void AssertMonotonicReportSeqno(int32_t* report_seqno,
-                                       const TabletReportPB& report) {
+                                       const LWTabletReportPB& report) {
   ASSERT_LT(*report_seqno, report.sequence_number());
   *report_seqno = report.sequence_number();
 }
 
-static void AssertReportHasUpdatedTablet(const TabletReportPB& report,
+static void AssertReportHasUpdatedTablet(const LWTabletReportPB& report,
                                          const string& tablet_id) {
   ASSERT_GE(report.updated_tablets_size(), 0);
   bool found_tablet = false;
-  for (ReportedTabletPB reported_tablet : report.updated_tablets()) {
-    if (reported_tablet.tablet_id() == tablet_id) {
+  for (const auto& reported_tablet : report.updated_tablets()) {
+    if (reported_tablet.tablet_id() == Slice(tablet_id)) {
       found_tablet = true;
       ASSERT_TRUE(reported_tablet.has_committed_consensus_state());
       ASSERT_TRUE(reported_tablet.committed_consensus_state().has_current_term())
@@ -479,12 +479,12 @@ static void AssertReportHasUpdatedTablet(const TabletReportPB& report,
       ASSERT_TRUE(reported_tablet.committed_consensus_state().has_leader_uuid())
           << reported_tablet.ShortDebugString();
       ASSERT_TRUE(reported_tablet.committed_consensus_state().has_config());
-      const RaftConfigPB& committed_config = reported_tablet.committed_consensus_state().config();
+      const auto& committed_config = reported_tablet.committed_consensus_state().config();
       ASSERT_EQ(kInvalidOpIdIndex, committed_config.committed_op_index());
       ASSERT_EQ(1, committed_config.peers_size());
-      ASSERT_TRUE(committed_config.peers(0).has_permanent_uuid())
+      ASSERT_TRUE(committed_config.peers().front().has_permanent_uuid())
           << reported_tablet.ShortDebugString();
-      ASSERT_EQ(committed_config.peers(0).permanent_uuid(),
+      ASSERT_EQ(committed_config.peers().front().permanent_uuid(),
                 reported_tablet.committed_consensus_state().leader_uuid())
           << reported_tablet.ShortDebugString();
     }
@@ -492,17 +492,18 @@ static void AssertReportHasUpdatedTablet(const TabletReportPB& report,
   ASSERT_TRUE(found_tablet);
 }
 
-static void CopyReportToUpdates(const TabletReportPB& req, TabletReportUpdatesPB* resp) {
+static void CopyReportToUpdates(const LWTabletReportPB& req, LWTabletReportUpdatesPB* resp) {
   resp->Clear();
   for (const auto & tablet : req.updated_tablets()) {
     auto new_tablet = resp->add_tablets();
-    new_tablet->set_tablet_id(tablet.tablet_id());
+    new_tablet->dup_tablet_id(tablet.tablet_id());
   }
 }
 
 TEST_F(TsTabletManagerTest, TestTabletReports) {
-  TabletReportPB report;
-  TabletReportUpdatesPB updates;
+  ThreadSafeArena arena;
+  LWTabletReportPB report(&arena);
+  LWTabletReportUpdatesPB updates(&arena);
   int32_t seqno = -1;
 
   // Generate a tablet report before any tablets are loaded. Should be empty.
@@ -521,7 +522,7 @@ TEST_F(TsTabletManagerTest, TestTabletReports) {
 
   // Create a tablet and do another incremental report - should include the tablet.
   ASSERT_OK(CreateNewTablet(kTableId, "tablet-1", schema_, nullptr));
-  int updated_tablets = 0;
+  size_t updated_tablets = 0;
   while (updated_tablets != 1) {
     tablet_manager_->GenerateTabletReport(&report);
     updated_tablets = report.updated_tablets().size();
@@ -560,8 +561,8 @@ TEST_F(TsTabletManagerTest, TestTabletReports) {
     bool found_tablet_2 = false;
     tablet_manager_->GenerateTabletReport(&report);
     ASSERT_MONOTONIC_REPORT_SEQNO(&seqno, report) << report.ShortDebugString();
-    for (const ReportedTabletPB& reported_tablet : report.updated_tablets()) {
-      if (reported_tablet.tablet_id() == "tablet-2") {
+    for (const auto& reported_tablet : report.updated_tablets()) {
+      if (reported_tablet.tablet_id() == Slice("tablet-2")) {
         found_tablet_2  = true;
         break;
       }
@@ -586,8 +587,9 @@ TEST_F(TsTabletManagerTest, TestTabletReports) {
 }
 
 TEST_F(TsTabletManagerTest, TestTabletReportLimit) {
-  TabletReportPB report;
-  TabletReportUpdatesPB updates;
+  ThreadSafeArena arena;
+  LWTabletReportPB report(&arena);
+  LWTabletReportUpdatesPB updates(&arena);
   int32_t seqno = -1;
 
   // Generate a tablet report before any tablets are loaded. Should be empty.
@@ -623,7 +625,7 @@ TEST_F(TsTabletManagerTest, TestTabletReportLimit) {
     ASSERT_EQ(n, report.updated_tablets().size());
     for (auto& t : report.updated_tablets()) {
       LOG(INFO) << "Erasing " << t.tablet_id();
-      ASSERT_EQ(1, tablet_ids.erase(t.tablet_id()));
+      ASSERT_EQ(1, tablet_ids.erase(t.tablet_id().ToBuffer()));
     }
     CopyReportToUpdates(report, &updates);
     tablet_manager_->MarkTabletReportAcknowledged(seqno, updates);
@@ -635,7 +637,7 @@ TEST_F(TsTabletManagerTest, TestTabletReportLimit) {
     ASSERT_MONOTONIC_REPORT_SEQNO(&seqno, report);
     ASSERT_EQ(n, report.updated_tablets().size());
     for (auto& t : report.updated_tablets()) {
-      ASSERT_EQ(1, tablet_ids_full.erase(t.tablet_id()));
+      ASSERT_EQ(1, tablet_ids_full.erase(t.tablet_id().ToBuffer()));
     }
     CopyReportToUpdates(report, &updates);
     tablet_manager_->MarkTabletReportAcknowledged(seqno, updates);
@@ -1366,8 +1368,9 @@ class ComputeDbHistoryRetentionPinCutoffTest : public TsTabletManagerTest {
     TsTabletManagerTest::SetUp();
 
     // Unblock AllowedHistoryCutoff's xCluster GetSafeTime early-return so the DB pin logic runs.
+    ThreadSafeArena arena;
     ASSERT_OK(mini_server_->server()->XClusterHandleMasterHeartbeatResponse(
-        master::TSHeartbeatResponsePB(), MonoTime()));
+        master::LWTSHeartbeatResponsePB(&arena), MonoTime()));
 
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_db_history_retention_pins) = true;
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_history_retention_interval_sec) = kSafetyWindowSec;
@@ -1389,27 +1392,32 @@ class ComputeDbHistoryRetentionPinCutoffTest : public TsTabletManagerTest {
   }
 
   void SetClusterPins(const std::unordered_map<PgOid, HybridTime>& pins) {
-    master::TSHeartbeatResponsePB resp;
+    ThreadSafeArena arena;
+    master::LWTSHeartbeatResponsePB resp(&arena);
     resp.set_cluster_ysql_db_pins_ready(true);
     for (const auto& [db_oid, pin] : pins) {
-      (*resp.mutable_cluster_ysql_db_oldest_pinned_read_times())[db_oid]
-          .set_db_level_oldest_read_time(pin.ToPB());
+      auto* entry = resp.add_cluster_ysql_db_oldest_pinned_read_times();
+      entry->set_key(db_oid);
+      entry->mutable_value()->set_db_level_oldest_read_time(pin.ToPB());
     }
     mini_server_->server()->UpdateClusterYsqlDbOldestPinnedReadTimes(resp);
   }
 
   void ClearClusterPins() {
-    master::TSHeartbeatResponsePB resp;
+    ThreadSafeArena arena;
+    master::LWTSHeartbeatResponsePB resp(&arena);
     resp.set_cluster_ysql_db_pins_ready(true);
     mini_server_->server()->UpdateClusterYsqlDbOldestPinnedReadTimes(resp);
   }
 
   // Sends a cluster pin map that must not be applied (e.g. incomplete after master failover).
   void SetClusterPinsNotReady(HybridTime pin, PgOid db_oid = kDbOid) {
-    master::TSHeartbeatResponsePB resp;
+    ThreadSafeArena arena;
+    master::LWTSHeartbeatResponsePB resp(&arena);
     resp.set_cluster_ysql_db_pins_ready(false);
-    (*resp.mutable_cluster_ysql_db_oldest_pinned_read_times())[db_oid]
-        .set_db_level_oldest_read_time(pin.ToPB());
+    auto* entry = resp.add_cluster_ysql_db_oldest_pinned_read_times();
+    entry->set_key(db_oid);
+    entry->mutable_value()->set_db_level_oldest_read_time(pin.ToPB());
     mini_server_->server()->UpdateClusterYsqlDbOldestPinnedReadTimes(resp);
   }
 
@@ -1453,8 +1461,9 @@ class ComputeDbHistoryRetentionPinCutoffTest : public TsTabletManagerTest {
   void RestartServer() {
     ASSERT_NO_FATAL_FAILURE(Reload());
     config_ = mini_server_->CreateLocalConfig();
+    ThreadSafeArena arena;
     ASSERT_OK(mini_server_->server()->XClusterHandleMasterHeartbeatResponse(
-        master::TSHeartbeatResponsePB(), /*lease_expiration_time=*/MonoTime()));
+        master::LWTSHeartbeatResponsePB(&arena), /*lease_expiration_time=*/MonoTime()));
   }
 
   HybridTime ClusterPin(PgOid db_oid = kDbOid) const {

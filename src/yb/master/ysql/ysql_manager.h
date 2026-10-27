@@ -121,7 +121,7 @@ class YsqlManager : public YsqlManagerIf {
 
   Status ValidateWriteToCatalogTableAllowed(TableIdView table_id, bool is_forced_update) const;
 
-  Status ValidateTServerVersion(const VersionInfoPB& version) const override;
+  Status ValidateTServerVersion(const LWVersionInfoPB& version) const override;
 
   // Returns the pg_class.oid of the PostgreSQL table corresponding to the given DocDB table_id.
   // Returns a non-OK status if the DocDB table is uncommitted. Uncommitted DocDB tables can be:

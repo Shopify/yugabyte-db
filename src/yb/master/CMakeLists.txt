@@ -38,10 +38,10 @@ YRPC_GENERATE(
   BINARY_ROOT ${CMAKE_CURRENT_BINARY_DIR}/../..
   PROTO_FILES
       master_cluster.proto master_dcl.proto
-      master_encryption.proto master_heartbeat.proto master_replication.proto
+      master_encryption.proto master_replication.proto
       master_backup.proto master_test.proto master_ysql_lease.proto
   MESSAGES_PROTO_FILES
-      master_ddl.proto master_client.proto master_admin.proto
+      master_ddl.proto master_client.proto master_admin.proto master_heartbeat.proto
   NO_SERVICE_MESSAGES_PROTO_FILES
       catalog_entity_info.proto master_types.proto)
 set(MASTER_YRPC_LIBS

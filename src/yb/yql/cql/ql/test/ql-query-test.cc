@@ -29,7 +29,7 @@
 #include "yb/master/catalog_manager.h"
 #include "yb/master/leader_epoch.h"
 #include "yb/master/master.h"
-#include "yb/master/master_heartbeat.pb.h"
+#include "yb/master/master_heartbeat.messages.h"
 #include "yb/master/ts_manager.h"
 
 #include "yb/util/decimal.h"
@@ -1607,8 +1607,10 @@ TEST_F(TestQLQuery, TestInvalidPeerTableEntries) {
   master::TSHeartbeatRequestPB heartbeat_request;
   *heartbeat_request.mutable_common()->mutable_ts_instance() = instance;
   *heartbeat_request.mutable_registration() = registration;
+  ThreadSafeArena arena;
   ASSERT_OK(leader_master->ts_manager()->RegisterFromHeartbeat(
-      heartbeat_request, leader_master->catalog_manager_impl()->GetLeaderEpochInternal(),
+      master::LWTSHeartbeatRequestPB(&arena, heartbeat_request),
+      leader_master->catalog_manager_impl()->GetLeaderEpochInternal(),
       CloudInfoPB(), nullptr));
 
   // Verify the peers table and ensure the invalid host is not present.

@@ -14,8 +14,6 @@
 #include <algorithm>
 #include <iterator>
 
-#include <google/protobuf/repeated_field.h>
-
 #include "yb/common/common_flags.h"
 #include "yb/common/hybrid_time.h"
 #include "yb/common/pg_catversions.h"
@@ -30,6 +28,7 @@
 #include "yb/master/catalog_manager_util.h"
 #include "yb/master/leader_epoch.h"
 #include "yb/master/master.h"
+#include "yb/master/master_heartbeat.messages.h"
 #include "yb/master/master_heartbeat.pb.h"
 #include "yb/master/master_heartbeat.service.h"
 #include "yb/master/master_tablet_service.h"
@@ -156,12 +155,11 @@ using namespace std::literals;
 using namespace std::placeholders;
 
 using consensus::ConsensusStatePB;
+using consensus::LWConsensusStatePB;
 using consensus::PeerMemberType;
 using tablet::RaftGroupStatePB;
 using tablet::TABLET_DATA_DELETED;
 using tablet::TABLET_DATA_TOMBSTONED;
-
-using google::protobuf::RepeatedPtrField;
 
 class MasterHeartbeatServiceImpl : public MasterServiceBase, public MasterHeartbeatIf {
  public:
@@ -173,8 +171,8 @@ class MasterHeartbeatServiceImpl : public MasterServiceBase, public MasterHeartb
       const UniverseUuid& tserver_universe_uuid,
       const UniverseUuid& master_universe_uuid);
 
-  void TSHeartbeat(const TSHeartbeatRequestPB* req,
-                   TSHeartbeatResponsePB* resp,
+  void TSHeartbeat(const LWTSHeartbeatRequestPB* req,
+                   LWTSHeartbeatResponsePB* resp,
                    rpc::RpcContext rpc) override;
 
  private:
@@ -184,7 +182,7 @@ class MasterHeartbeatServiceImpl : public MasterServiceBase, public MasterHeartb
   struct ReportedTablet {
     TabletId tablet_id;
     TabletInfoPtr info;
-    const ReportedTabletPB* report;
+    const LWReportedTabletPB* report;
     std::map<TableId, scoped_refptr<TableInfo>> tables;
 
     std::string ToString() const {
@@ -197,22 +195,22 @@ class MasterHeartbeatServiceImpl : public MasterServiceBase, public MasterHeartb
   // Returns true if report was processed, or false if full report should be requested.
   Result<bool> ProcessTabletReport(
       const TSDescriptorPtr& ts_desc,
-      const NodeInstancePB& ts_instance,
-      const TabletReportPB* report_ptr,
+      const LWNodeInstancePB& ts_instance,
+      const LWTabletReportPB* report_ptr,
       const TabletInfoPtr* reported_tablet_infos,
       const LeaderEpoch& epoch,
-      TabletReportUpdatesPB* report_update,
+      LWTabletReportUpdatesPB* report_update,
       rpc::RpcContext* rpc);
 
   Status ProcessTabletReportBatch(
       const TSDescriptorPtr& ts_desc,
-      const NodeInstancePB& ts_instance,
-      const TabletReportPB& report,
+      const LWNodeInstancePB& ts_instance,
+      const LWTabletReportPB& report,
       ReportedTablets::iterator begin,
       ReportedTablets::iterator end,
       const LeaderEpoch& epoch,
       CoarseTimePoint deadline,
-      TabletReportUpdatesPB* full_report_update,
+      LWTabletReportUpdatesPB* full_report_update,
       std::vector<RetryingTSRpcTaskWithTablePtr>* rpcs);
 
   void DeleteOrphanedTabletReplica(
@@ -220,13 +218,13 @@ class MasterHeartbeatServiceImpl : public MasterServiceBase, public MasterHeartb
 
   std::pair<MasterHeartbeatServiceImpl::ReportedTablets, std::vector<TabletId>>
       GetReportedAndOrphanedTablets(
-          const RepeatedPtrField<ReportedTabletPB>& updated_tablets,
+          const ArenaList<LWReportedTabletPB>& updated_tablets,
           const TabletInfoPtr* updated_tablet_infos);
 
   bool ProcessCommittedConsensusState(
       const TSDescriptorPtr& ts_desc,
       bool is_incremental,
-      const ReportedTabletPB& report,
+      const LWReportedTabletPB& report,
       const LeaderEpoch& epoch,
       std::map<TableId, TableInfo::ReadLock>* table_read_locks,
       const TabletInfoPtr& tablet,
@@ -234,67 +232,72 @@ class MasterHeartbeatServiceImpl : public MasterServiceBase, public MasterHeartb
       std::map<TableId, scoped_refptr<TableInfo>>* tables,
       std::vector<RetryingTSRpcTaskWithTablePtr>* rpcs);
 
+  // leader_uuid is the leader after ProcessCommittedConsensusState's adjustments, which the
+  // reported message does not carry.
   void UpdateTabletReplicasAfterConfigChange(
       const TabletInfoPtr& tablet,
       const std::string& sender_uuid,
-      const ConsensusStatePB& consensus_state,
-      const ReportedTabletPB& report,
+      const LWConsensusStatePB& consensus_state,
+      const std::string& leader_uuid,
+      const LWReportedTabletPB& report,
       const LeaderEpoch& epoch);
 
   void UpdateTabletReplicaInLocalMemory(
       const TSDescriptorPtr& ts_desc,
-      const ConsensusStatePB* consensus_state,
-      const ReportedTabletPB& report,
+      const LWConsensusStatePB* consensus_state,
+      const std::string& leader_uuid,
+      const LWReportedTabletPB& report,
       const TabletInfoPtr& tablet);
 
   TabletReplica CreateNewReplicaForLocalMemory(
       const TSDescriptorPtr& ts_desc,
-      const ConsensusStatePB* consensus_state,
-      const ReportedTabletPB& report,
+      const LWConsensusStatePB* consensus_state,
+      const std::string& leader_uuid,
+      const LWReportedTabletPB& report,
       const RaftGroupStatePB& state);
 
   bool ReplicaMapDiffersFromConsensusState(
-      const TabletInfoPtr& tablet, const ConsensusStatePB& cstate);
+      const TabletInfoPtr& tablet, const LWConsensusStatePB& cstate);
 
   // Returns false if the master does not know the tablet or has no replica of it on ts_uuid yet.
   bool ProcessTabletMetadata(
       const std::string& ts_uuid,
       const TabletInfoPtr& tablet,
-      const TabletDriveStorageMetadataPB& storage_metadata);
+      const LWTabletDriveStorageMetadataPB& storage_metadata);
 
   void ProcessLeaderInfo(
       const std::string& ts_uuid,
       const TabletInfoPtr& tablet,
-      const TabletLeaderMetricsPB& leader_info);
+      const LWTabletLeaderMetricsPB& leader_info);
 
   void ProcessTabletReplicaFullCompactionStatus(
       const TabletServerId& ts_uuid, const TabletInfoPtr& tablet,
-      const FullCompactionStatusPB& full_compaction_status);
+      const LWFullCompactionStatusPB& full_compaction_status);
 
   // Returns Status::OK if the validation succeeded and processing of the request should continue,
   // otherwise non-OK if processing of the heartbeat should stop. Also sets rpc appropriately.
   Status ValidateTServerUniverseOrRespond(
-      const TSHeartbeatRequestPB& req, TSHeartbeatResponsePB* resp, rpc::RpcContext* rpc);
+      const LWTSHeartbeatRequestPB& req, LWTSHeartbeatResponsePB* resp, rpc::RpcContext* rpc);
 
   Result<TSDescriptorPtr> UpdateAndReturnTSDescriptorOrRespond(
-      const LeaderEpoch& epoch, const TSHeartbeatRequestPB& req, TSHeartbeatResponsePB* resp,
+      const LeaderEpoch& epoch, const LWTSHeartbeatRequestPB& req, LWTSHeartbeatResponsePB* resp,
       rpc::RpcContext* rpc);
 
   Result<TSDescriptorPtr> RegisterTServerOrRespond(
-      const LeaderEpoch& epoch, const TSHeartbeatRequestPB& req, TSHeartbeatResponsePB* resp,
+      const LeaderEpoch& epoch, const LWTSHeartbeatRequestPB& req, LWTSHeartbeatResponsePB* resp,
       rpc::RpcContext* rpc);
 
   Status FillHeartbeatResponseOrRespond(
-      const TSHeartbeatRequestPB& req, TSHeartbeatResponsePB* resp, rpc::RpcContext* rpc);
+      const LWTSHeartbeatRequestPB& req, LWTSHeartbeatResponsePB* resp, rpc::RpcContext* rpc);
 
-  void PopulatePgCatalogVersionInfo(const TSHeartbeatRequestPB& req,
-                                    TSHeartbeatResponsePB& resp);
+  void PopulatePgCatalogVersionInfo(const LWTSHeartbeatRequestPB& req,
+                                    LWTSHeartbeatResponsePB& resp);
 
   // Populate global cluster-wide database pins in the tserver heartbeat response.
   //
   // Since there can be other ongoing sessions that involves DBs on a tserver but the tserver
   // itself is unaware of, every global database pin need to be included in the response.
-  void PopulateYsqlDbOldestPinnedReadTimes(TSHeartbeatResponsePB& resp);
+  void PopulateYsqlDbOldestPinnedReadTimes(LWTSHeartbeatResponsePB& resp);
 };
 
 Status MasterHeartbeatServiceImpl::CheckUniverseUuidMatchFromTserver(
@@ -324,8 +327,8 @@ Status MasterHeartbeatServiceImpl::CheckUniverseUuidMatchFromTserver(
 }
 
 void MasterHeartbeatServiceImpl::PopulatePgCatalogVersionInfo(
-    const TSHeartbeatRequestPB& req,
-    TSHeartbeatResponsePB& resp) {
+    const LWTSHeartbeatRequestPB& req,
+    LWTSHeartbeatResponsePB& resp) {
   // Travels with the catalog version because it is consumed at the same moment: a backend about
   // to bump the version needs to know what its last bump is still costing the leader.
   resp.set_ysql_catalog_prefetch_load(GetYsqlCatalogPrefetchLoad());
@@ -406,7 +409,7 @@ void MasterHeartbeatServiceImpl::PopulatePgCatalogVersionInfo(
         inval_messages->set_db_oid(db_oid_version.first);
         inval_messages->set_current_version(db_oid_version.second);
         if (message_list.has_value()) {
-          inval_messages->set_message_list(std::move(*message_list));
+          inval_messages->dup_message_list(*message_list);
         }
       }
     } else {
@@ -431,7 +434,8 @@ void MasterHeartbeatServiceImpl::PopulatePgCatalogVersionInfo(
     << tserver::CatalogInvalMessagesDataDebugString(resp);
 }
 
-void MasterHeartbeatServiceImpl::PopulateYsqlDbOldestPinnedReadTimes(TSHeartbeatResponsePB& resp) {
+void MasterHeartbeatServiceImpl::PopulateYsqlDbOldestPinnedReadTimes(
+    LWTSHeartbeatResponsePB& resp) {
   if (!FLAGS_enable_db_history_retention_pins) {
     return;
   }
@@ -439,14 +443,15 @@ void MasterHeartbeatServiceImpl::PopulateYsqlDbOldestPinnedReadTimes(TSHeartbeat
       catalog_manager_->TimeSinceElectedLeader());
   resp.set_cluster_ysql_db_pins_ready(cluster_pins.ready);
   for (const auto& [db_oid, pin] : cluster_pins.pins) {
-    (*resp.mutable_cluster_ysql_db_oldest_pinned_read_times())[db_oid]
-      .set_db_level_oldest_read_time(pin.ToPB());
+    auto* entry = resp.add_cluster_ysql_db_oldest_pinned_read_times();
+    entry->set_key(db_oid);
+    entry->mutable_value()->set_db_level_oldest_read_time(pin.ToPB());
   }
 }
 
 void MasterHeartbeatServiceImpl::TSHeartbeat(
-    const TSHeartbeatRequestPB* req,
-    TSHeartbeatResponsePB* resp,
+    const LWTSHeartbeatRequestPB* req,
+    LWTSHeartbeatResponsePB* resp,
     rpc::RpcContext rpc) {
   LongOperationTracker long_operation_tracker(
       "TSHeartbeat", FLAGS_master_ts_heartbeat_long_operation_warning_ms * 1ms);
@@ -459,7 +464,7 @@ void MasterHeartbeatServiceImpl::TSHeartbeat(
     LOG(WARNING) << "Could not set master raft config : " << s.ToString();
   } else if (cpb.has_config()) {
     if (cpb.config().committed_op_index() > req->config_index()) {
-      *resp->mutable_master_config() = std::move(cpb.config());
+      *resp->mutable_master_config() = cpb.config();
       LOG(INFO) << "Set config at index " << resp->master_config().committed_op_index()
                 << " for ts uuid "
                 << req->common().ts_instance().permanent_uuid();
@@ -527,7 +532,7 @@ void MasterHeartbeatServiceImpl::TSHeartbeat(
     std::vector<TabletId> tablet_ids;
     if (req->has_tablet_report()) {
       for (const auto& reported : req->tablet_report().updated_tablets()) {
-        tablet_ids.push_back(reported.tablet_id());
+        tablet_ids.push_back(reported.tablet_id().ToBuffer());
       }
     }
     const size_t num_reported_tablets = tablet_ids.size();
@@ -539,13 +544,13 @@ void MasterHeartbeatServiceImpl::TSHeartbeat(
         PREDICT_TRUE(!ANNOTATE_UNPROTECTED_READ(FLAGS_TEST_skip_processing_tablet_metadata));
     if (process_metadata) {
       for (const auto& metadata : req->storage_metadata()) {
-        tablet_ids.push_back(metadata.tablet_id());
+        tablet_ids.push_back(metadata.tablet_id().ToBuffer());
       }
       for (const auto& info : req->leader_info()) {
-        tablet_ids.push_back(info.tablet_id());
+        tablet_ids.push_back(info.tablet_id().ToBuffer());
       }
       for (const auto& full_compaction_status : req->full_compaction_statuses()) {
-        tablet_ids.push_back(full_compaction_status.tablet_id());
+        tablet_ids.push_back(full_compaction_status.tablet_id().ToBuffer());
       }
     }
     auto tablets = catalog_manager_->GetTabletInfos(tablet_ids);
@@ -629,7 +634,7 @@ void MasterHeartbeatServiceImpl::TSHeartbeat(
         if (leaders_drained) {
           for (const auto& desc : descs) {
             if (IsBlacklisted(desc->GetRegistration(), leader_blacklist)) {
-              resp->add_leader_blacklisted_tservers_with_no_leaders(desc->permanent_uuid());
+              resp->add_dup_leader_blacklisted_tservers_with_no_leaders(desc->permanent_uuid());
             }
           }
           ts_desc->exchg_pending_leader_drain_notification(leader_drain_version, 0);
@@ -668,48 +673,56 @@ void MasterHeartbeatServiceImpl::TSHeartbeat(
 
 std::pair<MasterHeartbeatServiceImpl::ReportedTablets, std::vector<TabletId>>
     MasterHeartbeatServiceImpl::GetReportedAndOrphanedTablets(
-    const RepeatedPtrField<ReportedTabletPB>& updated_tablets,
+    const ArenaList<LWReportedTabletPB>& updated_tablets,
     const TabletInfoPtr* updated_tablet_infos) {
   MasterHeartbeatServiceImpl::ReportedTablets reported_tablets;
   std::vector<TabletId> orphaned_tablets;
 
+  std::vector<TabletId> updated_tablet_ids;
+  std::transform(
+      updated_tablets.begin(), updated_tablets.end(),
+      std::back_inserter(updated_tablet_ids),
+      [](const auto& pb) { return pb.tablet_id().ToBuffer(); });
+
   // Get table objects for all updated colocated tables.
   std::vector<TableId> updated_table_ids;
-  for (int i = 0; i < updated_tablets.size(); ++i) {
-    if (!updated_tablet_infos[i]) {
+  size_t i = 0;
+  for (const auto& report : updated_tablets) {
+    if (!updated_tablet_infos[i++]) {
       continue;
     }
     // For colocated tablets, add ids for all the tables that need processing.
-    for (const auto& [table_id, _] : updated_tablets[i].table_to_version()) {
-      updated_table_ids.push_back(table_id);
+    for (const auto& entry : report.table_to_version()) {
+      updated_table_ids.push_back(entry.key().ToBuffer());
     }
   }
   std::unordered_map<TableId, TableInfoPtr> updated_tables =
       catalog_manager_->GetTableInfos(updated_table_ids);
 
-  for (int i = 0; i < updated_tablets.size(); ++i) {
+  i = 0;
+  for (const auto& report : updated_tablets) {
     const auto& tablet = updated_tablet_infos[i];
-    const auto& report = updated_tablets[i];
+    auto& tablet_id = updated_tablet_ids[i++];
 
     if (!tablet || FLAGS_TEST_simulate_sys_catalog_data_loss) {
-      orphaned_tablets.push_back(report.tablet_id());
+      orphaned_tablets.push_back(std::move(tablet_id));
       continue;
     }
 
     // 1b. Found the tablet, create information for updating local state.
     ReportedTablet reported_tablet {
-      .tablet_id = report.tablet_id(),
+      .tablet_id = std::move(tablet_id),
       .info = tablet,
       .report = &report,
       .tables = {}
     };
-    for (const auto& [table_id, version] : report.table_to_version()) {
-      auto table = updated_tables.find(table_id);
+    for (const auto& entry : report.table_to_version()) {
+      auto table = updated_tables.find(entry.key().ToBuffer());
       if (table->second == nullptr) {
         // TODO(Sanket): Do we need to suitably handle these orphaned tables?
         continue;
       }
-      reported_tablet.tables[table_id] = table->second;
+      reported_tablet.tables[table->first] = table->second;
     }
     reported_tablets.push_back(std::move(reported_tablet));
   }
@@ -739,11 +752,11 @@ void MasterHeartbeatServiceImpl::DeleteOrphanedTabletReplica(
 
 Result<bool> MasterHeartbeatServiceImpl::ProcessTabletReport(
     const TSDescriptorPtr& ts_desc,
-    const NodeInstancePB& ts_instance,
-    const TabletReportPB* report_ptr,
+    const LWNodeInstancePB& ts_instance,
+    const LWTabletReportPB* report_ptr,
     const TabletInfoPtr* reported_tablet_infos,
     const LeaderEpoch& epoch,
-    TabletReportUpdatesPB* report_update,
+    LWTabletReportUpdatesPB* report_update,
     rpc::RpcContext* rpc) {
   if (!report_ptr) {
     return ts_desc->has_tablet_report();
@@ -768,13 +781,13 @@ Result<bool> MasterHeartbeatServiceImpl::ProcessTabletReport(
     }
   }
 
-  int num_tablets = report.updated_tablets_size();
+  auto num_tablets = report.updated_tablets_size();
   TRACE_EVENT2("master", "ProcessTabletReport",
               "requestor", rpc->requestor_string(),
               "num_tablets", num_tablets);
 
   VLOG(2) << "Received tablet report from " << rpc::RequestorString(rpc) << "("
-          << ts_desc->permanent_uuid() << "): " << report.DebugString();
+          << ts_desc->permanent_uuid() << "): " << report.ShortDebugString();
 
   // TODO: on a full tablet report, we may want to iterate over the tablets we think
   // the server should have, compare vs the ones being reported, and somehow mark
@@ -785,7 +798,7 @@ Result<bool> MasterHeartbeatServiceImpl::ProcessTabletReport(
   // Process any delete requests from orphaned tablets, identified above.
   for (const auto& tablet_id : orphaned_tablets) {
     // Every tablet in the report that is processed gets a heartbeat response entry.
-    report_update->add_tablets()->set_tablet_id(tablet_id);
+    report_update->add_tablets()->dup_tablet_id(tablet_id);
     DeleteOrphanedTabletReplica(tablet_id, epoch, ts_desc);
   }
 
@@ -877,7 +890,7 @@ Result<bool> MasterHeartbeatServiceImpl::ProcessTabletReport(
   return true;
 }
 
-int64_t GetCommittedConsensusStateOpIdIndex(const ReportedTabletPB& report) {
+int64_t GetCommittedConsensusStateOpIdIndex(const LWReportedTabletPB& report) {
   if (!report.has_committed_consensus_state() ||
       !report.committed_consensus_state().config().has_committed_op_index()) {
     return consensus::kInvalidOpIdIndex;
@@ -886,7 +899,7 @@ int64_t GetCommittedConsensusStateOpIdIndex(const ReportedTabletPB& report) {
   return report.committed_consensus_state().config().committed_op_index();
 }
 
-Result<std::optional<OpId>> GetPendingConfigOpId(const ReportedTabletPB& report) {
+Result<std::optional<OpId>> GetPendingConfigOpId(const LWReportedTabletPB& report) {
   if (!report.has_pending_config_op_id()) {
     return std::nullopt;
   }
@@ -906,7 +919,7 @@ Result<std::optional<OpId>> GetPendingConfigOpId(const ReportedTabletPB& report)
 // pending_config_op_id is malformed, falls back to the legacy strict-less-than comparison for
 // backward compatibility.
 bool ShouldDeleteNonMember(
-    const ReportedTabletPB& report,
+    const LWReportedTabletPB& report,
     const ConsensusStatePB& prev_cstate,
     int64_t prev_opid_index,
     int64_t report_opid_index,
@@ -941,13 +954,13 @@ bool ShouldDeleteNonMember(
 
 Status MasterHeartbeatServiceImpl::ProcessTabletReportBatch(
     const TSDescriptorPtr& ts_desc,
-    const NodeInstancePB& ts_instance,
-    const TabletReportPB& full_report,
+    const LWNodeInstancePB& ts_instance,
+    const LWTabletReportPB& full_report,
     ReportedTablets::iterator begin,
     ReportedTablets::iterator end,
     const LeaderEpoch& epoch,
     CoarseTimePoint deadline,
-    TabletReportUpdatesPB* full_report_update,
+    LWTabletReportUpdatesPB* full_report_update,
     std::vector<RetryingTSRpcTaskWithTablePtr>* rpcs) {
   // First Pass. Iterate in TabletId Order to discover all Table locks we'll need.
 
@@ -987,13 +1000,13 @@ Status MasterHeartbeatServiceImpl::ProcessTabletReportBatch(
   for (auto it = begin; it != end; ++it) {
     const auto& tablet_id = it->tablet_id;
     const TabletInfoPtr& tablet = it->info;
-    const ReportedTabletPB& report = *it->report;
+    const LWReportedTabletPB& report = *it->report;
     const TableInfoPtr& table = tablet->table();
 
     // Prepare an heartbeat response entry for this tablet, now that we're going to process it.
     // Every tablet in the report that is processed gets one, even if there are no changes to it.
-    ReportedTabletUpdatesPB* update = full_report_update->add_tablets();
-    update->set_tablet_id(tablet_id);
+    auto* update = full_report_update->add_tablets();
+    update->dup_tablet_id(tablet_id);
 
     // Get tablet lock on demand.  This works in the batch case because the loop is ordered.
     // Timed acquisition bounded by the RPC deadline: give up (and let the tserver retry) rather
@@ -1002,7 +1015,7 @@ Status MasterHeartbeatServiceImpl::ProcessTabletReportBatch(
     auto& table_lock = table_read_locks[table->id()];
     auto& tablet_lock = tablet_write_locks[tablet_id];
 
-    TRACE_EVENT1("master", "HandleReportedTablet", "tablet_id", report.tablet_id());
+    TRACE_EVENT1("master", "HandleReportedTablet", "tablet_id", tablet_id);
     RETURN_NOT_OK_PREPEND(catalog_manager_->CheckIsLeaderAndReady(),
         Format("This master is no longer the leader, unable to handle report for tablet $0",
             tablet_id));
@@ -1014,7 +1027,7 @@ Status MasterHeartbeatServiceImpl::ProcessTabletReportBatch(
     if (tablet_lock->is_deleted() ||
         table_lock->started_deleting()) {
       const string msg = tablet_lock->pb.state_msg();
-      update->set_state_msg(msg);
+      update->dup_state_msg(msg);
       LOG(INFO) << "Got report from deleted tablet " << tablet->ToString()
                 << " (" << msg << "): Sending delete request for this tablet";
       // TODO(unknown): Cancel tablet creation, instead of deleting, in cases
@@ -1029,7 +1042,7 @@ Status MasterHeartbeatServiceImpl::ProcessTabletReportBatch(
       const string msg = tablet_lock->pb.state_msg();
       LOG(INFO) << "Got report from tablet " << tablet->tablet_id() << " for non-running table "
                 << table->ToString() << ": " << msg;
-      update->set_state_msg(msg);
+      update->dup_state_msg(msg);
       continue;
     }
 
@@ -1098,7 +1111,7 @@ Status MasterHeartbeatServiceImpl::ProcessTabletReportBatch(
       // When a tablet server is restarted, it sends a full tablet report with all of its tablets
       // in the NOT_STARTED state, so this would make the cluster balancer think that all the
       // tablets are being remote bootstrapped at once, so only process incremental reports here.
-      UpdateTabletReplicaInLocalMemory(ts_desc, nullptr /* consensus */, report, tablet);
+      UpdateTabletReplicaInLocalMemory(ts_desc, nullptr /* consensus */, "", report, tablet);
     }
   } // Finished one round of batch processing.
 
@@ -1153,7 +1166,7 @@ Status MasterHeartbeatServiceImpl::ProcessTabletReportBatch(
   // Third Pass. Process all tablet schema version changes.
   // (This is separate from tablet state mutations because only table on-disk state is changed.)
   for (auto it = begin; it != end; ++it) {
-    const ReportedTabletPB& report = *it->report;
+    const LWReportedTabletPB& report = *it->report;
     if (!report.has_schema_version()) {
       continue;
     }
@@ -1171,7 +1184,7 @@ Status MasterHeartbeatServiceImpl::ProcessTabletReportBatch(
 bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
     const TSDescriptorPtr& ts_desc,
     bool is_incremental,
-    const ReportedTabletPB& report,
+    const LWReportedTabletPB& report,
     const LeaderEpoch& epoch,
     std::map<TableId, TableInfo::ReadLock>* table_read_locks,
     const TabletInfoPtr& tablet,
@@ -1179,7 +1192,9 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
     std::map<TableId, scoped_refptr<TableInfo>>* tables,
     std::vector<RetryingTSRpcTaskWithTablePtr>* rpcs) {
   const ConsensusStatePB& prev_cstate = tablet_lock->pb.committed_consensus_state();
-  ConsensusStatePB cstate = report.committed_consensus_state();
+  const auto& cstate = report.committed_consensus_state();
+  // Adjusted below instead of the reported message, which is read-only.
+  std::string leader_uuid = cstate.leader_uuid().ToBuffer();
   bool tablet_was_mutated = false;
 
   // 6a. The master only processes reports for replicas with committed
@@ -1216,9 +1231,8 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
 
   // 6b. Disregard the leader state if the reported leader is not a member
   // of the committed config.
-  if (cstate.leader_uuid().empty() ||
-      !IsRaftConfigMember(cstate.leader_uuid(), cstate.config())) {
-    cstate.clear_leader_uuid();
+  if (leader_uuid.empty() || !IsRaftConfigMember(leader_uuid, cstate.config())) {
+    leader_uuid.clear();
     tablet_was_mutated = true;
   }
 
@@ -1231,7 +1245,7 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
   // - FLAG added to avoid waiting during mock tests.
   if (!tablet_lock->is_running() &&
       report.state() == tablet::RUNNING &&
-        (cstate.has_leader_uuid() ||
+        (!leader_uuid.empty() ||
         !FLAGS_catalog_manager_wait_for_new_tablets_to_elect_leader)) {
     DCHECK_EQ(SysTabletsEntryPB::CREATING, tablet_lock->pb.state())
         << "Tablet in unexpected state: " << tablet->ToString()
@@ -1248,7 +1262,7 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
   // - The new cstate has a leader, and either the old cstate didn't, or
   //   there was a term change.
   if (cstate.config().committed_op_index() > prev_cstate.config().committed_op_index() ||
-      (cstate.has_leader_uuid() &&
+      (!leader_uuid.empty() &&
           (!prev_cstate.has_leader_uuid() ||
               cstate.current_term() > prev_cstate.current_term()))) {
 
@@ -1261,11 +1275,11 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
     // the previous leader if the reported cstate has the same term as the
     // previous cstate, and the leader was known for that term.
     if (cstate.current_term() == prev_cstate.current_term()) {
-      if (!cstate.has_leader_uuid() && prev_cstate.has_leader_uuid()) {
-        cstate.set_leader_uuid(prev_cstate.leader_uuid());
+      if (leader_uuid.empty() && prev_cstate.has_leader_uuid()) {
+        leader_uuid = prev_cstate.leader_uuid();
         // Sanity check to detect consensus divergence bugs.
-      } else if (cstate.has_leader_uuid() && prev_cstate.has_leader_uuid() &&
-          cstate.leader_uuid() != prev_cstate.leader_uuid()) {
+      } else if (!leader_uuid.empty() && prev_cstate.has_leader_uuid() &&
+          leader_uuid != prev_cstate.leader_uuid()) {
         string msg = Format("Previously reported cstate for tablet $0 gave "
                             "a different leader for term $1 than the current cstate. "
                             "Previous cstate: $2. Current cstate: $3.",
@@ -1279,8 +1293,8 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
     // 6d(ii). Delete any replicas from the previous config that are not in the new one.
     if (FLAGS_master_tombstone_evicted_tablet_replicas) {
       std::unordered_set<string> current_member_uuids;
-      for (const consensus::RaftPeerPB &peer : cstate.config().peers()) {
-        InsertOrDie(&current_member_uuids, peer.permanent_uuid());
+      for (const auto& peer : cstate.config().peers()) {
+        InsertOrDie(&current_member_uuids, peer.permanent_uuid().ToBuffer());
       }
       for (const consensus::RaftPeerPB &prev_peer : prev_cstate.config().peers()) {
         const string& peer_uuid = prev_peer.permanent_uuid();
@@ -1303,13 +1317,20 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
           << " using config reported by " << ts_desc->permanent_uuid()
           << " to that committed in log index " << cstate.config().committed_op_index()
           << " with leader state from term " << cstate.current_term();
-    UpdateTabletReplicasAfterConfigChange(tablet, ts_desc->permanent_uuid(), cstate, report, epoch);
+    UpdateTabletReplicasAfterConfigChange(
+        tablet, ts_desc->permanent_uuid(), cstate, leader_uuid, report, epoch);
 
     // 6d(iv). Update the consensus state. Don't use 'prev_cstate' after this.
     LOG(INFO) << "Tablet: " << tablet->tablet_id() << " reported consensus state change."
               << " New consensus state: " << cstate.ShortDebugString()
               << " from " << ts_desc->permanent_uuid();
-    *tablet_lock.mutable_data()->pb.mutable_committed_consensus_state() = cstate;
+    auto* stored_cstate = tablet_lock.mutable_data()->pb.mutable_committed_consensus_state();
+    cstate.ToGoogleProtobuf(stored_cstate);
+    if (leader_uuid.empty()) {
+      stored_cstate->clear_leader_uuid();
+    } else {
+      stored_cstate->set_leader_uuid(leader_uuid);
+    }
     tablet_was_mutated = true;
   } else {
     // Report opid_index is equal to the previous opid_index. If some
@@ -1317,25 +1338,25 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
     // haven't yet heard from all the tservers in the config, update the in-memory
     // ReplicaLocations.
     LOG(INFO) << "Tablet server " << ts_desc->permanent_uuid() << " sent "
-              << (is_incremental ? "incremental" : "full tablet")
-              << " report for " << tablet->tablet_id()
-              << ", prev state op id: " << prev_cstate.config().committed_op_index()
-              << ", prev state term: " << prev_cstate.current_term()
-              << ", prev state has_leader_uuid: " << prev_cstate.has_leader_uuid()
-              << ". Consensus state: " << cstate.ShortDebugString();
+            << (is_incremental ? "incremental" : "full tablet")
+            << " report for " << tablet->tablet_id()
+            << ", prev state op id: " << prev_cstate.config().committed_op_index()
+            << ", prev state term: " << prev_cstate.current_term()
+            << ", prev state has_leader_uuid: " << prev_cstate.has_leader_uuid()
+            << ". Consensus state: " << cstate.ShortDebugString();
     if (FLAGS_enable_register_ts_from_raft &&
         ReplicaMapDiffersFromConsensusState(tablet, cstate)) {
       LOG(INFO) << Format("Tablet replica map differs from reported consensus state. Replica map: "
           "$0. Reported consensus state: $1.", *tablet->GetReplicaLocations(),
           cstate.ShortDebugString());
       UpdateTabletReplicasAfterConfigChange(
-          tablet, ts_desc->permanent_uuid(), cstate, report, epoch);
+          tablet, ts_desc->permanent_uuid(), cstate, leader_uuid, report, epoch);
     } else {
-      UpdateTabletReplicaInLocalMemory(ts_desc, &cstate, report, tablet);
+      UpdateTabletReplicaInLocalMemory(ts_desc, &cstate, leader_uuid, report, tablet);
     }
   }
 
-  if (FLAGS_use_create_table_leader_hint && !cstate.has_leader_uuid()) {
+  if (FLAGS_use_create_table_leader_hint && leader_uuid.empty()) {
     catalog_manager_->StartElectionIfReady(cstate, epoch, tablet);
   }
 
@@ -1395,41 +1416,42 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
 
   // Send AlterSchema RPC for colocated tables of this tablet if they are outdated.
   for (const auto& id_to_version : report.table_to_version()) {
+    const auto table_id = id_to_version.key().ToBuffer();
+    const auto version = id_to_version.value();
     // Skip Primary table.
-    if (tablet->table()->id() == id_to_version.first) {
+    if (tablet->table()->id() == table_id) {
       continue;
     }
-    if (tables->count(id_to_version.first)) {
-      const auto& table_lock = (*table_read_locks)[id_to_version.first];
+    if (tables->count(table_id)) {
+      const auto& table_lock = (*table_read_locks)[table_id];
       // Ignore if same version.
-      if (table_lock->pb.version() == id_to_version.second) {
+      if (table_lock->pb.version() == version) {
         continue;
       }
-      if (id_to_version.second > table_lock->pb.version()) {
+      if (version > table_lock->pb.version()) {
         LOG(WARNING) << "TS " << ts_desc->permanent_uuid()
                      << " has reported a schema version greater than the current one "
-                     << " for table " << id_to_version.first
+                     << " for table " << table_id
                      << ". Expected version " << table_lock->pb.version()
-                     << " got " << id_to_version.second
+                     << " got " << version
                      << " (corruption)";
       } else {
         LOG(INFO) << "TS " << ts_desc->permanent_uuid()
-                  << " does not have the latest schema for table " << id_to_version.first
+                  << " does not have the latest schema for table " << table_id
                   << ". Expected version " << table_lock->pb.version()
-                  << " got " << id_to_version.second;
+                  << " got " << version;
       }
       // All metadata related changes for the tablet is passed as part of RESTORE_ON_TABLET rpcs
       // and we should not trigger anything else during restore so as to not race schema versions.
       // TODO(Sanket): What if restore is stuck then this block is muted forever.
-      auto restore_result =
-          catalog_manager_->IsTableUndergoingPitrRestore(*(*tables)[id_to_version.first]);
+      auto restore_result = catalog_manager_->IsTableUndergoingPitrRestore(*(*tables)[table_id]);
       LOG_IF(DFATAL, !restore_result.ok())
           << "Failed to determine if table has PITR restore in progress";
       if (!restore_result.ok() || !*restore_result) {
-        LOG(INFO) << "Triggering AlterTable for table id " << id_to_version.first
+        LOG(INFO) << "Triggering AlterTable for table id " << table_id
                   << " due to heartbeat delay for tablet ID " << tablet->tablet_id();
         rpcs->push_back(std::make_shared<AsyncAlterTable>(
-            master_, catalog_manager_->AsyncTaskPool(), tablet, (*tables)[id_to_version.first],
+            master_, catalog_manager_->AsyncTaskPool(), tablet, (*tables)[table_id],
             TransactionId::Nil(), epoch));
       }
     }
@@ -1441,18 +1463,20 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
 void MasterHeartbeatServiceImpl::UpdateTabletReplicasAfterConfigChange(
     const TabletInfoPtr& tablet,
     const std::string& sender_uuid,
-    const ConsensusStatePB& consensus_state,
-    const ReportedTabletPB& report,
+    const LWConsensusStatePB& consensus_state,
+    const std::string& leader_uuid,
+    const LWReportedTabletPB& report,
     const LeaderEpoch& epoch) {
   auto replica_locations = std::make_shared<TabletReplicaMap>();
   auto prev_rl = tablet->GetReplicaLocations();
 
-  for (const consensus::RaftPeerPB& peer : consensus_state.config().peers()) {
+  for (const auto& peer : consensus_state.config().peers()) {
     if (!peer.has_permanent_uuid()) {
       LOG(WARNING) << "Missing UUID for peer" << peer.ShortDebugString();
       continue;
     }
-    auto ts_desc_result = master_->ts_manager()->LookupTSByUUID(peer.permanent_uuid());
+    const auto peer_uuid = peer.permanent_uuid().ToBuffer();
+    auto ts_desc_result = master_->ts_manager()->LookupTSByUUID(peer_uuid);
     if (!ts_desc_result.ok()) {
       if (!FLAGS_enable_register_ts_from_raft) {
         LOG(WARNING) << "Tablet server has never reported in. "
@@ -1465,7 +1489,7 @@ void MasterHeartbeatServiceImpl::UpdateTabletReplicasAfterConfigChange(
       LOG(INFO) << "Tablet server has never reported in. Registering the ts using "
                 << "the raft config. Peer: " << peer.ShortDebugString()
                 << "; Tablet: " << tablet->ToString();
-      Status s = catalog_manager_->RegisterTsFromRaftConfig(peer, epoch);
+      Status s = catalog_manager_->RegisterTsFromRaftConfig(peer.ToGoogleProtobuf(), epoch);
       if (!s.ok()) {
         LOG(WARNING) << "Could not register ts from raft config: " << s
                     << " Skip updating the replica map.";
@@ -1473,9 +1497,9 @@ void MasterHeartbeatServiceImpl::UpdateTabletReplicasAfterConfigChange(
       }
 
       // Guaranteed to find the ts since we just registered.
-      ts_desc_result = master_->ts_manager()->LookupTSByUUID(peer.permanent_uuid());
+      ts_desc_result = master_->ts_manager()->LookupTSByUUID(peer_uuid);
       if (!ts_desc_result.ok()) {
-        LOG(WARNING) << "Could not find ts with uuid " << peer.permanent_uuid()
+        LOG(WARNING) << "Could not find ts with uuid " << peer_uuid
                     << " after registering from raft config. Skip updating the replica"
                     << " map.";
         continue;
@@ -1489,7 +1513,8 @@ void MasterHeartbeatServiceImpl::UpdateTabletReplicasAfterConfigChange(
     const RaftGroupStatePB replica_state =
         (sender_uuid == ts_desc->permanent_uuid()) ? report.state() : RaftGroupStatePB::UNKNOWN;
 
-    auto replica = CreateNewReplicaForLocalMemory(ts_desc, &consensus_state, report, replica_state);
+    auto replica = CreateNewReplicaForLocalMemory(
+        ts_desc, &consensus_state, leader_uuid, report, replica_state);
     if (existing_replica) {
       replica.UpdateDriveInfo(existing_replica->drive_info);
       // Lease state is kept only for the leader.
@@ -1507,17 +1532,20 @@ void MasterHeartbeatServiceImpl::UpdateTabletReplicasAfterConfigChange(
 
 void MasterHeartbeatServiceImpl::UpdateTabletReplicaInLocalMemory(
     const TSDescriptorPtr& ts_desc,
-    const ConsensusStatePB* consensus_state,
-    const ReportedTabletPB& report,
+    const LWConsensusStatePB* consensus_state,
+    const std::string& leader_uuid,
+    const LWReportedTabletPB& report,
     const TabletInfoPtr& tablet) {
-  auto replica = CreateNewReplicaForLocalMemory(ts_desc, consensus_state, report, report.state());
+  auto replica = CreateNewReplicaForLocalMemory(
+      ts_desc, consensus_state, leader_uuid, report, report.state());
   catalog_manager_->UpdateTabletReplicaLocations(tablet, ts_desc->id(), replica);
 }
 
 TabletReplica MasterHeartbeatServiceImpl::CreateNewReplicaForLocalMemory(
     const TSDescriptorPtr& ts_desc,
-    const ConsensusStatePB* consensus_state,
-    const ReportedTabletPB& report,
+    const LWConsensusStatePB* consensus_state,
+    const std::string& leader_uuid,
+    const LWReportedTabletPB& report,
     const RaftGroupStatePB& state) {
   TabletReplica replica;
   // Tablets in state NOT_STARTED or BOOTSTRAPPING don't have a consensus.
@@ -1527,14 +1555,15 @@ TabletReplica MasterHeartbeatServiceImpl::CreateNewReplicaForLocalMemory(
   } else {
     CHECK(consensus_state != nullptr) << "No cstate: " << ts_desc->permanent_uuid()
                                       << " - " << state;
-    replica.role = GetConsensusRole(ts_desc->permanent_uuid(), *consensus_state);
+    replica.role = GetConsensusRole(
+        ts_desc->permanent_uuid(), leader_uuid, consensus_state->config());
     replica.member_type = GetConsensusMemberType(ts_desc->permanent_uuid(), *consensus_state);
   }
   if (report.has_should_disable_lb_move()) {
     replica.should_disable_lb_move = report.should_disable_lb_move();
   }
   if (report.has_fs_data_dir()) {
-    replica.fs_data_dir = report.fs_data_dir();
+    replica.fs_data_dir = report.fs_data_dir().ToBuffer();
   }
   replica.state = state;
   replica.ts_desc = ts_desc;
@@ -1546,13 +1575,13 @@ TabletReplica MasterHeartbeatServiceImpl::CreateNewReplicaForLocalMemory(
 }
 
 bool MasterHeartbeatServiceImpl::ReplicaMapDiffersFromConsensusState(
-    const TabletInfoPtr& tablet, const ConsensusStatePB& cstate) {
+    const TabletInfoPtr& tablet, const LWConsensusStatePB& cstate) {
   auto locs = tablet->GetReplicaLocations();
-  if (locs->size() != implicit_cast<size_t>(cstate.config().peers_size())) {
+  if (locs->size() != cstate.config().peers_size()) {
     return true;
   }
-  for (auto iter = cstate.config().peers().begin(); iter != cstate.config().peers().end(); iter++) {
-    if (locs->find(iter->permanent_uuid()) == locs->end()) {
+  for (const auto& peer : cstate.config().peers()) {
+    if (locs->find(peer.permanent_uuid().ToBuffer()) == locs->end()) {
       return true;
     }
   }
@@ -1571,8 +1600,8 @@ bool IsHtLeaseExpiredForTooLong(MicrosTime now, MicrosTime ht_lease_exp) {
 bool MasterHeartbeatServiceImpl::ProcessTabletMetadata(
     const std::string& ts_uuid,
     const TabletInfoPtr& tablet,
-    const TabletDriveStorageMetadataPB& storage_metadata) {
-  const string& tablet_id = storage_metadata.tablet_id();
+    const LWTabletDriveStorageMetadataPB& storage_metadata) {
+  const auto tablet_id = storage_metadata.tablet_id().ToBuffer();
   if (!tablet) {
     VLOG(1) << Format("Tablet $0 not found", tablet_id);
     return false;
@@ -1592,9 +1621,9 @@ bool MasterHeartbeatServiceImpl::ProcessTabletMetadata(
 void MasterHeartbeatServiceImpl::ProcessLeaderInfo(
     const std::string& ts_uuid,
     const TabletInfoPtr& tablet,
-    const TabletLeaderMetricsPB& leader_info) {
+    const LWTabletLeaderMetricsPB& leader_info) {
   if (!tablet) {
-    VLOG(1) << Format("Tablet $0 not found", leader_info.tablet_id());
+    VLOG(1) << Format("Tablet $0 not found", leader_info.tablet_id().ToBuffer());
     return;
   }
   const auto leader_lease_status = leader_info.leader_lease_status();
@@ -1608,13 +1637,13 @@ void MasterHeartbeatServiceImpl::ProcessLeaderInfo(
 
 void MasterHeartbeatServiceImpl::ProcessTabletReplicaFullCompactionStatus(
     const TabletServerId& ts_uuid, const TabletInfoPtr& tablet,
-    const FullCompactionStatusPB& full_compaction_status) {
+    const LWFullCompactionStatusPB& full_compaction_status) {
   if (!full_compaction_status.has_tablet_id()) {
     VLOG(1) << "Tablet id not found";
     return;
   }
 
-  const TabletId& tablet_id = full_compaction_status.tablet_id();
+  const auto tablet_id = full_compaction_status.tablet_id().ToBuffer();
 
   if (!full_compaction_status.has_full_compaction_state()) {
     LOG(WARNING) << Format(
@@ -1640,7 +1669,7 @@ void MasterHeartbeatServiceImpl::ProcessTabletReplicaFullCompactionStatus(
 }
 
 Status MasterHeartbeatServiceImpl::FillHeartbeatResponseOrRespond(
-    const TSHeartbeatRequestPB& req, TSHeartbeatResponsePB* resp, rpc::RpcContext* rpc) {
+    const LWTSHeartbeatRequestPB& req, LWTSHeartbeatResponsePB* resp, rpc::RpcContext* rpc) {
   auto s = catalog_manager_->FillHeartbeatResponse(req, resp);
   if (!s.ok()) {
     LOG(WARNING) << "Unable to fill heartbeat response: " << s.ToString();
@@ -1651,7 +1680,7 @@ Status MasterHeartbeatServiceImpl::FillHeartbeatResponseOrRespond(
 }
 
 Status MasterHeartbeatServiceImpl::ValidateTServerUniverseOrRespond(
-    const TSHeartbeatRequestPB& req, TSHeartbeatResponsePB* resp, rpc::RpcContext* rpc) {
+    const LWTSHeartbeatRequestPB& req, LWTSHeartbeatResponsePB* resp, rpc::RpcContext* rpc) {
   // At the time of this check, we need to know that we're the master leader to access the
   // cluster config.
   auto cluster_config_result = catalog_manager_->GetClusterConfig();
@@ -1663,7 +1692,7 @@ Status MasterHeartbeatServiceImpl::ValidateTServerUniverseOrRespond(
   }
   const auto& cluster_config = *cluster_config_result;
 
-  auto tserver_universe_uuid_res = UniverseUuid::FromString(req.universe_uuid());
+  auto tserver_universe_uuid_res = UniverseUuid::FromString(req.universe_uuid().ToBuffer());
   if (!tserver_universe_uuid_res) {
     LOG(WARNING) << "Could not decode request universe_uuid: "
                  << tserver_universe_uuid_res.status().ToString();
@@ -1699,7 +1728,7 @@ Status MasterHeartbeatServiceImpl::ValidateTServerUniverseOrRespond(
     }
 
     if (tserver_universe_uuid.IsNil()) {
-      resp->set_universe_uuid((*master_universe_uuid_res).ToString());
+      resp->dup_universe_uuid((*master_universe_uuid_res).ToString());
       auto* error = resp->mutable_error();
       error->set_code(MasterErrorPB::INVALID_REQUEST);
       StatusToPB(s, error->mutable_status());
@@ -1711,7 +1740,7 @@ Status MasterHeartbeatServiceImpl::ValidateTServerUniverseOrRespond(
     return s;
   }
   if (req.has_registration()) {
-    resp->set_cluster_uuid(cluster_config.cluster_uuid());
+    resp->dup_cluster_uuid(cluster_config.cluster_uuid());
   }
 
   return Status::OK();
@@ -1719,7 +1748,7 @@ Status MasterHeartbeatServiceImpl::ValidateTServerUniverseOrRespond(
 
 Result<TSDescriptorPtr>
 MasterHeartbeatServiceImpl::RegisterTServerOrRespond(
-    const LeaderEpoch& epoch, const TSHeartbeatRequestPB& req, TSHeartbeatResponsePB* resp,
+    const LeaderEpoch& epoch, const LWTSHeartbeatRequestPB& req, LWTSHeartbeatResponsePB* resp,
     rpc::RpcContext* rpc) {
   if (!FLAGS_skip_tserver_version_checks && req.registration().has_version_info()) {
     const auto& registration = req.registration();
@@ -1737,7 +1766,7 @@ MasterHeartbeatServiceImpl::RegisterTServerOrRespond(
     }
   }
 
-  const auto& ts_uuid = req.common().ts_instance().permanent_uuid();
+  const auto ts_uuid = req.common().ts_instance().permanent_uuid().ToBuffer();
   auto old_desc = server_->ts_manager()->LookupTSByUUID(ts_uuid);
   int64_t old_seqno = old_desc.ok() ? (*old_desc)->latest_seqno() : -1;
 
@@ -1778,7 +1807,7 @@ MasterHeartbeatServiceImpl::RegisterTServerOrRespond(
 }
 
 Result<TSDescriptorPtr> MasterHeartbeatServiceImpl::UpdateAndReturnTSDescriptorOrRespond(
-    const LeaderEpoch& epoch, const TSHeartbeatRequestPB& req, TSHeartbeatResponsePB* resp,
+    const LeaderEpoch& epoch, const LWTSHeartbeatRequestPB& req, LWTSHeartbeatResponsePB* resp,
     rpc::RpcContext* rpc) {
   if (req.has_registration()) {
     return RegisterTServerOrRespond(epoch, req, resp, rpc);

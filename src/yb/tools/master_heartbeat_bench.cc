@@ -94,6 +94,7 @@
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
+#include "yb/util/memory/arena.h"
 #include "yb/util/metrics.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/net_util.h"
@@ -235,8 +236,7 @@ class HollowTServer {
   // the real tserver's registration; only the addresses and the zone are rewritten.
   void FillHeartbeat(const string& universe_uuid, const master::TSHeartbeatRequestPB* mirror_tmpl,
                      const master::TSRegistrationPB* reg_tmpl,
-                     std::optional<bool> metrics_override, master::TSHeartbeatRequestPB* req) {
-    req->Clear();
+                     std::optional<bool> metrics_override, master::LWTSHeartbeatRequestPB* req) {
     std::lock_guard l(mutex_);
     storage_pending_.clear();
     const bool metrics_beat = metrics_override.has_value()
@@ -250,10 +250,10 @@ class HollowTServer {
     }
 
     auto* instance = req->mutable_common()->mutable_ts_instance();
-    instance->set_permanent_uuid(uuid_);
+    instance->dup_permanent_uuid(uuid_);
     instance->set_instance_seqno(instance_seqno_);
     if (!universe_uuid.empty()) {
-      req->set_universe_uuid(universe_uuid);
+      req->dup_universe_uuid(universe_uuid);
     }
     const auto now_micros = GetCurrentTimeMicros();
     req->set_ts_physical_time(now_micros);
@@ -276,13 +276,13 @@ class HollowTServer {
       reg->clear_private_rpc_addresses();
       reg->clear_broadcast_addresses();
       auto* addr = reg->add_private_rpc_addresses();
-      addr->set_host(host_port_.host());
+      addr->dup_host(host_port_.host());
       addr->set_port(host_port_.port());
       *reg->add_broadcast_addresses() = *addr;
       auto* cloud = reg->mutable_cloud_info();
-      cloud->set_placement_cloud("cloud1");
-      cloud->set_placement_region("region1");
-      cloud->set_placement_zone(Format("zone$0", index_ % 3));
+      cloud->dup_placement_cloud("cloud1");
+      cloud->dup_placement_region("region1");
+      cloud->dup_placement_zone(Format("zone$0", index_ % 3));
     }
 
     FillTabletReport(req);
@@ -308,13 +308,13 @@ class HollowTServer {
       metrics->set_write_ops_per_sec(0);
       metrics->set_uptime_seconds(hb_seq_ * FLAGS_heartbeat_interval_ms / 1000);
       auto* path_metric = metrics->add_path_metrics();
-      path_metric->set_path_id(Format("/data/hollow-ts-$0", index_));
+      path_metric->dup_path_id(Format("/data/hollow-ts-$0", index_));
       path_metric->set_used_space(tablets_.size() * (kSstBytes + kWalBytes));
       path_metric->set_total_space(1ULL << 40);
       for (const auto& [tablet_id, info] : tablets_) {
         if (SendStorageMetadata(tablet_id)) {
           auto* storage = req->add_storage_metadata();
-          storage->set_tablet_id(tablet_id);
+          storage->dup_tablet_id(tablet_id);
           storage->set_sst_file_size(kSstBytes);
           storage->set_wal_file_size(kWalBytes);
           storage->set_uncompressed_sst_file_size(kSstBytes * 3 / 2);
@@ -326,19 +326,19 @@ class HollowTServer {
         // The real provider adds leader_info only for tablets this tserver leads.
         if (info.leader_uuid == uuid_) {
           auto* leader = req->add_leader_info();
-          leader->set_tablet_id(tablet_id);
+          leader->dup_tablet_id(tablet_id);
           leader->set_leader_lease_status(consensus::LeaderLeaseStatus::HAS_LEASE);
           leader->set_ht_lease_expiration((now_micros + 2 * 1000 * 1000) << 12);
         }
         auto* compaction = req->add_full_compaction_statuses();
-        compaction->set_tablet_id(tablet_id);
+        compaction->dup_tablet_id(tablet_id);
         compaction->set_full_compaction_state(tablet::IDLE);
         compaction->set_last_full_compaction_time(0);
       }
     }
   }
 
-  void HandleHeartbeatSuccess(const master::TSHeartbeatResponsePB& resp, int64_t rtt_us) {
+  void HandleHeartbeatSuccess(const master::LWTSHeartbeatResponsePB& resp, int64_t rtt_us) {
     std::lock_guard l(mutex_);
     last_rtt_us_ = rtt_us;
     if (registration_in_flight_) {
@@ -362,7 +362,7 @@ class HollowTServer {
     }
     if (resp.has_tablet_report()) {
       for (const auto& update : resp.tablet_report().tablets()) {
-        dirty_.erase(update.tablet_id());
+        dirty_.erase(update.tablet_id().ToBuffer());
       }
     }
     if (resp.tablet_metadata_processed()) {
@@ -415,9 +415,10 @@ class HollowTServer {
   std::atomic<bool> heartbeat_in_flight{false};
   std::atomic<bool> lease_in_flight{false};
 
-  // Reused across calls; safe because at most one of each RPC is in flight.
-  master::TSHeartbeatRequestPB hb_req;
-  master::TSHeartbeatResponsePB hb_resp;
+  // At most one of each RPC is in flight; its arena is reset and the messages rebuilt per call.
+  ThreadSafeArena hb_arena;
+  master::LWTSHeartbeatRequestPB* hb_req = nullptr;
+  master::LWTSHeartbeatResponsePB* hb_resp = nullptr;
   rpc::RpcController hb_controller;
   master::RefreshYsqlLeaseRequestPB lease_req;
   master::RefreshYsqlLeaseResponsePB lease_resp;
@@ -435,14 +436,14 @@ class HollowTServer {
   // and report state; every other field stays byte-faithful to the real request.
   void FillFromTemplate(
       const master::TSHeartbeatRequestPB& tmpl, const string& universe_uuid,
-      master::TSHeartbeatRequestPB* req) REQUIRES(mutex_) {
+      master::LWTSHeartbeatRequestPB* req) REQUIRES(mutex_) {
     req->CopyFrom(tmpl);
     auto* instance = req->mutable_common()->mutable_ts_instance();
-    instance->set_permanent_uuid(uuid_);
+    instance->dup_permanent_uuid(uuid_);
     instance->set_instance_seqno(instance_seqno_);
     req->clear_registration();
     if (!universe_uuid.empty()) {
-      req->set_universe_uuid(universe_uuid);
+      req->dup_universe_uuid(universe_uuid);
     }
     const auto now_micros = GetCurrentTimeMicros();
     req->set_ts_physical_time(now_micros);
@@ -482,9 +483,9 @@ class HollowTServer {
 
     // Per-tablet sections must list our tablet ids; entries are cloned from the template
     // round-robin so per-entry content and sizes stay real.
-    const auto tmpl_storage = req->storage_metadata();
-    const auto tmpl_compactions = req->full_compaction_statuses();
-    const auto tmpl_leaders = req->leader_info();
+    const auto& tmpl_storage = tmpl.storage_metadata();
+    const auto& tmpl_compactions = tmpl.full_compaction_statuses();
+    const auto& tmpl_leaders = tmpl.leader_info();
     req->clear_storage_metadata();
     req->clear_full_compaction_statuses();
     req->clear_leader_info();
@@ -503,24 +504,24 @@ class HollowTServer {
       if (!tmpl_storage.empty() && SendStorageMetadata(tablet_id)) {
         auto* storage = req->add_storage_metadata();
         *storage = tmpl_storage.Get(i % tmpl_storage.size());
-        storage->set_tablet_id(tablet_id);
+        storage->dup_tablet_id(tablet_id);
       }
       if (!tmpl_compactions.empty()) {
         auto* compaction = req->add_full_compaction_statuses();
         *compaction = tmpl_compactions.Get(i % tmpl_compactions.size());
-        compaction->set_tablet_id(tablet_id);
+        compaction->dup_tablet_id(tablet_id);
       }
       if (!tmpl_leaders.empty() && info.leader_uuid == uuid_) {
         auto* leader = req->add_leader_info();
         *leader = tmpl_leaders.Get(
             leader_tmpl_idx >= 0 ? leader_tmpl_idx : i % tmpl_leaders.size());
-        leader->set_tablet_id(tablet_id);
+        leader->dup_tablet_id(tablet_id);
       }
       ++i;
     }
   }
 
-  void FillTabletReport(master::TSHeartbeatRequestPB* req) REQUIRES(mutex_) {
+  void FillTabletReport(master::LWTSHeartbeatRequestPB* req) REQUIRES(mutex_) {
     const int32_t limit = tablet_report_limit_;
     if (full_report_active_) {
       auto* report = req->mutable_tablet_report();
@@ -571,7 +572,7 @@ class HollowTServer {
       ++added;
     }
     for (const auto& tablet_id : removed_) {
-      report->add_removed_tablet_ids(tablet_id);
+      report->add_dup_removed_tablet_ids(tablet_id);
     }
     removed_.clear();
     report->set_remaining_tablet_count(
@@ -582,20 +583,21 @@ class HollowTServer {
 
   void AddReportedTablet(
       const string& tablet_id, const TabletInfo& info,
-      master::TabletReportPB* report) REQUIRES(mutex_) {
+      master::LWTabletReportPB* report) REQUIRES(mutex_) {
     auto* tablet = report->add_updated_tablets();
-    tablet->set_tablet_id(tablet_id);
+    tablet->dup_tablet_id(tablet_id);
     tablet->set_state(tablet::RUNNING);
     tablet->set_tablet_data_state(tablet::TABLET_DATA_READY);
     tablet->set_schema_version(0);
     auto* cstate = tablet->mutable_committed_consensus_state();
     cstate->set_current_term(1);
-    cstate->set_leader_uuid(info.leader_uuid);
+    cstate->dup_leader_uuid(info.leader_uuid);
     *cstate->mutable_config() = info.config;
   }
 
   // Same rules as TabletServer::ApplyTServerListUpdate; a stale delta has nothing new.
-  void ApplyTServerListUpdateUnlocked(const master::TServerListUpdatePB& update) REQUIRES(mutex_) {
+  void ApplyTServerListUpdateUnlocked(const master::LWTServerListUpdatePB& update)
+      REQUIRES(mutex_) {
     if (!update.full() && update.version() <= tserver_list_version_) {
       return;
     }
@@ -603,10 +605,10 @@ class HollowTServer {
       known_tservers_.clear();
     }
     for (const auto& uuid : update.removed()) {
-      known_tservers_.erase(uuid);
+      known_tservers_.erase(uuid.ToBuffer());
     }
     for (const auto& entry : update.tservers()) {
-      known_tservers_[entry.instance().permanent_uuid()] = entry.alive();
+      known_tservers_[entry.instance().permanent_uuid().ToBuffer()] = entry.alive();
     }
     tserver_list_version_ = update.version();
   }
@@ -1614,12 +1616,15 @@ class HeartbeatBench {
       }
     }
     ts->MarkRegistrationInFlight();
-    ts->FillHeartbeat(universe_uuid, tmpl.get(), reg_tmpl.get(), metrics_override, &ts->hb_req);
+    ts->hb_arena.Reset(ResetMode::kKeepLast);
+    ts->hb_req = ts->hb_arena.NewArenaObject<master::LWTSHeartbeatRequestPB>();
+    ts->hb_resp = ts->hb_arena.NewArenaObject<master::LWTSHeartbeatResponsePB>();
+    ts->FillHeartbeat(universe_uuid, tmpl.get(), reg_tmpl.get(), metrics_override, ts->hb_req);
     ts->hb_controller.Reset();
     ts->hb_controller.set_timeout(15s);
     ts->heartbeat_sent_time = MonoTime::Now();
     ts->heartbeat_proxy->TSHeartbeatAsync(
-        ts->hb_req, &ts->hb_resp, &ts->hb_controller, [this, ts] {
+        *ts->hb_req, ts->hb_resp, &ts->hb_controller, [this, ts] {
           HandleHeartbeatResponse(ts);
         });
   }
@@ -1636,13 +1641,13 @@ class HeartbeatBench {
       ts->heartbeat_in_flight.store(false, std::memory_order_release);
       return;
     }
-    const auto& resp = ts->hb_resp;
+    const auto& resp = *ts->hb_resp;
     // A first heartbeat without universe_uuid fails with INVALID_REQUEST but returns the
     // master's uuid for adoption; every later heartbeat echoes it.
     if (!resp.universe_uuid().empty()) {
       std::lock_guard l(universe_uuid_mutex_);
       if (universe_uuid_.empty()) {
-        universe_uuid_ = resp.universe_uuid();
+        universe_uuid_ = resp.universe_uuid().ToBuffer();
         LOG(INFO) << "Adopted universe uuid " << universe_uuid_;
       }
     }

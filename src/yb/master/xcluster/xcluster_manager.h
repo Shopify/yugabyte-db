@@ -30,8 +30,8 @@ class GetMasterXClusterConfigResponsePB;
 class PauseResumeXClusterProducerStreamsRequestPB;
 class PauseResumeXClusterProducerStreamsResponsePB;
 class PostTabletCreateTaskBase;
-class TSHeartbeatRequestPB;
-class TSHeartbeatResponsePB;
+class LWTSHeartbeatRequestPB;
+class LWTSHeartbeatResponsePB;
 class XClusterConfig;
 class XClusterSafeTimeService;
 struct SysCatalogLoadingState;
@@ -73,9 +73,12 @@ class XClusterManager : public XClusterManagerIf,
 
   Status PrepareDefaultXClusterConfig(int64_t term, bool recreate);
 
-  Status FillHeartbeatResponse(const TSHeartbeatRequestPB& req, TSHeartbeatResponsePB* resp) const;
+  Status FillHeartbeatResponse(
+      const LWTSHeartbeatRequestPB& req, LWTSHeartbeatResponsePB* resp) const;
 
   Status FillXClusterGuardedInfo(int64_t leader_term, XClusterGuardedInfoPB& info) override
+      EXCLUDES(xcluster_guarded_info_version_mutex_);
+  Status FillXClusterGuardedInfo(int64_t leader_term, LWXClusterGuardedInfoPB& info) override
       EXCLUDES(xcluster_guarded_info_version_mutex_);
 
   // Ensures that on successful return no TServer will ever give out xCluster-guarded information
@@ -291,7 +294,7 @@ class XClusterManager : public XClusterManagerIf,
   // XClusterManager.
 
   void StoreConsumerReplicationStatus(
-      const XClusterConsumerReplicationStatusPB& consumer_replication_status) override;
+      const LWXClusterConsumerReplicationStatusPB& consumer_replication_status) override;
   void SyncConsumerReplicationStatusMap(
       const xcluster::ReplicationGroupId& replication_group_id,
       const google::protobuf::Map<std::string, cdc::ProducerEntryPB>& producer_map) override;
@@ -359,6 +362,10 @@ class XClusterManager : public XClusterManagerIf,
   bool in_memory_state_cleared_ = true;
 
   std::unique_ptr<XClusterConfig> xcluster_config_;
+
+  template <class Info>
+  Status DoFillXClusterGuardedInfo(int64_t leader_term, Info& info)
+      EXCLUDES(xcluster_guarded_info_version_mutex_);
 
   // Guards the version counter below and serializes copies of the xCluster-guarded information so
   // that a copy with a higher version never carries older information.  Lock order: this mutex,

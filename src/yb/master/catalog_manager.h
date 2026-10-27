@@ -730,7 +730,7 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
       const std::set<TabletId>& new_running_tablets = {});
 
   void StartElectionIfReady(
-      const consensus::ConsensusStatePB& cstate, const LeaderEpoch& epoch,
+      const consensus::LWConsensusStatePB& cstate, const LeaderEpoch& epoch,
       const TabletInfoPtr& tablet);
 
   Result<bool> IsTableUndergoingPitrRestore(const TableInfo& table_info);
@@ -929,7 +929,7 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
 
   Status WaitForTransactionTableVersionUpdateToPropagate();
 
-  Status FillHeartbeatResponse(const TSHeartbeatRequestPB& req, TSHeartbeatResponsePB* resp);
+  Status FillHeartbeatResponse(const LWTSHeartbeatRequestPB& req, LWTSHeartbeatResponsePB* resp);
 
   SysCatalogTable* sys_catalog() override { return sys_catalog_; }
 
@@ -3272,18 +3272,18 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
 
   Status FillHeartbeatResponseEncryption(
       const SysClusterConfigEntryPB& cluster_config,
-      const TSHeartbeatRequestPB& req,
-      TSHeartbeatResponsePB* resp);
+      const LWTSHeartbeatRequestPB& req,
+      LWTSHeartbeatResponsePB* resp);
 
   void FillHeartbeatResponseClusterConfig(
       const SysClusterConfigEntryPB& cluster_config,
-      const TSHeartbeatRequestPB& req,
-      TSHeartbeatResponsePB* resp);
+      const LWTSHeartbeatRequestPB& req,
+      LWTSHeartbeatResponsePB* resp);
 
   Status FillHeartbeatResponseCDC(
       const SysClusterConfigEntryPB& cluster_config,
-      const TSHeartbeatRequestPB& req,
-      TSHeartbeatResponsePB* resp);
+      const LWTSHeartbeatRequestPB& req,
+      LWTSHeartbeatResponsePB* resp);
 
   Status AddSchemaVersionMappingToUniverseReplication(
       scoped_refptr<UniverseReplicationInfo> universe,

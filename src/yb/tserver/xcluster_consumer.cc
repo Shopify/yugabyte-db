@@ -33,7 +33,7 @@
 #include "yb/gutil/map-util.h"
 
 #include "yb/master/master_defaults.h"
-#include "yb/master/master_heartbeat.pb.h"
+#include "yb/master/master_heartbeat.messages.h"
 
 #include "yb/rocksdb/rate_limiter.h"
 #include "yb/rpc/rpc.h"
@@ -896,7 +896,7 @@ void XClusterConsumer::StoreReplicationError(
 
 // This happens on TS.heartbeat request, so it needs to finish quickly.
 void XClusterConsumer::PopulateMasterHeartbeatRequest(
-    master::TSHeartbeatRequestPB* req, bool needs_full_tablet_report) {
+    master::LWTSHeartbeatRequestPB* req, bool needs_full_tablet_report) {
   if (needs_full_tablet_report) {
     // We first fill partial report and then figure out if a full report is needed. Clear out any
     // partially filled state.
@@ -911,17 +911,17 @@ void XClusterConsumer::PopulateMasterHeartbeatRequest(
 
   for (const auto& [replication_group_id, table_map] : errors_to_send) {
     auto* replication_group_status = req->add_xcluster_consumer_replication_status();
-    replication_group_status->set_replication_group_id(std::move(replication_group_id.ToString()));
+    replication_group_status->dup_replication_group_id(replication_group_id.ToString());
     for (const auto& [consumer_table_id, producer_tablet_map] : table_map) {
       auto* table_status = replication_group_status->add_table_status();
-      table_status->set_consumer_table_id(std::move(consumer_table_id));
+      table_status->dup_consumer_table_id(consumer_table_id);
       for (const auto& [producer_tablet_id, error_info] : producer_tablet_map) {
         auto* stream_tablet_status = table_status->add_stream_tablet_status();
-        stream_tablet_status->set_producer_tablet_id(std::move(producer_tablet_id));
+        stream_tablet_status->dup_producer_tablet_id(producer_tablet_id);
         stream_tablet_status->set_consumer_term(error_info.consumer_term);
         stream_tablet_status->set_error(error_info.error);
         if (!error_info.error_detail.empty()) {
-          stream_tablet_status->set_error_detail(error_info.error_detail);
+          stream_tablet_status->dup_error_detail(error_info.error_detail);
         }
       }
     }

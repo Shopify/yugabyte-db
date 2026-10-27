@@ -16,6 +16,7 @@
 #include <string>
 
 #include "yb/common/colocated_util.h"
+#include "yb/common/common_types.messages.h"
 #include "yb/common/common_types.pb.h"
 #include "yb/common/hybrid_time.h"
 
@@ -246,14 +247,14 @@ void XClusterManager::DumpState(std::ostream* out, bool on_disk_dump) const {
 }
 
 Status XClusterManager::FillHeartbeatResponse(
-    const TSHeartbeatRequestPB& req, TSHeartbeatResponsePB* resp) const {
+    const LWTSHeartbeatRequestPB& req, LWTSHeartbeatResponsePB* resp) const {
   RETURN_NOT_OK(XClusterTargetManager::FillHeartbeatResponse(req, resp));
 
   return xcluster_config_->FillHeartbeatResponse(req, resp);
 }
 
-Status XClusterManager::FillXClusterGuardedInfo(
-    int64_t leader_term, XClusterGuardedInfoPB& info) {
+template <class Info>
+Status XClusterManager::DoFillXClusterGuardedInfo(int64_t leader_term, Info& info) {
   std::lock_guard l(xcluster_guarded_info_version_mutex_);
   ++xcluster_guarded_info_copy_count_;
   auto& version = *info.mutable_xcluster_guarded_info_version();
@@ -264,6 +265,16 @@ Status XClusterManager::FillXClusterGuardedInfo(
   info.set_oid_cache_invalidations_count(
       VERIFY_RESULT(catalog_manager_.GetOidCacheInvalidationsCount()));
   return Status::OK();
+}
+
+Status XClusterManager::FillXClusterGuardedInfo(
+    int64_t leader_term, XClusterGuardedInfoPB& info) {
+  return DoFillXClusterGuardedInfo(leader_term, info);
+}
+
+Status XClusterManager::FillXClusterGuardedInfo(
+    int64_t leader_term, LWXClusterGuardedInfoPB& info) {
+  return DoFillXClusterGuardedInfo(leader_term, info);
 }
 
 Status XClusterManager::PropagateXClusterGuardedInfo(MonoTime deadline) {
@@ -937,7 +948,7 @@ void XClusterManager::NotifyAutoFlagsConfigChanged() {
 }
 
 void XClusterManager::StoreConsumerReplicationStatus(
-    const XClusterConsumerReplicationStatusPB& consumer_replication_status) {
+    const LWXClusterConsumerReplicationStatusPB& consumer_replication_status) {
   XClusterTargetManager::StoreReplicationStatus(consumer_replication_status);
 }
 

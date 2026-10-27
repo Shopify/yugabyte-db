@@ -16,7 +16,7 @@
 #include "yb/consensus/log.h"
 #include "yb/consensus/raft_consensus.h"
 
-#include "yb/master/master_heartbeat.pb.h"
+#include "yb/master/master_heartbeat.messages.h"
 
 #include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_peer.h"
@@ -89,14 +89,14 @@ MonoDelta TServerMetricsHeartbeatDataProvider::Period() const {
 }
 
 void TServerMetricsHeartbeatDataProvider::AddData(
-    const master::TSHeartbeatResponsePB& last_resp, master::TSHeartbeatRequestPB* req) {
+    bool needs_full_tablet_report, master::LWTSHeartbeatRequestPB* req) {
   // Still set here only if the previous heartbeat got no successful response.
   pending_storage_metadata_.clear();
-  PeriodicalHeartbeatDataProvider::AddData(last_resp, req);
+  PeriodicalHeartbeatDataProvider::AddData(needs_full_tablet_report, req);
 }
 
 void TServerMetricsHeartbeatDataProvider::OnHeartbeatResponse(
-    const master::TSHeartbeatResponsePB& resp) {
+    const master::LWTSHeartbeatResponsePB& resp) {
   if (resp.tablet_metadata_processed()) {
     for (auto& [tablet_id, storage_metadata] : pending_storage_metadata_) {
       acked_storage_metadata_[tablet_id] = std::move(storage_metadata);
@@ -106,7 +106,7 @@ void TServerMetricsHeartbeatDataProvider::OnHeartbeatResponse(
 }
 
 void TServerMetricsHeartbeatDataProvider::DoAddData(
-    bool needs_full_tablet_report, master::TSHeartbeatRequestPB* req) {
+    bool needs_full_tablet_report, master::LWTSHeartbeatRequestPB* req) {
   // Get the total memory used.
   size_t mem_usage = MemTracker::GetRootTracker()->GetUpdatedConsumption(true /* force */);
   auto* metrics = req->mutable_metrics();
@@ -167,7 +167,7 @@ void TServerMetricsHeartbeatDataProvider::DoAddData(
                   consensus_result.get()->TryGetLeaderLeaseStatus(&ht_lease_exp);
               if (leader_lease_status) {
                 auto leader_info = req->add_leader_info();
-                leader_info->set_tablet_id(tablet_peer->tablet_id());
+                leader_info->dup_tablet_id(tablet_peer->tablet_id());
                 leader_info->set_leader_lease_status(*leader_lease_status);
                 if (*leader_lease_status == consensus::LeaderLeaseStatus::HAS_LEASE) {
                   leader_info->set_ht_lease_expiration(ht_lease_exp);
@@ -179,7 +179,7 @@ void TServerMetricsHeartbeatDataProvider::DoAddData(
 
         if (no_full_tablet_report) {
           auto full_compaction_status = req->add_full_compaction_statuses();
-          full_compaction_status->set_tablet_id(tablet->tablet_id());
+          full_compaction_status->dup_tablet_id(tablet->tablet_id());
           if (tablet->HasActiveFullCompaction()) {
             full_compaction_status->set_full_compaction_state(tablet::COMPACTING);
           } else {
@@ -253,12 +253,12 @@ void TServerMetricsHeartbeatDataProvider::DoAddData(
         continue;
       }
       auto* path_metric = metrics->add_path_metrics();
-      path_metric->set_path_id(path);
+      path_metric->dup_path_id(path);
       path_metric->set_used_space(stat->used_space);
       path_metric->set_total_space(stat->total_space);
       // Advertise the storage tier for data roots.
       const auto& tier = fs_mgr->GetTierForDataRoot(path);
-      path_metric->set_storage_tier(tier);
+      path_metric->dup_storage_tier(tier);
     }
   }
 }

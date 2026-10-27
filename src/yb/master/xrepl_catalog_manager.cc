@@ -35,7 +35,7 @@
 #include "yb/master/catalog_manager-internal.h"
 #include "yb/master/catalog_manager.h"
 #include "yb/master/master_ddl.pb.h"
-#include "yb/master/master_heartbeat.pb.h"
+#include "yb/master/master_heartbeat.messages.h"
 #include "yb/master/master_replication.pb.h"
 #include "yb/master/master_snapshot_coordinator.h"
 #include "yb/master/master_util.h"
@@ -6505,8 +6505,8 @@ Result<scoped_refptr<TableInfo>> CatalogManager::GetTableById(const TableId& tab
 
 Status CatalogManager::FillHeartbeatResponseCDC(
     const SysClusterConfigEntryPB& cluster_config,
-    const TSHeartbeatRequestPB& req,
-    TSHeartbeatResponsePB* resp) {
+    const LWTSHeartbeatRequestPB& req,
+    LWTSHeartbeatResponsePB* resp) {
   if (cdc_enabled_.load(std::memory_order_acquire)) {
     resp->set_xcluster_enabled_on_producer(true);
   }

@@ -36,7 +36,7 @@ class PGConn;
 }  // namespace pgwrapper
 
 namespace master {
-class TSHeartbeatRequestPB;
+class LWTSHeartbeatRequestPB;
 }  // namespace master
 
 namespace rpc {
@@ -62,7 +62,7 @@ class XClusterConsumerIf {
   virtual int32_t cluster_config_version() const = 0;
   virtual Status ReloadCertificates() = 0;
   virtual void PopulateMasterHeartbeatRequest(
-      master::TSHeartbeatRequestPB* req, bool needs_full_tablet_report) = 0;
+      master::LWTSHeartbeatRequestPB* req, bool needs_full_tablet_report) = 0;
   virtual std::vector<XClusterPollerStats> GetPollerStats() const = 0;
 
   virtual std::vector<TabletId> TEST_producer_tablets_running() const = 0;
