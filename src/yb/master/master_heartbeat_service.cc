@@ -574,6 +574,7 @@ void MasterHeartbeatServiceImpl::TSHeartbeat(
         for (const auto& info : req->leader_info()) {
           ProcessLeaderInfo(ts_desc->id(), tablets[idx++], info);
         }
+        resp->set_tablet_metadata_processed(true);
 
         // Only process the full compaction statuses if we have plenty of time to process the work
         // (> 50% of timeout).

@@ -526,6 +526,10 @@ Status HeartbeatPoller::TryHeartbeat() {
         .last_failure = Status::OK()});
   }
 
+  for (auto& data_provider : data_providers_) {
+    data_provider->OnHeartbeatResponse(last_hb_response_);
+  }
+
   if (last_hb_response_.has_cluster_uuid() && !last_hb_response_.cluster_uuid().empty()) {
     server_.set_cluster_uuid(last_hb_response_.cluster_uuid());
   }
