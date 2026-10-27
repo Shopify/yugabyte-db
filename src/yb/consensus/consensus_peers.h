@@ -132,7 +132,7 @@ typedef std::shared_ptr<Peer> PeerPtr;
 class Peer : public std::enable_shared_from_this<Peer> {
  public:
   Peer(const RaftPeerPB& peer, std::string tablet_id, std::string leader_uuid,
-       PeerProxyPtr proxy, PeerMessageQueue* queue, MultiRaftHeartbeatBatcherPtr multi_raft_batcher,
+       PeerProxyPtr proxy, PeerMessageQueue* queue, MultiRaftBatcherPtr multi_raft_batcher,
        ThreadPoolToken* raft_pool_token, Consensus* consensus, rpc::Messenger* messenger);
 
   // Initializes a peer and get its status.
@@ -276,7 +276,7 @@ class Peer : public std::enable_shared_from_this<Peer> {
 
   // Batcher that currently batches heartbeat requests that are sent by each consensus peer
   // on a per tserver level
-  MultiRaftHeartbeatBatcherPtr multi_raft_batcher_;
+  MultiRaftBatcherPtr multi_raft_batcher_;
 
   // Thread pool used to construct requests to this peer.
   ThreadPoolToken* raft_pool_token_;

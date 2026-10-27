@@ -132,7 +132,7 @@ using rpc::PeriodicTimer;
 
 Peer::Peer(
     const RaftPeerPB& peer_pb, string tablet_id, string leader_uuid, PeerProxyPtr proxy,
-    PeerMessageQueue* queue, MultiRaftHeartbeatBatcherPtr multi_raft_batcher,
+    PeerMessageQueue* queue, MultiRaftBatcherPtr multi_raft_batcher,
     ThreadPoolToken* raft_pool_token, Consensus* consensus, rpc::Messenger* messenger)
     : tablet_id_(std::move(tablet_id)),
       leader_uuid_(std::move(leader_uuid)),

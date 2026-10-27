@@ -55,14 +55,14 @@ struct ResponseCallbackData {
 
 }
 
-struct MultiRaftHeartbeatBatcher::MultiRaftConsensusData {
+struct MultiRaftBatcher::MultiRaftConsensusData {
   MultiRaftConsensusRequestPB batch_req;
   MultiRaftConsensusResponsePB batch_res;
   rpc::RpcController controller;
   std::vector<ResponseCallbackData> response_callback_data;
 };
 
-MultiRaftHeartbeatBatcher::MultiRaftHeartbeatBatcher(
+MultiRaftBatcher::MultiRaftBatcher(
     const HostPort& hostport,
     rpc::ProxyCache* proxy_cache,
     rpc::Messenger* messenger,
@@ -72,8 +72,8 @@ MultiRaftHeartbeatBatcher::MultiRaftHeartbeatBatcher(
       current_batch_(std::make_shared<MultiRaftConsensusData>()),
       running_calls_(running_calls) {}
 
-void MultiRaftHeartbeatBatcher::Start() {
-  std::weak_ptr<MultiRaftHeartbeatBatcher> weak_self = shared_from_this();
+void MultiRaftBatcher::Start() {
+  std::weak_ptr<MultiRaftBatcher> weak_self = shared_from_this();
   batch_sender_ = PeriodicTimer::Create(
     messenger_,
     [weak_self]() {
@@ -85,15 +85,15 @@ void MultiRaftHeartbeatBatcher::Start() {
   batch_sender_->Start();
 }
 
-MultiRaftHeartbeatBatcher::~MultiRaftHeartbeatBatcher() {
+MultiRaftBatcher::~MultiRaftBatcher() {
   std::lock_guard lock(mutex_);
   LOG_IF(DFATAL, current_batch_ && !current_batch_->response_callback_data.empty())
-      << "Not empty batch in ~MultiRaftHeartbeatBatcher";
+      << "Not empty batch in ~MultiRaftBatcher";
 }
 
-void MultiRaftHeartbeatBatcher::AddRequestToBatch(ConsensusRequestPB* request,
-                                                  ConsensusResponsePB* response,
-                                                  HeartbeatResponseCallback callback) {
+void MultiRaftBatcher::AddRequestToBatch(ConsensusRequestPB* request,
+                                         ConsensusResponsePB* response,
+                                         HeartbeatResponseCallback callback) {
   std::shared_ptr<MultiRaftConsensusData> data = nullptr;
   {
     std::lock_guard lock(mutex_);
@@ -111,7 +111,7 @@ void MultiRaftHeartbeatBatcher::AddRequestToBatch(ConsensusRequestPB* request,
   SendBatchRequest(data);
 }
 
-void MultiRaftHeartbeatBatcher::PrepareAndSendBatchRequest() {
+void MultiRaftBatcher::PrepareAndSendBatchRequest() {
   std::shared_ptr<MultiRaftConsensusData> data;
   {
     std::lock_guard lock(mutex_);
@@ -120,8 +120,8 @@ void MultiRaftHeartbeatBatcher::PrepareAndSendBatchRequest() {
   SendBatchRequest(data);
 }
 
-std::shared_ptr<MultiRaftHeartbeatBatcher::MultiRaftConsensusData>
-    MultiRaftHeartbeatBatcher::PrepareNextBatchRequest() {
+std::shared_ptr<MultiRaftBatcher::MultiRaftConsensusData>
+    MultiRaftBatcher::PrepareNextBatchRequest() {
   if (!current_batch_ || current_batch_->batch_req.consensus_request_size() == 0) {
     return nullptr;
   }
@@ -133,7 +133,7 @@ std::shared_ptr<MultiRaftHeartbeatBatcher::MultiRaftConsensusData>
   return data;
 }
 
-void MultiRaftHeartbeatBatcher::SendBatchRequest(std::shared_ptr<MultiRaftConsensusData> data) {
+void MultiRaftBatcher::SendBatchRequest(std::shared_ptr<MultiRaftConsensusData> data) {
   if (!data) {
     return;
   }
@@ -158,7 +158,7 @@ void MultiRaftHeartbeatBatcher::SendBatchRequest(std::shared_ptr<MultiRaftConsen
       data->batch_req, &data->batch_res, &data->controller, callback);
 }
 
-void MultiRaftHeartbeatBatcher::Shutdown() {
+void MultiRaftBatcher::Shutdown() {
   decltype(current_batch_) batch;
   batch_sender_->Stop();
   {
@@ -177,7 +177,7 @@ MultiRaftManager::MultiRaftManager(rpc::Messenger* messenger,
     : messenger_(messenger), proxy_cache_(proxy_cache),
       local_peer_cloud_info_pb_(std::move(local_peer_cloud_info_pb)) {}
 
-MultiRaftHeartbeatBatcherPtr MultiRaftManager::AddOrGetBatcher(const RaftPeerPB& remote_peer_pb) {
+MultiRaftBatcherPtr MultiRaftManager::AddOrGetBatcher(const RaftPeerPB& remote_peer_pb) {
   if (!FLAGS_enable_multi_raft_heartbeat_batcher) {
     return nullptr;
   }
@@ -188,7 +188,7 @@ MultiRaftHeartbeatBatcherPtr MultiRaftManager::AddOrGetBatcher(const RaftPeerPB&
     LOG(DFATAL) << __func__ << " after shutdown";
     return nullptr;
   }
-  MultiRaftHeartbeatBatcherPtr batcher;
+  MultiRaftBatcherPtr batcher;
 
   // After taking the lock, check if there is already a batcher
   // for the same remote host and return it.
@@ -196,7 +196,7 @@ MultiRaftHeartbeatBatcherPtr MultiRaftManager::AddOrGetBatcher(const RaftPeerPB&
   if (res != batchers_.end() && (batcher = res->second.lock())) {
     return batcher;
   }
-  batcher = std::make_shared<MultiRaftHeartbeatBatcher>(
+  batcher = std::make_shared<MultiRaftBatcher>(
       hostport, proxy_cache_, messenger_, &running_calls_);
   batchers_[hostport] = batcher;
   batcher->Start();
@@ -208,7 +208,7 @@ MultiRaftManager::~MultiRaftManager() {
 }
 
 void MultiRaftManager::StartShutdown() {
-  std::vector<MultiRaftHeartbeatBatcherPtr> batchers;
+  std::vector<MultiRaftBatcherPtr> batchers;
   {
     std::lock_guard lock(mutex_);
     shutdown_ = true;

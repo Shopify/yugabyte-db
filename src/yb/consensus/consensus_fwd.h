@@ -59,11 +59,11 @@ typedef std::unique_ptr<ConsensusServiceProxy> ConsensusServiceProxyPtr;
 class LeaderElection;
 typedef scoped_refptr<LeaderElection> LeaderElectionPtr;
 
+class MultiRaftBatcher;
+using MultiRaftBatcherPtr = std::shared_ptr<MultiRaftBatcher>;
+
 class PeerProxy;
 typedef std::unique_ptr<PeerProxy> PeerProxyPtr;
-
-class MultiRaftHeartbeatBatcher;
-using MultiRaftHeartbeatBatcherPtr = std::shared_ptr<MultiRaftHeartbeatBatcher>;
 
 struct LeaderElectionData;
 
