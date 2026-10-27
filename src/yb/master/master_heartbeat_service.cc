@@ -161,6 +161,52 @@ using tablet::RaftGroupStatePB;
 using tablet::TABLET_DATA_DELETED;
 using tablet::TABLET_DATA_TOMBSTONED;
 
+// Only what changed: the full state was 2.3 KB per replica after every table creation.
+std::string ConsensusStateDiffToString(
+    const ConsensusStatePB& prev, const LWConsensusStatePB& cur, const std::string& leader_uuid) {
+  std::string out;
+  const auto add = [&out](std::string part) {
+    out += out.empty() ? "" : ", ";
+    out += part;
+  };
+  if (cur.current_term() != prev.current_term()) {
+    add(Format("term $0 -> $1", prev.current_term(), cur.current_term()));
+  }
+  if (leader_uuid != prev.leader_uuid()) {
+    add(Format("leader $0 -> $1", prev.has_leader_uuid() ? prev.leader_uuid() : "none",
+               leader_uuid.empty() ? "none" : leader_uuid));
+  }
+  if (cur.config().committed_op_index() != prev.config().committed_op_index()) {
+    add(Format("committed_op_index $0 -> $1", prev.config().committed_op_index(),
+               cur.config().committed_op_index()));
+  }
+  for (const auto& peer : cur.config().peers()) {
+    const consensus::RaftPeerPB* prev_peer = nullptr;
+    for (const auto& candidate : prev.config().peers()) {
+      if (peer.permanent_uuid() == candidate.permanent_uuid()) {
+        prev_peer = &candidate;
+        break;
+      }
+    }
+    if (prev_peer == nullptr) {
+      add(Format("+$0 $1", peer.permanent_uuid(), PeerMemberType_Name(peer.member_type())));
+    } else if (prev_peer->member_type() != peer.member_type()) {
+      add(Format("$0 $1 -> $2", peer.permanent_uuid(),
+                 PeerMemberType_Name(prev_peer->member_type()),
+                 PeerMemberType_Name(peer.member_type())));
+    }
+  }
+  for (const auto& prev_peer : prev.config().peers()) {
+    if (!IsRaftConfigMember(prev_peer.permanent_uuid(), cur.config())) {
+      add(Format("-$0", prev_peer.permanent_uuid()));
+    }
+  }
+  if (cur.config().unsafe_config_change() != prev.config().unsafe_config_change()) {
+    add(Format("unsafe_config_change $0", cur.config().unsafe_config_change()));
+  }
+  return out.empty() ? "no change" : out;
+}
+
 class MasterHeartbeatServiceImpl : public MasterServiceBase, public MasterHeartbeatIf {
  public:
   explicit MasterHeartbeatServiceImpl(Master* master)
@@ -1321,9 +1367,9 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
         tablet, ts_desc->permanent_uuid(), cstate, leader_uuid, report, epoch);
 
     // 6d(iv). Update the consensus state. Don't use 'prev_cstate' after this.
-    LOG(INFO) << "Tablet: " << tablet->tablet_id() << " reported consensus state change."
-              << " New consensus state: " << cstate.ShortDebugString()
-              << " from " << ts_desc->permanent_uuid();
+    LOG(INFO) << "Tablet " << tablet->tablet_id() << " consensus state change from "
+              << ts_desc->permanent_uuid() << ": "
+              << ConsensusStateDiffToString(prev_cstate, cstate, leader_uuid);
     auto* stored_cstate = tablet_lock.mutable_data()->pb.mutable_committed_consensus_state();
     cstate.ToGoogleProtobuf(stored_cstate);
     if (leader_uuid.empty()) {
@@ -1337,7 +1383,7 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
     // replica is reporting the same consensus configuration we already know about, but we
     // haven't yet heard from all the tservers in the config, update the in-memory
     // ReplicaLocations.
-    LOG(INFO) << "Tablet server " << ts_desc->permanent_uuid() << " sent "
+    VLOG(1) << "Tablet server " << ts_desc->permanent_uuid() << " sent "
             << (is_incremental ? "incremental" : "full tablet")
             << " report for " << tablet->tablet_id()
             << ", prev state op id: " << prev_cstate.config().committed_op_index()
@@ -1346,7 +1392,7 @@ bool MasterHeartbeatServiceImpl::ProcessCommittedConsensusState(
             << ". Consensus state: " << cstate.ShortDebugString();
     if (FLAGS_enable_register_ts_from_raft &&
         ReplicaMapDiffersFromConsensusState(tablet, cstate)) {
-      LOG(INFO) << Format("Tablet replica map differs from reported consensus state. Replica map: "
+      VLOG(1) << Format("Tablet replica map differs from reported consensus state. Replica map: "
           "$0. Reported consensus state: $1.", *tablet->GetReplicaLocations(),
           cstate.ShortDebugString());
       UpdateTabletReplicasAfterConfigChange(
