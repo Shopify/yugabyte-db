@@ -69,32 +69,22 @@ class rw_semaphore {
 
   void lock_shared() {
     int loop_count = 0;
-    Atomic32 cur_state = base::subtle::NoBarrier_Load(&state_);
     while (true) {
-      Atomic32 expected = cur_state & kNumReadersMask;   // I expect no write lock
-      Atomic32 try_new_state = expected + 1;          // Add me as reader
-      cur_state = base::subtle::Acquire_CompareAndSwap(&state_, expected, try_new_state);
-      if (cur_state == expected)
+      // Readers never fail against each other here: only a writer sends us back off.
+      if (!(base::subtle::Barrier_AtomicIncrement(&state_, 1) & kWriteFlag)) {
         break;
-      // Either was already locked by someone else, or CAS failed.
-      boost::detail::yield(loop_count++);
+      }
+      base::subtle::Barrier_AtomicIncrement(&state_, -1);
+      while (base::subtle::NoBarrier_Load(&state_) & kWriteFlag) {
+        boost::detail::yield(loop_count++);
+      }
     }
   }
 
   void unlock_shared() {
-    int loop_count = 0;
-    Atomic32 cur_state = base::subtle::NoBarrier_Load(&state_);
-    while (true) {
-      DCHECK_GT(cur_state & kNumReadersMask, 0)
-        << "unlock_shared() called when there are no shared locks held";
-      Atomic32 expected = cur_state;           // I expect a write lock and other readers
-      Atomic32 try_new_state = expected - 1;   // Drop me as reader
-      cur_state = base::subtle::Release_CompareAndSwap(&state_, expected, try_new_state);
-      if (cur_state == expected)
-        break;
-      // Either was already locked by someone else, or CAS failed.
-      boost::detail::yield(loop_count++);
-    }
+    DCHECK_GT(base::subtle::NoBarrier_Load(&state_) & kNumReadersMask, 0)
+      << "unlock_shared() called when there are no shared locks held";
+    base::subtle::Barrier_AtomicIncrement(&state_, -1);
   }
 
   // Tries to acquire a write lock, if no one else has it.
@@ -145,16 +135,22 @@ class rw_semaphore {
   }
 
   void unlock() {
-    // I expect to be the only writer
-    DCHECK_EQ(base::subtle::NoBarrier_Load(&state_), kWriteFlag);
+    // Readers may be mid-increment, so only the write flag is ours to check and clear.
+    Atomic32 cur_state = base::subtle::NoBarrier_Load(&state_);
+    DCHECK(cur_state & kWriteFlag) << "unlock() called without the write lock";
 
 #ifndef NDEBUG
     writer_tid_ = kInvalidThreadId; // Invalid tid.
 #endif // NDEBUG
 
     ResetLockHolderStack();
-    // Reset: no writers & no readers.
-    Release_Store(&state_, 0);
+    while (true) {
+      Atomic32 seen = base::subtle::Release_CompareAndSwap(
+          &state_, cur_state, cur_state & kNumReadersMask);
+      if (seen == cur_state)
+        break;
+      cur_state = seen;
+    }
   }
 
   // Return true if the lock is currently held for write by any thread.

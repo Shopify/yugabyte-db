@@ -101,4 +101,31 @@ TEST(RWSemaphoreTest, TestBasicOperation) {
   }
 }
 
+// Many readers on one lock, with and without a writer, so reader-reader and
+// reader-writer collisions both get exercised.
+TEST(RWSemaphoreTest, TestReaderStorm) {
+  for (int num_writers : {0, 1}) {
+    SharedState s;
+    vector<std::thread> threads;
+    for (int i = 0; i < 32; i++) {
+      threads.emplace_back(std::bind(Reader, &s));
+    }
+    for (int i = 0; i < num_writers; i++) {
+      threads.emplace_back(std::bind(Writer, &s));
+    }
+
+    SleepFor(MonoDelta::FromMilliseconds(200));
+
+    {
+      std::lock_guard l(s.sem);
+      s.done = true;
+    }
+
+    for (auto& t : threads) {
+      t.join();
+    }
+    ASSERT_FALSE(s.sem.is_locked());
+  }
+}
+
 } // namespace yb
