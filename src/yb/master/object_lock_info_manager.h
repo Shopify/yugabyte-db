@@ -90,8 +90,8 @@ class ObjectLockInfoManager {
   void ReleaseLocksForTxn(const TransactionId& txn_id);
 
   Status RefreshYsqlLease(
-      const RefreshYsqlLeaseRequestPB& req, RefreshYsqlLeaseResponsePB& resp, rpc::RpcContext& rpc,
-      const LeaderEpoch& epoch);
+      const LWRefreshYsqlLeaseRequestPB& req, LWRefreshYsqlLeaseResponsePB& resp,
+      rpc::RpcContext& rpc, const LeaderEpoch& epoch);
 
   Status RelinquishYsqlLease(
       const RelinquishYsqlLeaseRequestPB& req, RelinquishYsqlLeaseResponsePB& resp,

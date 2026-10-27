@@ -18,6 +18,7 @@ option java_package = "org.yb.master";
 
 import "yb/common/wire_protocol.proto";
 import "yb/master/master_types.proto";
+import "yb/rpc/lightweight_message.proto";
 import "yb/rpc/service.proto";
 import "yb/tserver/tserver.proto";
 
@@ -57,7 +58,9 @@ service MasterYsqlLease {
   option (yb.rpc.custom_service_name) = "yb.master.MasterService";
 
   rpc RefreshYsqlLease(RefreshYsqlLeaseRequestPB)
-      returns (RefreshYsqlLeaseResponsePB);
+      returns (RefreshYsqlLeaseResponsePB) {
+    option (yb.rpc.lightweight_method).sides = BOTH;
+  }
   rpc RelinquishYsqlLease(RelinquishYsqlLeaseRequestPB)
       returns (RelinquishYsqlLeaseResponsePB);
 }

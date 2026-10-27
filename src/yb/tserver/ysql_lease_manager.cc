@@ -11,7 +11,7 @@
 // under the License.
 //
 
-#include "yb/master/master_ysql_lease.pb.h"
+#include "yb/master/master_ysql_lease.messages.h"
 
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/scheduler.h"
@@ -52,7 +52,7 @@ class YSQLLeaseManager::Impl {
  public:
   explicit Impl(TabletServer& server);
 
-  Status ProcessLeaseUpdate(const master::RefreshYsqlLeaseInfoPB& lease_refresh_info)
+  Status ProcessLeaseUpdate(const master::LWRefreshYsqlLeaseInfoPB& lease_refresh_info)
       EXCLUDES(lease_toggle_lock_, lock_);
 
   Status StartYSQLLeaseRefresher();
@@ -116,7 +116,7 @@ YSQLLeaseManager::Impl::Impl(TabletServer& server)
 }
 
 Status YSQLLeaseManager::Impl::ProcessLeaseUpdate(
-    const master::RefreshYsqlLeaseInfoPB& lease_refresh_info) {
+    const master::LWRefreshYsqlLeaseInfoPB& lease_refresh_info) {
   VLOG(2) << __func__;
   CoarseTimePoint new_lease_expiry_time{
       std::chrono::milliseconds(lease_refresh_info.lease_expiry_time_ms())};
@@ -166,7 +166,8 @@ Status YSQLLeaseManager::Impl::ProcessLeaseUpdate(
       // Reset the local lock manager to bootstrap from the given DDL lock entries.
       lock_manager = ResetAndGetTSLocalLockManager();
     }
-    RETURN_NOT_OK(lock_manager->BootstrapDdlObjectLocks(lease_refresh_info.ddl_lock_entries()));
+    RETURN_NOT_OK(lock_manager->BootstrapDdlObjectLocks(
+        lease_refresh_info.ddl_lock_entries().ToGoogleProtobuf()));
   }
   if (restart_pg) {
     WARN_NOT_OK(server_.RestartPG(), "Failed to restart PG postmaster.");

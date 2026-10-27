@@ -414,8 +414,8 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   Status IsTruncateTableDone(const IsTruncateTableDoneRequestPB* req,
                              IsTruncateTableDoneResponsePB* resp);
 
-  Status RefreshYsqlLease(const RefreshYsqlLeaseRequestPB* req,
-                          RefreshYsqlLeaseResponsePB* resp,
+  Status RefreshYsqlLease(const LWRefreshYsqlLeaseRequestPB* req,
+                          LWRefreshYsqlLeaseResponsePB* resp,
                           rpc::RpcContext* rpc,
                           const LeaderEpoch& epoch);
 

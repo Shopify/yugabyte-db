@@ -26,9 +26,14 @@ class MasterYsqlLeaseServiceImpl : public MasterServiceBase, public MasterYsqlLe
   explicit MasterYsqlLeaseServiceImpl(Master* master)
       : MasterServiceBase(master), MasterYsqlLeaseIf(master->metric_entity()) {}
 
+  void RefreshYsqlLease(
+      const LWRefreshYsqlLeaseRequestPB* req, LWRefreshYsqlLeaseResponsePB* resp,
+      rpc::RpcContext rpc) override {
+    HANDLE_ON_LEADER_WITH_LOCK(CatalogManager, RefreshYsqlLease);
+  }
+
   MASTER_SERVICE_IMPL_ON_LEADER_WITH_LOCK(
     CatalogManager,
-    (RefreshYsqlLease)
     (RelinquishYsqlLease)
   )
 };

@@ -52,7 +52,7 @@
 #include "yb/master/master_client.pb.h"
 #include "yb/master/master_defaults.h"
 #include "yb/master/master_error.h"
-#include "yb/master/master_ysql_lease.pb.h"
+#include "yb/master/master_ysql_lease.messages.h"
 #include "yb/master/sys_catalog_constants.h"
 #include "yb/master/ts_descriptor.h"
 #include "yb/master/xcluster/master_xcluster_util.h"
@@ -1540,7 +1540,7 @@ std::string DdlLogEntry::id() const {
 
 Result<std::variant<ObjectLockInfo::WriteLock, SysObjectLockEntryPB::LeaseInfoPB>>
 ObjectLockInfo::RefreshYsqlOperationLease(
-    const RefreshYsqlLeaseRequestPB& req, MonoDelta lease_ttl) {
+    const LWRefreshYsqlLeaseRequestPB& req, MonoDelta lease_ttl) {
   auto l = LockForWrite();
   auto& current_lease_info = l->pb.lease_info();
   if (req.instance().instance_seqno() < current_lease_info.instance_seqno()) {

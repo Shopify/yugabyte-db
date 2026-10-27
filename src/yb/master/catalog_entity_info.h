@@ -1234,7 +1234,7 @@ class ObjectLockInfo : public MetadataCowWrapper<PersistentObjectLockInfo> {
   virtual const std::string& id() const override { return ts_uuid_; }
 
   Result<std::variant<ObjectLockInfo::WriteLock, SysObjectLockEntryPB::LeaseInfoPB>>
-  RefreshYsqlOperationLease(const RefreshYsqlLeaseRequestPB& req, MonoDelta lease_ttl)
+  RefreshYsqlOperationLease(const LWRefreshYsqlLeaseRequestPB& req, MonoDelta lease_ttl)
       EXCLUDES(mutex_);
 
   virtual void Load(const SysObjectLockEntryPB& metadata) override;

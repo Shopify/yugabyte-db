@@ -420,8 +420,9 @@ class HollowTServer {
   master::LWTSHeartbeatRequestPB* hb_req = nullptr;
   master::LWTSHeartbeatResponsePB* hb_resp = nullptr;
   rpc::RpcController hb_controller;
-  master::RefreshYsqlLeaseRequestPB lease_req;
-  master::RefreshYsqlLeaseResponsePB lease_resp;
+  ThreadSafeArena lease_arena;
+  master::LWRefreshYsqlLeaseRequestPB* lease_req = nullptr;
+  master::LWRefreshYsqlLeaseResponsePB* lease_resp = nullptr;
   rpc::RpcController lease_controller;
   std::unique_ptr<master::MasterHeartbeatProxy> heartbeat_proxy;
   std::unique_ptr<master::MasterYsqlLeaseProxy> lease_proxy;
@@ -1668,10 +1669,12 @@ class HeartbeatBench {
   }
 
   void SendLeaseRefresh(HollowTServer* ts) {
-    auto& req = ts->lease_req;
-    req.Clear();
+    ts->lease_arena.Reset(ResetMode::kKeepLast);
+    ts->lease_req = ts->lease_arena.NewArenaObject<master::LWRefreshYsqlLeaseRequestPB>();
+    ts->lease_resp = ts->lease_arena.NewArenaObject<master::LWRefreshYsqlLeaseResponsePB>();
+    auto& req = *ts->lease_req;
     auto* instance = req.mutable_instance();
-    instance->set_permanent_uuid(ts->uuid());
+    instance->dup_permanent_uuid(ts->uuid());
     instance->set_instance_seqno(ts->instance_seqno());
     const auto epoch = ts->lease_epoch();
     if (epoch) {
@@ -1681,22 +1684,23 @@ class HeartbeatBench {
     ts->lease_controller.Reset();
     ts->lease_controller.set_timeout(10s);
     ts->lease_proxy->RefreshYsqlLeaseAsync(
-        req, &ts->lease_resp, &ts->lease_controller, [this, ts] {
+        req, ts->lease_resp, &ts->lease_controller, [this, ts] {
           HandleLeaseResponse(ts);
         });
   }
 
   void HandleLeaseResponse(HollowTServer* ts) {
     const auto status = ts->lease_controller.status();
-    if (!status.ok() || ts->lease_resp.has_error()) {
+    const auto& resp = *ts->lease_resp;
+    if (!status.ok() || resp.has_error()) {
       stats_.lease_refreshes_failed.fetch_add(1, std::memory_order_relaxed);
       YB_LOG_EVERY_N_SECS(WARNING, 10)
           << "Lease refresh from " << ts->uuid() << " failed: "
-          << (status.ok() ? ts->lease_resp.error().ShortDebugString() : status.ToString());
+          << (status.ok() ? resp.error().ShortDebugString() : status.ToString());
     } else {
       stats_.lease_refreshes_ok.fetch_add(1, std::memory_order_relaxed);
-      if (ts->lease_resp.has_info() && ts->lease_resp.info().has_lease_epoch()) {
-        ts->SetLeaseEpoch(ts->lease_resp.info().lease_epoch());
+      if (resp.has_info() && resp.info().has_lease_epoch()) {
+        ts->SetLeaseEpoch(resp.info().lease_epoch());
       }
     }
     ts->lease_in_flight.store(false, std::memory_order_release);
