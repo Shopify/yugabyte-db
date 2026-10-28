@@ -51,6 +51,7 @@ DECLARE_uint32(multi_raft_data_flush_delay_ms);
 DECLARE_uint64(multi_raft_heartbeat_interval_ms);
 DECLARE_uint32(multi_raft_rpc_timeout_ms);
 
+METRIC_DECLARE_event_stats(multi_raft_batched_response_processing_us);
 METRIC_DECLARE_counter(multi_raft_data_sends_direct);
 METRIC_DECLARE_counter(multi_raft_data_sub_requests);
 METRIC_DECLARE_counter(multi_raft_envelopes_sent);
@@ -939,6 +940,32 @@ TEST_F(MultiRaftBatcherTest, EnvelopeOpsMetric) {
   ASSERT_EQ(ops->TotalSum(), 3 + 2 + 4);
   ASSERT_EQ(ops->MaxValue(), 6);
   Complete(1);
+}
+
+// The time spent in each data sub-callback is recorded; heartbeat sub-callbacks are not counted.
+TEST_F(MultiRaftBatcherTest, BatchedResponseProcessingTimeMetric) {
+  CreateBatcher();
+  constexpr auto kCallbackTime = 30ms;
+  auto slow_callback = [kCallbackTime] { std::this_thread::sleep_for(kCallbackTime); };
+  auto& h1 = Add("t1", RequestKind::kHeartbeat);
+  auto& d2 = Add("t2", RequestKind::kData, 100, slow_callback);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  auto& d3 = Add("t3", RequestKind::kData, 100, slow_callback);
+  auto& d4 = Add("t4", RequestKind::kData, 100, slow_callback);
+  Complete(0);
+  ASSERT_NO_FATALS(WaitDone(h1));
+  ASSERT_NO_FATALS(WaitDone(d2));
+  ASSERT_EQ(NumEnvelopes(), 2);
+  // A failed envelope's data sub-callbacks are timed too.
+  Complete(1, STATUS(TimedOut, "Test timeout"));
+  ASSERT_NO_FATALS(WaitDone(d3));
+  ASSERT_NO_FATALS(WaitDone(d4));
+
+  // Recorded after the callback returns.
+  auto stats = Stats(METRIC_multi_raft_batched_response_processing_us);
+  ASSERT_OK(WaitFor([&stats] { return stats->TotalCount() >= 3; }, 10s, "Recorded"));
+  ASSERT_EQ(stats->TotalCount(), 3);
+  ASSERT_GE(stats->TotalSum(), 3 * ToMicroseconds(kCallbackTime));
 }
 
 // A batcher exists when either batching flag is set.

@@ -48,12 +48,14 @@ DEFINE_UNKNOWN_uint64(multi_raft_batch_size, 0,
 TAG_FLAG(multi_raft_batch_size, advanced);
 
 DEFINE_RUNTIME_bool(enable_multi_raft_data_batching, false,
-    "If true, Raft requests that carry operations or advance the commit index, and are smaller "
-    "than multi_raft_data_direct_threshold_bytes, are sent to a remote server through the "
-    "multi-Raft batcher, so that requests for different tablets share one "
-    "MultiRaftUpdateConsensus RPC. Raft peers created while this or "
-    "enable_multi_raft_heartbeat_batcher is set get a batcher; turning this on at runtime affects "
-    "only peers that already have one.");
+    "If true, this server does two things. As a Raft leader, it sends Raft requests that carry "
+    "operations or advance the commit index, and are smaller than "
+    "multi_raft_data_direct_threshold_bytes, to a remote server through the multi-Raft batcher, so "
+    "that requests for different tablets share one MultiRaftUpdateConsensus RPC. Raft peers "
+    "created while this or enable_multi_raft_heartbeat_batcher is set get a batcher; turning this "
+    "on at runtime affects only peers that already have one. As a Raft follower, it processes the "
+    "Raft requests inside each MultiRaftUpdateConsensus RPC it receives, heartbeats included, "
+    "concurrently instead of one after another; this is decided when each RPC arrives.");
 
 DEFINE_RUNTIME_uint32(multi_raft_data_flush_delay_ms, 2,
     "Maximum time, in milliseconds, that a data request waits in a multi-Raft batch while another "
@@ -125,6 +127,10 @@ METRIC_DEFINE_counter(server, multi_raft_heartbeat_sub_requests,
 METRIC_DEFINE_counter(server, multi_raft_data_sub_requests,
     "Multi-Raft Data Sub-Requests", yb::MetricUnit::kRequests,
     "Raft data requests sent inside MultiRaftUpdateConsensus RPCs.");
+METRIC_DEFINE_event_stats(server, multi_raft_batched_response_processing_us,
+    "Multi-Raft Batched Response Processing Time", yb::MetricUnit::kMicroseconds,
+    "Time spent processing the response of each Raft data request sent inside a "
+    "MultiRaftUpdateConsensus RPC, i.e. running its response callback.");
 METRIC_DEFINE_counter(server, multi_raft_data_sends_direct,
     "Multi-Raft Direct Data Sends", yb::MetricUnit::kRequests,
     "Raft data requests sent in their own UpdateConsensus RPC instead of through the multi-Raft "
@@ -181,6 +187,7 @@ struct MultiRaftBatcher::MultiRaftConsensusData {
 
   // Set before SendBatch.
   std::shared_ptr<MultiRaftBatchSender> sender;
+  EventStatsPtr batched_response_processing_us;
 
   // Set once the sender has returned from SendBatch. RpcController assigns its call without
   // holding its lock, so BatchHandle must not touch the controller before then. After it, nothing
@@ -212,6 +219,8 @@ struct MultiRaftBatcher::Metrics {
     heartbeat_sub_requests = METRIC_multi_raft_heartbeat_sub_requests.Instantiate(entity);
     data_sub_requests = METRIC_multi_raft_data_sub_requests.Instantiate(entity);
     data_sends_direct = METRIC_multi_raft_data_sends_direct.Instantiate(entity);
+    batched_response_processing_us =
+        METRIC_multi_raft_batched_response_processing_us.Instantiate(entity);
   }
 
   CounterPtr envelopes_sent;
@@ -227,6 +236,7 @@ struct MultiRaftBatcher::Metrics {
   CounterPtr heartbeat_sub_requests;
   CounterPtr data_sub_requests;
   CounterPtr data_sends_direct;
+  EventStatsPtr batched_response_processing_us;
 };
 
 enum class MultiRaftBatcher::FlushReason {
@@ -501,10 +511,19 @@ void MultiRaftBatcher::BatchCompleted(const MultiRaftConsensusData& data) {
 void MultiRaftBatcher::InvokeSubCallback(
     const BatchData& data, size_t idx, const Status& status) {
   auto& callback_data = data->response_callback_data[idx];
+  // Every data sub-callback, whether it runs in a SubCallbackTask, inline from its Done, or inline
+  // when there is no pool, comes through here.
+  const auto start = callback_data.kind == RequestKind::kData &&
+                     data->batched_response_processing_us
+      ? MonoTime::Now() : MonoTime();
   if (status.ok()) {
     callback_data.resp->Swap(data->batch_res.mutable_consensus_response(narrow_cast<int>(idx)));
   }
   callback_data.callback(status);
+  if (start.Initialized()) {
+    data->batched_response_processing_us->Increment(
+        (MonoTime::Now() - start).ToMicroseconds());
+  }
 }
 
 // Runs one sub-callback on a thread pool. If the pool drops the task (it is shutting down), the
@@ -604,6 +623,7 @@ void MultiRaftBatcher::SendBatchRequest(BatchData data) {
     DispatchSubCallbacks(data, status, data_pool);
   };
   data->sender = sender_;
+  data->batched_response_processing_us = metrics_->batched_response_processing_us;
   sender_->SendBatch(data->batch_req, &data->batch_res, &data->controller, std::move(callback));
   data->sent.store(true, std::memory_order_release);
 }

@@ -933,7 +933,7 @@ Status TabletServer::RegisterServices() {
   RETURN_NOT_OK(RegisterService(FLAGS_ts_admin_svc_queue_length, std::move(admin_service)));
 
   auto consensus_service = std::make_shared<ConsensusServiceImpl>(
-      metric_entity(), tablet_manager_.get());
+      metric_entity(), tablet_manager_.get(), messenger());
   LOG(INFO) << "yb::tserver::ConsensusServiceImpl created at " << consensus_service.get();
   RETURN_NOT_OK(RegisterService(FLAGS_ts_consensus_svc_queue_length,
                                 std::move(consensus_service),

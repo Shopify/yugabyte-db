@@ -4151,5 +4151,124 @@ TEST_F(RaftConsensusITest, PhantomAckFixPreventsCommittedDataLoss) {
   }
 }
 
+namespace {
+
+// Turns on heartbeat and data batching on every tablet server, including across restarts, whatever
+// the environment set. Must run before the table is created: a Raft peer gets a batcher only if one
+// of the flags is set when the peer is created.
+void EnableMultiRaftBatching(ExternalMiniCluster* cluster) {
+  for (const auto* flag :
+       {"enable_multi_raft_heartbeat_batcher", "enable_multi_raft_data_batching"}) {
+    ASSERT_OK(cluster->SetFlagOnTServers(flag, "true"));
+    cluster->AddExtraFlagOnTServers(flag, "true");
+  }
+}
+
+// Sum of a server-entity metric over the running tablet servers.
+int64_t SumServerMetric(
+    ExternalMiniCluster* cluster, const char* metric, const char* field = "value") {
+  int64_t sum = 0;
+  for (size_t i = 0; i != cluster->num_tablet_servers(); ++i) {
+    auto* ts = cluster->tablet_server(i);
+    if (!ts->IsProcessAlive()) {
+      continue;
+    }
+    auto value = ts->GetMetric<int64>("server", nullptr, metric, field);
+    if (value.ok()) {
+      sum += *value;
+    }
+  }
+  return sum;
+}
+
+int64_t ConcurrentSubRequests(ExternalTabletServer* ts) {
+  auto value = ts->GetMetric<int64>(
+      "server", nullptr, "multi_raft_update_sub_requests_concurrent", "value");
+  return value.ok() ? *value : 0;
+}
+
+} // namespace
+
+// A write workload over several tablets with heartbeat and data batching: leaders send both kinds
+// of requests in envelopes, followers process the envelopes concurrently, the leaders process the
+// batched data responses, and the replicas converge.
+TEST_F(RaftConsensusITest, MultiRaftBatchingWorkload) {
+  CreateCluster("raft_consensus-itest-cluster", {}, {});
+  ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
+
+  TestYcqlWorkload workload(cluster_.get());
+  workload.set_num_tablets(6);
+  workload.set_num_write_threads(4);
+  workload.set_write_batch_size(1);
+  workload.Setup(client::YBTableType::YQL_TABLE_TYPE);
+  workload.Start();
+  ASSERT_OK(WaitFor(
+      [&workload] { return workload.rows_inserted() >= 2000; }, 60s * kTimeMultiplier,
+      "Rows inserted"));
+  workload.StopAndJoin();
+  // Idle tablets heartbeat through the batchers.
+  ASSERT_OK(WaitFor(
+      [this] {
+        return SumServerMetric(cluster_.get(), "multi_raft_heartbeat_sub_requests") > 0;
+      },
+      30s, "Batched heartbeats"));
+
+  ASSERT_GT(SumServerMetric(cluster_.get(), "multi_raft_data_sub_requests"), 0);
+  ASSERT_GT(SumServerMetric(
+      cluster_.get(), "multi_raft_batched_response_processing_us", "total_count"), 0);
+  ASSERT_GT(SumServerMetric(cluster_.get(), "multi_raft_update_sub_requests_concurrent"), 0);
+
+  ClusterVerifier cluster_verifier(cluster_.get());
+  ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
+  ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
+      workload.table_name(), ClusterVerifier::AT_LEAST, workload.rows_inserted()));
+}
+
+// A tablet server that stops responding, and then crashes, while envelopes to it are in flight:
+// the leaders recover and the replicas converge.
+TEST_F(RaftConsensusITest, MultiRaftBatchingFollowerCrash) {
+  CreateCluster("raft_consensus-itest-cluster", {}, {});
+  ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
+
+  TestYcqlWorkload workload(cluster_.get());
+  workload.set_num_tablets(6);
+  workload.set_num_write_threads(4);
+  workload.set_write_batch_size(1);
+  workload.set_timeout_allowed(true);
+  workload.set_write_timeout_millis(5000);
+  workload.Setup(client::YBTableType::YQL_TABLE_TYPE);
+  workload.Start();
+  auto wait_for_rows = [&workload](int64_t delta) {
+    const auto target = workload.rows_inserted() + delta;
+    return WaitFor(
+        [&workload, target] { return workload.rows_inserted() >= target; },
+        60s * kTimeMultiplier, Format("$0 rows inserted", target));
+  };
+  ASSERT_OK(wait_for_rows(500));
+
+  auto* victim = cluster_->tablet_server(2);
+  // The victim is receiving envelopes.
+  ASSERT_GT(ConcurrentSubRequests(victim), 0);
+
+  ASSERT_OK(victim->Pause());
+  SleepFor(3s);
+  ASSERT_OK(victim->Resume());
+  ASSERT_OK(wait_for_rows(500));
+
+  victim->Shutdown();
+  ASSERT_OK(wait_for_rows(500));
+  ASSERT_OK(victim->Restart());
+  ASSERT_OK(wait_for_rows(500));
+  ASSERT_OK(WaitFor(
+      [victim] { return ConcurrentSubRequests(victim) > 0; }, 30s,
+      "Restarted server receives envelopes"));
+  workload.StopAndJoin();
+
+  ClusterVerifier cluster_verifier(cluster_.get());
+  ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
+  ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
+      workload.table_name(), ClusterVerifier::AT_LEAST, workload.rows_inserted()));
+}
+
 }  // namespace tserver
 }  // namespace yb

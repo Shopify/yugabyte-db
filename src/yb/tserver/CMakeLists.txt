@@ -450,6 +450,7 @@ set(YB_TEST_LINK_LIBS
   yb-tserver_util
   tablet_test_util
   ${YB_MIN_TEST_LIBS})
+ADD_YB_TEST(multi_raft_update_consensus-test)
 ADD_YB_TEST(remote_bootstrap_file_downloader-test)
 ADD_YB_TEST(remote_bootstrap_rocksdb_client-test)
 ADD_YB_TEST(remote_bootstrap_rocksdb_session-test)
