@@ -3078,15 +3078,16 @@ CoarseTimePoint MultiRaftUpdateDeadline(CoarseTimePoint client_deadline) {
 // concurrently. The RPC is answered exactly once: by the completion that fills the last slot, or
 // at the deadline with the unfilled slots set to TimedOut. RespondSuccess() lets the RPC layer
 // destroy the request and the response, so slots are written only under mutex_ and only while
-// responded_ is false; a sub-request that completes after the response is dropped.
+// responded_ is false; a sub-request that completes after the response is dropped. resp_ is
+// cleared when the response goes out, so that a write after it fails loudly.
 class MultiRaftUpdateState : public std::enable_shared_from_this<MultiRaftUpdateState> {
  public:
   MultiRaftUpdateState(
       consensus::MultiRaftConsensusResponsePB* resp, RpcContext context,
       CounterPtr deadline_responses)
-      : resp_(resp), context_(std::move(context)),
-        deadline_responses_(std::move(deadline_responses)),
-        filled_(resp->consensus_response_size()), remaining_(filled_.size()) {}
+      : resp_size_(resp->consensus_response_size()), context_(std::move(context)),
+        deadline_responses_(std::move(deadline_responses)), resp_(resp),
+        filled_(resp_size_), remaining_(resp_size_) {}
 
   void ArmDeadline(rpc::Scheduler* scheduler, CoarseTimePoint deadline) {
     std::lock_guard lock(mutex_);
@@ -3128,6 +3129,7 @@ class MultiRaftUpdateState : public std::enable_shared_from_this<MultiRaftUpdate
         return;
       }
       responded_ = true;
+      resp_ = nullptr;
       deadline_task_id = std::exchange(deadline_task_id_, rpc::kInvalidTaskId);
       scheduler = scheduler_;
     }
@@ -3156,6 +3158,7 @@ class MultiRaftUpdateState : public std::enable_shared_from_this<MultiRaftUpdate
         ++unfilled;
       }
       responded_ = true;
+      resp_ = nullptr;
       deadline_task_id_ = rpc::kInvalidTaskId;
     }
     IncrementCounter(deadline_responses_);
@@ -3166,12 +3169,12 @@ class MultiRaftUpdateState : public std::enable_shared_from_this<MultiRaftUpdate
     context_.RespondSuccess();
   }
 
-  consensus::MultiRaftConsensusResponsePB* const resp_;
-  const size_t resp_size_ = resp_->consensus_response_size();
+  const size_t resp_size_;
   RpcContext context_;
   const CounterPtr deadline_responses_;
 
   std::mutex mutex_;
+  consensus::MultiRaftConsensusResponsePB* resp_ GUARDED_BY(mutex_);
   std::vector<bool> filled_ GUARDED_BY(mutex_);
   size_t remaining_ GUARDED_BY(mutex_);
   bool responded_ GUARDED_BY(mutex_) = false;

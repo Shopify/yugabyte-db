@@ -55,6 +55,7 @@
 #include "yb/util/sync_point.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_thread_holder.h"
+#include "yb/util/thread.h"
 
 using namespace std::literals;
 
@@ -66,6 +67,7 @@ DECLARE_int32(multi_raft_update_max_threads);
 DECLARE_int32(raft_heartbeat_interval_ms);
 DECLARE_bool(use_preelection);
 
+METRIC_DECLARE_histogram(handler_latency_yb_consensus_ConsensusService_MultiRaftUpdateConsensus);
 METRIC_DECLARE_counter(multi_raft_update_deadline_responses);
 METRIC_DECLARE_counter(multi_raft_update_sub_requests_concurrent);
 
@@ -361,6 +363,11 @@ TEST_F(MultiRaftUpdateConsensusTest, SlotsInRequestOrder) {
         envelope->resp.consensus_response(narrow_cast<int>(i)), tablets_[i].last));
   }
   ASSERT_EQ(ConcurrentSubRequests() - concurrent_before, tablets_.size());
+  // The handler latency covers the time until the response, not until the handler returned.
+  auto handler_latency =
+      METRIC_handler_latency_yb_consensus_ConsensusService_MultiRaftUpdateConsensus.Instantiate(
+          mini_server_->server()->metric_entity());
+  ASSERT_GE(handler_latency->MaxValue(), ToMicroseconds(500ms));
 }
 
 // A failing sub-request gets an error in its own slot and does not affect the others.
@@ -550,7 +557,14 @@ class PostUpdateRecorder : public consensus::Consensus::ConsensusFaultHooks {
   Status PostUpdate() override {
     std::lock_guard lock(mutex_);
     durable_at_post_update_.push_back(log_->IsSafeOpIdToApply(op_id_));
+    auto* thread = Thread::current_thread();
+    thread_names_.push_back(thread ? thread->name() : "");
     return Status::OK();
+  }
+
+  std::vector<std::string> thread_names() {
+    std::lock_guard lock(mutex_);
+    return thread_names_;
   }
 
   std::vector<bool> durable_at_post_update() {
@@ -563,6 +577,7 @@ class PostUpdateRecorder : public consensus::Consensus::ConsensusFaultHooks {
   const OpId op_id_;
   std::mutex mutex_;
   std::vector<bool> durable_at_post_update_;
+  std::vector<std::string> thread_names_;
 };
 
 } // namespace
@@ -598,6 +613,11 @@ TEST_F(MultiRaftUpdateConsensusTest, PostDurabilityStepsAfterDurability) {
   // Had the election started before durability, the term change would have failed the wait.
   ASSERT_NO_FATALS(AssertSlotOk(envelope->resp.consensus_response(0), tablet.last));
   ASSERT_EQ(hooks->durable_at_post_update(), std::vector<bool>{true});
+  // Not on the log appender thread, which runs group commit for every tablet of the log.
+  auto thread_names = hooks->thread_names();
+  ASSERT_EQ(thread_names.size(), 1);
+  LOG(INFO) << "POST_UPDATE ran on thread " << thread_names[0];
+  ASSERT_STR_CONTAINS(thread_names[0], "raft_notifications");
   ASSERT_OK(WaitFor([this, &tablet] { return CurrentTerm(tablet) == 2; }, 10s, "Election"));
 }
 
