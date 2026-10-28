@@ -54,6 +54,7 @@ DECLARE_uint32(multi_raft_rpc_timeout_ms);
 METRIC_DECLARE_event_stats(multi_raft_batched_response_processing_us);
 METRIC_DECLARE_counter(multi_raft_data_sends_direct);
 METRIC_DECLARE_counter(multi_raft_data_sub_requests);
+METRIC_DECLARE_counter(multi_raft_envelopes_failed);
 METRIC_DECLARE_counter(multi_raft_envelopes_sent);
 METRIC_DECLARE_counter(multi_raft_flush_bytes_cap);
 METRIC_DECLARE_counter(multi_raft_flush_count_cap);
@@ -804,6 +805,62 @@ TEST_F(MultiRaftBatcherTest, ResponseCountMismatchFailsAllCallbacks) {
     ASSERT_FALSE(call->response.has_responder_uuid());
   }
   ASSERT_TRUE(log_waiter.IsEventOccurred());
+}
+
+// An envelope that fails as a whole counts once, whatever it carries. Successful envelopes, errors
+// inside sub-responses, and a pending batch aborted at shutdown do not count.
+TEST_F(MultiRaftBatcherTest, EnvelopesFailedMetric) {
+  CreateBatcher();
+  auto& d1 = Add("t1", RequestKind::kData);
+  ASSERT_TRUE(sender_state_->Complete(
+      0, Status::OK(),
+      [](size_t, const ConsensusRequestPB&, ConsensusResponsePB* response) {
+        response->mutable_error()->set_code(tserver::TabletServerErrorPB::TABLET_NOT_FOUND);
+      }));
+  ASSERT_NO_FATALS(WaitDone(d1));
+  ASSERT_OK(d1.status);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_envelopes_failed), 0);
+
+  // The RPC fails.
+  auto& d2 = Add("t2", RequestKind::kData);
+  auto& h3 = Add("t3", RequestKind::kHeartbeat);
+  ASSERT_EQ(NumEnvelopes(), 2);
+  Complete(1, STATUS(TimedOut, "Envelope timed out"));
+  ASSERT_NO_FATALS(WaitDone(d2));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_envelopes_failed), 1);
+
+  // Fewer responses than requests.
+  auto& d4 = Add("t4", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 3);
+  ASSERT_EQ(GetEnvelope(2)->tablet_ids, Tablets({"t3", "t4"}));
+  Complete(2, Status::OK(), /* num_responses= */ 1);
+  for (auto* call : {&h3, &d4}) {
+    ASSERT_NO_FATALS(WaitDone(*call));
+    ASSERT_TRUE(call->status.IsIllegalState()) << call->status;
+  }
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_envelopes_failed), 2);
+
+  // A heartbeat-only envelope.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_batch_size) = 1;
+  auto& h5 = Add("t5", RequestKind::kHeartbeat);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_batch_size) = 0;
+  ASSERT_EQ(NumEnvelopes(), 4);
+  Complete(3, STATUS(NetworkError, "Connection refused"));
+  ASSERT_NO_FATALS(WaitDone(h5));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_envelopes_failed), 3);
+
+  // Shutdown aborts the pending batch, which was never sent.
+  auto& d6 = Add("t6", RequestKind::kData);
+  auto& d7 = Add("t7", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 5);
+  batcher_->Shutdown();
+  ASSERT_NO_FATALS(WaitDone(d7));
+  ASSERT_TRUE(d7.status.IsAborted()) << d7.status;
+  Complete(4);
+  ASSERT_NO_FATALS(WaitDone(d6));
+  ASSERT_OK(d6.status);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_envelopes_failed), 3);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_envelopes_sent), 5);
 }
 
 TEST_F(MultiRaftBatcherTest, EnqueueFailureRunsSubCallbackInline) {

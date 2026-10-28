@@ -47,6 +47,8 @@
 #include "yb/consensus/replicate_msgs_holder.h"
 #include "yb/consensus/multi_raft_batcher.h"
 
+#include "yb/gutil/port.h"
+
 #include "yb/rpc/periodic.h"
 #include "yb/rpc/rpc_controller.h"
 
@@ -643,7 +645,8 @@ void Peer::ProcessHeartbeatResponse(const Status& status) {
   }
 }
 
-void Peer::ProcessBatchedResponse(const Status& status) {
+// Kept out of line as a uprobe attach point for timing Raft rounds.
+ATTRIBUTE_NOINLINE void Peer::ProcessBatchedResponse(const Status& status) {
   DCHECK(performing_update_mutex_.is_locked())
       << "Got a batched response when nothing was pending.";
   {

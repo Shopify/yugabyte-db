@@ -20,6 +20,7 @@
 #include "yb/consensus/consensus.proxy.h"
 
 #include "yb/gutil/casts.h"
+#include "yb/gutil/port.h"
 
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/periodic.h"
@@ -92,6 +93,14 @@ DECLARE_int32(consensus_rpc_timeout_ms);
 METRIC_DEFINE_counter(server, multi_raft_envelopes_sent,
     "Multi-Raft Envelopes Sent", yb::MetricUnit::kRequests,
     "Number of MultiRaftUpdateConsensus RPCs sent by multi-Raft batchers.");
+METRIC_DEFINE_counter(server, multi_raft_envelopes_failed,
+    "Multi-Raft Envelopes Failed", yb::MetricUnit::kRequests,
+    "Number of MultiRaftUpdateConsensus RPCs sent by multi-Raft batchers that failed as a whole, "
+    "failing every Raft request they carried with the same error: the RPC itself failed (for "
+    "example it timed out, the connection failed, or the sending or receiving server shut down), "
+    "or its response did not hold exactly one response per request. Errors returned for "
+    "individual Raft requests inside a successful RPC are not counted, nor are batches aborted "
+    "at shutdown before being sent.");
 METRIC_DEFINE_event_stats(server, multi_raft_envelope_sub_requests,
     "Multi-Raft Envelope Sub-Requests", yb::MetricUnit::kRequests,
     "Number of Raft requests in each MultiRaftUpdateConsensus RPC.");
@@ -187,6 +196,7 @@ struct MultiRaftBatcher::MultiRaftConsensusData {
 
   // Set before SendBatch.
   std::shared_ptr<MultiRaftBatchSender> sender;
+  CounterPtr envelopes_failed;
   EventStatsPtr batched_response_processing_us;
 
   // Set once the sender has returned from SendBatch. RpcController assigns its call without
@@ -207,6 +217,7 @@ struct MultiRaftBatcher::Metrics {
       return;
     }
     envelopes_sent = METRIC_multi_raft_envelopes_sent.Instantiate(entity);
+    envelopes_failed = METRIC_multi_raft_envelopes_failed.Instantiate(entity);
     envelope_sub_requests = METRIC_multi_raft_envelope_sub_requests.Instantiate(entity);
     envelope_bytes = METRIC_multi_raft_envelope_bytes.Instantiate(entity);
     envelope_ops = METRIC_multi_raft_envelope_ops.Instantiate(entity);
@@ -224,6 +235,7 @@ struct MultiRaftBatcher::Metrics {
   }
 
   CounterPtr envelopes_sent;
+  CounterPtr envelopes_failed;
   EventStatsPtr envelope_sub_requests;
   EventStatsPtr envelope_bytes;
   EventStatsPtr envelope_ops;
@@ -322,7 +334,8 @@ MultiRaftBatcher::~MultiRaftBatcher() {
       << "Not empty batch in ~MultiRaftBatcher";
 }
 
-MultiRaftBatcher::BatchHandle MultiRaftBatcher::AddRequestToBatch(
+// Kept out of line as a uprobe attach point for timing Raft rounds.
+ATTRIBUTE_NOINLINE MultiRaftBatcher::BatchHandle MultiRaftBatcher::AddRequestToBatch(
     ConsensusRequestPB* request, ConsensusResponsePB* response, BatchResponseCallback callback,
     RequestKind kind) {
   const auto request_bytes = request->ByteSizeLong();
@@ -491,7 +504,8 @@ void MultiRaftBatcher::DataFlushDeadlineExpired(rpc::ScheduledTaskId task_id) {
   SendBatchRequest(std::move(data));
 }
 
-void MultiRaftBatcher::BatchCompleted(const MultiRaftConsensusData& data) {
+// Kept out of line as a uprobe attach point for timing envelopes.
+ATTRIBUTE_NOINLINE void MultiRaftBatcher::BatchCompleted(const MultiRaftConsensusData& data) {
   if (!data.has_data()) {
     return;
   }
@@ -565,6 +579,9 @@ void MultiRaftBatcher::DispatchSubCallbacks(
         << status << ", destination: "
         << data->batch_req.consensus_request(0).dest_uuid();
   }
+  if (!status.ok()) {
+    IncrementCounter(data->envelopes_failed);
+  }
   // Each data sub-callback gets its own task because it does a full Raft response round
   // (majority tracking and building the next request). Heartbeat sub-callbacks are cheap and
   // run serially on this thread.
@@ -577,7 +594,8 @@ void MultiRaftBatcher::DispatchSubCallbacks(
   }
 }
 
-void MultiRaftBatcher::SendBatchRequest(BatchData data) {
+// Kept out of line as a uprobe attach point for timing envelopes.
+ATTRIBUTE_NOINLINE void MultiRaftBatcher::SendBatchRequest(BatchData data) {
   if (!data) {
     return;
   }
@@ -623,6 +641,7 @@ void MultiRaftBatcher::SendBatchRequest(BatchData data) {
     DispatchSubCallbacks(data, status, data_pool);
   };
   data->sender = sender_;
+  data->envelopes_failed = metrics_->envelopes_failed;
   data->batched_response_processing_us = metrics_->batched_response_processing_us;
   sender_->SendBatch(data->batch_req, &data->batch_res, &data->controller, std::move(callback));
   data->sent.store(true, std::memory_order_release);
