@@ -22,16 +22,18 @@
 #include <gtest/gtest.h>
 
 #include "yb/consensus/consensus.pb.h"
+#include "yb/consensus/metadata.pb.h"
 #include "yb/consensus/multi_raft_batcher.h"
-
-#include "yb/gutil/casts.h"
+#include "yb/consensus/multi_raft_batcher-test-util.h"
 
 #include "yb/rpc/messenger.h"
+#include "yb/rpc/proxy.h"
 
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/countdown_latch.h"
 #include "yb/util/logging_test_util.h"
 #include "yb/util/metrics.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_thread_holder.h"
 #include "yb/util/test_util.h"
@@ -40,6 +42,8 @@
 using namespace std::literals;
 
 DECLARE_int32(consensus_rpc_timeout_ms);
+DECLARE_bool(enable_multi_raft_data_batching);
+DECLARE_bool(enable_multi_raft_heartbeat_batcher);
 DECLARE_uint64(multi_raft_batch_bytes);
 DECLARE_uint64(multi_raft_batch_size);
 DECLARE_uint32(multi_raft_data_batch_size);
@@ -58,6 +62,7 @@ METRIC_DECLARE_counter(multi_raft_flush_response_clocked);
 METRIC_DECLARE_counter(multi_raft_flush_timer);
 METRIC_DECLARE_counter(multi_raft_heartbeat_sub_requests);
 METRIC_DECLARE_event_stats(multi_raft_envelope_bytes);
+METRIC_DECLARE_event_stats(multi_raft_envelope_ops);
 METRIC_DECLARE_event_stats(multi_raft_envelope_sub_requests);
 
 namespace yb::consensus {
@@ -67,45 +72,6 @@ using RequestKind = MultiRaftBatcher::RequestKind;
 namespace {
 
 constexpr auto kNeverMs = 3600 * 1000;
-
-// One MultiRaftUpdateConsensus RPC captured by FakeBatchSender.
-struct Envelope {
-  std::vector<std::string> tablet_ids;
-  MultiRaftConsensusResponsePB* resp;
-  rpc::RpcController* controller;
-  MonoDelta timeout;
-  rpc::InvokeCallbackMode callback_mode;
-  MultiRaftBatchSender::DoneCallback done;
-};
-
-struct SenderState {
-  std::mutex mutex;
-  std::vector<std::shared_ptr<Envelope>> envelopes;
-};
-
-class FakeBatchSender : public MultiRaftBatchSender {
- public:
-  explicit FakeBatchSender(std::shared_ptr<SenderState> state) : state_(std::move(state)) {}
-
-  void SendBatch(
-      const MultiRaftConsensusRequestPB& req, MultiRaftConsensusResponsePB* resp,
-      rpc::RpcController* controller, DoneCallback done) override {
-    auto envelope = std::make_shared<Envelope>();
-    for (const auto& request : req.consensus_request()) {
-      envelope->tablet_ids.push_back(request.tablet_id());
-    }
-    envelope->resp = resp;
-    envelope->controller = controller;
-    envelope->timeout = controller->timeout();
-    envelope->callback_mode = controller->invoke_callback_mode();
-    envelope->done = std::move(done);
-    std::lock_guard lock(state_->mutex);
-    state_->envelopes.push_back(std::move(envelope));
-  }
-
- private:
-  std::shared_ptr<SenderState> state_;
-};
 
 // A request added to the batcher, and what its callback observed.
 struct TestCall {
@@ -159,12 +125,20 @@ class MultiRaftBatcherTest : public YBTest {
     }
   }
 
-  ConsensusRequestPB MakeRequest(const std::string& tablet_id, size_t payload_bytes) {
+  ConsensusRequestPB MakeRequest(
+      const std::string& tablet_id, size_t payload_bytes, int num_ops = 0) {
     ConsensusRequestPB request;
     request.set_dest_uuid("follower-1");
     request.set_tablet_id(tablet_id);
     request.set_caller_uuid(std::string(payload_bytes, 'x'));
     request.set_caller_term(1);
+    for (int i = 1; i <= num_ops; ++i) {
+      auto* op = request.add_ops();
+      op->mutable_id()->set_term(1);
+      op->mutable_id()->set_index(i);
+      op->set_hybrid_time(i);
+      op->set_op_type(NO_OP);
+    }
     return request;
   }
 
@@ -209,31 +183,22 @@ class MultiRaftBatcherTest : public YBTest {
   }
 
   size_t NumEnvelopes() {
-    std::lock_guard lock(sender_state_->mutex);
-    return sender_state_->envelopes.size();
+    return sender_state_->NumEnvelopes();
   }
 
-  std::shared_ptr<Envelope> GetEnvelope(size_t idx) {
-    std::lock_guard lock(sender_state_->mutex);
-    CHECK_LT(idx, sender_state_->envelopes.size());
-    return sender_state_->envelopes[idx];
+  std::shared_ptr<FakeBatchEnvelope> GetEnvelope(size_t idx) {
+    return sender_state_->GetEnvelope(idx);
   }
 
   // Fills the envelope's response with num_responses sub-responses (default: one per request),
   // then completes the RPC with status, on this thread.
   void Complete(size_t idx, const Status& status = Status::OK(), int num_responses = -1) {
-    auto envelope = GetEnvelope(idx);
-    if (num_responses < 0) {
-      num_responses = narrow_cast<int>(envelope->tablet_ids.size());
-    }
-    for (int i = 0; i != num_responses; ++i) {
-      envelope->resp->add_consensus_response()->set_responder_uuid(
-          envelope->tablet_ids[i] + "-resp");
-    }
-    // Drop the sender's reference to the batch, as the RPC layer does after the callback.
-    auto done = std::move(envelope->done);
-    envelope->done = nullptr;
-    done(status);
+    ASSERT_TRUE(sender_state_->Complete(
+        idx, status,
+        [](size_t, const ConsensusRequestPB& request, ConsensusResponsePB* response) {
+          response->set_responder_uuid(request.tablet_id() + "-resp");
+        },
+        num_responses));
   }
 
   bool IsDone(const TestCall& call) {
@@ -273,7 +238,7 @@ class MultiRaftBatcherTest : public YBTest {
   std::atomic<int> running_calls_{0};
   // Destroyed after the sender state, which may hold callbacks that reference these calls.
   std::vector<std::unique_ptr<TestCall>> calls_;
-  std::shared_ptr<SenderState> sender_state_ = std::make_shared<SenderState>();
+  std::shared_ptr<FakeBatchSenderState> sender_state_ = std::make_shared<FakeBatchSenderState>();
   std::shared_ptr<MultiRaftBatcher> batcher_;
 };
 
@@ -469,9 +434,10 @@ TEST_F(MultiRaftBatcherTest, SubCallbackReAddsToBatcher) {
   }
 }
 
-// Several threads add data and heartbeats while another completes envelopes as they appear,
-// with the deadline and timer flushes active. Every request is sent exactly once and every
-// callback runs exactly once with its own response.
+// Several threads add data and heartbeats, and fail some of their batches through the handle,
+// while another completes envelopes as they appear, with the deadline and timer flushes active.
+// Every request is sent exactly once and every callback runs exactly once, with its own response
+// or with the failure.
 TEST_F(MultiRaftBatcherTest, ConcurrentAdds) {
   constexpr int kThreads = 4;
   constexpr int kRequestsPerThread = 300;
@@ -494,9 +460,14 @@ TEST_F(MultiRaftBatcherTest, ConcurrentAdds) {
     holder.AddThread([this, &calls = per_thread[t], &adders_running] {
       int i = 0;
       for (auto* call : calls) {
-        Submit(*call, i++ % 5 == 0 ? RequestKind::kHeartbeat : RequestKind::kData);
+        Submit(*call, i % 5 == 0 ? RequestKind::kHeartbeat : RequestKind::kData);
         call->handle.CallStateDebugString();
-        call->handle.MarkCallAsFailed();
+        call->handle.timeout();
+        call->handle.finished();
+        if (i % 10 == 3) {
+          call->handle.MarkCallAsFailed();
+        }
+        ++i;
       }
       --adders_running;
     });
@@ -507,7 +478,12 @@ TEST_F(MultiRaftBatcherTest, ConcurrentAdds) {
     const auto deadline = CoarseMonoClock::Now() + 60s;
     for (;;) {
       while (next < NumEnvelopes()) {
-        Complete(next++);
+        // The envelope may have been failed through a handle already.
+        sender_state_->Complete(
+            next++, Status::OK(),
+            [](size_t, const ConsensusRequestPB& request, ConsensusResponsePB* response) {
+              response->set_responder_uuid(request.tablet_id() + "-resp");
+            });
       }
       if (adders_running.load() == 0 && std::all_of(
               calls_.begin(), calls_.end(), [this](const auto& call) { return IsDone(*call); })) {
@@ -524,17 +500,29 @@ TEST_F(MultiRaftBatcherTest, ConcurrentAdds) {
   ASSERT_FALSE(completer_failed.load());
 
   std::unordered_map<std::string, int> sent;
+  std::unordered_map<std::string, bool> marked_failed;
+  size_t num_marked_failed = 0;
   for (size_t i = 0; i != NumEnvelopes(); ++i) {
-    for (const auto& tablet_id : GetEnvelope(i)->tablet_ids) {
+    auto envelope = GetEnvelope(i);
+    num_marked_failed += envelope->marked_failed;
+    for (const auto& tablet_id : envelope->tablet_ids) {
       ++sent[tablet_id];
+      marked_failed[tablet_id] = envelope->marked_failed;
     }
   }
   ASSERT_EQ(sent.size(), static_cast<size_t>(total));
+  LOG(INFO) << "Envelopes: " << NumEnvelopes() << ", failed through a handle: "
+            << num_marked_failed;
   for (const auto& call : calls_) {
     ASSERT_EQ(sent[call->tablet_id], 1) << call->tablet_id;
     ASSERT_EQ(call->num_callbacks.load(), 1) << call->tablet_id;
-    ASSERT_OK(call->status);
-    ASSERT_EQ(call->response.responder_uuid(), call->tablet_id + "-resp");
+    if (marked_failed[call->tablet_id]) {
+      ASSERT_TRUE(call->status.IsTimedOut()) << call->tablet_id << ": " << call->status;
+      ASSERT_FALSE(call->response.has_responder_uuid()) << call->tablet_id;
+    } else {
+      ASSERT_OK(call->status);
+      ASSERT_EQ(call->response.responder_uuid(), call->tablet_id + "-resp");
+    }
   }
   ASSERT_EQ(CounterValue(METRIC_multi_raft_heartbeat_sub_requests) +
             CounterValue(METRIC_multi_raft_data_sub_requests), total);
@@ -857,6 +845,124 @@ TEST_F(MultiRaftBatcherTest, BatchHandle) {
   ASSERT_EQ(d1.handle.CallStateDebugString(), "batch released");
   d1.handle.MarkCallAsFailed();
   Complete(1);
+}
+
+TEST_F(MultiRaftBatcherTest, BatchHandleTimeoutAndFinished) {
+  CreateBatcher();
+  MultiRaftBatcher::BatchHandle empty_handle;
+  ASSERT_FALSE(empty_handle.timeout().Initialized());
+  ASSERT_TRUE(empty_handle.finished());
+
+  auto& d1 = Add("t1", RequestKind::kData);
+  auto& d2 = Add("t2", RequestKind::kData);
+  auto& d3 = Add("t3", RequestKind::kData);
+  // Sent.
+  ASSERT_EQ(d1.handle.timeout(), 1000ms);
+  ASSERT_FALSE(d1.handle.finished());
+  // Pending: not inspectable yet.
+  ASSERT_FALSE(d2.handle.timeout().Initialized());
+  ASSERT_FALSE(d2.handle.finished());
+
+  // Completed while its sub-callback still holds the batch.
+  CountDownLatch release_d1(1);
+  d1.on_callback = [&release_d1] { release_d1.Wait(); };
+  auto release_on_failure = ScopeExit([&release_d1] { release_d1.CountDown(); });
+  Complete(0);
+  ASSERT_FALSE(d1.handle.expired());
+  ASSERT_TRUE(d1.handle.finished());
+  ASSERT_EQ(d1.handle.timeout(), 1000ms);
+  // The response-clocked envelope carrying t2 and t3 is now sent.
+  ASSERT_EQ(d2.handle.timeout(), 2000ms);
+  ASSERT_FALSE(d2.handle.finished());
+
+  // Released.
+  release_d1.CountDown();
+  ASSERT_NO_FATALS(WaitDone(d1));
+  ASSERT_OK(WaitFor([&d1] { return d1.handle.expired(); }, 10s, "Batch released"));
+  ASSERT_TRUE(d1.handle.finished());
+  ASSERT_FALSE(d1.handle.timeout().Initialized());
+  Complete(1);
+  for (auto* call : {&d2, &d3}) {
+    ASSERT_NO_FATALS(WaitDone(*call));
+  }
+}
+
+// Failing a batch through the handle fails the whole envelope, through the sender.
+TEST_F(MultiRaftBatcherTest, BatchHandleMarkCallAsFailed) {
+  CreateBatcher();
+  auto& h1 = Add("t1", RequestKind::kHeartbeat);
+  auto& d2 = Add("t2", RequestKind::kData);
+  auto& d3 = Add("t3", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  // Pending: nothing to fail.
+  d3.handle.MarkCallAsFailed();
+  ASSERT_FALSE(IsDone(d3));
+
+  d2.handle.MarkCallAsFailed();
+  ASSERT_TRUE(GetEnvelope(0)->marked_failed);
+  for (auto* call : {&h1, &d2}) {
+    ASSERT_NO_FATALS(WaitDone(*call));
+    ASSERT_TRUE(call->status.IsTimedOut()) << call->status;
+    ASSERT_EQ(call->num_callbacks.load(), 1);
+  }
+  // Finished: a second failure does nothing.
+  h1.handle.MarkCallAsFailed();
+  ASSERT_EQ(h1.num_callbacks.load(), 1);
+
+  // The failed envelope response-clocked the next one.
+  ASSERT_EQ(NumEnvelopes(), 2);
+  ASSERT_EQ(GetEnvelope(1)->tablet_ids, Tablets({"t3"}));
+  Complete(1);
+  ASSERT_NO_FATALS(WaitDone(d3));
+  ASSERT_OK(d3.status);
+  ASSERT_FALSE(GetEnvelope(1)->marked_failed);
+}
+
+TEST_F(MultiRaftBatcherTest, EnvelopeOpsMetric) {
+  CreateBatcher();
+  auto& h1 = NewCall("t1");
+  Submit(h1, RequestKind::kHeartbeat);
+  auto& d2 = NewCall("t2");
+  d2.request = MakeRequest("t2", 100, /* num_ops= */ 3);
+  Submit(d2, RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  auto& d3 = NewCall("t3");
+  d3.request = MakeRequest("t3", 100, /* num_ops= */ 2);
+  Submit(d3, RequestKind::kData);
+  auto& d4 = NewCall("t4");
+  d4.request = MakeRequest("t4", 100, /* num_ops= */ 4);
+  Submit(d4, RequestKind::kData);
+  Complete(0);
+  ASSERT_EQ(NumEnvelopes(), 2);
+  auto ops = Stats(METRIC_multi_raft_envelope_ops);
+  ASSERT_EQ(ops->TotalCount(), 2);
+  ASSERT_EQ(ops->TotalSum(), 3 + 2 + 4);
+  ASSERT_EQ(ops->MaxValue(), 6);
+  Complete(1);
+}
+
+// A batcher exists when either batching flag is set.
+TEST_F(MultiRaftBatcherTest, AddOrGetBatcherEitherFlag) {
+  rpc::ProxyCache proxy_cache(messenger_.get());
+  auto manager = std::make_shared<MultiRaftManager>(
+      messenger_.get(), &proxy_cache, CloudInfoPB(), metric_entity_);
+  RaftPeerPB peer_pb;
+  peer_pb.set_permanent_uuid("follower-1");
+  auto* addr = peer_pb.add_last_known_private_addr();
+  addr->set_host("127.0.0.1");
+  addr->set_port(12345);
+
+  for (auto heartbeat : {false, true}) {
+    for (auto data : {false, true}) {
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_heartbeat_batcher) = heartbeat;
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_data_batching) = data;
+      auto batcher = manager->AddOrGetBatcher(peer_pb);
+      ASSERT_EQ(batcher != nullptr, heartbeat || data)
+          << "heartbeat: " << heartbeat << ", data: " << data;
+    }
+  }
+  manager->StartShutdown();
+  manager->CompleteShutdown();
 }
 
 TEST_F(MultiRaftBatcherTest, RecordDirectDataSend) {

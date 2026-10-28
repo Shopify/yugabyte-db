@@ -48,9 +48,12 @@ DEFINE_UNKNOWN_uint64(multi_raft_batch_size, 0,
 TAG_FLAG(multi_raft_batch_size, advanced);
 
 DEFINE_RUNTIME_bool(enable_multi_raft_data_batching, false,
-    "If true, Raft requests that carry operations or advance the commit index are sent to a "
-    "remote server through the multi-Raft batcher, so that requests for different tablets share "
-    "one MultiRaftUpdateConsensus RPC.");
+    "If true, Raft requests that carry operations or advance the commit index, and are smaller "
+    "than multi_raft_data_direct_threshold_bytes, are sent to a remote server through the "
+    "multi-Raft batcher, so that requests for different tablets share one "
+    "MultiRaftUpdateConsensus RPC. Raft peers created while this or "
+    "enable_multi_raft_heartbeat_batcher is set get a batcher; turning this on at runtime affects "
+    "only peers that already have one.");
 
 DEFINE_RUNTIME_uint32(multi_raft_data_flush_delay_ms, 2,
     "Maximum time, in milliseconds, that a data request waits in a multi-Raft batch while another "
@@ -76,8 +79,10 @@ DEFINE_RUNTIME_uint32(multi_raft_rpc_timeout_ms, 0,
 TAG_FLAG(multi_raft_rpc_timeout_ms, advanced);
 
 DEFINE_RUNTIME_uint64(multi_raft_data_direct_threshold_bytes, 1_MB,
-    "Data requests whose serialized size is at least this many bytes are sent in their own "
-    "UpdateConsensus RPC instead of through the multi-Raft batcher.");
+    "When enable_multi_raft_data_batching is set, Raft data requests whose serialized size is at "
+    "least this many bytes are sent in their own UpdateConsensus RPC instead of through the "
+    "multi-Raft batcher. 0 means no threshold: every data request is batched, still subject to "
+    "multi_raft_batch_bytes.");
 TAG_FLAG(multi_raft_data_direct_threshold_bytes, advanced);
 
 DECLARE_int32(consensus_rpc_timeout_ms);
@@ -91,6 +96,9 @@ METRIC_DEFINE_event_stats(server, multi_raft_envelope_sub_requests,
 METRIC_DEFINE_event_stats(server, multi_raft_envelope_bytes,
     "Multi-Raft Envelope Bytes", yb::MetricUnit::kBytes,
     "Total serialized size of the Raft requests in each MultiRaftUpdateConsensus RPC.");
+METRIC_DEFINE_event_stats(server, multi_raft_envelope_ops,
+    "Multi-Raft Envelope Operations", yb::MetricUnit::kOperations,
+    "Total number of Raft operations in the requests of each MultiRaftUpdateConsensus RPC.");
 METRIC_DEFINE_counter(server, multi_raft_flush_immediate,
     "Multi-Raft Immediate Flushes", yb::MetricUnit::kRequests,
     "Multi-Raft batches sent as soon as a data request was added, because no batch carrying data "
@@ -119,8 +127,9 @@ METRIC_DEFINE_counter(server, multi_raft_data_sub_requests,
     "Raft data requests sent inside MultiRaftUpdateConsensus RPCs.");
 METRIC_DEFINE_counter(server, multi_raft_data_sends_direct,
     "Multi-Raft Direct Data Sends", yb::MetricUnit::kRequests,
-    "Raft data requests to a server with a multi-Raft batcher that were sent in their own "
-    "UpdateConsensus RPC instead.");
+    "Raft data requests sent in their own UpdateConsensus RPC instead of through the multi-Raft "
+    "batcher because of multi_raft_data_direct_threshold_bytes, while "
+    "enable_multi_raft_data_batching was set.");
 
 namespace yb {
 namespace consensus {
@@ -167,12 +176,19 @@ struct MultiRaftBatcher::MultiRaftConsensusData {
   rpc::RpcController controller;
   std::vector<ResponseCallbackData> response_callback_data;
   size_t num_data_requests = 0;
+  size_t num_ops = 0;
   size_t total_bytes = 0;
+
+  // Set before SendBatch.
+  std::shared_ptr<MultiRaftBatchSender> sender;
 
   // Set once the sender has returned from SendBatch. RpcController assigns its call without
   // holding its lock, so BatchHandle must not touch the controller before then. After it, nothing
   // writes the controller's call again.
   std::atomic<bool> sent{false};
+
+  // Set when the batch RPC completes, before any sub-callback runs.
+  std::atomic<bool> completed{false};
 
   bool empty() const { return response_callback_data.empty(); }
   bool has_data() const { return num_data_requests > 0; }
@@ -186,6 +202,7 @@ struct MultiRaftBatcher::Metrics {
     envelopes_sent = METRIC_multi_raft_envelopes_sent.Instantiate(entity);
     envelope_sub_requests = METRIC_multi_raft_envelope_sub_requests.Instantiate(entity);
     envelope_bytes = METRIC_multi_raft_envelope_bytes.Instantiate(entity);
+    envelope_ops = METRIC_multi_raft_envelope_ops.Instantiate(entity);
     flush_immediate = METRIC_multi_raft_flush_immediate.Instantiate(entity);
     flush_response_clocked = METRIC_multi_raft_flush_response_clocked.Instantiate(entity);
     flush_deadline = METRIC_multi_raft_flush_deadline.Instantiate(entity);
@@ -200,6 +217,7 @@ struct MultiRaftBatcher::Metrics {
   CounterPtr envelopes_sent;
   EventStatsPtr envelope_sub_requests;
   EventStatsPtr envelope_bytes;
+  EventStatsPtr envelope_ops;
   CounterPtr flush_immediate;
   CounterPtr flush_response_clocked;
   CounterPtr flush_deadline;
@@ -222,10 +240,30 @@ enum class MultiRaftBatcher::FlushReason {
 
 void MultiRaftBatcher::BatchHandle::MarkCallAsFailed() const {
   auto data = data_.lock();
-  if (!data || !data->sent.load(std::memory_order_acquire) || data->controller.finished()) {
+  if (!data || !data->sent.load(std::memory_order_acquire) ||
+      data->completed.load(std::memory_order_acquire) || data->controller.finished()) {
     return;
   }
-  data->controller.MarkCallAsFailed();
+  data->sender->MarkCallAsFailed(&data->controller);
+}
+
+MonoDelta MultiRaftBatcher::BatchHandle::timeout() const {
+  auto data = data_.lock();
+  if (!data || !data->sent.load(std::memory_order_acquire)) {
+    return MonoDelta();
+  }
+  return data->controller.timeout();
+}
+
+bool MultiRaftBatcher::BatchHandle::finished() const {
+  auto data = data_.lock();
+  if (!data) {
+    return true;
+  }
+  if (!data->sent.load(std::memory_order_acquire)) {
+    return false;
+  }
+  return data->completed.load(std::memory_order_acquire) || data->controller.finished();
 }
 
 std::string MultiRaftBatcher::BatchHandle::CallStateDebugString() const {
@@ -325,6 +363,7 @@ MultiRaftBatcher::BatchHandle MultiRaftBatcher::AddRequestUnlocked(
     .kind = kind,
   });
   current_batch_->total_bytes += request_bytes;
+  current_batch_->num_ops += request->ops_size();
   if (is_data) {
     ++current_batch_->num_data_requests;
   }
@@ -530,6 +569,7 @@ void MultiRaftBatcher::SendBatchRequest(BatchData data) {
   IncrementCounter(metrics_->envelopes_sent);
   IncrementStats(metrics_->envelope_sub_requests, num_requests);
   IncrementStats(metrics_->envelope_bytes, data->total_bytes);
+  IncrementStats(metrics_->envelope_ops, data->num_ops);
   const auto num_data_requests = narrow_cast<int>(data->num_data_requests);
   IncrementCounterBy(metrics_->heartbeat_sub_requests, num_requests - num_data_requests);
   IncrementCounterBy(metrics_->data_sub_requests, num_data_requests);
@@ -556,12 +596,14 @@ void MultiRaftBatcher::SendBatchRequest(BatchData data) {
   // next see that envelope in flight and accumulate behind it rather than each going out alone.
   auto callback = [data, data_pool, weak_self = weak_from_this(),
                    running_calls = running_calls_](const Status& status) {
+    data->completed.store(true, std::memory_order_release);
     --*running_calls;
     if (auto self = weak_self.lock()) {
       self->BatchCompleted(*data);
     }
     DispatchSubCallbacks(data, status, data_pool);
   };
+  data->sender = sender_;
   sender_->SendBatch(data->batch_req, &data->batch_res, &data->controller, std::move(callback));
   data->sent.store(true, std::memory_order_release);
 }
@@ -596,7 +638,7 @@ MultiRaftManager::MultiRaftManager(rpc::Messenger* messenger,
       metric_entity_(std::move(metric_entity)) {}
 
 MultiRaftBatcherPtr MultiRaftManager::AddOrGetBatcher(const RaftPeerPB& remote_peer_pb) {
-  if (!FLAGS_enable_multi_raft_heartbeat_batcher) {
+  if (!FLAGS_enable_multi_raft_heartbeat_batcher && !FLAGS_enable_multi_raft_data_batching) {
     return nullptr;
   }
 

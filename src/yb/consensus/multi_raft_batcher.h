@@ -45,6 +45,12 @@ class MultiRaftBatchSender {
   virtual void SendBatch(
       const MultiRaftConsensusRequestPB& req, MultiRaftConsensusResponsePB* resp,
       rpc::RpcController* controller, DoneCallback done) = 0;
+
+  // Fails a batch RPC that SendBatch issued on controller and that has not completed, so that
+  // its done callback runs with an error.
+  virtual void MarkCallAsFailed(rpc::RpcController* controller) {
+    controller->MarkCallAsFailed();
+  }
 };
 
 std::unique_ptr<MultiRaftBatchSender> CreateMultiRaftBatchSender(
@@ -70,14 +76,22 @@ class MultiRaftBatcher : public std::enable_shared_from_this<MultiRaftBatcher> {
 
  public:
   // Refers to the batch that carries a request, for diagnosing and failing a stuck batch RPC.
-  // Does not keep the batch alive. Both methods are no-ops until the batch's RPC has been
-  // issued, and after the batch has been released.
+  // Does not keep the batch alive. Until the batch's RPC has been issued, and after the batch has
+  // been released, the batch cannot be inspected: timeout() is uninitialized and
+  // MarkCallAsFailed() does nothing.
   class BatchHandle {
    public:
     BatchHandle() = default;
 
+    // Fails the whole batch RPC through MultiRaftBatchSender::MarkCallAsFailed, unless it has
+    // finished.
     void MarkCallAsFailed() const;
     std::string CallStateDebugString() const;
+    // The batch RPC's timeout.
+    MonoDelta timeout() const;
+    // True once the batch RPC has completed or the batch has been released. False before it is
+    // issued.
+    bool finished() const;
     bool expired() const { return data_.expired(); }
 
     const rpc::RpcController* TEST_controller() const;
@@ -152,7 +166,8 @@ class MultiRaftBatcher : public std::enable_shared_from_this<MultiRaftBatcher> {
 
   rpc::Messenger* const messenger_;
 
-  const std::unique_ptr<MultiRaftBatchSender> sender_;
+  // Shared with each sent batch, which uses it to fail its RPC.
+  const std::shared_ptr<MultiRaftBatchSender> sender_;
 
   const std::unique_ptr<Metrics> metrics_;
 
