@@ -142,9 +142,9 @@ class TabletPeerTest : public YBTabletTest {
     addr->set_host("fake-host");
     addr->set_port(0);
 
-    multi_raft_manager_ = std::make_unique<consensus::MultiRaftManager>(messenger_.get(),
-                                                                        proxy_cache_.get(),
-                                                                        config_peer.cloud_info());
+    multi_raft_manager_ = std::make_unique<consensus::MultiRaftManager>(
+        messenger_.get(), proxy_cache_.get(), config_peer.cloud_info(),
+        METRIC_ENTITY_server.Instantiate(&metric_registry_, "test-server"));
 
     // "Bootstrap" and start the TabletPeer.
     tablet_peer_.reset(new TabletPeer(

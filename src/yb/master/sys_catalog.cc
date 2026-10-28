@@ -592,7 +592,8 @@ void SysCatalogTable::SetupTabletPeer(const scoped_refptr<tablet::RaftGroupMetad
 
   multi_raft_manager_ = std::make_unique<consensus::MultiRaftManager>(master_->messenger(),
                                                                       &master_->proxy_cache(),
-                                                                      local_peer_pb_.cloud_info());
+                                                                      local_peer_pb_.cloud_info(),
+                                                                      metric_entity_);
 
   // TODO: handle crash mid-creation of tablet? do we ever end up with a
   // partially created tablet here?

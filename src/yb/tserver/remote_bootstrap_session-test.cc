@@ -126,9 +126,9 @@ void RemoteBootstrapSessionTest::SetUpTabletPeer() {
   MessengerBuilder mbuilder(CURRENT_TEST_NAME());
   messenger_ = ASSERT_RESULT(mbuilder.Build());
   proxy_cache_ = std::make_unique<rpc::ProxyCache>(messenger_.get());
-  multi_raft_manager_ = std::make_unique<consensus::MultiRaftManager>(messenger_.get(),
-                                                                      proxy_cache_.get(),
-                                                                      config_peer.cloud_info());
+  multi_raft_manager_ = std::make_unique<consensus::MultiRaftManager>(
+      messenger_.get(), proxy_cache_.get(), config_peer.cloud_info(),
+      METRIC_ENTITY_server.Instantiate(&metric_registry_, "test-server"));
 
   log_anchor_registry_.reset(new LogAnchorRegistry());
 

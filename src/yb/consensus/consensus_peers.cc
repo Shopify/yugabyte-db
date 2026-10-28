@@ -408,7 +408,8 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
     performing_heartbeat_lock.release();
     multi_raft_batcher_->AddRequestToBatch(
         &heartbeat_request_, &heartbeat_response_,
-        std::bind(&Peer::ProcessHeartbeatResponse, retain_self, _1));
+        std::bind(&Peer::ProcessHeartbeatResponse, retain_self, _1),
+        MultiRaftBatcher::RequestKind::kHeartbeat);
     return;
   }
 
