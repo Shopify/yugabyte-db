@@ -46,10 +46,13 @@
 
 #include "yb/gutil/bind.h"
 
+#include "yb/rpc/messenger.h"
 #include "yb/rpc/thread_pool.h"
 
 #include "yb/server/logical_clock.h"
 
+#include "yb/util/cgroups.h"
+#include "yb/util/logging_test_util.h"
 #include "yb/util/mem_tracker.h"
 #include "yb/util/metrics.h"
 #include "yb/util/status_log.h"
@@ -58,6 +61,7 @@
 
 DECLARE_bool(enable_leader_failure_detection);
 DECLARE_bool(never_fsync);
+DECLARE_bool(TEST_pause_before_wal_sync);
 DECLARE_int64(protege_synchronization_timeout_ms);
 DECLARE_int32(retryable_request_timeout_secs);
 
@@ -157,7 +161,8 @@ class RaftConsensusSpy : public RaftConsensus {
                    const scoped_refptr<log::Log>& log,
                    const shared_ptr<MemTracker>& parent_mem_tracker,
                    const Callback<void(std::shared_ptr<consensus::StateChangeContext> context)>&
-                     mark_dirty_clbk)
+                     mark_dirty_clbk,
+                   rpc::ThreadPool* raft_notifications_pool)
     : RaftConsensus(options,
                     std::move(cmeta),
                     std::move(proxy_factory),
@@ -173,7 +178,8 @@ class RaftConsensusSpy : public RaftConsensus {
                     parent_mem_tracker,
                     mark_dirty_clbk,
                     YQL_TABLE_TYPE,
-                    retryable_requests.get()) {
+                    retryable_requests.get(),
+                    raft_notifications_pool) {
     // These "aliases" allow us to count invocations and assert on them.
     ON_CALL(*this, StartConsensusOnlyRoundUnlocked(_))
         .WillByDefault(Invoke(this,
@@ -309,7 +315,8 @@ class RaftConsensusTest : public YBTest {
                                           operation_factory_.get(),
                                           log_.get(),
                                           MemTracker::GetRootTracker(),
-                                          Bind(&DoNothing)));
+                                          Bind(&DoNothing),
+                                          raft_notifications_pool_.get()));
 
     ON_CALL(*consensus_.get(), AppendNewRoundToQueueUnlocked(_))
         .WillByDefault(Invoke(this, &RaftConsensusTest::MockAppendNewRound));
@@ -974,6 +981,67 @@ class NoOpElectionPeerProxyFactory : public PeerProxyFactory {
   // on peer_proxy_factory_->messenger()->scheduler().
   rpc::AutoShutdownMessengerHolder messenger_;
 };
+
+// A PeerProxyFactory whose messenger's high-priority pool runs in the given cgroup.
+class SystemHighCgroupPeerProxyFactory : public PeerProxyFactory {
+ public:
+  explicit SystemHighCgroupPeerProxyFactory(Cgroup* system_high)
+      : messenger_(rpc::CreateAutoShutdownMessengerHolder(CHECK_RESULT(
+            rpc::MessengerBuilder("system-high-cgroup-test").SetSystemHighCgroup(system_high)
+                .Build()))) {}
+
+  PeerProxyPtr NewProxy(const RaftPeerPB& peer_pb) override {
+    return std::make_unique<NoOpElectionPeerProxy>();
+  }
+
+  rpc::Messenger* messenger() const override { return messenger_.get(); }
+
+ private:
+  rpc::AutoShutdownMessengerHolder messenger_;
+};
+
+// The steps of an asynchronous durability wait run on the Raft notifications pool in the cgroup of
+// the messenger's high-priority pool, where Update() runs, whatever the pool's own cgroup is (in
+// per-DB consensus mode it is not the system-high one). The cgroup object is not backed by a
+// cgroup file system, so a thread that moves into it fails with a warning, which is what this
+// test observes; tserver_cgroup_manager-test checks the real placement.
+TEST_F(RaftConsensusTest, AsyncWriteWaitStepsRunInSystemHighCgroup) {
+  Cgroup root(nullptr, "");
+  Cgroup system_high(&root, "no-such-cgroup-async-write-wait-test");
+  SetUpConsensus(
+      kMinimumTerm, /* num_peers= */ 3,
+      std::make_unique<SystemHighCgroupPeerProxyFactory>(&system_high));
+  SetUpGeneralExpectations();
+  ConsensusBootstrapInfo info;
+  ASSERT_OK(consensus_->Start(info));
+  log_->TEST_SetAllOpIdsSafe(false);
+
+  auto request_ptr = rpc::MakeSharedMessage<LWConsensusRequestPB>();
+  auto& request = *request_ptr;
+  LWConsensusResponsePB response(&request.arena());
+  request = MakeConsensusRequest(/* caller_term= */ 1, config_.peers(0).permanent_uuid(),
+                                 OpId::Min());
+  AddNoOpToConsensusRequest(&request, OpId(1, 1));
+
+  // The op is not durable when the wait starts, so the wait completes through a pool step.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_wal_sync) = true;
+  StringWaiterLogSink cgroup_log("Failed to move thread to cgroup");
+  std::atomic<bool> done{false};
+  Status status;
+  consensus_->UpdateAsync(
+      request_ptr, &response, CoarseBigDeadline(), [&done, &status](const Status& s) {
+        status = s;
+        done.store(true, std::memory_order_release);
+      });
+  SleepFor(200ms);
+  ASSERT_FALSE(done.load(std::memory_order_acquire));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_wal_sync) = false;
+  ASSERT_OK(WaitFor([&done] { return done.load(std::memory_order_acquire); }, 10s, "Update"));
+  ASSERT_OK(status);
+  ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
+  ASSERT_EQ(OpId::FromPB(response.status().last_received()), OpId(1, 1));
+  ASSERT_TRUE(cgroup_log.IsEventOccurred());
+}
 
 class RaftConsensusLeaderTransferTest : public RaftConsensusTest {
  public:

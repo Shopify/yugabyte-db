@@ -1144,6 +1144,42 @@ TEST_F(ConsensusPeersTest, SendAfterBatcherShutdown) {
   ASSERT_TRUE(test_peer.follower->received().empty());
 }
 
+// A peer closed while its batched data request is in flight drops the response when it arrives:
+// the update lock is released, the closed peer's response does not reach the queue, and nothing
+// more is sent.
+TEST_F(ConsensusPeersTest, CloseWhileBatchedRequestOutstanding) {
+  ASSERT_NO_FATALS(SetUpBatcher(
+      /* heartbeat_batching= */ false, /* data_batching= */ true,
+      /* inline_sub_callbacks= */ true));
+  auto test_peer = NewTestPeer(kFollowerUuid);
+  auto& peer = *test_peer.peer;
+  ASSERT_NO_FATALS(Negotiate(test_peer));
+  const auto num_direct_requests = test_peer.proxy->NumRequests();
+
+  AppendReplicateMessagesToQueue(message_queue_.get(), clock_, 1, 3);
+  ASSERT_OK(peer.SignalRequest(RequestTriggerMode::kNonEmptyOnly));
+  ASSERT_NO_FATALS(WaitForEnvelopes(1));
+  ASSERT_EQ(OpIndexes(GetEnvelope(0)->req.consensus_request(0)), Range(1, 3));
+  // Another op, so that processing the response would send a follow-up.
+  AppendReplicateMessagesToQueue(message_queue_.get(), clock_, 4, 1);
+  ASSERT_TRUE(peer.TEST_performing_update());
+  ASSERT_FALSE(peer.TEST_batched_handle().finished());
+
+  peer.Close();
+  ASSERT_TRUE(peer.TEST_performing_update());
+  StringWaiterLogSink untracked_response_log("peer was untracked, disregarding peer response");
+  // The sub-callback runs on this thread, so it has finished when this returns.
+  ASSERT_NO_FATALS(CompleteEnvelope(0));
+  ASSERT_EQ(test_peer.follower->received(), Range(1, 3));
+  ASSERT_FALSE(peer.TEST_performing_update());
+  ASSERT_TRUE(peer.TEST_batched_handle().expired());
+  ASSERT_FALSE(untracked_response_log.IsEventOccurred());
+  ASSERT_FALSE(consensus_->IsMajorityReplicated(1));
+  ASSERT_TRUE(raft_pool_->WaitFor(10s));
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ASSERT_EQ(test_peer.proxy->NumRequests(), num_direct_requests);
+}
+
 // The response, and the next round's send, can complete before AddRequestToBatch returns. The
 // handle the peer keeps is then the next round's.
 TEST_F(ConsensusPeersTest, SynchronousCompletionKeepsLatestHandle) {
