@@ -820,6 +820,11 @@ void RpcPeerProxy::LeaderElectionLostAsync(
 void RpcPeerProxy::StartRemoteBootstrap(
     const StartRemoteBootstrapRequestPB* request, StartRemoteBootstrapResponsePB* response,
     rpc::RpcController* controller, const rpc::ResponseCallback& callback) {
+  // The remote peer answers only after the leader has promoted it, which the leader can do only
+  // after this call completes, so it must time out. Without this, the call would use whatever
+  // timeout the controller kept from an earlier direct UpdateConsensus call, or none at all if
+  // every request to the peer went through the multi-Raft batcher.
+  controller->set_timeout(MonoDelta::FromMilliseconds(FLAGS_consensus_rpc_timeout_ms));
   consensus_proxy_->StartRemoteBootstrapAsync(*request, response, controller, callback);
 }
 
