@@ -25,6 +25,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -77,6 +78,7 @@ DECLARE_bool(ysql_enable_packed_row);
 DECLARE_bool(ysql_enable_packed_row_for_colocated_table);
 DECLARE_bool(ysql_enable_relcache_init_optimization);
 DECLARE_string(ysql_pg_conf_csv);
+DECLARE_string(ysql_sequence_cache_method);
 DECLARE_bool(ysql_use_packed_row_v2);
 DECLARE_bool(ysql_yb_enable_add_column_missing_default);
 DECLARE_bool(ysql_yb_enable_alter_table_rewrite);
@@ -591,6 +593,8 @@ class FrozenCatalog {
         "pg_description_o_c_o_index",
         "pg_shdescription",
         "pg_shdescription_o_c_index",
+        "pg_sequence",
+        "pg_sequence_seqrelid_index",
         "pg_yb_catalog_version",
         "pg_yb_catalog_version_pkey",
         "pg_yb_invalidation_messages",
@@ -1285,15 +1289,141 @@ class ReadonlyService : public UnsupportedPgClientService,
     Respond(status, resp, context);
   }
 
+  struct SequenceId {
+    uint32_t database_oid;
+    uint32_t sequence_oid;
+  };
+
+  static Result<uint32_t> NarrowOid(int64_t oid) {
+    SCHECK(
+        oid > 0 && oid <= std::numeric_limits<uint32_t>::max(), InvalidArgument,
+        "Invalid sequence request OID");
+    return static_cast<uint32_t>(oid);
+  }
+
+  Result<std::shared_ptr<Session>> SequenceSession(uint64_t session_id) {
+    SCHECK(catalog_.transaction_, NotSupported, "Frozen catalog rejects sequence access");
+    RETURN_NOT_OK(CheckSession(session_id));
+    auto session = sessions_.at(session_id);
+    // Sequence RPCs are not ordered with Perform, so queued Performs are not a protocol error.
+    SCHECK(
+        !session->sequence_broken, IllegalState,
+        "Local request sequence failed; reconnect required");
+    return session;
+  }
+
+  // Sequence tuples are nontransactional, so admission never starts the catalog transaction or
+  // takes the SQL lease. The lease gate still excludes callers while another backend holds it.
+  // Post-commit deletion (cleanup) runs after FinishTransaction released the lease, possibly to
+  // another backend; it is idempotent, so only the backend's own database is checked.
+  template <class Request>
+  Result<SequenceId> AdmitSequence(const Request& req, bool cleanup = false) {
+    const auto session = VERIFY_RESULT(SequenceSession(req.session_id()));
+    const SequenceId id{
+        VERIFY_RESULT(NarrowOid(req.db_oid())), VERIFY_RESULT(NarrowOid(req.seq_oid()))};
+    SCHECK(
+        session->database_oid != 0 && session->database_oid == id.database_oid, InvalidArgument,
+        "Sequence database does not match the backend database");
+    if (cleanup) return id;
+    SCHECK(
+        FLAGS_ysql_sequence_cache_method != "server", NotSupported,
+        "Server-side sequence caching is not supported by the local runtime");
+    const auto database = catalog_.databases_.find(id.database_oid);
+    SCHECK(
+        database != catalog_.databases_.end() && database->second != "template0" &&
+            database->second != "template1",
+        NotSupported, "Sequences require a known nontemplate database");
+    RETURN_NOT_OK(CheckSqlOwner(session->id));
+    return id;
+  }
+
+  void InsertSequenceTuple(
+      const tserver::LWPgInsertSequenceTupleRequestPB* req,
+      tserver::LWPgInsertSequenceTupleResponsePB* resp, rpc::RpcContext context) override {
+    std::lock_guard lock(mutex_);
+    auto status = [&]() -> Status {
+      const auto id = VERIFY_RESULT(AdmitSequence(*req));
+      return catalog_.transaction_->InsertSequence(
+          id.database_oid, id.sequence_oid, {req->last_val(), req->is_called()});
+    }();
+    Respond(status, resp, context);
+  }
+
+  void ReadSequenceTuple(
+      const tserver::LWPgReadSequenceTupleRequestPB* req,
+      tserver::LWPgReadSequenceTupleResponsePB* resp, rpc::RpcContext context) override {
+    std::lock_guard lock(mutex_);
+    auto tuple = [&]() -> Result<PgCatalogTransaction::SequenceTuple> {
+      const auto id = VERIFY_RESULT(AdmitSequence(*req));
+      SCHECK(req->read_time() == 0, NotSupported, "Historical sequence reads are not supported");
+      return catalog_.transaction_->ReadSequence(id.database_oid, id.sequence_oid);
+    }();
+    if (tuple.ok()) {
+      resp->set_last_val(tuple->last_value);
+      resp->set_is_called(tuple->is_called);
+    }
+    Respond(ResultToStatus(tuple), resp, context);
+  }
+
+  void UpdateSequenceTuple(
+      const tserver::LWPgUpdateSequenceTupleRequestPB* req,
+      tserver::LWPgUpdateSequenceTupleResponsePB* resp, rpc::RpcContext context) override {
+    std::lock_guard lock(mutex_);
+    auto skipped = [&]() -> Result<bool> {
+      const auto id = VERIFY_RESULT(AdmitSequence(*req));
+      std::optional<PgCatalogTransaction::SequenceTuple> expected;
+      if (req->has_expected()) {
+        expected = PgCatalogTransaction::SequenceTuple{
+            req->expected_last_val(), req->expected_is_called()};
+      }
+      return catalog_.transaction_->UpdateSequence(
+          id.database_oid, id.sequence_oid, {req->last_val(), req->is_called()}, expected);
+    }();
+    if (skipped.ok()) resp->set_skipped(*skipped);
+    Respond(ResultToStatus(skipped), resp, context);
+  }
+
+  void FetchSequenceTuple(
+      const tserver::LWPgFetchSequenceTupleRequestPB* req,
+      tserver::LWPgFetchSequenceTupleResponsePB* resp, rpc::RpcContext context) override {
+    std::lock_guard lock(mutex_);
+    auto range = [&]() -> Result<std::pair<int64_t, int64_t>> {
+      const auto id = VERIFY_RESULT(AdmitSequence(*req));
+      return catalog_.transaction_->FetchSequence(
+          id.database_oid, id.sequence_oid, req->fetch_count(), req->inc_by(), req->min_value(),
+          req->max_value(), req->cycle());
+    }();
+    if (range.ok()) {
+      resp->set_first_value(range->first);
+      resp->set_last_value(range->second);
+    }
+    Respond(ResultToStatus(range), resp, context);
+  }
+
+  void DeleteSequenceTuple(
+      const tserver::LWPgDeleteSequenceTupleRequestPB* req,
+      tserver::LWPgDeleteSequenceTupleResponsePB* resp, rpc::RpcContext context) override {
+    std::lock_guard lock(mutex_);
+    auto status = [&]() -> Status {
+      const auto id = VERIFY_RESULT(AdmitSequence(*req, /* cleanup= */ true));
+      return catalog_.transaction_->DeleteSequence(id.database_oid, id.sequence_oid);
+    }();
+    Respond(status, resp, context);
+  }
+
+  // Post-commit DROP DATABASE cleanup targets another database; the store authorizes it only
+  // after that database is durably retired.
   void DeleteDBSequences(
       const tserver::LWPgDeleteDBSequencesRequestPB* req,
       tserver::LWPgDeleteDBSequencesResponsePB* resp, rpc::RpcContext context) override {
     std::lock_guard lock(mutex_);
-    // Sequence creation is rejected, so no sequence state can exist for this deferred cleanup.
-    Respond(
-        catalog_.transaction_ ? CheckSession(req->session_id())
-                              : STATUS(NotSupported, "Frozen catalog rejects sequence cleanup"),
-        resp, context);
+    auto status = [&]() -> Status {
+      SCHECK(catalog_.transaction_, NotSupported, "Frozen catalog rejects sequence cleanup");
+      RETURN_NOT_OK(ResultToStatus(SequenceSession(req->session_id())));
+      const auto database_oid = VERIFY_RESULT(NarrowOid(req->db_oid()));
+      return catalog_.transaction_->DeleteDatabaseSequences(database_oid);
+    }();
+    Respond(status, resp, context);
   }
 
   void CreateDatabase(
@@ -1760,7 +1890,7 @@ class ReadonlyPgServer::Impl : public pgwrapper::PgWrapperContext {
         process_guard_.owns_lock(), IllegalState,
         "Only one local runtime per process is supported");
     SCHECK(sql_port != 0, InvalidArgument, "SQL port must be explicit");
-    const auto marker = mode == CatalogMode::kFrozen ? kOwnerMarker : "yb-local-catalog-txn-v9\n";
+    const auto marker = mode == CatalogMode::kFrozen ? kOwnerMarker : "yb-local-catalog-txn-v10\n";
     const auto identity = std::string(marker) + VersionInfo::GetShortVersionString() + "\n" +
                           VERIFY_RESULT(SnapshotFingerprint(snapshot)) + "\n";
     RETURN_NOT_OK(directory_lock_.Acquire(directory, identity));

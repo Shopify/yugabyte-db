@@ -11,7 +11,9 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "yb/tablet/metadata.pb.h"
@@ -43,6 +45,28 @@ class PgCatalogTransaction {
   // after a durability failure. Application reads require a healthy transaction.
   Result<rocksdb::DB*> ReadDB(const TableId& table = "");
   Result<uint32_t> AllocateOid(uint32_t database_oid);
+  // Native YSQL sequence tuples are nontransactional and live outside the catalog overlay. Each
+  // change is synced before it returns and survives rollback; only the shared durability fence,
+  // not a logical catalog abort, rejects them. An I/O error leaves the outcome unknown and fences
+  // the store until reopen.
+  struct SequenceTuple {
+    int64_t last_value;
+    bool is_called;
+  };
+  Status InsertSequence(uint32_t database_oid, uint32_t sequence_oid, const SequenceTuple& value);
+  Result<SequenceTuple> ReadSequence(uint32_t database_oid, uint32_t sequence_oid);
+  // Returns true when skipped: no tuple, or the current tuple differs from expected.
+  Result<bool> UpdateSequence(
+      uint32_t database_oid, uint32_t sequence_oid, const SequenceTuple& value,
+      const std::optional<SequenceTuple>& expected);
+  // Returns the first and last value of a range that is fully reserved on disk.
+  Result<std::pair<int64_t, int64_t>> FetchSequence(
+      uint32_t database_oid, uint32_t sequence_oid, uint32_t fetch_count, int64_t increment,
+      int64_t min_value, int64_t max_value, bool cycle);
+  Status DeleteSequence(uint32_t database_oid, uint32_t sequence_oid);
+  // Post-commit DROP DATABASE callback. Only a durably retired database is accepted; commit and
+  // Open already clean up retired sequences, so this is an idempotent bounded sweep.
+  Status DeleteDatabaseSequences(uint32_t database_oid);
   // Clone committed built-in-template catalogs into the active transaction. The caller supplies
   // only nonshared system catalogs; SQL publishes pg_database and its version row in this batch.
   Status CreateDatabase(

@@ -24,6 +24,12 @@ message DatabasePB {
   required uint32 template_oid = 4;
 }
 
+// Native nontransactional sequence state, synced before a value or change is acknowledged.
+message SequencePB {
+  required int64 last_value = 1;
+  required bool is_called = 2;
+}
+
 // Separate native-intent component format, not the SQL runtime database catalog.
 message LocalTransactionPB {
   required TransactionMetadataPB metadata = 1;
