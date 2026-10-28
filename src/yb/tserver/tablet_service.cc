@@ -3242,9 +3242,12 @@ ConsensusServiceImpl::ConsensusServiceImpl(const scoped_refptr<MetricEntity>& me
     : ConsensusServiceIf(metric_entity),
       tablet_manager_(tablet_manager),
       messenger_(messenger),
+      // Same cgroup as the high-priority RPC pool, which runs UpdateConsensus and the serial
+      // envelope loop: moving follower Raft work here must not lower its QoS class.
       multi_raft_update_pool_(std::make_unique<rpc::ThreadPool>(rpc::ThreadPoolOptions {
         .name = "multi_raft_update",
         .max_workers = static_cast<size_t>(std::max(FLAGS_multi_raft_update_max_threads, 1)),
+        .cgroup = messenger->system_high_cgroup(),
         .metrics = {
           .queue_length_stats = nullptr,
           .queue_time_us_stats =

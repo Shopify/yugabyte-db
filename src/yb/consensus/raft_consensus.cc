@@ -1707,13 +1707,38 @@ class RaftConsensus::AsyncWriteWait : public std::enable_shared_from_this<AsyncW
   }
 
  private:
-  // Runs f on raft_notifications_pool. If the pool no longer accepts tasks, fails the wait on the
-  // current thread without running the post-durability steps.
-  template <class F>
-  void Post(F&& f) {
-    if (!consensus_->raft_notifications_pool_->EnqueueFunctor(std::forward<F>(f))) {
-      Finish(STATUS(Aborted, "Raft notifications pool is shutting down"));
+  // A step of the wait run on raft_notifications_pool. If the pool rejects the task, or accepts it
+  // and drops it while shutting down, Done fails the wait, without the post-durability steps, so
+  // the caller's callback still runs. The task runs in the cgroup of the messenger's
+  // high-priority pool, where Update() runs, whatever the pool's own cgroup is.
+  class Step : public rpc::ThreadPoolTask {
+   public:
+    Step(std::shared_ptr<AsyncWriteWait> wait, std::function<void()> run)
+        : wait_(std::move(wait)), run_(std::move(run)) {
+      set_cgroup(wait_->consensus_->peer_proxy_factory_->messenger()->system_high_cgroup());
     }
+
+    void Run() override {
+      ran_ = true;
+      run_();
+    }
+
+    void Done(const Status& status) override {
+      if (!ran_) {
+        wait_->Finish(status.ok() ? STATUS(Aborted, "Raft notifications task dropped") : status);
+      }
+      delete this;
+    }
+
+   private:
+    const std::shared_ptr<AsyncWriteWait> wait_;
+    const std::function<void()> run_;
+    bool ran_ = false;
+  };
+
+  // Runs f on raft_notifications_pool, see Step.
+  void Post(std::function<void()> f) {
+    consensus_->raft_notifications_pool_->Enqueue(new Step(shared_from_this(), std::move(f)));
   }
 
   void ScheduleTickUnlocked(CoarseTimePoint now) REQUIRES(mutex_) {

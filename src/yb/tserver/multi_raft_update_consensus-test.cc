@@ -37,6 +37,7 @@
 
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/rpc_controller.h"
+#include "yb/rpc/thread_pool.h"
 
 #include "yb/server/clock.h"
 
@@ -44,11 +45,13 @@
 #include "yb/tablet/tablet_peer.h"
 
 #include "yb/tserver/mini_tablet_server.h"
+#include "yb/tserver/tablet_service.h"
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/tablet_server-test-base.h"
 #include "yb/tserver/ts_tablet_manager.h"
 
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/cgroups.h"
 #include "yb/util/countdown_latch.h"
 #include "yb/util/metrics.h"
 #include "yb/util/scope_exit.h"
@@ -67,6 +70,7 @@ DECLARE_int32(multi_raft_update_max_threads);
 DECLARE_int32(raft_heartbeat_interval_ms);
 DECLARE_bool(use_preelection);
 
+METRIC_DECLARE_entity(server);
 METRIC_DECLARE_histogram(handler_latency_yb_consensus_ConsensusService_MultiRaftUpdateConsensus);
 METRIC_DECLARE_counter(multi_raft_update_deadline_responses);
 METRIC_DECLARE_counter(multi_raft_update_sub_requests_concurrent);
@@ -422,6 +426,21 @@ TEST_F(MultiRaftUpdateConsensusTest, ShutdownWhileWaitingForLog) {
       << envelope->resp.consensus_response(0).ShortDebugString();
   ASSERT_NO_FATALS(AssertSlotOk(envelope->resp.consensus_response(1), tablets_[1].last));
   thread_holder.JoinAll();
+}
+
+// A durability wait whose step the Raft notifications pool does not run still completes its
+// sub-request, with an error, long before the envelope deadline.
+TEST_F(MultiRaftUpdateConsensusTest, NotificationPoolShutdownCompletesWait) {
+  ASSERT_NO_FATALS(StartServer(1));
+  auto& tablet = tablets_[0];
+  SetSlowDisk(tablet, 1s);
+  auto envelope = SendAsync({Data(&tablet, 1, false)});
+  ASSERT_OK(WaitForLastReceived(tablet));
+  ASSERT_FALSE(envelope->finished());
+  mini_server_->server()->tablet_manager()->raft_notifications_pool()->Shutdown();
+  ASSERT_OK(Wait(envelope.get()));
+  ASSERT_LT(envelope->elapsed(), 5s);
+  ASSERT_NO_FATALS(AssertSlotError(envelope->resp.consensus_response(0), AppStatusPB::ABORTED));
 }
 
 // At the deadline the RPC is answered with the completed slots and TimedOut in the others. A
@@ -890,6 +909,25 @@ TEST_F(MultiRaftUpdateConsensusTest, PoolBackPressure) {
   resp = ASSERT_RESULT(Send({Data(&tablets_[1], 1, true), Data(&tablets_[2], 1, true)}));
   ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(0), tablets_[1].last));
   ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(1), tablets_[2].last));
+}
+
+// The multi_raft_update pool runs in the cgroup of the messenger's high-priority pool, where the
+// direct UpdateConsensus path runs, so that QoS treats follower Raft work the same on both paths.
+// The cgroup object is not backed by a cgroup file system; only its identity is checked (moving a
+// thread into it fails with a warning). tserver_cgroup_manager-test checks the real placement.
+TEST(MultiRaftUpdatePoolTest, SameCgroupAsHighPriorityPool) {
+  Cgroup root(nullptr, "");
+  Cgroup system_high(&root, "no-such-cgroup-multi-raft-update-test");
+  auto messenger = ASSERT_RESULT(
+      rpc::MessengerBuilder("multi-raft-update-pool-test").SetSystemHighCgroup(&system_high)
+          .Build());
+  auto shutdown_messenger = ScopeExit([&messenger] { messenger->Shutdown(); });
+  MetricRegistry registry;
+  auto entity = METRIC_ENTITY_server.Instantiate(&registry, "test");
+  ConsensusServiceImpl service(entity, /* tablet_manager= */ nullptr, messenger.get());
+  ASSERT_EQ(service.TEST_multi_raft_update_pool().options().cgroup, &system_high);
+  ASSERT_EQ(messenger->ThreadPool(rpc::ServicePriority::kHigh).options().cgroup, &system_high);
+  service.Shutdown();
 }
 
 } // namespace yb::tserver

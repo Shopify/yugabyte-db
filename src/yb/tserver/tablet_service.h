@@ -458,6 +458,10 @@ class ConsensusServiceImpl : public consensus::ConsensusServiceIf {
 
   void Shutdown() override;
 
+  const rpc::ThreadPool& TEST_multi_raft_update_pool() const {
+    return *multi_raft_update_pool_;
+  }
+
   void UpdateConsensus(const consensus::LWConsensusRequestPB *req,
                        consensus::LWConsensusResponsePB *resp,
                        rpc::RpcContext context) override;
