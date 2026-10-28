@@ -10,11 +10,13 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -28,8 +30,10 @@
 
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/countdown_latch.h"
+#include "yb/util/logging_test_util.h"
 #include "yb/util/metrics.h"
 #include "yb/util/test_macros.h"
+#include "yb/util/test_thread_holder.h"
 #include "yb/util/test_util.h"
 #include "yb/util/thread_pool.h"
 
@@ -114,6 +118,7 @@ struct TestCall {
   Status status;
   bool on_high_pool = false;
   std::thread::id thread_id;
+  std::atomic<int> num_callbacks{0};
   std::atomic<bool> done{false};
 };
 
@@ -156,6 +161,7 @@ class MultiRaftBatcherTest : public YBTest {
 
   ConsensusRequestPB MakeRequest(const std::string& tablet_id, size_t payload_bytes) {
     ConsensusRequestPB request;
+    request.set_dest_uuid("follower-1");
     request.set_tablet_id(tablet_id);
     request.set_caller_uuid(std::string(payload_bytes, 'x'));
     request.set_caller_term(1);
@@ -166,25 +172,39 @@ class MultiRaftBatcherTest : public YBTest {
     return MakeRequest(tablet_id, payload_bytes).ByteSizeLong();
   }
 
-  TestCall& Add(
-      const std::string& tablet_id, RequestKind kind, size_t payload_bytes = 100,
+  // Creates a call without adding it to the batcher.
+  TestCall& NewCall(
+      const std::string& tablet_id, size_t payload_bytes = 100,
       std::function<void()> on_callback = {}) {
     auto& call = *calls_.emplace_back(std::make_unique<TestCall>());
     call.tablet_id = tablet_id;
     call.request = MakeRequest(tablet_id, payload_bytes);
     call.on_callback = std::move(on_callback);
+    return call;
+  }
+
+  // Adds a call created by NewCall to the batcher. Safe to call from any thread.
+  void Submit(TestCall& call, RequestKind kind) {
     auto* high_pool = &messenger_->ThreadPool(rpc::ServicePriority::kHigh);
     call.handle = batcher_->AddRequestToBatch(
         &call.request, &call.response, [&call, high_pool](const Status& status) {
           call.status = status;
           call.on_high_pool = high_pool->OwnsThisThread();
           call.thread_id = std::this_thread::get_id();
+          ++call.num_callbacks;
           if (call.on_callback) {
             call.on_callback();
           }
           call.done.store(true, std::memory_order_release);
         },
         kind);
+  }
+
+  TestCall& Add(
+      const std::string& tablet_id, RequestKind kind, size_t payload_bytes = 100,
+      std::function<void()> on_callback = {}) {
+    auto& call = NewCall(tablet_id, payload_bytes, std::move(on_callback));
+    Submit(call, kind);
     return call;
   }
 
@@ -313,18 +333,26 @@ TEST_F(MultiRaftBatcherTest, DeadlineFlushWhileResponseOutstanding) {
   Complete(1);
 }
 
+// The deadline armed for a batch is cancelled when that batch is flushed another way, so it
+// cannot cut short the wait of the next pending batch, which arms its own.
 TEST_F(MultiRaftBatcherTest, ResponseFlushCancelsDeadline) {
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_flush_delay_ms) = 200;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_flush_delay_ms) = 1000;
   CreateBatcher();
   Add("t1", RequestKind::kData);
   Add("t2", RequestKind::kData);
   Complete(0);
   ASSERT_EQ(NumEnvelopes(), 2);
-  // A negative check: wait past the deadline and make sure it did not flush anything.
   SleepFor(500ms);
+  Add("t3", RequestKind::kData);
+  // A negative check: past t2's deadline, but before t3's.
+  SleepFor(700ms);
   ASSERT_EQ(NumEnvelopes(), 2);
   ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_deadline), 0);
+  ASSERT_OK(WaitFor([this] { return NumEnvelopes() == 3; }, 10s, "Deadline flush"));
+  ASSERT_EQ(GetEnvelope(2)->tablet_ids, Tablets({"t3"}));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_deadline), 1);
   Complete(1);
+  Complete(2);
 }
 
 TEST_F(MultiRaftBatcherTest, HeartbeatOnlyBatchDoesNotFlushEarly) {
@@ -368,6 +396,149 @@ TEST_F(MultiRaftBatcherTest, HeartbeatRidesDataFlush) {
   ASSERT_TRUE(d2.on_high_pool);
   ASSERT_OK(d2.status);
   ASSERT_EQ(d2.response.responder_uuid(), "t2-resp");
+}
+
+// A heartbeat parked behind an in-flight data envelope neither arms the data deadline nor is
+// response-clocked; it waits for the timer or rides the next data flush.
+TEST_F(MultiRaftBatcherTest, HeartbeatParkedBehindDataInFlightWaitsForTimer) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_flush_delay_ms) = 10;
+  CreateBatcher();
+  auto& d1 = Add("t1", RequestKind::kData);
+  auto& h2 = Add("t2", RequestKind::kHeartbeat);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  // A negative check: wait well past the data deadline.
+  SleepFor(200ms);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_deadline), 0);
+
+  Complete(0);
+  ASSERT_NO_FATALS(WaitDone(d1));
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_response_clocked), 0);
+  ASSERT_FALSE(IsDone(h2));
+
+  // With nothing in flight, the next data add goes out immediately and carries the heartbeat.
+  auto& d3 = Add("t3", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 2);
+  ASSERT_EQ(GetEnvelope(1)->tablet_ids, Tablets({"t2", "t3"}));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_immediate), 2);
+  Complete(1);
+  for (auto* call : {&h2, &d3}) {
+    ASSERT_NO_FATALS(WaitDone(*call));
+    ASSERT_OK(call->status);
+  }
+}
+
+// Sub-callbacks run outside the batcher lock and may add to the same batcher, as Raft peers do
+// when they send their next request. The response-clocked flush happens first, so a data re-add
+// waits behind it rather than going out immediately.
+TEST_F(MultiRaftBatcherTest, SubCallbackReAddsToBatcher) {
+  CreateBatcher();
+  auto& h1b = NewCall("t1b");
+  auto& d2b = NewCall("t2b");
+  auto& h1 = Add("t1", RequestKind::kHeartbeat, 100, [this, &h1b] {
+    Submit(h1b, RequestKind::kHeartbeat);
+  });
+  auto& d2 = Add("t2", RequestKind::kData, 100, [this, &d2b] {
+    Submit(d2b, RequestKind::kData);
+  });
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ASSERT_EQ(GetEnvelope(0)->tablet_ids, Tablets({"t1", "t2"}));
+  auto& d3 = Add("t3", RequestKind::kData);
+
+  // The heartbeat callback re-adds inline on this thread.
+  Complete(0);
+  ASSERT_TRUE(IsDone(h1));
+  ASSERT_NO_FATALS(WaitDone(d2));
+  ASSERT_EQ(NumEnvelopes(), 2);
+  ASSERT_EQ(GetEnvelope(1)->tablet_ids, Tablets({"t3"}));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_immediate), 1);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_response_clocked), 1);
+
+  // Both re-adds are pending behind the envelope carrying t3.
+  Complete(1);
+  ASSERT_NO_FATALS(WaitDone(d3));
+  ASSERT_EQ(NumEnvelopes(), 3);
+  ASSERT_EQ(GetEnvelope(2)->tablet_ids, Tablets({"t1b", "t2b"}));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_response_clocked), 2);
+  Complete(2);
+  for (auto* call : {&h1b, &d2b}) {
+    ASSERT_NO_FATALS(WaitDone(*call));
+    ASSERT_OK(call->status);
+    ASSERT_EQ(call->response.responder_uuid(), call->tablet_id + "-resp");
+  }
+}
+
+// Several threads add data and heartbeats while another completes envelopes as they appear,
+// with the deadline and timer flushes active. Every request is sent exactly once and every
+// callback runs exactly once with its own response.
+TEST_F(MultiRaftBatcherTest, ConcurrentAdds) {
+  constexpr int kThreads = 4;
+  constexpr int kRequestsPerThread = 300;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_flush_delay_ms) = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_heartbeat_interval_ms) = 5;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_batch_size) = 8;
+  CreateBatcher();
+
+  std::vector<std::vector<TestCall*>> per_thread(kThreads);
+  for (int t = 0; t != kThreads; ++t) {
+    for (int i = 0; i != kRequestsPerThread; ++i) {
+      per_thread[t].push_back(&NewCall(Format("t$0-$1", t, i)));
+    }
+  }
+  const auto total = kThreads * kRequestsPerThread;
+
+  std::atomic<int> adders_running{kThreads};
+  TestThreadHolder holder;
+  for (int t = 0; t != kThreads; ++t) {
+    holder.AddThread([this, &calls = per_thread[t], &adders_running] {
+      int i = 0;
+      for (auto* call : calls) {
+        Submit(*call, i++ % 5 == 0 ? RequestKind::kHeartbeat : RequestKind::kData);
+        call->handle.CallStateDebugString();
+        call->handle.MarkCallAsFailed();
+      }
+      --adders_running;
+    });
+  }
+  std::atomic<bool> completer_failed{false};
+  holder.AddThread([this, &adders_running, &completer_failed] {
+    size_t next = 0;
+    const auto deadline = CoarseMonoClock::Now() + 60s;
+    for (;;) {
+      while (next < NumEnvelopes()) {
+        Complete(next++);
+      }
+      if (adders_running.load() == 0 && std::all_of(
+              calls_.begin(), calls_.end(), [this](const auto& call) { return IsDone(*call); })) {
+        return;
+      }
+      if (CoarseMonoClock::Now() > deadline) {
+        completer_failed = true;
+        return;
+      }
+      std::this_thread::sleep_for(1ms);
+    }
+  });
+  holder.JoinAll();
+  ASSERT_FALSE(completer_failed.load());
+
+  std::unordered_map<std::string, int> sent;
+  for (size_t i = 0; i != NumEnvelopes(); ++i) {
+    for (const auto& tablet_id : GetEnvelope(i)->tablet_ids) {
+      ++sent[tablet_id];
+    }
+  }
+  ASSERT_EQ(sent.size(), static_cast<size_t>(total));
+  for (const auto& call : calls_) {
+    ASSERT_EQ(sent[call->tablet_id], 1) << call->tablet_id;
+    ASSERT_EQ(call->num_callbacks.load(), 1) << call->tablet_id;
+    ASSERT_OK(call->status);
+    ASSERT_EQ(call->response.responder_uuid(), call->tablet_id + "-resp");
+  }
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_heartbeat_sub_requests) +
+            CounterValue(METRIC_multi_raft_data_sub_requests), total);
+  ASSERT_EQ(running_calls_.load(), 0);
 }
 
 TEST_F(MultiRaftBatcherTest, ByteCapSplitsBeforeOverLimitAdd) {
@@ -636,12 +807,14 @@ TEST_F(MultiRaftBatcherTest, ResponseCountMismatchFailsAllCallbacks) {
   CreateBatcher();
   auto& h1 = Add("t1", RequestKind::kHeartbeat);
   auto& d2 = Add("t2", RequestKind::kData);
+  StringWaiterLogSink log_waiter("1 responses for 2 requests, destination: follower-1");
   Complete(0, Status::OK(), /* num_responses= */ 1);
   for (auto* call : {&h1, &d2}) {
     ASSERT_NO_FATALS(WaitDone(*call));
     ASSERT_TRUE(call->status.IsIllegalState()) << call->status;
     ASSERT_FALSE(call->response.has_responder_uuid());
   }
+  ASSERT_TRUE(log_waiter.IsEventOccurred());
 }
 
 TEST_F(MultiRaftBatcherTest, EnqueueFailureRunsSubCallbackInline) {

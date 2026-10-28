@@ -27,6 +27,7 @@
 
 #include "yb/util/dist_trace.h"
 #include "yb/util/flags.h"
+#include "yb/util/logging.h"
 #include "yb/util/metrics.h"
 #include "yb/util/size_literals.h"
 #include "yb/util/thread_pool.h"
@@ -501,6 +502,10 @@ void MultiRaftBatcher::DispatchSubCallbacks(
     status = STATUS_FORMAT(
         IllegalState, "MultiRaft response has $0 responses for $1 requests",
         data->batch_res.consensus_response_size(), num_requests);
+    // Every sub-request in an envelope goes to the same server.
+    YB_LOG_EVERY_N_SECS(ERROR, 1)
+        << status << ", destination: "
+        << data->batch_req.consensus_request(0).dest_uuid();
   }
   // Each data sub-callback gets its own task because it does a full Raft response round
   // (majority tracking and building the next request). Heartbeat sub-callbacks are cheap and
