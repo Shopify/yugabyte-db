@@ -57,7 +57,7 @@ Status PgDmlWrite::Prepare(
   write_req_->set_schema_version(target_->schema_version());
   write_req_->set_stmt_id(reinterpret_cast<uint64_t>(write_req_.get()));
   write_req_->set_metrics_capture(pg_session_->metrics().metrics_capture());
-  ApplySkipIntentsOptimizationInfo(skip_intents_info, *write_req_);
+  RETURN_NOT_OK(ApplySkipIntentsOptimizationInfo(skip_intents_info, *write_req_));
 
   doc_op_ = std::make_shared<PgDocWriteOp>(pg_session_, &target_, std::move(write_op));
   PrepareColumns();
@@ -153,6 +153,7 @@ Status PgDmlWrite::Exec(ForceNonBufferable force_non_bufferable) {
 
     // Save the number of rows affected by the op.
     rows_affected_count_ = VERIFY_RESULT(doc_op_->GetRowsAffectedCount());
+    on_conflict_outcome_ = VERIFY_RESULT(doc_op_->GetOnConflictOutcome());
   }
 
   return Status::OK();

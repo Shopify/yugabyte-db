@@ -17,6 +17,7 @@ import (
 	"github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/config"
 	log "github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/logging"
 	"github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/preflight/checks"
+	"github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/ybactlstate"
 )
 
 var (
@@ -52,6 +53,8 @@ func initAfterFlagsParsed(cmdName string) {
 
 	// Load the config after confirming config file
 	common.InitViper()
+	// Before anything uses TLS. The state file covers an install whose yba-ctl.yml was edited.
+	common.ApplyFipsMode(viper.GetBool("fips.enabled") || ybactlstate.StoredFipsEnabled())
 
 	// Replicated migration handles config and root checks on its own.
 	// License does not need any config, so skip for now
@@ -135,6 +138,8 @@ func handleRootCheck(cmdName string) {
 			log.Warn("Failed to set as_root in config file, please set it manually")
 			log.Fatal("Failed to set as_root in config file: " + err.Error())
 		}
+		// Reload so the as_root state migration copies the value just written, not the unset one.
+		common.InitViper()
 		return
 	} else if user.Uid == "0" && !viper.GetBool("as_root") {
 		log.Fatal("running as root user with 'as_root' set to false is not supported")

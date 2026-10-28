@@ -5,22 +5,38 @@ package com.yugabyte.yw.common.pa;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.*;
 import static org.junit.Assert.assertThrows;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.verify;
 
 import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.operator.utils.KubernetesEnvironmentVariables;
+import com.yugabyte.yw.metrics.MetricQueryResponse;
+import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.PACollector;
+import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.filters.PACollectorFilter;
+import com.yugabyte.yw.models.helpers.NodeDetails;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import junitparams.JUnitParamsRunner;
 import okhttp3.HttpUrl;
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
+import okhttp3.mockwebserver.RecordedRequest;
+import org.apache.commons.lang3.tuple.ImmutablePair;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 import play.libs.Json;
 
 @RunWith(JUnitParamsRunner.class)
@@ -168,6 +184,74 @@ public class PerfAdvisorServiceTest extends FakeDBApplication {
     }
   }
 
+  @Test
+  public void testSyncActiveTableMetricsSendsTheUniversesSetting() throws Exception {
+    try (MockWebServer server = new MockWebServer()) {
+      server.start();
+      Universe universe = registeredUniverse(server);
+      // PA has it on; the universe's runtime flag is at its default, off.
+      server.enqueue(new MockResponse().setBody(universeMetadataJson(universe, true)));
+      server.enqueue(
+          new MockResponse()
+              .setBody(Json.stringify(Json.toJson(universeMetadata(universe, false)))));
+
+      perfAdvisorService.syncActiveTableMetrics(universe);
+
+      server.takeRequest(); // registering the collector
+      assertThat(server.takeRequest().getMethod(), equalTo("GET"));
+      RecordedRequest put = server.takeRequest();
+      assertThat(put.getMethod(), equalTo("PUT"));
+      assertThat(
+          Json.parse(put.getBody().readUtf8()).get("activeTableMetricsEnabled").asBoolean(),
+          equalTo(false));
+    }
+  }
+
+  @Test
+  public void testSyncActiveTableMetricsSkipsAnUnchangedSetting() throws Exception {
+    try (MockWebServer server = new MockWebServer()) {
+      server.start();
+      Universe universe = registeredUniverse(server);
+      server.enqueue(new MockResponse().setBody(universeMetadataJson(universe, false)));
+
+      perfAdvisorService.syncActiveTableMetrics(universe);
+
+      assertThat(server.getRequestCount(), equalTo(2));
+    }
+  }
+
+  @Test
+  public void testSyncActiveTableMetricsIgnoresUnregisteredUniverses() {
+    perfAdvisorService.syncActiveTableMetrics(ModelFactory.createUniverse());
+  }
+
+  /** A universe registered with a collector served by {@code server}. */
+  private Universe registeredUniverse(MockWebServer server) {
+    HttpUrl baseUrl = server.url("/");
+    PACollector platform =
+        createTestPlatform(baseUrl.scheme() + "://" + baseUrl.host() + ":" + baseUrl.port());
+    server.enqueue(new MockResponse().setBody(convertToCustomerMetadata(platform)));
+    perfAdvisorService.save(platform, false);
+    Universe universe = ModelFactory.createUniverse(Customer.get(defaultCustomerUuid).getId());
+    return Universe.saveDetails(
+        universe.getUniverseUUID(),
+        u -> u.getUniverseDetails().setPaCollectorUuid(platform.getUuid()));
+  }
+
+  /** PA's answer to a metadata lookup: a list with the universe's record. */
+  private String universeMetadataJson(Universe universe, boolean activeTableMetricsEnabled) {
+    return Json.stringify(
+        Json.toJson(List.of(universeMetadata(universe, activeTableMetricsEnabled))));
+  }
+
+  private PerfAdvisorClient.UniverseMetadata universeMetadata(
+      Universe universe, boolean activeTableMetricsEnabled) {
+    return new PerfAdvisorClient.UniverseMetadata()
+        .setId(universe.getUniverseUUID())
+        .setCustomerId(defaultCustomerUuid)
+        .setActiveTableMetricsEnabled(activeTableMetricsEnabled);
+  }
+
   private PACollector createTestPlatform(String name) {
     return createTestPlatform(defaultCustomerUuid, name);
   }
@@ -192,5 +276,108 @@ public class PerfAdvisorServiceTest extends FakeDBApplication {
                 .setPlatformUrl(platform.getYbaUrl())
                 .setMetricsUrl(platform.getMetricsUrl())
                 .setMetricsScrapePeriodSec(platform.getMetricsScrapePeriodSecs())));
+  }
+
+  private Universe universeWithTservers(int count) {
+    Universe universe = ModelFactory.createUniverse();
+    return Universe.saveDetails(
+        universe.getUniverseUUID(),
+        u -> {
+          u.getUniverseDetails().nodeDetailsSet.clear();
+          for (int i = 0; i < count; i++) {
+            NodeDetails node = new NodeDetails();
+            node.nodeName = "n" + i;
+            node.isTserver = true;
+            u.getUniverseDetails().nodeDetailsSet.add(node);
+          }
+        });
+  }
+
+  /** Answers each Prometheus query with the byte value of the first matching container. */
+  private void mockContainerMemory(Map<String, long[]> limitAndUsedByContainer) {
+    doAnswer(
+            invocation -> {
+              String query = invocation.getArgument(0);
+              for (Map.Entry<String, long[]> e : limitAndUsedByContainer.entrySet()) {
+                if (query.contains("container_name=\"" + e.getKey() + "\"")) {
+                  long bytes = query.contains("working_set") ? e.getValue()[1] : e.getValue()[0];
+                  MetricQueryResponse.Entry entry = new MetricQueryResponse.Entry();
+                  entry.values = new ArrayList<>(List.of(ImmutablePair.of(0.0, (double) bytes)));
+                  return new ArrayList<>(List.of(entry));
+                }
+              }
+              return new ArrayList<>();
+            })
+        .when(mockMetricQueryHelper)
+        .queryDirect(anyString());
+  }
+
+  private MockedStatic<KubernetesEnvironmentVariables> mockYugawarePod() {
+    MockedStatic<KubernetesEnvironmentVariables> env =
+        Mockito.mockStatic(KubernetesEnvironmentVariables.class);
+    env.when(KubernetesEnvironmentVariables::isYbaRunningInKubernetes).thenReturn(true);
+    env.when(KubernetesEnvironmentVariables::getPodName).thenReturn("yb-demo-yugaware-0");
+    env.when(KubernetesEnvironmentVariables::getPodNamespace).thenReturn("yb-platform");
+    return env;
+  }
+
+  @Test
+  public void testK8sCollectorBudgetCheckedOnPerfAdvisorContainer() {
+    Universe universe = universeWithTservers(3);
+    long mb = 1024 * 1024;
+    mockContainerMemory(Map.of("perf-advisor", new long[] {512 * mb, 400 * mb}));
+    try (MockedStatic<KubernetesEnvironmentVariables> env = mockYugawarePod()) {
+      PlatformServiceException e =
+          assertThrows(
+              PlatformServiceException.class,
+              () ->
+                  perfAdvisorService.validatePerfAdvisorMemory(
+                      universe,
+                      PerfAdvisorService.PaMemoryMode.NONE,
+                      PerfAdvisorService.PaMemoryMode.COLLECTOR_ONLY,
+                      "Cannot register"));
+      assertThat(e.getMessage(), containsString("in container perf-advisor"));
+    }
+    verify(mockMetricQueryHelper, atLeastOnce())
+        .queryDirect(
+            argThat(
+                q ->
+                    q.contains("pod_name=~\"yb-demo-main-.*\"")
+                        && q.contains("container_name=\"perf-advisor\"")
+                        && q.contains("namespace=\"yb-platform\"")));
+  }
+
+  @Test
+  public void testK8sCollectorCheckSkippedWithoutMetrics() {
+    Universe universe = universeWithTservers(3);
+    mockContainerMemory(Map.of());
+    try (MockedStatic<KubernetesEnvironmentVariables> env = mockYugawarePod()) {
+      perfAdvisorService.validatePerfAdvisorMemory(
+          universe,
+          PerfAdvisorService.PaMemoryMode.NONE,
+          PerfAdvisorService.PaMemoryMode.COLLECTOR_ONLY,
+          "Cannot register");
+    }
+  }
+
+  @Test
+  public void testK8sPrometheusBudgetStillRequiresMetrics() {
+    Universe universe = universeWithTservers(3);
+    long mb = 1024 * 1024;
+    mockContainerMemory(Map.of("perf-advisor", new long[] {4096 * mb, 100 * mb}));
+    try (MockedStatic<KubernetesEnvironmentVariables> env = mockYugawarePod()) {
+      PlatformServiceException e =
+          assertThrows(
+              PlatformServiceException.class,
+              () ->
+                  perfAdvisorService.validatePerfAdvisorMemory(
+                      universe,
+                      PerfAdvisorService.PaMemoryMode.NONE,
+                      PerfAdvisorService.PaMemoryMode.ADVANCED,
+                      "Cannot register"));
+      assertThat(
+          e.getMessage(), containsString("Could not determine available memory for container"));
+      assertThat(e.getMessage(), containsString("prometheus"));
+    }
   }
 }

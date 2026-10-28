@@ -87,6 +87,10 @@ class PgSession final : public std::enable_shared_from_this<PgSession> {
   void ResetCatalogReadPoint();
   [[nodiscard]] const ReadHybridTime& catalog_read_time() const { return catalog_read_time_; }
 
+  void SetHistoricalReadContext(
+      const ReadHybridTime& read_time, std::string transaction_id);
+  void ResetHistoricalReadContext();
+
   //------------------------------------------------------------------------------------------------
   // Operations on Session.
   //------------------------------------------------------------------------------------------------
@@ -151,6 +155,14 @@ class PgSession final : public std::enable_shared_from_this<PgSession> {
     uint32_t key_group;
     std::string key_value;
     std::optional<uint32_t> lifetime_threshold_ms;
+    // Catalog version the response is cached at, for the tserver to record. Already inside
+    // key_value, but only as bytes it cannot interpret.
+    uint64_t catalog_version;
+    // Do not fill on a miss; see CachingInfoPB.lookup_only.
+    bool lookup_only;
+    // Last request of a connection start's prefetch; see
+    // CachingInfoPB.completes_connection_prefetch.
+    bool completes_connection_prefetch;
   };
 
   Result<PerformFuture> RunAsync(
@@ -189,7 +201,7 @@ class PgSession final : public std::enable_shared_from_this<PgSession> {
 
   Status SetupPerformOptionsForDdl(tserver::PgPerformOptionsPB* options);
 
-  void SetupDeferReadPointOptionForSeparateDdlTxn(tserver::PgPerformOptionsPB* options) const;
+  void SetupPerformOptionsForSeparateDdlTxn(tserver::PgPerformOptionsPB* options) const;
 
   void SetTransactionHasWrites();
   Result<bool> CurrentTransactionUsesFastPath() const;
@@ -201,7 +213,7 @@ class PgSession final : public std::enable_shared_from_this<PgSession> {
 
   PgDocMetrics& metrics() { return metrics_; }
 
-  [[nodiscard]] PgWaitEventWatcher StartWaitEvent(ash::WaitStateCode wait_event);
+  [[nodiscard]] PgWaitEventWatcher StartWaitEvent(ash::WaitStateCode wait_event, uint32_t aux);
 
   Status AcquireAdvisoryLock(
       const YbcAdvisoryLockId& lock_id, YbcAdvisoryLockMode mode, bool wait, bool session);
@@ -249,7 +261,8 @@ class PgSession final : public std::enable_shared_from_this<PgSession> {
 
   NonTransactionalWrites OpsHaveNonTransactionalWrites(const PgsqlOps& operations) const;
 
-  Status SetReadTimeIfPresent(const PgsqlOps& operations, tserver::PgPerformOptionsPB& options);
+  Status SetReadTimeIfPresent(
+      const PgsqlOps& operations, bool has_catalog_ops, tserver::PgPerformOptionsPB& options);
   Status CheckConflictWithYbReadTime(const PgsqlOps& operations);
 
   template<class Generator>
@@ -286,6 +299,12 @@ class PgSession final : public std::enable_shared_from_this<PgSession> {
 
   ReadHybridTime catalog_read_time_;
 
+  struct HistoricalReadContext {
+    ReadHybridTime read_time;
+    std::string transaction_id;
+  };
+  std::optional<HistoricalReadContext> historical_read_context_;
+
   // Execution status.
   Status status_;
   std::string errmsg_;
@@ -320,7 +339,7 @@ Status SetupPerformOptionsForDdlIfNeeded(PgSession& session, PB& req) {
   if (req.use_regular_transaction_block()) {
     return session.SetupPerformOptionsForDdl(req.mutable_options());
   }
-  session.SetupDeferReadPointOptionForSeparateDdlTxn(req.mutable_options());
+  session.SetupPerformOptionsForSeparateDdlTxn(req.mutable_options());
   return Status::OK();
 }
 

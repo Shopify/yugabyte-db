@@ -66,9 +66,9 @@ To create a large number of client connections, ensure that "SHMMNI" (the maximu
 To enable built-in connection pooling for universes deployed using YugabyteDB Anywhere:
 
 - Turn on the **Connection pooling** option when creating a universe. Refer to [Create a multi-zone universe](../../../yugabyte-platform/create-deployments/create-universe-multi-zone/#advanced-configuration).
-- Edit connection pooling on an existing universe. Refer to [Edit connection pooling](../../../yugabyte-platform/manage-deployments/edit-universe/#edit-connection-pooling).
+- Edit connection pooling on an existing universe. Refer to [Edit connection pooling](../../../yugabyte-platform/scale-deployments/edit-config-flags/#connection-pooling).
 
-Note that when managing universes using YugabyteDB Anywhere, do not set the following flags manually: `enable_ysql_conn_mgr`, `ysql_conn_mgr_port`, or `pgsql_proxy_bind_address`. To customize other [Connection Manager settings](#configure), use [Edit configuration flags](../../../yugabyte-platform/manage-deployments/edit-config-flags/#connection-pooling-flags) (**Actions > Edit Flags**).
+Note that when managing universes using YugabyteDB Anywhere, do not set the following flags manually: `enable_ysql_conn_mgr`, `ysql_conn_mgr_port`, or `pgsql_proxy_bind_address`. To customize other [Connection Manager settings](#configure), use [Edit configuration flags](../../../yugabyte-platform/manage-deployments/edit-config-flags/#modify-configuration-flags) (**Actions > Edit Flags**).
 
 **Connect**
 
@@ -112,7 +112,7 @@ The following table describes YB-TServer flags related to YSQL Connection Manage
 | ysql_conn_mgr_superuser_sticky | Make superuser connections sticky.<br>Default: true |
 | ysql_conn_mgr_port | YSQL Connection Manager port to which clients can connect. This must be different from the PostgreSQL port set via `pgsql_proxy_bind_address`.<br>Default: 5433 |
 | ysql_conn_mgr_server_lifetime | The maximum duration (in seconds) that a backend PostgreSQL connection managed by YSQL Connection Manager can remain open after creation.<br>Default: 3600 |
-| ysql_conn_mgr_log_settings | Comma-separated list of log settings for YSQL Connection Manger. Can include 'log_debug', 'log_config', 'log_session', 'log_query', and 'log_stats'.<br>Default: "" |
+| ysql_conn_mgr_log_settings | Comma-separated list of log settings for YSQL Connection Manager, which may include `log_debug`, `log_session`, `log_query`, and `log_stats`. Only the log settings present in this string are enabled; omitted settings remain disabled. `log_config` is accepted for backward compatibility but has no effect, as config logging is always on.<br>Default: "" |
 | ysql_conn_mgr_log_max_size | Maximum YSQL Connection Manager log size (in bytes) after which the log file is rolled over. Set to 0 to disable size-based rollover.<br>Default: 0 |
 | ysql_conn_mgr_log_rotate_interval | Duration (in seconds) after which the YSQL Connection Manager log file is rolled over. Set to 0 to disable time-based rollover.<br>Default: 0 |
 | ysql_conn_mgr_use_auth_backend | When set to true ("auth backend mode"), each incoming authentication request is handled by a freshly spawned postgres backend. Set this parameter to false to use an authentication passthrough mechanism, where backends from a pool of "control backends" are reused for all authentication requests; this can potentially reduce new connection acquisition latency. Contact {{% support-general %}} about whether setting this parameter to false is recommended for your workload.<br>Default: true |
@@ -280,6 +280,7 @@ Independent of the adoption strategy, the `ysql_conn_mgr_alter_guc_stale_backend
 ## Limitations
 
 - YSQL Connection Manager can route up to 10,000 connection pools. This includes pools corresponding to dropped users and databases.
+- After a role is dropped, the first statement in any of its existing sessions that looks up the role (for example, `SELECT current_user`) fails with `invalid role OID`, and YSQL Connection Manager then disconnects all sessions of that role connected through the same node. It also disconnects them if it needs to open a new backend for the role, for example, when concurrent queries exceed the number of open backends. Until one of these happens, the sessions keep working. Disconnected sessions fail with errors such as `remote server read/write error` or `failed to get remote server connection`. In PostgreSQL, such sessions stay connected and only statements that look up the role fail. To avoid these errors, disconnect clients using a role before dropping it. {{<issue 35643>}}
 - Prepared statements may be visible to other sessions in the same connection pool. {{<issue 24652>}}
 - With `ysql_conn_mgr_enable_prep_stmt_close` disabled (not recommended), DEALLOCATE/DEALLOCATE ALL and protocol-level Close handling can result in unexpected behavior. {{<issue 24653>}}
 - Currently, you can't apply custom configurations to individual pools. The YSQL Connection Manager configuration applies to all pools.

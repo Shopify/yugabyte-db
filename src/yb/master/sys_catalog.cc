@@ -80,6 +80,7 @@
 #include "yb/master/master_snapshot_coordinator.h"
 #include "yb/master/master_util.h"
 #include "yb/master/sys_catalog_writer.h"
+#include "yb/master/xcluster/xcluster_manager.h"
 #include "yb/master/ysql/ysql_manager_if.h"
 
 #include "yb/qlexpr/index.h"
@@ -88,6 +89,7 @@
 #include "yb/rpc/thread_pool.h"
 
 #include "yb/tablet/operations/change_metadata_operation.h"
+#include "yb/tablet/persistence_gate.h"
 #include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_bootstrap_if.h"
 #include "yb/tablet/tablet_metadata.h"
@@ -124,7 +126,6 @@ using yb::consensus::RaftConfigPB;
 using yb::consensus::RaftPeerPB;
 using yb::log::Log;
 using yb::tserver::WriteResponsePB;
-using strings::Substitute;
 using yb::consensus::StateChangeContext;
 using yb::consensus::StateChangeReason;
 
@@ -364,7 +365,7 @@ Status SysCatalogTable::Load(FsManager* fs_manager) {
       return STATUS(IllegalState, "Loaded consesnsus metadata, but peer did not have a uuid");
     }
     if (peer.permanent_uuid() != fs_manager->uuid()) {
-      return STATUS(IllegalState, Substitute(
+      return STATUS(IllegalState, Format(
           "Loaded consensus metadata, but peer uuid ($0) was different than our uuid ($1)",
           peer.permanent_uuid(), fs_manager->uuid()));
     }
@@ -551,14 +552,14 @@ void SysCatalogTable::SysCatalogStateChanged(
       WARN_NOT_OK(GetRaftConfigMember(context->change_record.old_config(),
                                       context->remove_uuid,
                                       &peer),
-                  Substitute("Could not find uuid=$0 in config.", context->remove_uuid));
+                  Format("Could not find uuid=$0 in config.", context->remove_uuid));
       WARN_NOT_OK(
           inform_removed_master_pool_->SubmitFunc(
               [this, host_port = DesiredHostPort(peer, master_->MakeCloudInfoPB())]() {
             WARN_NOT_OK(master_->InformRemovedMaster(host_port),
                         "Failed to inform removed master " + host_port.ShortDebugString());
           }),
-          Substitute("Error submitting removal task for uuid=$0", context->remove_uuid));
+          Format("Error submitting removal task for uuid=$0", context->remove_uuid));
     }
   } else {
     VLOG(2) << "Reason '" << context->ToString() << "' provided in state change context, "
@@ -595,13 +596,26 @@ void SysCatalogTable::SetupTabletPeer(const scoped_refptr<tablet::RaftGroupMetad
                                                                       &master_->proxy_cache(),
                                                                       local_peer_pb_.cloud_info());
 
+  if (!persistence_gate_) {
+    // With the op's term: a catalog write admitted while this master was ready in an earlier term
+    // can be appended in a later one before that term's catalog load has refreshed the map.  Such
+    // a write gets LeaderNotReadyToServe, which the client retries.
+    persistence_gate_ = std::make_unique<tablet::PersistenceGate>(
+        [xcluster_manager = master_->catalog_manager_impl()->GetXClusterManagerImpl()](
+            int64_t op_term, uint32_t database_oid) {
+          return xcluster_manager->GetPersistenceBlockedThrough(op_term, database_oid);
+        },
+        metric_entity_);
+  }
+
   // TODO: handle crash mid-creation of tablet? do we ever end up with a
   // partially created tablet here?
   auto tablet_peer = std::make_shared<tablet::TabletPeer>(
       metadata, local_peer_pb_, scoped_refptr<server::Clock>(master_->clock()),
       metadata->fs_manager()->uuid(),
       Bind(&SysCatalogTable::SysCatalogStateChanged, Unretained(this), metadata->raft_group_id()),
-      metric_registry_, nullptr /* tablet_splitter */, master_->client_future());
+      metric_registry_, /*tablet_splitter=*/nullptr, persistence_gate_.get(),
+      master_->client_future());
 
   std::atomic_store(&tablet_peer_, tablet_peer);
 }
@@ -676,8 +690,10 @@ Status SysCatalogTable::OpenTablet(const scoped_refptr<tablet::RaftGroupMetadata
       // We won't be doing full compactions on the catalog tablet.
       .full_compaction_pool = nullptr,
       .admin_triggered_compaction_pool = nullptr,
+      .intent_cleanup_pool = raft_pool(),
       // We don't support splitting the catalog tablet, this field is unneeded.
       .post_split_compaction_added = nullptr,
+      .tier_migration_hooks = nullptr,
       // Metadata cache is not used on master.
       .metadata_cache = nullptr,
   };
@@ -728,10 +744,10 @@ Status SysCatalogTable::OpenTablet(const scoped_refptr<tablet::RaftGroupMetadata
 }
 
 std::string SysCatalogTable::LogPrefix() const {
-  return Substitute("T $0 P $1 [$2]: ",
-                    tablet_peer()->tablet_id(),
-                    tablet_peer()->permanent_uuid(),
-                    table_name());
+  return Format("T $0 P $1 [$2]: ",
+                tablet_peer()->tablet_id(),
+                tablet_peer()->permanent_uuid(),
+                table_name());
 }
 
 Status SysCatalogTable::WaitUntilRunning() {
@@ -933,6 +949,7 @@ Status SysCatalogTable::Visit(VisitorBase* visitor) {
   }));
 
   auto duration = CoarseMonoClock::Now() - start;
+  std::lock_guard metrics_lock(visitor_duration_metrics_mutex_);
   string id = Format("num_entries_with_type_$0_loaded", std::to_string(visitor->entry_type()));
   if (visitor_duration_metrics_.find(id) == visitor_duration_metrics_.end()) {
     string description = id + " metric for SysCatalogTable::Visit";
@@ -960,7 +977,8 @@ Status SysCatalogTable::Visit(VisitorBase* visitor) {
 }
 
 Status SysCatalogTable::ReadWithRestarts(
-    const ReadRestartFn& read_fn, tablet::RequireLease require_lease) const {
+    const ReadRestartFn& read_fn, tablet::RequireLease require_lease,
+    HybridTime* out_read_ht) const {
   ReadHybridTime read_time;
   auto tablet = tablet_peer()->shared_tablet_maybe_null();
   if (!tablet) {
@@ -983,6 +1001,9 @@ Status SysCatalogTable::ReadWithRestarts(
     }
     RETURN_NOT_OK(read_fn(read_time, &read_restart_ht));
   } while (read_restart_ht.is_valid());
+  if (out_read_ht) {
+    *out_read_ht = read_time.read;
+  }
   return Status::OK();
 }
 
@@ -1005,11 +1026,12 @@ Status SysCatalogTable::ReadYsqlDBCatalogVersion(
 }
 
 Status SysCatalogTable::ReadYsqlAllDBCatalogVersions(
-    const TableId& ysql_catalog_table_id, DbOidToCatalogVersionMap* versions) {
+    const TableId& ysql_catalog_table_id, DbOidToCatalogVersionMap* versions,
+    HybridTime* out_read_ht) {
   TRACE_EVENT0("master", "ReadYsqlAllDBCatalogVersions");
   return ReadYsqlDBCatalogVersionImpl(
       ysql_catalog_table_id, kInvalidOid, /*catalog_version=*/nullptr,
-      /*last_breaking_version=*/nullptr, versions);
+      /*last_breaking_version=*/nullptr, versions, out_read_ht);
 }
 
 Status SysCatalogTable::ReadYsqlDBCatalogVersionImpl(
@@ -1017,14 +1039,16 @@ Status SysCatalogTable::ReadYsqlDBCatalogVersionImpl(
     uint32_t db_oid,
     uint64_t* catalog_version,
     uint64_t* last_breaking_version,
-    DbOidToCatalogVersionMap* versions) {
+    DbOidToCatalogVersionMap* versions,
+    HybridTime* out_read_ht) {
   return ReadWithRestarts(
       [this, ysql_catalog_table_id, db_oid, catalog_version, last_breaking_version, versions](
           const ReadHybridTime& read_ht, HybridTime* read_restart_ht) -> Status {
         return SysCatalogTable::ReadYsqlDBCatalogVersionImplWithReadTime(
             ysql_catalog_table_id, db_oid, read_ht, read_restart_ht, catalog_version,
             last_breaking_version, versions);
-      });
+      },
+      tablet::RequireLease::kTrue, out_read_ht);
 }
 
 Status SysCatalogTable::ReadYsqlDBCatalogVersionImplWithReadTime(

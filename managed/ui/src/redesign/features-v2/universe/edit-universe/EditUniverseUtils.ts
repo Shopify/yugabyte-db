@@ -2,6 +2,7 @@ import { CloudType, Region } from '@app/redesign/helpers/dtos';
 import type { K8NodeSpec } from '@app/redesign/features/universe/universe-form/utils/dto';
 import { filter, isEmpty, keys, some } from 'lodash';
 import { useContext } from 'react';
+import { useTranslation } from 'react-i18next';
 import { TFunction } from 'i18next';
 import {
   ClusterGFlags,
@@ -14,13 +15,14 @@ import {
   PlacementRegion,
   Universe
 } from '@app/v2/api/yugabyteDBAnywhereV2APIs.schemas';
+
 import {
-  AWS_CLOUD_OPTION,
-  AZURE_CLOUD_OPTION,
-  GCP_CLOUD_OPTION,
-  K8S_CLOUD_OPTION,
-  OCI_CLOUD_OPTION,
-  ON_PREM_CLOUD_OPTION
+  AZURE_CLOUD_CIRCLED,
+  GCP_CLOUD_CIRCLED,
+  OCI_CLOUD_CIRCLED,
+  K8S_CLOUD_CIRCLED,
+  ON_PREM_CLOUD_CIRCLED,
+  AWS_CLOUD_CIRCLED
 } from '@yugabyte-ui-library/core';
 import { EditUniverseContext } from './EditUniverseContext';
 import {
@@ -40,22 +42,37 @@ export const getClusterByType = (universeData: Universe, type: ClusterSpecCluste
   return universeData.spec?.clusters.find((cluster) => cluster.cluster_type === type);
 };
 
+/** Multi-provider uses provider_specs; single-provider uses provider_spec. */
+export const getClusterProviderUuids = (cluster?: ClusterSpec): string[] => {
+  const fromSpecs = (cluster?.provider_specs ?? [])
+    .map((spec) => spec.provider)
+    .filter((uuid): uuid is string => !!uuid);
+  if (fromSpecs.length > 0) {
+    return fromSpecs;
+  }
+  return cluster?.provider_spec?.provider ? [cluster.provider_spec.provider] : [];
+};
+
+/** First provider settings entry (provider_spec, or provider_specs[0] for multi-provider). */
+export const getClusterProviderSpec = (cluster?: ClusterSpec) =>
+  cluster?.provider_spec ?? cluster?.provider_specs?.[0];
+
 export const getProviderIcon = (providerCode?: string) => {
   if (!providerCode) return null;
 
   switch (providerCode) {
     case CloudType.aws:
-      return AWS_CLOUD_OPTION.icon;
+      return AWS_CLOUD_CIRCLED;
     case CloudType.gcp:
-      return GCP_CLOUD_OPTION.icon;
+      return GCP_CLOUD_CIRCLED;
     case CloudType.azu:
-      return AZURE_CLOUD_OPTION.icon;
+      return AZURE_CLOUD_CIRCLED;
     case CloudType.onprem:
-      return ON_PREM_CLOUD_OPTION.icon;
+      return ON_PREM_CLOUD_CIRCLED;
     case CloudType.kubernetes:
-      return K8S_CLOUD_OPTION.icon;
+      return K8S_CLOUD_CIRCLED;
     case CloudType.oci:
-      return OCI_CLOUD_OPTION.icon;
+      return OCI_CLOUD_CIRCLED;
     default:
       return null;
   }
@@ -553,4 +570,19 @@ export function getDedicatedClusterDisplayNodeTotal(
 export function useIsUniverseReady() {
   const { universeData } = useEditUniverseContext();
   return !universeData?.info?.update_in_progress && !universeData?.info?.universe_paused;
+}
+
+/** Disable mutate CTAs when the universe is busy/paused or owned by the K8s operator. */
+export function useIsUniverseEditActionDisabled() {
+  const isUniverseReady = useIsUniverseReady();
+  const { isK8OperatorEditBlocked = false } = useEditUniverseContext();
+  return !isUniverseReady || isK8OperatorEditBlocked;
+}
+
+export function useK8OperatorEditBlockedTooltip(): string {
+  const { isK8OperatorEditBlocked = false } = useEditUniverseContext();
+  const { t } = useTranslation();
+  return isK8OperatorEditBlocked
+    ? t('blockedByKubernetesOperator', { keyPrefix: 'universeActions' })
+    : '';
 }

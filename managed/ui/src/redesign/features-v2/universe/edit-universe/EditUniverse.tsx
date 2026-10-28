@@ -5,11 +5,13 @@ import { browserHistory, withRouter, WithRouterProps } from 'react-router';
 import { Divider } from '@material-ui/core';
 import { mui, YBTab, YBTabs } from '@yugabyte-ui-library/core';
 
+import { DEFAULT_RUNTIME_GLOBAL_SCOPE } from '@app/actions/customers';
 import { YBLoadingCircleIcon } from '@app/components/common/indicators';
-import { api } from '@app/redesign/helpers/api';
+import { api, runtimeConfigQueryKey } from '@app/redesign/helpers/api';
+import { isK8OperatorApiBlocked } from '@app/redesign/helpers/k8OperatorResourceUtils';
 import { useGetUniverse } from '@app/v2/api/universe/universe';
 import { ClusterSpecClusterType } from '@app/v2/api/yugabyteDBAnywhereV2APIs.schemas';
-import { getClusterByType } from './EditUniverseUtils';
+import { getClusterByType, getClusterProviderUuids } from './EditUniverseUtils';
 import {
   EditUniverseContext,
   EditUniverseTabs,
@@ -73,14 +75,27 @@ const EditUniverseComponent: FC<EditUniverseProps & WithRouterProps> = ({
   const primaryCluster = universeData
     ? getClusterByType(universeData, ClusterSpecClusterType.PRIMARY)
     : undefined;
-  const providerUUID = primaryCluster?.provider_spec?.provider;
+  const providerUUIDs = useMemo(() => getClusterProviderUuids(primaryCluster), [primaryCluster]);
+  const providerUUIDsKey = providerUUIDs.join(',');
 
   const { data: providerRegions, isLoading: isProviderLoading } = useQuery(
-    [universeUUID, providerUUID],
-    () => api.fetchProviderRegions(providerUUID),
+    [universeUUID, 'providerRegions', providerUUIDsKey],
+    () =>
+      Promise.all(providerUUIDs.map((uuid) => api.fetchProviderRegions(uuid))).then((results) =>
+        results.flat()
+      ),
     {
-      enabled: isSuccess && !!providerUUID
+      enabled: isSuccess && providerUUIDs.length > 0
     }
+  );
+
+  const { data: runtimeConfigs } = useQuery(runtimeConfigQueryKey.globalScope(), () =>
+    api.fetchRuntimeConfigs(DEFAULT_RUNTIME_GLOBAL_SCOPE)
+  );
+
+  const isK8OperatorEditBlocked = isK8OperatorApiBlocked(
+    universeData?.info?.is_kubernetes_operator_controlled,
+    runtimeConfigs?.configEntries
   );
 
   const contextValue = useMemo(
@@ -88,9 +103,10 @@ const EditUniverseComponent: FC<EditUniverseProps & WithRouterProps> = ({
       ...InitialEditUniverseContextState,
       activeTab: selectedTab,
       universeData: universeData ?? null,
-      providerRegions: providerRegions ?? []
+      providerRegions: providerRegions ?? [],
+      isK8OperatorEditBlocked
     }),
-    [selectedTab, universeData, providerRegions]
+    [selectedTab, universeData, providerRegions, isK8OperatorEditBlocked]
   );
 
   if (isLoading || !universeData || isProviderLoading || !providerRegions) {

@@ -73,6 +73,7 @@
 
 #include "yb/tserver/service_util.h"
 
+#include "yb/util/flag_validators.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
@@ -237,7 +238,8 @@ static bool ValidateMaxRefreshInterval(const char* flag_name, uint32 value) {
   // log_min_seconds_to_retain, update_min_cdc_indices_interval_secs.
   DELAY_FLAG_VALIDATION_ON_STARTUP(flag_name);
 
-  uint32 min_allowed = FLAGS_log_min_seconds_to_retain + FLAGS_update_min_cdc_indices_interval_secs;
+  uint32 min_allowed = FINAL_FLAG_VALUE(log_min_seconds_to_retain) +
+                       FINAL_FLAG_VALUE(update_min_cdc_indices_interval_secs);
   if (value == 0 || value < min_allowed) {
     return true;
   }
@@ -1310,7 +1312,7 @@ Result<SetCDCCheckpointResponsePB> CDCServiceImpl::SetCDCCheckpoint(
   OpId checkpoint;
   HybridTime cdc_sdk_safe_time = HybridTime::kInvalid;
   bool set_latest_entry = req.bootstrap();
-  const string err_message = strings::Substitute(
+  const string err_message = Format(
       "Unable to get the latest entry op id from "
       "peer $0 and tablet $1 because its log object hasn't been initialized",
       tablet_peer->permanent_uuid(), tablet_peer->tablet_id());
@@ -2876,9 +2878,10 @@ Result<bool> CDCServiceImpl::CheckBeforeImageActive(
     // - If the tablet is colocated, we check the replica identities of this tablet's tables which
     // are present in the stream metadata's replica identity map.
     // - If the tablet is sys catalog, we check the replica identities of only tables
-    // 'pg_publication_rel', 'pg_class', 'pg_replication_origin', 'pg_publication' and optionally
-    // 'pg_attribute' (when ysql_yb_enable_replication_slot_transactional_ddl is enabled) residing
-    // in it. If before image is active for any such tables then we should return true.
+    // 'pg_publication_rel', 'pg_class', 'pg_replication_origin', 'pg_publication' and, when
+    // ysql_yb_enable_replication_slot_transactional_ddl is enabled, 'pg_attribute' and
+    // 'pg_publication_rel_prpubid_index' residing in it. If before image is active for any such
+    // tables then we should return true.
     if (is_colocated_tablet || is_sys_catalog_tablet) {
       auto table_ids = tablet_peer->tablet_metadata()->GetAllColocatedTables();
       bool replica_identity_found_for_any_table = false;
@@ -3049,13 +3052,13 @@ Result<TabletCDCCheckpointInfo> CDCServiceImpl::PopulateCDCSDKTabletCheckPointIn
   return *it;
 }
 
-int64_t CDCServiceImpl::GetXClusterMinRequiredIndex(const TabletId& tablet_id) {
+std::optional<int64_t> CDCServiceImpl::TryGetXClusterMinRequiredIndex(
+    const TabletId& tablet_id) {
   if (!CDCEnabled()) {
     return std::numeric_limits<int64_t>::max();
   }
 
   auto max_staleness_secs = FLAGS_xcluster_checkpoint_max_staleness_secs;
-
   if (max_staleness_secs == 0) {
     // Feature is disabled.
     return std::numeric_limits<int64_t>::max();
@@ -3065,16 +3068,11 @@ int64_t CDCServiceImpl::GetXClusterMinRequiredIndex(const TabletId& tablet_id) {
 
   auto seconds_since_last_refresh =
       MonoTime::Now().GetDeltaSince(xcluster_map_last_refresh_time_).ToSeconds();
-
   if (seconds_since_last_refresh > max_staleness_secs) {
-    YB_LOG_EVERY_N_SECS(WARNING, 60)
-        << "XCluster min opid map hasn't been refresh for a while, "
-        << "retain all WAL segments until the map is refreshed";
-    return 0;
+    return std::nullopt;
   }
 
   auto* min_replicated_opid = FindOrNull(xcluster_tablet_min_opid_map_, tablet_id);
-
   if (min_replicated_opid == nullptr) {
     // Tablet is not under XCluster replication.
     return std::numeric_limits<int64_t>::max();
@@ -3084,6 +3082,17 @@ int64_t CDCServiceImpl::GetXClusterMinRequiredIndex(const TabletId& tablet_id) {
           << " is the xcluster min required index for tablet " << tablet_id;
 
   return min_replicated_opid->index;
+}
+
+int64_t CDCServiceImpl::GetXClusterMinRequiredIndex(const TabletId& tablet_id) {
+  auto min_index = TryGetXClusterMinRequiredIndex(tablet_id);
+  if (!min_index) {
+    YB_LOG_EVERY_N_SECS(WARNING, 60)
+        << "XCluster min opid map hasn't been refreshed for a while, "
+        << "retain all WAL segments until the map is refreshed";
+    return 0;
+  }
+  return *min_index;
 }
 
 void CDCServiceImpl::AddTableToExpiredTablesMap(
@@ -4440,7 +4449,7 @@ Result<GetLatestEntryOpIdResponsePB> CDCServiceImpl::GetLatestEntryOpId(
         GetServingTablet(tablet_id), CDCError(CDCErrorPB::INTERNAL_ERROR));
 
     if (!tablet_peer->log_available()) {
-      const string err_message = strings::Substitute(
+      const string err_message = Format(
           "Unable to get the latest entry op id from "
           "peer $0 and tablet $1 because its log object hasn't been initialized",
           tablet_peer->permanent_uuid(), tablet_peer->tablet_id());
@@ -4933,6 +4942,7 @@ Result<std::vector<TableId>> CDCServiceImpl::GetStreamableCatalogTables(
   table_ids.push_back(GetPgsqlTableId(pg_database_oid, kPgClassTableOid));
   if (FLAGS_TEST_ysql_yb_enable_replication_slot_transactional_ddl) {
     table_ids.push_back(GetPgsqlTableId(pg_database_oid, kPgAttributeTableOid));
+    table_ids.push_back(GetPgsqlTableId(pg_database_oid, kPgPublicationRelPrpubidIndexOid));
   }
   table_ids.push_back(GetPgsqlTableId(pg_database_oid, kPgPublicationRelOid));
   table_ids.push_back(GetPgsqlTableId(kTemplate1Oid, kPgReplicationOriginOid));
@@ -5753,6 +5763,7 @@ void CDCServiceImpl::DestroyVirtualWALForCDC(
 
   // Get an exclusive lock to prevent multiple threads from trying to delete the same VirtualWAL
   // instance.
+  auto stream_id = xrepl::StreamId::Nil();
   {
     std::lock_guard l(mutex_);
     RPC_CHECK_AND_RETURN_ERROR(
@@ -5760,13 +5771,16 @@ void CDCServiceImpl::DestroyVirtualWALForCDC(
         STATUS_FORMAT(
             NotFound, "Virtual WAL instance not found for the session_id: $0", session_id),
         resp->mutable_error(), CDCErrorPB::INVALID_REQUEST, context);
-    const auto& stream_id = session_virtual_wal_[session_id]->GetStreamId();
-    const auto& curr_status = PersistActivePidInSlotEntry(stream_id, 0ULL);
+    stream_id = session_virtual_wal_[session_id]->GetStreamId();
     stream_to_session_.erase(stream_id);
-    if (!curr_status.ok()) {
-      VLOG(2) << "Failed to reset active_pid for stream_id: " << stream_id;
-    }
     session_virtual_wal_.erase(session_id);
+  }
+
+  // mutex_ is a spinlock, so the blocking cdc_state write must stay outside of it. During tserver
+  // shutdown that write retries until client RPCs are aborted, and the heartbeat thread spinning
+  // on mutex_ would keep TabletServer::Shutdown from ever reaching that abort.
+  if (!PersistActivePidInSlotEntry(stream_id, 0ULL).ok()) {
+    VLOG(2) << "Failed to reset active_pid for stream_id: " << stream_id;
   }
 
   LOG_WITH_FUNC(INFO) << "VirtualWAL instance successfully deleted for session_id: " << session_id;
@@ -5784,6 +5798,7 @@ void CDCServiceImpl::DestroyVirtualWALBatchForCDC(
   VLOG_WITH_FUNC(2) << "Received expired session ids: " << AsString(expired_session_ids)
                     << " for virtual WAL batch cleanup";
 
+  std::vector<xrepl::StreamId> stream_ids;
   {
     std::lock_guard l(mutex_);
     for (auto it = expired_session_ids.begin(); it != expired_session_ids.end(); ++it) {
@@ -5792,17 +5807,21 @@ void CDCServiceImpl::DestroyVirtualWALBatchForCDC(
                           << " does not have a virtual WAL associated with it";
         continue;
       }
-      const auto& stream_id = session_virtual_wal_[*it]->GetStreamId();
+      const auto stream_id = session_virtual_wal_[*it]->GetStreamId();
       LOG_WITH_FUNC(INFO) << "Received DestroyVirtualWALBatchForCDC request for session_id: " << *it
                           << " and stream_id: " << stream_id;
-      const auto& curr_status = PersistActivePidInSlotEntry(stream_id, 0ULL);
+      stream_ids.push_back(stream_id);
       stream_to_session_.erase(stream_id);
-      if (!curr_status.ok()) {
-        VLOG(2) << "Failed to reset active_pid for stream_id: " << stream_id;
-      }
       if (session_virtual_wal_.erase(*it)) {
         LOG_WITH_FUNC(INFO) << "VirtualWAL instance successfully deleted for session_id: " << *it;
       }
+    }
+  }
+
+  // Persist outside mutex_, see DestroyVirtualWALForCDC.
+  for (const auto& stream_id : stream_ids) {
+    if (!PersistActivePidInSlotEntry(stream_id, 0ULL).ok()) {
+      VLOG(2) << "Failed to reset active_pid for stream_id: " << stream_id;
     }
   }
 }

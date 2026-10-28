@@ -465,6 +465,10 @@ void SharedExchange::ResetBusy() {
   return header_.ResetBusy();
 }
 
+bool SharedExchange::busy() const {
+  return header_.busy();
+}
+
 void SharedExchange::Respond(size_t size) {
   header_.Respond(size);
 }
@@ -526,7 +530,9 @@ void SharedExchangeRunnable::CompleteShutdown() {
 }
 
 bool SharedExchangeRunnable::ReadyToShutdown() const {
-  return !stop_future_.valid() || stop_future_.wait_for(0s) == std::future_status::ready;
+  // Busy means an in-flight request; do not destroy the session under it (GH #33616).
+  return (!stop_future_.valid() || stop_future_.wait_for(0s) == std::future_status::ready) &&
+         !exchange_.busy();
 }
 
 class PgSessionSharedMemoryManager::Impl {
@@ -690,10 +696,15 @@ uint64_t PgSessionSharedMemoryManager::session_id() const {
   return impl_->session_id();
 }
 
-bool TServerSharedData::IsCronLeader() const {
+bool TServerSharedData::HasCronLease() const {
   // We are the leader if we have a valid lease time that has not expired.
-  auto lease_end = cron_leader_lease_.load();
+  auto lease_end = cron_lease_end_.load();
   return lease_end.Initialized() && lease_end > MonoTime::Now();
+}
+
+bool TServerSharedData::CanCronStartJobs() const {
+  // We are the active leader only if we have not stepped down and still hold a valid lease.
+  return cron_can_start_jobs_.load() && HasCronLease();
 }
 
 std::string MakeSharedMemoryBigSegmentName(const std::string& instance_id, uint64_t id) {

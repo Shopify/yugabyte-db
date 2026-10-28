@@ -45,6 +45,7 @@
 #include "yb/util/multi_drive_test_env.h"
 #include "yb/util/status.h"
 #include "yb/util/result.h"
+#include "yb/util/storage_tier.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 #include "yb/fs/fs.pb.h"
@@ -56,6 +57,7 @@ DECLARE_string(fs_data_dirs);
 DECLARE_string(fs_wal_dirs);
 DECLARE_bool(TEST_fail_write_pb_container);
 DECLARE_bool(export_drive_io_metrics);
+DECLARE_bool(enable_tiered_storage);
 
 namespace yb {
 
@@ -394,6 +396,7 @@ class StorageTierTest : public YBTest {
  public:
   void SetUp() override {
     YBTest::SetUp();
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_tiered_storage) = true;
   }
 
   // Build a FsManager directly from explicit paths + tiers without going
@@ -521,15 +524,49 @@ TEST_F(StorageTierTest, InvalidTierRejected) {
   ASSERT_STR_CONTAINS(s.ToString(), "Invalid storage tier");
 }
 
+// With tiered storage disabled (the default), a non-default tier label is rejected at init time.
+// An explicit default-tier label changes nothing and is still accepted.
+TEST_F(StorageTierTest, NonDefaultTierRejectedWhenTieredStorageDisabled) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_tiered_storage) = false;
+  auto hdd_path = GetTestPath("disabled_hdd");
+  auto ssd_path = GetTestPath("disabled_ssd");
+  ASSERT_OK(env_->CreateDir(hdd_path));
+  ASSERT_OK(env_->CreateDir(ssd_path));
+
+  {
+    FsManagerOpts opts;
+    opts.data_paths = {hdd_path};
+    opts.tier_by_path = {{hdd_path, "hdd"}};
+    opts.wal_paths = {hdd_path};
+    opts.server_type = kServerType;
+    auto mgr = std::make_unique<FsManager>(env_.get(), opts);
+    Status s = mgr->CreateInitialFileSystemLayout();
+    ASSERT_NOK(s);
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "enable_tiered_storage");
+  }
+  {
+    FsManagerOpts opts;
+    opts.data_paths = {ssd_path};
+    opts.tier_by_path = {{ssd_path, kDefaultStorageTier}};
+    opts.wal_paths = {ssd_path};
+    opts.server_type = kServerType;
+    auto mgr = std::make_unique<FsManager>(env_.get(), opts);
+    ASSERT_OK(mgr->CreateInitialFileSystemLayout());
+    ASSERT_OK(mgr->CheckAndOpenFileSystemRoots());
+    ASSERT_EQ(1u, mgr->GetDataRootDirsForTier(kDefaultStorageTier).size());
+  }
+}
+
 // IsValidStorageTier / ValidStorageTiers reflect the static set.
 TEST_F(StorageTierTest, ValidStorageTierSet) {
-  ASSERT_TRUE(FsManager::IsValidStorageTier("ssd"));
-  ASSERT_TRUE(FsManager::IsValidStorageTier("hdd"));
-  ASSERT_FALSE(FsManager::IsValidStorageTier("gold"));
-  ASSERT_FALSE(FsManager::IsValidStorageTier(""));
+  ASSERT_TRUE(IsValidStorageTier("ssd"));
+  ASSERT_TRUE(IsValidStorageTier("hdd"));
+  ASSERT_FALSE(IsValidStorageTier("gold"));
+  ASSERT_FALSE(IsValidStorageTier(""));
 
   // The default tier must always be a valid tier.
-  ASSERT_TRUE(FsManager::IsValidStorageTier(FsManager::kDefaultStorageTier));
+  ASSERT_TRUE(IsValidStorageTier(kDefaultStorageTier));
 }
 
 // ParseDataDirSpec edge cases exercised via FLAGS_fs_data_dirs.

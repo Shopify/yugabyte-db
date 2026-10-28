@@ -109,9 +109,12 @@
 #include "utils/relfilenodemap.h"
 
 /* YB includes */
+#include "catalog/pg_publication.h"
+#include "catalog/pg_publication_rel.h"
 #include "pg_yb_utils.h"
 #include "replication/walsender_private.h"
-
+#include "utils/catcache.h"
+#include "yb/yql/pggate/ybc_gflags.h"
 
 /* entry for a hash table we use to map from xid to our transaction state */
 typedef struct ReorderBufferTXNByIdEnt
@@ -547,6 +550,8 @@ ReorderBufferReturnChange(ReorderBuffer *rb, ReorderBufferChange *change,
 		case REORDER_BUFFER_CHANGE_INTERNAL_SPEC_ABORT:
 		case REORDER_BUFFER_CHANGE_INTERNAL_COMMAND_ID:
 		case REORDER_BUFFER_CHANGE_INTERNAL_TUPLECID:
+		case YB_REORDER_BUFFER_CHANGE_DDL:
+		case YB_REORDER_BUFFER_CHANGE_PUBLICATION_INVALIDATION:
 			break;
 	}
 
@@ -2237,6 +2242,11 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 
 					if (IsYugaByteEnabled())
 					{
+						if (*YBCGetGFlags()->TEST_ysql_yb_enable_replication_slot_transactional_ddl)
+							YBCSetHistoricalReadContext(change->data.tp.yb_read_time,
+														change->data.tp.yb_in_txn_limit,
+														change->data.tp.yb_txn_id);
+
 						/*
 						 * In YB, the replica identity used for streaming is the
 						 * one that existed at the time of slot (stream)
@@ -2491,6 +2501,28 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 
 				case REORDER_BUFFER_CHANGE_INTERNAL_TUPLECID:
 					elog(ERROR, "tuplecid value in changequeue");
+					break;
+
+				case YB_REORDER_BUFFER_CHANGE_DDL:
+					YBCInvalidateCachesForHistoricalReadContext();
+					/*
+					 * Inform the output plugin about the schema change so that
+					 * it can send the RELATION message to the client.
+					 */
+					YBReorderBufferSchemaChange(rb,
+												change->data.yb_ddl.table_oid);
+					break;
+
+				case YB_REORDER_BUFFER_CHANGE_PUBLICATION_INVALIDATION:
+					/*
+					 * An explicit ALTER PUBLICATION took effect at this point
+					 * of the transaction. Flushing these catalog caches fires
+					 * their syscache callbacks, so the output plugin rebuilds
+					 * its publication info on the next change, under that
+					 * change's historical read context.
+					 */
+					CatalogCacheFlushCatalog(PublicationRelationId);
+					CatalogCacheFlushCatalog(PublicationRelRelationId);
 					break;
 			}
 		}
@@ -3978,6 +4010,8 @@ ReorderBufferSerializeChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 		case REORDER_BUFFER_CHANGE_INTERNAL_SPEC_ABORT:
 		case REORDER_BUFFER_CHANGE_INTERNAL_COMMAND_ID:
 		case REORDER_BUFFER_CHANGE_INTERNAL_TUPLECID:
+		case YB_REORDER_BUFFER_CHANGE_DDL:
+		case YB_REORDER_BUFFER_CHANGE_PUBLICATION_INVALIDATION:
 			/* ReorderBufferChange contains everything important */
 			break;
 	}
@@ -4242,6 +4276,8 @@ ReorderBufferChangeSize(ReorderBufferChange *change)
 		case REORDER_BUFFER_CHANGE_INTERNAL_SPEC_ABORT:
 		case REORDER_BUFFER_CHANGE_INTERNAL_COMMAND_ID:
 		case REORDER_BUFFER_CHANGE_INTERNAL_TUPLECID:
+		case YB_REORDER_BUFFER_CHANGE_DDL:
+		case YB_REORDER_BUFFER_CHANGE_PUBLICATION_INVALIDATION:
 			/* ReorderBufferChange contains everything important */
 			break;
 	}
@@ -4598,6 +4634,8 @@ ReorderBufferRestoreChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 		case REORDER_BUFFER_CHANGE_INTERNAL_SPEC_ABORT:
 		case REORDER_BUFFER_CHANGE_INTERNAL_COMMAND_ID:
 		case REORDER_BUFFER_CHANGE_INTERNAL_TUPLECID:
+		case YB_REORDER_BUFFER_CHANGE_DDL:
+		case YB_REORDER_BUFFER_CHANGE_PUBLICATION_INVALIDATION:
 			break;
 	}
 

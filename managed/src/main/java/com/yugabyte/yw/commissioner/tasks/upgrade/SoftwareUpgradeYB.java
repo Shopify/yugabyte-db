@@ -222,9 +222,16 @@ public class SoftwareUpgradeYB extends SoftwareUpgradeTaskBase {
 
     nodesToApply = createCatalogRollbackRecoveryIfNeeded(universe, ctx, nodesToApply);
 
-    createMastersPhase(universe, ctx, nodesToApply);
+    // Same password for CREATE_USER (before masters) and CREATE_PG_PASS_FILE (after masters),
+    // matching K8s so .pgpass is written on the current leader after the master roll.
+    String catalogUpgradePassword =
+        ctx.requireAdditionalSuperUserForCatalogUpgrade
+            ? Util.getPostgresCompatiblePassword()
+            : null;
 
-    createCatalogBeforeTserversPhase(universe, ctx, nodesToApply);
+    createMastersPhase(universe, ctx, nodesToApply, catalogUpgradePassword);
+
+    createCatalogBeforeTserversPhase(universe, ctx, nodesToApply, catalogUpgradePassword);
 
     // Tservers are always upgraded in AZ order (sortAZs or canary-config order). Canary upgrades
     // additionally inject per-AZ pause checkpoints via createTserverUpgradeTasksByAz.
@@ -311,6 +318,11 @@ public class SoftwareUpgradeYB extends SoftwareUpgradeTaskBase {
           log.info("YSQL catalog upgrade is in a failed state. Rolling back catalog upgrade.");
           createRollbackYsqlMajorVersionCatalogUpgradeTask();
           rollbackMaster = true;
+        } else if (catalogUpgradeState.equals(
+            YsqlMajorCatalogUpgradeState.YSQL_MAJOR_CATALOG_UPGRADE_PENDING)) {
+          // Abort after last master (or .pgpass deleted on failure): all masters are PG15 but
+          // catalog is still PENDING. Roll masters back so CREATE USER DDLs are allowed.
+          rollbackMaster = true;
         }
       } else if (softwareUpgradeHelper.isAnyMasterUpgradedOrInProgressForYsqlMajorVersion(
           universe, "15")) {
@@ -391,10 +403,15 @@ public class SoftwareUpgradeYB extends SoftwareUpgradeTaskBase {
 
   /**
    * MASTERS: upgrades masters when not yet done. Ensures non-live masters are restarted, software
-   * is downloaded, and YSQL-major gflags/superuser are prepared before the rolling restart.
+   * is downloaded, and YSQL-major gflags/superuser are prepared before the rolling restart. Catalog
+   * upgrade password (if any) is used only for CREATE_USER here; .pgpass is written later in {@link
+   * #createCatalogBeforeTserversPhase} on the current master leader.
    */
   private void createMastersPhase(
-      Universe universe, UpgradeTaskCreationContext ctx, MastersAndTservers nodesToApply) {
+      Universe universe,
+      UpgradeTaskCreationContext ctx,
+      MastersAndTservers nodesToApply,
+      @Nullable String catalogUpgradePassword) {
     boolean mastersAlreadyUpgraded =
         (ctx.mastersDone && !catalogRollbackForcesMasterReupgrade)
             || nodesToApply.mastersList.size() == 0;
@@ -406,10 +423,9 @@ public class SoftwareUpgradeYB extends SoftwareUpgradeTaskBase {
         createRestartNonLiveTserversTasks(universe, ctx, universe.getTServers());
         createGFlagsUpgradeTaskForYSQLMajorUpgrade(
             universe, YsqlMajorVersionUpgradeState.IN_PROGRESS);
-        if (ctx.requireAdditionalSuperUserForCatalogUpgrade
+        if (catalogUpgradePassword != null
             && nodesToApply.tserversList.size() == universe.getTServers().size()) {
-          createManageCatalogUpgradeSuperUserTask(
-              Action.CREATE_USER_AND_PG_PASS_FILE, Util.getPostgresCompatiblePassword());
+          createManageCatalogUpgradeSuperUserTask(Action.CREATE_USER, catalogUpgradePassword);
         }
       }
       Map<UUID, Set<UUID>> priorMasterCompleted =
@@ -471,14 +487,20 @@ public class SoftwareUpgradeYB extends SoftwareUpgradeTaskBase {
   }
 
   /**
-   * CATALOG_BEFORE_TSERVERS: runs YSQL major catalog upgrade and optional superuser cleanup when
-   * all tservers are in scope.
+   * CATALOG_BEFORE_TSERVERS: writes .pgpass on the current master leader (after the master roll),
+   * runs YSQL major catalog upgrade, then deletes .pgpass when all tservers are in scope.
    */
   private void createCatalogBeforeTserversPhase(
-      Universe universe, UpgradeTaskCreationContext ctx, MastersAndTservers nodesToApply) {
+      Universe universe,
+      UpgradeTaskCreationContext ctx,
+      MastersAndTservers nodesToApply,
+      @Nullable String catalogUpgradePassword) {
     if (!ctx.requireYsqlMajorVersionUpgrade
         || nodesToApply.tserversList.size() != universe.getTServers().size()) {
       return;
+    }
+    if (catalogUpgradePassword != null) {
+      createManageCatalogUpgradeSuperUserTask(Action.CREATE_PG_PASS_FILE, catalogUpgradePassword);
     }
     createRunYsqlMajorVersionCatalogUpgradeTask();
     if (ctx.requireAdditionalSuperUserForCatalogUpgrade) {
@@ -509,24 +531,26 @@ public class SoftwareUpgradeYB extends SoftwareUpgradeTaskBase {
         universe.getUniverseUUID(),
         true /* ignoreErrors */,
         AutoFlagUtil.LOCAL_VOLATILE_AUTO_FLAG_CLASS_NAME /* maxClass */);
+    UniverseDefinitionTaskParams.SoftwareUpgradeState endState;
+    Boolean isSoftwareRollbackAllowed = null;
     if (!taskParams().rollbackSupport) {
       createFinalizeUpgradeTasks(
           taskParams().upgradeSystemCatalog,
           ctx.requireYsqlMajorVersionUpgrade,
-          ctx.requireAdditionalSuperUserForCatalogUpgrade);
+          ctx.requireAdditionalSuperUserForCatalogUpgrade,
+          false /* saveReadyState */);
+      endState = UniverseDefinitionTaskParams.SoftwareUpgradeState.Ready;
+      isSoftwareRollbackAllowed = false;
+    } else if (ctx.upgradeRequireFinalize) {
+      endState = UniverseDefinitionTaskParams.SoftwareUpgradeState.PreFinalize;
     } else {
-      if (ctx.upgradeRequireFinalize) {
-        createUpdateUniverseSoftwareUpgradeStateTask(
-            UniverseDefinitionTaskParams.SoftwareUpgradeState.PreFinalize,
-            true /* isSoftwareRollbackAllowed */);
-      } else {
-        createClearSoftwareUpgradeProgressTask();
-        createUpdateUniverseSoftwareUpgradeStateTask(
-            UniverseDefinitionTaskParams.SoftwareUpgradeState.Ready,
-            true /* isSoftwareRollbackAllowed */);
-      }
+      createClearSoftwareUpgradeProgressTask();
+      endState = UniverseDefinitionTaskParams.SoftwareUpgradeState.Ready;
     }
-    createUpdateSoftwareVersionTask(ctx.newVersion, false /* isSoftwareUpdateViaVm */)
+    // The end state is saved with the version (PLAT-23182). Saved earlier, an abort in between
+    // left it with the old version, and the failure handler doesn't reset an end state.
+    createUpdateSoftwareVersionTask(
+            ctx.newVersion, false /* isSoftwareUpdateViaVm */, endState, isSoftwareRollbackAllowed)
         .setSubTaskGroupType(getTaskSubGroupType());
   }
 

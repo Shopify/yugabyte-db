@@ -60,6 +60,7 @@
 #include "yb/tablet/write_query_context.h"
 
 #include "yb/util/atomic.h"
+#include "yb/util/disk_space_checker.h"
 
 using yb::consensus::StateChangeContext;
 
@@ -156,6 +157,8 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
 
   // Creates TabletPeer.
   // `tablet_splitter` will be used for applying split tablet Raft operation.
+  // `persistence_gate` decides whether stamped YSQL writes and commits may replicate; nullptr
+  // allows them all.
   TabletPeer(
       const RaftGroupMetadataPtr& meta,
       const consensus::RaftPeerPB& local_peer_pb,
@@ -164,6 +167,7 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
       Callback<void(std::shared_ptr<StateChangeContext> context)> mark_dirty_clbk,
       MetricRegistry* metric_registry,
       TabletSplitter* tablet_splitter,
+      const PersistenceGate* persistence_gate,
       const std::shared_future<client::YBClient*>& client_future);
 
   ~TabletPeer() override;
@@ -559,8 +563,10 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
   void RegisterAsyncWriteCompletion(const OpId& op_id, StdStatusCallback&& callback)
       EXCLUDES(async_write_queries_mutex_) override;
 
-  // Verifies that this peer has the op_id in its local log.
-  Status VerifyAsyncWriteReceived(const OpId& op_id);
+  // Verifies that this peer has the op_id in its local log. Without allow_log_lookup, a write from
+  // two or more terms ago is rejected.
+  Status VerifyAsyncWriteReceived(
+      const OpId& op_id, AllowLogLookup allow_log_lookup = AllowLogLookup::kTrue);
 
  protected:
   friend class RefCountedThreadSafe<TabletPeer>;
@@ -672,6 +678,8 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
   rpc::Scheduler& scheduler() const override;
   Status CheckOperationAllowed(
       const OpId& op_id, consensus::OperationType op_type) override;
+  Status CheckReplicateAllowed(consensus::LWReplicateMsg& replicate_msg) override;
+  bool ShouldRelinquishLeadership() override;
   // Return granular types of on-disk size of this tablet replica, in bytes.
   TabletOnDiskSizeInfo GetOnDiskSizeInfoUnlocked() const REQUIRES(lock_);
 
@@ -691,6 +699,8 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
   std::shared_ptr<consensus::RaftConsensus> GetRaftConsensusUnsafe() const EXCLUDES(lock_);
 
   TabletSplitter* tablet_splitter_;
+
+  const PersistenceGate* const persistence_gate_;
 
   std::shared_future<client::YBClient*> client_future_;
   mutable std::atomic<client::YBClient*> client_cache_{nullptr};
@@ -717,6 +727,10 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
       GUARDED_BY(async_write_queries_mutex_);
 
   rpc::ThreadPoolPtr service_thread_pool_holder_;
+
+  // Tracks the free space on the data directory. The WAL directory, which can be on a different
+  // disk, is tracked by the Log.
+  DiskSpaceChecker data_disk_space_checker_;
 
   DISALLOW_COPY_AND_ASSIGN(TabletPeer);
 };

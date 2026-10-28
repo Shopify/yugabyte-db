@@ -9,7 +9,6 @@ import com.google.common.collect.HashMultimap;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Multimap;
 import com.yugabyte.yw.commissioner.Common;
-import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.commissioner.tasks.KubernetesTaskBase.KubernetesPlacement;
 import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase;
 import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase.ServerType;
@@ -88,6 +87,8 @@ public class KubernetesUtil {
   public static String MIN_VERSION_FULL_MOVE_SUPPORT_STABLE = "2026.1.0.0-b0";
   public static String MIN_VERSION_NON_ROOT_DB_PREVIEW = "2.31.0.0-b0";
   public static String MIN_VERSION_NON_ROOT_DB_STABLE = "2026.1.2.0-b0";
+  public static String MIN_VERSION_NODE_EXPORTER_SIDECAR_PREVIEW = "2.31.0.0-b615";
+  public static String MIN_VERSION_NODE_EXPORTER_SIDECAR_STABLE = "2026.2.0.0-b1";
 
   public static boolean isNonRestartGflagsUpgradeSupported(String universeSoftwareVersion) {
     return Util.compareYBVersions(
@@ -96,6 +97,16 @@ public class KubernetesUtil {
             MIN_VERSION_NON_RESTART_GFLAGS_UPGRADE_SUPPORT_PREVIEW,
             true)
         >= 0;
+  }
+
+  public static boolean isNodeExporterSidecarSupported(@Nullable String universeSoftwareVersion) {
+    return universeSoftwareVersion != null
+        && Util.compareYBVersions(
+                universeSoftwareVersion,
+                MIN_VERSION_NODE_EXPORTER_SIDECAR_STABLE,
+                MIN_VERSION_NODE_EXPORTER_SIDECAR_PREVIEW,
+                true)
+            >= 0;
   }
 
   public static boolean isNamespacedServiceSupported(String universeSoftwareVersion) {
@@ -816,18 +827,18 @@ public class KubernetesUtil {
   }
 
   private static boolean isMCSEnabled(UniverseDefinitionTaskParams universeDetails) {
-    UUID providerUUID = Util.getSingleProviderUUID(universeDetails.getPrimaryCluster());
-    Provider provider = Provider.getOrBadRequest(providerUUID);
-    if (provider.getCloudCode().equals(Common.CloudType.kubernetes)) {
-      List<Region> regions = Region.getByProvider(provider.getUuid());
-      for (Region region : regions) {
-        List<AvailabilityZone> zones = AvailabilityZone.getAZsForRegion(region.getUuid());
-        for (AvailabilityZone zone : zones) {
-          if (zone.getDetails().getCloudInfo().getKubernetes() != null
-              && StringUtils.isNotBlank(
-                  zone.getDetails().getCloudInfo().getKubernetes().getKubePodAddressTemplate())) {
-            return true;
-          }
+    if (!Util.isKubernetesBased(universeDetails.getPrimaryCluster())) {
+      return false;
+    }
+    Provider provider = Util.getSingleProvider(universeDetails.getPrimaryCluster());
+    List<Region> regions = Region.getByProvider(provider.getUuid());
+    for (Region region : regions) {
+      List<AvailabilityZone> zones = AvailabilityZone.getAZsForRegion(region.getUuid());
+      for (AvailabilityZone zone : zones) {
+        if (zone.getDetails().getCloudInfo().getKubernetes() != null
+            && StringUtils.isNotBlank(
+                zone.getDetails().getCloudInfo().getKubernetes().getKubePodAddressTemplate())) {
+          return true;
         }
       }
     }
@@ -1046,7 +1057,8 @@ public class KubernetesUtil {
       UniverseDefinitionTaskParams universeParams, ClusterType clusterType) {
     Set<String> namespaces = new HashSet<>();
     for (Cluster cluster : universeParams.clusters) {
-      if (cluster.userIntent.providerType != CloudType.kubernetes) {
+
+      if (!Util.isKubernetesBased(cluster)) {
         continue;
       }
       if ((clusterType != null) && (clusterType != cluster.clusterType)) {
@@ -1093,7 +1105,7 @@ public class KubernetesUtil {
       azsOverridesStr = new HashMap<>();
     }
     for (Cluster cluster : universeParams.clusters) {
-      if (cluster.userIntent.providerType != CloudType.kubernetes) {
+      if (!Util.isKubernetesBased(cluster)) {
         continue;
       }
       if ((clusterType != null) && (clusterType != cluster.clusterType)) {
@@ -1866,15 +1878,15 @@ public class KubernetesUtil {
         continue;
       }
       DeviceInfo oldDeviceInfo, newDeviceInfo;
-      oldDeviceInfo = currCluster.userIntent.getDeviceInfoForAz(az.uuid, ServerType.TSERVER);
-      newDeviceInfo = newCluster.userIntent.getDeviceInfoForAz(az.uuid, ServerType.TSERVER);
+      oldDeviceInfo = currCluster.userIntent.evaluateDeviceInfoForAz(az.uuid, ServerType.TSERVER);
+      newDeviceInfo = newCluster.userIntent.evaluateDeviceInfoForAz(az.uuid, ServerType.TSERVER);
       if (!(newDeviceInfo == null
           || oldDeviceInfo.equals(newDeviceInfo)
           || oldDeviceInfo.onlyVolumeSizeChanged(newDeviceInfo))) {
         return true;
       }
-      oldDeviceInfo = currCluster.userIntent.getDeviceInfoForAz(az.uuid, ServerType.MASTER);
-      newDeviceInfo = newCluster.userIntent.getDeviceInfoForAz(az.uuid, ServerType.MASTER);
+      oldDeviceInfo = currCluster.userIntent.evaluateDeviceInfoForAz(az.uuid, ServerType.MASTER);
+      newDeviceInfo = newCluster.userIntent.evaluateDeviceInfoForAz(az.uuid, ServerType.MASTER);
       if (!(newDeviceInfo == null
           || oldDeviceInfo.equals(newDeviceInfo)
           || oldDeviceInfo.onlyVolumeSizeChanged(newDeviceInfo))) {

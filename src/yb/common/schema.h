@@ -368,6 +368,7 @@ class TableProperties {
     // Ignoring retain_delete_markers_.
     // Ignoring partitioning_version_.
     // Ignoring owns_vector_reverse_mapping_.
+    // Ignoring writes_vector_reverse_mapping_.
   }
 
   bool operator!=(const TableProperties& other) const {
@@ -394,6 +395,7 @@ class TableProperties {
     // Ignoring retain_delete_markers_.
     // Ignoring partitioning_version_.
     // Ignoring owns_vector_reverse_mapping_.
+    // Ignoring writes_vector_reverse_mapping_.
     return true;
   }
 
@@ -488,6 +490,10 @@ class TableProperties {
     return owns_vector_reverse_mapping_;
   }
 
+  bool writes_vector_reverse_mapping() const {
+    return writes_vector_reverse_mapping_;
+  }
+
   PgReplicaIdentity replica_identity() const {
     DCHECK(HasReplicaIdentity());
     return *ysql_replica_identity_;
@@ -536,6 +542,12 @@ class TableProperties {
   // Set by master at YSQL table creation; loaded via FromTablePropertiesPB; restored from backup.
   // Alter is intentionally not supported.
   bool owns_vector_reverse_mapping_;
+
+  // Whether writes to this table maintain the vector reverse mapping. When false, all vector
+  // indexes of the table store the ybctid as the vector payload instead.
+  // Set by master at YSQL table creation; loaded via FromTablePropertiesPB; restored from backup.
+  // Alter is intentionally not supported.
+  bool writes_vector_reverse_mapping_;
 
   // This is optional since its a ysql only field
   std::optional<PgReplicaIdentity> ysql_replica_identity_;
@@ -659,6 +671,19 @@ class Schema : public MissingValueProvider {
   size_t num_range_key_columns() const {
     return num_key_columns_ - num_hash_key_columns_;
   }
+
+  // Returns the component index for the given key column. All hash columns form component 0,
+  // followed by one component per range column. Unlike get_dockey_component_idx, hash columns
+  // share a single component. If column_idx is the number of key columns, returns the total
+  // number of components.
+  static size_t HashGroupAndRangeComponentIndex(size_t column_idx, size_t num_hash_key_columns) {
+    return column_idx < num_hash_key_columns
+        ? 0 : column_idx - num_hash_key_columns + (num_hash_key_columns ? 1 : 0);
+  }
+
+  // Returns the number of hash group and range components of the schema, see
+  // HashGroupAndRangeComponentIndex.
+  static size_t NumHashGroupAndRangeComponents(const SchemaPB& schema);
 
   // Return the byte offset within the row for the given column index.
   size_t column_offset(size_t col_idx) const {
@@ -1289,4 +1314,3 @@ class SchemaBuilder {
 ColumnKind SortingTypeToColumnKind(SortingType sorting_type);
 
 } // namespace yb
-

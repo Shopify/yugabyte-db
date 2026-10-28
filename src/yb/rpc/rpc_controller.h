@@ -174,6 +174,13 @@ class RpcController {
 
   ThreadPoolTag pool_tag() const { return pool_tag_; }
 
+  // Lets the next local call time out at its deadline instead of waiting for the handler.
+  // The handler could still use the request and response after that, so holder must keep them
+  // alive. The call releases holder when the handler responds.
+  void set_local_call_buffers_holder(std::shared_ptr<void> holder) {
+    local_call_buffers_holder_ = std::move(holder);
+  }
+
   // Priority requested for the call; the server takes the lower of this and the service default.
   void set_priority(RpcPriority priority) { priority_ = priority; }
 
@@ -207,6 +214,9 @@ class RpcController {
   ThreadPoolTag pool_tag_ = 0;
   std::optional<RpcPriority> priority_;
   std::optional<uint32_t> continuation_hops_;
+
+  // Taken by the next call, so it does not stay referenced from the controller.
+  std::shared_ptr<void> local_call_buffers_holder_;
 
   DISALLOW_COPY_AND_ASSIGN(RpcController);
 };

@@ -843,6 +843,14 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 			}
 		}
 
+		if (remove_old &&
+			IsYugaByteEnabled() &&
+			yb_test_force_parallel != YB_FORCE_PARALLEL_OFF &&
+			old_path->param_info == NULL &&
+			!yb_path_contains_gather(new_path) &&
+			yb_path_contains_gather(old_path))
+			remove_old = false;
+
 		/*
 		 * Remove current element from pathlist if dominated by new.
 		 */
@@ -1548,7 +1556,7 @@ create_index_path(PlannerInfo *root,
 				  Relids required_outer,
 				  double loop_count,
 				  bool partial_path,
-				  List *yb_merge_scan_saop_cols)
+				  List *yb_merge_scan_stream_cols)
 {
 	IndexPath  *pathnode = makeNode(IndexPath);
 	RelOptInfo *rel = index->rel;
@@ -1569,11 +1577,20 @@ create_index_path(PlannerInfo *root,
 	pathnode->yb_bitmap_idx_pushdowns = yb_bitmap_idx_pushdowns;
 	pathnode->indexorderbys = indexorderbys;
 	pathnode->indexorderbycols = indexorderbycols;
+
+	/*
+	 * YB: NoMovementScanDirection means "row order does not matter".  For
+	 * it, yb_scan_core.c does not call YBCPgSetForwardScan, and an unset
+	 * direction lets pggate read tablets in parallel
+	 * (CouldBeExecutedInParallel) and skip preserving ybctid order on
+	 * secondary index scans.  Forward and Backward both forfeit those
+	 * optimizations.
+	 */
 	pathnode->indexscandir = rel->is_yb_relation && pathkeys == NIL ?
 		NoMovementScanDirection : indexscandir;
 
-	pathnode->yb_index_path_info.merge_scan_saop_cols =
-		yb_merge_scan_saop_cols;
+	pathnode->yb_index_path_info.merge_scan_stream_cols =
+		yb_merge_scan_stream_cols;
 
 	if (IsYugaByteEnabled() &&
 		yb_enable_base_scans_cost_model &&
@@ -1916,17 +1933,30 @@ create_append_path(PlannerInfo *root,
 		/* YB */
 		if (subpaths)
 		{
+			List	   *groups = NIL;
+
 			/* YB: Accumulate batching info from subpaths for this "baserel". */
 			Assert(yb_has_same_batching_reqs(subpaths));
 
 			root->yb_cur_batched_relids =
 				YB_PATH_REQ_OUTER_BATCHED((Path *) linitial(subpaths));
+
+			/*
+			 * The parent's movable clauses can miss a group that a child's
+			 * index condition batches on, and children can batch different
+			 * clauses, so pass on the union of the children's groups.
+			 */
+			foreach(l, subpaths)
+				groups = list_concat(groups,
+									 YB_PATH_BATCHED_GROUPS((Path *) lfirst(l)));
+			root->yb_cur_batched_groups = groups;
 		}
 
 		pathnode->path.param_info = get_baserel_parampathinfo(root,
 															  rel,
 															  required_outer);
 		root->yb_cur_batched_relids = NULL;
+		root->yb_cur_batched_groups = NIL;
 	}
 	else
 		pathnode->path.param_info = get_appendrel_parampathinfo(rel,
@@ -3205,6 +3235,8 @@ create_nestloop_path(PlannerInfo *root,
 	pathnode->jpath.outerjoinpath = outer_path;
 	pathnode->jpath.innerjoinpath = inner_path;
 	pathnode->jpath.joinrestrictinfo = restrict_clauses;
+
+	pathnode->yb_first_batch_size = workspace->yb_first_batch_size;
 
 	if (IsYugaByteEnabled())
 	{
@@ -5523,11 +5555,12 @@ yb_create_unique_path(PlannerInfo *root,
  *
  * Cost
  * ====
- * Distinct index scans are so useful because they are retrieved efficiently
- * and pull fewer tuples from the underlying storage. Hence, we need to adjust
- * the cost accordingly. For that, we first estimate the number of distinct
- * tuples that will be returned by the prefix and then scale down the cost of
- * the path by the selectivity of the scan.
+ * Under the YB cost model the copy is costed anew by yb_cost_index, which
+ * reads the prefix length off the path and models the scan's skip loop: one
+ * row read and one skip per prefix group, with seek-forward standing in for
+ * the skip's seek when groups are small.  Its row estimate is the number of
+ * groups that yield a row.  Under the legacy cost model the regular scan's
+ * run cost is scaled down by the ratio of distinct groups to rows.
  *
  * Unique Node
  * ===========
@@ -5585,6 +5618,8 @@ yb_create_unique_path(PlannerInfo *root,
  * 			index scan. This value is sent to DocDB as a scan parameter.
  * 'yb_distinct_nkeys' is the number of pathkeys corresponding to the distinct
  * 			prefix.
+ * 'loop_count' is the number of repetitions of the scan, as for
+ * 			create_index_path.
  *
  * Returns a polymorphic path.
  * - either a bare distinct index scan path
@@ -5595,16 +5630,12 @@ yb_create_distinct_index_path(PlannerInfo *root,
 							  IndexOptInfo *index,
 							  IndexPath *basepath,
 							  int yb_distinct_prefixlen,
-							  int yb_distinct_nkeys)
+							  int yb_distinct_nkeys,
+							  double loop_count)
 {
 	IndexPath  *pathnode = makeNode(IndexPath);
-	int			numDistinctRows;
+	Cardinality	numDistinctRows;
 	bool		ignore_prefix_for_uniqkeys;
-	List	   *prefixExprs;
-	ListCell   *lc;
-	int			i;
-	Selectivity selectivity;
-	double		run_cost = 0;
 
 	/*
 	 * XXX: Memcpy'ing the index scan path the same way it is done in the
@@ -5638,34 +5669,57 @@ yb_create_distinct_index_path(PlannerInfo *root,
 		yb_get_uniqkeys(index,
 						ignore_prefix_for_uniqkeys ? 0 : yb_distinct_prefixlen);
 
+	/*
+	 * A range-partitioned index whose prefix misses some of the pathkeys
+	 * gets no Unique node on top (see below), so DocDB may return duplicate
+	 * rows from different tablets and the path has no uniqkeys.  Clear them
+	 * before the costing, which reads them.
+	 */
+	if (index->nhashcolumns == 0 && yb_distinct_nkeys < 0)
+		pathnode->path.yb_path_info.yb_uniqkeys = NIL;
+
 	/* Estimate cost. */
-	prefixExprs = NIL;
-	i = 0;
-	foreach(lc, index->indextlist)
+	if (IsYugaByteEnabled() &&
+		yb_enable_base_scans_cost_model &&
+		index->relam == LSM_AM_OID)
 	{
-		TargetEntry *tle;
-
-		if (i >= yb_distinct_prefixlen)
-			break;
-
-		tle = (TargetEntry *) lfirst(lc);
-		prefixExprs = lappend(prefixExprs, tle->expr);
-		i++;
+		yb_cost_index(pathnode, root, loop_count, false /* partial_path */ );
+		numDistinctRows = pathnode->path.rows;
 	}
-	pathnode->path.rows = clamp_row_est(pathnode->path.rows);
-	numDistinctRows = estimate_num_groups(root,
-										  prefixExprs,
-										  pathnode->path.rows,
-										  NULL,
-										  NULL);
-	selectivity = ((Cost) numDistinctRows) / ((Cost) pathnode->path.rows);
+	else
+	{
+		List	   *prefixExprs = NIL;
+		ListCell   *lc;
+		int			i = 0;
+		Selectivity selectivity;
+		double		run_cost;
 
-	run_cost = pathnode->path.total_cost - pathnode->path.startup_cost;
-	run_cost *= selectivity;
-	pathnode->path.total_cost = pathnode->path.startup_cost + run_cost;
-	pathnode->path.rows = numDistinctRows;
-	pathnode->indextotalcost *= selectivity;
-	pathnode->indexselectivity *= selectivity;
+		foreach(lc, index->indextlist)
+		{
+			TargetEntry *tle;
+
+			if (i >= yb_distinct_prefixlen)
+				break;
+
+			tle = (TargetEntry *) lfirst(lc);
+			prefixExprs = lappend(prefixExprs, tle->expr);
+			i++;
+		}
+		pathnode->path.rows = clamp_row_est(pathnode->path.rows);
+		numDistinctRows = estimate_num_groups(root,
+											  prefixExprs,
+											  pathnode->path.rows,
+											  NULL,
+											  NULL);
+		selectivity = ((Cost) numDistinctRows) / ((Cost) pathnode->path.rows);
+
+		run_cost = pathnode->path.total_cost - pathnode->path.startup_cost;
+		run_cost *= selectivity;
+		pathnode->path.total_cost = pathnode->path.startup_cost + run_cost;
+		pathnode->path.rows = numDistinctRows;
+		pathnode->indextotalcost *= selectivity;
+		pathnode->indexselectivity *= selectivity;
+	}
 
 	Assert(yb_distinct_prefixlen >= index->nhashcolumns);
 	/*
@@ -5730,12 +5784,6 @@ yb_create_distinct_index_path(PlannerInfo *root,
 			return (Path *)
 				yb_create_unique_path(root, index->rel, (Path *) pathnode,
 									  yb_distinct_nkeys, numDistinctRows);
-
-		/*
-		 * Unique path cannot be added on top => possible duplicate tuples
-		 * => no uniqkeys.
-		 */
-		pathnode->path.yb_path_info.yb_uniqkeys = NIL;
 	}
 
 	return (Path *) pathnode;
