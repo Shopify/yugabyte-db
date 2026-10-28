@@ -305,16 +305,12 @@ class HollowTServer {
         storage->set_vector_index_size(0);
         storage->set_has_active_vector_index_backfill(false);
         storage->set_may_have_orphaned_post_split_data(false);
-        // The real provider adds leader_info for every hosted tablet, not just led ones;
-        // followers report NO_MAJORITY_REPLICATED_LEASE without an expiration.
-        auto* leader = req->add_leader_info();
-        leader->set_tablet_id(tablet_id);
+        // The real provider adds leader_info only for tablets this tserver leads.
         if (info.leader_uuid == uuid_) {
+          auto* leader = req->add_leader_info();
+          leader->set_tablet_id(tablet_id);
           leader->set_leader_lease_status(consensus::LeaderLeaseStatus::HAS_LEASE);
           leader->set_ht_lease_expiration((now_micros + 2 * 1000 * 1000) << 12);
-        } else {
-          leader->set_leader_lease_status(
-              consensus::LeaderLeaseStatus::NO_MAJORITY_REPLICATED_LEASE);
         }
         auto* compaction = req->add_full_compaction_statuses();
         compaction->set_tablet_id(tablet_id);
@@ -491,14 +487,10 @@ class HollowTServer {
         *compaction = tmpl_compactions.Get(i % tmpl_compactions.size());
         compaction->set_tablet_id(tablet_id);
       }
-      if (!tmpl_leaders.empty()) {
+      if (!tmpl_leaders.empty() && info.leader_uuid == uuid_) {
         auto* leader = req->add_leader_info();
-        if (info.leader_uuid == uuid_ && leader_tmpl_idx >= 0) {
-          *leader = tmpl_leaders.Get(leader_tmpl_idx);
-        } else {
-          leader->set_leader_lease_status(
-              consensus::LeaderLeaseStatus::NO_MAJORITY_REPLICATED_LEASE);
-        }
+        *leader = tmpl_leaders.Get(
+            leader_tmpl_idx >= 0 ? leader_tmpl_idx : i % tmpl_leaders.size());
         leader->set_tablet_id(tablet_id);
       }
       ++i;
