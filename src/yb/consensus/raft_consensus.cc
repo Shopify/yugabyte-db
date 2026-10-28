@@ -59,6 +59,7 @@
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/periodic.h"
 #include "yb/rpc/rpc_controller.h"
+#include "yb/rpc/thread_pool.h"
 
 #include "yb/server/clock.h"
 
@@ -450,7 +451,8 @@ shared_ptr<RaftConsensus> RaftConsensus::Create(
       parent_mem_tracker,
       mark_dirty_clbk,
       table_type,
-      retryable_requests);
+      retryable_requests,
+      raft_notifications_pool);
 }
 
 RaftConsensus::RaftConsensus(
@@ -463,7 +465,8 @@ RaftConsensus::RaftConsensus(
     const scoped_refptr<server::Clock>& clock, ConsensusContext* consensus_context,
     const scoped_refptr<log::Log>& log, shared_ptr<MemTracker> parent_mem_tracker,
     Callback<void(std::shared_ptr<StateChangeContext> context)> mark_dirty_clbk,
-    TableType table_type, RetryableRequests* retryable_requests)
+    TableType table_type, RetryableRequests* retryable_requests,
+    rpc::ThreadPool* raft_notifications_pool)
     : raft_pool_concurrent_token_(std::move(raft_pool_concurrent_token)),
       log_(log),
       clock_(clock),
@@ -488,6 +491,7 @@ RaftConsensus::RaftConsensus(
       table_type_(table_type),
       update_raft_config_dns_latency_(
           METRIC_dns_resolve_latency_during_update_raft_config.Instantiate(table_metric_entity)),
+      raft_notifications_pool_(raft_notifications_pool),
       split_parent_tablet_id_(
           cmeta->has_split_parent_tablet_id() ? cmeta->split_parent_tablet_id() : ""),
       clone_source_info_(cmeta->clone_source_info()) {
@@ -1642,6 +1646,194 @@ void RaftConsensus::TryRemoveFollowerTask(const string& uuid,
 Status RaftConsensus::Update(
     const std::shared_ptr<LWConsensusRequestPB>& request_ptr,
     LWConsensusResponsePB* response, CoarseTimePoint deadline) {
+  RETURN_NOT_OK(StartUpdate(*request_ptr, response));
+  auto result = VERIFY_RESULT(LockAndUpdateReplica(request_ptr, response, deadline));
+
+  // Release the lock while we wait for the log append to finish so that commits can go through.
+  if (!result.wait_for_op_id.empty()) {
+    RETURN_NOT_OK(WaitForWrites(
+        result.current_term, result.wait_for_op_id, WriteWaitDeadline(result, deadline)));
+  }
+
+  return FinishUpdate(*request_ptr, result);
+}
+
+// Asynchronous form of the tail of Update(): WaitForWrites() then FinishUpdate(), without a thread
+// parked in between. Completion comes from whichever happens first: the log reports
+// wait_for_op_id durable (AddSafeOpIdWaiter), or a tick of the timer that replaces
+// WaitForWrites()'s loop. A tick runs that loop's body once (WriteNotYetDurable), so the deadline,
+// the term check, and the failure-detector snooze and vote withholding while the append is pending
+// keep WaitForWrites()'s order and raft_heartbeat_interval_ms cadence. The log callback and the
+// timer only re-post to raft_notifications_pool: neither the appender thread nor the scheduler
+// thread runs consensus work. Holds the RaftConsensus alive until completion.
+class RaftConsensus::AsyncWriteWait : public std::enable_shared_from_this<AsyncWriteWait> {
+ public:
+  AsyncWriteWait(
+      std::shared_ptr<RaftConsensus> consensus, std::shared_ptr<LWConsensusRequestPB> request,
+      const UpdateReplicaResult& result, CoarseTimePoint deadline, UpdateCallback callback)
+      : consensus_(std::move(consensus)), request_(std::move(request)), result_(result),
+        deadline_(deadline), callback_(std::move(callback)) {}
+
+  void Start() {
+    // As in WaitForWrites(), durability is checked at least once even if the deadline has already
+    // passed: AddSafeOpIdWaiter() returns 0 for an already-durable target.
+    Status status;
+    bool durable = false;
+    {
+      std::lock_guard lock(mutex_);
+      std::weak_ptr<AsyncWriteWait> weak_self = shared_from_this();
+      auto waiter_id = consensus_->log_->AddSafeOpIdWaiter(
+          result_.wait_for_op_id, [weak_self](const Status& status) {
+            if (auto self = weak_self.lock()) {
+              self->Post([self, status] { self->Finish(status); });
+            }
+          });
+      if (!waiter_id.ok()) {
+        finished_ = true;
+        status = waiter_id.status();
+      } else if (*waiter_id == 0) {
+        finished_ = true;
+        durable = true;
+      } else {
+        log_waiter_id_ = *waiter_id;
+        ScheduleTickUnlocked(CoarseMonoClock::Now());
+      }
+    }
+    if (durable) {
+      Complete(Status::OK());
+    } else if (!status.ok()) {
+      Complete(status);
+    }
+  }
+
+ private:
+  // Runs f on raft_notifications_pool. If the pool no longer accepts tasks, fails the wait on the
+  // current thread without running the post-durability steps.
+  template <class F>
+  void Post(F&& f) {
+    if (!consensus_->raft_notifications_pool_->EnqueueFunctor(std::forward<F>(f))) {
+      Finish(STATUS(Aborted, "Raft notifications pool is shutting down"));
+    }
+  }
+
+  void ScheduleTickUnlocked(CoarseTimePoint now) REQUIRES(mutex_) {
+    auto delay = std::clamp<CoarseDuration>(
+        deadline_ - now, CoarseDuration::zero(), FLAGS_raft_heartbeat_interval_ms * 1ms);
+    auto self = shared_from_this();
+    timer_id_ = consensus_->peer_proxy_factory_->messenger()->scheduler().Schedule(
+        [self](const Status& status) {
+          if (!status.ok()) {
+            // Aborted by Finish(), or the scheduler is shutting down.
+            self->Finish(status);
+            return;
+          }
+          self->Post([self] { self->Tick(); });
+        },
+        delay);
+  }
+
+  void Tick() {
+    {
+      std::lock_guard lock(mutex_);
+      if (finished_) {
+        return;
+      }
+      timer_id_ = rpc::kInvalidTaskId;
+    }
+    auto now = CoarseMonoClock::Now();
+    if (consensus_->log_->IsSafeOpIdToApply(result_.wait_for_op_id)) {
+      Finish(Status::OK());
+      return;
+    }
+    if (consensus_->shutdown_state_.load(std::memory_order_acquire) !=
+            ShutdownState::kNotStarted) {
+      Finish(STATUS(Aborted, "Raft consensus is shutting down"));
+      return;
+    }
+    auto status = consensus_->WriteNotYetDurable(
+        result_.current_term, result_.wait_for_op_id, deadline_, now);
+    if (!status.ok()) {
+      Finish(status);
+      return;
+    }
+    std::lock_guard lock(mutex_);
+    if (!finished_) {
+      ScheduleTickUnlocked(now);
+    }
+  }
+
+  // Completes the wait with status unless it has already completed.
+  void Finish(const Status& status) {
+    rpc::ScheduledTaskId timer_id;
+    uint64_t log_waiter_id;
+    {
+      std::lock_guard lock(mutex_);
+      if (finished_) {
+        return;
+      }
+      finished_ = true;
+      timer_id = std::exchange(timer_id_, rpc::kInvalidTaskId);
+      log_waiter_id = std::exchange(log_waiter_id_, 0);
+    }
+    if (timer_id != rpc::kInvalidTaskId) {
+      consensus_->peer_proxy_factory_->messenger()->scheduler().Abort(timer_id);
+    }
+    if (log_waiter_id != 0) {
+      consensus_->log_->RemoveSafeOpIdWaiter(log_waiter_id);
+    }
+    Complete(status);
+  }
+
+  // Called exactly once.
+  void Complete(Status status) {
+    if (status.ok()) {
+      status = consensus_->FinishUpdate(*request_, result_);
+    }
+    auto callback = std::move(callback_);
+    callback(status);
+  }
+
+  const std::shared_ptr<RaftConsensus> consensus_;
+  const std::shared_ptr<LWConsensusRequestPB> request_;
+  const UpdateReplicaResult result_;
+  const CoarseTimePoint deadline_;
+  UpdateCallback callback_;
+
+  std::mutex mutex_;
+  bool finished_ GUARDED_BY(mutex_) = false;
+  rpc::ScheduledTaskId timer_id_ GUARDED_BY(mutex_) = rpc::kInvalidTaskId;
+  uint64_t log_waiter_id_ GUARDED_BY(mutex_) = 0;
+};
+
+void RaftConsensus::UpdateAsync(
+    std::shared_ptr<LWConsensusRequestPB> request, LWConsensusResponsePB* response,
+    CoarseTimePoint deadline, UpdateCallback callback) {
+  if (!raft_notifications_pool_) {
+    callback(STATUS(NotSupported, "UpdateAsync needs a Raft notifications pool"));
+    return;
+  }
+  auto status = StartUpdate(*request, response);
+  if (!status.ok()) {
+    callback(status);
+    return;
+  }
+  auto result = LockAndUpdateReplica(request, response, deadline);
+  if (!result.ok()) {
+    callback(result.status());
+    return;
+  }
+  if (result->wait_for_op_id.empty()) {
+    callback(FinishUpdate(*request, *result));
+    return;
+  }
+  auto wait_deadline = WriteWaitDeadline(*result, deadline);
+  std::make_shared<AsyncWriteWait>(
+      shared_from_this(), std::move(request), *result, wait_deadline, std::move(callback))
+      ->Start();
+}
+
+Status RaftConsensus::StartUpdate(
+    const LWConsensusRequestPB& request, LWConsensusResponsePB* response) {
   if (const auto& wait_state = yb::ash::WaitStateInfo::CurrentWaitState()) {
     wait_state->set_query_id(
         std::to_underlying(yb::ash::FixedQueryId::kQueryIdForRaftUpdateConsensus));
@@ -1661,7 +1853,6 @@ Status RaftConsensus::Update(
         MonoDelta::kMax, LogPrefix() + "Paused by TEST_PauseUpdateConsensus"));
   }
 
-  const auto& request = *request_ptr;
   auto reject_mode = reject_mode_.load(std::memory_order_acquire);
   if (reject_mode != RejectMode::kNone) {
     if (reject_mode == RejectMode::kAll ||
@@ -1692,8 +1883,8 @@ Status RaftConsensus::Update(
   // Bound how long an already-appended entry can sit unsynced on a tablet that has gone quiet:
   // Log only re-evaluates --interval_durable_wal_write_ms when something is appended.
   //
-  // Placed ahead of both the write-stop rejection and the update_mutex_ block below to ensure
-  // durability even in the following scenarios:
+  // Placed ahead of both the write-stop rejection and the update_mutex_ wait
+  // (LockAndUpdateReplica) to ensure durability even in the following scenarios:
   //   - write stalls
   //   - unable to acquire update_mutex_
   //   - UpdateReplica() fails and returns early
@@ -1717,40 +1908,48 @@ Status RaftConsensus::Update(
         "RPC thread pile-up on update_mutex_");
   }
 
-  UpdateReplicaResult result;
-  {
-    // see var declaration
-    auto wait_start = CoarseMonoClock::now();
-    auto wait_duration = deadline != CoarseTimePoint::max() ? deadline - wait_start
-                                                            : CoarseDuration::max();
-    auto lock = LockMutex(&update_mutex_, wait_duration);
-    if (!lock.owns_lock()) {
-      return STATUS_FORMAT(TimedOut, "Unable to lock update mutex for $0", wait_duration);
-    }
+  return Status::OK();
+}
 
-    LongOperationTracker operation_tracker("UpdateReplica", 1s);
-    result = VERIFY_RESULT(UpdateReplica(request_ptr, response));
-
-    auto delay = TEST_delay_update_.load(std::memory_order_acquire);
-    if (delay != MonoDelta::kZero) {
-      std::this_thread::sleep_for(delay.ToSteadyDuration());
-    } else if (FLAGS_TEST_delay_update_consensus_requests_ms != 0) {
-      std::this_thread::sleep_for(1ms * FLAGS_TEST_delay_update_consensus_requests_ms);
-    }
+Result<RaftConsensus::UpdateReplicaResult> RaftConsensus::LockAndUpdateReplica(
+    const std::shared_ptr<LWConsensusRequestPB>& request_ptr, LWConsensusResponsePB* response,
+    CoarseTimePoint deadline) {
+  // see var declaration
+  auto wait_start = CoarseMonoClock::now();
+  auto wait_duration = deadline != CoarseTimePoint::max() ? deadline - wait_start
+                                                          : CoarseDuration::max();
+  auto lock = LockMutex(&update_mutex_, wait_duration);
+  if (!lock.owns_lock()) {
+    return STATUS_FORMAT(TimedOut, "Unable to lock update mutex for $0", wait_duration);
   }
 
-  // Release the lock while we wait for the log append to finish so that commits can go through.
-  if (!result.wait_for_op_id.empty()) {
-    auto wait_deadline = deadline;
-    if (result.empty_request) {
-      // The leader sends heartbeats at heartbeat cadence, and MultiRaftUpdateConsensus() answers
-      // its requests sequentially, so bound this wait by one interval as well as by the deadline.
-      wait_deadline = std::min(
-          wait_deadline, CoarseMonoClock::Now() + FLAGS_raft_heartbeat_interval_ms * 1ms);
-    }
-    RETURN_NOT_OK(WaitForWrites(result.current_term, result.wait_for_op_id, wait_deadline));
-  }
+  LongOperationTracker operation_tracker("UpdateReplica", 1s);
+  auto result = VERIFY_RESULT(UpdateReplica(request_ptr, response));
 
+  auto delay = TEST_delay_update_.load(std::memory_order_acquire);
+  if (delay != MonoDelta::kZero) {
+    std::this_thread::sleep_for(delay.ToSteadyDuration());
+  } else if (FLAGS_TEST_delay_update_consensus_requests_ms != 0) {
+    std::this_thread::sleep_for(1ms * FLAGS_TEST_delay_update_consensus_requests_ms);
+  }
+  return result;
+}
+
+CoarseTimePoint RaftConsensus::WriteWaitDeadline(
+    const UpdateReplicaResult& result, CoarseTimePoint deadline) {
+  if (!result.empty_request) {
+    return deadline;
+  }
+  // A request without ops is a heartbeat, and the leader sends the next one a heartbeat interval
+  // later anyway, so its acknowledgement need not wait longer than that for the log. The bound
+  // matters for envelopes (MultiRaftUpdateConsensus), whose deadline grows with the number of
+  // sub-requests and is far out for heartbeat-only ones. It can only shorten the wait, whether
+  // the envelope's sub-requests are processed one after another or concurrently.
+  return std::min(deadline, CoarseMonoClock::Now() + FLAGS_raft_heartbeat_interval_ms * 1ms);
+}
+
+Status RaftConsensus::FinishUpdate(
+    const LWConsensusRequestPB& request, const UpdateReplicaResult& result) {
   if (PREDICT_FALSE(VLOG_IS_ON(2))) {
     VLOG_WITH_PREFIX(2) << "Replica updated. "
         << state_->ToString() << " Request: " << request.ShortDebugString();
@@ -2356,8 +2555,10 @@ Status RaftConsensus::WaitForWrites(
     int64_t term, const OpId& wait_for_op_id, CoarseTimePoint deadline) {
   // 5 - We wait for the writes to be durable.
 
-  // Note that this is safe because dist consensus now only supports a single outstanding
-  // request at a time and this way we can allow commits to proceed while we wait.
+  // This runs without update_mutex_, so commits and later requests for this tablet can proceed
+  // while we wait. That is safe because the leader keeps at most one data request outstanding
+  // per peer and drops a heartbeat response older than its last data request, so overlapping
+  // waits for one tablet cannot reorder what the leader acts on.
   TRACE("Waiting on the replicates to finish logging");
   TRACE_EVENT0("consensus", "Wait for log");
   for (;;) {
@@ -2368,33 +2569,39 @@ Status RaftConsensus::WaitForWrites(
         wait_for_op_id,
         std::clamp<CoarseDuration>(
             deadline - now, CoarseDuration::zero(), FLAGS_raft_heartbeat_interval_ms * 1ms));
-    // If just waiting for our log append to finish lets snooze the timer.
-    // We don't want to fire leader election because we're waiting on our own log.
     if (!wait_result.empty()) {
       break;
     }
-    if (now >= deadline) {
-      return STATUS_FORMAT(
-          TimedOut, "Op id $0 did not become durable in the local WAL before the deadline",
-          wait_for_op_id);
-    }
-    int64_t new_term;
-    {
-      auto lock = state_->LockForRead();
-      new_term = state_->GetCurrentTermUnlocked();
-    }
-    if (term != new_term) {
-      return STATUS_FORMAT(IllegalState, "Term changed to $0 while waiting for writes in term $1",
-                           new_term, term);
-    }
-
-    SnoozeFailureDetector(DO_NOT_LOG);
-
-    const auto election_timeout_at = MonoTime::Now() + MinimumElectionTimeout();
-    UpdateAtomicMax(&withhold_votes_until_, election_timeout_at);
+    RETURN_NOT_OK(WriteNotYetDurable(term, wait_for_op_id, deadline, now));
   }
   TRACE("Finished waiting on the replicates to finish logging");
 
+  return Status::OK();
+}
+
+Status RaftConsensus::WriteNotYetDurable(
+    int64_t term, const OpId& wait_for_op_id, CoarseTimePoint deadline, CoarseTimePoint now) {
+  if (now >= deadline) {
+    return STATUS_FORMAT(
+        TimedOut, "Op id $0 did not become durable in the local WAL before the deadline",
+        wait_for_op_id);
+  }
+  int64_t new_term;
+  {
+    auto lock = state_->LockForRead();
+    new_term = state_->GetCurrentTermUnlocked();
+  }
+  if (term != new_term) {
+    return STATUS_FORMAT(IllegalState, "Term changed to $0 while waiting for writes in term $1",
+                         new_term, term);
+  }
+
+  // We are only waiting for our own log append, so do not let the failure detector start an
+  // election, and do not grant votes to anyone else meanwhile.
+  SnoozeFailureDetector(DO_NOT_LOG);
+
+  const auto election_timeout_at = MonoTime::Now() + MinimumElectionTimeout();
+  UpdateAtomicMax(&withhold_votes_until_, election_timeout_at);
   return Status::OK();
 }
 

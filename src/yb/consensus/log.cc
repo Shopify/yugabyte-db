@@ -1476,10 +1476,15 @@ Status Log::Sync() {
 Status Log::UpdateSegmentReadableOffset() {
   // Update the reader on how far it can read the active segment.
   RETURN_NOT_OK(reader_->UpdateLastSegmentOffset(active_segment_->written_offset()));
+  std::vector<SafeOpIdWaiter> ready_waiters;
   {
     std::lock_guard write_lock(last_synced_entry_op_id_mutex_);
     last_synced_entry_op_id_.store(last_appended_entry_op_id_, boost::memory_order_release);
     YB_PROFILE(last_synced_entry_op_id_cond_.notify_all());
+    CollectReadySafeOpIdWaitersUnlocked(&ready_waiters);
+  }
+  for (auto& waiter : ready_waiters) {
+    waiter.callback(Status::OK());
   }
   return Status::OK();
 }
@@ -1744,6 +1749,55 @@ OpId Log::WaitForSafeOpIdToApply(const OpId& min_allowed, MonoDelta duration) {
   return result;
 }
 
+bool Log::IsSafeOpIdToApply(const OpId& op_id) const {
+  return FLAGS_TEST_log_consider_all_ops_safe || all_op_ids_safe_ ||
+         last_synced_entry_op_id_.load(boost::memory_order_acquire) >= op_id;
+}
+
+Result<uint64_t> Log::AddSafeOpIdWaiter(const OpId& op_id, StdStatusCallback callback) {
+  // Checked under the mutex that guards the stores of last_synced_entry_op_id_, so a store cannot
+  // slip between the check and the registration.
+  std::lock_guard lock(last_synced_entry_op_id_mutex_);
+  if (IsSafeOpIdToApply(op_id)) {
+    return 0;
+  }
+  SCHECK(!safe_op_id_waiters_closed_, IllegalState, "Log is closed");
+  auto id = next_safe_op_id_waiter_id_++;
+  safe_op_id_waiters_.push_back(SafeOpIdWaiter {
+    .id = id,
+    .op_id = op_id,
+    .callback = std::move(callback),
+  });
+  return id;
+}
+
+void Log::RemoveSafeOpIdWaiter(uint64_t id) {
+  StdStatusCallback removed;
+  {
+    std::lock_guard lock(last_synced_entry_op_id_mutex_);
+    auto it = std::find_if(
+        safe_op_id_waiters_.begin(), safe_op_id_waiters_.end(),
+        [id](const auto& waiter) { return waiter.id == id; });
+    if (it == safe_op_id_waiters_.end()) {
+      return;
+    }
+    // Destroy the callback outside the mutex: it may hold the last reference to its owner.
+    removed = std::move(it->callback);
+    safe_op_id_waiters_.erase(it);
+  }
+}
+
+void Log::CollectReadySafeOpIdWaitersUnlocked(std::vector<SafeOpIdWaiter>* ready) {
+  if (safe_op_id_waiters_.empty()) {
+    return;
+  }
+  auto it = std::partition(
+      safe_op_id_waiters_.begin(), safe_op_id_waiters_.end(),
+      [this](const auto& waiter) { return !IsSafeOpIdToApply(waiter.op_id); });
+  std::move(it, safe_op_id_waiters_.end(), std::back_inserter(*ready));
+  safe_op_id_waiters_.erase(it, safe_op_id_waiters_.end());
+}
+
 Status Log::GC(const MinRetainLogIndexInfo& min_retain_log_index_info, int32_t* num_gced) {
   CHECK_GE(min_retain_log_index_info.earliest_needed_log_index, 0);
 
@@ -1927,6 +1981,21 @@ Status Log::Close() {
   // Allocation pool is used from appender pool, so we should shutdown appender first.
   appender_->Shutdown();
   allocation_token_.reset();
+
+  // Nothing advances last_synced_entry_op_id_ once the appender is gone, so fail the waiters
+  // instead of leaving them pending.
+  std::vector<SafeOpIdWaiter> closed_waiters;
+  {
+    std::lock_guard lock(last_synced_entry_op_id_mutex_);
+    safe_op_id_waiters_closed_ = true;
+    closed_waiters.swap(safe_op_id_waiters_);
+  }
+  if (!closed_waiters.empty()) {
+    const auto closed_status = STATUS(IllegalState, "Log closed while waiting for a safe op id");
+    for (auto& waiter : closed_waiters) {
+      waiter.callback(closed_status);
+    }
+  }
 
   if (PREDICT_FALSE(FLAGS_TEST_simulate_abrupt_server_restart)) {
     return Status::OK();
@@ -2374,11 +2443,16 @@ Status Log::ResetLastSyncedEntryOpId(const OpId& op_id) {
   RETURN_NOT_OK(WaitUntilAllFlushed());
 
   OpId old_value;
+  std::vector<SafeOpIdWaiter> ready_waiters;
   {
     std::lock_guard write_lock(last_synced_entry_op_id_mutex_);
     old_value = last_synced_entry_op_id_.load(boost::memory_order_acquire);
     last_synced_entry_op_id_.store(op_id, boost::memory_order_release);
     YB_PROFILE(last_synced_entry_op_id_cond_.notify_all());
+    CollectReadySafeOpIdWaitersUnlocked(&ready_waiters);
+  }
+  for (auto& waiter : ready_waiters) {
+    waiter.callback(Status::OK());
   }
   LOG_WITH_PREFIX(INFO) << "Reset last synced entry op id from " << old_value << " to " << op_id;
   if (old_value.term < op_id.term) {
