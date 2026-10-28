@@ -702,10 +702,22 @@ TEST_F(MultiRaftUpdateConsensusTest, SameTabletHeartbeatAndData) {
   struct Order {
     std::mutex mutex;
     TabletId tablet_id;
+    OpId heartbeat_preceding;
+    OpId data_first_op;
     bool heartbeat_runs_first = false;
     std::unique_ptr<CountDownLatch> first_done;
     std::vector<bool> ran_heartbeat;
   } order;
+  // Only the two requests of the current case: the task of an earlier request can still reach a
+  // sync point after its response has been received.
+  auto in_case = [&order](const consensus::LWConsensusRequestPB& req) {
+    if (req.tablet_id() != order.tablet_id) {
+      return false;
+    }
+    return req.ops().empty()
+        ? OpId::FromPB(req.preceding_id()) == order.heartbeat_preceding
+        : OpId::FromPB(req.ops().front().id()) == order.data_first_op;
+  };
   auto is_first = [&order](const consensus::LWConsensusRequestPB& req) {
     return req.ops().empty() == order.heartbeat_runs_first;
   };
@@ -715,7 +727,7 @@ TEST_F(MultiRaftUpdateConsensusTest, SameTabletHeartbeatAndData) {
     CountDownLatch* first_done;
     {
       std::lock_guard lock(order.mutex);
-      if (req.tablet_id() != order.tablet_id || is_first(req)) {
+      if (!in_case(req) || is_first(req)) {
         return;
       }
       first_done = order.first_done.get();
@@ -725,7 +737,7 @@ TEST_F(MultiRaftUpdateConsensusTest, SameTabletHeartbeatAndData) {
   sync_point->SetCallBack("MultiRaftUpdateTask::AfterUpdate", [&](void* arg) {
     auto& req = *static_cast<consensus::LWConsensusRequestPB*>(arg);
     std::lock_guard lock(order.mutex);
-    if (req.tablet_id() != order.tablet_id) {
+    if (!in_case(req)) {
       return;
     }
     order.ran_heartbeat.push_back(req.ops().empty());
@@ -751,6 +763,8 @@ TEST_F(MultiRaftUpdateConsensusTest, SameTabletHeartbeatAndData) {
     {
       std::lock_guard lock(order.mutex);
       order.tablet_id = tablet.id;
+      order.heartbeat_preceding = before_data;
+      order.data_first_op = OpId::FromPB(data.ops(0).id());
       order.heartbeat_runs_first = test_case.heartbeat_runs_first;
       order.first_done = std::make_unique<CountDownLatch>(1);
       order.ran_heartbeat.clear();
