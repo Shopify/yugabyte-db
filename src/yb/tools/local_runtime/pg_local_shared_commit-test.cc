@@ -14,11 +14,15 @@
 
 #include <algorithm>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
+#include <limits>
+#include <utility>
 
 #include "yb/common/doc_hybrid_time.h"
 #include "yb/dockv/doc_key.h"
 #include "yb/common/entity_ids.h"
+#include "yb/common/pgsql_error.h"
 #include "yb/common/pgsql_protocol.messages.h"
 #include "yb/common/schema_pbutil.h"
 #include "yb/docdb/doc_read_context.h"
@@ -27,9 +31,12 @@
 #include "yb/docdb/pgsql_operation.h"
 #include "yb/docdb/ql_rocksdb_storage.h"
 #include "yb/rocksdb/db.h"
+#include "yb/rocksdb/perf_context.h"
 #include "yb/rocksdb/write_batch.h"
 #include "yb/rpc/sidecars.h"
 #include "yb/tablet/tablet_options.h"
+#include "yb/tools/local_runtime/pg_local_metadata.pb.h"
+#include "yb/tools/local_runtime/pg_local_storage.h"
 #include "yb/tools/local_runtime/pg_local_table.h"
 #include "yb/tools/local_runtime/pg_local_txn_store.h"
 #include "yb/tserver/pg_client.pb.h"
@@ -90,6 +97,35 @@ Result<std::vector<int64_t>> Values(const std::string& bytes) {
   }
   SCHECK(slice.empty(), Corruption, "Unexpected trailing row data");
   return result;
+}
+
+// Mirrors the catalog's private sequence key layout, so tests can seed and inspect it in bulk.
+std::string SequenceKey(uint32_t database_oid, uint32_t sequence_oid) {
+  char name[32];
+  snprintf(
+      name, sizeof(name), "sequence/%08x/%08x", static_cast<unsigned>(database_oid),
+      static_cast<unsigned>(sequence_oid));
+  return PgLocalStorage::MetadataKey(name);
+}
+
+std::string SequenceValue(int64_t last_value) {
+  SequencePB tuple;
+  tuple.set_last_value(last_value);
+  tuple.set_is_called(true);
+  return tuple.SerializeAsString();
+}
+
+Result<size_t> CountSequences(const PgLocalStorage& storage, uint32_t database_oid) {
+  const auto end = SequenceKey(database_oid + 1, 0);
+  std::unique_ptr<rocksdb::Iterator> it(
+      storage.db()->NewIterator(rocksdb::ReadOptions(), storage.metadata()));
+  size_t count = 0;
+  for (it->Seek(SequenceKey(database_oid, 0)); it->Valid() && it->key().compare(Slice(end)) < 0;
+       it->Next()) {
+    ++count;
+  }
+  RETURN_NOT_OK(it->status());
+  return count;
 }
 
 class PgLocalSharedCommitTest : public YBTest {
@@ -258,9 +294,36 @@ class PgLocalSharedCommitTest : public YBTest {
     return STATUS(IllegalState, "SQL paging did not terminate");
   }
 
+  Result<std::pair<int64_t, bool>> Sequence(uint32_t database_oid, uint32_t sequence_oid) {
+    const auto tuple = VERIFY_RESULT(catalog_->ReadSequence(database_oid, sequence_oid));
+    return std::make_pair(tuple.last_value, tuple.is_called);
+  }
+
   void Reopen() {
     catalog_.reset();
     catalog_ = ASSERT_RESULT(PgCatalogTransaction::Open(path_, Seed() + "/rocksdb"));
+  }
+
+  Result<std::vector<tablet::TableInfoPB>> PgClassSources() {
+    tserver::ExportedTabletMetadataChanges changes;
+    RETURN_NOT_OK(pb_util::ReadPBContainerFromPath(
+        Env::Default(), Seed() + "/exported_tablet_metadata_changes", &changes));
+    std::vector<tablet::TableInfoPB> sources;
+    const auto collect = [&](const tablet::TableInfoPB& table) {
+      if (table.table_id() == GetPgsqlTableId(1, kPgClassTableOid)) sources.push_back(table);
+    };
+    for (const auto& change : changes.metadata_changes()) {
+      if (change.has_add_table()) collect(change.add_table());
+      for (const auto& table : change.add_multiple_tables()) collect(table);
+    }
+    SCHECK_EQ(sources.size(), 1, IllegalState, "Missing pg_class seed descriptor");
+    return sources;
+  }
+
+  // Closes the catalog and opens its storage directly, for bulk synthetic seeding and inspection.
+  Result<std::shared_ptr<PgLocalStorage>> OpenClosedStorage() {
+    catalog_.reset();
+    return PgLocalStorage::Open(path_, Seed() + "/rocksdb");
   }
 
   std::string path_;
@@ -1278,6 +1341,310 @@ TEST_F(PgLocalSharedCommitTest, DropDatabaseChunkedCleanupCrash) {
     Reopen();
     ASSERT_EQ(batches, completed_batches);
   }
+}
+
+TEST_F(PgLocalSharedCommitTest, SequenceStateSurvivesRollbackAndReopen) {
+  using Tuple = PgCatalogTransaction::SequenceTuple;
+  using Range = std::pair<int64_t, int64_t>;
+  using State = std::pair<int64_t, bool>;
+  constexpr uint32_t kDatabase = 1;
+  constexpr uint32_t kUp = 1000005100;
+  constexpr uint32_t kDown = kUp + 1;
+  constexpr uint32_t kCas = kUp + 2;
+  constexpr auto kMax = std::numeric_limits<int64_t>::max();
+  const auto fetch = [&](uint32_t sequence, uint32_t count, int64_t step, int64_t min,
+                         int64_t max, bool cycle) {
+    return catalog_->FetchSequence(kDatabase, sequence, count, step, min, max, cycle);
+  };
+  const auto update = [&](uint32_t sequence, Tuple value, std::optional<Tuple> expected) {
+    return catalog_->UpdateSequence(kDatabase, sequence, value, expected);
+  };
+  ASSERT_OK(catalog_->InsertSequence(kDatabase, kUp, Tuple{kMax - 9, false}));
+  ASSERT_NOK(catalog_->InsertSequence(kDatabase, kUp, Tuple{1, false}));
+  ASSERT_TRUE(catalog_->InsertSequence(0, kDown, Tuple{1, false}).IsInvalidArgument());
+  ASSERT_TRUE(catalog_->InsertSequence(kDatabase, 1, Tuple{1, false}).IsInvalidArgument());
+  ASSERT_OK(catalog_->InsertSequence(kDatabase, kDown, Tuple{-1, false}));
+  ASSERT_OK(catalog_->InsertSequence(kDatabase, kCas, Tuple{10, true}));
+
+  // Neither a logical catalog abort nor the rollback below may undo sequence state.
+  ASSERT_RESULT(catalog_->BeginWithNative());
+  ASSERT_OK(Version(initial_ + 1, 1));
+  ASSERT_NOK(catalog_->DropDatabase(1, "template1", 2));
+  ASSERT_NOK(catalog_->CheckHealthy());
+
+  ASSERT_EQ(ASSERT_RESULT(fetch(kUp, 3, 2, 1, kMax, false)), Range(kMax - 9, kMax - 5));
+  // Truncated at the bound; the next step would overflow int64.
+  ASSERT_EQ(ASSERT_RESULT(fetch(kUp, 10, 2, 1, kMax, false)), Range(kMax - 3, kMax - 1));
+  auto status = ResultToStatus(fetch(kUp, 1, 2, 1, kMax, false));
+  ASSERT_EQ(PgsqlError(status), YBPgErrorCode::YB_PG_SEQUENCE_GENERATOR_LIMIT_EXCEEDED) << status;
+  ASSERT_EQ(ASSERT_RESULT(fetch(kUp, 2, 2, 1, kMax, true)), Range(1, 3));
+
+  ASSERT_EQ(ASSERT_RESULT(fetch(kDown, 5, -3, -100, -1, false)), Range(-1, -13));
+  ASSERT_EQ(ASSERT_RESULT(fetch(kDown, 50, -3, -100, -1, false)), Range(-16, -100));
+  status = ResultToStatus(fetch(kDown, 1, -3, -100, -1, false));
+  ASSERT_EQ(PgsqlError(status), YBPgErrorCode::YB_PG_SEQUENCE_GENERATOR_LIMIT_EXCEEDED) << status;
+  ASSERT_EQ(ASSERT_RESULT(fetch(kDown, 2, -3, -100, -1, true)), Range(-1, -4));
+
+  ASSERT_TRUE(ResultToStatus(fetch(kDown, 0, -3, -100, -1, false)).IsInvalidArgument());
+  ASSERT_TRUE(ResultToStatus(fetch(kDown, 1, 0, -100, -1, false)).IsInvalidArgument());
+  ASSERT_TRUE(ResultToStatus(fetch(kDown, 1, -3, -1, -100, false)).IsInvalidArgument());
+  ASSERT_TRUE(ResultToStatus(fetch(kCas + 1, 1, 1, 1, 10, false)).IsNotFound());
+  ASSERT_EQ(ASSERT_RESULT(Sequence(kDatabase, kDown)), State(-4, true));
+
+  ASSERT_TRUE(ASSERT_RESULT(update(kCas, Tuple{20, true}, Tuple{11, true})));
+  ASSERT_TRUE(ASSERT_RESULT(update(kCas, Tuple{20, true}, Tuple{10, false})));
+  ASSERT_EQ(ASSERT_RESULT(Sequence(kDatabase, kCas)), State(10, true));
+  ASSERT_FALSE(ASSERT_RESULT(update(kCas, Tuple{20, false}, Tuple{10, true})));
+  ASSERT_EQ(ASSERT_RESULT(Sequence(kDatabase, kCas)), State(20, false));
+  ASSERT_FALSE(ASSERT_RESULT(update(kCas, Tuple{-5, true}, std::nullopt)));
+  ASSERT_EQ(ASSERT_RESULT(Sequence(kDatabase, kCas)), State(-5, true));
+  ASSERT_TRUE(ASSERT_RESULT(update(kCas + 1, Tuple{1, true}, std::nullopt)));
+  ASSERT_OK(catalog_->DeleteSequence(kDatabase, kCas));
+  ASSERT_OK(catalog_->DeleteSequence(kDatabase, kCas));
+  ASSERT_TRUE(ResultToStatus(catalog_->ReadSequence(kDatabase, kCas)).IsNotFound());
+
+  catalog_->Abort();
+  ASSERT_OK(catalog_->CheckHealthy());
+  ASSERT_EQ(ASSERT_RESULT(Version()), initial_);
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_EQ(ASSERT_RESULT(Sequence(kDatabase, kUp)), State(3, true));
+    ASSERT_EQ(ASSERT_RESULT(Sequence(kDatabase, kDown)), State(-4, true));
+    ASSERT_TRUE(ResultToStatus(catalog_->ReadSequence(kDatabase, kCas)).IsNotFound());
+    Reopen();
+  }
+  ASSERT_EQ(ASSERT_RESULT(fetch(kUp, 1, 2, 1, kMax, false)), Range(5, 5));
+  // An uncalled value outside the request bounds is rejected before any reservation.
+  ASSERT_OK(catalog_->InsertSequence(kDatabase, kCas, Tuple{50, false}));
+  ASSERT_TRUE(ResultToStatus(fetch(kCas, 5, 1, 1, 10, false)).IsNotSupported());
+  ASSERT_TRUE(ResultToStatus(fetch(kCas, 5, -1, 60, 100, true)).IsNotSupported());
+  ASSERT_EQ(ASSERT_RESULT(Sequence(kDatabase, kCas)), State(50, false));
+  ASSERT_EQ(ASSERT_RESULT(fetch(kCas, 5, 1, 1, 100, false)), Range(50, 54));
+}
+
+TEST_F(PgLocalSharedCommitTest, SequenceRetirementAndWriteFailureFence) {
+  using Tuple = PgCatalogTransaction::SequenceTuple;
+  using Range = std::pair<int64_t, int64_t>;
+  using State = std::pair<int64_t, bool>;
+  tserver::ExportedTabletMetadataChanges changes;
+  ASSERT_OK(
+      pb_util::ReadPBContainerFromPath(
+          Env::Default(), Seed() + "/exported_tablet_metadata_changes", &changes));
+  std::vector<tablet::TableInfoPB> sources;
+  const auto collect = [&](const tablet::TableInfoPB& table) {
+    if (table.table_id() == GetPgsqlTableId(1, kPgClassTableOid)) sources.push_back(table);
+  };
+  for (const auto& change : changes.metadata_changes()) {
+    if (change.has_add_table()) collect(change.add_table());
+    for (const auto& table : change.add_multiple_tables()) collect(table);
+  }
+  ASSERT_EQ(sources.size(), 1);
+  // Adjacent OIDs share each sequence key up to the final database digit.
+  constexpr uint32_t kRetired = 1000005500;
+  constexpr uint32_t kSurviving = kRetired + 1;
+  constexpr uint32_t kSequence = 1000005600;
+  ASSERT_RESULT(catalog_->BeginWithNative());
+  ASSERT_OK(catalog_->CreateDatabase(kRetired, "retired_database", sources, 1));
+  ASSERT_OK(catalog_->Commit());
+  ASSERT_RESULT(catalog_->BeginWithNative());
+  ASSERT_OK(catalog_->CreateDatabase(kSurviving, "surviving_database", sources, 1));
+  ASSERT_OK(catalog_->Commit());
+  for (const auto database : {kRetired, kSurviving, 1u}) {
+    ASSERT_OK(catalog_->InsertSequence(database, kSequence, Tuple{7, true}));
+  }
+  ASSERT_OK(catalog_->InsertSequence(kRetired, kSequence + 1, Tuple{1, false}));
+  ASSERT_TRUE(catalog_->DeleteDatabaseSequences(kRetired).IsIllegalState());
+
+  ASSERT_RESULT(catalog_->BeginWithNative());
+  ASSERT_OK(catalog_->DropDatabase(kRetired, "retired_database", 1));
+  catalog_->Abort();
+  ASSERT_EQ(ASSERT_RESULT(Sequence(kRetired, kSequence + 1)), State(1, false));
+  ASSERT_RESULT(catalog_->BeginWithNative());
+  ASSERT_OK(catalog_->DropDatabase(kRetired, "retired_database", 1));
+  ASSERT_OK(catalog_->Commit());
+  for (int i = 0; i < 2; ++i) {
+    for (const auto sequence : {kSequence, kSequence + 1}) {
+      ASSERT_TRUE(ResultToStatus(catalog_->ReadSequence(kRetired, sequence)).IsNotFound());
+    }
+    ASSERT_EQ(ASSERT_RESULT(Sequence(kSurviving, kSequence)), State(7, true));
+    ASSERT_EQ(ASSERT_RESULT(Sequence(1, kSequence)), State(7, true));
+    ASSERT_TRUE(catalog_->InsertSequence(kRetired, kSequence, Tuple{1, false}).IsNotSupported());
+    ASSERT_OK(catalog_->DeleteDatabaseSequences(kRetired));
+    ASSERT_TRUE(catalog_->DeleteDatabaseSequences(kSurviving).IsIllegalState());
+    Reopen();
+  }
+
+  auto* sync = SyncPoint::GetInstance();
+  auto cleanup = ScopeExit([&] {
+    sync->DisableProcessing();
+    sync->ClearAllCallBacks();
+  });
+  sync->SetCallBack("PgCatalogTransaction::SequenceWriteStatus", [](void* status) {
+    *static_cast<Status*>(status) = STATUS(IOError, "Ambiguous sequence acknowledgement");
+  });
+  sync->EnableProcessing();
+  ASSERT_TRUE(
+      ResultToStatus(catalog_->FetchSequence(kSurviving, kSequence, 3, 1, 1, 100, false))
+          .IsIOError());
+  sync->DisableProcessing();
+  ASSERT_TRUE(ResultToStatus(catalog_->ReadSequence(1, kSequence)).IsIOError());
+  ASSERT_TRUE(
+      ResultToStatus(catalog_->FetchSequence(1, kSequence, 1, 1, 1, 100, false)).IsIOError());
+  ASSERT_TRUE(catalog_->InsertSequence(1, kSequence + 1, Tuple{1, false}).IsIOError());
+  ASSERT_TRUE(
+      ResultToStatus(catalog_->UpdateSequence(1, kSequence, Tuple{1, false}, std::nullopt))
+          .IsIOError());
+  ASSERT_TRUE(catalog_->DeleteSequence(1, kSequence).IsIOError());
+  ASSERT_TRUE(catalog_->DeleteDatabaseSequences(kRetired).IsIOError());
+  ASSERT_TRUE(catalog_->CheckHealthy().IsIOError());
+  ASSERT_TRUE(catalog_->Begin().IsIOError());
+  ASSERT_TRUE(ResultToStatus(catalog_->AllocateOid(1)).IsIOError());
+  ASSERT_TRUE(ResultToStatus(catalog_->NativeTransactions().Begin()).IsIOError());
+  Reopen();
+  // The unacknowledged reservation is durable, so its values are never reissued.
+  ASSERT_EQ(ASSERT_RESULT(Sequence(kSurviving, kSequence)), State(10, true));
+  ASSERT_EQ(
+      ASSERT_RESULT(catalog_->FetchSequence(kSurviving, kSequence, 1, 1, 1, 100, false)),
+      Range(11, 11));
+  ASSERT_EQ(ASSERT_RESULT(Sequence(1, kSequence)), State(7, true));
+}
+
+TEST_F(PgLocalSharedCommitTest, SequenceCleanupResumesAfterDurableBatch) {
+  using State = std::pair<int64_t, bool>;
+  constexpr uint32_t kRetired = 1000005700;
+  constexpr uint32_t kSequence = 1000010000;
+  // Enough fixed-size keys for at least three 256 KiB cleanup batches.
+  constexpr uint32_t kRetiredSequences = 15000;
+  constexpr uint32_t kNeighborSequences = 3;
+  const std::string name = "retired_sequences";
+  const auto sources = ASSERT_RESULT(PgClassSources());
+  ASSERT_RESULT(catalog_->BeginWithNative());
+  ASSERT_OK(catalog_->CreateDatabase(kRetired, name, sources, 1));
+  ASSERT_OK(catalog_->Commit());
+  {
+    auto storage = ASSERT_RESULT(OpenClosedStorage());
+    rocksdb::WriteBatch batch;
+    for (uint32_t i = 0; i < kRetiredSequences; ++i) {
+      batch.Put(storage->metadata(), SequenceKey(kRetired, kSequence + i), SequenceValue(i));
+    }
+    // Neighbors share every key byte up to the final database digit.
+    for (const auto database : {kRetired - 1, kRetired + 1}) {
+      for (uint32_t i = 0; i < kNeighborSequences; ++i) {
+        batch.Put(
+            storage->metadata(), SequenceKey(database, kSequence + i), SequenceValue(100 + i));
+      }
+    }
+    ASSERT_OK(storage->Write(&batch, true));
+  }
+  Reopen();
+  ASSERT_EQ(ASSERT_RESULT(Sequence(kRetired, kSequence + 1)), State(1, true));
+
+  auto* sync = SyncPoint::GetInstance();
+  auto cleanup = ScopeExit([&] {
+    sync->DisableProcessing();
+    sync->ClearAllCallBacks();
+  });
+  size_t sequence_batches = 0;
+  size_t retired_batches = 0;
+  size_t deleted = 0;
+  bool interrupt = true;
+  sync->SetCallBack("PgCatalogTransaction::SequenceCleanupBatch", [&](void* value) {
+    // Storage::Write has appended both watermarks, so this is the whole synced batch.
+    const auto* batch = static_cast<rocksdb::WriteBatch*>(value);
+    ASSERT_LE(batch->GetDataSize(), 256 * 1024);
+    deleted += batch->Count() - 2;
+    ++sequence_batches;
+  });
+  sync->SetCallBack("PgCatalogTransaction::SequenceCleanupStatus", [&](void* status) {
+    if (std::exchange(interrupt, false)) {
+      *static_cast<Status*>(status) = STATUS(IOError, "Interrupted after a durable batch");
+    }
+  });
+  sync->SetCallBack(
+      "PgCatalogTransaction::RetiredDatabaseCleanupBatch", [&](void*) { ++retired_batches; });
+  sync->EnableProcessing();
+  ASSERT_RESULT(catalog_->BeginWithNative());
+  ASSERT_OK(catalog_->DropDatabase(kRetired, name, 1));
+  ASSERT_TRUE(catalog_->Commit().IsIOError());
+  ASSERT_EQ(sequence_batches, 1);
+  const auto first = deleted;
+  ASSERT_GT(first, 0);
+  {
+    auto storage = ASSERT_RESULT(OpenClosedStorage());
+    ASSERT_EQ(ASSERT_RESULT(CountSequences(*storage, kRetired)), kRetiredSequences - first);
+  }
+
+  sequence_batches = 0;
+  deleted = 0;
+  Reopen();
+  ASSERT_GE(sequence_batches, 2);
+  ASSERT_EQ(deleted, kRetiredSequences - first);
+  for (const auto database : {kRetired - 1, kRetired + 1}) {
+    for (uint32_t i = 0; i < kNeighborSequences; ++i) {
+      ASSERT_EQ(ASSERT_RESULT(Sequence(database, kSequence + i)), State(100 + i, true));
+    }
+  }
+  ASSERT_TRUE(catalog_->InsertSequence(kRetired, kSequence, {1, false}).IsNotSupported());
+
+  sequence_batches = 0;
+  retired_batches = 0;
+  Reopen();
+  ASSERT_EQ(sequence_batches, 0);
+  ASSERT_EQ(retired_batches, 0);
+  auto storage = ASSERT_RESULT(OpenClosedStorage());
+  ASSERT_EQ(ASSERT_RESULT(CountSequences(*storage, kRetired)), 0);
+  for (const auto database : {kRetired - 1, kRetired + 1}) {
+    ASSERT_EQ(ASSERT_RESULT(CountSequences(*storage, database)), kNeighborSequences);
+  }
+}
+
+TEST_F(PgLocalSharedCommitTest, RetiredCleanupScansStopAtUpperBounds) {
+  constexpr uint32_t kRetired = 1000005800;
+  constexpr uint32_t kSequence = 1000011000;
+  constexpr uint32_t kTombstones = 2000;
+  const std::string name = "scan_bound_test";
+  const auto sources = ASSERT_RESULT(PgClassSources());
+  ASSERT_RESULT(catalog_->BeginWithNative());
+  ASSERT_OK(catalog_->CreateDatabase(kRetired, name, sources, 1));
+  ASSERT_OK(catalog_->Commit());
+  ASSERT_RESULT(catalog_->BeginWithNative());
+  ASSERT_OK(catalog_->DropDatabase(kRetired, name, 1));
+  ASSERT_OK(catalog_->Commit());
+  {
+    // Database 1's dropped sequences sort right after the retired-database markers, and the next
+    // database's right after the retired database's own sequence range.
+    auto storage = ASSERT_RESULT(OpenClosedStorage());
+    rocksdb::WriteBatch batch;
+    for (const auto database : {1u, kRetired + 1}) {
+      for (uint32_t i = 0; i < kTombstones; ++i) {
+        const auto key = SequenceKey(database, kSequence + i);
+        batch.Put(storage->metadata(), key, SequenceValue(i));
+        batch.Delete(storage->metadata(), key);
+      }
+    }
+    ASSERT_OK(storage->Write(&batch, true));
+  }
+  {
+    // Recovery keeps the tombstones. Without a physical bound, stepping past the last marker
+    // walks every one of them.
+    auto storage = ASSERT_RESULT(OpenClosedStorage());
+    std::unique_ptr<rocksdb::Iterator> it(
+        storage->db()->NewIterator(rocksdb::ReadOptions(), storage->metadata()));
+    it->Seek(PgLocalStorage::MetadataKey("retired-database/"));
+    ASSERT_TRUE(it->Valid());
+    rocksdb::perf_context.Reset();
+    it->Next();
+    ASSERT_OK(it->status());
+    ASSERT_GE(rocksdb::perf_context.internal_delete_skipped_count, 2 * kTombstones);
+  }
+  Reopen();
+  // An empty commit's only metadata iteration is the retired-database marker scan.
+  ASSERT_OK(catalog_->Begin());
+  rocksdb::perf_context.Reset();
+  ASSERT_OK(catalog_->Commit());
+  ASSERT_EQ(rocksdb::perf_context.internal_delete_skipped_count, 0);
+  rocksdb::perf_context.Reset();
+  ASSERT_OK(catalog_->DeleteDatabaseSequences(kRetired));
+  ASSERT_EQ(rocksdb::perf_context.internal_delete_skipped_count, 0);
 }
 
 }  // namespace

@@ -11,6 +11,7 @@
 #include "yb/tools/local_runtime/pg_catalog_transaction.h"
 
 #include <charconv>
+#include <cstdio>
 #include <algorithm>
 #include <filesystem>
 #include <optional>
@@ -20,6 +21,7 @@
 
 #include "yb/common/doc_hybrid_time.h"
 #include "yb/common/entity_ids.h"
+#include "yb/common/pgsql_error.h"
 #include "yb/dockv/doc_key.h"
 #include "yb/common/pgsql_protocol.messages.h"
 #include "yb/docdb/doc_read_context.h"
@@ -127,6 +129,37 @@ std::string MetadataKey(const std::string& name) {
   auto key = dockv::DocKey(dockv::KeyEntryValues{dockv::KeyEntryValue(name)}).Encode();
   return key.ToStringBuffer() +
          dockv::KeyEntryValue(DocHybridTime(HybridTime::kInitial, 0)).ToKeyBytes().ToStringBuffer();
+}
+
+// Fixed-width hex keeps each database's sequences contiguous in metadata key order.
+std::string SequenceName(uint32_t database_oid, std::optional<uint32_t> sequence_oid = {}) {
+  char name[32];
+  if (sequence_oid) {
+    snprintf(
+        name, sizeof(name), "sequence/%08x/%08x", static_cast<unsigned>(database_oid),
+        static_cast<unsigned>(*sequence_oid));
+  } else {
+    snprintf(name, sizeof(name), "sequence/%08x/", static_cast<unsigned>(database_oid));
+  }
+  return name;
+}
+
+Result<std::string> MetadataName(Slice key) {
+  dockv::DocKey doc_key;
+  RETURN_NOT_OK(doc_key.DecodeFrom(&key));
+  SCHECK(
+      doc_key.range_group().size() == 1 &&
+          doc_key.range_group()[0].type() == dockv::KeyEntryType::kString,
+      Corruption, "Invalid local metadata key");
+  return doc_key.range_group()[0].GetString();
+}
+
+Status SequenceLimitExceeded(bool maximum) {
+  return STATUS(
+      QLError,
+      maximum ? "nextval: reached maximum value of sequence \"%s\" (%s)"
+              : "nextval: reached minimum value of sequence \"%s\" (%s)",
+      Slice(), PgsqlError(YBPgErrorCode::YB_PG_SEQUENCE_GENERATOR_LIMIT_EXCEEDED));
 }
 
 }  // namespace
@@ -520,6 +553,205 @@ class PgCatalogTransaction::Impl {
     return range.first++;
   }
 
+  Result<std::string> SequenceKey(uint32_t database_oid, uint32_t sequence_oid) {
+    SCHECK(
+        database_oid != 0 && database_oid < kPgUpperBoundNormalObjectId &&
+            sequence_oid >= kPgFirstNormalObjectId && sequence_oid < kPgUpperBoundNormalObjectId,
+        InvalidArgument, "Invalid sequence identity");
+    return MetadataKey(SequenceName(database_oid, sequence_oid));
+  }
+
+  Result<std::optional<SequenceTuple>> GetSequence(const std::string& key) {
+    std::string encoded;
+    const auto status = db_->Get(rocksdb::ReadOptions(), MetadataFamily(), key, &encoded);
+    if (status.IsNotFound()) return std::nullopt;
+    RETURN_NOT_OK(status);
+    SequencePB tuple;
+    SCHECK(tuple.ParseFromString(encoded), Corruption, "Invalid local sequence tuple");
+    return SequenceTuple{tuple.last_value(), tuple.is_called()};
+  }
+
+  Status SyncSequence(rocksdb::WriteBatch* batch) {
+    TEST_SYNC_POINT("PgCatalogTransaction::BeforeSequenceWrite");
+    // Never publishes a commit time: sequence state is independent of SQL commit visibility.
+    failure_ = storage_->Write(batch, true);
+    TEST_SYNC_POINT_CALLBACK("PgCatalogTransaction::SequenceWriteStatus", &failure_);
+    if (!failure_.ok()) return failure_.CloneAndPrepend("Sequence write outcome is unknown");
+    return Status::OK();
+  }
+
+  Status PutSequence(const std::string& key, const SequenceTuple& value) {
+    SequencePB tuple;
+    tuple.set_last_value(value.last_value);
+    tuple.set_is_called(value.is_called);
+    rocksdb::WriteBatch batch;
+    batch.Put(MetadataFamily(), key, tuple.SerializeAsString());
+    return SyncSequence(&batch);
+  }
+
+  Status InsertSequence(uint32_t database_oid, uint32_t sequence_oid, const SequenceTuple& value) {
+    RETURN_NOT_OK(Status(failure_));
+    const auto key = VERIFY_RESULT(SequenceKey(database_oid, sequence_oid));
+    // A completed retirement is never revisited, so no state may reappear after it.
+    std::string marker;
+    const auto retired = db_->Get(
+        rocksdb::ReadOptions(), MetadataFamily(),
+        MetadataKey("retired-database/" + GetPgsqlNamespaceId(database_oid)), &marker);
+    if (!retired.IsNotFound()) {
+      RETURN_NOT_OK(retired);
+      return STATUS(NotSupported, "Retired databases cannot create sequences");
+    }
+    if (VERIFY_RESULT(GetSequence(key))) {
+      return STATUS_FORMAT(
+          InternalError, "Unknown error while trying to insert into sequences_data DocDB table: $0",
+          PgsqlResponsePB::RequestStatus_Name(PgsqlResponsePB::PGSQL_STATUS_DUPLICATE_KEY_ERROR));
+    }
+    return PutSequence(key, value);
+  }
+
+  Result<SequenceTuple> ReadSequence(uint32_t database_oid, uint32_t sequence_oid) {
+    RETURN_NOT_OK(Status(failure_));
+    const auto tuple =
+        VERIFY_RESULT(GetSequence(VERIFY_RESULT(SequenceKey(database_oid, sequence_oid))));
+    if (!tuple) {
+      return STATUS_FORMAT(NotFound, "Unable to find relation for sequence $0", sequence_oid);
+    }
+    return *tuple;
+  }
+
+  Result<bool> UpdateSequence(
+      uint32_t database_oid, uint32_t sequence_oid, const SequenceTuple& value,
+      const std::optional<SequenceTuple>& expected) {
+    RETURN_NOT_OK(Status(failure_));
+    const auto key = VERIFY_RESULT(SequenceKey(database_oid, sequence_oid));
+    const auto current = VERIFY_RESULT(GetSequence(key));
+    if (!current || (expected && (current->last_value != expected->last_value ||
+                                  current->is_called != expected->is_called))) {
+      return true;
+    }
+    RETURN_NOT_OK(PutSequence(key, value));
+    return false;
+  }
+
+  Result<std::pair<int64_t, int64_t>> FetchSequence(
+      uint32_t database_oid, uint32_t sequence_oid, uint32_t fetch_count, int64_t increment,
+      int64_t min_value, int64_t max_value, bool cycle) {
+    RETURN_NOT_OK(Status(failure_));
+    // Native DocDB only DCHECKs these; a malformed request must not produce a wrapped range.
+    SCHECK(
+        fetch_count > 0 && increment != 0 && min_value <= max_value, InvalidArgument,
+        "Invalid sequence fetch parameters");
+    const auto key = VERIFY_RESULT(SequenceKey(database_oid, sequence_oid));
+    const auto current = VERIFY_RESULT(GetSequence(key));
+    if (!current) return STATUS(NotFound, "Unable to find relation for sequence");
+    // A rolled-back ALTER can leave a RESTART value outside the reverted bounds. PostgreSQL would
+    // return it anyway; native DocDB narrows the resulting negative count to a wrapped uint32.
+    SCHECK(
+        current->is_called ||
+            (current->last_value >= min_value && current->last_value <= max_value),
+        NotSupported, "Uncalled sequence value outside MINVALUE/MAXVALUE is not supported");
+    // PgsqlWriteOperation::ApplyFetchSequence arithmetic, widened so no step can overflow.
+    const __int128 step = increment;
+    const __int128 min = min_value;
+    const __int128 max = max_value;
+    __int128 first = current->last_value;
+    if (current->is_called) {
+      if (step > 0 && first > max - step) {
+        if (!cycle) return SequenceLimitExceeded(true);
+        first = min;
+      } else if (step < 0 && first < min - step) {
+        if (!cycle) return SequenceLimitExceeded(false);
+        first = max;
+      } else {
+        first += step;
+      }
+    }
+    __int128 count = fetch_count - 1;
+    if (step > 0 && first + step * count > max) {
+      count = (max - first) / step;
+    } else if (step < 0 && first + step * count < min) {
+      count = (min - first) / step;
+    }
+    const auto last = static_cast<int64_t>(first + step * count);
+    if (!current->is_called || current->last_value != last) {
+      RETURN_NOT_OK(PutSequence(key, SequenceTuple{last, true}));
+    }
+    return std::make_pair(static_cast<int64_t>(first), last);
+  }
+
+  Status DeleteSequence(uint32_t database_oid, uint32_t sequence_oid) {
+    RETURN_NOT_OK(Status(failure_));
+    const auto key = VERIFY_RESULT(SequenceKey(database_oid, sequence_oid));
+    if (!VERIFY_RESULT(GetSequence(key))) return Status::OK();
+    rocksdb::WriteBatch batch;
+    batch.Delete(MetadataFamily(), key);
+    return SyncSequence(&batch);
+  }
+
+  // Bounded synced batches; the root iterator keeps a stable view across these writes.
+  Status DeleteSequences(uint32_t database_oid) {
+    constexpr size_t kBatchLimit = 256 * 1024;
+    const auto prefix = SequenceName(database_oid);
+    rocksdb::WriteBatch watermarks;
+    watermarks.Put(
+        MetadataFamily(), MetadataKey("clock"), std::to_string(storage_->clock().ToUint64()));
+    watermarks.Put(
+        MetadataFamily(), MetadataKey("committed"), std::to_string(latest_.ToUint64()));
+    rocksdb::WriteBatch batch;
+    const auto flush = [&]() -> Status {
+      if (!batch.Count()) return Status::OK();
+      failure_ = storage_->Write(&batch, true);
+      TEST_SYNC_POINT_CALLBACK("PgCatalogTransaction::SequenceCleanupBatch", &batch);
+      TEST_SYNC_POINT_CALLBACK("PgCatalogTransaction::SequenceCleanupStatus", &failure_);
+      RETURN_NOT_OK(Status(failure_));
+      batch.Clear();
+      return Status::OK();
+    };
+    // '0' sorts right after '/'. The physical bound keeps the scan from walking the next
+    // database's keys and tombstones; the name check alone stops only at a live key.
+    auto bound_name = prefix;
+    bound_name.back() = '0';
+    const auto bound = MetadataKey(bound_name);
+    const Slice upper(bound);
+    rocksdb::ReadOptions options;
+    options.iterate_upper_bound = &upper;
+    std::unique_ptr<rocksdb::Iterator> rows(db_->NewIterator(options, MetadataFamily()));
+    for (rows->Seek(MetadataKey(prefix)); rows->Valid(); rows->Next()) {
+      const auto name = VERIFY_RESULT(MetadataName(rows->key()));
+      if (!name.starts_with(prefix)) break;
+      uint32_t sequence_oid = 0;
+      const auto* end = name.data() + name.size();
+      const auto parsed = std::from_chars(name.data() + prefix.size(), end, sequence_oid, 16);
+      SCHECK(
+          parsed.ec == std::errc() && parsed.ptr == end &&
+              SequenceName(database_oid, sequence_oid) == name,
+          Corruption, "Invalid local sequence key");
+      if (batch.GetDataSize() + rows->key().size() + 16 + watermarks.GetDataSize() > kBatchLimit) {
+        RETURN_NOT_OK(flush());
+      }
+      batch.Delete(MetadataFamily(), rows->key());
+    }
+    RETURN_NOT_OK(rows->status());
+    rows.reset();
+    return flush();
+  }
+
+  Status DeleteDatabaseSequences(uint32_t database_oid) {
+    RETURN_NOT_OK(Status(failure_));
+    SCHECK(
+        database_oid >= kPgFirstNormalObjectId && database_oid < kPgUpperBoundNormalObjectId,
+        InvalidArgument, "Invalid database OID");
+    std::string marker;
+    const auto retired = db_->Get(
+        rocksdb::ReadOptions(), MetadataFamily(),
+        MetadataKey("retired-database/" + GetPgsqlNamespaceId(database_oid)), &marker);
+    if (retired.IsNotFound()) {
+      return STATUS(IllegalState, "Sequence cleanup requires a retired database");
+    }
+    RETURN_NOT_OK(retired);
+    return DeleteSequences(database_oid);
+  }
+
   Status CreateTable(const tablet::TableInfoPB& metadata, uint32_t subtransaction) {
     RETURN_NOT_OK(CheckHealthy());
     SCHECK(active_, IllegalState, "Table creation requires an active transaction");
@@ -779,8 +1011,13 @@ class PgCatalogTransaction::Impl {
     RETURN_NOT_OK(Status(failure_));
     constexpr size_t kBatchLimit = 256 * 1024;
     const std::string prefix = "retired-database/";
-    std::unique_ptr<rocksdb::Iterator> markers(
-        db_->NewIterator(rocksdb::ReadOptions(), MetadataFamily()));
+    // Sequence keys and tombstones sort right after the markers; the name check alone would walk
+    // every leading tombstone on each cleanup pass.
+    const auto bound = MetadataKey("retired-database0");
+    const Slice upper(bound);
+    rocksdb::ReadOptions options;
+    options.iterate_upper_bound = &upper;
+    std::unique_ptr<rocksdb::Iterator> markers(db_->NewIterator(options, MetadataFamily()));
     for (markers->Seek(MetadataKey(prefix)); markers->Valid(); markers->Next()) {
       dockv::DocKey key;
       auto slice = markers->key();
@@ -854,6 +1091,7 @@ class PgCatalogTransaction::Impl {
       RETURN_NOT_OK(rows->status());
       rows.reset();
       RETURN_NOT_OK(flush());
+      RETURN_NOT_OK(DeleteSequences(oid));
       batch.Put(MetadataFamily(), markers->key(), "complete");
       RETURN_NOT_OK(flush());
     }
@@ -1143,6 +1381,37 @@ Result<rocksdb::DB*> PgCatalogTransaction::ReadDB(const TableId& table) {
 Result<uint32_t> PgCatalogTransaction::AllocateOid(uint32_t database_oid) {
   std::lock_guard lock(impl_->storage_->mutex());
   return impl_->AllocateOid(database_oid);
+}
+Status PgCatalogTransaction::InsertSequence(
+    uint32_t database_oid, uint32_t sequence_oid, const SequenceTuple& value) {
+  std::lock_guard lock(impl_->storage_->mutex());
+  return impl_->InsertSequence(database_oid, sequence_oid, value);
+}
+Result<PgCatalogTransaction::SequenceTuple> PgCatalogTransaction::ReadSequence(
+    uint32_t database_oid, uint32_t sequence_oid) {
+  std::lock_guard lock(impl_->storage_->mutex());
+  return impl_->ReadSequence(database_oid, sequence_oid);
+}
+Result<bool> PgCatalogTransaction::UpdateSequence(
+    uint32_t database_oid, uint32_t sequence_oid, const SequenceTuple& value,
+    const std::optional<SequenceTuple>& expected) {
+  std::lock_guard lock(impl_->storage_->mutex());
+  return impl_->UpdateSequence(database_oid, sequence_oid, value, expected);
+}
+Result<std::pair<int64_t, int64_t>> PgCatalogTransaction::FetchSequence(
+    uint32_t database_oid, uint32_t sequence_oid, uint32_t fetch_count, int64_t increment,
+    int64_t min_value, int64_t max_value, bool cycle) {
+  std::lock_guard lock(impl_->storage_->mutex());
+  return impl_->FetchSequence(
+      database_oid, sequence_oid, fetch_count, increment, min_value, max_value, cycle);
+}
+Status PgCatalogTransaction::DeleteSequence(uint32_t database_oid, uint32_t sequence_oid) {
+  std::lock_guard lock(impl_->storage_->mutex());
+  return impl_->DeleteSequence(database_oid, sequence_oid);
+}
+Status PgCatalogTransaction::DeleteDatabaseSequences(uint32_t database_oid) {
+  std::lock_guard lock(impl_->storage_->mutex());
+  return impl_->DeleteDatabaseSequences(database_oid);
 }
 Status PgCatalogTransaction::CreateDatabase(
     uint32_t oid, const std::string& name, const std::vector<tablet::TableInfoPB>& sources,

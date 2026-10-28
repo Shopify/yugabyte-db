@@ -141,6 +141,8 @@ int main(int argc, char** argv) {
   std::stringstream output;
   yb::JsonWriter writer(&output, yb::JsonWriter::COMPACT);
   writer.StartObject();
+  writer.String("protocol_version");
+  writer.Int(1);
   writer.String("state");
   writer.String("ready");
   writer.String("host");
@@ -151,6 +153,11 @@ int main(int argc, char** argv) {
   writer.String(server->RpcAddress().ToString());
   writer.String("mode");
   writer.String(FLAGS_experimental_catalog_writes ? "experimental-serialized-sql" : "readonly");
+  writer.String("pid");
+  writer.Int(getpid());
+  // Already verified above to be the directory reported by SHOW data_directory.
+  writer.String("data_directory");
+  writer.String(server->PgDataDirectory());
   writer.EndObject();
   std::cout << output.str() << '\n' << std::flush;
 

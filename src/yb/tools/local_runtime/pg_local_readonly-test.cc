@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <future>
+#include <limits>
 #include <map>
 #include <set>
 
@@ -47,6 +48,7 @@
 #include "yb/tserver/tserver_admin.pb.h"
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/env_util.h"
+#include "yb/util/flags.h"
 #include "yb/util/memory/arena.h"
 #include "yb/util/pb_util.h"
 #include "yb/util/scope_exit.h"
@@ -56,6 +58,8 @@
 #include "yb/util/test_thread_holder.h"
 #include "yb/util/test_util.h"
 #include "yb/yql/pgwrapper/libpq_utils.h"
+
+DECLARE_string(ysql_sequence_cache_method);
 
 namespace yb::local_runtime {
 namespace {
@@ -84,6 +88,96 @@ Result<tablet::TableInfoPB> TestTable(
   column->set_is_hash(true);
   return BuildLocalTable(create);
 }
+
+// Direct sequence RPCs. Local handlers answer in-band, while the unsupported default fails the
+// RPC itself; a transport failure therefore maps to RemoteError, which no handler returns.
+class SequenceRpc {
+ public:
+  explicit SequenceRpc(const tserver::PgClientServiceProxy& proxy) : proxy_(proxy) {}
+
+  Status Insert(uint64_t session, int64_t database, int64_t sequence) const {
+    auto request = Make<tserver::PgInsertSequenceTupleRequestPB>(session, database, sequence);
+    request.set_last_val(1);
+    tserver::PgInsertSequenceTupleResponsePB response;
+    return Call(&tserver::PgClientServiceProxy::InsertSequenceTuple, request, &response);
+  }
+
+  Result<std::pair<int64_t, bool>> Read(
+      uint64_t session, int64_t database, int64_t sequence, uint64_t read_time = 0) const {
+    auto request = Make<tserver::PgReadSequenceTupleRequestPB>(session, database, sequence);
+    request.set_read_time(read_time);
+    tserver::PgReadSequenceTupleResponsePB response;
+    RETURN_NOT_OK(Call(&tserver::PgClientServiceProxy::ReadSequenceTuple, request, &response));
+    return std::make_pair(response.last_val(), response.is_called());
+  }
+
+  Status Update(uint64_t session, int64_t database, int64_t sequence) const {
+    auto request = Make<tserver::PgUpdateSequenceTupleRequestPB>(session, database, sequence);
+    request.set_last_val(500);
+    request.set_is_called(true);
+    tserver::PgUpdateSequenceTupleResponsePB response;
+    return Call(&tserver::PgClientServiceProxy::UpdateSequenceTuple, request, &response);
+  }
+
+  // Reserves up to three values of an ascending 1..1000 sequence.
+  Result<std::pair<int64_t, int64_t>> Fetch(
+      uint64_t session, int64_t database, int64_t sequence) const {
+    auto request = Make<tserver::PgFetchSequenceTupleRequestPB>(session, database, sequence);
+    request.set_fetch_count(3);
+    request.set_inc_by(1);
+    request.set_min_value(1);
+    request.set_max_value(1000);
+    tserver::PgFetchSequenceTupleResponsePB response;
+    RETURN_NOT_OK(Call(&tserver::PgClientServiceProxy::FetchSequenceTuple, request, &response));
+    return std::make_pair(response.first_value(), response.last_value());
+  }
+
+  Status Delete(uint64_t session, int64_t database, int64_t sequence) const {
+    const auto request =
+        Make<tserver::PgDeleteSequenceTupleRequestPB>(session, database, sequence);
+    tserver::PgDeleteSequenceTupleResponsePB response;
+    return Call(&tserver::PgClientServiceProxy::DeleteSequenceTuple, request, &response);
+  }
+
+  Status DeleteDatabase(uint64_t session, int64_t database) const {
+    const auto request = Make<tserver::PgDeleteDBSequencesRequestPB>(session, database, 0);
+    tserver::PgDeleteDBSequencesResponsePB response;
+    return Call(&tserver::PgClientServiceProxy::DeleteDBSequences, request, &response);
+  }
+
+  std::vector<Status> All(uint64_t session, int64_t database, int64_t sequence) const {
+    return {
+        Insert(session, database, sequence), ResultToStatus(Read(session, database, sequence)),
+        Update(session, database, sequence), ResultToStatus(Fetch(session, database, sequence)),
+        Delete(session, database, sequence), DeleteDatabase(session, database)};
+  }
+
+ private:
+  template <class Request>
+  static Request Make(uint64_t session, int64_t database, int64_t sequence) {
+    Request request;
+    request.set_session_id(session);
+    request.set_db_oid(database);
+    if constexpr (requires { request.set_seq_oid(sequence); }) request.set_seq_oid(sequence);
+    return request;
+  }
+
+  template <class Request, class Response>
+  Status Call(
+      Status (tserver::PgClientServiceProxy::*method)(
+          const Request&, Response*, rpc::RpcController*) const,
+      const Request& request, Response* response) const {
+    rpc::RpcController controller;
+    controller.set_timeout(MonoDelta::FromSeconds(10));
+    const auto transport = (proxy_.*method)(request, response, &controller);
+    if (!transport.ok()) {
+      return STATUS_FORMAT(RemoteError, "Sequence RPC bypassed its local handler: $0", transport);
+    }
+    return response->has_status() ? StatusFromPB(response->status()) : Status::OK();
+  }
+
+  const tserver::PgClientServiceProxy& proxy_;
+};
 
 class ReadonlyPgServerTest : public YBTest {
  protected:
@@ -720,6 +814,14 @@ void ReadonlyPgServerTest::CheckCommand(bool writable) {
   ASSERT_STREQ(ready["state"].GetString(), "ready");
   ASSERT_TRUE(ready.HasMember("sql_port") && ready["sql_port"].IsInt());
   ASSERT_EQ(ready["sql_port"].GetInt(), port);
+  ASSERT_TRUE(ready.HasMember("protocol_version") && ready["protocol_version"].IsInt());
+  ASSERT_EQ(ready["protocol_version"].GetInt(), 1);
+  ASSERT_TRUE(ready.HasMember("mode") && ready["mode"].IsString());
+  ASSERT_STREQ(ready["mode"].GetString(), writable ? "experimental-serialized-sql" : "readonly");
+  ASSERT_TRUE(ready.HasMember("pid") && ready["pid"].IsInt());
+  ASSERT_EQ(ready["pid"].GetInt(), server->pid());
+  ASSERT_TRUE(ready.HasMember("data_directory") && ready["data_directory"].IsString());
+  const std::string ready_directory = ready["data_directory"].GetString();
   pgwrapper::PGConnSettings settings{
       .host = "127.0.0.1",
       .port = port,
@@ -734,6 +836,8 @@ void ReadonlyPgServerTest::CheckCommand(bool writable) {
       ASSERT_RESULT(connection.FetchRow<std::string>("SHOW data_directory"));
   std::error_code error;
   ASSERT_TRUE(std::filesystem::equivalent(connected_directory, directory + "/pg_data", error));
+  ASSERT_FALSE(error);
+  ASSERT_TRUE(std::filesystem::equivalent(ready_directory, connected_directory, error));
   ASSERT_FALSE(error);
   if (writable) {
     const std::string query = "SELECT obj_description('pg_catalog.pg_class'::regclass)";
@@ -1135,7 +1239,10 @@ TEST_F(ReadonlyPgServerTest, CatalogSavepointsAndSessionFence) {
     ASSERT_EQ(ASSERT_RESULT(idle.FetchRow<std::string>(query)), "final");
     ASSERT_OK(connection.Execute("BEGIN"));
     ASSERT_OK(connection.Execute("COMMENT ON TABLE pg_catalog.pg_class IS 'discard'"));
-    ASSERT_NOK(connection.Execute("CREATE SEQUENCE unsupported"));
+    const auto split = connection.Execute(
+        "CREATE TABLE split_unsupported(k bigint,PRIMARY KEY(k ASC)) SPLIT AT VALUES((100))");
+    ASSERT_NOK(split);
+    ASSERT_STR_CONTAINS(split.ToString(), "Unsupported local table request");
     ASSERT_OK(connection.Execute("ROLLBACK"));
     ASSERT_EQ(ASSERT_RESULT(connection.FetchRow<std::string>(query)), "final");
     ASSERT_OK(connection.Execute("BEGIN"));
@@ -1910,6 +2017,11 @@ TEST_F(ReadonlyPgServerTest, RejectsWritesAtRpcBoundary) {
   ASSERT_OK(proxy.Perform(request, &response, &controller));
   ASSERT_TRUE(StatusFromPB(response.status()).IsNotSupported());
   ASSERT_TRUE(response.responses().empty());
+  const SequenceRpc sequences(proxy);
+  for (const auto& status : sequences.All(heartbeat_response.session_id(), 16384, 16385)) {
+    ASSERT_TRUE(status.IsNotSupported()) << status;
+    ASSERT_STR_CONTAINS(status.ToString(), "Frozen catalog rejects sequence");
+  }
 }
 
 TEST_F(ReadonlyPgServerTest, BackwardScans) {
@@ -2383,6 +2495,389 @@ TEST_F(ReadonlyPgServerTest, RejectsIncompleteDatabasePublication) {
           path, Snapshot(), AllocateFreePort(), CatalogMode::kSerializedTransactions));
   ASSERT_TRUE(status.IsCorruption()) << status;
   ASSERT_STR_CONTAINS(status.ToString(), "missing its pg_database row");
+}
+
+TEST_F(ReadonlyPgServerTest, SequenceBackedSchemaLifecycle) {
+  const auto path = GetTestPath("sequence-schema");
+  auto server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          path, Snapshot(), AllocateFreePort(), CatalogMode::kSerializedTransactions));
+  const auto insert_item = [](pgwrapper::PGConn& c, const std::string& name) {
+    return c.FetchRow<int64_t>("INSERT INTO seq_items(name) VALUES('" + name + "') RETURNING id");
+  };
+  {
+    auto c = ASSERT_RESULT(Connect(*server));
+    ASSERT_OK(c.Execute("CREATE TABLE seq_items(id bigserial PRIMARY KEY,name text UNIQUE)"));
+    ASSERT_EQ(ASSERT_RESULT(insert_item(c, "alpha")), 1);
+    ASSERT_EQ(ASSERT_RESULT(insert_item(c, "beta")), 2);
+    const std::vector<std::string> duplicates = {
+        "INSERT INTO seq_items(name) VALUES('alpha')", "INSERT INTO seq_items VALUES(1,'other')"};
+    for (const auto& statement : duplicates) {
+      const auto status = c.Execute(statement);
+      ASSERT_NOK(status);
+      ASSERT_EQ(PgsqlError(status), YBPgErrorCode::YB_PG_UNIQUE_VIOLATION) << status;
+    }
+    // The rejected default still consumed 3; sequence values are never handed back.
+    ASSERT_EQ(ASSERT_RESULT(insert_item(c, "gamma")), 4);
+    ASSERT_OK(c.Execute("BEGIN"));
+    ASSERT_OK(c.Execute(
+        "CREATE TABLE seq_events(id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+        "item_id bigint NOT NULL)"));
+    ASSERT_OK(c.Execute("INSERT INTO seq_events(item_id) SELECT id FROM seq_items"));
+    ASSERT_OK(c.Execute("SAVEPOINT before_scratch"));
+    ASSERT_OK(c.Execute("CREATE TABLE seq_scratch(id serial PRIMARY KEY)"));
+    ASSERT_EQ(
+        ASSERT_RESULT(c.FetchRow<int32_t>("INSERT INTO seq_scratch DEFAULT VALUES RETURNING id")),
+        1);
+    ASSERT_OK(c.Execute("ROLLBACK TO before_scratch"));
+    ASSERT_OK(c.Execute("ALTER TABLE seq_items ADD COLUMN note text DEFAULT 'migrated'"));
+    ASSERT_OK(c.Execute("COMMIT"));
+    ASSERT_TRUE(ASSERT_RESULT(c.FetchRow<bool>(
+        "SELECT to_regclass('seq_scratch') IS NULL AND "
+        "to_regclass('seq_scratch_id_seq') IS NULL")));
+    ASSERT_EQ(ASSERT_RESULT(c.FetchRow<int64_t>("SELECT max(id) FROM seq_events")), 3);
+    const auto generated = c.Execute("INSERT INTO seq_events VALUES(10,1)");
+    ASSERT_NOK(generated);
+    ASSERT_EQ(PgsqlError(generated), YBPgErrorCode::YB_PG_GENERATED_ALWAYS) << generated;
+  }
+  server.reset();
+  server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          path, Snapshot(), AllocateFreePort(), CatalogMode::kSerializedTransactions));
+  auto c = ASSERT_RESULT(Connect(*server));
+  // A restart may skip the rest of a cached range, but must not reissue values.
+  ASSERT_GT(ASSERT_RESULT(insert_item(c, "delta")), 4);
+  ASSERT_GT(
+      ASSERT_RESULT(c.FetchRow<int64_t>("INSERT INTO seq_events(item_id) VALUES(1) RETURNING id")),
+      3);
+  ASSERT_EQ(
+      ASSERT_RESULT(c.FetchRow<int64_t>("SELECT count(*) FROM seq_items WHERE note='migrated'")),
+      4);
+  ASSERT_TRUE(
+      ASSERT_RESULT(c.FetchRow<bool>("SELECT count(DISTINCT id)=count(*) FROM seq_items")));
+}
+
+TEST_F(ReadonlyPgServerTest, SequenceValuesAreNontransactional) {
+  const auto path = GetTestPath("sequence-values");
+  auto server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          path, Snapshot(), AllocateFreePort(), CatalogMode::kSerializedTransactions));
+  std::set<int64_t> issued;
+  const auto next = [&issued](pgwrapper::PGConn& c) -> Result<int64_t> {
+    const auto value = VERIFY_RESULT(c.FetchRow<int64_t>("SELECT nextval('seq_counter')"));
+    SCHECK(issued.insert(value).second, IllegalState, "Sequence value issued twice");
+    return value;
+  };
+  {
+    auto first = ASSERT_RESULT(Connect(*server));
+    auto second = ASSERT_RESULT(Connect(*server));
+    ASSERT_OK(first.Execute("CREATE SEQUENCE seq_counter"));
+    // ysql_sequence_cache_minval=100 gives each connection its own 100-value range.
+    ASSERT_EQ(
+        ASSERT_RESULT(first.FetchRow<int64_t>(
+            "SELECT seqcache FROM pg_sequence WHERE seqrelid='seq_counter'::regclass")),
+        100);
+    ASSERT_EQ(ASSERT_RESULT(next(first)), 1);
+    ASSERT_EQ(ASSERT_RESULT(next(second)), 101);
+    ASSERT_OK(first.Execute("BEGIN"));
+    ASSERT_EQ(ASSERT_RESULT(next(first)), 2);
+    ASSERT_OK(first.Execute("ROLLBACK"));
+    ASSERT_EQ(ASSERT_RESULT(next(first)), 3);
+    ASSERT_OK(second.Execute("BEGIN"));
+    ASSERT_EQ(ASSERT_RESULT(second.FetchRow<int64_t>("SELECT setval('seq_counter',500)")), 500);
+    ASSERT_OK(second.Execute("ROLLBACK"));
+    ASSERT_EQ(ASSERT_RESULT(next(second)), 501);
+    ASSERT_EQ(ASSERT_RESULT(next(first)), 4);
+    ASSERT_EQ(
+        ASSERT_RESULT(first.FetchRow<int64_t>("SELECT setval('seq_counter',700,false)")), 700);
+    ASSERT_OK(first.Execute("BEGIN"));
+    ASSERT_OK(first.Execute("SAVEPOINT s"));
+    ASSERT_EQ(ASSERT_RESULT(next(first)), 700);
+    ASSERT_OK(first.Execute("ROLLBACK TO s"));
+    ASSERT_EQ(ASSERT_RESULT(next(first)), 701);
+    ASSERT_OK(first.Execute("COMMIT"));
+    ASSERT_EQ(ASSERT_RESULT(first.FetchRow<int64_t>("SELECT currval('seq_counter')")), 701);
+    for (int i = 0; i < 5; ++i) {
+      ASSERT_RESULT(next(first));
+      ASSERT_RESULT(next(second));
+    }
+  }
+  const auto high = *issued.rbegin();
+  server.reset();
+  server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          path, Snapshot(), AllocateFreePort(), CatalogMode::kSerializedTransactions));
+  auto first = ASSERT_RESULT(Connect(*server));
+  auto second = ASSERT_RESULT(Connect(*server));
+  ASSERT_GT(ASSERT_RESULT(next(first)), high);
+  ASSERT_GT(ASSERT_RESULT(next(second)), high);
+  ASSERT_RESULT(next(first));
+}
+
+TEST_F(ReadonlyPgServerTest, BoundedSequenceLimits) {
+  auto server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          GetTestPath("sequence-bounds"), Snapshot(), AllocateFreePort(),
+          CatalogMode::kSerializedTransactions));
+  auto first = ASSERT_RESULT(Connect(*server));
+  auto second = ASSERT_RESULT(Connect(*server));
+  ASSERT_OK(first.Execute("CREATE SEQUENCE seq_up MAXVALUE 3"));
+  ASSERT_OK(first.Execute("CREATE SEQUENCE seq_down INCREMENT -2 MINVALUE -5 MAXVALUE -1"));
+  ASSERT_OK(first.Execute("CREATE SEQUENCE seq_ring MAXVALUE 3 CYCLE"));
+  const auto take = [](pgwrapper::PGConn& c, const std::string& sequence, int count) {
+    return c.FetchRows<int64_t>(Format(
+        "SELECT nextval('$0') FROM generate_series(1,$1)", sequence, count));
+  };
+  const auto exhausted = [](pgwrapper::PGConn& c, const std::string& sequence) {
+    const auto status = ResultToStatus(c.Fetch("SELECT nextval('" + sequence + "')"));
+    ASSERT_NOK(status);
+    ASSERT_EQ(PgsqlError(status), YBPgErrorCode::YB_PG_SEQUENCE_GENERATOR_LIMIT_EXCEEDED)
+        << status;
+  };
+  ASSERT_EQ(ASSERT_RESULT(take(first, "seq_up", 3)), (std::vector<int64_t>{1, 2, 3}));
+  ASSERT_NO_FATALS(exhausted(first, "seq_up"));
+  ASSERT_NO_FATALS(exhausted(second, "seq_up"));
+  ASSERT_EQ(ASSERT_RESULT(take(first, "seq_down", 3)), (std::vector<int64_t>{-1, -3, -5}));
+  ASSERT_NO_FATALS(exhausted(first, "seq_down"));
+  ASSERT_NO_FATALS(exhausted(second, "seq_down"));
+  ASSERT_EQ(ASSERT_RESULT(take(first, "seq_ring", 5)), (std::vector<int64_t>{1, 2, 3, 1, 2}));
+  // The exhausted session refetches from shared state after another session's setval.
+  ASSERT_EQ(ASSERT_RESULT(second.FetchRow<int64_t>("SELECT setval('seq_up',2)")), 2);
+  ASSERT_EQ(ASSERT_RESULT(take(first, "seq_up", 1)), std::vector<int64_t>{3});
+  ASSERT_NO_FATALS(exhausted(first, "seq_up"));
+}
+
+TEST_F(ReadonlyPgServerTest, SequenceTuplesDeletedOnDrop) {
+  const auto path = GetTestPath("sequence-drop");
+  auto server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          path, Snapshot(), AllocateFreePort(), CatalogMode::kSerializedTransactions));
+  using Identity = std::pair<uint32_t, uint32_t>;
+  const auto identity = [](pgwrapper::PGConn& c, const std::string& sequence) -> Result<Identity> {
+    const auto database = VERIFY_RESULT(c.FetchRow<int64_t>(
+        "SELECT oid::bigint FROM pg_database WHERE datname=current_database()"));
+    const auto relation =
+        VERIFY_RESULT(c.FetchRow<int64_t>(Format("SELECT '$0'::regclass::oid::bigint", sequence)));
+    return Identity(static_cast<uint32_t>(database), static_cast<uint32_t>(relation));
+  };
+  const auto next = [](pgwrapper::PGConn& c, const std::string& sequence) {
+    return c.FetchRow<int64_t>(Format("SELECT nextval('$0')", sequence));
+  };
+  std::vector<Identity> dropped;
+  Identity kept;
+  std::tuple<int64_t, bool> kept_state;
+  {
+    auto c = ASSERT_RESULT(Connect(*server));
+    ASSERT_OK(c.Execute("CREATE SEQUENCE seq_dropped"));
+    ASSERT_OK(c.Execute("CREATE SEQUENCE seq_kept"));
+    ASSERT_OK(c.Execute("CREATE TABLE seq_owner(id bigserial PRIMARY KEY,v text)"));
+    for (const auto* sequence : {"seq_dropped", "seq_kept", "seq_owner_id_seq"}) {
+      ASSERT_EQ(ASSERT_RESULT(next(c, sequence)), 1);
+    }
+    dropped.push_back(ASSERT_RESULT(identity(c, "seq_dropped")));
+    dropped.push_back(ASSERT_RESULT(identity(c, "seq_owner_id_seq")));
+    kept = ASSERT_RESULT(identity(c, "seq_kept"));
+    // Rolling back discards the postponed tuple deletion.
+    ASSERT_OK(c.Execute("BEGIN"));
+    ASSERT_OK(c.Execute("DROP SEQUENCE seq_kept"));
+    ASSERT_OK(c.Execute("DROP TABLE seq_owner"));
+    ASSERT_OK(c.Execute("ROLLBACK"));
+    kept_state =
+        ASSERT_RESULT((c.FetchRow<int64_t, bool>("SELECT last_value,is_called FROM seq_kept")));
+    ASSERT_TRUE(std::get<1>(kept_state));
+    ASSERT_EQ(ASSERT_RESULT(next(c, "seq_kept")), 2);
+    ASSERT_EQ(
+        ASSERT_RESULT(
+            c.FetchRow<int64_t>("INSERT INTO seq_owner(v) VALUES('kept') RETURNING id")),
+        2);
+    ASSERT_OK(c.Execute("DROP SEQUENCE seq_dropped"));
+    ASSERT_OK(c.Execute("DROP TABLE seq_owner"));
+    ASSERT_OK(c.Execute("CREATE DATABASE seq_drop_db"));
+    {
+      auto local = ASSERT_RESULT(Connect(*server, "seq_drop_db"));
+      ASSERT_OK(local.Execute("CREATE SEQUENCE seq_local"));
+      ASSERT_OK(local.Execute("CREATE TABLE seq_local_rows(id serial PRIMARY KEY)"));
+      ASSERT_EQ(ASSERT_RESULT(next(local, "seq_local")), 1);
+      ASSERT_EQ(
+          ASSERT_RESULT(
+              local.FetchRow<int32_t>("INSERT INTO seq_local_rows DEFAULT VALUES RETURNING id")),
+          1);
+      dropped.push_back(ASSERT_RESULT(identity(local, "seq_local")));
+      dropped.push_back(ASSERT_RESULT(identity(local, "seq_local_rows_id_seq")));
+    }
+    ASSERT_OK(c.Execute("DROP DATABASE seq_drop_db"));
+  }
+  server.reset();
+  // DROP succeeds even if postcommit cleanup fails; only storage shows the deletion.
+  auto store =
+      ASSERT_RESULT(PgCatalogTransaction::Open(path + "/catalog", Snapshot() + "/rocksdb"));
+  for (const auto& [database, sequence] : dropped) {
+    const auto status = ResultToStatus(store->ReadSequence(database, sequence));
+    ASSERT_TRUE(status.IsNotFound()) << database << "/" << sequence << ": " << status;
+  }
+  const auto retained = ASSERT_RESULT(store->ReadSequence(kept.first, kept.second));
+  ASSERT_EQ(std::make_tuple(retained.last_value, retained.is_called), kept_state);
+}
+
+TEST_F(ReadonlyPgServerTest, SequenceRpcGuards) {
+  auto server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          GetTestPath("sequence-rpc"), Snapshot(), AllocateFreePort(),
+          CatalogMode::kSerializedTransactions));
+  uint32_t database = 0;
+  int64_t sequence = 0;
+  {
+    auto c = ASSERT_RESULT(Connect(*server));
+    database = static_cast<uint32_t>(ASSERT_RESULT(c.FetchRow<int64_t>(
+        "SELECT oid::bigint FROM pg_database WHERE datname=current_database()")));
+    ASSERT_OK(c.Execute("CREATE SEQUENCE seq_rpc"));
+    sequence = ASSERT_RESULT(c.FetchRow<int64_t>("SELECT 'seq_rpc'::regclass::oid::bigint"));
+  }
+  rpc::MessengerBuilder builder("sequence-rpc-client");
+  builder.UseDefaultConnectionContextFactory();
+  auto messenger = ASSERT_RESULT(builder.Build());
+  auto shutdown = ScopeExit([&] { messenger->Shutdown(); });
+  rpc::ProxyCache cache(messenger.get());
+  tserver::PgClientServiceProxy proxy(&cache, server->RpcAddress());
+  const SequenceRpc sequences(proxy);
+  const auto connect = [&]() -> Result<uint64_t> {
+    tserver::PgHeartbeatRequestPB request;
+    request.set_pid(getpid());
+    tserver::PgHeartbeatResponsePB response;
+    rpc::RpcController controller;
+    controller.set_timeout(MonoDelta::FromSeconds(10));
+    RETURN_NOT_OK(proxy.Heartbeat(request, &response, &controller));
+    if (response.has_status()) return StatusFromPB(response.status());
+    return response.session_id();
+  };
+  // Heartbeat admits a backend without a database; as in PgGate, a Perform binds it.
+  const auto perform = [&](uint64_t session, uint64_t serial, uint32_t database_oid,
+                           bool lease) -> Status {
+    ThreadSafeArena arena;
+    tserver::LWPgPerformRequestPB request(&arena);
+    tserver::LWPgPerformResponsePB response(&arena);
+    request.set_session_id(session);
+    request.mutable_sequence_num()->set_serial_no(serial);
+    if (serial) {
+      request.mutable_sequence_num()->mutable_predecessor_serial_no()->set_value(serial - 1);
+    }
+    auto* options = request.mutable_options();
+    options->set_connected_database_oid(database_oid);
+    if (lease) {
+      options->set_sql_transaction_active(true);
+      options->set_is_using_table_locks(true);
+      options->set_txn_serial_no(serial + 1);
+    }
+    rpc::RpcController controller;
+    controller.set_timeout(MonoDelta::FromSeconds(10));
+    RETURN_NOT_OK(proxy.Perform(request, &response, &controller));
+    return response.has_status() ? StatusFromPB(response.status()) : Status::OK();
+  };
+  const auto finish = [&](uint64_t session) -> Status {
+    tserver::PgFinishTransactionRequestPB request;
+    request.set_session_id(session);
+    request.set_commit(false);
+    tserver::PgFinishTransactionResponsePB response;
+    rpc::RpcController controller;
+    controller.set_timeout(MonoDelta::FromSeconds(10));
+    RETURN_NOT_OK(proxy.FinishTransaction(request, &response, &controller));
+    return response.has_status() ? StatusFromPB(response.status()) : Status::OK();
+  };
+  using Tuple = std::pair<int64_t, bool>;
+  constexpr uint32_t kTemplate1 = 1;
+  const auto owner = ASSERT_RESULT(connect());
+  const auto cleaner = ASSERT_RESULT(connect());
+  const auto unbound = ASSERT_RESULT(connect());
+  const auto templated = ASSERT_RESULT(connect());
+  ASSERT_OK(perform(owner, 0, database, false));
+  ASSERT_OK(perform(cleaner, 0, database, false));
+  ASSERT_OK(perform(templated, 0, kTemplate1, false));
+  ASSERT_EQ(ASSERT_RESULT(sequences.Read(owner, database, sequence)), Tuple(1, false));
+
+  // Cleanup skips the lease, cache, and template checks, but not the database identity check.
+  const std::vector<Status> invalid = {
+      ResultToStatus(sequences.Read(std::numeric_limits<uint64_t>::max() - 1, database, sequence)),
+      ResultToStatus(sequences.Read(unbound, database, sequence)),
+      ResultToStatus(sequences.Read(owner, kTemplate1, sequence)),
+      ResultToStatus(sequences.Read(owner, database, 0)),
+      ResultToStatus(sequences.Read(owner, database, int64_t{1} << 32)),
+      sequences.Delete(templated, database, sequence)};
+  for (const auto& status : invalid) ASSERT_TRUE(status.IsInvalidArgument()) << status;
+  const auto in_template = sequences.Insert(templated, kTemplate1, sequence);
+  ASSERT_TRUE(in_template.IsNotSupported()) << in_template;
+  const auto historical = ResultToStatus(sequences.Read(owner, database, sequence, 1));
+  ASSERT_TRUE(historical.IsNotSupported()) << historical;
+  const auto cache_method = FLAGS_ysql_sequence_cache_method;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_sequence_cache_method) = "server";
+  const auto server_cache = ResultToStatus(sequences.Fetch(owner, database, sequence));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_sequence_cache_method) = cache_method;
+  ASSERT_TRUE(server_cache.IsNotSupported()) << server_cache;
+
+  // Another backend's lease rejects access before any value is reserved or changed.
+  ASSERT_OK(perform(cleaner, 1, database, true));
+  const std::vector<Status> leased = {
+      sequences.Insert(owner, database, sequence),
+      ResultToStatus(sequences.Read(owner, database, sequence)),
+      sequences.Update(owner, database, sequence),
+      ResultToStatus(sequences.Fetch(owner, database, sequence))};
+  for (const auto& status : leased) ASSERT_TRUE(status.IsTryAgain()) << status;
+  ASSERT_OK(finish(cleaner));
+  ASSERT_EQ(ASSERT_RESULT(sequences.Read(owner, database, sequence)), Tuple(1, false));
+  ASSERT_EQ(
+      ASSERT_RESULT(sequences.Fetch(owner, database, sequence)),
+      std::make_pair(int64_t{1}, int64_t{3}));
+
+  // Postcommit cleanup arrives after FinishTransaction, here once the lease has moved on.
+  ASSERT_OK(perform(owner, 1, database, true));
+  const auto blocked = ResultToStatus(sequences.Read(cleaner, database, sequence));
+  ASSERT_TRUE(blocked.IsTryAgain()) << blocked;
+  const auto live = sequences.DeleteDatabase(cleaner, database);
+  ASSERT_TRUE(live.IsInvalidArgument() || live.IsIllegalState()) << live;
+  ASSERT_EQ(ASSERT_RESULT(sequences.Read(owner, database, sequence)), Tuple(3, true));
+  ASSERT_OK(sequences.Delete(cleaner, database, sequence));
+  ASSERT_OK(sequences.Delete(cleaner, database, sequence));
+  const auto deleted = ResultToStatus(sequences.Read(owner, database, sequence));
+  ASSERT_TRUE(deleted.IsNotFound()) << deleted;
+  ASSERT_OK(finish(owner));
+}
+
+TEST_F(ReadonlyPgServerTest, SequenceRestartRollbackBounds) {
+  auto server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          GetTestPath("sequence-restart-rollback"), Snapshot(), AllocateFreePort(),
+          CatalogMode::kSerializedTransactions));
+  auto c = ASSERT_RESULT(Connect(*server));
+  ASSERT_OK(c.Execute("CREATE SEQUENCE seq_widen_up MAXVALUE 3"));
+  ASSERT_OK(c.Execute("CREATE SEQUENCE seq_widen_down INCREMENT -1 MINVALUE -3 MAXVALUE -1"));
+  struct Case {
+    std::string sequence;
+    std::string widen;
+    int64_t min, max, restart, setval, next;
+  };
+  const std::vector<Case> cases = {
+      {"seq_widen_up", "MAXVALUE 100 RESTART 50", 1, 3, 50, 2, 3},
+      {"seq_widen_down", "MINVALUE -100 RESTART -50", -3, -1, -50, -2, -3}};
+  for (const auto& [sequence, widen, min, max, restart, setval, next] : cases) {
+    ASSERT_OK(c.Execute("BEGIN"));
+    ASSERT_OK(c.ExecuteFormat("ALTER SEQUENCE $0 $1", sequence, widen));
+    ASSERT_OK(c.Execute("ROLLBACK"));
+    // The bounds roll back with the catalog; the RESTART tuple is nontransactional.
+    ASSERT_EQ(
+        ASSERT_RESULT((c.FetchRow<int64_t, int64_t>(Format(
+            "SELECT seqmin,seqmax FROM pg_sequence WHERE seqrelid='$0'::regclass", sequence)))),
+        std::make_tuple(min, max));
+    const auto state = Format("SELECT last_value,is_called FROM $0", sequence);
+    ASSERT_EQ(ASSERT_RESULT((c.FetchRow<int64_t, bool>(state))), std::make_tuple(restart, false));
+    const auto rejected = ResultToStatus(c.Fetch(Format("SELECT nextval('$0')", sequence)));
+    ASSERT_NOK(rejected);
+    ASSERT_STR_CONTAINS(rejected.ToString(), "outside MINVALUE/MAXVALUE");
+    ASSERT_EQ(ASSERT_RESULT((c.FetchRow<int64_t, bool>(state))), std::make_tuple(restart, false));
+    ASSERT_EQ(
+        ASSERT_RESULT(c.FetchRow<int64_t>(Format("SELECT setval('$0',$1)", sequence, setval))),
+        setval);
+    ASSERT_EQ(
+        ASSERT_RESULT(c.FetchRow<int64_t>(Format("SELECT nextval('$0')", sequence))), next);
+  }
 }
 
 }  // namespace
