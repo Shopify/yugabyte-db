@@ -89,6 +89,7 @@
 #include "yb/tserver/tserver_service.proxy.h"
 
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/curl_util.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
 #include "yb/util/oid_generator.h"
@@ -4164,34 +4165,93 @@ void EnableMultiRaftBatching(ExternalMiniCluster* cluster) {
   }
 }
 
-// Sum of a server-entity metric over the running tablet servers.
+int64_t ServerMetric(ExternalTabletServer* ts, const char* metric, const char* field = "value") {
+  if (!ts->IsProcessAlive()) {
+    return 0;
+  }
+  auto value = ts->GetMetric<int64>("server", nullptr, metric, field);
+  return value.ok() ? *value : 0;
+}
+
+// Sum of a server-entity metric over the running tablet servers, except the one given.
 int64_t SumServerMetric(
-    ExternalMiniCluster* cluster, const char* metric, const char* field = "value") {
+    ExternalMiniCluster* cluster, const char* metric, const char* field = "value",
+    const ExternalTabletServer* except = nullptr) {
   int64_t sum = 0;
   for (size_t i = 0; i != cluster->num_tablet_servers(); ++i) {
     auto* ts = cluster->tablet_server(i);
-    if (!ts->IsProcessAlive()) {
-      continue;
-    }
-    auto value = ts->GetMetric<int64>("server", nullptr, metric, field);
-    if (value.ok()) {
-      sum += *value;
+    if (ts != except) {
+      sum += ServerMetric(ts, metric, field);
     }
   }
   return sum;
 }
 
 int64_t ConcurrentSubRequests(ExternalTabletServer* ts) {
-  auto value = ts->GetMetric<int64>(
-      "server", nullptr, "multi_raft_update_sub_requests_concurrent", "value");
-  return value.ok() ? *value : 0;
+  return ServerMetric(ts, "multi_raft_update_sub_requests_concurrent");
+}
+
+// The ids of the tablets of the table that the tablet server hosts.
+Result<std::vector<TabletId>> TableTabletIds(
+    ExternalMiniCluster* cluster, ExternalTabletServer* ts, const client::YBTableName& table) {
+  auto resp = VERIFY_RESULT(cluster->ListTablets(ts));
+  std::vector<TabletId> result;
+  for (const auto& entry : resp.status_and_schema()) {
+    if (entry.tablet_status().table_name() == table.table_name()) {
+      result.push_back(entry.tablet_status().tablet_id());
+    }
+  }
+  return result;
+}
+
+// The names of the metrics on the server's Prometheus page.
+Result<std::unordered_set<std::string>> PrometheusMetricNames(ExternalDaemon* daemon) {
+  EasyCurl curl;
+  faststring out;
+  RETURN_NOT_OK(curl.FetchURL(
+      Format("http://$0/prometheus-metrics", daemon->bound_http_hostport().ToString()), &out));
+  std::unordered_set<std::string> result;
+  std::istringstream lines(out.ToString());
+  for (std::string line; std::getline(lines, line);) {
+    if (line.empty() || line[0] == '#') {
+      continue;
+    }
+    result.insert(line.substr(0, line.find_first_of("{ ")));
+  }
+  return result;
+}
+
+// Whether the metric is exported: a counter or gauge under its own name, event_stats and
+// histograms as name_sum and name_count.
+bool HasPrometheusMetric(
+    const std::unordered_set<std::string>& names, const std::string& metric) {
+  return names.contains(metric) ||
+         (names.contains(metric + "_sum") && names.contains(metric + "_count"));
+}
+
+void StartBatchedWriteWorkload(TestYcqlWorkload* workload, int num_tablets = 6) {
+  workload->set_num_tablets(num_tablets);
+  workload->set_num_write_threads(4);
+  workload->set_write_batch_size(1);
+  workload->set_timeout_allowed(true);
+  workload->set_write_timeout_millis(5000);
+  workload->Setup(client::YBTableType::YQL_TABLE_TYPE);
+  workload->Start();
+}
+
+Status WaitForMoreRows(const TestYcqlWorkload& workload, int64_t delta) {
+  const auto target = workload.rows_inserted() + delta;
+  return WaitFor(
+      [&workload, target] { return workload.rows_inserted() >= target; },
+      60s * kTimeMultiplier, Format("$0 rows inserted", target));
 }
 
 } // namespace
 
 // A write workload over several tablets with heartbeat and data batching: leaders send both kinds
 // of requests in envelopes, followers process the envelopes concurrently, the leaders process the
-// batched data responses, and the replicas converge.
+// batched data responses, and the replicas converge. Nothing stops or slows a follower, so no
+// envelope fails and none is answered at its deadline.
 TEST_F(RaftConsensusITest, MultiRaftBatchingWorkload) {
   CreateCluster("raft_consensus-itest-cluster", {}, {});
   ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
@@ -4217,6 +4277,8 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingWorkload) {
   ASSERT_GT(SumServerMetric(
       cluster_.get(), "multi_raft_batched_response_processing_us", "total_count"), 0);
   ASSERT_GT(SumServerMetric(cluster_.get(), "multi_raft_update_sub_requests_concurrent"), 0);
+  ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_envelopes_failed"), 0);
+  ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_update_deadline_responses"), 0);
 
   ClusterVerifier cluster_verifier(cluster_.get());
   ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
@@ -4224,46 +4286,248 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingWorkload) {
       workload.table_name(), ClusterVerifier::AT_LEAST, workload.rows_inserted()));
 }
 
+// Every multi-Raft batching metric, and the existing metrics that show how consensus RPCs behave,
+// are on the Prometheus page of a tablet server with batching on.
+TEST_F(RaftConsensusITest, MultiRaftBatchingMetricsExported) {
+  CreateCluster("raft_consensus-itest-cluster", {}, {});
+  ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
+
+  TestYcqlWorkload workload(cluster_.get());
+  ASSERT_NO_FATALS(StartBatchedWriteWorkload(&workload));
+  ASSERT_OK(WaitForMoreRows(workload, 500));
+  workload.StopAndJoin();
+
+  // Registered by each multi-Raft batcher, i.e. on a server that leads a tablet.
+  const std::vector<std::string> kLeaderMetrics = {
+    "multi_raft_batched_response_processing_us",
+    "multi_raft_data_sends_direct",
+    "multi_raft_data_sub_requests",
+    "multi_raft_envelope_bytes",
+    "multi_raft_envelope_ops",
+    "multi_raft_envelope_sub_requests",
+    "multi_raft_envelopes_failed",
+    "multi_raft_envelopes_sent",
+    "multi_raft_flush_bytes_cap",
+    "multi_raft_flush_count_cap",
+    "multi_raft_flush_deadline",
+    "multi_raft_flush_immediate",
+    "multi_raft_flush_response_clocked",
+    "multi_raft_flush_timer",
+    "multi_raft_heartbeat_sub_requests",
+  };
+  // Registered by every tablet server.
+  const std::vector<std::string> kServerMetrics = {
+    "handler_latency_outbound_call_queue_time",
+    "handler_latency_yb_consensus_ConsensusService_MultiRaftUpdateConsensus",
+    "handler_latency_yb_consensus_ConsensusService_UpdateConsensus",
+    "handler_latency_yb_tserver_TabletServerService_Read",
+    "handler_latency_yb_tserver_TabletServerService_Write",
+    "log_group_commit_latency",
+    "multi_raft_update_deadline_responses",
+    "multi_raft_update_pool_queue_time_us",
+    "multi_raft_update_pool_run_time_us",
+    "multi_raft_update_sub_requests_concurrent",
+    "not_leader_rejections",
+    "rpc_incoming_queue_time",
+  };
+
+  size_t num_servers_with_batcher = 0;
+  for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
+    auto* ts = cluster_->tablet_server(i);
+    SCOPED_TRACE(ts->uuid());
+    auto names = ASSERT_RESULT(PrometheusMetricNames(ts));
+    for (const auto& metric : kServerMetrics) {
+      ASSERT_TRUE(HasPrometheusMetric(names, metric)) << metric;
+    }
+    // A server that leads no tablet has no batcher.
+    if (ServerMetric(ts, "multi_raft_envelopes_sent") == 0) {
+      continue;
+    }
+    ++num_servers_with_batcher;
+    for (const auto& metric : kLeaderMetrics) {
+      ASSERT_TRUE(HasPrometheusMetric(names, metric)) << metric;
+    }
+  }
+  LOG(INFO) << "Tablet servers with a multi-Raft batcher: " << num_servers_with_batcher;
+  ASSERT_GT(num_servers_with_batcher, 0);
+}
+
 // A tablet server that stops responding, and then crashes, while envelopes to it are in flight:
-// the leaders recover and the replicas converge.
+// the envelopes to it fail as a whole, the leaders recover, and the replicas converge.
 TEST_F(RaftConsensusITest, MultiRaftBatchingFollowerCrash) {
   CreateCluster("raft_consensus-itest-cluster", {}, {});
   ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
 
   TestYcqlWorkload workload(cluster_.get());
-  workload.set_num_tablets(6);
-  workload.set_num_write_threads(4);
-  workload.set_write_batch_size(1);
-  workload.set_timeout_allowed(true);
-  workload.set_write_timeout_millis(5000);
-  workload.Setup(client::YBTableType::YQL_TABLE_TYPE);
-  workload.Start();
-  auto wait_for_rows = [&workload](int64_t delta) {
-    const auto target = workload.rows_inserted() + delta;
-    return WaitFor(
-        [&workload, target] { return workload.rows_inserted() >= target; },
-        60s * kTimeMultiplier, Format("$0 rows inserted", target));
-  };
-  ASSERT_OK(wait_for_rows(500));
+  ASSERT_NO_FATALS(StartBatchedWriteWorkload(&workload));
+  ASSERT_OK(WaitForMoreRows(workload, 500));
 
   auto* victim = cluster_->tablet_server(2);
   // The victim is receiving envelopes.
   ASSERT_GT(ConcurrentSubRequests(victim), 0);
+  const auto envelopes_failed_before = SumServerMetric(
+      cluster_.get(), "multi_raft_envelopes_failed", "value", victim);
 
   ASSERT_OK(victim->Pause());
   SleepFor(3s);
+  // Envelopes to the stopped server timed out on the other servers, each failing every Raft
+  // request it carried.
+  const auto envelopes_failed = SumServerMetric(
+      cluster_.get(), "multi_raft_envelopes_failed", "value", victim);
   ASSERT_OK(victim->Resume());
-  ASSERT_OK(wait_for_rows(500));
+  LOG(INFO) << "Envelopes failed while the follower was stopped: "
+            << envelopes_failed - envelopes_failed_before;
+  ASSERT_GT(envelopes_failed, envelopes_failed_before);
+  ASSERT_OK(WaitForMoreRows(workload, 500));
 
   victim->Shutdown();
-  ASSERT_OK(wait_for_rows(500));
+  ASSERT_OK(WaitForMoreRows(workload, 500));
   ASSERT_OK(victim->Restart());
-  ASSERT_OK(wait_for_rows(500));
+  ASSERT_OK(WaitForMoreRows(workload, 500));
   ASSERT_OK(WaitFor(
       [victim] { return ConcurrentSubRequests(victim) > 0; }, 30s,
       "Restarted server receives envelopes"));
   workload.StopAndJoin();
 
+  ClusterVerifier cluster_verifier(cluster_.get());
+  ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
+  ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
+      workload.table_name(), ClusterVerifier::AT_LEAST, workload.rows_inserted()));
+}
+
+// Leaders with batched data rounds in flight step down under load: other replicas take over, the
+// writes continue, and no acknowledged write is lost.
+TEST_F(RaftConsensusITest, MultiRaftBatchingLeaderStepDown) {
+  constexpr size_t kNumStepDowns = 3;
+  CreateCluster("raft_consensus-itest-cluster", {}, {});
+  ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
+
+  TestYcqlWorkload workload(cluster_.get());
+  ASSERT_NO_FATALS(StartBatchedWriteWorkload(&workload));
+  ASSERT_OK(WaitForMoreRows(workload, 500));
+
+  auto tablet_ids = ASSERT_RESULT(TableTabletIds(
+      cluster_.get(), cluster_->tablet_server(0), workload.table_name()));
+  ASSERT_GE(tablet_ids.size(), kNumStepDowns);
+  tablet_ids.resize(kNumStepDowns);
+  std::vector<itest::TServerDetails*> leaders;
+  for (const auto& tablet_id : tablet_ids) {
+    itest::TServerDetails* leader;
+    ASSERT_OK(FindTabletLeader(tablet_servers_, tablet_id, 30s, &leader));
+    leaders.push_back(leader);
+  }
+
+  // The leaders are sending data through their batchers.
+  std::vector<int64_t> data_sub_requests;
+  for (auto* leader : leaders) {
+    data_sub_requests.push_back(ServerMetric(
+        cluster_->tablet_server_by_uuid(leader->uuid()), "multi_raft_data_sub_requests"));
+  }
+  ASSERT_OK(WaitForMoreRows(workload, 200));
+  for (size_t i = 0; i != leaders.size(); ++i) {
+    ASSERT_GT(ServerMetric(
+        cluster_->tablet_server_by_uuid(leaders[i]->uuid()), "multi_raft_data_sub_requests"),
+        data_sub_requests[i]) << leaders[i]->uuid();
+  }
+  ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_data_sends_direct"), 0);
+
+  for (size_t i = 0; i != tablet_ids.size(); ++i) {
+    ASSERT_OK(itest::LeaderStepDown(leaders[i], tablet_ids[i], nullptr, 10s));
+  }
+  for (size_t i = 0; i != tablet_ids.size(); ++i) {
+    ASSERT_OK(WaitFor([this, &tablet_ids, &leaders, i]() -> Result<bool> {
+      itest::TServerDetails* leader;
+      auto status = FindTabletLeader(tablet_servers_, tablet_ids[i], 1s, &leader);
+      return status.ok() && leader->uuid() != leaders[i]->uuid();
+    }, 30s, Format("New leader of $0", tablet_ids[i])));
+  }
+  ASSERT_OK(WaitForMoreRows(workload, 500));
+  workload.StopAndJoin();
+
+  ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_update_deadline_responses"), 0);
+  ClusterVerifier cluster_verifier(cluster_.get());
+  ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
+  ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
+      workload.table_name(), ClusterVerifier::AT_LEAST, workload.rows_inserted()));
+}
+
+// A table is deleted while writes to it, sent through the batchers, are in flight: its peers are
+// closed with batched rounds outstanding, and the writes to another table carry on.
+TEST_F(RaftConsensusITest, MultiRaftBatchingDeleteTableUnderLoad) {
+  CreateCluster("raft_consensus-itest-cluster", {}, {});
+  ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
+
+  TestYcqlWorkload kept(cluster_.get());
+  ASSERT_NO_FATALS(StartBatchedWriteWorkload(&kept, 3));
+  TestYcqlWorkload deleted(cluster_.get());
+  deleted.set_table_name(client::YBTableName(
+      YQLDatabase::YQL_DATABASE_CQL, kept.table_name().namespace_name(), "deleted_table"));
+  deleted.set_not_found_allowed(true);
+  deleted.set_insert_failures_allowed(true);
+  ASSERT_NO_FATALS(StartBatchedWriteWorkload(&deleted, 3));
+  ASSERT_OK(WaitForMoreRows(kept, 300));
+
+  // Writes to the table are going through the batchers when it is deleted.
+  const auto data_sub_requests = SumServerMetric(cluster_.get(), "multi_raft_data_sub_requests");
+  ASSERT_OK(WaitForMoreRows(deleted, 300));
+  ASSERT_GT(SumServerMetric(cluster_.get(), "multi_raft_data_sub_requests"), data_sub_requests);
+  ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_data_sends_direct"), 0);
+  ASSERT_OK(deleted.client().DeleteTable(deleted.table_name()));
+  deleted.StopAndJoin();
+
+  ASSERT_OK(WaitForMoreRows(kept, 500));
+  kept.StopAndJoin();
+  for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
+    auto* ts = cluster_->tablet_server(i);
+    ASSERT_TRUE(ts->IsProcessAlive()) << ts->uuid();
+    ASSERT_EQ(ASSERT_RESULT(TableTabletIds(cluster_.get(), ts, deleted.table_name())).size(), 0)
+        << ts->uuid();
+  }
+
+  ClusterVerifier cluster_verifier(cluster_.get());
+  ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
+  ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
+      kept.table_name(), ClusterVerifier::AT_LEAST, kept.rows_inserted()));
+}
+
+// A follower replica of a loaded tablet is tombstoned: the leader learns that from a batched
+// sub-response (TABLET_NOT_FOUND), remote-bootstraps the replica, and the replica catches up.
+TEST_F(RaftConsensusITest, MultiRaftBatchingTombstonedFollowerUnderLoad) {
+  CreateCluster("raft_consensus-itest-cluster", {}, {});
+  ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
+
+  TestYcqlWorkload workload(cluster_.get());
+  ASSERT_NO_FATALS(StartBatchedWriteWorkload(&workload, 3));
+  ASSERT_OK(WaitForMoreRows(workload, 500));
+
+  const auto tablet_id = ASSERT_RESULT(TableTabletIds(
+      cluster_.get(), cluster_->tablet_server(0), workload.table_name())).front();
+  itest::TServerDetails* leader;
+  ASSERT_OK(FindTabletLeader(tablet_servers_, tablet_id, 30s, &leader));
+  itest::TServerDetails* follower = nullptr;
+  for (const auto& [uuid, details] : tablet_servers_) {
+    if (uuid != leader->uuid()) {
+      follower = details.get();
+      break;
+    }
+  }
+  ASSERT_NE(follower, nullptr);
+  const auto follower_idx = cluster_->tablet_server_index_by_uuid(follower->uuid());
+  auto* leader_ts = cluster_->tablet_server_by_uuid(leader->uuid());
+  const auto data_sub_requests = ServerMetric(leader_ts, "multi_raft_data_sub_requests");
+
+  ASSERT_OK(itest::DeleteTablet(
+      follower, tablet_id, tablet::TABLET_DATA_TOMBSTONED, std::nullopt, 30s));
+  // Only a remote bootstrap brings a tombstoned replica back to a ready state with data.
+  ASSERT_OK(inspect_->WaitForTabletDataStateOnTS(
+      follower_idx, tablet_id, tablet::TABLET_DATA_READY, 60s * kTimeMultiplier));
+  ASSERT_OK(itest::WaitUntilTabletRunning(follower, tablet_id, 60s * kTimeMultiplier));
+  ASSERT_OK(WaitForMoreRows(workload, 500));
+  ASSERT_GT(ServerMetric(leader_ts, "multi_raft_data_sub_requests"), data_sub_requests);
+  ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_data_sends_direct"), 0);
+  workload.StopAndJoin();
+
+  ASSERT_OK(WaitForServersToAgree(60s * kTimeMultiplier, tablet_servers_, tablet_id, 1));
   ClusterVerifier cluster_verifier(cluster_.get());
   ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
   ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
