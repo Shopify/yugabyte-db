@@ -25,8 +25,12 @@ build/latest/bin/yb-local-readonly \
   --data_dir "$PWD/build/local-runtime/readonly-dev" --sql_port 15433
 ```
 
-Use a new directory initially. Startup emits a JSON readiness record on stdout
-after SQL verification; process logs go to stderr. In another terminal:
+Use a new directory initially. Startup emits a one-line JSON readiness record on stdout
+after SQL verification; process logs go to stderr. The record has `protocol_version`
+(currently 1), `state` (`ready`), `host`, `sql_port`, `rpc_address`, `mode` (`readonly`
+or `experimental-serialized-sql`), `pid` (the CLI process to signal for shutdown), and
+`data_directory` (the PostgreSQL data directory, matching `SHOW data_directory`).
+In another terminal:
 
 ```sh
 build/latest/postgres/bin/ysqlsh -X -h 127.0.0.1 -p 15433 -U yugabyte -d yugabyte \
@@ -112,6 +116,23 @@ created. Backward scans support one hash code or a single-partition relation, in
 Reads without partition bounds route a scalar ybctid by its DocKey hash; unbounded
 ybctid batches are rejected on multi-partition relations. PgGate supplies bounds for both.
 
+Sequences, serial/bigserial, and identity columns use native nontransactional sequence values.
+Every tuple change, including each connection's cached-range reservation, is synced before it
+is acknowledged: nextval/setval survive ROLLBACK and savepoint rollback, and restart does not
+reissue reserved values. Caches are connection-local, so values interleave across connections
+and rollback, rejected inserts, and restart leave gaps. Sequence RPCs neither start a SQL
+transaction nor take the lease, but fail while another backend holds it. The exception is
+DROP SEQUENCE/owning-table tuple deletion: PostgreSQL sends it after FinishTransaction released
+the lease, so it is admitted under any lease, still only for the backend's own database. DROP
+DATABASE cleanup deletes only a durably retired database's tuples. PostgreSQL merely warns when
+post-commit deletion fails. Tuples from a failed or rolled-back CREATE, or from missed
+post-commit cleanup, are unreachable (OIDs are not reused) but persist until their database is
+retired or the directory is recreated. Server-side sequence caching
+(ysql_sequence_cache_method=server), historical sequence reads, sequences in template
+databases, and TRUNCATE ... RESTART IDENTITY remain unsupported. A rolled-back ALTER that
+widened bounds and RESTARTed can leave an uncalled value outside the reverted
+MINVALUE/MAXVALUE; nextval then fails before changing state, and an in-range setval recovers.
+
 Foreground non-unique, unique, covering, partial, and expression indexes use native
 PostgreSQL/PgGate population and maintenance. Base/index intents share a transaction;
 unique NULL-distinct/NULLS NOT DISTINCT encodings are unchanged. Explicit CONCURRENTLY,
@@ -131,22 +152,22 @@ name/OID, OID reservation bound, SQL pg_database/dependency/version tuples, and 
 bundle in one transaction. Templates containing application tables are unsupported.
 DROP DATABASE accepts only locally created databases without live target backends. It
 atomically retires their namespace and application descriptors with the SQL catalog rows.
-Historical catalog keys are then deleted in <=256 KiB synced batches; a retirement marker
-restarts interrupted cleanup. Retired database OIDs cannot be reused. Catalog shared-memory
-slots are not renumbered under live backends; dropped slots are cleared and retained until
-restart. Database rename and arbitrary database cloning remain unsupported.
+Historical catalog keys and sequence tuples are then deleted in <=256 KiB synced batches; a
+retirement marker restarts interrupted cleanup. Retired database OIDs cannot be reused.
+Catalog shared-memory slots are not renumbered under live backends; dropped slots are cleared
+and retained until restart. Database rename and arbitrary database cloning remain unsupported.
 
-Sequences, colocation, tablegroups/tablespaces, explicit split bounds, cross-partition
-backward scans, replay/retry, general historical reads, and unimplemented RPCs fail explicitly.
+Colocation, tablegroups/tablespaces, explicit split bounds, cross-partition backward scans,
+replay/retry, general historical reads, and unimplemented RPCs fail explicitly.
 This is not a general transaction/planner compatibility claim. Do not use it to edit arbitrary
 system catalogs.
 
 ### Storage and lifecycle
 
-One RocksDB holds catalogs in its default CF, descriptors/counters in local-metadata,
-regular application data in table/<id>, intents in intents/<id>, and native transaction
-status/bindings in local-native-transactions. All participants share the cache, CF ownership,
-mutex, allocated clock, committed watermark, and persistent I/O failure fence.
+One RocksDB holds catalogs in its default CF, descriptors/counters/sequence tuples in
+local-metadata, regular application data in table/<id>, intents in intents/<id>, and native
+transaction status/bindings in local-native-transactions. All participants share the cache, CF
+ownership, mutex, allocated clock, committed watermark, and persistent I/O failure fence.
 
 Catalog tuples/descriptors use a private WriteBatchWithIndex overlay. Application reads and
 writes use native DocDB operations, intents, and status resolution through PgLocalTxnStore,
@@ -174,7 +195,7 @@ not all buffered in the catalog overlay. There are 1,024 rollback ranges and 65,
 native transactions. Compaction and intent/history GC remain disabled: repeated fixture
 loads retain history, and memory/disk use must be measured for the intended workload.
 
-Each backend owns its sequence watermark, queued calls, deadline timer, and error state.
+Each backend owns its request-sequence watermark, queued calls, deadline timer, and error state.
 Sequencing has no lifetime request-count cap. Out-of-order arrivals park without blocking
 RPC workers; the 64-call / 16 MiB encoded queue bound is service-wide. Missing predecessors
 must arrive within five seconds or the RPC deadline. Replay, timeout, overflow, or backend
@@ -200,17 +221,20 @@ index, hash-range, paging, queue, error, ownership, and restart tests, targeted 
 
 ```sh
 for test in SerializedSqlSessions SchemaLifecycle PrimaryKeyRewrite LargeNativeTransaction \
-            DropsDatabasesAndRetainsOtherSlots CommandCatalogTransactions; do
+            DropsDatabasesAndRetainsOtherSlots CommandCatalogTransactions \
+            SequenceBackedSchemaLifecycle SequenceValuesAreNontransactional \
+            BoundedSequenceLimits SequenceTuplesDeletedOnDrop SequenceRpcGuards \
+            SequenceRestartRollbackBounds; do
   ./yb_build.sh release --clang21 --cxx-test pg_local_readonly-test \
     --gtest_filter ReadonlyPgServerTest.$test --sj --skip-pg-parquet --no-odyssey --no-ybc \
     --no-postgres --skip-initdb || exit 1
 done
 ```
 
-Upgrade/rollback: write mode uses ownership marker yb-local-catalog-txn-v9. Recreate v1-v8
-SQL directories; never edit markers to bypass engine/seed checks. Frozen, production-tablet,
-and mismatched-build directories cannot be reused. The exact build identity includes its
-build timestamp. There is no experimental data-format upgrade promise.
+Upgrade/rollback: write mode uses ownership marker yb-local-catalog-txn-v10, which adds durable
+sequence tuples. Recreate v1-v9 SQL directories; never edit markers to bypass engine/seed checks.
+Frozen, production-tablet, and mismatched-build directories cannot be reused. The exact build
+identity includes its build timestamp. There is no experimental data-format upgrade promise.
 
 The production protocol gains additive backend-ID fields on OpenTable, GetTablePartitionList,
 and GetDatabaseInfo, plus sql_transaction_active on Perform options. Ordinary tservers ignore
@@ -234,12 +258,14 @@ disabled because this store has no Raft hybrid-time frontiers.
 pg_local_shared_commit-test covers atomic catalog/data publication, snapshots/DDL exclusion,
 parent/savepoint writes, native SQL types/sidecars, schema packing and column-ID recovery,
 table/database retirement, bounded cleanup and SIGKILL, missing storage, and shared failure
-fences. pg_local_txn_store-test retains its standalone conflict/snapshot/paging/concurrent-caller
+fences. SequenceStateSurvivesRollbackAndReopen and SequenceRetirementAndWriteFailureFence cover
+sequence tuples across abort/reopen, database retirement, and ambiguous write failure.
+pg_local_txn_store-test retains its standalone conflict/snapshot/paging/concurrent-caller
 coverage and optional CPU/RSS probe. These component tests do not establish concurrent writable
 SQL or power-loss durability.
 
 Standalone native format is local-native-intents/2 (v1 requires recreation); the shared SQL
-storage format remains local-shared-sql/1 inside the v9 runtime ownership boundary.
+storage format remains local-shared-sql/1 inside the v10 runtime ownership boundary.
 
 ## Integrated standalone measurement
 
