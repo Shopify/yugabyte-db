@@ -2,6 +2,22 @@
 
 This document provides a guide for agents working on YugabyteDB
 
+### Shopify contribution issues
+
+For Shopify-originated issue intake, public issue publication, or private/public
+issue linking, use
+[shopify-create-issue](.claude/skills/shopify-create-issue/SKILL.md). Its public
+publication target is `Shopify/yugabyte-db`. Source evidence stays in the configured
+private tracker; normal sanitized publication does not require a separate approval.
+Use the Shopify tool for publication and recovery rather than the inherited
+upstream `create-issue` workflow. Existing public upstream issues can be reused.
+
+Shopify contributions require an approving review from `yugabyte-code-reviewers`
+and a merge into the Shopify integration branch before maintainer-led upstream
+submission. The integration branch is `master-shopify`; series and maintenance
+branches use the `<release>-shopify` suffix. Repository setup and the remaining
+PR/backport skills are separate rollout steps from the issue-publishing tool.
+
 ### Deploying and running
 
 For agents that want to deploy, configure and run YugabyteDB refer to instructions at ./docs/content/stable/quick-start
