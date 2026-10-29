@@ -4582,6 +4582,9 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingKillSwitchUnderLoad) {
   auto error_lines = WatchForBatchingErrorLines(cluster_.get());
 
   TestYcqlWorkload workload(cluster_.get());
+  // Tens of thousands of random int32 keys would likely repeat one, and the row count check below
+  // would then fail without any row being lost.
+  workload.set_sequential_write(true);
   ASSERT_NO_FATALS(StartBatchedWriteWorkload(&workload));
   // The tablets of a table nobody writes to only heartbeat, through the batchers whatever the data
   // flag, so followers keep receiving envelopes while data goes direct.
@@ -4663,6 +4666,7 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingKillSwitchUnderLoad) {
     ASSERT_TRUE(ts->IsProcessAlive()) << ts->uuid();
   }
   ASSERT_NO_FATALS(AssertNoBatchingErrorLines(error_lines.get()));
+  LOG(INFO) << "Rows inserted: " << workload.rows_inserted();
   ClusterVerifier cluster_verifier(cluster_.get());
   ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
   ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
