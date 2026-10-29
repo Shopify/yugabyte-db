@@ -4246,6 +4246,22 @@ Status WaitForMoreRows(const TestYcqlWorkload& workload, int64_t delta) {
       60s * kTimeMultiplier, Format("$0 rows inserted", target));
 }
 
+// Watches every tablet server's log, across restarts, for lines that no batching scenario may
+// produce: a Raft request stuck past its timeout (`Peer::CheckStuckCall`) and an envelope answered
+// with the wrong number of responses (`MultiRaftBatcher::DispatchSubCallbacks`). Neither stops
+// the process in a release build. A daemon has a single log listener, so the test must not
+// register another one while this is alive.
+std::unique_ptr<LogWaiter> WatchForBatchingErrorLines(ExternalMiniCluster* cluster) {
+  const auto tservers = cluster->tserver_daemons();
+  return std::make_unique<LogWaiter>(
+      std::vector<ExternalDaemon*>(tservers.begin(), tservers.end()),
+      std::vector<std::string>{"Found an RPC call in stuck state", "responses for"});
+}
+
+void AssertNoBatchingErrorLines(LogWaiter* waiter) {
+  ASSERT_FALSE(waiter->IsEventOccurred()) << waiter->matched_log_line();
+}
+
 } // namespace
 
 // A write workload over several tablets with heartbeat and data batching: leaders send both kinds
@@ -4255,6 +4271,7 @@ Status WaitForMoreRows(const TestYcqlWorkload& workload, int64_t delta) {
 TEST_F(RaftConsensusITest, MultiRaftBatchingWorkload) {
   CreateCluster("raft_consensus-itest-cluster", {}, {});
   ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
+  auto error_lines = WatchForBatchingErrorLines(cluster_.get());
 
   TestYcqlWorkload workload(cluster_.get());
   workload.set_num_tablets(6);
@@ -4280,6 +4297,7 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingWorkload) {
   ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_envelopes_failed"), 0);
   ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_update_deadline_responses"), 0);
 
+  ASSERT_NO_FATALS(AssertNoBatchingErrorLines(error_lines.get()));
   ClusterVerifier cluster_verifier(cluster_.get());
   ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
   ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
@@ -4291,6 +4309,7 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingWorkload) {
 TEST_F(RaftConsensusITest, MultiRaftBatchingMetricsExported) {
   CreateCluster("raft_consensus-itest-cluster", {}, {});
   ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
+  auto error_lines = WatchForBatchingErrorLines(cluster_.get());
 
   TestYcqlWorkload workload(cluster_.get());
   ASSERT_NO_FATALS(StartBatchedWriteWorkload(&workload));
@@ -4349,6 +4368,7 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingMetricsExported) {
     }
   }
   LOG(INFO) << "Tablet servers with a multi-Raft batcher: " << num_servers_with_batcher;
+  ASSERT_NO_FATALS(AssertNoBatchingErrorLines(error_lines.get()));
   ASSERT_GT(num_servers_with_batcher, 0);
 }
 
@@ -4357,6 +4377,7 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingMetricsExported) {
 TEST_F(RaftConsensusITest, MultiRaftBatchingFollowerCrash) {
   CreateCluster("raft_consensus-itest-cluster", {}, {});
   ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
+  auto error_lines = WatchForBatchingErrorLines(cluster_.get());
 
   TestYcqlWorkload workload(cluster_.get());
   ASSERT_NO_FATALS(StartBatchedWriteWorkload(&workload));
@@ -4389,6 +4410,7 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingFollowerCrash) {
       "Restarted server receives envelopes"));
   workload.StopAndJoin();
 
+  ASSERT_NO_FATALS(AssertNoBatchingErrorLines(error_lines.get()));
   ClusterVerifier cluster_verifier(cluster_.get());
   ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
   ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
@@ -4401,6 +4423,7 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingLeaderStepDown) {
   constexpr size_t kNumStepDowns = 3;
   CreateCluster("raft_consensus-itest-cluster", {}, {});
   ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
+  auto error_lines = WatchForBatchingErrorLines(cluster_.get());
 
   TestYcqlWorkload workload(cluster_.get());
   ASSERT_NO_FATALS(StartBatchedWriteWorkload(&workload));
@@ -4445,6 +4468,7 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingLeaderStepDown) {
   workload.StopAndJoin();
 
   ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_update_deadline_responses"), 0);
+  ASSERT_NO_FATALS(AssertNoBatchingErrorLines(error_lines.get()));
   ClusterVerifier cluster_verifier(cluster_.get());
   ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
   ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
@@ -4456,6 +4480,7 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingLeaderStepDown) {
 TEST_F(RaftConsensusITest, MultiRaftBatchingDeleteTableUnderLoad) {
   CreateCluster("raft_consensus-itest-cluster", {}, {});
   ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
+  auto error_lines = WatchForBatchingErrorLines(cluster_.get());
 
   TestYcqlWorkload kept(cluster_.get());
   ASSERT_NO_FATALS(StartBatchedWriteWorkload(&kept, 3));
@@ -4472,11 +4497,15 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingDeleteTableUnderLoad) {
   ASSERT_OK(WaitForMoreRows(deleted, 300));
   ASSERT_GT(SumServerMetric(cluster_.get(), "multi_raft_data_sub_requests"), data_sub_requests);
   ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_data_sends_direct"), 0);
+  const auto envelopes_failed = SumServerMetric(cluster_.get(), "multi_raft_envelopes_failed");
   ASSERT_OK(deleted.client().DeleteTable(deleted.table_name()));
   deleted.StopAndJoin();
 
   ASSERT_OK(WaitForMoreRows(kept, 500));
   kept.StopAndJoin();
+  // Closing a peer fails only its own slot of an envelope (the follower answers it with an error),
+  // never the envelope.
+  ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_envelopes_failed"), envelopes_failed);
   for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
     auto* ts = cluster_->tablet_server(i);
     ASSERT_TRUE(ts->IsProcessAlive()) << ts->uuid();
@@ -4484,6 +4513,7 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingDeleteTableUnderLoad) {
         << ts->uuid();
   }
 
+  ASSERT_NO_FATALS(AssertNoBatchingErrorLines(error_lines.get()));
   ClusterVerifier cluster_verifier(cluster_.get());
   ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
   ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
@@ -4495,6 +4525,7 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingDeleteTableUnderLoad) {
 TEST_F(RaftConsensusITest, MultiRaftBatchingTombstonedFollowerUnderLoad) {
   CreateCluster("raft_consensus-itest-cluster", {}, {});
   ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
+  auto error_lines = WatchForBatchingErrorLines(cluster_.get());
 
   TestYcqlWorkload workload(cluster_.get());
   ASSERT_NO_FATALS(StartBatchedWriteWorkload(&workload, 3));
@@ -4528,6 +4559,110 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingTombstonedFollowerUnderLoad) {
   workload.StopAndJoin();
 
   ASSERT_OK(WaitForServersToAgree(60s * kTimeMultiplier, tablet_servers_, tablet_id, 1));
+  ASSERT_NO_FATALS(AssertNoBatchingErrorLines(error_lines.get()));
+  ClusterVerifier cluster_verifier(cluster_.get());
+  ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
+  ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
+      workload.table_name(), ClusterVerifier::AT_LEAST, workload.rows_inserted()));
+}
+
+// The data-batching kill switch under load, flipped the way an operator would: one tablet server
+// at a time, at runtime, off and then back on. Between flips, leaders with the flag on send data
+// envelopes to followers with it off, which answer on the serial handler. With the flag off
+// everywhere, data goes direct and no follower uses the concurrent handler; with it back on, both
+// resume. Nothing stops or slows a follower, so no envelope fails and none is answered at its
+// deadline.
+TEST_F(RaftConsensusITest, MultiRaftBatchingKillSwitchUnderLoad) {
+  constexpr auto kDataFlag = "enable_multi_raft_data_batching";
+  constexpr int64_t kRowsBetweenFlips = 1000;
+  // Long enough for envelopes in flight at the last flip to drain under the held update locks.
+  const auto kSettle = 3s * kTimeMultiplier;
+  CreateCluster("raft_consensus-itest-cluster", {}, {});
+  ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
+  auto error_lines = WatchForBatchingErrorLines(cluster_.get());
+
+  TestYcqlWorkload workload(cluster_.get());
+  ASSERT_NO_FATALS(StartBatchedWriteWorkload(&workload));
+  // The tablets of a table nobody writes to only heartbeat, through the batchers whatever the data
+  // flag, so followers keep receiving envelopes while data goes direct.
+  TestYcqlWorkload idle(cluster_.get());
+  idle.set_table_name(client::YBTableName(
+      YQLDatabase::YQL_DATABASE_CQL, workload.table_name().namespace_name(), "idle_table"));
+  idle.set_num_tablets(3);
+  idle.Setup(client::YBTableType::YQL_TABLE_TYPE);
+  ASSERT_OK(WaitForMoreRows(workload, 500));
+
+  auto data_sub_requests = [this] {
+    return SumServerMetric(cluster_.get(), "multi_raft_data_sub_requests");
+  };
+  auto concurrent_sub_requests = [this] {
+    return SumServerMetric(cluster_.get(), "multi_raft_update_sub_requests_concurrent");
+  };
+  auto heartbeat_sub_requests = [this] {
+    return SumServerMetric(cluster_.get(), "multi_raft_heartbeat_sub_requests");
+  };
+  auto direct_updates = [this] {
+    return SumServerMetric(
+        cluster_.get(), "handler_latency_yb_consensus_ConsensusService_UpdateConsensus",
+        "total_count");
+  };
+  auto assert_no_failures = [this] {
+    ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_envelopes_failed"), 0);
+    ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_update_deadline_responses"), 0);
+  };
+
+  // On: leaders batch data and followers process the envelopes concurrently.
+  auto data_before = data_sub_requests();
+  auto concurrent_before = concurrent_sub_requests();
+  ASSERT_OK(WaitForMoreRows(workload, 300));
+  LOG(INFO) << "Batching on: data sub-requests +" << data_sub_requests() - data_before
+            << ", concurrent sub-requests +" << concurrent_sub_requests() - concurrent_before;
+  ASSERT_GT(data_sub_requests(), data_before);
+  ASSERT_GT(concurrent_sub_requests(), concurrent_before);
+  ASSERT_NO_FATALS(assert_no_failures());
+
+  // Off, one server at a time.
+  for (auto* ts : cluster_->tserver_daemons()) {
+    ASSERT_OK(cluster_->SetFlag(ts, kDataFlag, "false"));
+    ASSERT_OK(WaitForMoreRows(workload, kRowsBetweenFlips));
+  }
+  SleepFor(kSettle);
+  data_before = data_sub_requests();
+  concurrent_before = concurrent_sub_requests();
+  const auto heartbeat_before = heartbeat_sub_requests();
+  const auto direct_before = direct_updates();
+  ASSERT_OK(WaitForMoreRows(workload, 300));
+  SleepFor(kSettle);
+  LOG(INFO) << "Batching off: data sub-requests +" << data_sub_requests() - data_before
+            << ", concurrent sub-requests +" << concurrent_sub_requests() - concurrent_before
+            << ", heartbeat sub-requests +" << heartbeat_sub_requests() - heartbeat_before
+            << ", direct updates +" << direct_updates() - direct_before;
+  ASSERT_EQ(data_sub_requests(), data_before);
+  ASSERT_GT(direct_updates(), direct_before);
+  // Envelopes still arrive, with heartbeats only, and followers run them on the serial handler.
+  ASSERT_GT(heartbeat_sub_requests(), heartbeat_before);
+  ASSERT_EQ(concurrent_sub_requests(), concurrent_before);
+  ASSERT_NO_FATALS(assert_no_failures());
+
+  // On again, one server at a time.
+  for (auto* ts : cluster_->tserver_daemons()) {
+    ASSERT_OK(cluster_->SetFlag(ts, kDataFlag, "true"));
+    ASSERT_OK(WaitForMoreRows(workload, kRowsBetweenFlips));
+  }
+  data_before = data_sub_requests();
+  concurrent_before = concurrent_sub_requests();
+  ASSERT_OK(WaitForMoreRows(workload, 300));
+  LOG(INFO) << "Batching on again: data sub-requests +" << data_sub_requests() - data_before
+            << ", concurrent sub-requests +" << concurrent_sub_requests() - concurrent_before;
+  ASSERT_GT(data_sub_requests(), data_before);
+  ASSERT_GT(concurrent_sub_requests(), concurrent_before);
+  workload.StopAndJoin();
+
+  ASSERT_NO_FATALS(assert_no_failures());
+  for (auto* ts : cluster_->tserver_daemons()) {
+    ASSERT_TRUE(ts->IsProcessAlive()) << ts->uuid();
+  }
+  ASSERT_NO_FATALS(AssertNoBatchingErrorLines(error_lines.get()));
   ClusterVerifier cluster_verifier(cluster_.get());
   ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
   ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
