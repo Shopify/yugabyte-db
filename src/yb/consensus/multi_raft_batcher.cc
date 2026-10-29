@@ -504,8 +504,10 @@ void MultiRaftBatcher::DataFlushDeadlineExpired(rpc::ScheduledTaskId task_id) {
   SendBatchRequest(std::move(data));
 }
 
-// Kept out of line as a uprobe attach point for timing envelopes.
-ATTRIBUTE_NOINLINE void MultiRaftBatcher::BatchCompleted(const MultiRaftConsensusData& data) {
+// Kept out of line as a uprobe attach point for timing envelopes. `used` keeps LTO from rewriting
+// the signature (it could pass only `data.has_data()` instead of the batch the probe keys on).
+__attribute__((used)) ATTRIBUTE_NOINLINE void MultiRaftBatcher::BatchCompleted(
+    const MultiRaftConsensusData& data) {
   if (!data.has_data()) {
     return;
   }
