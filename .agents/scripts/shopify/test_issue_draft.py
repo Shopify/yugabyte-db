@@ -87,6 +87,59 @@ class PublicDraftTest(unittest.TestCase):
                     with self.assertRaises(IssueError):
                         render_draft(public_draft(**{field: text}), PRIVATE_REPO)
 
+    def test_rejects_addresses_followed_by_sentence_punctuation(self):
+        for address in ("10.2.3.4", "fd00::23", "::ffff:10.2.3.4"):
+            for punctuation in (".", "...", ";"):
+                for field in ("title", "description"):
+                    with self.subTest(address=address, punctuation=punctuation, field=field):
+                        text = f"The server address is {address}{punctuation}"
+                        with self.assertRaises(IssueError) as raised:
+                            render_draft(public_draft(**{field: text}), PRIVATE_REPO)
+                        self.assertEqual(
+                            "Public draft rejected:\n"
+                            "- An address outside the documentation or loopback ranges.",
+                            str(raised.exception),
+                        )
+
+    def test_accepts_explicit_yugabyte_version_labels(self):
+        for description in (
+                "YugabyteDB version: 2.20.9.0-b50",
+                "YugabyteDB version: `2.20.9.0-b50`.",
+                "YugabyteDB 2.25.2.0",
+                "Version 2.25.2.0.",
+                "Version: 2.25.2.0"):
+            with self.subTest(description=description):
+                result = render_draft(public_draft(description=description), PRIVATE_REPO)
+                self.assertIn(description, result["body"])
+
+    def test_version_labels_do_not_allow_unrelated_addresses(self):
+        for description in (
+                "The server address is 2.20.9.0.",
+                "YugabyteDB version: 10.2.3.4.",
+                "YugabyteDB version: 2.20.9.0:5433",
+                "YugabyteDB version: 2.20.9.0/24",
+                "YugabyteDB version: 2.20.9.0-b50. The server address is 10.2.3.4.",
+                "Version 2.25.2.0; the server address is fd00::23."):
+            with self.subTest(description=description):
+                with self.assertRaises(IssueError) as raised:
+                    render_draft(public_draft(description=description), PRIVATE_REPO)
+                self.assertEqual(
+                    "Public draft rejected:\n"
+                    "- An address outside the documentation or loopback ranges.",
+                    str(raised.exception),
+                )
+
+    def test_version_labels_do_not_hide_source_specific_terms(self):
+        with self.assertRaises(IssueError) as raised:
+            render_draft(public_draft(
+                description="YugabyteDB version: 2.20.9.0-b50",
+                sensitive_terms=["2.20.9.0-b50"],
+            ), PRIVATE_REPO)
+        self.assertEqual(
+            "Public draft rejected:\n- Source-specific sensitive term #1 remains in the draft.",
+            str(raised.exception),
+        )
+
     def test_accepts_documentation_addresses_versions_and_public_sources(self):
         description = "\n".join((
             "Version 2025.2.8.1, C++ std::string, email user@example.com.",
@@ -140,6 +193,16 @@ class PublicDraftTest(unittest.TestCase):
         draft["connector_configuration"] = "Endpoint: https://customer.internal/config"
         with self.assertRaises(IssueError):
             render_draft(draft, PRIVATE_REPO)
+
+    def test_cdc_accepts_explicit_yugabyte_release_versions(self):
+        for version in ("2.20.9.0-b50", "2.25.2.0"):
+            with self.subTest(version=version):
+                result = render_draft(public_draft(
+                    template="cdc", connector_version="v1.9.5.y.15",
+                    connector_configuration="Synthetic local connector.",
+                    yugabyte_version=version,
+                ), PRIVATE_REPO)
+                self.assertIn("### YugabyteDB version\n\n" + version, result["body"])
 
     def test_issue_references_are_fully_qualified_and_repository_scoped(self):
         self.assertEqual(("Shopify/yugabyte-db", 42), issue_ref(

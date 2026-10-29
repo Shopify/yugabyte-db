@@ -49,8 +49,12 @@ EXAMPLE_NETWORKS = tuple(ipaddress.ip_network(value) for value in (
 URL_PATTERN = re.compile(r'''\b[a-z][a-z0-9+.-]*://[^\s<>\[\]{}"']+''', re.I)
 EMAIL_PATTERN = re.compile(r"\b[\w.+-]+@(?:[\w-]+\.)+[a-z]{2,}\b", re.I)
 IP_PATTERN = re.compile(
-    r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])|"
+    r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)|"
     r"(?<![\w:])(?:[0-9a-f]{0,4}:){2,}[0-9a-f:.]*(?![\w:])", re.I)
+# Legacy 2.x release numbers overlap IPv4 syntax; require an explicit version context.
+YUGABYTE_VERSION_PATTERN = re.compile(
+    r"\b(?:YugabyteDB(?:\s+version)?|version)(?:\s*[:=]\s*|\s+)`?"
+    r"v?2(?:\.\d+){3}(?:-b\d+)?(?![\w:/]|\.\d)", re.I)
 UUID_PATTERN = re.compile(r"\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b", re.I)
 SECRET_PATTERN = re.compile(
     r"-----BEGIN (?:[A-Z ]*PRIVATE KEY|CERTIFICATE)-----|"
@@ -118,7 +122,7 @@ def normalized(text: str) -> str:
 
 def example_address(value: str) -> bool:
     try:
-        address = ipaddress.ip_address(value)
+        address = ipaddress.ip_address(value.rstrip("."))
     except ValueError:
         return True  # A version number or C++ qualifier, rather than an address.
     return address.is_loopback or any(
@@ -159,7 +163,8 @@ def check_disclosures(content: str, sensitive_terms: list[str], private_repo: st
                  r"\s*[=:]\s*[\"']?[^\s\"'<>]{6,}",
                  content, re.I):
         findings.append("Credential assignment; use a placeholder without a credential value.")
-    if any(not example_address(match[0]) for match in IP_PATTERN.finditer(content)):
+    address_text = YUGABYTE_VERSION_PATTERN.sub(" ", content)
+    if any(not example_address(match[0]) for match in IP_PATTERN.finditer(address_text)):
         findings.append("An address outside the documentation or loopback ranges.")
     if any(match[0].split("@", 1)[1].casefold() not in {"example.com", "example.org", "example.net"}
            for match in EMAIL_PATTERN.finditer(content)):
