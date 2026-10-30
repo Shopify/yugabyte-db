@@ -180,8 +180,8 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // thread in WaitForWrites(), it calls callback once with the status Update() would have
   // returned, after the durability wait and the post-durability steps (StartElection,
   // POST_UPDATE). The callback runs on the calling thread when nothing needs to be waited for
-  // or the wait target is already durable, otherwise on raft_notifications_pool. request and
-  // response must stay valid until callback has been called.
+  // or the wait target is already durable, otherwise on raft_notifications_pool. response must
+  // stay valid until callback has been called; request is kept alive for as long as it is needed.
   void UpdateAsync(
       std::shared_ptr<LWConsensusRequestPB> request, LWConsensusResponsePB* response,
       CoarseTimePoint deadline, UpdateCallback callback);

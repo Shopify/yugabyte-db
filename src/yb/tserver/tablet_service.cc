@@ -3076,8 +3076,8 @@ CoarseTimePoint MultiRaftUpdateDeadline(CoarseTimePoint client_deadline) {
 
 // Response state shared by the sub-requests of one MultiRaftUpdateConsensus RPC that is handled
 // concurrently. The RPC is answered exactly once: by the completion that fills the last slot, or
-// at the deadline with the unfilled slots set to TimedOut. RespondSuccess() lets the RPC layer
-// destroy the request and the response, so slots are written only under mutex_ and only while
+// at the deadline with the unfilled slots set to TimedOut. Responding lets the RPC layer destroy
+// the request and the response, so slots are written only under mutex_ and only while
 // responded_ is false; a sub-request that completes after the response is dropped. resp_ is
 // cleared when the response goes out, so that a write after it fails loudly.
 class MultiRaftUpdateState : public std::enable_shared_from_this<MultiRaftUpdateState> {
@@ -3136,7 +3136,7 @@ class MultiRaftUpdateState : public std::enable_shared_from_this<MultiRaftUpdate
     if (deadline_task_id != rpc::kInvalidTaskId) {
       scheduler->Abort(deadline_task_id);
     }
-    context_.RespondSuccess();
+    Respond();
   }
 
  private:
@@ -3166,7 +3166,15 @@ class MultiRaftUpdateState : public std::enable_shared_from_this<MultiRaftUpdate
         << "MultiRaftUpdateConsensus from " << context_.requestor_string() << " answered at its "
         << "deadline with " << unfilled << " of " << resp_size_
         << " requests not completed";
-    context_.RespondSuccess();
+    Respond();
+  }
+
+  // Called once, by whoever set responded_. A sub-request can keep this state alive after the
+  // response, for example while its pool task is blocked in a step that ignores the deadline, so
+  // the inbound call, with its request and response, is released here rather than with the state.
+  void Respond() {
+    auto context = std::move(context_);
+    context.RespondSuccess();
   }
 
   const size_t resp_size_;
@@ -3206,7 +3214,7 @@ class MultiRaftUpdateTask : public rpc::ThreadPoolTask {
     auto response = rpc::MakeSharedMessage<consensus::LWConsensusResponsePB>();
     consensus_->UpdateAsync(
         request_, response.get(), deadline_,
-        [state = state_, index = index_, tablet_peer = tablet_peer_, request = request_,
+        [state = state_, index = index_, tablet_peer = tablet_peer_,
          response](const Status& status) {
           if (status.ok()) {
             FillUpdateConsensusResponse(*tablet_peer, response.get());

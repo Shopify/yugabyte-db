@@ -53,6 +53,7 @@
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/cgroups.h"
 #include "yb/util/countdown_latch.h"
+#include "yb/util/mem_tracker.h"
 #include "yb/util/metrics.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/sync_point.h"
@@ -468,6 +469,32 @@ TEST_F(MultiRaftUpdateConsensusTest, DeadlinePartialResponse) {
   auto resp = ASSERT_RESULT(Send({Heartbeat(tablets_[0]), Heartbeat(paused)}));
   ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(0), tablets_[0].last));
   ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(1), paused.last));
+}
+
+// Once the RPC is answered, a sub-request that is still running no longer keeps the inbound call
+// alive. The paused sub-request ignores the deadline, so it outlives the response.
+TEST_F(MultiRaftUpdateConsensusTest, AnsweredEnvelopeReleasedWhileSubRequestPending) {
+  ASSERT_NO_FATALS(StartServer(1));
+  auto& paused = tablets_[0];
+  auto calls = mini_server_->server()->mem_tracker()->FindChild("Call");
+  ASSERT_NE(calls, nullptr);
+  auto inbound_calls = calls->FindChild("Inbound RPC");
+  ASSERT_NE(inbound_calls, nullptr);
+  Consensus(paused)->TEST_PauseUpdateConsensus(true);
+  auto unpause = ScopeExit([this, &paused] {
+    Consensus(paused)->TEST_PauseUpdateConsensus(false);
+  });
+  auto envelope = SendAsync({Data(&paused, 1, true)}, 1s);
+  ASSERT_OK(Wait(envelope.get()));
+  ASSERT_NO_FATALS(AssertSlotError(envelope->resp.consensus_response(0), AppStatusPB::TIMED_OUT));
+  ASSERT_OK(WaitFor(
+      [&inbound_calls] { return inbound_calls->consumption() == 0; }, 3s,
+      "Inbound call released"));
+  // The sub-request was still paused the whole time.
+  ASSERT_NE(LastReceived(paused), paused.last);
+
+  Consensus(paused)->TEST_PauseUpdateConsensus(false);
+  ASSERT_OK(WaitForLastReceived(paused));
 }
 
 // The log waits of sub-requests for different tablets overlap, and do not hold a thread: a single
