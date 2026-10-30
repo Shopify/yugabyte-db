@@ -57,7 +57,8 @@ std::unique_ptr<MultiRaftBatchSender> CreateMultiRaftBatchSender(
     rpc::ProxyCache* proxy_cache, const HostPort& hostport);
 
 // - MultiRaftBatcher batches ConsensusRequestPBs from the local peers of different tablets that
-//   replicate to the same remote tserver, and sends each batch as one MultiRaftUpdateConsensus RPC.
+//   replicate to the same remote server (a tserver, or a master for sys catalog peers), and sends
+//   each batch as one MultiRaftUpdateConsensus RPC.
 // - Heartbeats (RequestKind::kHeartbeat) are sent every FLAGS_multi_raft_heartbeat_interval_ms
 //   ms, or once the batch reaches FLAGS_multi_raft_batch_size requests.
 // - Data requests (RequestKind::kData) are sent immediately when no batch carrying data to this
@@ -190,7 +191,7 @@ class MultiRaftBatcher : public std::enable_shared_from_this<MultiRaftBatcher> {
 };
 
 // MultiRaftManager is responsible for managing all MultiRaftBatchers
-// for a given tserver (utilizes a mapping between a hostport and the corresponding batcher).
+// of a given server (utilizes a mapping between a hostport and the corresponding batcher).
 // MultiRaftManager allows multiple peers to share the same batcher
 // if they are connected to the same remote host.
 class MultiRaftManager: public std::enable_shared_from_this<MultiRaftManager> {

@@ -41,7 +41,9 @@ DEFINE_UNKNOWN_bool(enable_multi_raft_heartbeat_batcher, false,
             "If true, enables multi-Raft batching of raft heartbeats.");
 
 DEFINE_UNKNOWN_uint64(multi_raft_heartbeat_interval_ms, 50,
-              "The heartbeat interval for batch Raft replication.");
+              "The heartbeat interval for batch Raft replication: how often each multi-Raft "
+              "batcher sends its pending batch. Also the backstop for batched data requests. "
+              "Read when the batcher is created.");
 TAG_FLAG(multi_raft_heartbeat_interval_ms, advanced);
 
 DEFINE_UNKNOWN_uint64(multi_raft_batch_size, 0,
@@ -153,7 +155,8 @@ using rpc::PeriodicTimer;
 
 namespace {
 
-// Tracks a single peers ConsensusResponsePB as well as its ProcessResponse callback.
+// One request of a batch: where to put its response, and the callback that completes it
+// (Peer::ProcessHeartbeatResponse or Peer::ProcessBatchedResponse, by kind).
 struct ResponseCallbackData {
   ConsensusResponsePB* resp;
   MultiRaftBatcher::BatchResponseCallback callback;
