@@ -366,6 +366,8 @@ class Log : public RefCountedThreadSafe<Log> {
   // True if WaitForSafeOpIdToApply(op_id) would return without waiting.
   bool IsSafeOpIdToApply(const OpId& op_id) const;
 
+  size_t TEST_num_safe_op_id_waiters() const;
+
   // Return a readable segment with the given sequence number, or NotFound error if it
   // cannot be found (e.g. if it has already been GCed).
   Result<scoped_refptr<ReadableLogSegment>> GetSegmentBySequenceNumber(int64_t seq) const;

@@ -37,9 +37,11 @@
 
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/rpc_controller.h"
+#include "yb/rpc/service_pool.h"
 #include "yb/rpc/thread_pool.h"
 
 #include "yb/server/clock.h"
+#include "yb/server/rpc_server.h"
 
 #include "yb/tablet/operations.pb.h"
 #include "yb/tablet/tablet_peer.h"
@@ -60,6 +62,7 @@
 #include "yb/util/test_macros.h"
 #include "yb/util/test_thread_holder.h"
 #include "yb/util/thread.h"
+#include "yb/util/tsan_util.h"
 
 using namespace std::literals;
 
@@ -495,6 +498,64 @@ TEST_F(MultiRaftUpdateConsensusTest, AnsweredEnvelopeReleasedWhileSubRequestPend
 
   Consensus(paused)->TEST_PauseUpdateConsensus(false);
   ASSERT_OK(WaitForLastReceived(paused));
+}
+
+// A sub-request's wait for its log ends at the envelope deadline even though the log is still
+// slow, so the wait does not outlive the response.
+TEST_F(MultiRaftUpdateConsensusTest, DurabilityWaitEndsAtDeadline) {
+  ASSERT_NO_FATALS(StartServer(1));
+  auto& tablet = tablets_[0];
+  auto* log = tablet.peer->log();
+  SetSlowDisk(tablet, 10s);
+  auto envelope = SendAsync({Data(&tablet, 1, false)}, 3s);
+  ASSERT_OK(WaitFor(
+      [log] { return log->TEST_num_safe_op_id_waiters() == 1; }, 2s, "Waiting for the log"));
+  ASSERT_OK(Wait(envelope.get()));
+  ASSERT_NO_FATALS(AssertSlotError(envelope->resp.consensus_response(0), AppStatusPB::TIMED_OUT));
+  ASSERT_OK(WaitFor(
+      [log] { return log->TEST_num_safe_op_id_waiters() == 0; }, 2s, "Wait ended"));
+  ASSERT_FALSE(log->IsSafeOpIdToApply(tablet.last));
+  SetSlowDisk(tablet, 0s);
+  ASSERT_OK(WaitFor(
+      [log, &tablet] { return log->IsSafeOpIdToApply(tablet.last); }, 30s, "Log catches up"));
+}
+
+// A sub-request whose task the pool drops at shutdown, before it ran, completes its slot with the
+// pool's error rather than leaving it to the deadline.
+TEST_F(MultiRaftUpdateConsensusTest, PoolShutdownCompletesQueuedSubRequest) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_update_max_threads) = 1;
+  ASSERT_NO_FATALS(StartServer(2));
+  auto& paused = tablets_[0];
+  const auto queued = tablets_[1];
+  auto service = std::dynamic_pointer_cast<ConsensusServiceImpl>(
+      mini_server_->server()->rpc_server()->TEST_service_pool("yb.consensus.ConsensusService")
+          ->TEST_get_service());
+  ASSERT_NE(service, nullptr);
+  std::atomic<int> started{0};
+  auto* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("MultiRaftUpdateTask::BeforeUpdate", [&started](void*) { ++started; });
+  sync_point->EnableProcessing();
+  Consensus(paused)->TEST_PauseUpdateConsensus(true);
+  auto unpause = ScopeExit([this, &paused] {
+    Consensus(paused)->TEST_PauseUpdateConsensus(false);
+  });
+
+  // The pool's only thread is held by the paused sub-request, so the other one stays queued.
+  auto envelope = SendAsync({Data(&paused, 1, true), Data(&tablets_[1], 1, true)}, 30s);
+  ASSERT_OK(WaitFor([&started] { return started.load() == 1; }, 10s, "Paused sub-request runs"));
+  TestThreadHolder thread_holder;
+  // Shutdown drops the queued task at once, then waits for the running one.
+  thread_holder.AddThreadFunctor([service] { service->Shutdown(); });
+  SleepFor(500ms * kTimeMultiplier);
+  Consensus(paused)->TEST_PauseUpdateConsensus(false);
+  ASSERT_OK(Wait(envelope.get()));
+  thread_holder.JoinAll();
+  ASSERT_LT(envelope->elapsed(), 10s);
+  ASSERT_NO_FATALS(AssertSlotOk(envelope->resp.consensus_response(0), paused.last));
+  ASSERT_NO_FATALS(AssertSlotError(envelope->resp.consensus_response(1), AppStatusPB::ABORTED));
+  // The queued sub-request never ran.
+  ASSERT_EQ(started.load(), 1);
+  ASSERT_EQ(LastReceived(tablets_[1]), queued.last);
 }
 
 // The log waits of sub-requests for different tablets overlap, and do not hold a thread: a single

@@ -1787,6 +1787,11 @@ void Log::RemoveSafeOpIdWaiter(uint64_t id) {
   }
 }
 
+size_t Log::TEST_num_safe_op_id_waiters() const {
+  std::lock_guard lock(last_synced_entry_op_id_mutex_);
+  return safe_op_id_waiters_.size();
+}
+
 void Log::CollectReadySafeOpIdWaitersUnlocked(std::vector<SafeOpIdWaiter>* ready) {
   if (safe_op_id_waiters_.empty()) {
     return;
