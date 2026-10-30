@@ -280,8 +280,8 @@ class Peer : public std::enable_shared_from_this<Peer> {
   uint64_t batched_round_ GUARDED_BY(batched_round_lock_) = 0;
   bool batched_round_outstanding_ GUARDED_BY(batched_round_lock_) = false;
   MultiRaftBatcher::BatchHandle batched_handle_ GUARDED_BY(batched_round_lock_);
-  // Send time of the outstanding batched data request. Separate from last_rpc_start_time_, which
-  // a heartbeat response resets even while a data request is outstanding.
+  // Send time of the outstanding batched data request. Read with batched_handle_ under
+  // batched_round_lock_, so the detector never pairs one round's handle with another's send time.
   CoarseTimePoint batched_send_time_ GUARDED_BY(batched_round_lock_) = CoarseTimePoint::min();
 
   // Each time a heartbeat request is sent this value is incremented.

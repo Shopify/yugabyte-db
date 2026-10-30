@@ -1360,6 +1360,55 @@ TEST_F(ConsensusPeersTest, YB_NEVER_DEBUG_TEST(HeartbeatResponseDoesNotHideStuck
   ASSERT_EQ(peer.failed_attempts(), 1);
 }
 
+// The same for a direct data request: a batched heartbeat's response that arrives while it is
+// outstanding does not hide it from the detector. The detector logs at DFATAL, which is fatal in
+// debug builds.
+TEST_F(ConsensusPeersTest, YB_NEVER_DEBUG_TEST(HeartbeatResponseDoesNotHideStuckDirectCall)) {
+  ASSERT_NO_FATALS(SetUpBatcher(/* heartbeat_batching= */ true, /* data_batching= */ false));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_batch_size) = 1;
+  // Otherwise the peer sends no ops while a heartbeat is unacknowledged.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_consensus_exponential_backoff) = false;
+  // The direct request's timeout, which TestFollowerProxy sets on the peer's controller.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_consensus_rpc_timeout_ms) = 50;
+  auto test_peer = NewTestPeer(kFollowerUuid);
+  auto& peer = *test_peer.peer;
+  // The first request is a heartbeat. The second one stays outstanding.
+  ASSERT_OK(peer.SignalRequest(RequestTriggerMode::kAlwaysSend));
+  ASSERT_NO_FATALS(WaitForEnvelopes(1));
+  ASSERT_NO_FATALS(CompleteEnvelope(0));
+  ASSERT_OK(peer.SignalRequest(RequestTriggerMode::kAlwaysSend));
+  ASSERT_NO_FATALS(WaitForEnvelopes(2));
+  ASSERT_TRUE(GetEnvelope(1)->req.consensus_request(0).ops().empty());
+
+  test_peer.proxy->Hold();
+  AppendReplicateMessagesToQueue(message_queue_.get(), clock_, 1, 2);
+  ASSERT_OK(peer.SignalRequest(RequestTriggerMode::kNonEmptyOnly));
+  ASSERT_OK(WaitFor([&test_peer] {
+    return test_peer.proxy->HasHeldRequest();
+  }, 10s, "Direct request held"));
+  ASSERT_EQ(OpIndexes(test_peer.proxy->Request(0)), Range(1, 2));
+
+  // Heartbeat sub-callbacks run on this thread, so the heartbeat's response has been processed
+  // when this returns, while the direct request is still outstanding.
+  ASSERT_NO_FATALS(CompleteEnvelope(1));
+  ASSERT_TRUE(test_peer.proxy->HasHeldRequest());
+  ASSERT_TRUE(peer.TEST_performing_update());
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_consensus_stuck_peer_call_threshold_ms) = 1;
+  StringWaiterLogSink log_waiter("Found an RPC call in stuck state");
+  ASSERT_OK(WaitFor([&peer, &log_waiter] {
+    EXPECT_OK(peer.SignalRequest(RequestTriggerMode::kNonEmptyOnly));
+    return log_waiter.IsEventOccurred();
+  }, 10s, "Stuck call logged"));
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_consensus_stuck_peer_call_threshold_ms) = kNeverMs;
+  test_peer.proxy->Release();
+  ASSERT_OK(WaitFor([&test_peer] {
+    return test_peer.follower->received() == Range(1, 2) &&
+           !test_peer.peer->TEST_performing_update();
+  }, 10s, "Direct request completed"));
+}
+
 // Batched requests do not ask for traces, which only the direct UpdateConsensus handler returns.
 TEST_F(ConsensusPeersTest, BatchedRequestNotTraced) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_collect_update_consensus_traces) = true;
