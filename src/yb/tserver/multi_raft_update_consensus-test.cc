@@ -70,6 +70,7 @@ DECLARE_bool(allow_encryption_at_rest);
 DECLARE_bool(disable_auto_flags_management);
 DECLARE_bool(enable_leader_failure_detection);
 DECLARE_bool(enable_multi_raft_data_batching);
+DECLARE_bool(enforce_xcluster_guarded_lease);
 DECLARE_int32(multi_raft_update_max_threads);
 DECLARE_int32(raft_heartbeat_interval_ms);
 DECLARE_bool(use_preelection);
@@ -151,6 +152,7 @@ class MultiRaftUpdateConsensusTest : public TabletServerTestBase {
     // There is no master, as in TabletServerTestBase::StartTabletServer.
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_disable_auto_flags_management) = true;
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_allow_encryption_at_rest) = false;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enforce_xcluster_guarded_lease) = false;
     mini_server_ = ASSERT_RESULT(CreateMiniTabletServer());
     auto master_addresses = std::make_shared<server::MasterAddresses>();
     master_addresses->push_back({HostPort("255.255.255.255", 1)});
