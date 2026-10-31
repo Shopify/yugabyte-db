@@ -76,7 +76,9 @@
 #include "yb/qlexpr/index.h"
 #include "yb/qlexpr/ql_rowblock.h"
 
+#include "yb/rpc/messenger.h"
 #include "yb/rpc/rpc_context.h"
+#include "yb/rpc/scheduler.h"
 #include "yb/rpc/sidecars.h"
 #include "yb/rpc/thread_pool.h"
 
@@ -236,6 +238,7 @@ DEFINE_test_flag(int32, dump_tablet_data_hash_scheme_version, -1,
     "version.");
 
 DECLARE_bool(disable_alter_vs_write_mutual_exclusion);
+DECLARE_bool(enable_multi_raft_data_batching);
 DECLARE_uint64(max_clock_skew_usec);
 DECLARE_uint64(transaction_min_running_check_interval_ms);
 DECLARE_int64(transaction_rpc_timeout_ms);
@@ -364,6 +367,31 @@ TAG_FLAG(ysql_debug_log_write_requests, unsafe);
 
 DEFINE_test_flag(bool, cdc_fail_before_setting_barrier, false,
   "Fail CreateTablet before setting CDC retention barriers");
+
+DEFINE_NON_RUNTIME_int32(multi_raft_update_max_threads, 256,
+    "Maximum number of threads that process the Raft requests carried by "
+    "MultiRaftUpdateConsensus RPCs when enable_multi_raft_data_batching is set. A thread is held "
+    "while a request is applied and appended to the log, including any wait for the tablet's "
+    "update lock or a write stall, but not while the log append becomes durable. Threads are "
+    "created on demand.");
+TAG_FLAG(multi_raft_update_max_threads, advanced);
+
+METRIC_DEFINE_counter(server, multi_raft_update_sub_requests_concurrent,
+    "Multi-Raft Sub-Requests Processed Concurrently", yb::MetricUnit::kRequests,
+    "Raft requests received inside MultiRaftUpdateConsensus RPCs and processed concurrently, "
+    "because enable_multi_raft_data_batching was set when the RPC arrived.");
+METRIC_DEFINE_counter(server, multi_raft_update_deadline_responses,
+    "Multi-Raft Deadline Responses", yb::MetricUnit::kRequests,
+    "MultiRaftUpdateConsensus RPCs answered at their deadline, with the Raft requests that had "
+    "not completed set to TimedOut.");
+METRIC_DEFINE_event_stats(server, multi_raft_update_pool_queue_time_us,
+    "Multi-Raft Update Queue Time", yb::MetricUnit::kMicroseconds,
+    "Time a Raft request received inside a MultiRaftUpdateConsensus RPC waited for a thread of "
+    "the multi_raft_update_max_threads pool.");
+METRIC_DEFINE_event_stats(server, multi_raft_update_pool_run_time_us,
+    "Multi-Raft Update Run Time", yb::MetricUnit::kMicroseconds,
+    "Time a thread of the multi_raft_update_max_threads pool spent on one Raft request received "
+    "inside a MultiRaftUpdateConsensus RPC, up to its log append.");
 
 double TEST_delay_create_transaction_probability = 0;
 
@@ -2905,29 +2933,252 @@ void TabletServiceImpl::Read(const ReadRequestMsg* req,
   PerformRead(server_, this, req, resp, std::move(context));
 }
 
+namespace {
+
+void FillUpdateConsensusResponse(
+    tablet::TabletPeer& tablet_peer, consensus::LWConsensusResponsePB* resp) {
+  auto tablet = tablet_peer.shared_tablet_maybe_null();
+  if (tablet) {
+    resp->set_num_sst_files(tablet->GetCurrentVersionNumSSTFiles());
+  }
+  resp->set_propagated_hybrid_time(tablet_peer.clock().Now().ToUint64());
+}
+
+// The leader times an envelope from its send, this server from receipt, so a response sent at
+// the client deadline would reach the leader after it has given up on the envelope and failed
+// every sub-request. Answering at 90% of the remaining time keeps the results of the
+// sub-requests that did finish.
+CoarseTimePoint MultiRaftUpdateDeadline(CoarseTimePoint client_deadline) {
+  if (client_deadline == CoarseTimePoint::max()) {
+    return client_deadline;
+  }
+  auto now = CoarseMonoClock::now();
+  if (client_deadline <= now) {
+    return client_deadline;
+  }
+  return now + (client_deadline - now) * 9 / 10;
+}
+
+// Response state shared by the sub-requests of one MultiRaftUpdateConsensus RPC that is handled
+// concurrently. The RPC is answered exactly once: by the completion that fills the last slot, or
+// at the deadline with the unfilled slots set to TimedOut. Responding lets the RPC layer destroy
+// the request and the response, so slots are written only under mutex_ and only while
+// responded_ is false; a sub-request that completes after the response is dropped. resp_ is
+// cleared when the response goes out, so that a write after it fails loudly.
+class MultiRaftUpdateState : public std::enable_shared_from_this<MultiRaftUpdateState> {
+ public:
+  MultiRaftUpdateState(
+      consensus::MultiRaftConsensusResponsePB* resp, RpcContext context,
+      CounterPtr deadline_responses)
+      : resp_size_(resp->consensus_response_size()), context_(std::move(context)),
+        deadline_responses_(std::move(deadline_responses)), resp_(resp),
+        filled_(resp_size_), remaining_(resp_size_) {}
+
+  void ArmDeadline(rpc::Scheduler* scheduler, CoarseTimePoint deadline) {
+    std::lock_guard lock(mutex_);
+    if (responded_) {
+      return;
+    }
+    scheduler_ = scheduler;
+    deadline_task_id_ = scheduler->Schedule(
+        [self = shared_from_this()](const Status&) {
+          // Also reached when the task is aborted after the response, or when the scheduler
+          // shuts down; responded_ tells the cases apart.
+          self->DeadlineExpired();
+        },
+        deadline - CoarseMonoClock::now());
+  }
+
+  // Fills slot index with status if it is not OK, otherwise with response.
+  void Complete(size_t index, const Status& status, consensus::LWConsensusResponsePB* response) {
+    rpc::ScheduledTaskId deadline_task_id;
+    rpc::Scheduler* scheduler;
+    {
+      std::lock_guard lock(mutex_);
+      if (responded_) {
+        VLOG(1) << "Dropping the result of request " << index
+                << " of a MultiRaftUpdateConsensus RPC answered at its deadline: " << status;
+        return;
+      }
+      DCHECK(!filled_[index]);
+      auto* slot = resp_->mutable_consensus_response(narrow_cast<int>(index));
+      if (status.ok()) {
+        response->ToGoogleProtobuf(slot);
+      } else {
+        // A partially filled response could confuse the leader, as in UpdateConsensus.
+        slot->Clear();
+        SetupError(slot->mutable_error(), status);
+      }
+      filled_[index] = true;
+      if (--remaining_ != 0) {
+        return;
+      }
+      responded_ = true;
+      resp_ = nullptr;
+      deadline_task_id = std::exchange(deadline_task_id_, rpc::kInvalidTaskId);
+      scheduler = scheduler_;
+    }
+    if (deadline_task_id != rpc::kInvalidTaskId) {
+      scheduler->Abort(deadline_task_id);
+    }
+    Respond();
+  }
+
+ private:
+  void DeadlineExpired() {
+    size_t unfilled = 0;
+    {
+      std::lock_guard lock(mutex_);
+      if (responded_) {
+        return;
+      }
+      for (size_t i = 0; i != filled_.size(); ++i) {
+        if (filled_[i]) {
+          continue;
+        }
+        auto* slot = resp_->mutable_consensus_response(narrow_cast<int>(i));
+        slot->Clear();
+        SetupError(slot->mutable_error(), STATUS(
+            TimedOut, "MultiRaftUpdateConsensus deadline expired before this request completed"));
+        ++unfilled;
+      }
+      responded_ = true;
+      resp_ = nullptr;
+      deadline_task_id_ = rpc::kInvalidTaskId;
+    }
+    IncrementCounter(deadline_responses_);
+    YB_LOG_EVERY_N_SECS(WARNING, 10)
+        << "MultiRaftUpdateConsensus from " << context_.requestor_string() << " answered at its "
+        << "deadline with " << unfilled << " of " << resp_size_
+        << " requests not completed";
+    Respond();
+  }
+
+  // Called once, by whoever set responded_. A sub-request can keep this state alive after the
+  // response, for example while its pool task is blocked in a step that ignores the deadline, so
+  // the inbound call, with its request and response, is released here rather than with the state.
+  void Respond() {
+    auto context = std::move(context_);
+    context.RespondSuccess();
+  }
+
+  const size_t resp_size_;
+  RpcContext context_;
+  const CounterPtr deadline_responses_;
+
+  std::mutex mutex_;
+  consensus::MultiRaftConsensusResponsePB* resp_ GUARDED_BY(mutex_);
+  std::vector<bool> filled_ GUARDED_BY(mutex_);
+  size_t remaining_ GUARDED_BY(mutex_);
+  bool responded_ GUARDED_BY(mutex_) = false;
+  rpc::Scheduler* scheduler_ GUARDED_BY(mutex_) = nullptr;
+  rpc::ScheduledTaskId deadline_task_id_ GUARDED_BY(mutex_) = rpc::kInvalidTaskId;
+};
+
+// One sub-request of a concurrently handled MultiRaftUpdateConsensus RPC, run on the multi-Raft
+// update pool. It owns copies of everything it uses, because the RPC's request and response may
+// be gone by the time it runs.
+class MultiRaftUpdateTask : public rpc::ThreadPoolTask {
+ public:
+  MultiRaftUpdateTask(
+      std::shared_ptr<MultiRaftUpdateState> state, size_t index, tablet::TabletPeerPtr tablet_peer,
+      std::shared_ptr<consensus::RaftConsensus> consensus,
+      std::shared_ptr<consensus::LWConsensusRequestPB> request, CoarseTimePoint deadline)
+      : state_(std::move(state)), index_(index), tablet_peer_(std::move(tablet_peer)),
+        consensus_(std::move(consensus)), request_(std::move(request)), deadline_(deadline) {}
+
+  void Run() override {
+    ran_ = true;
+    // Queued behind blocked tasks until the response has gone out: running the update now would
+    // only be wasted work.
+    if (CoarseMonoClock::now() >= deadline_) {
+      state_->Complete(index_, STATUS(TimedOut, "Deadline expired before processing"), nullptr);
+      return;
+    }
+    TEST_SYNC_POINT_CALLBACK("MultiRaftUpdateTask::BeforeUpdate", request_.get());
+    auto response = rpc::MakeSharedMessage<consensus::LWConsensusResponsePB>();
+    consensus_->UpdateAsync(
+        request_, response.get(), deadline_,
+        [state = state_, index = index_, tablet_peer = tablet_peer_,
+         response](const Status& status) {
+          if (status.ok()) {
+            FillUpdateConsensusResponse(*tablet_peer, response.get());
+          }
+          state->Complete(index, status, response.get());
+        });
+    TEST_SYNC_POINT_CALLBACK("MultiRaftUpdateTask::AfterUpdate", request_.get());
+  }
+
+  void Done(const Status& status) override {
+    if (!ran_) {
+      // The pool did not accept or dropped the task.
+      state_->Complete(index_, status, nullptr);
+    }
+    delete this;
+  }
+
+ private:
+  const std::shared_ptr<MultiRaftUpdateState> state_;
+  const size_t index_;
+  const tablet::TabletPeerPtr tablet_peer_;
+  const std::shared_ptr<consensus::RaftConsensus> consensus_;
+  const std::shared_ptr<consensus::LWConsensusRequestPB> request_;
+  const CoarseTimePoint deadline_;
+  bool ran_ = false;
+};
+
+} // namespace
+
 ConsensusServiceImpl::ConsensusServiceImpl(const scoped_refptr<MetricEntity>& metric_entity,
-                                           TabletPeerLookupIf* tablet_manager)
+                                           TabletPeerLookupIf* tablet_manager,
+                                           rpc::Messenger* messenger)
     : ConsensusServiceIf(metric_entity),
-      tablet_manager_(tablet_manager) {
+      tablet_manager_(tablet_manager),
+      messenger_(messenger),
+      // Same cgroup as the high-priority RPC pool, which runs UpdateConsensus and the serial
+      // envelope loop: moving follower Raft work here must not lower its QoS class.
+      multi_raft_update_pool_(std::make_unique<rpc::ThreadPool>(rpc::ThreadPoolOptions {
+        .name = "multi_raft_update",
+        .max_workers = static_cast<size_t>(std::max(FLAGS_multi_raft_update_max_threads, 1)),
+        .cgroup = messenger->system_high_cgroup(),
+        .metrics = {
+          .queue_length_stats = nullptr,
+          .queue_time_us_stats =
+              METRIC_multi_raft_update_pool_queue_time_us.Instantiate(metric_entity),
+          .run_time_us_stats =
+              METRIC_multi_raft_update_pool_run_time_us.Instantiate(metric_entity),
+        },
+      })),
+      multi_raft_update_sub_requests_concurrent_(
+          METRIC_multi_raft_update_sub_requests_concurrent.Instantiate(metric_entity)),
+      multi_raft_update_deadline_responses_(
+          METRIC_multi_raft_update_deadline_responses.Instantiate(metric_entity)) {
 }
 
 ConsensusServiceImpl::~ConsensusServiceImpl() {
+  multi_raft_update_pool_->Shutdown();
+}
+
+void ConsensusServiceImpl::Shutdown() {
+  multi_raft_update_pool_->Shutdown();
+  ConsensusServiceIf::Shutdown();
 }
 
 void ConsensusServiceImpl::CompleteUpdateConsensusResponse(
     std::shared_ptr<tablet::TabletPeer> tablet_peer,
     consensus::LWConsensusResponsePB* resp) {
-  auto tablet = tablet_peer->shared_tablet_maybe_null();
-  if (tablet) {
-    resp->set_num_sst_files(tablet->GetCurrentVersionNumSSTFiles());
-  }
-  resp->set_propagated_hybrid_time(tablet_peer->clock().Now().ToUint64());
+  FillUpdateConsensusResponse(*tablet_peer, resp);
 }
 
 void ConsensusServiceImpl::MultiRaftUpdateConsensus(
       const consensus::MultiRaftConsensusRequestPB *req,
       consensus::MultiRaftConsensusResponsePB *resp,
       rpc::RpcContext context) {
+    // Envelopes already in progress finish on the path they started on when the flag changes.
+    if (FLAGS_enable_multi_raft_data_batching) {
+      MultiRaftUpdateConsensusConcurrently(req, resp, std::move(context));
+      return;
+    }
     DVLOG(3) << "Received Batch Consensus Update RPC: " << req->ShortDebugString();
     // Effectively performs ConsensusServiceImpl::UpdateConsensus for
     // each ConsensusRequestPB in the batch but does not fail the entire
@@ -2979,6 +3230,71 @@ void ConsensusServiceImpl::MultiRaftUpdateConsensus(
       temp_resp->ToGoogleProtobuf(consensus_resp);
     }
     context.RespondSuccess();
+}
+
+void ConsensusServiceImpl::MultiRaftUpdateConsensusConcurrently(
+    const consensus::MultiRaftConsensusRequestPB* req,
+    consensus::MultiRaftConsensusResponsePB* resp,
+    rpc::RpcContext context) {
+  DVLOG(3) << "Received Batch Consensus Update RPC: " << req->ShortDebugString();
+  const auto num_requests = req->consensus_request_size();
+  IncrementCounterBy(multi_raft_update_sub_requests_concurrent_, num_requests);
+  if (num_requests == 0) {
+    context.RespondSuccess();
+    return;
+  }
+  const auto deadline = MultiRaftUpdateDeadline(context.GetClientDeadline());
+
+  // Everything that reads req, and the pre-sizing of resp, happens before the first sub-request
+  // is dispatched: from then on the response can be sent at any time, which destroys both.
+  struct SubRequest {
+    Status status;
+    tablet::TabletPeerPtr tablet_peer;
+    std::shared_ptr<consensus::RaftConsensus> consensus;
+    std::shared_ptr<consensus::LWConsensusRequestPB> request;
+  };
+  std::vector<SubRequest> sub_requests(num_requests);
+  for (int i = 0; i != num_requests; ++i) {
+    resp->add_consensus_response();
+    auto& sub_request = sub_requests[i];
+    const auto& consensus_req = req->consensus_request(i);
+    auto uuid_match_res = CheckUuidMatch(
+        tablet_manager_, "UpdateConsensus", &consensus_req, context.requestor_string());
+    if (!uuid_match_res.ok()) {
+      sub_request.status = uuid_match_res.status();
+      continue;
+    }
+    auto peer_tablet_res = LookupTabletPeer(tablet_manager_, consensus_req.tablet_id());
+    if (!peer_tablet_res.ok()) {
+      sub_request.status = peer_tablet_res.status();
+      continue;
+    }
+    sub_request.tablet_peer = peer_tablet_res->tablet_peer;
+    auto consensus_res = GetConsensus(sub_request.tablet_peer);
+    if (!consensus_res.ok()) {
+      sub_request.status = consensus_res.status();
+      continue;
+    }
+    sub_request.consensus = std::move(*consensus_res);
+    // TODO(lw_uc) effective update for multiraft.
+    sub_request.request = rpc::CopySharedMessage(consensus_req);
+  }
+
+  auto state = std::make_shared<MultiRaftUpdateState>(
+      resp, std::move(context), multi_raft_update_deadline_responses_);
+  if (deadline != CoarseTimePoint::max()) {
+    state->ArmDeadline(&messenger_->scheduler(), deadline);
+  }
+  for (int i = 0; i != num_requests; ++i) {
+    auto& sub_request = sub_requests[i];
+    if (!sub_request.status.ok()) {
+      state->Complete(i, sub_request.status, nullptr);
+      continue;
+    }
+    multi_raft_update_pool_->Enqueue(new MultiRaftUpdateTask(
+        state, i, std::move(sub_request.tablet_peer), std::move(sub_request.consensus),
+        std::move(sub_request.request), deadline));
+  }
 }
 
 void ConsensusServiceImpl::UpdateConsensus(const consensus::LWConsensusRequestPB* req,

@@ -141,7 +141,8 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
     std::shared_ptr<MemTracker> parent_mem_tracker,
     Callback<void(std::shared_ptr<StateChangeContext> context)> mark_dirty_clbk,
     TableType table_type,
-    RetryableRequests* retryable_requests);
+    RetryableRequests* retryable_requests,
+    rpc::ThreadPool* raft_notifications_pool = nullptr);
 
   virtual ~RaftConsensus() override;
 
@@ -177,6 +178,20 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   Status Update(
       const std::shared_ptr<LWConsensusRequestPB>& request,
       LWConsensusResponsePB* response, CoarseTimePoint deadline) override;
+
+  using UpdateCallback = std::function<void(const Status&)>;
+
+  // Update() without the wait for durability on the calling thread. Runs the same steps as
+  // Update() up to and including UpdateReplica() on the calling thread, which can block exactly
+  // as Update() does (test hooks, update_mutex_, write stalls). Then, instead of parking the
+  // thread in WaitForWrites(), it calls callback once with the status Update() would have
+  // returned, after the durability wait and the post-durability steps (StartElection,
+  // POST_UPDATE). The callback runs on the calling thread when nothing needs to be waited for
+  // or the wait target is already durable, otherwise on raft_notifications_pool. response must
+  // stay valid until callback has been called; request is kept alive for as long as it is needed.
+  void UpdateAsync(
+      std::shared_ptr<LWConsensusRequestPB> request, LWConsensusResponsePB* response,
+      CoarseTimePoint deadline, UpdateCallback callback);
 
   Status RequestVote(const VoteRequestPB* request,
                      VoteResponsePB* response) override;
@@ -481,7 +496,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   struct UpdateReplicaResult {
     OpId wait_for_op_id;
 
-    // The request carried no ops, so the wait is bounded tighter. See Update().
+    // The request carried no ops, so the wait is bounded tighter. See WriteWaitDeadline().
     bool empty_request = false;
 
     // Start an election after the writes are committed?
@@ -490,10 +505,11 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
     int64_t current_term = OpId::kUnknownTerm;
   };
 
-  // Updates the state in a replica by storing the received operations in the log
-  // and triggering the required operations. This method won't return until all
-  // operations have been stored in the log and all Prepares() have been completed,
-  // and a replica cannot accept any more Update() requests until this is done.
+  // Updates the state in a replica by enqueueing the received operations for Prepare() and for
+  // the log append, and triggering the required operations. Called with update_mutex_ held. It
+  // does not wait for the append to become durable: the caller waits for the returned
+  // wait_for_op_id after releasing update_mutex_ (WaitForWrites(), or AsyncWriteWait for
+  // UpdateAsync()).
   Result<UpdateReplicaResult> UpdateReplica(
       const std::shared_ptr<LWConsensusRequestPB>& request,
       LWConsensusResponsePB* response);
@@ -727,10 +743,34 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
                                            const LeaderRequest& deduped_req,
                                            OpId last_from_leader);
 
+  // Steps of Update() and UpdateAsync() before update_mutex_ is taken: test hooks, rejections,
+  // PRE_UPDATE and the write-stop check.
+  Status StartUpdate(const LWConsensusRequestPB& request, LWConsensusResponsePB* response);
+
+  // Takes update_mutex_ (waiting until deadline) and runs UpdateReplica() under it.
+  Result<UpdateReplicaResult> LockAndUpdateReplica(
+      const std::shared_ptr<LWConsensusRequestPB>& request, LWConsensusResponsePB* response,
+      CoarseTimePoint deadline);
+
+  // Deadline of the durability wait of an Update() whose UpdateReplica() returned result.
+  static CoarseTimePoint WriteWaitDeadline(
+      const UpdateReplicaResult& result, CoarseTimePoint deadline);
+
+  // Steps of Update() and UpdateAsync() after the durability wait.
+  Status FinishUpdate(const LWConsensusRequestPB& request, const UpdateReplicaResult& result);
+
   // Wait until the operation with op id equal to wait_for_op_id is flushed in the WAL.
   // If term was changed during wait from the specified one - exit with error.
   // If the op is still not flushed when the deadline expires - exit with TimedOut.
   Status WaitForWrites(int64_t term, const OpId& wait_for_op_id, CoarseTimePoint deadline);
+
+  // One step of a durability wait that found wait_for_op_id not yet durable, where now is the
+  // time the step started. Shared by WaitForWrites() and AsyncWriteWait.
+  Status WriteNotYetDurable(
+      int64_t term, const OpId& wait_for_op_id, CoarseTimePoint deadline, CoarseTimePoint now);
+
+  // The durability wait and FinishUpdate() of UpdateAsync().
+  class AsyncWriteWait;
 
   // See comment for ReplicaState::CancelPendingOperation
   void RollbackIdAndDeleteOpId(const ReplicateMsgPtr& replicate_msg, bool should_exists);
@@ -834,6 +874,10 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   MonoTime withold_replica_updates_until_ = MonoTime::kUninitialized;
 
   std::atomic<RejectMode> reject_mode_{RejectMode::kNone};
+
+  // Runs the durability waits of UpdateAsync(). Null for instances built directly by tests, which
+  // then cannot use UpdateAsync().
+  rpc::ThreadPool* const raft_notifications_pool_;
 
   CoarseTimePoint disable_pre_elections_until_ = CoarseTimePoint::min();
 

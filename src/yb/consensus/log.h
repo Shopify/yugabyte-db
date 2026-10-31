@@ -41,6 +41,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <boost/atomic.hpp>
 
@@ -353,6 +354,23 @@ class Log : public RefCountedThreadSafe<Log> {
   //
   // On timeout returns default constructed OpId.
   OpId WaitForSafeOpIdToApply(const OpId& op_id, MonoDelta duration = MonoDelta());
+
+  // Callback-based sibling of WaitForSafeOpIdToApply, for callers that must not park a thread.
+  // Returns 0, without keeping the callback, if op_id is already safe to apply (the condition
+  // WaitForSafeOpIdToApply waits for). Otherwise keeps the callback and returns an id for
+  // RemoveSafeOpIdWaiter. The callback is called once: with OK when op_id becomes safe, or with
+  // an error if the log is closed first. It runs on the thread that advances the synced op id
+  // (the appender, inside Sync()) or that closes the log, so it must be cheap and must not block
+  // or call back into this Log. Returns an error if the log is already closed.
+  Result<uint64_t> AddSafeOpIdWaiter(const OpId& op_id, StdStatusCallback callback);
+
+  // Drops a waiter added by AddSafeOpIdWaiter without calling it. No-op if it already ran.
+  void RemoveSafeOpIdWaiter(uint64_t id);
+
+  // True if WaitForSafeOpIdToApply(op_id) would return without waiting.
+  bool IsSafeOpIdToApply(const OpId& op_id) const;
+
+  size_t TEST_num_safe_op_id_waiters() const;
 
   // Return a readable segment with the given sequence number, or NotFound error if it
   // cannot be found (e.g. if it has already been GCed).
@@ -697,6 +715,22 @@ class Log : public RefCountedThreadSafe<Log> {
 
   // Whether the last fsync failed.
   std::atomic<bool> sync_failed_{false};
+
+  struct SafeOpIdWaiter {
+    uint64_t id;
+    OpId op_id;
+    StdStatusCallback callback;
+  };
+
+  // Waiters added by AddSafeOpIdWaiter, protected by last_synced_entry_op_id_mutex_. Only
+  // in-flight follower updates register here, so the list stays short.
+  std::vector<SafeOpIdWaiter> safe_op_id_waiters_;
+  uint64_t next_safe_op_id_waiter_id_ = 1;
+  bool safe_op_id_waiters_closed_ = false;
+
+  // Must be called with last_synced_entry_op_id_mutex_ held. Moves the waiters whose op id is
+  // now safe into ready, to be called after the mutex is released.
+  void CollectReadySafeOpIdWaitersUnlocked(std::vector<SafeOpIdWaiter>* ready);
 
   // The last know OpId for a REPLICATE message appended to this log (any segment).
   // This variable is not accessed concurrently.

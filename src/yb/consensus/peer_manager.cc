@@ -79,7 +79,7 @@ void PeerManager::UpdateRaftConfig(const RaftConfigPB& config) {
     }
 
     VLOG_WITH_PREFIX(1) << "Adding remote peer. Peer: " << peer_pb.ShortDebugString();
-    MultiRaftHeartbeatBatcherPtr multi_raft_batcher = nullptr;
+    MultiRaftBatcherPtr multi_raft_batcher = nullptr;
     if (multi_raft_manager_) {
       multi_raft_batcher = multi_raft_manager_->AddOrGetBatcher(peer_pb);
     }

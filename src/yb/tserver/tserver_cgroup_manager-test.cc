@@ -25,6 +25,11 @@
 #include "yb/common/entity_ids.h"
 #include "yb/common/termination_monitor.h"
 
+#include "yb/consensus/consensus.pb.h"
+#include "yb/consensus/consensus.proxy.h"
+
+#include "yb/rpc/rpc_controller.h"
+
 #include "yb/gutil/sysinfo.h"
 
 #include "yb/util/backoff_waiter.h"
@@ -36,6 +41,7 @@
 
 using namespace std::literals;
 
+DECLARE_bool(enable_multi_raft_data_batching);
 DECLARE_bool(enable_qos);
 DECLARE_bool(qos_system_dbs_use_shared_pool);
 DECLARE_bool(qos_consensus_per_db_cgroups);
@@ -536,6 +542,38 @@ TEST_F(TServerCgroupManagerTest, TestSystemHighSingletonThreads) {
           << "Thread with prefix '" << e.prefix << "' not yet visible";
     }
   });
+}
+
+// Raft requests received in MultiRaftUpdateConsensus RPCs are processed on the multi_raft_update
+// pool; it must stay in @system-high like the high-priority RPC pool that runs UpdateConsensus.
+TEST_F(TServerCgroupManagerTest, TestMultiRaftUpdatePoolInSystemHigh) {
+  ASSERT_OK(WaitForTabletRunning(kTabletId));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_data_batching) = true;
+
+  // A request from a stale term: the replica rejects it without changing state, but it still
+  // runs as a task on the pool.
+  consensus::MultiRaftConsensusRequestPB req;
+  auto* update = req.add_consensus_request();
+  update->set_tablet_id(kTabletId);
+  update->set_dest_uuid(mini_server_->server()->permanent_uuid());
+  update->set_caller_uuid("fake-leader");
+  update->set_caller_term(0);
+  consensus::MultiRaftConsensusResponsePB resp;
+  rpc::RpcController controller;
+  controller.set_timeout(10s);
+  ASSERT_OK(consensus_proxy_->MultiRaftUpdateConsensus(req, &resp, &controller));
+  ASSERT_EQ(resp.consensus_response_size(), 1);
+  ASSERT_EQ(resp.consensus_response(0).status().error().code(),
+            consensus::ConsensusErrorPB::INVALID_TERM)
+      << resp.ShortDebugString();
+
+  // Thread comms are truncated to 15 chars: "multi_raft_update_1_worker" -> "multi_raft_upda".
+  auto threads = ASSERT_RESULT(GetPoolThreadCgroups({"multi_raft_upd"}));
+  ASSERT_FALSE(threads.empty()) << "No multi_raft_update worker thread found";
+  for (const auto& t : threads) {
+    EXPECT_EQ(t.cgroup, "/@system-high")
+        << "Thread " << t.comm << " (tid " << t.tid << ") found in " << t.cgroup;
+  }
 }
 
 // Regression test for #31710: TerminationMonitor::Create(cgroup) moves the

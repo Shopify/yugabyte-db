@@ -842,7 +842,8 @@ Status TSTabletManager::Init() {
 
   multi_raft_manager_ = std::make_unique<consensus::MultiRaftManager>(server_->messenger(),
                                                                       &server_->proxy_cache(),
-                                                                      local_peer_pb_.cloud_info());
+                                                                      local_peer_pb_.cloud_info(),
+                                                                      server_->metric_entity());
 
   if (FLAGS_enable_wait_queues && !PREDICT_FALSE(FLAGS_disable_deadlock_detection)) {
     waiting_txn_registry_ = std::make_unique<docdb::LocalWaitingTxnRegistry>(

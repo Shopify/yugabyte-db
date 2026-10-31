@@ -594,7 +594,8 @@ void SysCatalogTable::SetupTabletPeer(const scoped_refptr<tablet::RaftGroupMetad
 
   multi_raft_manager_ = std::make_unique<consensus::MultiRaftManager>(master_->messenger(),
                                                                       &master_->proxy_cache(),
-                                                                      local_peer_pb_.cloud_info());
+                                                                      local_peer_pb_.cloud_info(),
+                                                                      metric_entity_);
 
   if (!persistence_gate_) {
     // With the op's term: a catalog write admitted while this master was ready in an earlier term

@@ -49,6 +49,7 @@
 #include "yb/gutil/ref_counted.h"
 
 #include "yb/rpc/rpc_context.h"
+#include "yb/rpc/rpc_fwd.h"
 
 #include "yb/tablet/tablet_fwd.h"
 
@@ -58,6 +59,8 @@
 #include "yb/tserver/tserver_admin.pb.h"
 #include "yb/tserver/tserver_admin.service.h"
 #include "yb/tserver/tserver_service.service.h"
+
+#include "yb/util/metrics_fwd.h"
 
 namespace yb {
 class Schema;
@@ -448,14 +451,26 @@ class TabletServiceAdminImpl : public TabletServerAdminServiceIf {
 class ConsensusServiceImpl : public consensus::ConsensusServiceIf {
  public:
   ConsensusServiceImpl(const scoped_refptr<MetricEntity>& metric_entity,
-                       TabletPeerLookupIf* tablet_manager_);
+                       TabletPeerLookupIf* tablet_manager_,
+                       rpc::Messenger* messenger);
 
   virtual ~ConsensusServiceImpl();
+
+  void Shutdown() override;
+
+  const rpc::ThreadPool& TEST_multi_raft_update_pool() const {
+    return *multi_raft_update_pool_;
+  }
 
   void UpdateConsensus(const consensus::LWConsensusRequestPB *req,
                        consensus::LWConsensusResponsePB *resp,
                        rpc::RpcContext context) override;
 
+  // Handles an envelope of Raft requests for different tablets, sent by a leader's multi-Raft
+  // batcher. Every sub-request gets a response in the slot of the same index, with per-sub-request
+  // error isolation. With enable_multi_raft_data_batching set (read once per RPC), the
+  // sub-requests are processed concurrently (MultiRaftUpdateConsensusConcurrently); otherwise one
+  // after another on the handler thread.
   void MultiRaftUpdateConsensus(const consensus::MultiRaftConsensusRequestPB *req,
                                 consensus::MultiRaftConsensusResponsePB *resp,
                                 rpc::RpcContext context) override;
@@ -504,7 +519,21 @@ class ConsensusServiceImpl : public consensus::ConsensusServiceIf {
   void CompleteUpdateConsensusResponse(std::shared_ptr<tablet::TabletPeer> tablet_peer,
                                        consensus::LWConsensusResponsePB* resp);
 
+  // Each sub-request's steps up to its log append (the same steps as UpdateConsensus, which can
+  // block on the tablet's update_mutex_ or a write stall, and include applying committed
+  // operations) run as one task on multi_raft_update_pool_, so neither the handler thread nor
+  // other sub-requests wait for them. The wait for durability does not hold a thread
+  // (RaftConsensus::UpdateAsync). The RPC is answered when the last slot is filled, or at the
+  // deadline with the unfilled slots set to TimedOut.
+  void MultiRaftUpdateConsensusConcurrently(const consensus::MultiRaftConsensusRequestPB* req,
+                                            consensus::MultiRaftConsensusResponsePB* resp,
+                                            rpc::RpcContext context);
+
   TabletPeerLookupIf* tablet_manager_;
+  rpc::Messenger* const messenger_;
+  std::unique_ptr<rpc::ThreadPool> multi_raft_update_pool_;
+  scoped_refptr<Counter> multi_raft_update_sub_requests_concurrent_;
+  scoped_refptr<Counter> multi_raft_update_deadline_responses_;
 };
 
 }  // namespace tserver

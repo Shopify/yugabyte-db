@@ -1286,6 +1286,74 @@ TEST_F(LogTest, TestWaitUntilAllFlushed) {
   }
 }
 
+TEST_F(LogTest, SafeOpIdWaiter) {
+  BuildLog();
+
+  struct Waiter {
+    std::atomic<int> calls{0};
+    Status status;
+
+    StdStatusCallback Callback() {
+      return [this](const Status& s) {
+        status = s;
+        calls.fetch_add(1);
+      };
+    }
+  };
+
+  OpIdPB opid;
+  opid.set_term(1);
+  opid.set_index(1);
+  ASSERT_OK(AppendNoOp(&opid));
+
+  // Already safe: the callback is not kept.
+  Waiter safe;
+  ASSERT_EQ(ASSERT_RESULT(log_->AddSafeOpIdWaiter(OpId(1, 1), safe.Callback())), 0);
+  ASSERT_TRUE(log_->IsSafeOpIdToApply(OpId(1, 1)));
+
+  // Fires when the op is synced, not before.
+  Waiter pending;
+  ASSERT_NE(ASSERT_RESULT(log_->AddSafeOpIdWaiter(OpId(1, 3), pending.Callback())), 0);
+  ASSERT_OK(AppendNoOp(&opid));
+  ASSERT_EQ(pending.calls.load(), 0);
+  ASSERT_FALSE(log_->IsSafeOpIdToApply(OpId(1, 3)));
+  ASSERT_OK(AppendNoOp(&opid));
+  // The waiter runs inside Sync, before the append callback that AppendNoOp waits for.
+  ASSERT_EQ(pending.calls.load(), 1);
+  ASSERT_OK(pending.status);
+
+  // A removed waiter is not called.
+  Waiter removed;
+  auto removed_id = ASSERT_RESULT(log_->AddSafeOpIdWaiter(OpId(1, 4), removed.Callback()));
+  ASSERT_NE(removed_id, 0);
+  log_->RemoveSafeOpIdWaiter(removed_id);
+  ASSERT_OK(AppendNoOp(&opid));
+  ASSERT_EQ(removed.calls.load(), 0);
+
+  // ResetLastSyncedEntryOpId also fires waiters.
+  Waiter reset;
+  ASSERT_NE(ASSERT_RESULT(log_->AddSafeOpIdWaiter(OpId(1, 6), reset.Callback())), 0);
+  ASSERT_OK(log_->ResetLastSyncedEntryOpId(OpId(1, 6)));
+  ASSERT_EQ(reset.calls.load(), 1);
+  ASSERT_OK(reset.status);
+
+  // The all-safe shortcut of WaitForSafeOpIdToApply applies too.
+  log_->TEST_SetAllOpIdsSafe(true);
+  Waiter all_safe;
+  ASSERT_EQ(ASSERT_RESULT(log_->AddSafeOpIdWaiter(OpId(5, 100), all_safe.Callback())), 0);
+  log_->TEST_SetAllOpIdsSafe(false);
+
+  // Closing the log fails pending waiters, and later registrations fail.
+  Waiter closed;
+  ASSERT_NE(ASSERT_RESULT(log_->AddSafeOpIdWaiter(OpId(1, 10), closed.Callback())), 0);
+  ASSERT_OK(log_->Close());
+  ASSERT_EQ(closed.calls.load(), 1);
+  ASSERT_TRUE(closed.status.IsIllegalState()) << closed.status;
+  Waiter after_close;
+  ASSERT_NOK(log_->AddSafeOpIdWaiter(OpId(1, 11), after_close.Callback()));
+  ASSERT_EQ(after_close.calls.load(), 0);
+}
+
 // Tests log reopening and that GC'ing the old log's segments works.
 TEST_F(LogTest, TestLogReopenAndGC) {
   BuildLog();
