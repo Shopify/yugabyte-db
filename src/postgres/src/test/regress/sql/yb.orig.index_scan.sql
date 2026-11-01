@@ -686,3 +686,66 @@ reset yb_fetch_row_limit;
 reset yb_fetch_size_limit;
 
 drop table simple;
+
+--
+-- Strict row comparison on a key prefix: the scan must start after (or stop before) every row
+-- with that prefix instead of reading them for the recheck to remove.
+--
+\set explain 'EXPLAIN (ANALYZE, DIST, COSTS OFF, TIMING OFF, SUMMARY OFF)'
+CREATE TABLE prefix_bound (a int, b text, c int, PRIMARY KEY (a ASC, b ASC, c ASC));
+INSERT INTO prefix_bound
+    SELECT 1, b, c FROM unnest(ARRAY['apple', 'banana', 'cherry']) b, generate_series(1, 100) c;
+:explain SELECT * FROM prefix_bound WHERE (a, b) > (1, 'banana') LIMIT 1;
+:explain SELECT * FROM prefix_bound WHERE (a, b) < (1, 'banana')
+    ORDER BY a DESC, b DESC, c DESC LIMIT 1;
+:explain SELECT * FROM prefix_bound WHERE (a, b, c) > (1, 'banana', NULL) LIMIT 1;
+SELECT * FROM prefix_bound WHERE (a, b) > (1, 'banana') LIMIT 1;
+SELECT * FROM prefix_bound WHERE (a, b) < (1, 'banana') ORDER BY a DESC, b DESC, c DESC LIMIT 1;
+SELECT count(*) FROM prefix_bound WHERE (a, b) > (1, 'banana');
+SELECT count(*) FROM prefix_bound WHERE (a, b) <= (1, 'banana');
+SELECT count(*) FROM prefix_bound WHERE (a, b, c) > (1, 'banana', NULL);
+SELECT count(*) FROM prefix_bound WHERE (a, b, c) < (1, 'banana', NULL);
+
+-- DESC key: a strict SQL lower bound is a strict DocDB upper bound.
+CREATE TABLE prefix_bound_desc (r1 int, r2 int, r3 int, PRIMARY KEY (r1 DESC, r2 DESC, r3 DESC));
+INSERT INTO prefix_bound_desc
+    SELECT 1, r2, r3 FROM generate_series(1, 10) r2, generate_series(1, 100) r3;
+:explain SELECT * FROM prefix_bound_desc WHERE (r1, r2) > (1, 5) ORDER BY r1, r2, r3 LIMIT 1;
+:explain SELECT * FROM prefix_bound_desc WHERE (r1, r2) < (1, 5)
+    ORDER BY r1 DESC, r2 DESC, r3 DESC LIMIT 1;
+SELECT * FROM prefix_bound_desc WHERE (r1, r2) > (1, 5) ORDER BY r1, r2, r3 LIMIT 1;
+SELECT * FROM prefix_bound_desc WHERE (r1, r2) < (1, 5) ORDER BY r1 DESC, r2 DESC, r3 DESC LIMIT 1;
+SELECT count(*) FROM prefix_bound_desc WHERE (r1, r2) > (1, 5);
+SELECT count(*) FROM prefix_bound_desc WHERE (r1, r2) < (1, 5);
+
+-- Mixed directions: only r1 can be pushed down, so (r1) >= (10) is used and (10, 150) stays.
+CREATE TABLE prefix_bound_mixed (r1 int, r2 int, PRIMARY KEY (r1 ASC, r2 DESC));
+INSERT INTO prefix_bound_mixed VALUES (9, 0), (10, 50), (10, 100), (10, 150), (11, 0);
+SELECT * FROM prefix_bound_mixed WHERE (r1, r2) > (10, 100) ORDER BY r1, r2;
+SELECT * FROM prefix_bound_mixed WHERE (r1, r2) < (10, 100) ORDER BY r1, r2;
+
+-- Secondary indexes store a hidden key column after the index columns, so a comparison on all
+-- index columns is a prefix bound too.
+CREATE TABLE prefix_bound_idx (id int PRIMARY KEY, a int, b text, c int);
+INSERT INTO prefix_bound_idx
+    SELECT row_number() OVER (), 1, b, c
+    FROM unnest(ARRAY['apple', 'banana', 'cherry']) b, generate_series(1, 100) c;
+INSERT INTO prefix_bound_idx SELECT 1000 + g, 1, 'banana', 50 FROM generate_series(1, 100) g;
+CREATE INDEX NONCONCURRENTLY prefix_bound_idx_abc ON prefix_bound_idx (a ASC, b ASC, c ASC);
+:explain /*+ IndexOnlyScan(prefix_bound_idx prefix_bound_idx_abc) */
+    SELECT a, b, c FROM prefix_bound_idx WHERE (a, b, c) > (1, 'banana', 50)
+    ORDER BY a, b, c LIMIT 1;
+/*+ IndexOnlyScan(prefix_bound_idx prefix_bound_idx_abc) */
+    SELECT a, b, c FROM prefix_bound_idx WHERE (a, b, c) > (1, 'banana', 50)
+    ORDER BY a, b, c LIMIT 1;
+DELETE FROM prefix_bound_idx WHERE id > 1000;
+DROP INDEX prefix_bound_idx_abc;
+CREATE UNIQUE INDEX NONCONCURRENTLY prefix_bound_idx_abc ON prefix_bound_idx (a ASC, b ASC, c ASC);
+:explain /*+ IndexOnlyScan(prefix_bound_idx prefix_bound_idx_abc) */
+    SELECT a, b, c FROM prefix_bound_idx WHERE (a, b, c) > (1, 'banana', 50)
+    ORDER BY a, b, c LIMIT 1;
+/*+ IndexOnlyScan(prefix_bound_idx prefix_bound_idx_abc) */
+    SELECT a, b, c FROM prefix_bound_idx WHERE (a, b, c) > (1, 'banana', 50)
+    ORDER BY a, b, c LIMIT 1;
+
+DROP TABLE prefix_bound, prefix_bound_desc, prefix_bound_mixed, prefix_bound_idx;

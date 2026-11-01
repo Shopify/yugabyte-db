@@ -2031,7 +2031,7 @@ EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT * FROM pk_range_int
 ---------------------------------------------------------------------------------------------------------
  Index Scan using pk_range_int_asc_pkey on pk_range_int_asc (actual rows=4 loops=1)
    Index Cond: ((ROW(r1, r3) <= ROW(1, 3)) AND (ROW(r1, r2) < ROW(1, 3)) AND (ROW(r1, r2) >= ROW(1, 2)))
-   Rows Removed by Index Recheck: 6
+   Rows Removed by Index Recheck: 1
 (3 rows)
 
 SELECT * FROM pk_range_int_asc WHERE (r1, r3) <= (1,3) AND (r1,r2) < (1,3) AND (r1,r2) >= (1,2);
@@ -2153,8 +2153,7 @@ EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT * FROM pk_comp WHER
 ------------------------------------------------------------------
  Index Scan using pk_comp_pkey on pk_comp (actual rows=1 loops=1)
    Index Cond: (ROW(a, b) > ROW(0, NULL::text))
-   Rows Removed by Index Recheck: 1
-(3 rows)
+(2 rows)
 
 SELECT * FROM pk_comp WHERE (a, b) > (0, NULL) ORDER BY a, b;
  a | b 
@@ -3742,7 +3741,7 @@ EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT * FROM pk_range_int
 ---------------------------------------------------------------------------------------------------------
  Index Scan using pk_range_int_desc_pkey on pk_range_int_desc (actual rows=4 loops=1)
    Index Cond: ((ROW(r1, r3) <= ROW(1, 3)) AND (ROW(r1, r2) < ROW(1, 3)) AND (ROW(r1, r2) >= ROW(1, 2)))
-   Rows Removed by Index Recheck: 6
+   Rows Removed by Index Recheck: 1
 (3 rows)
 
 SELECT * FROM pk_range_int_desc WHERE (r1, r3) <= (1,3) AND (r1,r2) < (1,3) AND (r1,r2) >= (1,2);
@@ -5084,3 +5083,205 @@ explain (analyze, dist, costs off, timing off, summary off)
 reset yb_fetch_row_limit;
 reset yb_fetch_size_limit;
 drop table simple;
+--
+-- Strict row comparison on a key prefix: the scan must start after (or stop before) every row
+-- with that prefix instead of reading them for the recheck to remove.
+--
+\set explain 'EXPLAIN (ANALYZE, DIST, COSTS OFF, TIMING OFF, SUMMARY OFF)'
+CREATE TABLE prefix_bound (a int, b text, c int, PRIMARY KEY (a ASC, b ASC, c ASC));
+INSERT INTO prefix_bound
+    SELECT 1, b, c FROM unnest(ARRAY['apple', 'banana', 'cherry']) b, generate_series(1, 100) c;
+:explain SELECT * FROM prefix_bound WHERE (a, b) > (1, 'banana') LIMIT 1;
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Limit (actual rows=1 loops=1)
+   ->  Index Scan using prefix_bound_pkey on prefix_bound (actual rows=1 loops=1)
+         Index Cond: (ROW(a, b) > ROW(1, 'banana'::text))
+         Storage Table Read Requests: 1
+         Storage Table Read Ops: 1
+         Storage Table Rows Scanned: 1
+(6 rows)
+
+:explain SELECT * FROM prefix_bound WHERE (a, b) < (1, 'banana')
+    ORDER BY a DESC, b DESC, c DESC LIMIT 1;
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
+ Limit (actual rows=1 loops=1)
+   ->  Index Scan Backward using prefix_bound_pkey on prefix_bound (actual rows=1 loops=1)
+         Index Cond: (ROW(a, b) < ROW(1, 'banana'::text))
+         Storage Table Read Requests: 1
+         Storage Table Read Ops: 1
+         Storage Table Rows Scanned: 1
+(6 rows)
+
+:explain SELECT * FROM prefix_bound WHERE (a, b, c) > (1, 'banana', NULL) LIMIT 1;
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Limit (actual rows=1 loops=1)
+   ->  Index Scan using prefix_bound_pkey on prefix_bound (actual rows=1 loops=1)
+         Index Cond: (ROW(a, b, c) > ROW(1, 'banana'::text, NULL::integer))
+         Storage Table Read Requests: 1
+         Storage Table Read Ops: 1
+         Storage Table Rows Scanned: 1
+(6 rows)
+
+SELECT * FROM prefix_bound WHERE (a, b) > (1, 'banana') LIMIT 1;
+ a |   b    | c 
+---+--------+---
+ 1 | cherry | 1
+(1 row)
+
+SELECT * FROM prefix_bound WHERE (a, b) < (1, 'banana') ORDER BY a DESC, b DESC, c DESC LIMIT 1;
+ a |   b   |  c  
+---+-------+-----
+ 1 | apple | 100
+(1 row)
+
+SELECT count(*) FROM prefix_bound WHERE (a, b) > (1, 'banana');
+ count 
+-------
+   100
+(1 row)
+
+SELECT count(*) FROM prefix_bound WHERE (a, b) <= (1, 'banana');
+ count 
+-------
+   200
+(1 row)
+
+SELECT count(*) FROM prefix_bound WHERE (a, b, c) > (1, 'banana', NULL);
+ count 
+-------
+   100
+(1 row)
+
+SELECT count(*) FROM prefix_bound WHERE (a, b, c) < (1, 'banana', NULL);
+ count 
+-------
+   100
+(1 row)
+
+-- DESC key: a strict SQL lower bound is a strict DocDB upper bound.
+CREATE TABLE prefix_bound_desc (r1 int, r2 int, r3 int, PRIMARY KEY (r1 DESC, r2 DESC, r3 DESC));
+INSERT INTO prefix_bound_desc
+    SELECT 1, r2, r3 FROM generate_series(1, 10) r2, generate_series(1, 100) r3;
+:explain SELECT * FROM prefix_bound_desc WHERE (r1, r2) > (1, 5) ORDER BY r1, r2, r3 LIMIT 1;
+                                             QUERY PLAN                                              
+-----------------------------------------------------------------------------------------------------
+ Limit (actual rows=1 loops=1)
+   ->  Index Scan Backward using prefix_bound_desc_pkey on prefix_bound_desc (actual rows=1 loops=1)
+         Index Cond: (ROW(r1, r2) > ROW(1, 5))
+         Storage Table Read Requests: 1
+         Storage Table Read Ops: 1
+         Storage Table Rows Scanned: 1
+(6 rows)
+
+:explain SELECT * FROM prefix_bound_desc WHERE (r1, r2) < (1, 5)
+    ORDER BY r1 DESC, r2 DESC, r3 DESC LIMIT 1;
+                                         QUERY PLAN                                         
+--------------------------------------------------------------------------------------------
+ Limit (actual rows=1 loops=1)
+   ->  Index Scan using prefix_bound_desc_pkey on prefix_bound_desc (actual rows=1 loops=1)
+         Index Cond: (ROW(r1, r2) < ROW(1, 5))
+         Storage Table Read Requests: 1
+         Storage Table Read Ops: 1
+         Storage Table Rows Scanned: 1
+(6 rows)
+
+SELECT * FROM prefix_bound_desc WHERE (r1, r2) > (1, 5) ORDER BY r1, r2, r3 LIMIT 1;
+ r1 | r2 | r3 
+----+----+----
+  1 |  6 |  1
+(1 row)
+
+SELECT * FROM prefix_bound_desc WHERE (r1, r2) < (1, 5) ORDER BY r1 DESC, r2 DESC, r3 DESC LIMIT 1;
+ r1 | r2 | r3  
+----+----+-----
+  1 |  4 | 100
+(1 row)
+
+SELECT count(*) FROM prefix_bound_desc WHERE (r1, r2) > (1, 5);
+ count 
+-------
+   500
+(1 row)
+
+SELECT count(*) FROM prefix_bound_desc WHERE (r1, r2) < (1, 5);
+ count 
+-------
+   400
+(1 row)
+
+-- Mixed directions: only r1 can be pushed down, so (r1) >= (10) is used and (10, 150) stays.
+CREATE TABLE prefix_bound_mixed (r1 int, r2 int, PRIMARY KEY (r1 ASC, r2 DESC));
+INSERT INTO prefix_bound_mixed VALUES (9, 0), (10, 50), (10, 100), (10, 150), (11, 0);
+SELECT * FROM prefix_bound_mixed WHERE (r1, r2) > (10, 100) ORDER BY r1, r2;
+ r1 | r2  
+----+-----
+ 10 | 150
+ 11 |   0
+(2 rows)
+
+SELECT * FROM prefix_bound_mixed WHERE (r1, r2) < (10, 100) ORDER BY r1, r2;
+ r1 | r2 
+----+----
+  9 |  0
+ 10 | 50
+(2 rows)
+
+-- Secondary indexes store a hidden key column after the index columns, so a comparison on all
+-- index columns is a prefix bound too.
+CREATE TABLE prefix_bound_idx (id int PRIMARY KEY, a int, b text, c int);
+INSERT INTO prefix_bound_idx
+    SELECT row_number() OVER (), 1, b, c
+    FROM unnest(ARRAY['apple', 'banana', 'cherry']) b, generate_series(1, 100) c;
+INSERT INTO prefix_bound_idx SELECT 1000 + g, 1, 'banana', 50 FROM generate_series(1, 100) g;
+CREATE INDEX NONCONCURRENTLY prefix_bound_idx_abc ON prefix_bound_idx (a ASC, b ASC, c ASC);
+:explain /*+ IndexOnlyScan(prefix_bound_idx prefix_bound_idx_abc) */
+    SELECT a, b, c FROM prefix_bound_idx WHERE (a, b, c) > (1, 'banana', 50)
+    ORDER BY a, b, c LIMIT 1;
+                                          QUERY PLAN                                          
+----------------------------------------------------------------------------------------------
+ Limit (actual rows=1 loops=1)
+   ->  Index Only Scan using prefix_bound_idx_abc on prefix_bound_idx (actual rows=1 loops=1)
+         Index Cond: (ROW(a, b, c) > ROW(1, 'banana'::text, 50))
+         Heap Fetches: 0
+         Storage Index Read Requests: 1
+         Storage Index Read Ops: 1
+         Storage Index Rows Scanned: 1
+(7 rows)
+
+/*+ IndexOnlyScan(prefix_bound_idx prefix_bound_idx_abc) */
+    SELECT a, b, c FROM prefix_bound_idx WHERE (a, b, c) > (1, 'banana', 50)
+    ORDER BY a, b, c LIMIT 1;
+ a |   b    | c  
+---+--------+----
+ 1 | banana | 51
+(1 row)
+
+DELETE FROM prefix_bound_idx WHERE id > 1000;
+DROP INDEX prefix_bound_idx_abc;
+CREATE UNIQUE INDEX NONCONCURRENTLY prefix_bound_idx_abc ON prefix_bound_idx (a ASC, b ASC, c ASC);
+:explain /*+ IndexOnlyScan(prefix_bound_idx prefix_bound_idx_abc) */
+    SELECT a, b, c FROM prefix_bound_idx WHERE (a, b, c) > (1, 'banana', 50)
+    ORDER BY a, b, c LIMIT 1;
+                                          QUERY PLAN                                          
+----------------------------------------------------------------------------------------------
+ Limit (actual rows=1 loops=1)
+   ->  Index Only Scan using prefix_bound_idx_abc on prefix_bound_idx (actual rows=1 loops=1)
+         Index Cond: (ROW(a, b, c) > ROW(1, 'banana'::text, 50))
+         Heap Fetches: 0
+         Storage Index Read Requests: 1
+         Storage Index Read Ops: 1
+         Storage Index Rows Scanned: 1
+(7 rows)
+
+/*+ IndexOnlyScan(prefix_bound_idx prefix_bound_idx_abc) */
+    SELECT a, b, c FROM prefix_bound_idx WHERE (a, b, c) > (1, 'banana', 50)
+    ORDER BY a, b, c LIMIT 1;
+ a |   b    | c  
+---+--------+----
+ 1 | banana | 51
+(1 row)
+
+DROP TABLE prefix_bound, prefix_bound_desc, prefix_bound_mixed, prefix_bound_idx;

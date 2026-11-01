@@ -133,7 +133,53 @@ SELECT h, r1, r2 FROM hc_rc_t1
       AND (yb_hash_code(h), h, r1, r2) > (yb_hash_code(1), 1, 6, 60)
     ORDER BY h, r1, r2;
 
+-------------------------------------------------------------------
+-- Test 11: Strict bound on a key prefix.
+-- The bound excludes every key starting with the prefix, so DocDB must
+-- start after (lower) or stop before (upper) the whole prefix group
+-- instead of reading it for Postgres to recheck it away: no
+-- "Rows Removed by Index Recheck" below.
+-------------------------------------------------------------------
+CREATE TABLE hc_rc_t4(
+    a text,
+    r1 int,
+    r2 int,
+    PRIMARY KEY(a HASH, r1 ASC, r2 ASC)
+);
+INSERT INTO hc_rc_t4 SELECT 'hot', i, i FROM generate_series(1, 1000) i;
+INSERT INTO hc_rc_t4 SELECT 'g' || g, 1, 1 FROM generate_series(1, 20) g;
+
+-- Strict lower bound on (yb_hash_code, a): next group after 'hot'.
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT * FROM hc_rc_t4
+    WHERE (yb_hash_code(a), a) > (yb_hash_code('hot'::text), 'hot')
+    LIMIT 3;
+-- A NULL member decides the comparison on the members before it.
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT * FROM hc_rc_t4
+    WHERE (yb_hash_code(a), a, r1) > (yb_hash_code('hot'::text), 'hot', NULL::int)
+    LIMIT 3;
+-- Strict upper bound on (yb_hash_code, a) within the hash code of 'hot'.
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT * FROM hc_rc_t4
+    WHERE (yb_hash_code(a), a) < (yb_hash_code('hot'::text), 'hot')
+      AND yb_hash_code(a) >= yb_hash_code('hot'::text);
+-- Results match the same condition evaluated by Postgres only.
+SELECT count(*) FROM hc_rc_t4
+    WHERE (yb_hash_code(a), a) > (yb_hash_code('hot'::text), 'hot');
+SELECT count(*) FROM hc_rc_t4
+    WHERE yb_hash_code(a) > yb_hash_code('hot'::text)
+       OR (yb_hash_code(a) = yb_hash_code('hot'::text) AND a > 'hot');
+SELECT count(*) FROM hc_rc_t4
+    WHERE (yb_hash_code(a), a, r1) > (yb_hash_code('hot'::text), 'hot', NULL::int);
+SELECT count(*) FROM hc_rc_t4
+    WHERE (yb_hash_code(a), a) <= (yb_hash_code('hot'::text), 'hot');
+SELECT count(*) FROM hc_rc_t4
+    WHERE yb_hash_code(a) < yb_hash_code('hot'::text)
+       OR (yb_hash_code(a) = yb_hash_code('hot'::text) AND a <= 'hot');
+
 -- Clean up.
 DROP TABLE hc_rc_t1;
 DROP TABLE hc_rc_t2;
 DROP TABLE hc_rc_t3;
+DROP TABLE hc_rc_t4;

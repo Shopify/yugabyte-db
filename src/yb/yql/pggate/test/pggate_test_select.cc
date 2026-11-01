@@ -1933,20 +1933,37 @@ TEST_F(PggateTestRowBounds, TestHashBoundsRangeDesc) {
   {
     // yb_hash_code(4::int4, 4::int4) = 2181
     const RowKey key{ 2181, 4, 4, 4 };
-    CheckRowCount({ .lower = ExclusiveBound(key), .upper = ExclusiveBound(key) }, 10);
+    CheckRowCount({ .lower = InclusiveBound(key), .upper = InclusiveBound(key) }, 10);
   }
 
   {
     // yb_hash_code(4::int4, 4::int4) = 2181
     const RowKey key{ 2181, 4, 4 };
-    CheckRowCount({ .lower = ExclusiveBound(key), .upper = ExclusiveBound(key) }, 100);
+    CheckRowCount({ .lower = InclusiveBound(key), .upper = InclusiveBound(key) }, 100);
   }
 
   {
     // The hash bucket has only one pair of hash values
     // yb_hash_code(4::int4, 4::int4) = 2181
     const RowKey key{ 2181, 4, std::nullopt, 4, 4 };
-    CheckRowCount({ .lower = ExclusiveBound(key), .upper = ExclusiveBound(key) }, 100);
+    CheckRowCount({ .lower = InclusiveBound(key), .upper = InclusiveBound(key) }, 100);
+  }
+
+  // Exclusive bounds on incomplete keys exclude every key with that prefix
+  {
+    // yb_hash_code(4::int4, 4::int4) = 2181
+    const RowKey key{ 2181, 4, 4, 4 };
+    CheckRowCount({ .lower = ExclusiveBound(key), .upper = ExclusiveBound(key) }, 0);
+    // r1 is DESC: after r1 = 4 come r1 = 3..0, before it r1 = 9..5
+    const RowKey bucket{ 2181, 4, 4 };
+    CheckRowCount({ .lower = ExclusiveBound(key), .upper = InclusiveBound(bucket) }, 40);
+    CheckRowCount({ .lower = InclusiveBound(bucket), .upper = ExclusiveBound(key) }, 50);
+  }
+
+  {
+    // yb_hash_code(4::int4, 4::int4) = 2181
+    const RowKey key{ 2181, 4, std::nullopt, 4, 4 };
+    CheckRowCount({ .lower = ExclusiveBound(key), .upper = ExclusiveBound(key) }, 0);
   }
 }
 
