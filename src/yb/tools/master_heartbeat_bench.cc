@@ -1789,7 +1789,7 @@ class HeartbeatBench {
         }
         SCHECK(MonoTime::Now() < deadline, TimedOut,
                "Table $0 not running within timeout", table_name.ToString());
-        SleepFor(1s);
+        SleepFor(500ms);
       }
       return Status::OK();
     };
