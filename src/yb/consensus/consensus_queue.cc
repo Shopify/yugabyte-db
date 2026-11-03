@@ -489,6 +489,10 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
   static constexpr uint64_t kSendUnboundedLogOps = std::numeric_limits<uint64_t>::max();
   DCHECK(request->ops().empty()) << request->ShortDebugString();
 
+  if (PREDICT_FALSE(leader_stall_check_ && leader_stall_check_())) {
+    return STATUS(ServiceUnavailable, "Leader update lock stalled, not sending requests to peers");
+  }
+
   OpId preceding_id;
   MonoDelta unreachable_time = MonoDelta::kMin;
   bool is_voter = false;
