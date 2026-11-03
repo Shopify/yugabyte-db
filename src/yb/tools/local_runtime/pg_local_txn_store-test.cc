@@ -17,6 +17,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <functional>
+#include <map>
 
 #include "yb/common/transaction_error.h"
 #include "yb/docdb/docdb_rocksdb_util.h"
@@ -24,6 +25,7 @@
 #include "yb/rocksdb/db.h"
 #include "yb/tablet/tablet_options.h"
 #include "yb/util/env.h"
+#include "yb/util/flags.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/subprocess.h"
 #include "yb/util/sync_point.h"
@@ -31,6 +33,9 @@
 #include "yb/util/test_thread_holder.h"
 #include "yb/util/test_util.h"
 #include "yb/yql/pggate/util/pg_wire.h"
+
+DECLARE_uint64(local_runtime_churn_write_buffer_bytes);
+DECLARE_uint64(local_runtime_intents_memtable_budget_bytes);
 
 namespace yb::local_runtime {
 namespace {
@@ -153,6 +158,29 @@ Status MutateStorage(
   return action(db.get(), handles);
 }
 
+// Live keys per column family; status records in the metadata family are counted as "tx".
+Result<std::map<std::string, size_t>> CountKeys(const std::string& path) {
+  std::map<std::string, size_t> counts;
+  RETURN_NOT_OK(MutateStorage(path, [&](auto* db, const auto& handles) -> Status {
+    for (auto* handle : handles) {
+      std::unique_ptr<rocksdb::Iterator> it(db->NewIterator(rocksdb::ReadOptions(), handle));
+      for (it->SeekToFirst(); it->Valid(); it->Next()) {
+        auto name = handle->GetName();
+        if (name == rocksdb::kDefaultColumnFamilyName) {
+          dockv::DocKey key;
+          auto bytes = it->key();
+          RETURN_NOT_OK(key.DecodeFrom(&bytes));
+          if (key.range_group()[0].GetString().starts_with("tx/")) name = "tx";
+        }
+        ++counts[name];
+      }
+      RETURN_NOT_OK(it->status());
+    }
+    return Status::OK();
+  }));
+  return counts;
+}
+
 class PgLocalTxnStoreTest : public YBTest {
  protected:
   void SetUp() override {
@@ -216,6 +244,8 @@ TEST_F(PgLocalTxnStoreTest, NativePriorityConflicts) {
   ASSERT_OK(Write(high, 1, 30));
   ASSERT_NOK(store_->Commit(low));
   ASSERT_NOK(Write(low, 2, 40));
+  // The wounded transaction stays visible as aborted until its owner finishes it.
+  ASSERT_OK(store_->Abort(low));
   ASSERT_OK(store_->Commit(high));
   const auto reader = ASSERT_RESULT(store_->Begin());
   ASSERT_EQ(ASSERT_RESULT(Rows(reader)), (std::vector<Row>{{7, 1, 30}}));
@@ -258,6 +288,88 @@ TEST_F(PgLocalTxnStoreTest, SavepointsReleaseNativeConflicts) {
   store_ = ASSERT_RESULT(PgLocalTxnStore::Open(path_));
   const auto reader = ASSERT_RESULT(store_->Begin());
   ASSERT_EQ(ASSERT_RESULT(Rows(reader)), (std::vector<Row>{{7, 1, 10}, {7, 2, 99}, {7, 5, 50}}));
+}
+
+TEST_F(PgLocalTxnStoreTest, ReclaimsFinishedTransactions) {
+  const auto committed = ASSERT_RESULT(store_->Begin());
+  ASSERT_OK(Write(committed, 1, 10));
+  ASSERT_OK(Write(committed, 2, 20, 2));
+  ASSERT_OK(store_->RollbackTo(committed, 2));
+  ASSERT_OK(Put(store_.get(), committed, schema_, "b", 1, 30, 3));
+  const auto aborted = ASSERT_RESULT(store_->Begin());
+  ASSERT_OK(Write(aborted, 3, 40));
+  ASSERT_OK(store_->Abort(aborted));
+  ASSERT_OK(store_->Commit(committed));
+  // A reclaim failure after the durable commit fences the store but does not fail the commit.
+  const auto stranded = ASSERT_RESULT(store_->Begin());
+  ASSERT_OK(Write(stranded, 4, 50));
+  {
+    auto* sync = SyncPoint::GetInstance();
+    auto cleanup = ScopeExit([&] {
+      sync->DisableProcessing();
+      sync->ClearAllCallBacks();
+    });
+    sync->SetCallBack("PgLocalTxnStore::WriteStatus", [](void* status) {
+      *static_cast<Status*>(status) = STATUS(IOError, "Injected reclaim failure");
+    });
+    sync->EnableProcessing();
+    ASSERT_OK(store_->Commit(stranded));
+    ASSERT_NOK(store_->Begin());
+  }
+  store_.reset();
+  auto counts = ASSERT_RESULT(CountKeys(path_));
+  ASSERT_EQ(counts["tx"], 1);
+  ASSERT_GT(counts["i/a"], 0);
+  ASSERT_EQ(counts["i/b"], 0);
+  store_ = ASSERT_RESULT(PgLocalTxnStore::Open(path_));
+  const auto reader = ASSERT_RESULT(store_->Begin());
+  ASSERT_EQ(ASSERT_RESULT(Rows(reader)), (std::vector<Row>{{7, 1, 10}, {7, 4, 50}}));
+  ASSERT_EQ(ASSERT_RESULT(Rows(reader, "b")), (std::vector<Row>{{7, 1, 30}}));
+  ASSERT_OK(store_->Abort(reader));
+  store_.reset();
+  counts = ASSERT_RESULT(CountKeys(path_));
+  ASSERT_EQ(counts["tx"], 0);
+  ASSERT_EQ(counts["i/a"], 0);
+  ASSERT_EQ(counts["i/b"], 0);
+  ASSERT_GT(counts["r/a"], 0);
+  ASSERT_GT(counts["r/b"], 0);
+}
+
+TEST_F(PgLocalTxnStoreTest, FlushedIntentsStayCorrect) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_local_runtime_churn_write_buffer_bytes) = 64 * 1024;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_local_runtime_intents_memtable_budget_bytes) = 16 * 1024;
+  store_.reset();
+  store_ = ASSERT_RESULT(PgLocalTxnStore::Open(path_));
+  // Pending across every flush: its intents must survive them and still be removed at the end.
+  const auto pending = ASSERT_RESULT(store_->Begin());
+  ASSERT_OK(Write(pending, 1000, 1));
+  std::vector<Row> expected;
+  for (int64_t i = 1; i <= 300; ++i) {
+    const auto txn = ASSERT_RESULT(store_->Begin());
+    ASSERT_OK(Write(txn, i, i));
+    ASSERT_OK(Write(txn, i, i * 10, 1, true));
+    if (i % 3) {
+      ASSERT_OK(store_->Commit(txn));
+      expected.push_back({7, i, i * 10});
+    } else {
+      ASSERT_OK(store_->Abort(txn));
+    }
+  }
+  // Its snapshot predates every other commit.
+  ASSERT_EQ(ASSERT_RESULT(Rows(pending)), (std::vector<Row>{{7, 1000, 1}}));
+  auto with_pending = expected;
+  with_pending.push_back({7, 1000, 1});
+  const auto reader = ASSERT_RESULT(store_->Begin());
+  ASSERT_EQ(ASSERT_RESULT(Rows(reader)), expected);
+  ASSERT_OK(store_->Abort(reader));
+  ASSERT_OK(store_->Commit(pending));
+  store_.reset();
+  const auto counts = ASSERT_RESULT(CountKeys(path_));
+  ASSERT_EQ(counts.contains("i/a") ? counts.at("i/a") : 0, 0);
+  ASSERT_EQ(counts.contains("tx") ? counts.at("tx") : 0, 0);
+  store_ = ASSERT_RESULT(PgLocalTxnStore::Open(path_));
+  const auto reopened = ASSERT_RESULT(store_->Begin());
+  ASSERT_EQ(ASSERT_RESULT(Rows(reopened)), with_pending);
 }
 
 TEST_F(PgLocalTxnStoreTest, StatementLimitsAndPaging) {
@@ -444,9 +556,9 @@ TEST_F(PgLocalTxnStoreTest, MissingPublishedFamilyIsCorruption) {
 }
 
 TEST_F(PgLocalTxnStoreTest, UnknownIntentTransactionIsCorruption) {
+  // Finished transactions leave no intents, so strand an unfinished one's.
   const auto writer = ASSERT_RESULT(store_->Begin());
   ASSERT_OK(Write(writer, 1, 10));
-  ASSERT_OK(store_->Commit(writer));
   store_.reset();
   ASSERT_OK(MutateStorage(path_, [&](auto* db, const auto&) -> Status {
     const auto key =

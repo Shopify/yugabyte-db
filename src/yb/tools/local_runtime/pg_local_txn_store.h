@@ -43,12 +43,12 @@ struct TransactionReadResult {
 // overlap. Catalog-owned transactions finish through the single-WAL catalog coordinator.
 // Independent SQL transactions read and resolve conflicts at the backend's read point (statement
 // or transaction snapshot, as PgGate selects); others use their begin time. SQL row locks write
-// native lock intents. No serializable execution, waiting, retries, or intent/history GC.
-// Transactions that wrote no intents are forgotten when they finish. Bounds: 65536 retained
-// transactions, 64 active, 1024 rollbacks per txn. Cumulative encoded intents: 512 MiB per
-// attached SQL txn, 16 MiB per standalone txn. Each encoded intent batch plus resident catalog
-// pending bytes is limited to 16 MiB; the catalog coordinator also limits its final WAL batch to
-// 16 MiB.
+// native lock intents. No serializable execution, waiting, retries, or history GC. Finished
+// transactions are reclaimed as on a tablet: committed intents are applied to regular rows, then
+// intents and the status record are removed. Bounds: 65536 unfinished transactions, 64 active,
+// 1024 rollbacks per txn. Cumulative encoded intents: 512 MiB per attached SQL txn, 16 MiB per
+// standalone txn. Each encoded intent batch plus resident catalog pending bytes is limited to
+// 16 MiB; the catalog coordinator also limits its final WAL batch to 16 MiB.
 class PgLocalTxnStore {
  public:
   static Result<std::unique_ptr<PgLocalTxnStore>> Open(const std::string& directory);

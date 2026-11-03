@@ -16,6 +16,7 @@
 #include <limits>
 #include <mutex>
 #include <unordered_map>
+#include <tuple>
 #include <unordered_set>
 
 #include "yb/common/pgsql_protocol.messages.h"
@@ -23,14 +24,18 @@
 #include "yb/common/schema_pbutil.h"
 #include "yb/common/transaction_error.h"
 #include "yb/docdb/conflict_resolution.h"
+#include "yb/docdb/consensus_frontier.h"
 #include "yb/docdb/doc_read_context.h"
+#include "yb/docdb/doc_vector_index.h"
 #include "yb/docdb/doc_write_batch.h"
 #include "yb/docdb/docdb.h"
+#include "yb/docdb/docdb_compaction_context.h"
 #include "yb/docdb/docdb_rocksdb_util.h"
 #include "yb/docdb/pgsql_operation.h"
 #include "yb/docdb/ql_rocksdb_storage.h"
 #include "yb/docdb/rocksdb_writer.h"
 #include "yb/docdb/shared_lock_manager.h"
+#include "yb/docdb/storage_set.h"
 #include "yb/dockv/doc_key.h"
 #include "yb/dockv/partition.h"
 #include "yb/rocksdb/db.h"
@@ -48,6 +53,9 @@
 
 DEFINE_NON_RUNTIME_bool(local_runtime_cache_bindings, true,
     "Reuse native table bindings until the catalog metadata changes.");
+DEFINE_NON_RUNTIME_uint64(local_runtime_intents_memtable_budget_bytes, 64ULL * 1024 * 1024,
+    "Unflushed intent bytes across all tables before the largest intents families are flushed. "
+    "0 leaves flushing to each family's write buffer size.");
 
 namespace yb::local_runtime {
 namespace {
@@ -80,7 +88,8 @@ class IntentBatch : public rocksdb::DirectWriteHandler {
     return {entry.first, entry.second};
   }
 
-  void SingleDelete(const Slice& key) override { batch_->Delete(family_, key); }
+  // Intent and reverse-index keys are each written once, so a flush can drop a removed pair.
+  void SingleDelete(const Slice& key) override { batch_->SingleDelete(family_, key); }
 
  private:
   static std::string Join(const SliceParts& parts) {
@@ -93,6 +102,43 @@ class IntentBatch : public rocksdb::DirectWriteHandler {
   rocksdb::WriteBatch* batch_;
   rocksdb::ColumnFamilyHandle* family_;
   std::deque<std::pair<std::string, std::string>> entries_;
+};
+
+// Applies committed intents to a regular family. Native apply-state records let a tablet resume a
+// large transaction after a restart; here the status record outlives every chunk and recovery
+// reapplies from the start, so they are dropped instead of stored with the table's rows.
+class ApplyBatch : public rocksdb::DirectWriteHandler {
+ public:
+  ApplyBatch(rocksdb::WriteBatch* batch, rocksdb::ColumnFamilyHandle* family)
+      : batch_(batch, family) {}
+
+  std::pair<Slice, Slice> Put(const SliceParts& key, const SliceParts& value) override {
+    if (key.num_parts > 0 &&
+        key.parts[0].starts_with(dockv::KeyEntryTypeAsChar::kTransactionApplyState)) {
+      return {};
+    }
+    return batch_.Put(key, value);
+  }
+
+  void SingleDelete(const Slice& key) override { batch_.SingleDelete(key); }
+
+ private:
+  IntentBatch batch_;
+};
+
+// Local tables are never colocated and have no vector indexes. NotFound tells the native apply
+// path's vector-index updater that no row needs a reverse mapping.
+class NoPackings : public docdb::SchemaPackingProvider {
+ public:
+  Result<docdb::CompactionSchemaInfo> CotablePacking(
+      const Uuid&, uint32_t, HybridTime) override {
+    return STATUS(NotFound, "Local tables have no cotable packings");
+  }
+
+  Result<docdb::CompactionSchemaInfo> ColocationPacking(
+      ColocationId, uint32_t, HybridTime) override {
+    return STATUS(NotFound, "Local tables are not colocated");
+  }
 };
 
 const std::unordered_set<std::string> kWriteFields = {
@@ -282,7 +328,8 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     for (const auto& name : orphaned) RETURN_NOT_OK(storage_->DropFamily(name));
     for (const auto& [id, schema] : schemas) RETURN_NOT_OK(AddTable(id, schema));
     if (recovery.Count()) RETURN_NOT_OK(Persist(&recovery, true));
-    return RefreshCatalogBindings(true);
+    RETURN_NOT_OK(RefreshCatalogBindings(true));
+    return ReclaimRecovered();
   }
 
   Status Persist(
@@ -816,10 +863,39 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
         metadata_, MetaKey("tx/" + txn->metadata.transaction_id.ToString()),
         next.SerializeAsString());
     RETURN_NOT_OK(Persist(&batch, false));
+    NoteIntents(table_id, batch_bytes);
     txn->pb = std::move(next);
     // Retained status lets other transactions resolve these intents, including lock-only ones.
-    txn->touched.insert(table_id);
+    if (txn->touched.insert(table_id).second) ++unfinished_writers_[table_id];
     return Status::OK();
+  }
+
+  std::string IntentsFamily(const TableId& id) const { return (owner_ ? "intents/" : "i/") + id; }
+
+  // Removed intents and their tombstones stay in a memtable until it flushes, and a family flushes
+  // itself only past its write buffer size; across hundreds of tables that adds up to most of the
+  // store's memory. Flushing the largest families once a store-wide budget is exceeded drops the
+  // removed pairs. Families no unfinished transaction has written go first: their removed pairs
+  // all cancel, so the flush writes no file. Sizes are encoded batch bytes, an estimate of memtable
+  // usage.
+  void NoteIntents(const TableId& id, size_t bytes) {
+    const auto budget = FLAGS_local_runtime_intents_memtable_budget_bytes;
+    if (!budget) return;
+    unflushed_intents_[id] += bytes;
+    unflushed_total_ += bytes;
+    if (unflushed_total_ <= budget) return;
+    std::vector<std::tuple<bool, size_t, TableId>> largest;
+    for (const auto& [table, size] : unflushed_intents_)
+      largest.emplace_back(!unfinished_writers_.contains(table), size, table);
+    std::sort(largest.begin(), largest.end(), std::greater<>());
+    for (const auto& [idle, size, table] : largest) {
+      if (unflushed_total_ <= budget / 2) break;
+      // Dropped tables take their families, and their memtables, with them.
+      if (const auto it = handles_.find(IntentsFamily(table)); it != handles_.end())
+        WARN_NOT_OK(storage_->FlushFamily(it->second.get()), "Flushing local intents");
+      unflushed_total_ -= size;
+      unflushed_intents_.erase(table);
+    }
   }
 
   // Mirrors a tserver row-marked read: lock intents come from docdb::GetIntents, are resolved like
@@ -1154,14 +1230,115 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     return !txn.catalog_owned && txn.touched.empty() && txn.pb.intent_bytes() == 0;
   }
 
+  // Dropped tables take their families, and their intents, with them.
+  std::optional<std::pair<rocksdb::ColumnFamilyHandle*, rocksdb::ColumnFamilyHandle*>>
+  FamiliesOf(const TableId& id) const {
+    const auto regular = handles_.find((owner_ ? "table/" : "r/") + id);
+    const auto intents = handles_.find((owner_ ? "intents/" : "i/") + id);
+    if (regular == handles_.end() || intents == handles_.end()) return std::nullopt;
+    return std::make_pair(regular->second.get(), intents->second.get());
+  }
+
+  // What a tablet does when a transaction finishes: committed intents become regular records at
+  // the commit time (skipping row locks and aborted subtransactions), then the intents are removed.
+  // Left in place, every later read would resolve them again and they would accumulate for the life
+  // of the store. Chunks are unsynced and removal starts only once the apply is complete, so until
+  // the status record is deleted a crash leaves recovery to reclaim whatever remains.
+  Status ReclaimIntents(const Txn& txn, const TableId& table_id) {
+    const auto families = FamiliesOf(table_id);
+    if (!families) return Status::OK();
+    const auto& id = txn.metadata.transaction_id;
+    ColumnFamilyView intents(db_, families->second);
+    std::optional<docdb::ApplyTransactionState> state;
+    while (txn.pb.status() == TransactionStatus::COMMITTED) {
+      const HybridTime commit_ht(txn.pb.commit_ht());
+      rocksdb::WriteBatch batch;
+      ApplyBatch handler(&batch, families->first);
+      docdb::ConsensusFrontiers frontiers;
+      docdb::ApplyIntentsContext context(
+          kStatusLocation, id, state ? &*state : nullptr, txn.subtransaction.aborted, commit_ht,
+          commit_ht, HybridTime::kMin, OpId(), &docdb::KeyBounds::kNoBounds, no_packings_,
+          frontiers, &intents, nullptr, docdb::StorageSet::All(), TableType::PGSQL_TABLE_TYPE,
+          {});
+      docdb::IntentsWriter writer(
+          state ? state->key : Slice(), HybridTime::kMin, &intents, &context);
+      RETURN_NOT_OK(writer.Apply(handler));
+      if (batch.Count()) RETURN_NOT_OK(Persist(&batch, false));
+      auto next = context.apply_state();
+      if (!next.active()) break;
+      state = std::move(next);
+    }
+    state.reset();
+    for (;;) {
+      rocksdb::WriteBatch batch;
+      IntentBatch handler(&batch, families->second);
+      docdb::RemoveIntentsContext context(id, 0);
+      docdb::IntentsWriter writer(
+          state ? state->key : Slice(), HybridTime::kMin, &intents, &context);
+      RETURN_NOT_OK(writer.Apply(handler));
+      if (batch.Count()) {
+        RETURN_NOT_OK(Persist(&batch, false));
+        NoteIntents(table_id, batch.GetDataSize());
+      }
+      auto next = context.apply_state();
+      if (!next.active()) break;
+      state = std::move(next);
+    }
+    return Status::OK();
+  }
+
   Status Forget(Txn* txn) {
     const auto id = txn->metadata.transaction_id;
+    for (const auto& table : txn->touched) RETURN_NOT_OK(ReclaimIntents(*txn, table));
+    for (const auto& table : txn->touched) {
+      // Recovered transactions were never counted.
+      const auto it = unfinished_writers_.find(table);
+      if (it != unfinished_writers_.end() && !--it->second) unfinished_writers_.erase(it);
+    }
     rocksdb::WriteBatch batch;
     batch.Delete(metadata_, MetaKey("tx/" + id.ToString()));
-    // Unsynced: a lost delete leaves a pending record that recovery marks aborted.
+    // Unsynced: a lost delete leaves the record for recovery, which reclaims any intents again
+    // and marks a pending transaction aborted.
     RETURN_NOT_OK(Persist(&batch, false));
     if (txn->pb.status() == TransactionStatus::PENDING) storage_->DataFinished();
     txns_.erase(id);
+    return Status::OK();
+  }
+
+  // The commit is already durable: a failed reclaim fails the store, not the commit.
+  void ForgetCommitted(Txn* txn) {
+    auto status = Forget(txn);
+    if (!status.ok() && failure_.ok()) failure_ = std::move(status);
+  }
+
+  // Recovery has no touched sets, so the reverse index says which tables hold each transaction's
+  // intents. Only transactions finished by a crash remain at this point.
+  Status ReclaimRecovered() {
+    if (txns_.empty()) return Status::OK();
+    const std::string prefix = owner_ ? "intents/" : "i/";
+    const char marker = dockv::KeyEntryTypeAsChar::kTransactionId;
+    for (const auto& [name, handle] : handles_) {
+      if (!name.starts_with(prefix)) continue;
+      std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(rocksdb::ReadOptions(), handle.get()));
+      for (it->Seek(Slice(&marker, 1)); it->Valid() && it->key().starts_with(marker);) {
+        const auto key = it->key();
+        SCHECK_GE(
+            key.size(), 1 + TransactionId::StaticSize(), Corruption, "Invalid reverse index key");
+        const auto id = VERIFY_RESULT(
+            FullyDecodeTransactionId(key.Prefix(1 + TransactionId::StaticSize()).WithoutPrefix(1)));
+        const auto txn = txns_.find(id);
+        if (txn != txns_.end()) txn->second.touched.insert(name.substr(prefix.size()));
+        // A transaction's reverse index entries all sort below its id followed by kMaxByte.
+        auto next = key.Prefix(1 + TransactionId::StaticSize()).ToBuffer();
+        next.push_back(dockv::KeyEntryTypeAsChar::kMaxByte);
+        it->Seek(next);
+      }
+      RETURN_NOT_OK(it->status());
+    }
+    for (auto it = txns_.begin(); it != txns_.end();) {
+      auto& txn = (it++)->second;
+      RETURN_NOT_OK(Forget(&txn));
+    }
     return Status::OK();
   }
 
@@ -1178,10 +1355,14 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     // native status manager exposes these unapplied intents only after the durable commit.
     RETURN_NOT_OK(Save(txn, std::move(next), true, true));
     TEST_SYNC_POINT("PgLocalTxnStore::AfterCommit");
+    ForgetCommitted(txn);
     return Status::OK();
   }
 
-  Status AbortTxn(const TransactionId& id, bool catalog_owned = false) {
+  // The owner's abort removes the transaction. A conflicting transaction's abort only marks it, so
+  // the owner still sees it aborted, and the owner's abort removes it later. Neither is synced:
+  // recovery treats a pending record as aborted.
+  Status AbortTxn(const TransactionId& id, bool catalog_owned = false, bool by_owner = true) {
     RETURN_NOT_OK(Status(failure_));
     const auto it = txns_.find(id);
     SCHECK(it != txns_.end(), NotFound, "Unknown transaction");
@@ -1192,11 +1373,11 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     SCHECK(
         txn.pb.status() != TransactionStatus::COMMITTED, IllegalState,
         "Cannot abort a committed transaction");
+    if (by_owner) return Forget(&txn);
     if (txn.pb.status() == TransactionStatus::ABORTED) return Status::OK();
-    if (Unreferenced(txn)) return Forget(&txn);
     auto next = txn.pb;
     next.set_status(TransactionStatus::ABORTED);
-    return Save(&txn, std::move(next), true);
+    return Save(&txn, std::move(next), false);
   }
 
   Status RollbackTo(const TransactionId& id, uint32_t subtransaction, bool catalog_owned = false) {
@@ -1280,7 +1461,7 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
           it->second.subtransaction.aborted, kStatusLocation));
       return;
     }
-    const auto status = AbortTxn(id);
+    const auto status = AbortTxn(id, false, false);
     if (!status.ok())
       callback(status);
     else
@@ -1350,6 +1531,11 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
   dockv::SchemaPackingRegistryPtr packings_ =
       std::make_shared<dockv::SchemaPackingRegistry>("native-intents");
   docdb::SharedLockManager locks_;
+  NoPackings no_packings_;
+  std::unordered_map<TableId, size_t> unflushed_intents_;
+  size_t unflushed_total_ = 0;
+  // Unfinished transactions that have written intents to each table.
+  std::unordered_map<TableId, size_t> unfinished_writers_;
   tablet::ScopedTabletMetrics metrics_;
   std::shared_ptr<tablet::TabletMetricsHolder> metrics_holder_ =
       std::make_shared<tablet::TabletMetricsHolder>(false, &metrics_, nullptr);
@@ -1459,6 +1645,7 @@ void PgLocalTxnStore::CatalogCommitted(const TransactionId& id, HybridTime time)
   txn.pb.set_status(TransactionStatus::COMMITTED);
   txn.pb.set_commit_ht(time.ToUint64());
   impl_->storage_->DataFinished();
+  impl_->ForgetCommitted(&txn);
 }
 Status PgLocalTxnStore::AbortCatalog(const TransactionId& id) { return impl_->AbortTxn(id, true); }
 Status PgLocalTxnStore::RollbackCatalog(const TransactionId& id, uint32_t subtransaction) {
