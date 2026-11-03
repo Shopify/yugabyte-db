@@ -1036,31 +1036,43 @@ TEST_F(PgLocalSharedCommitTest, SqlRejectsUnsupportedReadModes) {
   ASSERT_OK(catalog_->CreateTable(table_, 1));
   ASSERT_OK(Write(txn, table_, 1, 10));
   ASSERT_OK(catalog_->Commit());
-  for (int mode = 0; mode < 7; ++mode) {
+  {
+    // Row-marked reads write native lock intents and leave the transaction usable.
+    txn = ASSERT_RESULT(catalog_->BeginWithNative());
+    ThreadSafeArena arena;
+    LWPgsqlReadRequestPB request(&arena);
+    request.CopyFrom(ASSERT_RESULT(Scan(table_)));
+    request.set_row_mark_type(ROW_MARK_EXCLUSIVE);
+    request.set_wait_policy(WAIT_ERROR);
+    LWPgsqlResponsePB response(&arena);
+    rpc::Sidecars sidecars;
+    ASSERT_OK(catalog_->NativeTransactions().ReadSql(
+        txn, request, &response, &sidecars, CoarseTimePoint::max(), HybridTime::kInvalid));
+    ASSERT_OK(catalog_->CheckHealthy());
+    ASSERT_OK(catalog_->Commit());
+  }
+  for (int mode = 0; mode < 6; ++mode) {
     txn = ASSERT_RESULT(catalog_->BeginWithNative());
     ThreadSafeArena arena;
     LWPgsqlReadRequestPB request(&arena);
     request.CopyFrom(ASSERT_RESULT(Scan(table_)));
     switch (mode) {
       case 0:
-        request.set_row_mark_type(ROW_MARK_EXCLUSIVE);
-        break;
-      case 1:
         request.set_skip_intents_read(true);
         break;
-      case 2:
+      case 1:
         request.set_read_at_in_txn_limit(true);
         break;
-      case 3:
+      case 2:
         request.set_is_for_backfill(true);
         break;
-      case 4:
+      case 3:
         request.mutable_index_request()->CopyFrom(ASSERT_RESULT(Scan(table_)));
         break;
-      case 5:
+      case 4:
         request.set_is_forward_scan(false);
         break;
-      case 6:
+      case 5:
         ReadHybridTime::SingleTime(HybridTime::kInitial)
             .ToPB(request.mutable_paging_state()->mutable_read_time());
         break;

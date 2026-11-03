@@ -1154,7 +1154,10 @@ class ReadonlyService : public UnsupportedPgClientService,
     auto status = session.sequence.Register(req->sequence_num().serial_no(), Predecessor(*req));
     if (status.ok()) status = PerformReads(session, *req, resp, context);
     if (!status.ok()) {
-      if (catalog_.transaction_) {
+      // PgGate skips a SKIP LOCKED row reported as kSkipLocking; its statement continues.
+      const bool skipped =
+          TransactionError::ValueFromStatus(status) == TransactionErrorCode::kSkipLocking;
+      if (catalog_.transaction_ && !skipped) {
         session.transaction_failed = true;
         session.failed_subtxn = std::max(1u, req->options().active_sub_transaction_id());
       }

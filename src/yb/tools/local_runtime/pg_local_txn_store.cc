@@ -19,6 +19,7 @@
 #include <unordered_set>
 
 #include "yb/common/pgsql_protocol.messages.h"
+#include "yb/common/row_mark.h"
 #include "yb/common/schema_pbutil.h"
 #include "yb/common/transaction_error.h"
 #include "yb/docdb/conflict_resolution.h"
@@ -588,8 +589,11 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
   }
 
   Status FinishStatement(Txn* txn, Status status, const PgsqlResponseMsg& response) {
+    // SKIP LOCKED reports a locked row with kSkipLocking; PgGate skips it and continues.
+    const bool skipped =
+        TransactionError::ValueFromStatus(status) == TransactionErrorCode::kSkipLocking;
     if ((!status.ok() || response.status() != PgsqlResponsePB::PGSQL_STATUS_OK) && failure_.ok() &&
-        txn->pb.status() == TransactionStatus::PENDING) {
+        !skipped && txn->pb.status() == TransactionStatus::PENDING) {
       auto next = txn->pb;
       next.set_failed_subtransaction(txn->current_subtransaction);
       next.clear_subtransaction();
@@ -758,8 +762,15 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     SCHECK(!restart.is_valid(), NotSupported, "Native write requested a read restart");
     if (response->status() != PgsqlResponsePB::PGSQL_STATUS_OK) return Status::OK();
     doc_batch.MoveToWriteBatchPB(&pairs);
+    return WriteIntents(txn, table, pairs, write_time, request.table_id().ToBuffer());
+  }
+
+  // Persists data or row-lock intents, prepared and conflict-checked by the caller.
+  Status WriteIntents(
+      Txn* txn, Table* table, const docdb::LWKeyValueWriteBatchPB& pairs, HybridTime write_time,
+      const TableId& table_id) {
     SCHECK_LT(
-        pairs.write_pairs().size(),
+        pairs.write_pairs().size() + pairs.read_pairs().size(),
         std::numeric_limits<IntraTxnWriteId>::max() - txn->pb.next_write_id(), NotSupported,
         "Transaction write IDs exhausted");
     rocksdb::WriteBatch batch;
@@ -767,7 +778,6 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     docdb::TransactionalWriter writer(
         pairs, write_time, txn->metadata.transaction_id, IsolationLevel::SNAPSHOT_ISOLATION,
         dockv::PartialRangeKeyIntents::kTrue, Slice(), txn->pb.next_write_id(), nullptr);
-    const auto table_id = request.table_id().ToBuffer();
     if (!txn->touched.contains(table_id)) writer.SetMetadataToStore(&pairs.transaction());
     RETURN_NOT_OK(writer.Apply(handler));
     auto next = txn->pb;
@@ -791,9 +801,54 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
         next.SerializeAsString());
     RETURN_NOT_OK(Persist(&batch, false));
     txn->pb = std::move(next);
+    // Retained status lets other transactions resolve these intents, including lock-only ones.
     txn->touched.insert(table_id);
     return Status::OK();
   }
+
+  // Mirrors a tserver row-marked read: lock intents come from docdb::GetIntents, are resolved like
+  // writes, then persisted before the read executes. Committed lock-only intents stay in the
+  // intents family, but conflict resolution treats a committed transaction's locks as released
+  // and readers skip them. There is no wait queue, so WAIT_BLOCK fails like WAIT_ERROR.
+  Status LockRows(
+      Txn* txn, Table* table, const PgsqlReadRequestMsg& request, RowMarkType row_mark,
+      HybridTime read_time) {
+    ThreadSafeArena arena;
+    docdb::LWKeyValueWriteBatchPB pairs(&arena);
+    RETURN_NOT_OK(docdb::GetIntents(
+        request, table->context->schema(), IsolationLevel::SNAPSHOT_ISOLATION, &pairs));
+    if (pairs.read_pairs().empty()) return Status::OK();
+    txn->metadata.ToPB(pairs.mutable_transaction());
+    pairs.mutable_subtransaction()->set_subtransaction_id(txn->current_subtransaction);
+    txn->subtransaction.aborted.ToPB(
+        pairs.mutable_subtransaction()->mutable_aborted()->mutable_set());
+    pairs.set_row_mark_type(row_mark);
+    const auto write_time = VERIFY_RESULT(Tick());
+    const docdb::DocOperations no_operations;
+    auto locks = VERIFY_RESULT(
+        docdb::PrepareDocWriteOperation(
+            no_operations, pairs.read_pairs(), metrics_holder_,
+            IsolationLevel::SNAPSHOT_ISOLATION, row_mark, true, false, CoarseTimePoint::max(),
+            dockv::PartialRangeKeyIntents::kTrue, &locks_));
+    const auto policy = pairs.has_wait_policy() && pairs.wait_policy() == WAIT_SKIP
+                            ? docdb::SKIP_ON_CONFLICT
+                            : docdb::FAIL_ON_CONFLICT;
+    RequestScope scope;
+    std::optional<Result<HybridTime>> resolution;
+    RETURN_NOT_OK(
+        docdb::ResolveTransactionConflicts(
+            no_operations, policy, pairs, scope, write_time, read_time,
+            txn->metadata.pg_txn_start_us, Env::Default()->NowMicros(), request_id_, table->DB(),
+            dockv::PartialRangeKeyIntents::kTrue, this, metrics_holder_, &locks.lock_batch, nullptr,
+            false, CoarseTimePoint::max(),
+            [&resolution](const Result<HybridTime>& result) { resolution.emplace(result); },
+            dockv::SkipPrefixLocks::kFalse));
+    // Without a wait queue, this manager's inline callbacks cannot leave a resolver in flight.
+    CHECK(resolution.has_value());
+    RETURN_NOT_OK(ResultToStatus(*resolution));
+    return WriteIntents(txn, table, pairs, write_time, request.table_id().ToBuffer());
+  }
+
 
   Result<TransactionReadResult> Read(
       const TransactionId& id, const PgsqlReadRequestPB& request, size_t tablet,
@@ -921,9 +976,6 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
       HybridTime snapshot) {
     SCHECK_EQ(request.client(), YQL_CLIENT_PGSQL, InvalidArgument, "Expected a YSQL request");
     SCHECK(
-        !request.has_row_mark_type() || request.row_mark_type() == ROW_MARK_ABSENT, NotSupported,
-        "Native SQL row locks are not supported");
-    SCHECK(
         !request.has_sampling_state() && request.sample_blocks().empty() &&
             !request.has_vector_idx_options() && !request.has_get_tablet_key_ranges_request() &&
             !request.is_for_backfill() && !request.has_backfill_spec() &&
@@ -1027,6 +1079,10 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     docdb::KeyBounds bounds(lower, upper);
     auto db = table->DB();
     db.key_bounds = &bounds;
+    const auto row_mark = request.has_row_mark_type() ? request.row_mark_type() : ROW_MARK_ABSENT;
+    if (IsValidRowMarkType(row_mark)) {
+      RETURN_NOT_OK(LockRows(txn, table, normalized, row_mark, time.read));
+    }
     docdb::QLRocksDBStorage storage(
         "native-sql", db, {.start_key = KeyBuffer(lower), .end_key = KeyBuffer(upper)});
     auto read_data = docdb::ReadOperationData::FromReadTime(time);
