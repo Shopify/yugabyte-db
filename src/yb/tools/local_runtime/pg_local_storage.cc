@@ -13,6 +13,7 @@
 #include <charconv>
 #include <filesystem>
 #include <limits>
+#include <map>
 
 #include "yb/common/doc_hybrid_time.h"
 #include "yb/docdb/docdb_rocksdb_util.h"
@@ -22,6 +23,13 @@
 #include "yb/rocksdb/write_batch.h"
 #include "yb/tablet/tablet_options.h"
 #include "yb/util/env_util.h"
+#include "yb/util/flags.h"
+#include "yb/util/logging.h"
+#include "yb/util/tostring.h"
+
+DEFINE_NON_RUNTIME_uint64(local_runtime_churn_write_buffer_bytes, 8ULL * 1024 * 1024,
+    "Memtable size for intents and metadata families, whose entries are mostly removed or "
+    "superseded. 0 keeps the default size, without compaction.");
 
 namespace yb::local_runtime {
 namespace {
@@ -65,7 +73,20 @@ Result<HybridTime> ParseTime(const std::string& value) {
 
 }  // namespace
 
-PgLocalStorage::~PgLocalStorage() = default;
+PgLocalStorage::~PgLocalStorage() {
+  if (!db_) return;
+  // Families are never flushed, so their memtables hold the store's resident data.
+  std::map<std::string, uint64_t> bytes;
+  for (const auto& [name, handle] : families_) {
+    uint64_t size = 0;
+    if (!db_->GetIntProperty(handle.get(), rocksdb::DB::Properties::kCurSizeAllMemTables, &size))
+      continue;
+    const bool rows = name.starts_with("table/") || name.starts_with("r/");
+    const bool intents = name.starts_with("intents/") || name.starts_with("i/");
+    bytes[rows ? "rows" : intents ? "intents" : name] += size;
+  }
+  LOG(INFO) << "Local storage memtable bytes: " << AsString(bytes);
+}
 
 std::string PgLocalStorage::MetadataKey(const std::string& name) {
   return dockv::DocKey(dockv::KeyEntryValues{dockv::KeyEntryValue(name)})
@@ -96,12 +117,26 @@ Status PgLocalStorage::Initialize(const std::string& directory, const std::strin
   docdb::InitRocksDBOptions(
       &intents_options_, "local-shared", "local-shared", nullptr, tablet_options,
       docdb::StorageDbType::kIntents);
-  for (auto* options : {&regular_options_, &intents_options_}) {
+  // Removed intents and superseded clock/status records stay in a memtable, beside their
+  // tombstones, until it flushes; with the default 128 MiB buffers they rarely do and come to most
+  // of the store's memory. Small buffers let a flush drop them, and universal compaction (the
+  // native default) merges what survives. Table and catalog rows keep large buffers and no
+  // compaction: without history GC, compacting them would only rewrite the same versions.
+  const auto churn_bytes = FLAGS_local_runtime_churn_write_buffer_bytes;
+  churn_options_ = regular_options_;
+  for (auto* options : {&regular_options_, &intents_options_, &churn_options_}) {
     options->disable_wal = false;
-    options->compaction_style = rocksdb::kCompactionStyleNone;
     options->max_manifest_file_size = 128ULL * 1024 * 1024;
-    options->level0_slowdown_writes_trigger = std::numeric_limits<int>::max();
-    options->level0_stop_writes_trigger = std::numeric_limits<int>::max();
+    if (options == &regular_options_ || !churn_bytes) {
+      options->compaction_style = rocksdb::kCompactionStyleNone;
+      options->level0_slowdown_writes_trigger = std::numeric_limits<int>::max();
+      options->level0_stop_writes_trigger = std::numeric_limits<int>::max();
+    } else {
+      options->write_buffer_size = churn_bytes;
+      // Flushed intents files are small and mostly cancel out; merge them early.
+      options->level0_file_num_compaction_trigger = 2;
+      options->compaction_options_universal.min_merge_width = 2;
+    }
   }
   regular_options_.create_if_missing = fresh && seed.empty();
   regular_options_.create_missing_column_families = fresh;
@@ -112,10 +147,7 @@ Status PgLocalStorage::Initialize(const std::string& directory, const std::strin
     RETURN_NOT_OK(rocksdb::DB::ListColumnFamilies(regular_options_, directory, &names));
   if (fresh) names.push_back(kMetadataFamily);
   std::vector<rocksdb::ColumnFamilyDescriptor> descriptors;
-  for (const auto& name : names) {
-    const bool intents = name.starts_with("i/") || name.starts_with("intents/");
-    descriptors.emplace_back(name, intents ? intents_options_ : regular_options_);
-  }
+  for (const auto& name : names) descriptors.emplace_back(name, FamilyOptions(name));
   std::vector<rocksdb::ColumnFamilyHandle*> handles;
   rocksdb::DB* db;
   RETURN_NOT_OK(rocksdb::DB::Open(regular_options_, directory, descriptors, &handles, &db));
@@ -152,6 +184,19 @@ Status PgLocalStorage::Initialize(const std::string& directory, const std::strin
   return Write(&batch, true);
 }
 
+const rocksdb::Options& PgLocalStorage::FamilyOptions(const std::string& name) const {
+  if (name.starts_with("i/") || name.starts_with("intents/")) return intents_options_;
+  // Shared metadata and the native transaction store's status records.
+  if (name == kMetadataFamily || name == "local-native-transactions") return churn_options_;
+  return regular_options_;
+}
+
+Status PgLocalStorage::FlushFamily(rocksdb::ColumnFamilyHandle* family) {
+  rocksdb::FlushOptions options;
+  options.wait = false;
+  return db_->Flush(options, family);
+}
+
 rocksdb::ColumnFamilyHandle* PgLocalStorage::metadata() const {
   return families_.at(kMetadataFamily).get();
 }
@@ -160,8 +205,7 @@ Result<rocksdb::ColumnFamilyHandle*> PgLocalStorage::CreateFamily(const std::str
   RETURN_NOT_OK(Status(failure_));
   SCHECK(!families_.contains(name), AlreadyPresent, "Column family already exists");
   rocksdb::ColumnFamilyHandle* handle;
-  const bool intents = name.starts_with("i/") || name.starts_with("intents/");
-  failure_ = db_->CreateColumnFamily(intents ? intents_options_ : regular_options_, name, &handle);
+  failure_ = db_->CreateColumnFamily(FamilyOptions(name), name, &handle);
   RETURN_NOT_OK(Status(failure_));
   families_.emplace(name, std::unique_ptr<rocksdb::ColumnFamilyHandle>(handle));
   return handle;

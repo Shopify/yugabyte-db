@@ -34,6 +34,8 @@ class PgLocalStorage {
   rocksdb::DB* db() const { return db_.get(); }
   rocksdb::ColumnFamilyHandle* metadata() const;
   const auto& families() const { return families_; }
+  // Starts a background flush of one family; a failure leaves its memtable in place.
+  Status FlushFamily(rocksdb::ColumnFamilyHandle* family);
   Result<rocksdb::ColumnFamilyHandle*> CreateFamily(const std::string& name);
   Status DropFamily(const std::string& name);
   std::recursive_mutex& mutex() { return mutex_; }
@@ -56,8 +58,11 @@ class PgLocalStorage {
  private:
   Status Initialize(const std::string& directory, const std::string& seed);
   std::recursive_mutex mutex_;
+  const rocksdb::Options& FamilyOptions(const std::string& name) const;
+
   rocksdb::Options regular_options_;
   rocksdb::Options intents_options_;
+  rocksdb::Options churn_options_;
   std::unique_ptr<rocksdb::DB> db_;
   std::unordered_map<std::string, std::unique_ptr<rocksdb::ColumnFamilyHandle>> families_;
   HybridTime clock_ = HybridTime::kInitial;
