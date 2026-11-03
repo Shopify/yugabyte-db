@@ -85,7 +85,8 @@ PgLocalStorage::~PgLocalStorage() {
     const bool intents = name.starts_with("intents/") || name.starts_with("i/");
     bytes[rows ? "rows" : intents ? "intents" : name] += size;
   }
-  LOG(INFO) << "Local storage memtable bytes: " << AsString(bytes);
+  LOG(INFO) << "Local storage memtable bytes: " << AsString(bytes) << ", writes: " << writes_
+            << ", synced: " << synced_writes_ << ", family changes: " << family_changes_;
 }
 
 std::string PgLocalStorage::MetadataKey(const std::string& name) {
@@ -205,6 +206,7 @@ Result<rocksdb::ColumnFamilyHandle*> PgLocalStorage::CreateFamily(const std::str
   RETURN_NOT_OK(Status(failure_));
   SCHECK(!families_.contains(name), AlreadyPresent, "Column family already exists");
   rocksdb::ColumnFamilyHandle* handle;
+  ++family_changes_;
   failure_ = db_->CreateColumnFamily(FamilyOptions(name), name, &handle);
   RETURN_NOT_OK(Status(failure_));
   families_.emplace(name, std::unique_ptr<rocksdb::ColumnFamilyHandle>(handle));
@@ -218,6 +220,7 @@ Status PgLocalStorage::DropFamily(const std::string& name) {
   SCHECK(
       name != kMetadataFamily && name != rocksdb::kDefaultColumnFamilyName, InvalidArgument,
       "Cannot drop shared metadata or catalogs");
+  ++family_changes_;
   failure_ = db_->DropColumnFamily(it->second.get());
   RETURN_NOT_OK(Status(failure_));
   families_.erase(it);
@@ -247,6 +250,8 @@ Status PgLocalStorage::Write(rocksdb::WriteBatch* batch, bool sync, HybridTime c
       std::to_string((commit_time.is_valid() ? commit_time : committed_).ToUint64()));
   rocksdb::WriteOptions options;
   options.sync = sync;
+  ++writes_;
+  if (sync) ++synced_writes_;
   failure_ = db_->Write(options, batch);
   RETURN_NOT_OK(Status(failure_));
   if (commit_time.is_valid()) committed_ = commit_time;
