@@ -41,7 +41,9 @@
 #include "yb/docdb/docdb_rocksdb_util.h"
 #include "yb/docdb/pgsql_operation.h"
 #include "yb/docdb/ql_rocksdb_storage.h"
+#include "yb/rpc/inbound_call.h"
 #include "yb/rpc/messenger.h"
+#include "yb/rpc/rpc_service.h"
 #include "yb/rpc/scheduler.h"
 #include "yb/rpc/sidecars.h"
 #include "yb/rpc/yb_rpc.h"
@@ -62,6 +64,7 @@
 #include "yb/util/pb_util.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/sync_point.h"
+#include "yb/util/thread_restrictions.h"
 #include "yb/util/uuid.h"
 #include "yb/yql/pgwrapper/pg_wrapper.h"
 #include "yb/yql/pggate/util/pg_wire.h"
@@ -85,8 +88,46 @@ DECLARE_bool(ysql_yb_enable_alter_table_rewrite);
 DECLARE_bool(ysql_yb_enable_ddl_atomicity_infra);
 DECLARE_bool(ysql_yb_enable_ddl_savepoint_infra);
 
+METRIC_DECLARE_event_stats(rpc_incoming_queue_time);
+
+DEFINE_NON_RUNTIME_bool(local_runtime_inline_rpc, true,
+    "Handle local runtime RPCs on the reactor thread instead of a service thread pool.");
+
 namespace yb::local_runtime {
 namespace {
+
+// Every handler serializes on the service mutex and never waits for another call (out-of-order
+// requests are parked, not awaited), so a thread-pool hop adds two cross-thread wakeups per call
+// and no concurrency. Handlers do storage I/O, which reactor threads otherwise forbid.
+class InlineService : public rpc::RpcService {
+ public:
+  InlineService(rpc::ServiceIfPtr service, const scoped_refptr<MetricEntity>& entity)
+      : service_(std::move(service)),
+        queue_time_(METRIC_rpc_incoming_queue_time.Instantiate(entity)) {}
+
+  void FillEndpoints(rpc::RpcEndpointMap* map) override {
+    service_->FillEndpoints(rpc::RpcServicePtr(this), map);
+  }
+
+  void Process(rpc::InboundCallPtr call, rpc::Queue) override {
+    call->RecordHandlingStarted(queue_time_);
+    if (PREDICT_FALSE(call->ClientTimedOut())) {
+      call->RespondTimedOutIfPending("Call timed out before local handling");
+      return;
+    }
+    if (!call->TryStartProcessing()) return;
+    ThreadRestrictions::ScopedAllowIO allow_io;
+    ThreadRestrictions::ScopedAllowWait allow_wait;
+    service_->Handle(std::move(call));
+  }
+
+  void StartShutdown() override { service_->Shutdown(); }
+  void CompleteShutdown() override {}
+
+ private:
+  const rpc::ServiceIfPtr service_;
+  const scoped_refptr<EventStats> queue_time_;
+};
 
 constexpr auto kOwnerMarker = "yb-local-readonly-v2\n";
 std::mutex runtime_mutex;
@@ -1003,10 +1044,8 @@ class ReadonlyService : public UnsupportedPgClientService,
     const auto it = sessions_.find(id);
     SCHECK(it != sessions_.end(), InvalidArgument, "Unknown local session");
     auto session = it->second;
-    if (kill(session->pid, 0) != 0 && errno == ESRCH) {
-      RetireSession(*session);
-      return STATUS(InvalidArgument, "Local backend has exited");
-    }
+    // A call on the session's own connection shows its backend is alive. Exited backends are
+    // retired when a session is created or another session needs exclusive ownership.
     if (!catalog_.failure_.ok()) CancelPending(*session, catalog_.failure_);
     return catalog_.failure_;
   }
@@ -1137,6 +1176,11 @@ class ReadonlyService : public UnsupportedPgClientService,
     if (!CheckSession(id).ok()) return;
     auto session = sessions_.at(id);
     session->timer_armed = false;
+    // An exited backend never sends the predecessor that would release its parked requests.
+    if (kill(session->pid, 0) != 0 && errno == ESRCH) {
+      RetireSession(*session);
+      return;
+    }
     const auto now = CoarseMonoClock::Now();
     for (const auto& [serial, call] : session->pending) {
       if (call.deadline <= now) {
@@ -2032,7 +2076,12 @@ class ReadonlyPgServer::Impl : public pgwrapper::PgWrapperContext {
     RETURN_NOT_OK(rpc_server_->Init(messenger_.get()));
     service_ = std::make_shared<ReadonlyService>(
         entity_, catalog_, messenger_->scheduler(), [this] { PublishVersions(); });
-    RETURN_NOT_OK(rpc_server_->RegisterService(64, service_));
+    if (FLAGS_local_runtime_inline_rpc) {
+      RETURN_NOT_OK(messenger_->RegisterService(
+          service_->service_name(), make_scoped_refptr<InlineService>(service_, entity_)));
+    } else {
+      RETURN_NOT_OK(rpc_server_->RegisterService(64, service_));
+    }
     RETURN_NOT_OK(rpc_server_->Start());
     {
       auto data = shared_memory_.SharedData();

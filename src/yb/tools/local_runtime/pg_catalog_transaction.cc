@@ -548,6 +548,7 @@ class PgCatalogTransaction::Impl {
     rocksdb::WriteBatch reservation;
     reservation.Put(MetadataFamily(), key, std::to_string(end));
     failure_ = storage_->Write(&reservation, true);
+    ++metadata_generation_;
     TEST_SYNC_POINT_CALLBACK("PgCatalogTransaction::OidReservationStatus", &failure_);
     RETURN_NOT_OK(Status(failure_));
     range = {oid, end};
@@ -576,6 +577,7 @@ class PgCatalogTransaction::Impl {
     TEST_SYNC_POINT("PgCatalogTransaction::BeforeSequenceWrite");
     // Never publishes a commit time: sequence state is independent of SQL commit visibility.
     failure_ = storage_->Write(batch, true);
+    ++metadata_generation_;
     TEST_SYNC_POINT_CALLBACK("PgCatalogTransaction::SequenceWriteStatus", &failure_);
     if (!failure_.ok()) return failure_.CloneAndPrepend("Sequence write outcome is unknown");
     return Status::OK();
@@ -702,6 +704,7 @@ class PgCatalogTransaction::Impl {
     const auto flush = [&]() -> Status {
       if (!batch.Count()) return Status::OK();
       failure_ = storage_->Write(&batch, true);
+      ++metadata_generation_;
       TEST_SYNC_POINT_CALLBACK("PgCatalogTransaction::SequenceCleanupBatch", &batch);
       TEST_SYNC_POINT_CALLBACK("PgCatalogTransaction::SequenceCleanupStatus", &failure_);
       RETURN_NOT_OK(Status(failure_));
@@ -777,6 +780,7 @@ class PgCatalogTransaction::Impl {
     SCHECK(!families_.contains(name), AlreadyPresent, "Local table already exists");
     RETURN_NOT_OK(SetSubtransaction(subtransaction));
     const auto next_column_id = VERIFY_RESULT(NextColumnId(metadata, true));
+    ++metadata_generation_;
     auto* family = VERIFY_RESULT(storage_->CreateFamily(name));
     families_.emplace(name, Family{family, std::make_unique<OverlayView>(db_, family, &pending_)});
     created_.insert(name);
@@ -951,6 +955,7 @@ class PgCatalogTransaction::Impl {
         {active_subtxn_, family, std::move(key), std::move(value), std::move(doc_key), write_id,
          deleted});
     const auto& entry = staged_.back();
+    ++metadata_generation_;
     if (entry.deleted)
       pending_.Delete(family, entry.key);
     else
@@ -962,6 +967,7 @@ class PgCatalogTransaction::Impl {
   }
 
   void Rebuild() {
+    ++metadata_generation_;
     pending_.Clear();
     for (const auto& entry : staged_) {
       if (entry.deleted)
@@ -1001,6 +1007,7 @@ class PgCatalogTransaction::Impl {
       std::erase_if(staged_, [family](const auto& entry) { return entry.family == family; });
       Rebuild();
       families_.at(name).view.reset();
+      ++metadata_generation_;
       RETURN_NOT_OK(storage_->DropFamily(name));
       families_.erase(name);
       created_.erase(name);
@@ -1067,6 +1074,7 @@ class PgCatalogTransaction::Impl {
       rocksdb::WriteBatch batch;
       const auto flush = [&]() -> Status {
         if (!batch.Count()) return Status::OK();
+        ++metadata_generation_;
         RETURN_NOT_OK(storage_->Write(&batch, true));
         TEST_SYNC_POINT_CALLBACK("PgCatalogTransaction::RetiredDatabaseCleanupBatch", &batch);
         batch.Clear();
@@ -1219,6 +1227,7 @@ class PgCatalogTransaction::Impl {
         "Catalog commit exceeds 16 MiB batch limit");
     TEST_SYNC_POINT("PgCatalogTransaction::BeforeCommit");
     failure_ = storage_->Write(&commit, true, commit_time);
+    ++metadata_generation_;
     TEST_SYNC_POINT_CALLBACK("PgCatalogTransaction::CommitStatus", &failure_);
     RETURN_NOT_OK(Status(failure_));
     catalog_latest_ = commit_time;
@@ -1271,6 +1280,7 @@ class PgCatalogTransaction::Impl {
     }
     pending_.Clear();
     staged_.clear();
+    ++metadata_generation_;
     aborted_ranges_.clear();
     highest_subtxn_ = 1;
     error_subtxn_ = 0;
@@ -1321,6 +1331,9 @@ class PgCatalogTransaction::Impl {
   bool active_ = false;
   bool aborted_ = false;
   bool preserve_deleted_bindings_ = false;
+  // Bumped by every change to staged or stored catalog metadata, so the native store can reuse
+  // table bindings without rereading descriptors while it is unchanged.
+  uint64_t metadata_generation_ = 0;
   // RETURN_NOT_OK moves non-const statuses; returning this fence must copy it.
   Status& failure_;
   // Catalog rows change only in catalog commits; data commits advance latest_ alone.
@@ -1365,7 +1378,8 @@ Result<std::unique_ptr<PgCatalogTransaction>> PgCatalogTransaction::Open(
             RETURN_NOT_OK(ptr->CheckHealthy());
             return ptr->StatementStatus(ptr->SetSubtransaction(subtransaction), subtransaction);
           },
-          [ptr = result->impl_.get()] { return ptr->pending_.GetWriteBatch()->GetDataSize(); }));
+          [ptr = result->impl_.get()] { return ptr->pending_.GetWriteBatch()->GetDataSize(); },
+          [ptr = result->impl_.get()] { return ptr->metadata_generation_; }));
   // Attachment releases native views and removes orphan intents before regular CF cleanup.
   std::lock_guard lock(storage->mutex());
   RETURN_NOT_OK(storage->AcquireCatalog(result->impl_.get()));
