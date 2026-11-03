@@ -44,7 +44,9 @@ class PgLocalStorage {
   Status Write(
       rocksdb::WriteBatch* batch, bool sync, HybridTime commit_time = HybridTime::kInvalid);
 
-  Status AcquireCatalog(const void* owner);
+  // Catalog ownership excludes independent data transactions. When adopting, the single active
+  // data transaction is the one being joined to the catalog transaction.
+  Status AcquireCatalog(const void* owner, bool adopting = false);
   void ReleaseCatalog(const void* owner);
   const void* catalog_owner() const { return catalog_owner_; }
   size_t active_data() const { return active_data_; }

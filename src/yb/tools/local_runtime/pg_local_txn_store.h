@@ -41,8 +41,11 @@ struct TransactionReadResult {
 // Attached SQL access uses authoritative catalog descriptors; the standalone PB API remains
 // restricted to immutable HASH schemas (INT64/INT32/STRING). Operations serialize; transactions
 // overlap. Catalog-owned transactions finish through the single-WAL catalog coordinator.
-// No RC/serializable execution, row locks, retries, or intent/history GC. Bounds: 65536 retained
-// transactions, 64 active, 1024 rollbacks per txn. Cumulative encoded intents: 512 MiB per attached
+// Independent SQL transactions read and resolve conflicts at the backend's read point (statement
+// or transaction snapshot, as PgGate selects); others use their begin time. No serializable
+// execution, row locks, waiting, retries, or intent/history GC. Transactions that wrote no
+// intents are forgotten when they finish. Bounds: 65536 retained transactions, 64 active, 1024
+// rollbacks per txn. Cumulative encoded intents: 512 MiB per attached
 // SQL txn, 16 MiB per standalone txn. Each encoded intent batch plus resident catalog pending
 // bytes is limited to 16 MiB; the catalog coordinator also limits its final WAL batch to 16 MiB.
 class PgLocalTxnStore {
@@ -52,6 +55,8 @@ class PgLocalTxnStore {
 
   Status CreateTable(const TableId& id, const Schema& schema, int32_t tablets);
   Result<TransactionId> Begin(uint64_t priority = 100);
+  // Independent attached SQL transaction. SERIALIZABLE is rejected rather than weakened.
+  Result<TransactionId> BeginSql(IsolationLevel isolation, uint64_t priority = 100);
   Result<ReadHybridTime> ReadPoint(const TransactionId& id);
   Status Write(
       const TransactionId& id, const PgsqlWriteRequestPB& request, PgsqlResponsePB* response,
@@ -59,13 +64,15 @@ class PgLocalTxnStore {
   Result<TransactionReadResult> Read(
       const TransactionId& id, const PgsqlReadRequestPB& request, size_t tablet,
       HybridTime own_write_limit = HybridTime::kInvalid);
+  // snapshot, when valid, replaces the begin time as the read point for others' commits.
   Status WriteSql(
       const TransactionId& id, const PgsqlWriteRequestMsg& request, PgsqlResponseMsg* response,
-      rpc::Sidecars* sidecars, uint32_t subtransaction);
+      rpc::Sidecars* sidecars, uint32_t subtransaction,
+      HybridTime snapshot = HybridTime::kInvalid);
   Status ReadSql(
       const TransactionId& id, const PgsqlReadRequestMsg& request, PgsqlResponseMsg* response,
       rpc::Sidecars* sidecars, CoarseTimePoint deadline, HybridTime own_limit,
-      uint32_t subtransaction = 1);
+      uint32_t subtransaction = 1, HybridTime snapshot = HybridTime::kInvalid);
   Status Commit(const TransactionId& id);
   Status Abort(const TransactionId& id);
   Status RollbackTo(const TransactionId& id, uint32_t subtransaction);
@@ -78,6 +85,8 @@ class PgLocalTxnStore {
       std::shared_ptr<PgLocalStorage> storage, const void* owner, TableLookup lookup,
       std::function<Status(uint32_t)> statement_start, std::function<size_t()> staged_bytes);
   Result<TransactionId> BeginCatalog(uint64_t priority);
+  // Joins an independent pending transaction to the catalog transaction that now owns storage.
+  Status AdoptCatalog(const TransactionId& id);
   Status AppendCatalogCommit(const TransactionId& id, HybridTime time, rocksdb::WriteBatch* batch);
   void CatalogCommitted(const TransactionId& id, HybridTime time);
   Status AbortCatalog(const TransactionId& id);

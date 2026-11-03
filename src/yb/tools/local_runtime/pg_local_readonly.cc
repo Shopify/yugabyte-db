@@ -735,7 +735,7 @@ class FrozenCatalog {
     SCHECK(
         transaction_ || !request.has_row_mark_type() || request.row_mark_type() == ROW_MARK_ABSENT,
         NotSupported, "Frozen catalog does not support row locks");
-    // Mutable catalog row locks are uncontended: no other SQL backend can be admitted.
+    // Mutable catalog row locks are uncontended: their requester holds the exclusive lease.
     SCHECK_EQ(
         request.metrics_capture(), PGSQL_METRICS_CAPTURE_NONE, NotSupported,
         "Frozen catalog metrics collection is not implemented");
@@ -892,6 +892,7 @@ class ReadonlyService : public UnsupportedPgClientService,
     void ResetTransaction() {
       txn_serial = 0;
       sql_serial = 0;
+      sql_active = false;
       native_txn.reset();
       autonomous = false;
       transaction_failed = false;
@@ -908,6 +909,14 @@ class ReadonlyService : public UnsupportedPgClientService,
     bool sequence_broken = false;
     uint64_t txn_serial = 0;
     uint64_t sql_serial = 0;
+    // Open SQL transaction, including read-only ones without native state, until its finish.
+    bool sql_active = false;
+    // Snapshot for this backend's independent reads and writes. Like PgClientSession, a new
+    // read_time_serial_no picks a new point: once per transaction for snapshot isolation, once per
+    // statement for READ COMMITTED.
+    uint64_t read_serial = 0;
+    HybridTime read_point;
+    // The joined catalog transaction for transaction_owner_, otherwise an independent one.
     std::optional<TransactionId> native_txn;
     bool autonomous = false;
     bool transaction_failed = false;
@@ -931,8 +940,15 @@ class ReadonlyService : public UnsupportedPgClientService,
   }
 
   Status AbortOwnedTransaction(Session& session) {
-    if (sql_owner_ == session.id) sql_owner_ = 0;
-    if (transaction_owner_ != session.id) return Status::OK();
+    if (exclusive_owner_ == session.id) exclusive_owner_ = 0;
+    if (transaction_owner_ != session.id) {
+      if (!session.native_txn) return Status::OK();
+      const auto id = *session.native_txn;
+      session.native_txn.reset();
+      // Conflict arbitration may already have aborted it; finished write-less ones are gone.
+      const auto status = catalog_.transaction_->NativeTransactions().Abort(id);
+      return status.IsNotFound() ? Status::OK() : status;
+    }
     CHECK(catalog_.transaction_);
     catalog_.transaction_->Abort();
     transaction_owner_ = 0;
@@ -995,27 +1011,49 @@ class ReadonlyService : public UnsupportedPgClientService,
     return catalog_.failure_;
   }
 
-  Status CheckSqlOwner(uint64_t id) {
+  // Fails while another backend holds the exclusive lease. Data transactions do not take it.
+  Status CheckExclusive(uint64_t id) {
     TEST_SYNC_POINT_CALLBACK("LocalRuntime::BeforeSqlOwnerCheck", &id);
-    if (sql_owner_ && sessions_.contains(sql_owner_)) {
-      const auto owner = sessions_.at(sql_owner_);
+    if (exclusive_owner_ && sessions_.contains(exclusive_owner_)) {
+      const auto owner = sessions_.at(exclusive_owner_);
       if (kill(owner->pid, 0) != 0 && errno == ESRCH) {
         // The requesting handler may retain only a Session&. Retire it on a later request.
         if (owner->id == id) return STATUS(Aborted, "Local backend has exited");
         RetireSession(*owner);
       }
     }
-    if (sql_owner_ && sql_owner_ != id) {
+    if (exclusive_owner_ && exclusive_owner_ != id) {
       return STATUS(
-          TryAgain, "Overlapping SQL transactions are not supported by the local runtime",
+          TryAgain, "Another local backend holds the exclusive catalog lease",
           TransactionError(TransactionErrorCode::kConflict));
     }
     return Status(catalog_.failure_);
   }
 
+  // Catalog changes and strong object locks require that no other backend has an open SQL
+  // transaction: the catalog overlay is shared, and the lease substitutes for the table locks
+  // those transactions would otherwise hold.
+  Status AcquireExclusive(Session& session) {
+    RETURN_NOT_OK(CheckExclusive(session.id));
+    if (exclusive_owner_ == session.id) return Status::OK();
+    for (auto it = sessions_.begin(); it != sessions_.end();) {
+      const auto other = (it++)->second;
+      if (other->id == session.id || !other->sql_active) continue;
+      if (kill(other->pid, 0) != 0 && errno == ESRCH) {
+        RetireSession(*other);
+        continue;
+      }
+      return STATUS(
+          TryAgain, "Concurrent SQL transactions block local catalog changes",
+          TransactionError(TransactionErrorCode::kConflict));
+    }
+    exclusive_owner_ = session.id;
+    return Status::OK();
+  }
+
   Status AcquireSqlTransaction(Session& session, const tserver::LWPgPerformOptionsPB& options) {
     if (!catalog_.transaction_) return Status::OK();
-    RETURN_NOT_OK(CheckSqlOwner(session.id));
+    RETURN_NOT_OK(CheckExclusive(session.id));
     if (options.connected_database_oid()) {
       SCHECK(
           session.database_oid == 0 || session.database_oid == options.connected_database_oid(),
@@ -1027,9 +1065,9 @@ class ReadonlyService : public UnsupportedPgClientService,
         options.is_using_table_locks(), NotSupported,
         "Local SQL requires native table locking and transaction-end notifications");
     SCHECK(
-        !sql_owner_ || session.sql_serial == options.txn_serial_no(), NotSupported,
+        !session.sql_active || session.sql_serial == options.txn_serial_no(), NotSupported,
         "SQL transaction end notification missing; reconnect required");
-    sql_owner_ = session.id;
+    session.sql_active = true;
     session.sql_serial = options.txn_serial_no();
     return Status::OK();
   }
@@ -1038,7 +1076,7 @@ class ReadonlyService : public UnsupportedPgClientService,
     if (id) RETURN_NOT_OK(CheckSession(id));
     RETURN_NOT_OK(Status(catalog_.failure_));
     // Legacy callers may see committed descriptors, never another backend's private DDL.
-    return CheckSqlOwner(id);
+    return CheckExclusive(id);
   }
 
   std::optional<uint64_t> Predecessor(const tserver::PgPerformRequestMsg& req) const {
@@ -1198,8 +1236,12 @@ class ReadonlyService : public UnsupportedPgClientService,
     DrainPending(*session);
   }
 
+  // Catalog work joins the single catalog transaction under the exclusive lease, adopting any
+  // independent data transaction this backend already started. Other work uses an independent
+  // native transaction, concurrent with other backends.
   Status EnsureTransaction(
-      Session& session, const tserver::LWPgPerformOptionsPB& options, bool read_only = false) {
+      Session& session, const tserver::LWPgPerformOptionsPB& options, bool read_only = false,
+      bool catalog = true) {
     SCHECK(catalog_.transaction_, NotSupported, "Local catalog server is read-only");
     SCHECK(!session.transaction_failed, IllegalState, "Local transaction requires rollback");
     RETURN_NOT_OK(AcquireSqlTransaction(session, options));
@@ -1218,15 +1260,32 @@ class ReadonlyService : public UnsupportedPgClientService,
           read_only || options.isolation() != IsolationLevel::NON_TRANSACTIONAL, NotSupported,
           "Nontransactional application writes are not supported");
     }
-    SCHECK(
-        transaction_owner_ == 0 || transaction_owner_ == session.id, NotSupported,
-        "Another local backend owns the catalog transaction");
-    if (!catalog_.transaction_->active()) {
-      session.native_txn = VERIFY_RESULT(catalog_.transaction_->BeginWithNative());
+    if (catalog && transaction_owner_ != session.id) {
+      RETURN_NOT_OK(AcquireExclusive(session));
+      SCHECK(
+          transaction_owner_ == 0 && !catalog_.transaction_->active(), NotSupported,
+          "Another local backend owns the catalog transaction");
+      if (session.native_txn) {
+        SCHECK_EQ(
+            session.txn_serial, options.txn_serial_no(), NotSupported,
+            "Overlapping local transactions");
+        RETURN_NOT_OK(catalog_.transaction_->BeginAdoptingNative(*session.native_txn));
+      } else {
+        session.native_txn = VERIFY_RESULT(catalog_.transaction_->BeginWithNative());
+        session.txn_serial = options.txn_serial_no();
+      }
       transaction_owner_ = session.id;
-      session.txn_serial = options.txn_serial_no();
       session.autonomous = false;
+    } else if (!session.native_txn) {
+      session.native_txn = VERIFY_RESULT(
+          catalog_.transaction_->NativeTransactions().BeginSql(
+              static_cast<IsolationLevel>(options.isolation())));
+      session.txn_serial = options.txn_serial_no();
     }
+    SCHECK(
+        transaction_owner_ == session.id ||
+            options.isolation() != IsolationLevel::SERIALIZABLE_ISOLATION,
+        NotSupported, "SERIALIZABLE isolation is not supported by the local runtime");
     SCHECK_EQ(
         session.txn_serial, options.txn_serial_no(), NotSupported,
         "Overlapping local transactions");
@@ -1254,7 +1313,8 @@ class ReadonlyService : public UnsupportedPgClientService,
 
   Status DropDatabase(Session& session, const tserver::PgDropDatabaseRequestPB& request) {
     SCHECK(
-        catalog_.transaction_ && transaction_owner_ == session.id && sql_owner_ == session.id &&
+        catalog_.transaction_ && transaction_owner_ == session.id &&
+            exclusive_owner_ == session.id &&
             catalog_.transaction_->active(),
         NotSupported, "DROP DATABASE must share the catalog transaction");
     SCHECK(
@@ -1313,7 +1373,7 @@ class ReadonlyService : public UnsupportedPgClientService,
   }
 
   // Sequence tuples are nontransactional, so admission never starts the catalog transaction or
-  // takes the SQL lease. The lease gate still excludes callers while another backend holds it.
+  // takes the exclusive lease, but still excludes callers while another backend holds it.
   // Post-commit deletion (cleanup) runs after FinishTransaction released the lease, possibly to
   // another backend; it is idempotent, so only the backend's own database is checked.
   template <class Request>
@@ -1333,7 +1393,7 @@ class ReadonlyService : public UnsupportedPgClientService,
         database != catalog_.databases_.end() && database->second != "template0" &&
             database->second != "template1",
         NotSupported, "Sequences require a known nontemplate database");
-    RETURN_NOT_OK(CheckSqlOwner(session->id));
+    RETURN_NOT_OK(CheckExclusive(session->id));
     return id;
   }
 
@@ -1520,31 +1580,52 @@ class ReadonlyService : public UnsupportedPgClientService,
         "Historical reads are not available on a frozen catalog");
     // Start before selecting the statement limit, including read-only SQL transactions.
     // The native table-lock path guarantees a FinishTransaction even without data writes.
+    // Catalog mutations must be DDL, so DDL mode alone selects the catalog transaction.
+    const bool catalog = req.options().ddl_mode();
     for (const auto& op : req.ops()) {
       if (op.has_write()) {
-        RETURN_NOT_OK(EnsureTransaction(session, req.options()));
-      } else if (
-          op.has_read() && catalog_.transaction_ &&
-          VERIFY_RESULT_REF(catalog_.Find(op.read().table_id().ToBuffer())).application) {
-        RETURN_NOT_OK(EnsureTransaction(session, req.options(), true));
+        RETURN_NOT_OK(EnsureTransaction(session, req.options(), false, catalog));
+      } else if (op.has_read() && catalog_.transaction_) {
+        if (VERIFY_RESULT_REF(catalog_.Find(op.read().table_id().ToBuffer())).application) {
+          RETURN_NOT_OK(EnsureTransaction(session, req.options(), true, catalog));
+        } else if (
+            op.read().has_row_mark_type() && op.read().row_mark_type() != ROW_MARK_ABSENT) {
+          // Catalog row locks are not resolved against other backends; exclude them instead.
+          RETURN_NOT_OK(AcquireExclusive(session));
+        }
       }
     }
-    auto statement_time = catalog_.ReadTime();
+    // One shared clock orders every backend. Own-write limits stay distinct from the snapshot.
+    auto statement_time =
+        catalog_.transaction_ ? catalog_.transaction_->Clock() : catalog_.ReadTime();
     if (catalog_.transaction_ && req.options().has_in_txn_limit_ht()) {
       const auto limit = HybridTime(req.options().in_txn_limit_ht().value());
       if (limit.is_valid() && !limit.is_special()) statement_time = limit;
       RETURN_NOT_OK(catalog_.transaction_->ValidateReadTime(statement_time));
       resp->set_used_in_txn_limit_ht(statement_time.ToUint64());
     }
-    // The exclusive SQL lease fixes committed state through FinishTransaction, including
-    // read-only SQL. Own-write statement limits remain distinct from the native snapshot.
-    if (req.options().read_time_options().has_read_time()) {
-      const auto time = ReadHybridTime::FromPB(req.options().read_time_options().read_time()).read;
+    const auto& read_options = req.options().read_time_options();
+    if (read_options.has_read_time()) {
+      const auto time = ReadHybridTime::FromPB(read_options.read_time()).read;
       if (catalog_.transaction_)
         RETURN_NOT_OK(catalog_.transaction_->ValidateReadTime(time));
       else
         SCHECK(time == catalog_.ReadTime(), NotSupported, "Historical reads are not supported");
     }
+    if (catalog_.transaction_) {
+      // Mirrors PgClientSession: an explicit read time wins, otherwise a changed serial (zero
+      // keeps the current point) selects the current clock.
+      const auto serial = read_options.read_time_serial_no();
+      if (read_options.has_read_time() && read_options.read_time().has_read_ht()) {
+        session.read_point = ReadHybridTime::FromPB(read_options.read_time()).read;
+      } else if (!session.read_point.is_valid() || (serial && serial != session.read_serial)) {
+        session.read_point = catalog_.transaction_->Clock();
+      }
+      if (serial) session.read_serial = serial;
+    }
+    // The catalog transaction excludes every other writer, so its begin time is its snapshot.
+    const auto snapshot =
+        transaction_owner_ == session.id ? HybridTime::kInvalid : session.read_point;
     if (catalog_.transaction_) {
       SCHECK(
           !req.options().read_time_options().restart_transaction() &&
@@ -1554,7 +1635,7 @@ class ReadonlyService : public UnsupportedPgClientService,
     size_t op_index = 0;
     for (const auto& op : req.ops()) {
       if (op.has_write()) {
-        RETURN_NOT_OK(EnsureTransaction(session, req.options()));
+        RETURN_NOT_OK(EnsureTransaction(session, req.options(), false, catalog));
         const auto& table = VERIFY_RESULT_REF(catalog_.Find(op.write().table_id().ToBuffer()));
         SCHECK(
             table.application || req.options().ddl_mode(), NotSupported,
@@ -1562,7 +1643,7 @@ class ReadonlyService : public UnsupportedPgClientService,
         if (table.application) {
           RETURN_NOT_OK(catalog_.transaction_->NativeTransactions().WriteSql(
               *session.native_txn, op.write(), resp->add_responses(), &context.sidecars(),
-              req.options().active_sub_transaction_id()));
+              req.options().active_sub_transaction_id(), snapshot));
         } else {
           RETURN_NOT_OK(catalog_.Write(
               op.write(), resp->add_responses(), &context.sidecars(),
@@ -1596,7 +1677,7 @@ class ReadonlyService : public UnsupportedPgClientService,
           RETURN_NOT_OK(catalog_.transaction_->NativeTransactions().ReadSql(
               *session.native_txn, op.read(), resp->add_responses(), &context.sidecars(),
               context.GetClientDeadline(), statement_time,
-              std::max(1u, req.options().active_sub_transaction_id())));
+              std::max(1u, req.options().active_sub_transaction_id()), snapshot));
           ++catalog_.reads_;
         } else {
           RETURN_NOT_OK(catalog_.Read(
@@ -1759,7 +1840,12 @@ class ReadonlyService : public UnsupportedPgClientService,
       status = STATUS(NotSupported, "Session object locks are not supported");
     }
     if (status.ok()) {
-      status = AcquireSqlTransaction(*sessions_.at(req->session_id()), req->options());
+      auto& session = *sessions_.at(req->session_id());
+      status = AcquireSqlTransaction(session, req->options());
+      // Data transactions only take weak locks, which never conflict with each other. Stronger
+      // modes stand in for catalog-level exclusion until the transaction finishes.
+      if (status.ok() && catalog_.transaction_ && req->lock_type() > tserver::ROW_EXCLUSIVE_LOCK)
+        status = AcquireExclusive(session);
     }
     Respond(status, resp, context);
   }
@@ -1772,9 +1858,20 @@ class ReadonlyService : public UnsupportedPgClientService,
     if (status.ok()) status = CheckNoPending(*sessions_.at(req->session_id()));
     if (status.ok()) {
       auto& session = *sessions_.at(req->session_id());
-      if (!catalog_.transaction_ || transaction_owner_ != session.id) {
+      if (catalog_.transaction_ && transaction_owner_ != session.id && session.native_txn) {
+        if (req->sub_transaction_id() == 0) {
+          status = STATUS(InvalidArgument, "Invalid subtransaction");
+        } else if (req->options().txn_serial_no() != session.txn_serial) {
+          status = STATUS(NotSupported, "Cannot roll back a different local transaction");
+        } else {
+          status = catalog_.transaction_->NativeTransactions().RollbackTo(
+              *session.native_txn, req->sub_transaction_id());
+          if (status.ok() && session.failed_subtxn >= req->sub_transaction_id())
+            session.transaction_failed = false;
+        }
+      } else if (!catalog_.transaction_ || transaction_owner_ != session.id) {
         // This backend has no mutable participant. A rejected contender must never roll
-        // back the current owner's catalog or release its SQL lease.
+        // back the current owner's catalog or release its exclusive lease.
         if (session.failed_subtxn >= req->sub_transaction_id()) session.transaction_failed = false;
         if (req->sub_transaction_id() == 0) {
           status = STATUS(InvalidArgument, "Invalid subtransaction");
@@ -1834,9 +1931,28 @@ class ReadonlyService : public UnsupportedPgClientService,
         }
       }
       if (!txn.active()) transaction_owner_ = 0;
+    } else if (
+        status.ok() && catalog_.transaction_ && sessions_.at(req->session_id())->native_txn) {
+      auto& session = *sessions_.at(req->session_id());
+      auto& native = catalog_.transaction_->NativeTransactions();
+      const auto id = *session.native_txn;
+      if (req->commit() && !session.transaction_failed) {
+        status = native.Commit(id);
+        // A pending transaction left behind would block every later catalog change.
+        if (!status.ok()) {
+          const auto abort = native.Abort(id);
+          if (!abort.ok() && !abort.IsNotFound() && !abort.IsIllegalState())
+            WARN_NOT_OK(abort, "Aborting uncommitted local transaction");
+        }
+      } else {
+        status = native.Abort(id);
+        // Conflict arbitration may already have aborted it; finished write-less ones are gone.
+        if (status.IsNotFound()) status = Status::OK();
+        if (status.ok() && req->commit()) status = STATUS(IllegalState, "Transaction was aborted");
+      }
     }
     if (sessions_.contains(req->session_id()) && transaction_owner_ != req->session_id()) {
-      if (sql_owner_ == req->session_id()) sql_owner_ = 0;
+      if (exclusive_owner_ == req->session_id()) exclusive_owner_ = 0;
       sessions_.at(req->session_id())->ResetTransaction();
     }
     Respond(status, resp, context);
@@ -1860,8 +1976,9 @@ class ReadonlyService : public UnsupportedPgClientService,
   // One overlay still owns all mutable descriptors. Never infer ownership from a session ID
   // being valid: per-session protocol state is not concurrent catalog isolation.
   uint64_t transaction_owner_ = 0;
-  // This lease covers SQL reads and object locks, even before a storage transaction exists.
-  uint64_t sql_owner_ = 0;
+  // Held from the first catalog change or strong object lock until the transaction finishes.
+  // Other backends' SQL requests fail while it is held, and it requires them to be idle.
+  uint64_t exclusive_owner_ = 0;
   uint64_t next_session_ = 0;
   std::unordered_map<uint64_t, std::shared_ptr<Session>> sessions_;
 };
@@ -1944,7 +2061,7 @@ class ReadonlyPgServer::Impl : public pgwrapper::PgWrapperContext {
       FLAGS_ysql_enable_object_locking_infra = true;
       FLAGS_enable_object_lock_fastpath = false;
       FLAGS_enable_object_locking_for_table_locks = true;
-      // Foreground index build holds the exclusive SQL transaction lease.
+      // Foreground index build holds the exclusive catalog lease.
       FLAGS_ysql_disable_index_backfill = true;
       // Match a newly initialized native universe, without relying on test-only AutoFlag promotion.
       // Unpacked template catalogs exceed the bounded atomic database-copy batch.

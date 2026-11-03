@@ -480,9 +480,12 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     RETURN_NOT_OK(Status(failure_));
     const auto it = txns_.find(id);
     SCHECK(it != txns_.end(), NotFound, "Unknown transaction");
-    SCHECK(
-        it->second.pb.status() == TransactionStatus::PENDING, Aborted,
-        "Transaction is no longer pending");
+    if (it->second.pb.status() != TransactionStatus::PENDING) {
+      // Conflict arbitration may abort another backend's transaction between its operations.
+      return STATUS(
+          Aborted, "Transaction is no longer pending",
+          TransactionError(TransactionErrorCode::kAborted));
+    }
     SCHECK(
         allow_failed || !it->second.pb.failed_subtransaction(), Aborted,
         "Statement failed; rollback required");
@@ -507,7 +510,8 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     return it->second.get();
   }
 
-  Result<TransactionId> Begin(uint64_t priority, bool catalog_owned = false) {
+  Result<TransactionId> Begin(
+      uint64_t priority, bool catalog_owned = false) {
     std::lock_guard lock(mutex_);
     RETURN_NOT_OK(Status(failure_));
     SCHECK(
@@ -538,9 +542,14 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     return id;
   }
 
-  ReadHybridTime ReadTime(const Txn& txn, HybridTime own_limit) const {
-    auto result = ReadHybridTime::FromUint64(txn.pb.read_ht());
-    result.in_txn_limit = own_limit.is_valid() ? own_limit : clock_;
+  // A SQL backend's read point is its statement or transaction snapshot, as PgGate selects; the
+  // transaction may begin after it. No own write precedes the read point of a transaction that
+  // began after it, so the own-write limit never needs to.
+  ReadHybridTime ReadTime(
+      const Txn& txn, HybridTime own_limit, HybridTime snapshot = HybridTime::kInvalid) const {
+    const auto read = snapshot.is_valid() ? snapshot : HybridTime(txn.pb.read_ht());
+    auto result = ReadHybridTime::SingleTime(read);
+    result.in_txn_limit = own_limit.is_valid() ? std::max(own_limit, read) : clock_;
     return result;
   }
 
@@ -607,14 +616,15 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
 
   Status WriteSql(
       const TransactionId& id, const PgsqlWriteRequestMsg& request, PgsqlResponseMsg* response,
-      rpc::Sidecars* sidecars, uint32_t subtransaction) {
+      rpc::Sidecars* sidecars, uint32_t subtransaction, HybridTime snapshot) {
     std::lock_guard lock(mutex_);
     SCHECK(response && sidecars, InvalidArgument, "Missing SQL response or sidecars");
     response->Clear();
     auto* txn = VERIFY_RESULT(Active(id));
     SCHECK(owner_, NotSupported, "SQL execution requires authoritative catalog descriptors");
     RETURN_NOT_OK(StartWrite(txn, subtransaction));
-    return FinishStatement(txn, DoWriteSql(txn, request, response, sidecars), *response);
+    return FinishStatement(
+        txn, DoWriteSql(txn, request, response, sidecars, snapshot), *response);
   }
 
   Status DoWrite(Txn* txn, const PgsqlWriteRequestPB& request, PgsqlResponsePB* response) {
@@ -657,14 +667,14 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     req.CopyFrom(normalized);
     LWPgsqlResponsePB resp(&arena);
     rpc::Sidecars sidecars;
-    const auto status = ExecuteWrite(txn, table, req, &resp, &sidecars);
+    const auto status = ExecuteWrite(txn, table, req, &resp, &sidecars, HybridTime::kInvalid);
     *response = resp.ToGoogleProtobuf();
     return status;
   }
 
   Status DoWriteSql(
       Txn* txn, const PgsqlWriteRequestMsg& request, PgsqlResponseMsg* response,
-      rpc::Sidecars* sidecars) {
+      rpc::Sidecars* sidecars, HybridTime snapshot) {
     SCHECK_EQ(request.client(), YQL_CLIENT_PGSQL, InvalidArgument, "Expected a YSQL request");
     SCHECK(
         request.stmt_type() == PgsqlWriteRequestPB::PGSQL_INSERT ||
@@ -693,12 +703,12 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
       RETURN_NOT_OK(
           dockv::InitPartitionKey(table->context->schema(), table->partition_schema, &normalized));
     }
-    return ExecuteWrite(txn, table, normalized, response, sidecars);
+    return ExecuteWrite(txn, table, normalized, response, sidecars, snapshot);
   }
 
   Status ExecuteWrite(
       Txn* txn, Table* table, const PgsqlWriteRequestMsg& request, PgsqlResponseMsg* response,
-      rpc::Sidecars* sidecars) {
+      rpc::Sidecars* sidecars, HybridTime snapshot) {
     ThreadSafeArena arena;
     auto sub = txn->subtransaction;
     sub.subtransaction_id = txn->current_subtransaction;
@@ -724,7 +734,7 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     RETURN_NOT_OK(
         docdb::ResolveTransactionConflicts(
             operations, docdb::FAIL_ON_CONFLICT, pairs, scope, write_time,
-            HybridTime(txn->pb.read_ht()), txn->metadata.pg_txn_start_us,
+            ReadTime(*txn, write_time, snapshot).read, txn->metadata.pg_txn_start_us,
             Env::Default()->NowMicros(), request_id_, table->DB(),
             dockv::PartialRangeKeyIntents::kTrue, this, metrics_holder_, &locks.lock_batch, nullptr,
             false, CoarseTimePoint::max(),
@@ -739,7 +749,8 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     ReadRestartData restart;
     docdb::DocOperationApplyData data{
         .doc_write_batch = &doc_batch,
-        .read_operation_data = docdb::ReadOperationData::FromReadTime(ReadTime(*txn, write_time)),
+        .read_operation_data =
+            docdb::ReadOperationData::FromReadTime(ReadTime(*txn, write_time, snapshot)),
         .read_restart_data = &restart,
         .schema_packing_provider = nullptr,
     };
@@ -892,7 +903,7 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
   Status ReadSql(
       const TransactionId& id, const PgsqlReadRequestMsg& request, PgsqlResponseMsg* response,
       rpc::Sidecars* sidecars, CoarseTimePoint deadline, HybridTime own_limit,
-      uint32_t subtransaction) {
+      uint32_t subtransaction, HybridTime snapshot) {
     std::lock_guard lock(mutex_);
     SCHECK(response && sidecars, InvalidArgument, "Missing SQL response or sidecars");
     response->Clear();
@@ -900,12 +911,14 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     SCHECK(owner_, NotSupported, "SQL execution requires authoritative catalog descriptors");
     RETURN_NOT_OK(StartWrite(txn, subtransaction));
     return FinishStatement(
-        txn, DoReadSql(txn, request, response, sidecars, deadline, own_limit), *response);
+        txn, DoReadSql(txn, request, response, sidecars, deadline, own_limit, snapshot),
+        *response);
   }
 
   Status DoReadSql(
       Txn* txn, const PgsqlReadRequestMsg& request, PgsqlResponseMsg* response,
-      rpc::Sidecars* sidecars, CoarseTimePoint deadline, HybridTime own_limit) {
+      rpc::Sidecars* sidecars, CoarseTimePoint deadline, HybridTime own_limit,
+      HybridTime snapshot) {
     SCHECK_EQ(request.client(), YQL_CLIENT_PGSQL, InvalidArgument, "Expected a YSQL request");
     SCHECK(
         !request.has_row_mark_type() || request.row_mark_type() == ROW_MARK_ABSENT, NotSupported,
@@ -930,13 +943,13 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     SCHECK(
         !page.has_table_id() || page.table_id() == request.table_id(), InvalidArgument,
         "Paging table mismatch");
-    auto time = ReadTime(*txn, own_limit);
+    auto time = ReadTime(*txn, own_limit, snapshot);
     if (page.has_read_time()) {
       const auto page_time = ReadHybridTime::FromPB(page.read_time());
       SCHECK(
           page_time.read == time.read && page_time.global_limit == time.global_limit &&
               page_time.local_limit == time.local_limit &&
-              (!own_limit.is_valid() || page_time.in_txn_limit == own_limit),
+              (!own_limit.is_valid() || page_time.in_txn_limit == time.in_txn_limit),
           NotSupported, "Historical native SQL paging is not supported");
       time = page_time;
     }
@@ -1064,10 +1077,28 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     return Status::OK();
   }
 
+  // Status is only consulted through intents, so a transaction that wrote none is unreferenced
+  // once it finishes. Retaining it would only consume the bounded transaction history.
+  bool Unreferenced(const Txn& txn) const {
+    return !txn.catalog_owned && txn.touched.empty() && txn.pb.intent_bytes() == 0;
+  }
+
+  Status Forget(Txn* txn) {
+    const auto id = txn->metadata.transaction_id;
+    rocksdb::WriteBatch batch;
+    batch.Delete(metadata_, MetaKey("tx/" + id.ToString()));
+    // Unsynced: a lost delete leaves a pending record that recovery marks aborted.
+    RETURN_NOT_OK(Persist(&batch, false));
+    if (txn->pb.status() == TransactionStatus::PENDING) storage_->DataFinished();
+    txns_.erase(id);
+    return Status::OK();
+  }
+
   Status Commit(const TransactionId& id) {
     std::lock_guard lock(mutex_);
     auto* txn = VERIFY_RESULT(Active(id));
     SCHECK(!txn->catalog_owned, NotSupported, "Finish through the catalog coordinator");
+    if (Unreferenced(*txn)) return Forget(txn);
     auto next = txn->pb;
     next.set_commit_ht(VERIFY_RESULT(Tick()).ToUint64());
     next.set_status(TransactionStatus::COMMITTED);
@@ -1091,6 +1122,7 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
         txn.pb.status() != TransactionStatus::COMMITTED, IllegalState,
         "Cannot abort a committed transaction");
     if (txn.pb.status() == TransactionStatus::ABORTED) return Status::OK();
+    if (Unreferenced(txn)) return Forget(&txn);
     auto next = txn.pb;
     next.set_status(TransactionStatus::ABORTED);
     return Save(&txn, std::move(next), true);
@@ -1102,13 +1134,11 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     SCHECK(
         !txn->catalog_owned || catalog_owned, NotSupported,
         "Rollback through the catalog coordinator");
-    SCHECK(
-        subtransaction > 0 &&
-            (catalog_owned || subtransaction <= txn->subtransaction.subtransaction_id),
-        InvalidArgument, "Invalid rollback subtransaction");
+    SCHECK(subtransaction > 0, InvalidArgument, "Invalid rollback subtransaction");
     SCHECK_LT(txn->pb.rollbacks(), 1024, NotSupported, "Subtransaction rollback limit reached");
+    // SQL may roll back to a savepoint this store never saw: no request used it or any later one.
     auto sub = txn->subtransaction;
-    if (catalog_owned) sub.subtransaction_id = std::max(sub.subtransaction_id, subtransaction);
+    sub.subtransaction_id = std::max(sub.subtransaction_id, subtransaction);
     RETURN_NOT_OK(sub.aborted.SetRange(subtransaction, sub.subtransaction_id));
     auto next = txn->pb;
     next.set_rollbacks(next.rollbacks() + 1);
@@ -1265,6 +1295,14 @@ Status PgLocalTxnStore::CreateTable(const TableId& id, const Schema& schema, int
   return impl_->CreateTable(id, schema, tablets);
 }
 Result<TransactionId> PgLocalTxnStore::Begin(uint64_t priority) { return impl_->Begin(priority); }
+Result<TransactionId> PgLocalTxnStore::BeginSql(IsolationLevel isolation, uint64_t priority) {
+  SCHECK(impl_->owner_, NotSupported, "SQL transactions require catalog descriptors");
+  // Concurrent snapshot transactions would admit write skew, so do not weaken SERIALIZABLE.
+  SCHECK(
+      isolation != IsolationLevel::SERIALIZABLE_ISOLATION, NotSupported,
+      "SERIALIZABLE isolation is not supported by the local runtime");
+  return impl_->Begin(priority);
+}
 Result<ReadHybridTime> PgLocalTxnStore::ReadPoint(const TransactionId& id) {
   return impl_->ReadPoint(id);
 }
@@ -1280,14 +1318,15 @@ Result<TransactionReadResult> PgLocalTxnStore::Read(
 }
 Status PgLocalTxnStore::WriteSql(
     const TransactionId& id, const PgsqlWriteRequestMsg& request, PgsqlResponseMsg* response,
-    rpc::Sidecars* sidecars, uint32_t subtransaction) {
-  return impl_->WriteSql(id, request, response, sidecars, subtransaction);
+    rpc::Sidecars* sidecars, uint32_t subtransaction, HybridTime snapshot) {
+  return impl_->WriteSql(id, request, response, sidecars, subtransaction, snapshot);
 }
 Status PgLocalTxnStore::ReadSql(
     const TransactionId& id, const PgsqlReadRequestMsg& request, PgsqlResponseMsg* response,
     rpc::Sidecars* sidecars, CoarseTimePoint deadline, HybridTime own_limit,
-    uint32_t subtransaction) {
-  return impl_->ReadSql(id, request, response, sidecars, deadline, own_limit, subtransaction);
+    uint32_t subtransaction, HybridTime snapshot) {
+  return impl_->ReadSql(
+      id, request, response, sidecars, deadline, own_limit, subtransaction, snapshot);
 }
 Status PgLocalTxnStore::Commit(const TransactionId& id) { return impl_->Commit(id); }
 Status PgLocalTxnStore::Abort(const TransactionId& id) {
@@ -1320,6 +1359,15 @@ Result<std::unique_ptr<PgLocalTxnStore>> PgLocalTxnStore::Attach(
 }
 Result<TransactionId> PgLocalTxnStore::BeginCatalog(uint64_t priority) {
   return impl_->Begin(priority, true);
+}
+Status PgLocalTxnStore::AdoptCatalog(const TransactionId& id) {
+  auto* txn = VERIFY_RESULT(impl_->Active(id));
+  SCHECK(
+      !txn->catalog_owned && impl_->storage_->catalog_owner() == impl_->owner_, IllegalState,
+      "Catalog adoption requires the catalog owner");
+  // Begin already counted this transaction as active data; CatalogCommitted/abort finish it.
+  txn->catalog_owned = true;
+  return Status::OK();
 }
 Status PgLocalTxnStore::AppendCatalogCommit(
     const TransactionId& id, HybridTime time, rocksdb::WriteBatch* batch) {
