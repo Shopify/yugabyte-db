@@ -73,9 +73,10 @@ class PgCatalogTransaction {
       uint32_t oid, const std::string& name,
       const std::vector<tablet::TableInfoPB>& source_catalogs, uint32_t subtransaction);
   // Retire a cloned database atomically with shared SQL database/version/dependency deletes.
-  // Caller holds an exclusive SQL lease with no target backend/snapshot. Commit reclaims retired
-  // catalog versions in bounded WAL batches before releasing ownership; Open resumes interrupted
-  // cleanup. Retired database OIDs cannot be reused, but names can be reused with a fresh OID.
+  // Caller holds the exclusive catalog lease with no target backend/snapshot. Commit reclaims
+  // retired catalog versions in bounded WAL batches before releasing ownership; Open resumes
+  // interrupted cleanup. Retired database OIDs cannot be reused, but names can be reused with a
+  // fresh OID.
   Status DropDatabase(uint32_t oid, const std::string& name, uint32_t subtransaction);
   Result<std::vector<tablet::TableInfoPB>> CatalogTables();
   Status CreateTable(const tablet::TableInfoPB& metadata, uint32_t subtransaction);
@@ -85,6 +86,10 @@ class PgCatalogTransaction {
   Result<std::vector<tablet::TableInfoPB>> Tables();
   Result<tablet::TableInfoPB> GetTable(const TableId& id);
   HybridTime ReadTime() const;
+  // Current allocated clock, the upper bound of every local read point.
+  HybridTime Clock() const;
+  // Without an active catalog transaction, catalog state is fixed from the last catalog commit,
+  // so any time between it and the clock reads the same catalog.
   Status ValidateReadTime(HybridTime time) const;
   bool active() const;
   Status CheckHealthy() const;
@@ -92,6 +97,9 @@ class PgCatalogTransaction {
   // Internal integration gate: no other native transaction may exist. The joined transaction
   // cannot independently commit/abort; Commit/RollbackTo/Abort coordinate both participants.
   Result<TransactionId> BeginWithNative(uint64_t priority = 100);
+  // Starts the catalog transaction by joining the caller's independent native transaction, which
+  // must be the only active one. It then commits or aborts only with the catalog changes.
+  Status BeginAdoptingNative(const TransactionId& id);
   PgLocalTxnStore& NativeTransactions();
   Status Apply(
       const PgsqlWriteRequestMsg& request, const docdb::DocReadContextPtr& context,
