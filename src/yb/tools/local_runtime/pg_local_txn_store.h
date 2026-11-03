@@ -84,7 +84,8 @@ class PgLocalTxnStore {
   using TableLookup = std::function<Result<tablet::TableInfoPB>(const TableId&)>;
   static Result<std::unique_ptr<PgLocalTxnStore>> Attach(
       std::shared_ptr<PgLocalStorage> storage, const void* owner, TableLookup lookup,
-      std::function<Status(uint32_t)> statement_start, std::function<size_t()> staged_bytes);
+      std::function<Status(uint32_t)> statement_start, std::function<size_t()> staged_bytes,
+      std::function<uint64_t()> catalog_generation);
   Result<TransactionId> BeginCatalog(uint64_t priority);
   // Joins an independent pending transaction to the catalog transaction that now owns storage.
   Status AdoptCatalog(const TransactionId& id);
