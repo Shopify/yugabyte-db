@@ -1259,13 +1259,6 @@ TEST_F(ReadonlyPgServerTest, ConcurrentSqlSessions) {
   ASSERT_OK(first.Execute("COMMIT"));
   ASSERT_EQ(ASSERT_RESULT(keys("k>=10")), "10,12");
 
-  ASSERT_OK(first.Execute("BEGIN"));
-  ASSERT_OK(first.Execute("SAVEPOINT row_lock"));
-  ASSERT_NOK(first.Fetch("SELECT * FROM lease_rows FOR UPDATE"));
-  ASSERT_OK(first.Execute("ROLLBACK TO row_lock"));
-  ASSERT_EQ(ASSERT_RESULT(read(first)), 30);
-  ASSERT_OK(first.Execute("COMMIT"));
-
   // A backend that exits mid-transaction loses its writes and stops blocking catalog changes.
   {
     auto exiting = ASSERT_RESULT(Connect(*server));
@@ -1289,6 +1282,97 @@ TEST_F(ReadonlyPgServerTest, ConcurrentSqlSessions) {
     ASSERT_EQ(ASSERT_RESULT(read(first)), 30);
     ASSERT_EQ(ASSERT_RESULT(keys("k<=4")), "1,2,3,4");
   }
+}
+
+TEST_F(ReadonlyPgServerTest, RowLocks) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_yb_enable_read_committed_isolation) = true;
+  auto server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          GetTestPath("row-locks"), Snapshot(), AllocateFreePort(),
+          CatalogMode::kSerializedTransactions));
+  auto locker = ASSERT_RESULT(Connect(*server));
+  auto other = ASSERT_RESULT(Connect(*server));
+  ASSERT_OK(locker.Execute("CREATE TABLE locked_rows(k bigint PRIMARY KEY, v bigint)"));
+  ASSERT_OK(locker.Execute("INSERT INTO locked_rows VALUES(1,10),(2,20),(3,30)"));
+  // A REPEATABLE READ snapshot taken first keeps the query layer from retrying the conflict.
+  const auto expect_conflict = [&other](const std::string& statement) -> Status {
+    RETURN_NOT_OK(other.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
+    RETURN_NOT_OK(other.Fetch("SELECT count(*) FROM locked_rows"));
+    const auto status = ResultToStatus(other.Fetch(statement));
+    RETURN_NOT_OK(other.Execute("ROLLBACK"));
+    SCHECK(!status.ok(), IllegalState, "Expected a row-lock conflict: " + statement);
+    SCHECK(
+        PgsqlError(status) == YBPgErrorCode::YB_PG_T_R_SERIALIZATION_FAILURE, IllegalState,
+        status.ToString());
+    return Status::OK();
+  };
+  const auto expect_allowed = [&other](const std::string& statement) -> Status {
+    RETURN_NOT_OK(other.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
+    const auto status = ResultToStatus(other.Fetch(statement));
+    RETURN_NOT_OK(other.Execute("ROLLBACK"));
+    return status;
+  };
+
+  // FOR UPDATE excludes writers and other lockers of that row only; plain reads still proceed,
+  // and the locker's own lock intents never mask its data.
+  ASSERT_OK(locker.Execute("BEGIN"));
+  ASSERT_EQ(
+      ASSERT_RESULT(locker.FetchRow<int64_t>("SELECT v FROM locked_rows WHERE k=1 FOR UPDATE")),
+      10);
+  ASSERT_EQ(ASSERT_RESULT(locker.FetchRow<int64_t>("SELECT v FROM locked_rows WHERE k=1")), 10);
+  ASSERT_OK(expect_conflict("UPDATE locked_rows SET v=11 WHERE k=1 RETURNING v"));
+  ASSERT_OK(expect_conflict("SELECT v FROM locked_rows WHERE k=1 FOR SHARE"));
+  ASSERT_OK(expect_allowed("SELECT v FROM locked_rows WHERE k=2 FOR UPDATE"));
+  ASSERT_OK(expect_allowed("SELECT v FROM locked_rows WHERE k=1"));
+  ASSERT_NOK(other.Fetch("SELECT v FROM locked_rows WHERE k=1 FOR UPDATE NOWAIT"));
+  ASSERT_EQ(
+      ASSERT_RESULT(other.FetchAllAsString(
+          "SELECT k FROM locked_rows ORDER BY k FOR UPDATE SKIP LOCKED")),
+      "2; 3");
+  ASSERT_OK(locker.Execute("COMMIT"));
+  ASSERT_OK(expect_allowed("UPDATE locked_rows SET v=11 WHERE k=1 RETURNING v"));
+
+  // Shared modes are mutually compatible; FOR KEY SHARE conflicts only with FOR UPDATE.
+  ASSERT_OK(locker.Execute("BEGIN"));
+  ASSERT_OK(locker.Fetch("SELECT v FROM locked_rows WHERE k=1 FOR SHARE"));
+  ASSERT_OK(expect_allowed("SELECT v FROM locked_rows WHERE k=1 FOR SHARE"));
+  ASSERT_OK(expect_conflict("UPDATE locked_rows SET v=12 WHERE k=1 RETURNING v"));
+  ASSERT_OK(locker.Execute("COMMIT"));
+  ASSERT_OK(locker.Execute("BEGIN"));
+  ASSERT_OK(locker.Fetch("SELECT v FROM locked_rows WHERE k=1 FOR KEY SHARE"));
+  ASSERT_OK(expect_allowed("SELECT v FROM locked_rows WHERE k=1 FOR NO KEY UPDATE"));
+  ASSERT_OK(expect_conflict("SELECT v FROM locked_rows WHERE k=1 FOR UPDATE"));
+  ASSERT_OK(locker.Execute("COMMIT"));
+
+  // A full-scan lock covers every row it read.
+  ASSERT_OK(locker.Execute("BEGIN"));
+  ASSERT_EQ(ASSERT_RESULT(locker.FetchAllAsString("SELECT k FROM locked_rows FOR UPDATE")).size(),
+            ASSERT_RESULT(locker.FetchAllAsString("SELECT k FROM locked_rows")).size());
+  ASSERT_OK(expect_conflict("UPDATE locked_rows SET v=21 WHERE k=2 RETURNING v"));
+  ASSERT_OK(locker.Execute("COMMIT"));
+
+  // Rollback and savepoint rollback release locks.
+  ASSERT_OK(locker.Execute("BEGIN"));
+  ASSERT_OK(locker.Fetch("SELECT v FROM locked_rows WHERE k=3 FOR UPDATE"));
+  ASSERT_OK(locker.Execute("ROLLBACK"));
+  ASSERT_OK(expect_allowed("UPDATE locked_rows SET v=31 WHERE k=3 RETURNING v"));
+  ASSERT_OK(locker.Execute("BEGIN"));
+  ASSERT_OK(locker.Execute("SAVEPOINT unlock"));
+  ASSERT_OK(locker.Fetch("SELECT v FROM locked_rows WHERE k=3 FOR UPDATE"));
+  ASSERT_OK(locker.Execute("ROLLBACK TO unlock"));
+  ASSERT_OK(expect_allowed("UPDATE locked_rows SET v=32 WHERE k=3 RETURNING v"));
+  ASSERT_OK(locker.Execute("COMMIT"));
+
+  // A lock-only commit after another snapshot is a released lock, not a write conflict.
+  ASSERT_OK(other.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
+  // Every earlier probe rolled back, so the committed value is unchanged.
+  ASSERT_EQ(ASSERT_RESULT(other.FetchRow<int64_t>("SELECT v FROM locked_rows WHERE k=1")), 10);
+  ASSERT_OK(locker.Execute("BEGIN"));
+  ASSERT_OK(locker.Fetch("SELECT v FROM locked_rows WHERE k=1 FOR UPDATE"));
+  ASSERT_OK(locker.Execute("COMMIT"));
+  ASSERT_OK(other.Execute("UPDATE locked_rows SET v=13 WHERE k=1"));
+  ASSERT_OK(other.Execute("COMMIT"));
+  ASSERT_EQ(ASSERT_RESULT(locker.FetchRow<int64_t>("SELECT v FROM locked_rows WHERE k=1")), 13);
 }
 
 TEST_F(ReadonlyPgServerTest, CatalogSavepointsAndSessionFence) {
