@@ -59,6 +59,7 @@
 #include "yb/util/test_util.h"
 #include "yb/yql/pgwrapper/libpq_utils.h"
 
+DECLARE_bool(yb_enable_read_committed_isolation);
 DECLARE_string(ysql_sequence_cache_method);
 
 namespace yb::local_runtime {
@@ -621,6 +622,8 @@ TEST_F(ReadonlyPgServerTest, CatalogReloadFailureIsFailStop) {
       ASSERT_OK(c.Execute("INSERT INTO cache_rows VALUES(1,10)"));
       ASSERT_OK(c.Execute("BEGIN"));
       ASSERT_OK(c.Execute("UPDATE cache_rows SET v=20 WHERE k=1"));
+      // Only catalog transactions rebuild descriptors on rollback; DDL adopts the data write.
+      ASSERT_OK(c.Execute("ALTER TABLE cache_rows ADD COLUMN extra bigint"));
       ASSERT_OK(c.Execute("SAVEPOINT s"));
       ASSERT_OK(c.Execute("UPDATE cache_rows SET v=30 WHERE k=1"));
       auto* sync = SyncPoint::GetInstance();
@@ -1144,61 +1147,147 @@ TEST_F(ReadonlyPgServerTest, CatalogCommitCrashRecovery) {
   }
 }
 
-TEST_F(ReadonlyPgServerTest, SerializedSqlSessions) {
+TEST_F(ReadonlyPgServerTest, ConcurrentSqlSessions) {
+  // Release builds default to native READ COMMITTED; pin it so every build checks one contract.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_yb_enable_read_committed_isolation) = true;
   auto server = ASSERT_RESULT(
       ReadonlyPgServer::Start(
-          GetTestPath("serialized-sql"), Snapshot(), AllocateFreePort(),
+          GetTestPath("concurrent-sql"), Snapshot(), AllocateFreePort(),
           CatalogMode::kSerializedTransactions));
   auto first = ASSERT_RESULT(Connect(*server));
   ASSERT_OK(first.Execute("CREATE TABLE lease_rows(k bigint PRIMARY KEY,v bigint)"));
   ASSERT_OK(first.Execute("CREATE UNIQUE INDEX lease_value ON lease_rows(v)"));
   ASSERT_OK(first.Execute("INSERT INTO lease_rows VALUES(1,10)"));
   auto second = ASSERT_RESULT(Connect(*server));
-  ASSERT_OK(first.Execute("PREPARE lease_read AS SELECT v FROM lease_rows WHERE k=1"));
-  ASSERT_EQ(ASSERT_RESULT(first.FetchRow<int64_t>("EXECUTE lease_read")), 10);
-  for (const auto& end : {"COMMIT", "ROLLBACK"}) {
-    ASSERT_OK(first.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"));
-    ASSERT_EQ(ASSERT_RESULT(first.FetchRow<int64_t>("EXECUTE lease_read")), 10);
-    ASSERT_OK(second.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
-    const auto conflict = second.Execute("UPDATE lease_rows SET v=20 WHERE k=1");
+  for (auto* connection : {&first, &second})
+    ASSERT_OK(connection->Execute("PREPARE lease_read AS SELECT v FROM lease_rows WHERE k=1"));
+  const auto read = [](pgwrapper::PGConn& connection) {
+    return connection.FetchRow<int64_t>("EXECUTE lease_read");
+  };
+  const auto keys = [&second](const std::string& where) {
+    return second.FetchRow<std::string>(
+        "SELECT coalesce(string_agg(k::text, ',' ORDER BY k), '') FROM lease_rows WHERE " + where);
+  };
+
+  // A snapshot reader neither blocks a writer nor sees its later commit.
+  ASSERT_OK(first.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"));
+  ASSERT_EQ(ASSERT_RESULT(read(first)), 10);
+  ASSERT_OK(second.Execute("UPDATE lease_rows SET v=20 WHERE k=1"));
+  ASSERT_EQ(ASSERT_RESULT(read(first)), 10);
+  ASSERT_OK(first.Execute("COMMIT"));
+  ASSERT_EQ(ASSERT_RESULT(read(first)), 20);
+
+  // READ COMMITTED statements read and update as of their own start.
+  ASSERT_OK(first.Execute("BEGIN ISOLATION LEVEL READ COMMITTED"));
+  ASSERT_EQ(ASSERT_RESULT(read(first)), 20);
+  ASSERT_OK(second.Execute("UPDATE lease_rows SET v=21 WHERE k=1"));
+  ASSERT_EQ(ASSERT_RESULT(read(first)), 21);
+  ASSERT_OK(first.Execute("UPDATE lease_rows SET v=v+1 WHERE k=1"));
+  ASSERT_OK(first.Execute("COMMIT"));
+  ASSERT_EQ(ASSERT_RESULT(read(second)), 22);
+
+  // Disjoint writers commit concurrently, in either order.
+  ASSERT_OK(first.Execute("BEGIN"));
+  ASSERT_OK(second.Execute("BEGIN"));
+  ASSERT_OK(first.Execute("INSERT INTO lease_rows VALUES(2,200)"));
+  ASSERT_OK(second.Execute("INSERT INTO lease_rows VALUES(3,300)"));
+  ASSERT_OK(second.Execute("COMMIT"));
+  ASSERT_OK(first.Execute("COMMIT"));
+  ASSERT_EQ(ASSERT_RESULT(keys("true")), "1,2,3");
+
+  // Overlapping row and unique-index writes fail rather than wait, and the loser continues
+  // after a savepoint rollback.
+  ASSERT_OK(first.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
+  ASSERT_OK(first.Execute("UPDATE lease_rows SET v=30 WHERE k=1"));
+  ASSERT_OK(first.Execute("INSERT INTO lease_rows VALUES(4,400)"));
+  ASSERT_OK(second.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
+  for (const auto& statement :
+       {"UPDATE lease_rows SET v=40 WHERE k=1", "INSERT INTO lease_rows VALUES(5,400)"}) {
+    ASSERT_OK(second.Execute("SAVEPOINT attempt"));
+    const auto conflict = second.Execute(statement);
     ASSERT_NOK(conflict);
     ASSERT_EQ(PgsqlError(conflict), YBPgErrorCode::YB_PG_T_R_SERIALIZATION_FAILURE) << conflict;
-    ASSERT_OK(second.Execute("ROLLBACK"));
-    ASSERT_EQ(ASSERT_RESULT(first.FetchRow<int64_t>("EXECUTE lease_read")), 10);
-    ASSERT_OK(first.Execute(end));
-    ASSERT_OK(second.Execute("UPDATE lease_rows SET v=11 WHERE k=1"));
-    ASSERT_OK(second.Execute("UPDATE lease_rows SET v=10 WHERE k=1"));
+    ASSERT_OK(second.Execute("ROLLBACK TO attempt"));
   }
-  ASSERT_OK(second.Execute("ALTER TABLE lease_rows ADD CONSTRAINT positive CHECK(v>0)"));
-  ASSERT_EQ(ASSERT_RESULT(first.FetchRow<int64_t>("EXECUTE lease_read")), 10);
-  ASSERT_OK(first.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"));
-  ASSERT_GT(ASSERT_RESULT(first.FetchRow<int64_t>("SELECT count(*) FROM pg_class")), 0);
-  ASSERT_OK(first.Execute("SAVEPOINT retained"));
-  ASSERT_NOK(first.Fetch("SELECT * FROM absent_table"));
-  ASSERT_OK(first.Execute("ROLLBACK TO retained"));
-  ASSERT_OK(second.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
-  ASSERT_NOK(second.Execute("COMMENT ON TABLE lease_rows IS 'not published'"));
-  ASSERT_OK(second.Execute("ROLLBACK"));
+  ASSERT_OK(second.Execute("INSERT INTO lease_rows VALUES(6,600)"));
+  ASSERT_OK(second.Execute("COMMIT"));
   ASSERT_OK(first.Execute("COMMIT"));
+  ASSERT_EQ(ASSERT_RESULT(read(second)), 30);
+  ASSERT_EQ(ASSERT_RESULT(keys("true")), "1,2,3,4,6");
+
+  // Catalog changes need every other backend idle, and exclude them while open.
+  ASSERT_OK(first.Execute("BEGIN"));
+  ASSERT_EQ(ASSERT_RESULT(read(first)), 30);
+  ASSERT_NOK(second.Execute("CREATE TABLE blocked_rows(k bigint PRIMARY KEY)"));
+  ASSERT_OK(first.Execute("COMMIT"));
+  ASSERT_OK(second.Execute("CREATE TABLE blocked_rows(k bigint PRIMARY KEY)"));
+  ASSERT_OK(second.Execute("BEGIN"));
   ASSERT_OK(second.Execute("COMMENT ON TABLE lease_rows IS 'published'"));
+  const auto excluded = ResultToStatus(first.Fetch("SELECT count(*) FROM lease_rows"));
+  ASSERT_NOK(excluded);
+  ASSERT_EQ(PgsqlError(excluded), YBPgErrorCode::YB_PG_T_R_SERIALIZATION_FAILURE) << excluded;
+  ASSERT_OK(second.Execute("COMMIT"));
   ASSERT_EQ(
       ASSERT_RESULT(first.FetchRow<std::string>("SELECT obj_description('lease_rows'::regclass)")),
       "published");
+
+  // DDL adopts the backend's open data transaction, so both commit or roll back together.
   ASSERT_OK(first.Execute("BEGIN"));
-  ASSERT_EQ(ASSERT_RESULT(first.FetchRow<int64_t>("EXECUTE lease_read")), 10);
+  ASSERT_OK(first.Execute("INSERT INTO lease_rows VALUES(7,700)"));
+  ASSERT_OK(first.Execute("CREATE TABLE adopted_rows(k bigint PRIMARY KEY)"));
+  ASSERT_OK(first.Execute("INSERT INTO adopted_rows VALUES(1)"));
+  ASSERT_OK(first.Execute("COMMIT"));
+  ASSERT_EQ(ASSERT_RESULT(second.FetchRow<int64_t>("SELECT k FROM adopted_rows")), 1);
+  ASSERT_EQ(ASSERT_RESULT(keys("k=7")), "7");
+  ASSERT_OK(first.Execute("BEGIN"));
+  ASSERT_OK(first.Execute("INSERT INTO lease_rows VALUES(8,800)"));
+  ASSERT_OK(first.Execute("CREATE TABLE discarded_rows(k bigint PRIMARY KEY)"));
+  ASSERT_OK(first.Execute("ROLLBACK"));
+  ASSERT_EQ(ASSERT_RESULT(keys("k=8")), "");
+  ASSERT_TRUE(
+      ASSERT_RESULT(second.FetchRow<bool>("SELECT to_regclass('discarded_rows') IS NULL")));
+
+  // Savepoints in an independent transaction, including one no request ever used.
+  ASSERT_OK(first.Execute("BEGIN"));
+  ASSERT_OK(first.Execute("INSERT INTO lease_rows VALUES(10,1000)"));
+  ASSERT_OK(first.Execute("SAVEPOINT partial"));
+  ASSERT_OK(first.Execute("INSERT INTO lease_rows VALUES(11,1100)"));
+  ASSERT_OK(first.Execute("ROLLBACK TO partial"));
+  ASSERT_OK(first.Execute("SAVEPOINT unused"));
+  ASSERT_OK(first.Execute("ROLLBACK TO unused"));
+  ASSERT_OK(first.Execute("INSERT INTO lease_rows VALUES(12,1200)"));
+  ASSERT_OK(first.Execute("COMMIT"));
+  ASSERT_EQ(ASSERT_RESULT(keys("k>=10")), "10,12");
+
+  ASSERT_OK(first.Execute("BEGIN"));
   ASSERT_OK(first.Execute("SAVEPOINT row_lock"));
   ASSERT_NOK(first.Fetch("SELECT * FROM lease_rows FOR UPDATE"));
   ASSERT_OK(first.Execute("ROLLBACK TO row_lock"));
-  ASSERT_EQ(ASSERT_RESULT(first.FetchRow<int64_t>("EXECUTE lease_read")), 10);
+  ASSERT_EQ(ASSERT_RESULT(read(first)), 30);
   ASSERT_OK(first.Execute("COMMIT"));
+
+  // A backend that exits mid-transaction loses its writes and stops blocking catalog changes.
+  {
+    auto exiting = ASSERT_RESULT(Connect(*server));
+    ASSERT_OK(exiting.Execute("BEGIN"));
+    ASSERT_OK(exiting.Execute("INSERT INTO lease_rows VALUES(20,2000)"));
+  }
+  ASSERT_OK(WaitFor(
+      [&second]() -> Result<bool> {
+        return second.Execute("CREATE TABLE after_exit(k bigint PRIMARY KEY)").ok();
+      },
+      30s, "exited backend released its transaction"));
+  ASSERT_EQ(ASSERT_RESULT(keys("k=20")), "");
+
+  // Catalog changes from one backend reach another's caches.
   ASSERT_OK(second.Execute(
       "CREATE FUNCTION payload_length(bytea) RETURNS bigint LANGUAGE sql IMMUTABLE "
       "AS $$ SELECT octet_length($1)::bigint $$"));
   ASSERT_OK(second.Execute("CREATE CAST(bytea AS bigint) WITH FUNCTION payload_length(bytea)"));
   ASSERT_EQ(ASSERT_RESULT(first.FetchRow<int64_t>("SELECT decode('010203','hex')::bigint")), 3);
   for (int i = 0; i < 20; ++i) {
-    ASSERT_EQ(ASSERT_RESULT(first.FetchRow<int64_t>("EXECUTE lease_read")), 10);
-    ASSERT_EQ(ASSERT_RESULT(second.FetchRow<int64_t>("SELECT count(*) FROM lease_rows")), 1);
+    ASSERT_EQ(ASSERT_RESULT(read(first)), 30);
+    ASSERT_EQ(ASSERT_RESULT(keys("k<=4")), "1,2,3,4");
   }
 }
 
@@ -2773,6 +2862,21 @@ TEST_F(ReadonlyPgServerTest, SequenceRpcGuards) {
     RETURN_NOT_OK(proxy.Perform(request, &response, &controller));
     return response.has_status() ? StatusFromPB(response.status()) : Status::OK();
   };
+  // A strong object lock takes the exclusive lease, as DDL does; plain SQL transactions do not.
+  const auto lock_exclusive = [&](uint64_t session, uint64_t serial) -> Status {
+    tserver::PgAcquireObjectLockRequestPB request;
+    request.set_session_id(session);
+    auto* options = request.mutable_options();
+    options->set_sql_transaction_active(true);
+    options->set_is_using_table_locks(true);
+    options->set_txn_serial_no(serial + 1);
+    request.set_lock_type(tserver::ACCESS_EXCLUSIVE_LOCK);
+    tserver::PgAcquireObjectLockResponsePB response;
+    rpc::RpcController controller;
+    controller.set_timeout(MonoDelta::FromSeconds(10));
+    RETURN_NOT_OK(proxy.AcquireObjectLock(request, &response, &controller));
+    return response.has_status() ? StatusFromPB(response.status()) : Status::OK();
+  };
   const auto finish = [&](uint64_t session) -> Status {
     tserver::PgFinishTransactionRequestPB request;
     request.set_session_id(session);
@@ -2813,8 +2917,11 @@ TEST_F(ReadonlyPgServerTest, SequenceRpcGuards) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_sequence_cache_method) = cache_method;
   ASSERT_TRUE(server_cache.IsNotSupported()) << server_cache;
 
-  // Another backend's lease rejects access before any value is reserved or changed.
+  // Another backend's open SQL transaction does not block sequences.
   ASSERT_OK(perform(cleaner, 1, database, true));
+  ASSERT_EQ(ASSERT_RESULT(sequences.Read(owner, database, sequence)), Tuple(1, false));
+  // Its exclusive lease rejects access before any value is reserved or changed.
+  ASSERT_OK(lock_exclusive(cleaner, 1));
   const std::vector<Status> leased = {
       sequences.Insert(owner, database, sequence),
       ResultToStatus(sequences.Read(owner, database, sequence)),
@@ -2829,6 +2936,7 @@ TEST_F(ReadonlyPgServerTest, SequenceRpcGuards) {
 
   // Postcommit cleanup arrives after FinishTransaction, here once the lease has moved on.
   ASSERT_OK(perform(owner, 1, database, true));
+  ASSERT_OK(lock_exclusive(owner, 1));
   const auto blocked = ResultToStatus(sequences.Read(cleaner, database, sequence));
   ASSERT_TRUE(blocked.IsTryAgain()) << blocked;
   const auto live = sequences.DeleteDatabase(cleaner, database);

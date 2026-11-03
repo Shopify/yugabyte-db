@@ -91,20 +91,29 @@ ROLLBACK;
 
 ### SQL contract
 
-Multiple idle backends can connect, but storage-touching SQL transactions hold one
-exclusive service-wide lease until COMMIT/ROLLBACK or backend retirement. Contending
-transactions fail with a serialization error; there is no wait queue or general
-multi-writer SQL isolation. The lease includes catalog-only and read-only transactions,
-not merely transactions with storage writes. Parallel workers and session object locks
-are disabled/rejected. Row-lock requests remain unsupported.
+Backends run SQL transactions concurrently. Each data transaction is an independent native
+transaction; conflicting row and unique-index writes go through native DocDB conflict
+resolution and fail with a serialization error instead of waiting. Reads and conflict checks
+use the backend's read point, chosen like PgClientSession: a new read_time_serial_no picks the
+current clock, so REPEATABLE READ keeps one snapshot and READ COMMITTED gets one per statement.
+SERIALIZABLE is rejected rather than weakened. There is no wait queue or deadlock detection.
+
+Catalog changes, catalog row locks, and object locks stronger than ROW EXCLUSIVE take one
+exclusive lease until COMMIT/ROLLBACK or backend retirement. It is granted only while no other
+backend has an open SQL transaction, and other backends' SQL fails with a serialization error
+while it is held. A backend's open data transaction is adopted into its catalog transaction, so
+both still publish in one WAL batch. Parallel workers and session object locks are
+disabled/rejected. Application row-lock requests remain unsupported.
 
 PgGate explicitly reports whether a SQL transaction is active, distinguishing backend
 startup reads from SQL transaction lifetime. Native table locking is enabled and its
 shared-memory fast path disabled, so even read-only SQL transactions send FinishTransaction.
 Metadata RPCs carry the backend ID: another backend, or a caller without an ID, cannot
 read private DDL descriptors. Catalog shared-memory versions publish only after commit;
-missing incremental invalidations cause native cache refresh. Do not weaken these gates
-based on backend idleness or the absence of a native storage transaction.
+missing incremental invalidations cause native cache refresh. Catalog reads outside the
+catalog transaction may use any time from the last catalog commit to the clock; data commits do
+not change catalog rows. Do not admit catalog work while another backend has an open SQL
+transaction, even a read-only one without native state.
 
 Supported SQL includes native scalar encodings for smallint/integer/bigint, boolean,
 real/double precision, numeric, UUID, date/time/timestamps, text/varchar, bytea, and JSON/JSONB;
@@ -192,7 +201,7 @@ Limits are 16 MiB for the encoded catalog overlay/final commit batch and for an 
 intent batch plus pending catalog bytes, with additional arenas/overlay/rollback overhead.
 Attached SQL transactions may stream up to 512 MiB of cumulative encoded intents. These are
 not all buffered in the catalog overlay. There are 1,024 rollback ranges and 65,536 retained
-native transactions. Compaction and intent/history GC remain disabled: repeated fixture
+native transactions; transactions that wrote no intents are not retained after they finish. Compaction and intent/history GC remain disabled: repeated fixture
 loads retain history, and memory/disk use must be measured for the intended workload.
 
 Each backend owns its request-sequence watermark, queued calls, deadline timer, and error state.
@@ -220,7 +229,7 @@ Run each C++ case separately using yb_build.sh. In addition to the original cata
 index, hash-range, paging, queue, error, ownership, and restart tests, targeted SQL gates are:
 
 ```sh
-for test in SerializedSqlSessions SchemaLifecycle PrimaryKeyRewrite LargeNativeTransaction \
+for test in ConcurrentSqlSessions SchemaLifecycle PrimaryKeyRewrite LargeNativeTransaction \
             DropsDatabasesAndRetainsOtherSlots CommandCatalogTransactions \
             SequenceBackedSchemaLifecycle SequenceValuesAreNontransactional \
             BoundedSequenceLimits SequenceTuplesDeletedOnDrop SequenceRpcGuards \

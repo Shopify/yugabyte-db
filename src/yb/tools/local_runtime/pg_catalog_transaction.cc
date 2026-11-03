@@ -170,7 +170,8 @@ class PgCatalogTransaction::Impl {
       : storage_(std::move(storage)),
         db_(storage_->db()),
         latest_(storage_->committed()),
-        failure_(storage_->failure()) {}
+        failure_(storage_->failure()),
+        catalog_latest_(storage_->committed()) {}
 
   Status Initialize() {
     for (const auto& [name, handle] : storage_->families()) {
@@ -445,7 +446,7 @@ class PgCatalogTransaction::Impl {
       }
     }
     // The bundle and shared SQL rows retire atomically. Historical versions are reclaimed only
-    // after publication, under the caller's exclusive SQL lease and this catalog owner.
+    // after publication, under the caller's exclusive catalog lease and this catalog owner.
     RETURN_NOT_OK(Stage(MetadataFamily(), MetadataKey("retired-database/" + ns), encoded));
     RETURN_NOT_OK(Stage(MetadataFamily(), bundle_key, "", "", 0, true));
     return Stage(MetadataFamily(), MetadataKey("oid/" + std::to_string(oid)), "", "", 0, true);
@@ -1113,11 +1114,11 @@ class PgCatalogTransaction::Impl {
     return Status::OK();
   }
 
-  Status Begin() {
+  Status Begin(bool adopting = false) {
     RETURN_NOT_OK(CheckHealthy());
     SCHECK(!active_, IllegalState, "Catalog transaction already active");
     time_ = VERIFY_RESULT(storage_->Tick());
-    RETURN_NOT_OK(storage_->AcquireCatalog(this));
+    RETURN_NOT_OK(storage_->AcquireCatalog(this, adopting));
     active_ = true;
     return Status::OK();
   }
@@ -1220,6 +1221,7 @@ class PgCatalogTransaction::Impl {
     failure_ = storage_->Write(&commit, true, commit_time);
     TEST_SYNC_POINT_CALLBACK("PgCatalogTransaction::CommitStatus", &failure_);
     RETURN_NOT_OK(Status(failure_));
+    catalog_latest_ = commit_time;
     std::erase_if(oid_ranges_, [&](const auto& range) {
       const auto key = MetadataKey("oid/" + std::to_string(range.first));
       return std::any_of(staged_.begin(), staged_.end(), [&](const auto& entry) {
@@ -1321,6 +1323,8 @@ class PgCatalogTransaction::Impl {
   bool preserve_deleted_bindings_ = false;
   // RETURN_NOT_OK moves non-const statuses; returning this fence must copy it.
   Status& failure_;
+  // Catalog rows change only in catalog commits; data commits advance latest_ alone.
+  HybridTime catalog_latest_;
 };
 
 PgCatalogTransaction::PgCatalogTransaction(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -1463,11 +1467,18 @@ bool PgCatalogTransaction::active() const {
   std::lock_guard lock(impl_->storage_->mutex());
   return impl_->active_;
 }
+HybridTime PgCatalogTransaction::Clock() const {
+  std::lock_guard lock(impl_->storage_->mutex());
+  return impl_->storage_->clock();
+}
 Status PgCatalogTransaction::ValidateReadTime(HybridTime time) const {
   std::lock_guard lock(impl_->storage_->mutex());
   RETURN_NOT_OK(Status(impl_->failure_));
+  // An active catalog transaction excludes data transactions, so its window starts at the latest
+  // commit. Later catalog commits receive times above the clock, so no window includes them.
+  const auto lower = impl_->active_ ? impl_->latest_ : impl_->catalog_latest_;
   SCHECK(
-      time >= impl_->latest_ && time <= ReadTime(), NotSupported,
+      time >= lower && time <= impl_->storage_->clock(), NotSupported,
       "Read time is outside the active local snapshot");
   return Status::OK();
 }
@@ -1509,6 +1520,17 @@ Result<TransactionId> PgCatalogTransaction::BeginWithNative(uint64_t priority) {
   }
   impl_->native_txn_ = *txn;
   return *txn;
+}
+Status PgCatalogTransaction::BeginAdoptingNative(const TransactionId& id) {
+  std::lock_guard lock(impl_->storage_->mutex());
+  RETURN_NOT_OK(impl_->Begin(/* adopting= */ true));
+  auto status = impl_->native_->AdoptCatalog(id);
+  if (!status.ok()) {
+    impl_->Abort();
+    return status;
+  }
+  impl_->native_txn_ = id;
+  return Status::OK();
 }
 PgLocalTxnStore& PgCatalogTransaction::NativeTransactions() { return *impl_->native_; }
 

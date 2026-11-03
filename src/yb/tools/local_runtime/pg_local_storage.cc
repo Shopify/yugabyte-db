@@ -209,10 +209,10 @@ Status PgLocalStorage::Write(rocksdb::WriteBatch* batch, bool sync, HybridTime c
   return Status::OK();
 }
 
-Status PgLocalStorage::AcquireCatalog(const void* owner) {
+Status PgLocalStorage::AcquireCatalog(const void* owner, bool adopting) {
   RETURN_NOT_OK(Status(failure_));
   SCHECK(
-      !catalog_owner_ && active_data_ == 0, NotSupported,
+      !catalog_owner_ && active_data_ == (adopting ? 1 : 0), NotSupported,
       "Catalog changes require exclusive transaction ownership");
   catalog_owner_ = owner;
   return Status::OK();
