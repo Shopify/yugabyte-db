@@ -43,7 +43,11 @@
 #include "yb/tools/local_runtime/pg_local_request_validation.h"
 #include "yb/tools/local_runtime/pg_local_storage.h"
 #include "yb/util/env.h"
+#include "yb/util/flags.h"
 #include "yb/util/sync_point.h"
+
+DEFINE_NON_RUNTIME_bool(local_runtime_cache_bindings, true,
+    "Reuse native table bindings until the catalog metadata changes.");
 
 namespace yb::local_runtime {
 namespace {
@@ -134,7 +138,8 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
       std::shared_ptr<PgLocalStorage> storage, rocksdb::ColumnFamilyHandle* metadata,
       const void* owner = nullptr, TableLookup lookup = {},
       std::function<Status(uint32_t)> statement_start = {},
-      std::function<size_t()> staged_bytes = {})
+      std::function<size_t()> staged_bytes = {},
+      std::function<uint64_t()> catalog_generation = {})
       : storage_(std::move(storage)),
         mutex_(storage_->mutex()),
         db_(storage_->db()),
@@ -144,6 +149,7 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
         lookup_(std::move(lookup)),
         statement_start_(std::move(statement_start)),
         staged_bytes_(std::move(staged_bytes)),
+        catalog_generation_(std::move(catalog_generation)),
         clock_(storage_->clock()),
         failure_(storage_->failure()) {}
 
@@ -156,6 +162,9 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     std::vector<dockv::Partition> partitions;
 
     std::string descriptor;
+    uint32_t schema_version = 0;
+    // Catalog metadata generation at which Find last confirmed descriptor and schema_version.
+    uint64_t generation = std::numeric_limits<uint64_t>::max();
     docdb::DocDB DB() const {
       return {
           .regular = regular_view.get(),
@@ -495,16 +504,24 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
 
   Result<Table*> Find(const TableId& id) {
     if (owner_) {
+      const auto generation = catalog_generation_();
+      const auto cached = tables_.find(id);
+      if (FLAGS_local_runtime_cache_bindings && cached != tables_.end() &&
+          cached->second->generation == generation)
+        return cached->second.get();
       const auto metadata = VERIFY_RESULT(lookup_(id));
       // Revalidate even cached bindings: ALTER and index creation can change the descriptor
       // without changing the schema itself. Never fall back to a regular-only view.
-      const auto cached = tables_.find(id);
       SCHECK(handles_.contains("table/" + id), Corruption, "Missing native regular family");
       SCHECK(
           !bindings_.contains(id) || handles_.contains("intents/" + id), Corruption,
           "Published native binding is missing its intents family");
       if (cached == tables_.end() || cached->second->descriptor != metadata.SerializeAsString())
         RETURN_NOT_OK(AddAttachedTable(id, metadata));
+      auto& table = *tables_.at(id);
+      table.schema_version = metadata.schema_version();
+      table.generation = generation;
+      return &table;
     }
     const auto it = tables_.find(id);
     SCHECK(it != tables_.end(), NotFound, "Unknown transaction-store table");
@@ -696,9 +713,8 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
         NotSupported, "Unsupported native SQL write mode");
     SCHECK_EQ(request.packed_rows().size() % 2, 0, InvalidArgument, "Unpaired packed rows");
     auto* table = VERIFY_RESULT(Find(request.table_id().ToBuffer()));
-    const auto metadata = VERIFY_RESULT(lookup_(request.table_id().ToBuffer()));
     SCHECK_EQ(
-        request.schema_version(), metadata.schema_version(), InvalidArgument,
+        request.schema_version(), table->schema_version, InvalidArgument,
         "Native SQL schema version mismatch");
     ThreadSafeArena arena;
     LWPgsqlWriteRequestPB normalized(&arena);
@@ -987,9 +1003,8 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
         !request.has_index_request(), NotSupported,
         "Nested application index reads require separate column-family storage");
     auto* table = VERIFY_RESULT(Find(request.table_id().ToBuffer()));
-    const auto metadata = VERIFY_RESULT(lookup_(request.table_id().ToBuffer()));
     SCHECK_EQ(
-        request.schema_version(), metadata.schema_version(), InvalidArgument,
+        request.schema_version(), table->schema_version, InvalidArgument,
         "Native SQL schema version mismatch");
     const auto& page = request.paging_state();
     SCHECK(
@@ -1323,6 +1338,7 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
   TableLookup lookup_;
   std::function<Status(uint32_t)> statement_start_;
   std::function<size_t()> staged_bytes_;
+  std::function<uint64_t()> catalog_generation_;
   std::unordered_map<TableId, std::unique_ptr<Table>> tables_;
   std::unordered_set<TableId> bindings_;
   std::unordered_map<TransactionId, Txn, TransactionIdHash> txns_;
@@ -1395,7 +1411,8 @@ Status PgLocalTxnStore::RollbackTo(const TransactionId& id, uint32_t subtransact
 
 Result<std::unique_ptr<PgLocalTxnStore>> PgLocalTxnStore::Attach(
     std::shared_ptr<PgLocalStorage> storage, const void* owner, TableLookup lookup,
-    std::function<Status(uint32_t)> statement_start, std::function<size_t()> staged_bytes) {
+    std::function<Status(uint32_t)> statement_start, std::function<size_t()> staged_bytes,
+    std::function<uint64_t()> catalog_generation) {
   auto it = storage->families().find(kMetadataFamily);
   std::string initialized;
   const auto marker = storage->db()->Get(
@@ -1409,7 +1426,7 @@ Result<std::unique_ptr<PgLocalTxnStore>> PgLocalTxnStore::Attach(
                        : it->second.get();
   auto impl = std::make_unique<Impl>(
       storage, metadata, owner, std::move(lookup), std::move(statement_start),
-      std::move(staged_bytes));
+      std::move(staged_bytes), std::move(catalog_generation));
   RETURN_NOT_OK(impl->Initialize());
   return std::unique_ptr<PgLocalTxnStore>(new PgLocalTxnStore(std::move(impl)));
 }
