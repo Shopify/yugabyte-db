@@ -63,6 +63,11 @@ class PgLocalStorage {
   rocksdb::Options regular_options_;
   rocksdb::Options intents_options_;
   rocksdb::Options churn_options_;
+  // Reported at shutdown: how often a write waits for the WAL to reach the device.
+  uint64_t writes_ = 0;
+  uint64_t synced_writes_ = 0;
+  // Creating or dropping a family also syncs the MANIFEST.
+  uint64_t family_changes_ = 0;
   std::unique_ptr<rocksdb::DB> db_;
   std::unordered_map<std::string, std::unique_ptr<rocksdb::ColumnFamilyHandle>> families_;
   HybridTime clock_ = HybridTime::kInitial;
