@@ -107,9 +107,15 @@ disabled/rejected.
 
 Application row locks (FOR UPDATE, FOR NO KEY UPDATE, FOR SHARE, FOR KEY SHARE) follow the
 tserver path: lock intents from docdb::GetIntents are conflict-checked and persisted before the
-read. NOWAIT and the default wait policy fail on conflict; SKIP LOCKED skips the row. Committed
-lock-only intents are never removed, but conflict resolution treats them as released and readers
-ignore them.
+read. NOWAIT and the default wait policy fail on conflict; SKIP LOCKED skips the row. Lock-only
+intents are removed when their transaction finishes, like any other intent.
+
+Finished transactions are reclaimed the way a tablet does it: committed intents are applied to
+regular rows at the commit time (skipping row locks and rolled-back savepoints), then all of the
+transaction's intents and its status record are removed. Aborts are not synced, since recovery
+treats a pending record as aborted. A transaction aborted by a conflicting one stays visible as
+aborted until its owner finishes it. Recovery finds each leftover transaction's tables from the
+intent reverse index and reclaims them before serving.
 
 PgGate explicitly reports whether a SQL transaction is active, distinguishing backend
 startup reads from SQL transaction lifetime. Native table locking is enabled and its
@@ -206,9 +212,13 @@ commit-time catalog updates; aborted IDs remain rejected.
 Limits are 16 MiB for the encoded catalog overlay/final commit batch and for an encoded
 intent batch plus pending catalog bytes, with additional arenas/overlay/rollback overhead.
 Attached SQL transactions may stream up to 512 MiB of cumulative encoded intents. These are
-not all buffered in the catalog overlay. There are 1,024 rollback ranges and 65,536 retained
-native transactions; transactions that wrote no intents are not retained after they finish. Compaction and intent/history GC remain disabled: repeated fixture
-loads retain history, and memory/disk use must be measured for the intended workload.
+not all buffered in the catalog overlay. There are 1,024 rollback ranges and 65,536 unfinished
+native transactions. History GC is disabled and table rows are never compacted, so committed
+versions accumulate. Intents and metadata families use small write buffers
+(--local_runtime_churn_write_buffer_bytes) and universal compaction, and the largest intents
+families are flushed once unflushed intents exceed --local_runtime_intents_memtable_budget_bytes:
+removed intents otherwise stay in memtables beside their tombstones. The WAL is not truncated while
+table rows stay unflushed, so memory/disk use must be measured for the intended workload.
 
 Each backend owns its request-sequence watermark, queued calls, deadline timer, and error state.
 Sequencing has no lifetime request-count cap. Out-of-order arrivals park without blocking
@@ -267,7 +277,7 @@ The standalone PgLocalTxnStore PB API remains limited to immutable version-zero 
 using INT64/INT32/STRING. It allows overlapping snapshot transactions with native fail-on-conflict
 arbitration, at most 64 active transactions, and 16 MiB cumulative intents per transaction.
 The attached SQL API loads authoritative schemas, index contexts, and old row packings instead.
-Committed intents remain unapplied and use durable status resolution. Intent SST filtering is
+Committed intents are applied and removed after the durable commit. Intent SST filtering is
 disabled because this store has no Raft hybrid-time frontiers.
 
 pg_local_shared_commit-test covers atomic catalog/data publication, snapshots/DDL exclusion,
