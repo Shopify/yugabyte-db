@@ -103,7 +103,13 @@ exclusive lease until COMMIT/ROLLBACK or backend retirement. It is granted only 
 backend has an open SQL transaction, and other backends' SQL fails with a serialization error
 while it is held. A backend's open data transaction is adopted into its catalog transaction, so
 both still publish in one WAL batch. Parallel workers and session object locks are
-disabled/rejected. Application row-lock requests remain unsupported.
+disabled/rejected.
+
+Application row locks (FOR UPDATE, FOR NO KEY UPDATE, FOR SHARE, FOR KEY SHARE) follow the
+tserver path: lock intents from docdb::GetIntents are conflict-checked and persisted before the
+read. NOWAIT and the default wait policy fail on conflict; SKIP LOCKED skips the row. Committed
+lock-only intents are never removed, but conflict resolution treats them as released and readers
+ignore them.
 
 PgGate explicitly reports whether a SQL transaction is active, distinguishing backend
 startup reads from SQL transaction lifetime. Native table locking is enabled and its
