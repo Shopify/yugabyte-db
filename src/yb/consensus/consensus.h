@@ -265,7 +265,11 @@ class Consensus {
   //
   // allow_stale could be used to avoid refreshing cache, when we are OK to read slightly outdated
   // value.
-  virtual LeaderState GetLeaderState(bool allow_stale = false) const = 0;
+  //
+  // deadline bounds the wait for the replica state lock when the cache has to be refreshed.
+  // Past the deadline the result is LEADER_BUT_NO_MAJORITY_REPLICATED_LEASE.
+  virtual LeaderState GetLeaderState(
+      bool allow_stale = false, CoarseTimePoint deadline = CoarseTimePoint::max()) const = 0;
 
   LeaderStatus GetLeaderStatus(bool allow_stale = false) const;
   int64_t LeaderTerm() const;

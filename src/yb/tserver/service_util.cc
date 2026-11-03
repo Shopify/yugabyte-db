@@ -135,7 +135,7 @@ void SetupErrorAndRespond(LWTabletServerErrorPB* error,
   DoSetupErrorAndRespond(error, s, context);
 }
 
-Result<int64_t> LeaderTerm(const tablet::TabletPeer& tablet_peer) {
+Result<int64_t> LeaderTerm(const tablet::TabletPeer& tablet_peer, CoarseTimePoint deadline) {
   auto consensus_result = tablet_peer.GetConsensus();
   if (!consensus_result) {
     auto state = tablet_peer.state();
@@ -146,7 +146,7 @@ Result<int64_t> LeaderTerm(const tablet::TabletPeer& tablet_peer) {
     return STATUS(Aborted, "Tablet peer was closed");
   }
   auto& consensus = consensus_result.get();
-  auto leader_state = consensus->GetLeaderState();
+  auto leader_state = consensus->GetLeaderState(/* allow_stale = */ false, deadline);
 
   VLOG(1) << Format(
       "Check for tablet $0 peer $1. Peer role is $2. Leader status is $3.",
@@ -202,8 +202,8 @@ void LeaderTabletPeer::FillTabletPeer(TabletPeerTablet source) {
   tablet = std::move(source.tablet);
 }
 
-Status LeaderTabletPeer::FillTerm() {
-  auto leader_term_result = LeaderTerm(*peer);
+Status LeaderTabletPeer::FillTerm(CoarseTimePoint deadline) {
+  auto leader_term_result = LeaderTerm(*peer, deadline);
   if (!leader_term_result.ok()) {
     auto tablet = peer->shared_tablet_maybe_null();
     if (tablet) {
@@ -252,8 +252,8 @@ Status CheckPeerIsReady(
 }
 
 
-Status CheckPeerIsLeader(const tablet::TabletPeer& tablet_peer) {
-  return ResultToStatus(LeaderTerm(tablet_peer));
+Status CheckPeerIsLeader(const tablet::TabletPeer& tablet_peer, CoarseTimePoint deadline) {
+  return ResultToStatus(LeaderTerm(tablet_peer, deadline));
 }
 
 bool IsErrorCodeNotTheLeader(const Status& status) {
@@ -308,7 +308,7 @@ Result<TabletPeerTablet> LookupTabletPeer(
 Result<std::shared_ptr<tablet::AbstractTablet>> GetTablet(
     TabletPeerLookupIf* tablet_manager, TabletIdView tablet_id,
     tablet::TabletPeerPtr tablet_peer, YBConsistencyLevel consistency_level,
-    AllowSplitTablet allow_split_tablet, ReadResponseMsg* resp) {
+    AllowSplitTablet allow_split_tablet, ReadResponseMsg* resp, CoarseTimePoint deadline) {
   tablet::TabletPtr tablet_ptr = nullptr;
   if (tablet_peer) {
     DCHECK_EQ(tablet_peer->tablet_id(), tablet_id);
@@ -327,7 +327,7 @@ Result<std::shared_ptr<tablet::AbstractTablet>> GetTablet(
       LOG(FATAL) << "--TEST_assert_reads_from_follower_rejected_because_of_staleness is true but "
                     "consistency level is invalid: YBConsistencyLevel::STRONG";
     }
-    auto status = CheckPeerIsLeader(*tablet_peer);
+    auto status = CheckPeerIsLeader(*tablet_peer, deadline);
     if (!status.ok()) {
       if (IsErrorCodeNotTheLeader(status)) {
         FillTabletConsensusInfo(resp, tablet_id, tablet_peer);
@@ -335,7 +335,7 @@ Result<std::shared_ptr<tablet::AbstractTablet>> GetTablet(
       return status;
     }
   } else {
-    auto s = CheckPeerIsLeader(*tablet_peer.get());
+    auto s = CheckPeerIsLeader(*tablet_peer.get(), deadline);
     // Peer is not the leader, so check that the time since it last heard from the leader is less
     // than FLAGS_max_stale_read_bound_time_ms.
     if (PREDICT_FALSE(!s.ok())) {
