@@ -134,8 +134,9 @@ Status PgLocalStorage::Initialize(const std::string& directory, const std::strin
   churn_options_ = regular_options_;
   for (auto* options : {&regular_options_, &intents_options_, &churn_options_}) {
     options->disable_wal = false;
-    // Every flush logs an edit; rolling writes a fresh snapshot of all families instead.
-    options->max_manifest_file_size = 32ULL * 1024 * 1024;
+    // Rolling writes a snapshot of every family, thousands here, so a small limit would roll on
+    // nearly every flush once the snapshot itself exceeds it.
+    options->max_manifest_file_size = 128ULL * 1024 * 1024;
     if (options == &regular_options_ ? !max_wal_bytes : !churn_bytes) {
       options->compaction_style = rocksdb::kCompactionStyleNone;
       options->level0_slowdown_writes_trigger = std::numeric_limits<int>::max();
