@@ -392,7 +392,8 @@ class TabletInfo : public MetadataCowWrapper<PersistentTabletInfo> {
     return initiated_election_.compare_exchange_strong(expected, true);
   }
 
-  void UpdateReplicaFullCompactionStatus(
+  // Returns false if the replica is not in replica_locations_ map.
+  bool UpdateReplicaFullCompactionStatus(
       const TabletServerId& ts_uuid, const FullCompactionStatus& full_compaction_status);
 
   // The next four methods are getters and setters for the transient, in memory list of table ids

@@ -275,7 +275,7 @@ class MasterHeartbeatServiceImpl : public MasterServiceBase, public MasterHeartb
       const TabletInfoPtr& tablet,
       const TabletLeaderMetricsPB& leader_info);
 
-  void ProcessTabletReplicaFullCompactionStatus(
+  bool ProcessTabletReplicaFullCompactionStatus(
       const TabletServerId& ts_uuid, const TabletInfoPtr& tablet,
       const FullCompactionStatusPB& full_compaction_status);
 
@@ -593,17 +593,19 @@ void MasterHeartbeatServiceImpl::TSHeartbeat(
         for (const auto& info : req->leader_info()) {
           ProcessLeaderInfo(ts_desc->id(), tablets[idx++], info);
         }
-        resp->set_tablet_metadata_processed(all_applied);
 
         // Only process the full compaction statuses if we have plenty of time to process the work
         // (> 50% of timeout).
         safe_time_left = CoarseMonoClock::Now() + (FLAGS_heartbeat_rpc_timeout_ms * 1ms / 2);
         if (rpc.GetClientDeadline() > safe_time_left) {
           for (const auto& full_compaction_status : req->full_compaction_statuses()) {
-            ProcessTabletReplicaFullCompactionStatus(
+            all_applied &= ProcessTabletReplicaFullCompactionStatus(
                 ts_desc->permanent_uuid(), tablets[idx++], full_compaction_status);
           }
+        } else if (!req->full_compaction_statuses().empty()) {
+          all_applied = false;
         }
+        resp->set_tablet_metadata_processed(all_applied);
       }
 
       for (const auto& consumer_replication_state : req->xcluster_consumer_replication_status()) {
@@ -1612,12 +1614,12 @@ void MasterHeartbeatServiceImpl::ProcessLeaderInfo(
               master_->clock()->Now().GetPhysicalValueMicros(), ht_lease_exp));
 }
 
-void MasterHeartbeatServiceImpl::ProcessTabletReplicaFullCompactionStatus(
+bool MasterHeartbeatServiceImpl::ProcessTabletReplicaFullCompactionStatus(
     const TabletServerId& ts_uuid, const TabletInfoPtr& tablet,
     const FullCompactionStatusPB& full_compaction_status) {
   if (!full_compaction_status.has_tablet_id()) {
     VLOG(1) << "Tablet id not found";
-    return;
+    return true;
   }
 
   const TabletId& tablet_id = full_compaction_status.tablet_id();
@@ -1625,21 +1627,22 @@ void MasterHeartbeatServiceImpl::ProcessTabletReplicaFullCompactionStatus(
   if (!full_compaction_status.has_full_compaction_state()) {
     LOG(WARNING) << Format(
         "Full compaction status not reported for tablet $0 on tserver $1", tablet_id, ts_uuid);
-    return;
+    return true;
   }
 
   if (!full_compaction_status.has_last_full_compaction_time()) {
     LOG(WARNING) << Format(
         "Last full compaction time not reported for tablet $0 on tserver $1", tablet_id, ts_uuid);
-    return;
+    return true;
   }
 
+  // The replica entry may not exist yet (chunked tablet report); the tserver resends on false.
   if (!tablet) {
     LOG_WITH_FUNC(WARNING) << Format("Tablet $0 not found", tablet_id);
-    return;
+    return false;
   }
 
-  tablet->UpdateReplicaFullCompactionStatus(
+  return tablet->UpdateReplicaFullCompactionStatus(
       ts_uuid, FullCompactionStatus{
                    full_compaction_status.full_compaction_state(),
                    HybridTime(full_compaction_status.last_full_compaction_time())});
