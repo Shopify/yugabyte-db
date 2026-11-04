@@ -45,6 +45,9 @@ class TServerMetricsHeartbeatDataProvider : public PeriodicalHeartbeatDataProvid
   // in flight that move into acked_storage_metadata_ once its response confirms them.
   std::unordered_map<TabletId, master::TabletDriveStorageMetadataPB> acked_storage_metadata_;
   std::unordered_map<TabletId, master::TabletDriveStorageMetadataPB> pending_storage_metadata_;
+  // Same for full compaction statuses; both are confirmed by one response bit.
+  std::unordered_map<TabletId, master::FullCompactionStatusPB> acked_full_compaction_status_;
+  std::unordered_map<TabletId, master::FullCompactionStatusPB> pending_full_compaction_status_;
 };
 
 } // namespace tserver
