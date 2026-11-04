@@ -56,7 +56,8 @@ class HeartbeatDataProvider {
   virtual void AddData(
       const master::TSHeartbeatResponsePB& last_resp, master::TSHeartbeatRequestPB* req) = 0;
 
-  // Called with the successful response to the heartbeat the provider last added data to.
+  // Called with every successful heartbeat response, whether or not this provider added data to
+  // the request.
   virtual void OnHeartbeatResponse(const master::TSHeartbeatResponsePB& resp) {}
 
   const std::string& LogPrefix() const;
