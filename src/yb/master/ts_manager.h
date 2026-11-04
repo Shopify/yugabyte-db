@@ -303,7 +303,7 @@ class TSManager {
 
   TSDescriptorMap servers_by_id_ GUARDED_BY(map_lock_);
 
-  mutable YsqlDbPinIndex ysql_db_pin_index_;
+  YsqlDbPinIndex ysql_db_pin_index_;
   // Latched once every live descriptor has reported pins: a descriptor only becomes live through
   // a heartbeat, which reports them, so only a leader load can make this false again.
   mutable std::atomic<bool> ysql_db_pins_all_reported_{false};
