@@ -115,10 +115,10 @@ DEFINE_NON_RUNTIME_int32(run_seconds, 300, "Steady-state measurement window.");
 DEFINE_NON_RUNTIME_int32(full_metrics_beat_period, 5,
     "Send the tablet metrics payload (storage_metadata + leader_info) every Nth heartbeat, "
     "matching the real tserver's 5s metrics cadence.");
-DEFINE_NON_RUNTIME_bool(send_storage_metadata_on_change, false,
-    "Same as the tserver flag: hollow tservers send a tablet's storage_metadata once and again "
-    "only after a full report or a response that did not confirm processing it, and the real "
-    "tserver is started with the flag.");
+DEFINE_NON_RUNTIME_bool(send_tablet_metadata_on_change, false,
+    "Same as the tserver flag: hollow tservers send a tablet's storage_metadata and "
+    "full_compaction_status once and again only after a full report or a response that did not "
+    "confirm processing them, and the real tserver is started with the flag.");
 DEFINE_NON_RUNTIME_string(master_bin, "", "Path to the yb-master binary (required).");
 DEFINE_NON_RUNTIME_string(data_dir, "",
     "Fresh scratch directory for master data and logs (required).");
@@ -213,15 +213,26 @@ class HollowTServer {
     dirty_.erase(tablet_id);
     removed_.insert(tablet_id);
     storage_acked_.erase(tablet_id);
+    compaction_acked_.erase(tablet_id);
   }
 
   // Hollow tablet sizes never change, so acked entries are only resent after a full report.
   bool SendStorageMetadata(const string& tablet_id) REQUIRES(mutex_) {
-    if (FLAGS_send_storage_metadata_on_change &&
+    if (FLAGS_send_tablet_metadata_on_change &&
         storage_acked_.contains(tablet_id)) {
       return false;
     }
     storage_pending_.insert(tablet_id);
+    return true;
+  }
+
+  // Same for compaction statuses: hollow tablets never compact.
+  bool SendFullCompactionStatus(const string& tablet_id) REQUIRES(mutex_) {
+    if (FLAGS_send_tablet_metadata_on_change &&
+        compaction_acked_.contains(tablet_id)) {
+      return false;
+    }
+    compaction_pending_.insert(tablet_id);
     return true;
   }
 
@@ -239,6 +250,7 @@ class HollowTServer {
     req->Clear();
     std::lock_guard l(mutex_);
     storage_pending_.clear();
+    compaction_pending_.clear();
     const bool metrics_beat = metrics_override.has_value()
         ? *metrics_override
         : hb_seq_ % FLAGS_full_metrics_beat_period == 0;
@@ -367,10 +379,13 @@ class HollowTServer {
     }
     if (resp.tablet_metadata_processed()) {
       storage_acked_.insert(storage_pending_.begin(), storage_pending_.end());
+      compaction_acked_.insert(compaction_pending_.begin(), compaction_pending_.end());
     }
     storage_pending_.clear();
+    compaction_pending_.clear();
     if (resp.needs_full_tablet_report()) {
       storage_acked_.clear();
+      compaction_acked_.clear();
       full_report_queue_.clear();
       for (const auto& [tablet_id, _] : tablets_) {
         full_report_queue_.push_back(tablet_id);
@@ -505,7 +520,7 @@ class HollowTServer {
         *storage = tmpl_storage.Get(i % tmpl_storage.size());
         storage->set_tablet_id(tablet_id);
       }
-      if (!tmpl_compactions.empty()) {
+      if (!tmpl_compactions.empty() && SendFullCompactionStatus(tablet_id)) {
         auto* compaction = req->add_full_compaction_statuses();
         *compaction = tmpl_compactions.Get(i % tmpl_compactions.size());
         compaction->set_tablet_id(tablet_id);
@@ -622,6 +637,8 @@ class HollowTServer {
   std::set<string> removed_ GUARDED_BY(mutex_);
   std::set<string> storage_acked_ GUARDED_BY(mutex_);
   std::set<string> storage_pending_ GUARDED_BY(mutex_);
+  std::set<string> compaction_acked_ GUARDED_BY(mutex_);
+  std::set<string> compaction_pending_ GUARDED_BY(mutex_);
   std::deque<string> full_report_queue_ GUARDED_BY(mutex_);
   bool full_report_active_ GUARDED_BY(mutex_) = false;
   bool full_report_started_ GUARDED_BY(mutex_) = false;
@@ -1483,8 +1500,8 @@ class HeartbeatBench {
         // Heartbeats reach the master through the relay, where they are captured.
         Format("--tserver_master_addrs=127.0.0.1:$0", FLAGS_relay_port),
         Format("--heartbeat_interval_ms=$0", FLAGS_heartbeat_interval_ms),
-        Format("--tserver_heartbeat_metrics_send_storage_metadata_on_change=$0",
-               FLAGS_send_storage_metadata_on_change),
+        Format("--tserver_heartbeat_metrics_send_tablet_metadata_on_change=$0",
+               FLAGS_send_tablet_metadata_on_change),
         "--enable_ysql=false",
         "--placement_cloud=cloud1",
         "--placement_region=region1",
