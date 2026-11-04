@@ -1397,7 +1397,9 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     next.clear_subtransaction();
     sub.ToPB(next.mutable_subtransaction());
     if (next.failed_subtransaction() >= subtransaction) next.clear_failed_subtransaction();
-    return Save(txn, std::move(next), true);
+    // Unsynced, like the intents it masks: recovery aborts a pending transaction outright, and a
+    // later commit's sync covers this earlier WAL record. PgGate sends one before every abort.
+    return Save(txn, std::move(next), false);
   }
 
   HybridTime LocalCommitTime(const TransactionId& id) override {

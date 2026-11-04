@@ -16,6 +16,7 @@
 #include <array>
 #include <csignal>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <map>
 
@@ -36,6 +37,7 @@
 
 DECLARE_uint64(local_runtime_churn_write_buffer_bytes);
 DECLARE_uint64(local_runtime_intents_memtable_budget_bytes);
+DECLARE_uint64(local_runtime_max_wal_bytes);
 
 namespace yb::local_runtime {
 namespace {
@@ -370,6 +372,42 @@ TEST_F(PgLocalTxnStoreTest, FlushedIntentsStayCorrect) {
   store_ = ASSERT_RESULT(PgLocalTxnStore::Open(path_));
   const auto reopened = ASSERT_RESULT(store_->Begin());
   ASSERT_EQ(ASSERT_RESULT(Rows(reopened)), with_pending);
+}
+
+TEST_F(PgLocalTxnStoreTest, WalStaysBounded) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_local_runtime_max_wal_bytes) = 256 * 1024;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_local_runtime_churn_write_buffer_bytes) = 64 * 1024;
+  store_.reset();
+  store_ = ASSERT_RESULT(PgLocalTxnStore::Open(path_));
+  std::vector<Row> original, latest;
+  for (int64_t i = 1; i <= 200; ++i) {
+    const auto txn = ASSERT_RESULT(store_->Begin());
+    ASSERT_OK(Write(txn, i, i));
+    ASSERT_OK(store_->Commit(txn));
+    original.push_back({7, i, i});
+  }
+  // Flushed and compacted table rows keep every version: there is no history GC.
+  const auto snapshot = ASSERT_RESULT(store_->Begin());
+  for (int64_t round = 1; round <= 3; ++round) {
+    latest.clear();
+    for (int64_t i = 1; i <= 200; ++i) {
+      const auto txn = ASSERT_RESULT(store_->Begin());
+      ASSERT_OK(Write(txn, i, i * 10 + round, 1, true));
+      ASSERT_OK(store_->Commit(txn));
+      latest.push_back({7, i, i * 10 + round});
+    }
+  }
+  ASSERT_EQ(ASSERT_RESULT(Rows(snapshot)), original);
+  ASSERT_OK(store_->Abort(snapshot));
+  store_.reset();
+  uintmax_t log_bytes = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(path_)) {
+    if (entry.path().extension() == ".log") log_bytes += entry.file_size();
+  }
+  ASSERT_LE(log_bytes, 1024 * 1024);
+  store_ = ASSERT_RESULT(PgLocalTxnStore::Open(path_));
+  const auto reader = ASSERT_RESULT(store_->Begin());
+  ASSERT_EQ(ASSERT_RESULT(Rows(reader)), latest);
 }
 
 TEST_F(PgLocalTxnStoreTest, StatementLimitsAndPaging) {

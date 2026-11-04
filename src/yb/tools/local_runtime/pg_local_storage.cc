@@ -30,6 +30,9 @@
 DEFINE_NON_RUNTIME_uint64(local_runtime_churn_write_buffer_bytes, 8ULL * 1024 * 1024,
     "Memtable size for intents and metadata families, whose entries are mostly removed or "
     "superseded. 0 keeps the default size, without compaction.");
+DEFINE_NON_RUNTIME_uint64(local_runtime_max_wal_bytes, 256ULL * 1024 * 1024,
+    "WAL size past which families holding data in the oldest log are flushed so it can be "
+    "deleted. 0 never forces a flush and leaves table and catalog rows uncompacted.");
 
 namespace yb::local_runtime {
 namespace {
@@ -121,24 +124,38 @@ Status PgLocalStorage::Initialize(const std::string& directory, const std::strin
   // Removed intents and superseded clock/status records stay in a memtable, beside their
   // tombstones, until it flushes; with the default 128 MiB buffers they rarely do and come to most
   // of the store's memory. Small buffers let a flush drop them, and universal compaction (the
-  // native default) merges what survives. Table and catalog rows keep large buffers and no
-  // compaction: without history GC, compacting them would only rewrite the same versions.
+  // native default) merges what survives.
+  // Table and catalog rows keep large buffers and are rarely full, so without a WAL cap every log
+  // stays live for the life of the store. The cap flushes whatever still holds the oldest log; the
+  // flushed row files then need compaction too, which keeps every version (there is no history
+  // GC filter) and only merges files.
   const auto churn_bytes = FLAGS_local_runtime_churn_write_buffer_bytes;
+  const auto max_wal_bytes = FLAGS_local_runtime_max_wal_bytes;
   churn_options_ = regular_options_;
   for (auto* options : {&regular_options_, &intents_options_, &churn_options_}) {
     options->disable_wal = false;
-    options->max_manifest_file_size = 128ULL * 1024 * 1024;
-    if (options == &regular_options_ || !churn_bytes) {
+    // Every flush logs an edit; rolling writes a fresh snapshot of all families instead.
+    options->max_manifest_file_size = 32ULL * 1024 * 1024;
+    if (options == &regular_options_ ? !max_wal_bytes : !churn_bytes) {
       options->compaction_style = rocksdb::kCompactionStyleNone;
       options->level0_slowdown_writes_trigger = std::numeric_limits<int>::max();
       options->level0_stop_writes_trigger = std::numeric_limits<int>::max();
     } else {
-      options->write_buffer_size = churn_bytes;
-      // Flushed intents files are small and mostly cancel out; merge them early.
+      if (options != &regular_options_) options->write_buffer_size = churn_bytes;
+      // Flushed files are small (intents mostly cancel out); merge them early.
       options->level0_file_num_compaction_trigger = 2;
       options->compaction_options_universal.min_merge_width = 2;
     }
   }
+  regular_options_.max_total_wal_size = max_wal_bytes;
+  // Each regular SST gets a fixed 64 KiB bloom filter block. Forced flushes write a small file for
+  // every family holding the oldest log, so the filters dwarf the data and crowd the block cache,
+  // while each family has only a few files for a filter to skip. Files without a filter are read
+  // as possibly containing every key.
+  regular_options_.table_factory = churn_options_.table_factory = intents_options_.table_factory;
+  // An SST is two open files here, and a family of each kind per table and index adds up to
+  // thousands of SSTs; bound the readers kept open.
+  regular_options_.max_open_files = 1000;
   regular_options_.create_if_missing = fresh && seed.empty();
   regular_options_.create_missing_column_families = fresh;
   std::vector<std::string> names;
