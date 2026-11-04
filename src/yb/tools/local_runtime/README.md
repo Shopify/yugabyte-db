@@ -213,12 +213,15 @@ Limits are 16 MiB for the encoded catalog overlay/final commit batch and for an 
 intent batch plus pending catalog bytes, with additional arenas/overlay/rollback overhead.
 Attached SQL transactions may stream up to 512 MiB of cumulative encoded intents. These are
 not all buffered in the catalog overlay. There are 1,024 rollback ranges and 65,536 unfinished
-native transactions. History GC is disabled and table rows are never compacted, so committed
-versions accumulate. Intents and metadata families use small write buffers
-(--local_runtime_churn_write_buffer_bytes) and universal compaction, and the largest intents
-families are flushed once unflushed intents exceed --local_runtime_intents_memtable_budget_bytes:
-removed intents otherwise stay in memtables beside their tombstones. The WAL is not truncated while
-table rows stay unflushed, so memory/disk use must be measured for the intended workload.
+native transactions. History GC is disabled, so committed versions accumulate. Intents and
+metadata families use small write buffers (--local_runtime_churn_write_buffer_bytes), and the
+largest intents families are flushed once unflushed intents exceed
+--local_runtime_intents_memtable_budget_bytes: removed intents otherwise stay in memtables beside
+their tombstones. Past --local_runtime_max_wal_bytes of WAL, every family holding the oldest log is
+flushed so it can be deleted. All families use universal compaction without a filter, which merges
+files and keeps every version, and SSTs carry no bloom filter: forced flushes write a small file
+per family, which a fixed 64 KiB filter block would dwarf. Synced writes are commits, catalog
+changes, sequence state and table creation; aborts and savepoint rollbacks are not synced.
 
 Each backend owns its request-sequence watermark, queued calls, deadline timer, and error state.
 Sequencing has no lifetime request-count cap. Out-of-order arrivals park without blocking
