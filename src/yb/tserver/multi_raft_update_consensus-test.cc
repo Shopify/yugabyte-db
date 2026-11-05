@@ -17,6 +17,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -34,6 +35,8 @@
 #include "yb/consensus/log.h"
 #include "yb/consensus/metadata.pb.h"
 #include "yb/consensus/raft_consensus.h"
+
+#include "yb/gutil/thread_annotations.h"
 
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/rpc_context.h"
@@ -58,6 +61,7 @@
 #include "yb/util/countdown_latch.h"
 #include "yb/util/mem_tracker.h"
 #include "yb/util/metrics.h"
+#include "yb/util/random_util.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/sync_point.h"
 #include "yb/util/test_macros.h"
@@ -74,11 +78,15 @@ DECLARE_bool(enable_multi_raft_data_batching);
 DECLARE_bool(enforce_xcluster_guarded_lease);
 DECLARE_int32(multi_raft_update_max_threads);
 DECLARE_int32(raft_heartbeat_interval_ms);
+DECLARE_bool(TEST_multi_raft_update_fail_partial_frames);
 DECLARE_bool(use_preelection);
 
 METRIC_DECLARE_entity(server);
 METRIC_DECLARE_histogram(handler_latency_yb_consensus_ConsensusService_MultiRaftUpdateConsensus);
 METRIC_DECLARE_counter(multi_raft_update_deadline_responses);
+METRIC_DECLARE_event_stats(multi_raft_update_frame_slots);
+METRIC_DECLARE_counter(multi_raft_update_frames_sent);
+METRIC_DECLARE_event_stats(multi_raft_update_slot_wait_us);
 METRIC_DECLARE_counter(multi_raft_update_sub_requests_concurrent);
 
 namespace yb::tserver {
@@ -98,6 +106,20 @@ constexpr auto kFakePeer = "fake-peer";
 // leader_failure_max_missed_heartbeat_periods (6) heartbeat intervals.
 constexpr int kHeartbeatIntervalMs = 100;
 
+// Partial frames received for one envelope, recorded by its partial-response callback on the
+// client's reactor thread. Shared with the callback, so it lives as long as the callback does.
+struct FrameLog {
+  std::mutex mutex;
+  std::vector<MultiRaftConsensusResponsePB> partials GUARDED_BY(mutex);
+  std::vector<MonoTime> partial_times GUARDED_BY(mutex);
+  int parse_errors GUARDED_BY(mutex) = 0;
+
+  size_t num_partials() {
+    std::lock_guard lock(mutex);
+    return partials.size();
+  }
+};
+
 struct Envelope {
   consensus::MultiRaftConsensusRequestPB req;
   MultiRaftConsensusResponsePB resp;
@@ -105,9 +127,173 @@ struct Envelope {
   CountDownLatch done{1};
   MonoTime start;
   MonoTime finish;
+  // Set when the envelope was sent with a partial-response callback.
+  std::shared_ptr<FrameLog> frames;
+  // Partial frames received when the final callback ran: the client runs every partial callback
+  // for frames that precede the final before the final callback.
+  size_t partials_before_final = 0;
+
+  // The final callback references this envelope.
+  ~Envelope() { done.WaitFor(60s); }
 
   bool finished() const { return done.count() == 0; }
   MonoDelta elapsed() const { return finish - start; }
+};
+
+// The frames of a streamed envelope, and the slots merged into request order.
+struct StreamedResult {
+  MultiRaftConsensusResponsePB merged;
+  std::vector<MultiRaftConsensusResponsePB> partials;
+  std::vector<MonoTime> partial_times;
+  // The final frame as received.
+  MultiRaftConsensusResponsePB final_frame;
+
+  std::set<uint32_t> PartialIndices() const {
+    std::set<uint32_t> result;
+    for (const auto& frame : partials) {
+      result.insert(frame.index().begin(), frame.index().end());
+    }
+    return result;
+  }
+
+  std::set<uint32_t> FinalIndices() const {
+    return {final_frame.index().begin(), final_frame.index().end()};
+  }
+};
+
+// Records the test sync points of streamed envelopes, for the first streamed envelope that reaches
+// one, and can hold its sender at the n-th SenderBeforeSend or SenderBeforeRelease until Resume().
+// It can also hold the sub-request for one tablet before its update until ResumeUpdate().
+// Declare it after everything its owner reads from it: on destruction it releases every hold,
+// clears every sync-point callback and waits for the callbacks still running.
+class StreamSyncPoints {
+ public:
+  struct Send {
+    size_t num_slots;
+    bool final;
+  };
+
+  struct Completion {
+    size_t index;
+    bool accepted;
+  };
+
+  // hold_send, hold_release: 1-based ordinal of the sync point at which the sender waits; 0 for
+  // none.
+  explicit StreamSyncPoints(
+      size_t hold_send = 0, size_t hold_release = 0, TabletId hold_update = {})
+      : hold_send_(hold_send), hold_release_(hold_release), hold_update_(std::move(hold_update)) {
+    auto* sync_point = SyncPoint::GetInstance();
+    if (!hold_update_.empty()) {
+      sync_point->SetCallBack("MultiRaftUpdateTask::BeforeUpdate", [this](void* arg) {
+        if (static_cast<consensus::LWConsensusRequestPB*>(arg)->tablet_id() == hold_update_) {
+          update_resume_.WaitFor(60s);
+        }
+      });
+    }
+    sync_point->SetCallBack("MultiRaftUpdateState::Completed", [this](void* arg) {
+      auto& info = *static_cast<MultiRaftUpdateSyncPointArg*>(arg);
+      std::lock_guard lock(mutex_);
+      if (Track(info.envelope)) {
+        completions_.push_back({info.index, info.accepted});
+      }
+    });
+    sync_point->SetCallBack("MultiRaftUpdateState::SenderBeforeSend", [this](void* arg) {
+      auto& info = *static_cast<MultiRaftUpdateSyncPointArg*>(arg);
+      {
+        std::lock_guard lock(mutex_);
+        if (!Track(info.envelope)) {
+          return;
+        }
+        sends_.push_back({info.num_slots, info.final});
+        if (sends_.size() != hold_send_) {
+          return;
+        }
+        held_ = true;
+      }
+      Hold();
+    });
+    sync_point->SetCallBack("MultiRaftUpdateState::SenderBeforeRelease", [this](void* arg) {
+      auto& info = *static_cast<MultiRaftUpdateSyncPointArg*>(arg);
+      {
+        std::lock_guard lock(mutex_);
+        if (!Track(info.envelope)) {
+          return;
+        }
+        if (++releases_ != hold_release_) {
+          return;
+        }
+        held_ = true;
+      }
+      Hold();
+    });
+    sync_point->EnableProcessing();
+  }
+
+  ~StreamSyncPoints() {
+    Resume();
+    ResumeUpdate();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+
+  void Resume() { resume_.CountDown(); }
+
+  void ResumeUpdate() { update_resume_.CountDown(); }
+
+  Status WaitHeld() {
+    return WaitFor([this] {
+      std::lock_guard lock(mutex_);
+      return held_;
+    }, 30s, "Sender held");
+  }
+
+  // Waits until request index has completed num times with the given accepted value.
+  Status WaitCompleted(size_t index, bool accepted) {
+    return WaitFor([this, index, accepted] {
+      std::lock_guard lock(mutex_);
+      for (const auto& completion : completions_) {
+        if (completion.index == index && completion.accepted == accepted) {
+          return true;
+        }
+      }
+      return false;
+    }, 30s, Format("Request $0 completed, accepted: $1", index, accepted));
+  }
+
+  std::vector<Send> sends() {
+    std::lock_guard lock(mutex_);
+    return sends_;
+  }
+
+  std::vector<Completion> completions() {
+    std::lock_guard lock(mutex_);
+    return completions_;
+  }
+
+ private:
+  bool Track(const void* envelope) REQUIRES(mutex_) {
+    if (!envelope_) {
+      envelope_ = envelope;
+    }
+    return envelope_ == envelope;
+  }
+
+  void Hold() {
+    // Bounded, so that a failed test cannot hang the server's shutdown.
+    resume_.WaitFor(60s);
+  }
+
+  const size_t hold_send_;
+  const size_t hold_release_;
+  const TabletId hold_update_;
+  CountDownLatch resume_{1};
+  CountDownLatch update_resume_{1};
+  std::mutex mutex_;
+  const void* envelope_ GUARDED_BY(mutex_) = nullptr;
+  std::vector<Send> sends_ GUARDED_BY(mutex_);
+  std::vector<Completion> completions_ GUARDED_BY(mutex_);
+  size_t releases_ GUARDED_BY(mutex_) = 0;
+  bool held_ GUARDED_BY(mutex_) = false;
 };
 
 void AssertSlotOk(const ConsensusResponsePB& slot, const OpId& last_received) {
@@ -262,11 +448,110 @@ class MultiRaftUpdateConsensusTest : public TabletServerTestBase {
     return Status::OK();
   }
 
+  // One write op per tablet, committed on every tablet but tablets_[0].
+  std::vector<ConsensusRequestPB> OneOpPerTablet() {
+    std::vector<ConsensusRequestPB> requests;
+    for (size_t i = 0; i != tablets_.size(); ++i) {
+      requests.push_back(Data(&tablets_[i], 1, /* commit= */ i != 0));
+    }
+    return requests;
+  }
+
   Result<MultiRaftConsensusResponsePB> Send(
       std::vector<ConsensusRequestPB> requests, MonoDelta timeout = 30s) {
     auto envelope = SendAsync(std::move(requests), timeout);
     RETURN_NOT_OK(Wait(envelope.get()));
     return envelope->resp;
+  }
+
+  // Sends an envelope with a partial-response callback that records every partial frame, and with
+  // stream_responses set if stream.
+  std::unique_ptr<Envelope> SendRecordedAsync(
+      std::vector<ConsensusRequestPB> requests, MonoDelta timeout = 30s, bool stream = true) {
+    auto envelope = std::make_unique<Envelope>();
+    for (auto& request : requests) {
+      *envelope->req.add_consensus_request() = std::move(request);
+    }
+    if (stream) {
+      envelope->req.set_stream_responses(true);
+    }
+    envelope->frames = std::make_shared<FrameLog>();
+    envelope->controller.set_timeout(timeout);
+    envelope->controller.set_partial_response_callback(
+        [frames = envelope->frames](Slice body, RefCntBuffer) {
+          MultiRaftConsensusResponsePB frame;
+          auto parsed = frame.ParseFromArray(body.data(), narrow_cast<int>(body.size()));
+          std::lock_guard lock(frames->mutex);
+          if (!parsed) {
+            ++frames->parse_errors;
+            return;
+          }
+          frames->partials.push_back(std::move(frame));
+          frames->partial_times.push_back(MonoTime::Now());
+        });
+    envelope->start = MonoTime::Now();
+    auto* e = envelope.get();
+    consensus_proxy_->MultiRaftUpdateConsensusAsync(
+        e->req, &e->resp, &e->controller, [e] {
+          {
+            std::lock_guard lock(e->frames->mutex);
+            e->partials_before_final = e->frames->partials.size();
+          }
+          e->finish = MonoTime::Now();
+          e->done.CountDown();
+        });
+    return envelope;
+  }
+
+  // Waits for a streamed envelope and checks the frame shape: every frame sets index, parallel to
+  // its responses; no partial frame is empty or arrives after the final; the final carries at
+  // least one slot; and every request is answered exactly once.
+  Result<StreamedResult> WaitStreamed(Envelope* envelope) {
+    SCHECK(envelope->done.WaitFor(60s), TimedOut, "Envelope did not complete");
+    RETURN_NOT_OK(envelope->controller.status());
+    StreamedResult result;
+    {
+      std::lock_guard lock(envelope->frames->mutex);
+      SCHECK_EQ(envelope->frames->parse_errors, 0, IllegalState, "Unparsable partial frame");
+      result.partials = envelope->frames->partials;
+      result.partial_times = envelope->frames->partial_times;
+    }
+    SCHECK_EQ(
+        envelope->partials_before_final, result.partials.size(), IllegalState,
+        "Partial frame after the final");
+    result.final_frame = envelope->resp;
+    const auto num_requests = static_cast<size_t>(envelope->req.consensus_request_size());
+    std::vector<const ConsensusResponsePB*> slots(num_requests);
+    auto add_frame = [&slots, num_requests](
+        const MultiRaftConsensusResponsePB& frame, const char* kind) -> Status {
+      SCHECK_EQ(
+          frame.index_size(), frame.consensus_response_size(), IllegalState,
+          Format("$0 frame: index not parallel to the responses: $1", kind,
+                 frame.ShortDebugString()));
+      SCHECK_GT(frame.index_size(), 0, IllegalState, Format("Empty $0 frame", kind));
+      for (int i = 0; i != frame.index_size(); ++i) {
+        const auto index = frame.index(i);
+        SCHECK_LT(index, num_requests, IllegalState, Format("$0 frame: bad index", kind));
+        SCHECK(!slots[index], IllegalState, Format("Request $0 answered twice", index));
+        slots[index] = &frame.consensus_response(i);
+      }
+      return Status::OK();
+    };
+    for (const auto& frame : result.partials) {
+      RETURN_NOT_OK(add_frame(frame, "partial"));
+    }
+    RETURN_NOT_OK(add_frame(result.final_frame, "final"));
+    for (size_t i = 0; i != num_requests; ++i) {
+      SCHECK(slots[i], IllegalState, Format("Request $0 not answered", i));
+      *result.merged.add_consensus_response() = *slots[i];
+    }
+    return result;
+  }
+
+  Result<StreamedResult> SendStreamed(
+      std::vector<ConsensusRequestPB> requests, MonoDelta timeout = 30s) {
+    auto envelope = SendRecordedAsync(std::move(requests), timeout);
+    return WaitStreamed(envelope.get());
   }
 
   std::shared_ptr<consensus::RaftConsensus> Consensus(const TestTablet& tablet) {
@@ -302,6 +587,14 @@ class MultiRaftUpdateConsensusTest : public TabletServerTestBase {
 
   int64_t DeadlineResponses() {
     return ServerCounter(METRIC_multi_raft_update_deadline_responses);
+  }
+
+  int64_t FramesSent() {
+    return ServerCounter(METRIC_multi_raft_update_frames_sent);
+  }
+
+  scoped_refptr<EventStats> ServerStats(const EventStatsPrototype& prototype) {
+    return prototype.Instantiate(mini_server_->server()->metric_entity());
   }
 
   std::shared_ptr<MemTracker> InboundCallsTracker() {
@@ -431,6 +724,8 @@ class MultiRaftUpdateConsensusTest : public TabletServerTestBase {
     RETURN_NOT_OK(consensus_proxy_->RequestConsensusVote(req, &resp, &controller));
     return resp;
   }
+
+  void TestSameTabletHeartbeatAndData(bool stream);
 
   std::string server_uuid_;
   int64_t term_ = 1;
@@ -953,9 +1248,10 @@ TEST_F(MultiRaftUpdateConsensusTest, MixedEnvelope) {
 
 // An envelope can carry a heartbeat and a data request for the same tablet (the heartbeat was
 // parked in the leader's batch when the data request joined it). Both request orders, each forced
-// into both execution orders, are correct. That the leader drops the heartbeat's response is
-// covered by StaleHeartbeatResponseDroppedAfterBatchedSend in consensus_peers-test.
-TEST_F(MultiRaftUpdateConsensusTest, SameTabletHeartbeatAndData) {
+// into both execution orders, are correct, with the envelope streamed if stream. That the leader
+// drops the heartbeat's response is covered by StaleHeartbeatResponseDroppedAfterBatchedSend in
+// consensus_peers-test.
+void MultiRaftUpdateConsensusTest::TestSameTabletHeartbeatAndData(bool stream) {
   struct Case {
     bool heartbeat_first_in_request;
     bool heartbeat_runs_first;
@@ -986,6 +1282,8 @@ TEST_F(MultiRaftUpdateConsensusTest, SameTabletHeartbeatAndData) {
   auto is_first = [&order](const consensus::LWConsensusRequestPB& req) {
     return req.ops().empty() == order.heartbeat_runs_first;
   };
+  // Destroyed first: the callbacks capture the locals above.
+  SyncPointScope sync_point_scope;
   auto* sync_point = SyncPoint::GetInstance();
   sync_point->SetCallBack("MultiRaftUpdateTask::BeforeUpdate", [&](void* arg) {
     auto& req = *static_cast<consensus::LWConsensusRequestPB*>(arg);
@@ -1035,9 +1333,15 @@ TEST_F(MultiRaftUpdateConsensusTest, SameTabletHeartbeatAndData) {
       order.ran_heartbeat.clear();
     }
     const int heartbeat_slot = test_case.heartbeat_first_in_request ? 0 : 1;
-    auto resp = ASSERT_RESULT(Send(test_case.heartbeat_first_in_request
+    auto requests = test_case.heartbeat_first_in_request
         ? std::vector<ConsensusRequestPB>{heartbeat, data}
-        : std::vector<ConsensusRequestPB>{data, heartbeat}));
+        : std::vector<ConsensusRequestPB>{data, heartbeat};
+    MultiRaftConsensusResponsePB resp;
+    if (stream) {
+      resp = ASSERT_RESULT(SendStreamed(std::move(requests))).merged;
+    } else {
+      resp = ASSERT_RESULT(Send(std::move(requests)));
+    }
     // The envelope can be answered from inside UpdateAsync, before the second request reaches
     // AfterUpdate.
     ASSERT_OK(WaitFor(
@@ -1067,6 +1371,16 @@ TEST_F(MultiRaftUpdateConsensusTest, SameTabletHeartbeatAndData) {
     ASSERT_NO_FATALS(AssertSlotOk(
         ASSERT_RESULT(Send({Heartbeat(tablet)})).consensus_response(0), tablet.last));
   }
+}
+
+TEST_F(MultiRaftUpdateConsensusTest, SameTabletHeartbeatAndData) {
+  TestSameTabletHeartbeatAndData(/* stream= */ false);
+}
+
+// The streamed frames carry the right index for each of the two requests, in both execution
+// orders.
+TEST_F(MultiRaftUpdateConsensusTest, StreamedHeartbeatAndDataSameTablet) {
+  TestSameTabletHeartbeatAndData(/* stream= */ true);
 }
 
 // The flag is read once per RPC: an envelope in progress finishes on the path it started on, in
@@ -1190,6 +1504,441 @@ TEST_F(MultiRaftUpdateConsensusTest, PoolBackPressure) {
   resp = ASSERT_RESULT(Send({Data(&tablets_[1], 1, true), Data(&tablets_[2], 1, true)}));
   ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(0), tablets_[1].last));
   ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(1), tablets_[2].last));
+}
+
+// With stream_responses, each response goes out as soon as its sub-request completes: the fast
+// slots in partial frames, the slow one in the final. Every frame sets index.
+TEST_F(MultiRaftUpdateConsensusTest, StreamedFramesCarryIndices) {
+  ASSERT_NO_FATALS(StartServer(3));
+  constexpr auto kDiskDelay = 1s;
+  SetSlowDisk(tablets_[0], kDiskDelay);
+  std::vector<ConsensusRequestPB> requests;
+  for (size_t i = 0; i != tablets_.size(); ++i) {
+    requests.push_back(Data(&tablets_[i], narrow_cast<int>(i) + 1, /* commit= */ i != 0));
+  }
+  auto envelope = SendRecordedAsync(std::move(requests));
+  auto result = ASSERT_RESULT(WaitStreamed(envelope.get()));
+  // The slow slot completed last.
+  ASSERT_GE(envelope->elapsed(), kDiskDelay);
+  ASSERT_EQ(result.PartialIndices(), (std::set<uint32_t>{1, 2}));
+  ASSERT_EQ(result.FinalIndices(), (std::set<uint32_t>{0}));
+  // The fast slots did not wait for it.
+  for (auto time : result.partial_times) {
+    ASSERT_GT(envelope->finish - time, 500ms);
+  }
+  for (size_t i = 0; i != tablets_.size(); ++i) {
+    ASSERT_NO_FATALS(AssertSlotOk(
+        result.merged.consensus_response(narrow_cast<int>(i)), tablets_[i].last));
+  }
+}
+
+// Completions that arrive while the sender is busy share its next frame.
+TEST_F(MultiRaftUpdateConsensusTest, StreamedCoalescesCoincidingCompletions) {
+  ASSERT_NO_FATALS(StartServer(4));
+  std::unique_ptr<Envelope> envelope;
+  for (size_t i = 1; i != tablets_.size(); ++i) {
+    Consensus(tablets_[i])->TEST_PauseUpdateConsensus(true);
+  }
+  auto unpause = ScopeExit([this] {
+    for (size_t i = 1; i != tablets_.size(); ++i) {
+      Consensus(tablets_[i])->TEST_PauseUpdateConsensus(false);
+    }
+  });
+  const auto frames_before = FramesSent();
+  StreamSyncPoints sync_points(/* hold_send= */ 1);
+  std::vector<ConsensusRequestPB> requests;
+  for (auto& tablet : tablets_) {
+    requests.push_back(Data(&tablet, 1, /* commit= */ true));
+  }
+  envelope = SendRecordedAsync(std::move(requests));
+  // The first sender holds slot 0's frame while the other three complete.
+  ASSERT_OK(sync_points.WaitHeld());
+  for (size_t i = 1; i != tablets_.size(); ++i) {
+    Consensus(tablets_[i])->TEST_PauseUpdateConsensus(false);
+  }
+  for (size_t i = 1; i != tablets_.size(); ++i) {
+    ASSERT_OK(sync_points.WaitCompleted(i, /* accepted= */ true));
+  }
+  sync_points.Resume();
+  auto result = ASSERT_RESULT(WaitStreamed(envelope.get()));
+  ASSERT_EQ(result.partials.size(), 1);
+  ASSERT_EQ(result.PartialIndices(), (std::set<uint32_t>{0}));
+  ASSERT_EQ(result.FinalIndices(), (std::set<uint32_t>{1, 2, 3}));
+  auto sends = sync_points.sends();
+  ASSERT_EQ(sends.size(), 2);
+  ASSERT_EQ(sends[0].num_slots, 1);
+  ASSERT_FALSE(sends[0].final);
+  ASSERT_EQ(sends[1].num_slots, 3);
+  ASSERT_TRUE(sends[1].final);
+  ASSERT_EQ(FramesSent() - frames_before, 2);
+  for (size_t i = 0; i != tablets_.size(); ++i) {
+    ASSERT_NO_FATALS(AssertSlotOk(
+        result.merged.consensus_response(narrow_cast<int>(i)), tablets_[i].last));
+  }
+}
+
+// The final carries exactly the slots no partial frame carried, with their indices; an error slot
+// goes out in a partial frame like any other.
+TEST_F(MultiRaftUpdateConsensusTest, StreamedFinalCarriesRemainder) {
+  ASSERT_NO_FATALS(StartServer(2));
+  constexpr auto kDiskDelay = 1s;
+  SetSlowDisk(tablets_[1], kDiskDelay);
+  auto unknown_tablet = Heartbeat(tablets_[0]);
+  unknown_tablet.set_tablet_id("no-such-tablet");
+  auto envelope = SendRecordedAsync(
+      {Data(&tablets_[0], 1, true), unknown_tablet, Data(&tablets_[1], 2, false)});
+  auto result = ASSERT_RESULT(WaitStreamed(envelope.get()));
+  ASSERT_GE(envelope->elapsed(), kDiskDelay);
+  ASSERT_EQ(result.PartialIndices(), (std::set<uint32_t>{0, 1}));
+  ASSERT_EQ(result.final_frame.consensus_response_size(), 1);
+  ASSERT_EQ(result.final_frame.index_size(), 1);
+  ASSERT_EQ(result.final_frame.index(0), 2);
+  ASSERT_NO_FATALS(AssertSlotOk(result.final_frame.consensus_response(0), tablets_[1].last));
+  ASSERT_NO_FATALS(AssertSlotOk(result.merged.consensus_response(0), tablets_[0].last));
+  ASSERT_EQ(result.merged.consensus_response(1).error().code(),
+            TabletServerErrorPB::TABLET_NOT_FOUND);
+}
+
+// A slot still running at the deadline goes out TimedOut in the final, after the partial frames
+// of the others.
+TEST_F(MultiRaftUpdateConsensusTest, StreamedDeadlineAfterPartials) {
+  ASSERT_NO_FATALS(StartServer(3));
+  auto& paused = tablets_[2];
+  Consensus(paused)->TEST_PauseUpdateConsensus(true);
+  auto unpause = ScopeExit([this, &paused] {
+    Consensus(paused)->TEST_PauseUpdateConsensus(false);
+  });
+  const auto deadline_responses_before = DeadlineResponses();
+  auto envelope = SendRecordedAsync(
+      {Data(&tablets_[0], 1, true), Data(&tablets_[1], 1, true), Data(&paused, 1, true)}, 2s);
+  auto result = ASSERT_RESULT(WaitStreamed(envelope.get()));
+  ASSERT_EQ(DeadlineResponses() - deadline_responses_before, 1);
+  ASSERT_GE(envelope->elapsed(), 1500ms);
+  ASSERT_EQ(result.PartialIndices(), (std::set<uint32_t>{0, 1}));
+  ASSERT_EQ(result.FinalIndices(), (std::set<uint32_t>{2}));
+  ASSERT_NO_FATALS(AssertSlotOk(result.merged.consensus_response(0), tablets_[0].last));
+  ASSERT_NO_FATALS(AssertSlotOk(result.merged.consensus_response(1), tablets_[1].last));
+  ASSERT_NO_FATALS(AssertSlotError(result.merged.consensus_response(2), AppStatusPB::TIMED_OUT));
+}
+
+// The deadline times a slot out while the sender is busy, and then the slot's own completion
+// arrives. The slot is answered once, TimedOut, by the sender.
+TEST_F(MultiRaftUpdateConsensusTest, StreamedDeadlineRacesCompletion) {
+  ASSERT_NO_FATALS(StartServer(2));
+  auto& held = tablets_[1];
+  std::unique_ptr<Envelope> envelope;
+  const auto deadline_responses_before = DeadlineResponses();
+  StreamSyncPoints sync_points(
+      /* hold_send= */ 1, /* hold_release= */ 0, /* hold_update= */ held.id);
+  // The client gives up 10% after the server's deadline: enough for the steps below, which wait
+  // for no timer.
+  envelope = SendRecordedAsync(
+      {Data(&tablets_[0], 1, true), Data(&held, 1, true)}, 6s * kTimeMultiplier);
+  ASSERT_OK(sync_points.WaitHeld());
+  ASSERT_OK(WaitFor(
+      [this, deadline_responses_before] {
+        return DeadlineResponses() - deadline_responses_before == 1;
+      },
+      20s * kTimeMultiplier, "Deadline fired while the sender is held"));
+  sync_points.ResumeUpdate();
+  ASSERT_OK(sync_points.WaitCompleted(1, /* accepted= */ false));
+  sync_points.Resume();
+  auto result = ASSERT_RESULT(WaitStreamed(envelope.get()));
+  ASSERT_EQ(result.PartialIndices(), (std::set<uint32_t>{0}));
+  ASSERT_EQ(result.FinalIndices(), (std::set<uint32_t>{1}));
+  ASSERT_NO_FATALS(AssertSlotOk(result.merged.consensus_response(0), tablets_[0].last));
+  ASSERT_NO_FATALS(AssertSlotError(result.merged.consensus_response(1), AppStatusPB::TIMED_OUT));
+  ASSERT_EQ(sync_points.sends().size(), 2);
+}
+
+// A completion appended after the sender found the ready list empty, but before it gave up its
+// role, is sent by that sender, not left for the deadline.
+TEST_F(MultiRaftUpdateConsensusTest, StreamedNoStrandedCompletion) {
+  ASSERT_NO_FATALS(StartServer(2));
+  auto& paused = tablets_[1];
+  std::unique_ptr<Envelope> envelope;
+  Consensus(paused)->TEST_PauseUpdateConsensus(true);
+  auto unpause = ScopeExit([this, &paused] {
+    Consensus(paused)->TEST_PauseUpdateConsensus(false);
+  });
+  const auto deadline_responses_before = DeadlineResponses();
+  StreamSyncPoints sync_points(/* hold_send= */ 0, /* hold_release= */ 1);
+  constexpr auto kTimeout = 10s;
+  envelope = SendRecordedAsync({Data(&tablets_[0], 1, true), Data(&paused, 1, true)}, kTimeout);
+  // The sender has sent slot 0 and holds its role with an empty list.
+  ASSERT_OK(sync_points.WaitHeld());
+  ASSERT_EQ(sync_points.sends().size(), 1);
+  Consensus(paused)->TEST_PauseUpdateConsensus(false);
+  ASSERT_OK(sync_points.WaitCompleted(1, /* accepted= */ true));
+  sync_points.Resume();
+  auto result = ASSERT_RESULT(WaitStreamed(envelope.get()));
+  ASSERT_LT(envelope->elapsed(), kTimeout / 2);
+  ASSERT_EQ(DeadlineResponses(), deadline_responses_before);
+  ASSERT_EQ(result.PartialIndices(), (std::set<uint32_t>{0}));
+  ASSERT_EQ(result.FinalIndices(), (std::set<uint32_t>{1}));
+  ASSERT_NO_FATALS(AssertSlotOk(result.merged.consensus_response(0), tablets_[0].last));
+  ASSERT_NO_FATALS(AssertSlotOk(result.merged.consensus_response(1), paused.last));
+}
+
+// Many sub-requests completing at random times: every response arrives long before the deadline.
+TEST_F(MultiRaftUpdateConsensusTest, StreamedNoStrandedCompletionStress) {
+  constexpr size_t kTablets = 8;
+  constexpr int kEnvelopes = 20;
+  constexpr auto kTimeout = 10s;
+  ASSERT_NO_FATALS(StartServer(kTablets));
+  // Spreads the completions over the sender's sends and releases.
+  auto* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("MultiRaftUpdateTask::BeforeUpdate", [](void*) {
+    SleepFor(RandomUniformInt(0, 3000) * 1us);
+  });
+  sync_point->EnableProcessing();
+  size_t num_partials = 0;
+  for (int i = 0; i != kEnvelopes; ++i) {
+    std::vector<ConsensusRequestPB> requests;
+    for (auto& tablet : tablets_) {
+      requests.push_back(Data(&tablet, 1, /* commit= */ true));
+    }
+    auto envelope = SendRecordedAsync(std::move(requests), kTimeout);
+    auto result = ASSERT_RESULT(WaitStreamed(envelope.get()));
+    ASSERT_LT(envelope->elapsed(), kTimeout / 2);
+    for (size_t j = 0; j != kTablets; ++j) {
+      ASSERT_NO_FATALS(AssertSlotOk(
+          result.merged.consensus_response(narrow_cast<int>(j)), tablets_[j].last));
+    }
+    num_partials += result.partials.size();
+  }
+  LOG(INFO) << "Partial frames: " << num_partials << " in " << kEnvelopes << " envelopes";
+  ASSERT_GT(num_partials, 0);
+}
+
+// After the final at the deadline, the paused slot's completion is dropped, and nothing more is
+// sent.
+TEST_F(MultiRaftUpdateConsensusTest, StreamedLateCompletionDropped) {
+  ASSERT_NO_FATALS(StartServer(2));
+  auto& paused = tablets_[1];
+  std::unique_ptr<Envelope> envelope;
+  Consensus(paused)->TEST_PauseUpdateConsensus(true);
+  auto unpause = ScopeExit([this, &paused] {
+    Consensus(paused)->TEST_PauseUpdateConsensus(false);
+  });
+  const auto deadline_responses_before = DeadlineResponses();
+  StreamSyncPoints sync_points;
+  envelope = SendRecordedAsync({Data(&tablets_[0], 1, true), Data(&paused, 1, true)}, 2s);
+  auto result = ASSERT_RESULT(WaitStreamed(envelope.get()));
+  ASSERT_EQ(DeadlineResponses() - deadline_responses_before, 1);
+  ASSERT_EQ(result.FinalIndices(), (std::set<uint32_t>{1}));
+  ASSERT_NO_FATALS(AssertSlotError(result.merged.consensus_response(1), AppStatusPB::TIMED_OUT));
+  const auto frames_sent = FramesSent();
+  const auto num_sends = sync_points.sends().size();
+  ASSERT_EQ(num_sends, 2);
+  ASSERT_NE(LastReceived(paused), paused.last);
+
+  Consensus(paused)->TEST_PauseUpdateConsensus(false);
+  ASSERT_OK(sync_points.WaitCompleted(1, /* accepted= */ false));
+  ASSERT_OK(WaitForLastReceived(paused));
+  ASSERT_EQ(sync_points.sends().size(), num_sends);
+  ASSERT_EQ(FramesSent(), frames_sent);
+  ASSERT_EQ(envelope->frames->num_partials(), result.partials.size());
+  auto resp = ASSERT_RESULT(Send({Heartbeat(tablets_[0]), Heartbeat(paused)}));
+  ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(1), paused.last));
+}
+
+// Sub-requests that fail before dispatch are streamed with their indices, together.
+TEST_F(MultiRaftUpdateConsensusTest, StreamedErrorSlots) {
+  ASSERT_NO_FATALS(StartServer(1));
+  constexpr auto kDiskDelay = 500ms;
+  SetSlowDisk(tablets_[0], kDiskDelay);
+  auto wrong_uuid = Heartbeat(tablets_[0]);
+  wrong_uuid.set_dest_uuid("no-such-server");
+  auto unknown_tablet = Heartbeat(tablets_[0]);
+  unknown_tablet.set_tablet_id("no-such-tablet");
+  auto envelope = SendRecordedAsync({wrong_uuid, Data(&tablets_[0], 1, false), unknown_tablet});
+  auto result = ASSERT_RESULT(WaitStreamed(envelope.get()));
+  ASSERT_GE(envelope->elapsed(), kDiskDelay);
+  ASSERT_EQ(result.partials.size(), 1);
+  ASSERT_EQ(result.PartialIndices(), (std::set<uint32_t>{0, 2}));
+  ASSERT_EQ(result.FinalIndices(), (std::set<uint32_t>{1}));
+  ASSERT_EQ(result.merged.consensus_response(0).error().code(),
+            TabletServerErrorPB::WRONG_SERVER_UUID);
+  ASSERT_NO_FATALS(AssertSlotOk(result.merged.consensus_response(1), tablets_[0].last));
+  ASSERT_EQ(result.merged.consensus_response(2).error().code(),
+            TabletServerErrorPB::TABLET_NOT_FOUND);
+}
+
+// An envelope without sub-requests is answered once, without partial frames or index.
+TEST_F(MultiRaftUpdateConsensusTest, StreamedEmptyEnvelope) {
+  ASSERT_NO_FATALS(StartServer(1));
+  const auto frames_before = FramesSent();
+  auto envelope = SendRecordedAsync({});
+  ASSERT_OK(Wait(envelope.get()));
+  ASSERT_EQ(envelope->resp.consensus_response_size(), 0);
+  ASSERT_EQ(envelope->resp.index_size(), 0);
+  ASSERT_EQ(envelope->frames->num_partials(), 0);
+  ASSERT_EQ(FramesSent(), frames_before);
+}
+
+// The serial handler answers once, in request order and without index, whatever
+// stream_responses says.
+TEST_F(MultiRaftUpdateConsensusTest, SerialHandlerIgnoresStreamResponses) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_data_batching) = false;
+  ASSERT_NO_FATALS(StartServer(3));
+  SetSlowDisk(tablets_[0], 500ms);
+  const auto concurrent_before = ConcurrentSubRequests();
+  const auto frames_before = FramesSent();
+  auto envelope = SendRecordedAsync(OneOpPerTablet());
+  ASSERT_OK(Wait(envelope.get()));
+  ASSERT_EQ(envelope->frames->num_partials(), 0);
+  ASSERT_EQ(envelope->resp.index_size(), 0);
+  for (size_t i = 0; i != tablets_.size(); ++i) {
+    ASSERT_NO_FATALS(AssertSlotOk(
+        envelope->resp.consensus_response(narrow_cast<int>(i)), tablets_[i].last));
+  }
+  ASSERT_EQ(ConcurrentSubRequests(), concurrent_before);
+  ASSERT_EQ(FramesSent(), frames_before);
+
+  // The same envelope is streamed by the concurrent handler.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_data_batching) = true;
+  envelope = SendRecordedAsync(OneOpPerTablet());
+  auto result = ASSERT_RESULT(WaitStreamed(envelope.get()));
+  ASSERT_GT(result.partials.size(), 0);
+}
+
+// Without stream_responses the concurrent handler answers once, in request order and without
+// index, even to a caller that accepts partial frames.
+TEST_F(MultiRaftUpdateConsensusTest, NonStreamedUnchanged) {
+  ASSERT_NO_FATALS(StartServer(3));
+  constexpr auto kDiskDelay = 500ms;
+  SetSlowDisk(tablets_[0], kDiskDelay);
+  auto frame_slots = ServerStats(METRIC_multi_raft_update_frame_slots);
+  const auto frames_before = FramesSent();
+  const auto frame_slots_before = frame_slots->TotalCount();
+  auto envelope = SendRecordedAsync(OneOpPerTablet(), 30s, /* stream= */ false);
+  ASSERT_OK(Wait(envelope.get()));
+  ASSERT_GE(envelope->elapsed(), kDiskDelay);
+  ASSERT_EQ(envelope->frames->num_partials(), 0);
+  ASSERT_EQ(envelope->resp.index_size(), 0);
+  for (size_t i = 0; i != tablets_.size(); ++i) {
+    ASSERT_NO_FATALS(AssertSlotOk(
+        envelope->resp.consensus_response(narrow_cast<int>(i)), tablets_[i].last));
+  }
+  ASSERT_EQ(FramesSent(), frames_before);
+  ASSERT_EQ(frame_slots->TotalCount(), frame_slots_before);
+
+  // The same envelope with stream_responses is streamed.
+  envelope = SendRecordedAsync(OneOpPerTablet());
+  auto result = ASSERT_RESULT(WaitStreamed(envelope.get()));
+  ASSERT_GT(result.partials.size(), 0);
+}
+
+// The slot wait measures the barrier without streaming, and almost nothing with it.
+TEST_F(MultiRaftUpdateConsensusTest, SlotWaitMetric) {
+  ASSERT_NO_FATALS(StartServer(3));
+  constexpr auto kDiskDelay = 1s;
+  SetSlowDisk(tablets_[0], kDiskDelay);
+  auto slot_wait = ServerStats(METRIC_multi_raft_update_slot_wait_us);
+  auto count_before = slot_wait->TotalCount();
+  auto sum_before = slot_wait->TotalSum();
+  auto envelope = SendAsync(OneOpPerTablet());
+  ASSERT_OK(Wait(envelope.get()));
+  ASSERT_GE(envelope->elapsed(), kDiskDelay);
+  ASSERT_EQ(slot_wait->TotalCount() - count_before, tablets_.size());
+  // Each of the two fast slots waited for the slow one.
+  const auto barrier_sum = slot_wait->TotalSum() - sum_before;
+  LOG(INFO) << "Slot wait without streaming: " << barrier_sum << " us";
+  ASSERT_GE(barrier_sum, 2 * ToMicroseconds(kDiskDelay - 200ms));
+
+  count_before = slot_wait->TotalCount();
+  sum_before = slot_wait->TotalSum();
+  envelope = SendRecordedAsync(OneOpPerTablet());
+  ASSERT_RESULT(WaitStreamed(envelope.get()));
+  ASSERT_GE(envelope->elapsed(), kDiskDelay);
+  ASSERT_EQ(slot_wait->TotalCount() - count_before, tablets_.size());
+  const auto streamed_sum = slot_wait->TotalSum() - sum_before;
+  LOG(INFO) << "Slot wait with streaming: " << streamed_sum << " us";
+  ASSERT_LT(streamed_sum, ToMicroseconds(200ms));
+}
+
+// The frame metrics count every frame of a streamed envelope and every slot once.
+TEST_F(MultiRaftUpdateConsensusTest, StreamedFrameMetrics) {
+  ASSERT_NO_FATALS(StartServer(4));
+  SetSlowDisk(tablets_[0], 500ms);
+  auto requests = OneOpPerTablet();
+  auto frame_slots = ServerStats(METRIC_multi_raft_update_frame_slots);
+  const auto frames_before = FramesSent();
+  const auto frame_count_before = frame_slots->TotalCount();
+  const auto frame_slots_before = frame_slots->TotalSum();
+  auto result = ASSERT_RESULT(SendStreamed(std::move(requests)));
+  ASSERT_GT(result.partials.size(), 0);
+  ASSERT_EQ(FramesSent() - frames_before, result.partials.size() + 1);
+  ASSERT_EQ(frame_slots->TotalCount() - frame_count_before, result.partials.size() + 1);
+  ASSERT_EQ(frame_slots->TotalSum() - frame_slots_before, tablets_.size());
+}
+
+// A ready response waiting for a busy sender stays valid after its tablet is deleted.
+TEST_F(MultiRaftUpdateConsensusTest, StreamedResponseOutlivesDeletedTablet) {
+  ASSERT_NO_FATALS(StartServer(2));
+  auto& deleted = tablets_[1];
+  std::unique_ptr<Envelope> envelope;
+  Consensus(deleted)->TEST_PauseUpdateConsensus(true);
+  bool tablet_deleted = false;
+  auto unpause = ScopeExit([this, &deleted, &tablet_deleted] {
+    if (!tablet_deleted) {
+      Consensus(deleted)->TEST_PauseUpdateConsensus(false);
+    }
+  });
+  std::weak_ptr<consensus::RaftConsensus> deleted_consensus = Consensus(deleted);
+  StreamSyncPoints sync_points(/* hold_send= */ 1);
+  envelope = SendRecordedAsync({Data(&tablets_[0], 1, true), Data(&deleted, 2, true)});
+  // The sender holds slot 0's frame while slot 1 becomes ready behind it.
+  ASSERT_OK(sync_points.WaitHeld());
+  Consensus(deleted)->TEST_PauseUpdateConsensus(false);
+  ASSERT_OK(sync_points.WaitCompleted(1, /* accepted= */ true));
+  tablet_deleted = true;
+  std::optional<TabletServerErrorPB::Code> error_code;
+  ASSERT_OK(mini_server_->server()->tablet_manager()->DeleteTablet(
+      deleted.id, tablet::TABLET_DATA_DELETED, tablet::ShouldAbortActiveTransactions::kFalse,
+      /* cas_config_opid_index_less_or_equal= */ std::nullopt, /* hide_only= */ false,
+      /* keep_data= */ false, &error_code));
+  deleted.peer.reset();
+  ASSERT_OK(WaitFor(
+      [&deleted_consensus] { return deleted_consensus.expired(); }, 10s,
+      "RaftConsensus of the deleted tablet destroyed"));
+  ASSERT_FALSE(envelope->finished());
+  sync_points.Resume();
+  auto result = ASSERT_RESULT(WaitStreamed(envelope.get()));
+  ASSERT_EQ(result.FinalIndices(), (std::set<uint32_t>{1}));
+  const auto& slot = result.merged.consensus_response(1);
+  ASSERT_NO_FATALS(AssertSlotOk(slot, deleted.last));
+  ASSERT_EQ(slot.responder_uuid(), server_uuid_) << slot.ShortDebugString();
+  ASSERT_EQ(slot.responder_term(), term_) << slot.ShortDebugString();
+}
+
+// When a partial frame cannot be sent, its slots and every later one go in the final, each once.
+TEST_F(MultiRaftUpdateConsensusTest, StreamedPartialFailureFallsBack) {
+  ASSERT_NO_FATALS(StartServer(3));
+  constexpr auto kDiskDelay = 1s;
+  SetSlowDisk(tablets_[0], kDiskDelay);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_multi_raft_update_fail_partial_frames) = true;
+  auto requests = OneOpPerTablet();
+  const auto frames_before = FramesSent();
+  std::unique_ptr<Envelope> envelope;
+  StreamSyncPoints sync_points;
+  envelope = SendRecordedAsync(std::move(requests));
+  auto result = ASSERT_RESULT(WaitStreamed(envelope.get()));
+  ASSERT_GE(envelope->elapsed(), kDiskDelay);
+  // A partial frame was tried, and after it only the final.
+  auto sends = sync_points.sends();
+  ASSERT_EQ(sends.size(), 2);
+  ASSERT_FALSE(sends[0].final);
+  ASSERT_TRUE(sends[1].final);
+  ASSERT_EQ(sends[1].num_slots, tablets_.size());
+  ASSERT_EQ(result.partials.size(), 0);
+  ASSERT_EQ(result.FinalIndices(), (std::set<uint32_t>{0, 1, 2}));
+  ASSERT_EQ(FramesSent() - frames_before, 1);
+  for (size_t i = 0; i != tablets_.size(); ++i) {
+    ASSERT_NO_FATALS(AssertSlotOk(
+        result.merged.consensus_response(narrow_cast<int>(i)), tablets_[i].last));
+  }
 }
 
 // The multi_raft_update pool runs in the cgroup of the messenger's high-priority pool, where the
