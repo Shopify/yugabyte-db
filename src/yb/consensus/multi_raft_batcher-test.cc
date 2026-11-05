@@ -200,6 +200,19 @@ class MultiRaftBatcherTest : public YBTest {
         kind);
   }
 
+  // A ReplicateMsg owned only by the returned holder, and a request op that points to it.
+  LWReplicateMsgsHolder AddHeldOp(TestCall& call, std::weak_ptr<LWReplicateMsg>* weak_msg) {
+    ReplicateMsg op;
+    op.mutable_id()->set_term(1);
+    op.mutable_id()->set_index(1);
+    op.set_hybrid_time(1);
+    op.set_op_type(NO_OP);
+    auto msg = rpc::CopySharedMessage(op);
+    call.request->mutable_ops()->push_back_ref(msg.get());
+    *weak_msg = msg;
+    return LWReplicateMsgsHolder(ReplicateMsgs{std::move(msg)}, ScopedTrackedConsumption());
+  }
+
   TestCall& Add(
       const std::string& tablet_id, RequestKind kind, size_t payload_bytes = 100,
       std::function<void()> on_callback = {}) {
@@ -1053,6 +1066,117 @@ TEST_F(MultiRaftBatcherTest, BatchedResponseProcessingTimeMetric) {
   ASSERT_OK(WaitFor([&stats] { return stats->TotalCount() >= 3; }, 10s, "Recorded"));
   ASSERT_EQ(stats->TotalCount(), 3);
   ASSERT_GE(stats->TotalSum(), 3 * ToMicroseconds(kCallbackTime));
+}
+
+// The envelope references the added requests instead of copying them.
+TEST_F(MultiRaftBatcherTest, EnvelopeReferencesRequest) {
+  CreateBatcher();
+  auto& h1 = NewCall("t1");
+  auto& d2 = NewCall("t2");
+  std::vector<const LWConsensusRequestPB*> referenced;
+  sender_state_->SetSendHook([this, &referenced](size_t envelope_idx) {
+    for (const auto& request : GetEnvelope(envelope_idx)->lw_req->consensus_request()) {
+      referenced.push_back(&request);
+    }
+  });
+  Submit(h1, RequestKind::kHeartbeat);
+  Submit(d2, RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ASSERT_EQ(referenced, (std::vector<const LWConsensusRequestPB*>{h1.request, d2.request}));
+  ASSERT_EQ(GetEnvelope(0)->tablet_ids, Tablets({"t1", "t2"}));
+  Complete(0);
+  for (auto* call : {&h1, &d2}) {
+    ASSERT_NO_FATALS(WaitDone(*call));
+    ASSERT_OK(call->status);
+    ASSERT_EQ(call->response.responder_uuid(), call->tablet_id + "-resp");
+  }
+}
+
+// The holder keeps the messages that the request's ops point to alive while the envelope is
+// serialized, and is released as soon as SendBatch returns, before the response.
+TEST_F(MultiRaftBatcherTest, HolderReleasedAfterSerialize) {
+  CreateBatcher();
+  auto& d1 = NewCall("t1");
+  std::weak_ptr<LWReplicateMsg> weak_msg;
+  auto holder = AddHeldOp(d1, &weak_msg);
+  ASSERT_EQ(weak_msg.use_count(), 1);
+  std::atomic<bool> alive_in_send{false};
+  sender_state_->SetSendHook([&weak_msg, &alive_in_send](size_t) {
+    alive_in_send = !weak_msg.expired();
+  });
+  Submit(d1, RequestKind::kData, std::move(holder));
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ASSERT_TRUE(alive_in_send.load());
+  const auto& sent = GetEnvelope(0)->req.consensus_request(0);
+  ASSERT_EQ(sent.ops_size(), 1);
+  ASSERT_EQ(sent.ops(0).id().index(), 1);
+  ASSERT_TRUE(weak_msg.expired());
+  ASSERT_FALSE(IsDone(d1));
+  Complete(0);
+  ASSERT_NO_FATALS(WaitDone(d1));
+  ASSERT_OK(d1.status);
+}
+
+// A batch aborted at shutdown is never serialized: its callbacks get Aborted without a response,
+// and its holders are released.
+TEST_F(MultiRaftBatcherTest, ShutdownBeforeSerializeNeverSerializes) {
+  CreateBatcher();
+  auto& d1 = Add("t1", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  auto& d2 = NewCall("t2");
+  std::weak_ptr<LWReplicateMsg> weak_msg;
+  auto holder = AddHeldOp(d2, &weak_msg);
+  // Parked behind the envelope in flight. The flush deadline never fires in this fixture.
+  Submit(d2, RequestKind::kData, std::move(holder));
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ASSERT_FALSE(IsDone(d2));
+  ASSERT_FALSE(weak_msg.expired());
+
+  batcher_->Shutdown();
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ASSERT_TRUE(IsDone(d2));
+  ASSERT_TRUE(d2.status.IsAborted()) << d2.status;
+  ASSERT_FALSE(d2.had_response);
+  ASSERT_FALSE(d2.had_holder);
+  ASSERT_TRUE(weak_msg.expired());
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_envelopes_sent), 1);
+
+  Complete(0);
+  ASSERT_NO_FATALS(WaitDone(d1));
+  ASSERT_OK(d1.status);
+}
+
+// A slot's response stays valid until its callback returns, however long that takes. The batch
+// that holds it is released once every callback has returned and the RPC layer has dropped it.
+TEST_F(MultiRaftBatcherTest, BatchedResponseOutlivesDispatch) {
+  CreateBatcher();
+  auto& d1 = NewCall("t1");
+  auto& h2 = NewCall("t2");
+  std::atomic<bool> d1_batch_alive{false};
+  std::atomic<bool> h2_batch_alive{false};
+  d1.on_callback = [&d1, &d1_batch_alive] {
+    std::this_thread::sleep_for(300ms);
+    d1_batch_alive = !d1.handle.expired();
+  };
+  h2.on_callback = [&h2, &h2_batch_alive] {
+    h2_batch_alive = !h2.handle.expired();
+  };
+  Submit(h2, RequestKind::kHeartbeat);
+  Submit(d1, RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  Complete(0);
+  // The heartbeat callback ran inline and the data callback is still sleeping.
+  ASSERT_TRUE(IsDone(h2));
+  ASSERT_TRUE(h2_batch_alive.load());
+  ASSERT_FALSE(d1.handle.expired());
+  ASSERT_NO_FATALS(WaitDone(d1));
+  ASSERT_TRUE(d1_batch_alive.load());
+  for (auto* call : {&d1, &h2}) {
+    ASSERT_OK(call->status);
+    ASSERT_TRUE(call->had_holder);
+    ASSERT_EQ(call->response.responder_uuid(), call->tablet_id + "-resp");
+  }
+  ASSERT_OK(WaitFor([&d1] { return d1.handle.expired(); }, 10s, "Batch released"));
 }
 
 // A batcher exists when either batching flag is set.

@@ -84,6 +84,7 @@ DECLARE_bool(enable_multi_raft_data_batching);
 DECLARE_bool(enable_multi_raft_heartbeat_batcher);
 DECLARE_uint64(multi_raft_batch_size);
 DECLARE_uint64(multi_raft_data_direct_threshold_bytes);
+DECLARE_uint32(multi_raft_data_flush_delay_ms);
 DECLARE_uint64(multi_raft_heartbeat_interval_ms);
 DECLARE_uint32(multi_raft_rpc_timeout_ms);
 DECLARE_int32(raft_heartbeat_interval_ms);
@@ -112,6 +113,14 @@ std::vector<int64_t> OpIndexes(const ConsensusRequestPB& request) {
     result.push_back(op.id().index());
   }
   return result;
+}
+
+// A serialized ConsensusRequestPB, in the form GPB serializes it, so that LW and GPB
+// serializations of the same request compare equal.
+std::string NormalizedRequest(const std::string& serialized) {
+  ConsensusRequestPB request;
+  CHECK(request.ParseFromString(serialized));
+  return request.SerializeAsString();
 }
 
 std::vector<int64_t> Range(int64_t first, int64_t last) {
@@ -952,6 +961,207 @@ TEST_F(ConsensusPeersTest, EnvelopeFailureIgnoresWellFormedResponse) {
   ASSERT_EQ(peer.failed_attempts(), 1);
   ASSERT_EQ(message_queue_->GetTrackedPeerForTests(kFollowerUuid).last_received, last_received);
   ASSERT_FALSE(consensus_->IsMajorityReplicated(1));
+}
+
+// The envelope references update_request_, which is unchanged from the add until the response:
+// what goes on the wire is the request as it was added, and no new round starts before the
+// response.
+TEST_F(ConsensusPeersTest, UpdateRequestUnchangedWhileReferenced) {
+  ASSERT_NO_FATALS(SetUpBatcher(/* heartbeat_batching= */ false, /* data_batching= */ true));
+  auto test_peer = NewTestPeer(kFollowerUuid);
+  auto& peer = *test_peer.peer;
+  ASSERT_NO_FATALS(Negotiate(test_peer));
+
+  std::mutex mutex;
+  int num_adds = 0;
+  LWConsensusRequestPB* added = nullptr;
+  std::string added_bytes;
+  SyncPointScope sync_point;
+  sync_point->SetCallBack(
+      "Peer::SendNextRequest:BeforeBatchedAdd", [&mutex, &num_adds, &added, &added_bytes](
+          void* arg) {
+        std::lock_guard lock(mutex);
+        if (++num_adds == 1) {
+          added = static_cast<LWConsensusRequestPB*>(arg);
+          added_bytes = added->SerializeAsString();
+        }
+      });
+  sync_point->EnableProcessing();
+
+  AppendReplicateMessagesToQueue(message_queue_.get(), clock_, 1, 3);
+  ASSERT_OK(peer.SignalRequest(RequestTriggerMode::kNonEmptyOnly));
+  ASSERT_NO_FATALS(WaitForEnvelopes(1));
+  const auto wire = GetEnvelope(0)->req.consensus_request(0).SerializeAsString();
+  ASSERT_EQ(OpIndexes(GetEnvelope(0)->req.consensus_request(0)), Range(1, 3));
+  {
+    std::lock_guard lock(mutex);
+    ASSERT_EQ(num_adds, 1);
+    ASSERT_EQ(NormalizedRequest(added_bytes), wire);
+  }
+
+  // New ops neither start a new round nor touch the referenced request.
+  AppendReplicateMessagesToQueue(message_queue_.get(), clock_, 4, 2);
+  ASSERT_OK(peer.SignalRequest(RequestTriggerMode::kNonEmptyOnly));
+  ASSERT_OK(peer.SignalRequest(RequestTriggerMode::kAlwaysSend));
+  ASSERT_TRUE(raft_pool_->WaitFor(10s));
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ASSERT_EQ(test_peer.proxy->NumRequests(), 1);
+  ASSERT_TRUE(test_peer.follower->received().empty());
+  {
+    std::lock_guard lock(mutex);
+    ASSERT_EQ(num_adds, 1);
+    ASSERT_EQ(NormalizedRequest(added->SerializeAsString()), wire);
+  }
+
+  ASSERT_NO_FATALS(CompleteEnvelope(0));
+  ASSERT_NO_FATALS(CompleteUntilIdle(test_peer));
+  consensus_->WaitForMajorityReplicatedIndex(5);
+  ASSERT_EQ(test_peer.follower->received(), Range(1, 5));
+}
+
+// A batched heartbeat is a copy: a data round that rebuilds update_request_ while the heartbeat
+// waits in the batch does not change what the heartbeat sends.
+TEST_F(ConsensusPeersTest, LwHeartbeatWhileDataRoundRebuilt) {
+  ASSERT_NO_FATALS(SetUpBatcher(/* heartbeat_batching= */ true, /* data_batching= */ true));
+  // Otherwise the peer sends no ops while a heartbeat is unacknowledged.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_consensus_exponential_backoff) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_batch_size) = 1;
+  auto test_peer = NewTestPeer(kFollowerUuid);
+  auto& peer = *test_peer.peer;
+  // The first request is a heartbeat, sent alone.
+  ASSERT_OK(peer.SignalRequest(RequestTriggerMode::kAlwaysSend));
+  ASSERT_NO_FATALS(WaitForEnvelopes(1));
+  ASSERT_NO_FATALS(CompleteEnvelope(0));
+  // From now on heartbeats wait in the batch until a data request flushes it.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_batch_size) = 0;
+
+  std::mutex mutex;
+  std::vector<std::string> events;
+  std::string heartbeat_bytes;
+  SyncPointScope sync_point;
+  sync_point->SetCallBack(
+      "Peer::SendNextRequest:BeforeHeartbeatAdd", [&mutex, &events, &heartbeat_bytes](void* arg) {
+        std::lock_guard lock(mutex);
+        events.push_back("heartbeat");
+        heartbeat_bytes = static_cast<LWConsensusRequestPB*>(arg)->SerializeAsString();
+      });
+  sync_point->SetCallBack("Peer::SendNextRequest:BeforeBatchedAdd", [&mutex, &events](void*) {
+    std::lock_guard lock(mutex);
+    events.push_back("data");
+  });
+  sync_point->EnableProcessing();
+  sender_state_->SetSendHook([&mutex, &events](size_t) {
+    std::lock_guard lock(mutex);
+    events.push_back("send");
+  });
+  auto get_events = [&mutex, &events] {
+    std::lock_guard lock(mutex);
+    return events;
+  };
+
+  ASSERT_OK(peer.SignalRequest(RequestTriggerMode::kAlwaysSend));
+  ASSERT_OK(WaitFor([&get_events, &peer] {
+    return get_events() == std::vector<std::string>{"heartbeat"} &&
+           !peer.TEST_performing_update();
+  }, 10s, "Heartbeat parked"));
+  ASSERT_EQ(NumEnvelopes(), 1);
+
+  // The data round rebuilds update_request_, now with ops, and its add flushes the batch.
+  AppendReplicateMessagesToQueue(message_queue_.get(), clock_, 1, 2);
+  ASSERT_OK(peer.SignalRequest(RequestTriggerMode::kNonEmptyOnly));
+  ASSERT_NO_FATALS(WaitForEnvelopes(2));
+  ASSERT_EQ(get_events(), (std::vector<std::string>{"heartbeat", "data", "send"}));
+  const auto& req = GetEnvelope(1)->req;
+  ASSERT_EQ(req.consensus_request_size(), 2);
+  ASSERT_TRUE(req.consensus_request(0).ops().empty());
+  ASSERT_EQ(OpIndexes(req.consensus_request(1)), Range(1, 2));
+  {
+    std::lock_guard lock(mutex);
+    ASSERT_EQ(req.consensus_request(0).SerializeAsString(), NormalizedRequest(heartbeat_bytes));
+  }
+
+  ASSERT_NO_FATALS(CompleteUntilIdle(test_peer));
+  consensus_->WaitForMajorityReplicatedIndex(2);
+  ASSERT_EQ(test_peer.follower->received(), Range(1, 2));
+}
+
+// The peer gets a pointer into the batch's response, not a copy.
+TEST_F(ConsensusPeersTest, BatchedResponseNotCopied) {
+  ASSERT_NO_FATALS(SetUpBatcher(
+      /* heartbeat_batching= */ false, /* data_batching= */ true,
+      /* inline_sub_callbacks= */ true));
+  auto test_peer = NewTestPeer(kFollowerUuid);
+  auto& peer = *test_peer.peer;
+  ASSERT_NO_FATALS(Negotiate(test_peer));
+
+  std::vector<const LWConsensusResponsePB*> responses;
+  std::string responder_uuid;
+  SyncPointScope sync_point;
+  sync_point->SetCallBack(
+      "Peer::ProcessBatchedResponse", [&responses, &responder_uuid](void* arg) {
+        auto* response = static_cast<const LWConsensusResponsePB*>(arg);
+        responses.push_back(response);
+        if (response) {
+          responder_uuid = response->responder_uuid().ToBuffer();
+        }
+      });
+  sync_point->EnableProcessing();
+
+  AppendReplicateMessagesToQueue(message_queue_.get(), clock_, 1, 2);
+  ASSERT_OK(peer.SignalRequest(RequestTriggerMode::kNonEmptyOnly));
+  ASSERT_NO_FATALS(WaitForEnvelopes(1));
+  // The sub-callback runs on this thread, so it has finished when this returns.
+  ASSERT_NO_FATALS(CompleteEnvelope(0));
+  const auto& batch_responses = GetEnvelope(0)->responses;
+  ASSERT_EQ(batch_responses.size(), 1);
+  ASSERT_EQ(responses, std::vector<const LWConsensusResponsePB*>{batch_responses[0]});
+  ASSERT_EQ(responder_uuid, kFollowerUuid);
+
+  ASSERT_NO_FATALS(CompleteUntilIdle(test_peer));
+  consensus_->WaitForMajorityReplicatedIndex(2);
+  ASSERT_EQ(test_peer.follower->received(), Range(1, 2));
+}
+
+// A batched request references members of its peer, so the batch keeps the peer alive until the
+// envelope is serialized, even after the peer is closed and released by everyone else.
+TEST_F(ConsensusPeersTest, BatchKeepsClosedPeerAliveUntilSerialized) {
+  ASSERT_NO_FATALS(SetUpBatcher(/* heartbeat_batching= */ false, /* data_batching= */ true));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_flush_delay_ms) = kNeverMs;
+  auto in_flight = NewTestPeer(kFollowerUuid);
+  auto parked = NewTestPeer(kFollower2Uuid);
+  ASSERT_NO_FATALS(Negotiate(in_flight));
+  ASSERT_NO_FATALS(Negotiate(parked));
+
+  AppendReplicateMessagesToQueue(message_queue_.get(), clock_, 1, 2);
+  ASSERT_OK(in_flight.peer->SignalRequest(RequestTriggerMode::kNonEmptyOnly));
+  ASSERT_NO_FATALS(WaitForEnvelopes(1));
+  // Waits behind the envelope in flight.
+  ASSERT_OK(parked.peer->SignalRequest(RequestTriggerMode::kNonEmptyOnly));
+  ASSERT_OK(WaitFor([&parked] {
+    return !parked.peer->TEST_batched_handle().expired();
+  }, 10s, "Request parked"));
+  ASSERT_TRUE(raft_pool_->WaitFor(10s));
+  ASSERT_EQ(NumEnvelopes(), 1);
+
+  std::weak_ptr<Peer> weak_parked = parked.peer;
+  parked.peer->Close();
+  test_peers_.erase(std::find(test_peers_.begin(), test_peers_.end(), parked.peer));
+  parked.peer.reset();
+  // Only the batch holds the peer now.
+  ASSERT_FALSE(weak_parked.expired());
+
+  // The response-clocked flush serializes the parked request.
+  ASSERT_NO_FATALS(CompleteEnvelope(0));
+  ASSERT_NO_FATALS(WaitForEnvelopes(2));
+  const auto& sent = GetEnvelope(1)->req.consensus_request(0);
+  ASSERT_EQ(sent.tablet_id(), kTabletId);
+  ASSERT_EQ(sent.caller_uuid(), kLeaderUuid);
+  ASSERT_EQ(sent.dest_uuid(), kFollower2Uuid);
+  ASSERT_EQ(OpIndexes(sent), Range(1, 2));
+
+  // The closed peer drops the response, and goes away with the batch.
+  ASSERT_NO_FATALS(CompleteEnvelope(1));
+  ASSERT_OK(WaitFor([&weak_parked] { return weak_parked.expired(); }, 10s, "Peer released"));
 }
 
 void ConsensusPeersTest::TestEnvelopeFailure(const Status& status) {
