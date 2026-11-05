@@ -2984,7 +2984,9 @@ CoarseTimePoint MultiRaftUpdateDeadline(CoarseTimePoint client_deadline) {
 // response is dropped.
 //
 // A completed slot keeps the sub-request's own response message, which was allocated for
-// RaftConsensus::UpdateAsync, rather than a copy. resp_ is built only when the RPC is answered,
+// RaftConsensus::UpdateAsync, rather than a copy. The state does not keep the tablet's peer or
+// consensus alive, so a held response must own everything it references (the tablet can be
+// deleted before the RPC is answered). resp_ is built only when the RPC is answered,
 // in request order: a completed slot is referenced from resp_ (push_back_ref), and an error or
 // unfilled slot gets an error entry on the RPC's arena. Responding serializes resp_
 // synchronously, so the slot entries are released right after RespondSuccess() returns.
@@ -3137,7 +3139,7 @@ class MultiRaftUpdateState : public std::enable_shared_from_this<MultiRaftUpdate
 // including its durability wait and FinishUpdate, completes. Replicate messages appended from the
 // sub-request also hold the params, until they are applied and evicted from the log cache, as on
 // the direct UpdateConsensus path. The response is a message of its own, kept by the state once
-// the sub-request completes.
+// the sub-request completes; the task's tablet peer and consensus are released before then.
 //
 // Accepted cost: a sub-request still running after the response, for example one blocked on the
 // tablet's update_mutex_ or a slow log past the deadline, pins the whole envelope buffer rather
@@ -3247,7 +3249,8 @@ void ConsensusServiceImpl::MultiRaftUpdateConsensus(
     DVLOG(3) << "Received Batch Consensus Update RPC: " << req->ShortDebugString();
     // Effectively performs ConsensusServiceImpl::UpdateConsensus for
     // each ConsensusRequestPB in the batch but does not fail the entire
-    // batch if a single request fails.
+    // batch if a single request fails. Each slot is serialized only when the whole envelope is
+    // answered, after the sub-request's tablet peer and consensus have been released.
     for (const auto& sub_request : req->consensus_request()) {
       // As in UpdateConsensus: the generated interface gives a const request, but Update moves
       // messages out of it.

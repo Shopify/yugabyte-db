@@ -1925,7 +1925,9 @@ Status RaftConsensus::StartUpdate(
   }
 
   RETURN_NOT_OK(ExecuteHook(PRE_UPDATE));
-  response->ref_responder_uuid(state_->GetPeerUuid());
+  // Copied: the response can be held and serialized after this RaftConsensus is gone (for example
+  // a completed slot of a multi-Raft envelope that is answered later).
+  response->dup_responder_uuid(state_->GetPeerUuid());
 
   VLOG_WITH_PREFIX(2) << "Replica received request: " << request.ShortDebugString();
 

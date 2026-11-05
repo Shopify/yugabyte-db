@@ -369,6 +369,50 @@ class MultiRaftUpdateConsensusTest : public TabletServerTestBase {
     consensus->TEST_DelayUpdate(MonoDelta::kZero);
   }
 
+  // Sends {Heartbeat(tablets_[0]), Data(tablets_[1])} with tablets_[1] paused, deletes tablets_[0]
+  // after its sub-request has completed and before the envelope is answered, and checks that its
+  // slot still reports this server: a held response must not borrow from the deleted tablet's
+  // RaftConsensus. With concurrent, the envelope is answered at its deadline; otherwise the serial
+  // loop answers once tablets_[1] is unpaused.
+  void TestResponseOutlivesDeletedTablet(bool concurrent) {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_data_batching) = concurrent;
+    ASSERT_NO_FATALS(StartServer(2));
+    auto& deleted = tablets_[0];
+    auto& paused = tablets_[1];
+    Consensus(paused)->TEST_PauseUpdateConsensus(true);
+    auto unpause = ScopeExit([this, &paused] {
+      Consensus(paused)->TEST_PauseUpdateConsensus(false);
+    });
+    std::weak_ptr<consensus::RaftConsensus> deleted_consensus = Consensus(deleted);
+    auto envelope = SendAsync({Heartbeat(deleted), Data(&paused, 1, true)}, 5s);
+    // The first sub-request has completed by then; its slot is checked below.
+    SleepFor(500ms * kTimeMultiplier);
+    ASSERT_FALSE(envelope->finished());
+    std::optional<TabletServerErrorPB::Code> error_code;
+    ASSERT_OK(mini_server_->server()->tablet_manager()->DeleteTablet(
+        deleted.id, tablet::TABLET_DATA_DELETED, tablet::ShouldAbortActiveTransactions::kFalse,
+        /* cas_config_opid_index_less_or_equal= */ std::nullopt, /* hide_only= */ false,
+        /* keep_data= */ false, &error_code));
+    deleted.peer.reset();
+    ASSERT_OK(WaitFor(
+        [&deleted_consensus] { return deleted_consensus.expired(); }, 10s,
+        "RaftConsensus of the deleted tablet destroyed"));
+    ASSERT_FALSE(envelope->finished());
+    if (!concurrent) {
+      Consensus(paused)->TEST_PauseUpdateConsensus(false);
+    }
+    ASSERT_OK(Wait(envelope.get()));
+    const auto& slot = envelope->resp.consensus_response(0);
+    ASSERT_NO_FATALS(AssertSlotOk(slot, deleted.last));
+    ASSERT_EQ(slot.responder_uuid(), server_uuid_) << slot.ShortDebugString();
+    if (concurrent) {
+      ASSERT_NO_FATALS(
+          AssertSlotError(envelope->resp.consensus_response(1), AppStatusPB::TIMED_OUT));
+    } else {
+      ASSERT_NO_FATALS(AssertSlotOk(envelope->resp.consensus_response(1), paused.last));
+    }
+  }
+
   VoteRequestPB MakeVoteRequest(const TestTablet& tablet, int64_t term, bool ignore_live_leader) {
     VoteRequestPB req;
     req.set_tablet_id(tablet.id);
@@ -452,6 +496,17 @@ TEST_F(MultiRaftUpdateConsensusTest, ErrorIsolation) {
   ASSERT_EQ(resp.consensus_response(3).status().error().code(),
             consensus::ConsensusErrorPB::INVALID_TERM);
   ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(4), tablets_[0].last));
+}
+
+// A completed slot held until the envelope is answered stays valid after its tablet is deleted.
+TEST_F(MultiRaftUpdateConsensusTest, ConcurrentResponseOutlivesDeletedTablet) {
+  TestResponseOutlivesDeletedTablet(/* concurrent= */ true);
+}
+
+// The serial handler's slots stay valid until the envelope is answered, after their tablet is
+// deleted.
+TEST_F(MultiRaftUpdateConsensusTest, SerialResponseOutlivesDeletedTablet) {
+  TestResponseOutlivesDeletedTablet(/* concurrent= */ false);
 }
 
 // When every sub-request fails before dispatch, the handler thread fills every slot and answers.
