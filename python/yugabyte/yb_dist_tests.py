@@ -224,7 +224,9 @@ ARCHIVED_PATHS_IN_SRC_DIR = [
     'requirements.txt',
     'requirements_frozen.txt',
     'build/yugabyte-bash-common',
-    'yb.env'
+    'yb.env',
+    # Read from the source tree by pg_production_profile-test.
+    'src/yb/yql/pgwrapper/production_profile',
 ]
 
 
