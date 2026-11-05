@@ -24,9 +24,11 @@
 //   --<key>=<value>, or bare --<key> meaning true
 //       Active: applied and asserted.
 //   # PROD --<key>=<per-host> [DROPPED: <reason>]
-//       Host-specific production line. Not applied and not asserted; the value is never recorded.
+//       Host-specific production line. The value is never recorded, applied or asserted.
 //   # PROD --<key>=<value> [SUBSTITUTED: harness]
 //       Production value the harness overrides. Not applied; the live value is expected to differ.
+//   Production still sets the key of either marker, so it must remain a known, non-deprecated
+//   flag of the daemon.
 //   Any other line starting with '#': free-form comment.
 //   Blank line: ignored.
 // The value is everything after the first '=', verbatim, quotes included. Any other line is an
@@ -256,6 +258,12 @@ Result<std::optional<ProfileEntry>> ParseProfileLine(std::string_view line) {
   }
   if (line.starts_with("#")) {
     return std::nullopt;
+  }
+  // gflags applies "-key=value" and indented flag lines, but rendered flagfiles never have them.
+  if (line.starts_with("-") || std::isspace(static_cast<unsigned char>(line.front()))) {
+    return STATUS_FORMAT(
+        InvalidArgument, "Not in the profile grammar (flags start with '--' at column 0): '$0'",
+        line);
   }
   return STATUS_FORMAT(
       InvalidArgument,
@@ -571,7 +579,19 @@ TEST_F(PgProductionProfileTest, FlagfilesParseCleanly) {
   for (const auto& [daemon, profile] : profiles) {
     const auto& flags = xml[daemon];
     for (const auto& entry : profile.entries) {
+      auto it = flags.find(entry.key);
       if (entry.kind != ProfileEntryKind::kActive) {
+        // Production sets this key even though the test cannot apply its value.
+        const auto* marker = entry.kind == ProfileEntryKind::kDropped ? "DROPPED" : "SUBSTITUTED";
+        if (it == flags.end()) {
+          failures.push_back(Format(
+              "$0: --$1 ($2 marker) is not a flag of this binary; production's line for it is "
+              "dropped silently", daemon, entry.key, marker));
+        } else if (it->second.deprecated()) {
+          failures.push_back(Format(
+              "$0: --$1 ($2 marker) is deprecated (tags '$3')", daemon, entry.key, marker,
+              it->second.tags));
+        }
         continue;
       }
       // Rows of the two lists are checked separately below.
@@ -582,7 +602,6 @@ TEST_F(PgProductionProfileTest, FlagfilesParseCleanly) {
       if (other_daemon_only && other_daemon_only->defined_in_daemon != daemon) {
         continue;
       }
-      auto it = flags.find(entry.key);
       if (it == flags.end()) {
         failures.push_back(Format(
             "$0: --$1 (file value '$2') is not a flag of this binary; gflags drops it silently",
