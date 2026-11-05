@@ -1500,19 +1500,19 @@ TEST_F(MultiRaftBatcherTest, StreamedMissingIndex) {
   auto& d2 = NewCall("t2");
   const auto env = SendStreamed(DataCalls({&d0, &d1, &d2}));
   const auto failed_before = CounterValue(METRIC_multi_raft_envelopes_failed);
-  StringWaiterLogSink log_waiter(
-      "MultiRaft response has no response for requests [1] of 3, destination: follower-1");
   ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
   ASSERT_NO_FATALS(WaitDone(d0));
   ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK(), Frame(env, {2})));
   ASSERT_NO_FATALS(WaitReleased(d0));
   ASSERT_TRUE(d1.status.IsIllegalState()) << d1.status;
+  ASSERT_STR_CONTAINS(
+      d1.status.message().ToBuffer(),
+      "MultiRaft response has no response for request 1, destination: follower-1");
   ASSERT_FALSE(d1.had_response);
   for (auto* call : {&d0, &d2}) {
     ASSERT_OK(call->status);
     ASSERT_EQ(call->response.responder_uuid(), call->tablet_id + "-resp");
   }
-  ASSERT_TRUE(log_waiter.IsEventOccurred());
   ASSERT_EQ(CounterValue(METRIC_multi_raft_envelopes_failed) - failed_before, 1);
 }
 
@@ -1730,12 +1730,16 @@ TEST_F(MultiRaftBatcherTest, NoSerializationOnReactor) {
   ASSERT_EQ(NumEnvelopes(), env + 1);
   ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK(), Frame(env, {2})));
   ASSERT_OK(WaitFor([this, env] { return NumEnvelopes() == env + 2; }, 10s, "Clocked flush"));
-  ASSERT_EQ(GetEnvelope(env + 1)->tablet_ids, Tablets({"t3", "t0b", "t1b"}));
+  // The re-adds come from two pool tasks, in either order.
+  auto next_tablets = GetEnvelope(env + 1)->tablet_ids;
+  std::sort(next_tablets.begin(), next_tablets.end());
+  ASSERT_EQ(next_tablets, Tablets({"t0b", "t1b", "t3"}));
   ASSERT_NO_FATALS(WaitDone(d2));
 
   const auto next = env + 1;
   ASSERT_TRUE(DeliverOnReactor(next, Frame(next, {1})));
   ASSERT_NO_FATALS(CompleteOnReactor(next, Status::OK(), Frame(next, {2, 0})));
+  ASSERT_EQ(GetEnvelope(next)->tablet_ids[0], "t3");
   for (auto* call : {&d3, &d0b, &h1b}) {
     ASSERT_NO_FATALS(WaitDone(*call));
     ASSERT_OK(call->status);
@@ -1930,7 +1934,7 @@ TEST_F(MultiRaftBatcherTest, StreamedBatchReleased) {
 
 // A slot's peer may rebuild its request in place once a partial frame answered it, while the
 // envelope is still in flight. Nothing that completes the envelope reads the request again: the
-// failure is logged with the destination recorded at the add.
+// failure names the destination recorded at the add.
 TEST_F(MultiRaftBatcherTest, StreamedMissingIndexAfterSlotRebuilt) {
   CreateBatcher();
   auto& d0 = NewCall("t0");
@@ -1941,13 +1945,11 @@ TEST_F(MultiRaftBatcherTest, StreamedMissingIndexAfterSlotRebuilt) {
   ASSERT_OK(d0.status);
   d0.request->dup_dest_uuid("rebuilt-destination");
   d0.request->dup_tablet_id("rebuilt-tablet");
-  StringWaiterLogSink right_destination(
-      "MultiRaft response has no response for requests [1] of 2, destination: follower-1");
   StringWaiterLogSink rebuilt_destination("rebuilt-destination");
   ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK()));
   ASSERT_NO_FATALS(WaitReleased(d1));
   ASSERT_TRUE(d1.status.IsIllegalState()) << d1.status;
-  ASSERT_TRUE(right_destination.IsEventOccurred());
+  ASSERT_STR_CONTAINS(d1.status.message().ToBuffer(), "destination: follower-1");
   ASSERT_FALSE(rebuilt_destination.IsEventOccurred());
 }
 

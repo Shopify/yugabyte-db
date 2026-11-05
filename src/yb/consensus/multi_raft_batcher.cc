@@ -917,15 +917,18 @@ void MultiRaftBatcher::ProcessStreamedFinal(
       [[fallthrough]];
     case Kind::kIndexed:
       if (!unanswered.empty()) {
+        const auto& destination = data->dest_uuid;
         YB_LOG_EVERY_N_SECS(ERROR, 1)
             << "MultiRaft response has no response for requests " << AsString(unanswered)
-            << " of " << num_requests << ", destination: " << data->dest_uuid;
+            << " of " << num_requests << ", destination: " << destination;
         IncrementCounter(data->metrics->envelopes_failed);
         for (auto idx : unanswered) {
           slots.push_back({
               .idx = idx,
               .status = STATUS_FORMAT(
-                  IllegalState, "MultiRaft response has no response for request $0", idx),
+                  IllegalState,
+                  "MultiRaft response has no response for request $0, destination: $1", idx,
+                  destination),
               .response = nullptr});
         }
       }
