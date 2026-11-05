@@ -28,11 +28,15 @@
 #include "yb/rpc/periodic.h"
 #include "yb/rpc/scheduler.h"
 
+#include "yb/gutil/thread_annotations.h"
+
 #include "yb/util/dist_trace.h"
 #include "yb/util/flags.h"
+#include "yb/util/locks.h"
 #include "yb/util/logging.h"
 #include "yb/util/memory/arena.h"
 #include "yb/util/metrics.h"
+#include "yb/util/ref_cnt_buffer.h"
 #include "yb/util/size_literals.h"
 #include "yb/util/thread_pool.h"
 
@@ -62,6 +66,14 @@ DEFINE_RUNTIME_bool(enable_multi_raft_data_batching, false,
     "on at runtime affects only peers that already have one. As a Raft follower, it processes the "
     "Raft requests inside each MultiRaftUpdateConsensus RPC it receives, heartbeats included, "
     "concurrently instead of one after another; this is decided when each RPC arrives.");
+
+DEFINE_RUNTIME_bool(enable_multi_raft_streaming_responses, false,
+    "If true, a Raft leader asks the follower to answer each Raft request of a multi-Raft batch "
+    "that carries data as soon as that request completes, instead of answering the whole batch "
+    "once its slowest request completes. A follower streams only if its own "
+    "enable_multi_raft_data_batching is on; otherwise it answers once, as without this flag. "
+    "Read when each batch is sent.");
+TAG_FLAG(enable_multi_raft_streaming_responses, advanced);
 
 DEFINE_RUNTIME_uint32(multi_raft_data_flush_delay_ms, 2,
     "Maximum time, in milliseconds, that a data request waits in a multi-Raft batch while another "
@@ -100,12 +112,14 @@ METRIC_DEFINE_counter(server, multi_raft_envelopes_sent,
     "Number of MultiRaftUpdateConsensus RPCs sent by multi-Raft batchers.");
 METRIC_DEFINE_counter(server, multi_raft_envelopes_failed,
     "Multi-Raft Envelopes Failed", yb::MetricUnit::kRequests,
-    "Number of MultiRaftUpdateConsensus RPCs sent by multi-Raft batchers that failed as a whole, "
-    "failing every Raft request they carried with the same error: the RPC itself failed (for "
-    "example it timed out, the connection failed, or the sending or receiving server shut down), "
-    "or its response did not hold exactly one response per request. Errors returned for "
-    "individual Raft requests inside a successful RPC are not counted, nor are batches aborted "
-    "at shutdown before being sent.");
+    "Number of MultiRaftUpdateConsensus RPCs sent by multi-Raft batchers that failed, failing "
+    "each Raft request they carried that had no response yet with the same error: the RPC "
+    "itself failed (for example it timed out, the connection failed, or the sending or receiving "
+    "server shut down), or its responses did not answer every request exactly once. Without "
+    "enable_multi_raft_streaming_responses that is every request of the RPC. With it, requests "
+    "already answered by an earlier response frame keep their response, and an RPC whose final "
+    "response leaves requests unanswered counts once. Errors returned for individual Raft "
+    "requests are not counted, nor are batches aborted at shutdown before being sent.");
 METRIC_DEFINE_event_stats(server, multi_raft_envelope_sub_requests,
     "Multi-Raft Envelope Sub-Requests", yb::MetricUnit::kRequests,
     "Number of Raft requests in each MultiRaftUpdateConsensus RPC.");
@@ -145,6 +159,14 @@ METRIC_DEFINE_event_stats(server, multi_raft_batched_response_processing_us,
     "Multi-Raft Batched Response Processing Time", yb::MetricUnit::kMicroseconds,
     "Time spent processing the response of each Raft data request sent inside a "
     "MultiRaftUpdateConsensus RPC, i.e. running its response callback.");
+METRIC_DEFINE_counter(server, multi_raft_frames_received,
+    "Multi-Raft Response Frames Received", yb::MetricUnit::kMessages,
+    "Response frames, partial and final, received for MultiRaftUpdateConsensus RPCs sent with "
+    "enable_multi_raft_streaming_responses. A failed RPC has no final frame.");
+METRIC_DEFINE_event_stats(server, multi_raft_frame_slots,
+    "Multi-Raft Response Frame Slots", yb::MetricUnit::kRequests,
+    "Number of Raft request responses in each response frame counted by "
+    "multi_raft_frames_received.");
 METRIC_DEFINE_counter(server, multi_raft_data_sends_direct,
     "Multi-Raft Direct Data Sends", yb::MetricUnit::kRequests,
     "Raft data requests sent in their own UpdateConsensus RPC instead of through the multi-Raft "
@@ -164,6 +186,59 @@ struct ResponseCallbackData {
   MultiRaftBatcher::BatchResponseCallback callback;
   MultiRaftBatcher::RequestKind kind;
 };
+
+// Runs f on a thread pool. If the pool drops the task (it is shutting down), f runs inline in
+// Done, on the enqueuing thread, instead: f must run, since a peer holds a lock until its callback
+// runs, and a completed envelope must leave data_batches_in_flight_.
+template <class F>
+class InlineOnRejectTask : public ThreadPoolTask {
+ public:
+  explicit InlineOnRejectTask(F f) : f_(std::move(f)) {}
+
+  void Run() override {
+    ran_ = true;
+    f_();
+  }
+
+  void Done(const Status& status) override {
+    if (!ran_) {
+      Run();
+    }
+    delete this;
+  }
+
+ private:
+  F f_;
+  bool ran_ = false;
+};
+
+template <class F>
+void EnqueueOrRunInline(rpc::ThreadPool* pool, F&& f) {
+  pool->Enqueue(new InlineOnRejectTask<std::decay_t<F>>(std::forward<F>(f)));
+}
+
+// A partial response frame of a streamed batch, parsed in place: response lives on arena and
+// points into buffer. The holder of the callbacks of the slots it answers.
+struct StreamedFrame {
+  StreamedFrame(RefCntBuffer buffer_, size_t arena_size)
+      : buffer(std::move(buffer_)), arena(arena_size), response(&arena) {}
+
+  RefCntBuffer buffer;
+  ThreadSafeArena arena;
+  LWMultiRaftConsensusResponsePB response;
+};
+
+constexpr size_t kFrameArenaBaseBytes = 512;
+constexpr size_t kFrameArenaBytesPerBodyByte = 10;
+
+// The first block of a frame's arena is sized from the frame instead of the 4 KB default, which
+// would be mostly unused for the usual frame of one or two responses. Parsed LW messages take
+// several times their wire size: a follower's response of about 80 bytes on the wire takes about
+// 600 bytes parsed, and the ratio is higher for responses that set fewer fields.
+size_t FrameArenaSize(size_t body_size) {
+  return std::min<size_t>(kFrameArenaBaseBytes + kFrameArenaBytesPerBodyByte * body_size,
+                          ThreadSafeArena::kMaxBlockSize);
+}
 
 class ProxyBatchSender : public MultiRaftBatchSender {
  public:
@@ -190,18 +265,27 @@ std::unique_ptr<MultiRaftBatchSender> CreateMultiRaftBatchSender(
   return std::make_unique<ProxyBatchSender>(proxy_cache, hostport);
 }
 
-// - batch_req is serialized in SendBatch and must not be read after it returns. Its sub-requests
-//   belong to their Raft peers and may be rebuilt as soon as their slot is delivered. Anything
-//   needed later (the destination, the request count) is recorded separately: dest_uuid and
-//   response_callback_data.size().
+// - batch_req is serialized in SendBatch and must not be read after it returns, nor by any
+//   response path (which may run inside SendBatch). Its sub-requests belong to their Raft peers,
+//   and a peer may rebuild its request in place as soon as its slot is delivered, which for a
+//   streamed batch is while the call is still in flight. Anything needed later (the destination,
+//   the request count) is recorded separately: dest_uuid and response_callback_data.size().
 // - Each sub-request, and the Peer members it references (Peer::update_request_ refs the
 //   Peer's tablet id and uuids), is kept alive until serialization by its slot's callback, which
 //   binds a strong reference to the Peer. So no slot callback is moved out, cleared or reset
-//   before SendBatch has returned. Batches that are never serialized (Shutdown, an add after
-//   Shutdown) may run their callbacks at once.
-// - A slot's response points into batch_res, which lives on arena, and into the buffer of
-//   controller's call. The holder passed to each callback is this batch, so controller is never
-//   Reset once it has been sent.
+//   before the batch is destroyed: slot tasks run each callback in place. Batches that are never
+//   serialized (Shutdown, an add after Shutdown) may run their callbacks at once.
+// - A slot answered by the final response points into batch_res, which lives on arena, and into
+//   the buffer of controller's call; its holder is this batch. controller is reset only before the
+//   send, and the batcher makes one attempt per batch, so it is never reset while a holder may be
+//   alive. A slot answered by a partial frame points into the frame, which its holder keeps.
+// - Streamed batches only: slots_lock guards answered, partials_processed and final_processed.
+//   Partial frames and the final normally arrive on the reactor in order, but the final can also
+//   run on the thread that fails the call (RpcController::MarkCallAsFailed from the Peer's stuck
+//   call detector, or a send failure inside SendBatch) while a partial frame is being processed
+//   on the reactor. The lock makes each slot answered exactly once: by a frame, or by the final.
+//   The critical sections only flip bits, so a spinlock suits them. Nothing is enqueued or invoked
+//   under it, and it allocates only to record an invalid index.
 struct MultiRaftBatcher::MultiRaftConsensusData {
   // Declared before the messages that live on it.
   ThreadSafeArena arena;
@@ -213,9 +297,8 @@ struct MultiRaftBatcher::MultiRaftConsensusData {
   // as soon as SendBatch returns. Slot callbacks may already be running on other threads by then,
   // so these are kept apart from response_callback_data.
   std::vector<LWReplicateMsgsHolder> msgs_holders;
-  // The response of each slot, in request order. Filled once, before any slot callback runs, if
-  // the batch RPC succeeded with one response per request.
-  std::vector<const LWConsensusResponsePB*> responses;
+  // Streamed batches only, sized when the batch is sent: whether a frame has answered each slot.
+  std::vector<bool> answered GUARDED_BY(slots_lock);
   // Copied from the first sub-request. Every sub-request goes to the same server.
   std::string dest_uuid;
   size_t num_data_requests = 0;
@@ -224,8 +307,7 @@ struct MultiRaftBatcher::MultiRaftConsensusData {
 
   // Set before SendBatch.
   std::shared_ptr<MultiRaftBatchSender> sender;
-  CounterPtr envelopes_failed;
-  EventStatsPtr batched_response_processing_us;
+  std::shared_ptr<Metrics> metrics;
 
   // Set once the sender has returned from SendBatch. RpcController assigns its call without
   // holding its lock, so BatchHandle must not touch the controller before then. After it, nothing
@@ -235,8 +317,22 @@ struct MultiRaftBatcher::MultiRaftConsensusData {
   // Set when the batch RPC completes, before any sub-callback runs.
   std::atomic<bool> completed{false};
 
+  // Set before SendBatch.
+  bool streamed = false;
+
+  simple_spinlock slots_lock;
+  bool partials_processed GUARDED_BY(slots_lock) = false;
+  bool final_processed GUARDED_BY(slots_lock) = false;
+
   bool empty() const { return response_callback_data.empty(); }
   bool has_data() const { return num_data_requests > 0; }
+};
+
+// The callback of one slot to run, with its outcome.
+struct MultiRaftBatcher::SlotDelivery {
+  size_t idx;
+  Status status;
+  const LWConsensusResponsePB* response;
 };
 
 struct MultiRaftBatcher::Metrics {
@@ -260,6 +356,8 @@ struct MultiRaftBatcher::Metrics {
     data_sends_direct = METRIC_multi_raft_data_sends_direct.Instantiate(entity);
     batched_response_processing_us =
         METRIC_multi_raft_batched_response_processing_us.Instantiate(entity);
+    frames_received = METRIC_multi_raft_frames_received.Instantiate(entity);
+    frame_slots = METRIC_multi_raft_frame_slots.Instantiate(entity);
   }
 
   CounterPtr envelopes_sent;
@@ -277,6 +375,8 @@ struct MultiRaftBatcher::Metrics {
   CounterPtr data_sub_requests;
   CounterPtr data_sends_direct;
   EventStatsPtr batched_response_processing_us;
+  CounterPtr frames_received;
+  EventStatsPtr frame_slots;
 };
 
 enum class MultiRaftBatcher::FlushReason {
@@ -339,7 +439,7 @@ MultiRaftBatcher::MultiRaftBatcher(
     const MetricEntityPtr& metric_entity)
     : messenger_(messenger),
       sender_(std::move(sender)),
-      metrics_(std::make_unique<Metrics>(metric_entity)),
+      metrics_(std::make_shared<Metrics>(metric_entity)),
       current_batch_(std::make_shared<MultiRaftConsensusData>()),
       running_calls_(running_calls) {}
 
@@ -555,34 +655,39 @@ __attribute__((used)) ATTRIBUTE_NOINLINE void MultiRaftBatcher::BatchCompleted(
 }
 
 void MultiRaftBatcher::InvokeSubCallback(
-    const BatchData& data, size_t idx, const Status& status) {
+    const BatchData& data, size_t idx, const Status& status,
+    const LWConsensusResponsePB* response, const std::shared_ptr<void>& holder) {
   auto& callback_data = data->response_callback_data[idx];
   // Every data sub-callback, whether it runs in a SubCallbackTask, inline from its Done, or inline
   // when there is no pool, comes through here.
-  const auto start = callback_data.kind == RequestKind::kData &&
-                     data->batched_response_processing_us
+  const auto& processing_us = data->metrics->batched_response_processing_us;
+  const auto start = callback_data.kind == RequestKind::kData && processing_us
       ? MonoTime::Now() : MonoTime();
   if (status.ok()) {
-    callback_data.callback(status, data->responses[idx], data);
+    callback_data.callback(status, response, holder);
   } else {
     callback_data.callback(status, /* response= */ nullptr, /* holder= */ {});
   }
   if (start.Initialized()) {
-    data->batched_response_processing_us->Increment(
-        (MonoTime::Now() - start).ToMicroseconds());
+    processing_us->Increment((MonoTime::Now() - start).ToMicroseconds());
   }
 }
 
 // Runs one sub-callback on a thread pool. If the pool drops the task (it is shutting down), the
-// sub-callback runs inline in Done instead: a caller may hold a lock until its callback runs.
+// sub-callback runs inline in Done instead: a caller may hold a lock until its callback runs. For
+// a streamed batch the enqueuing thread is normally the reactor, which runs a callback inline this
+// way only while the messenger shuts its pools down.
 class MultiRaftBatcher::SubCallbackTask : public ThreadPoolTask {
  public:
-  SubCallbackTask(BatchData data, size_t idx, Status status)
-      : data_(std::move(data)), idx_(idx), status_(std::move(status)) {}
+  SubCallbackTask(
+      BatchData data, size_t idx, Status status, const LWConsensusResponsePB* response,
+      std::shared_ptr<void> holder)
+      : data_(std::move(data)), idx_(idx), status_(std::move(status)), response_(response),
+        holder_(std::move(holder)) {}
 
   void Run() override {
     ran_ = true;
-    InvokeSubCallback(data_, idx_, status_);
+    InvokeSubCallback(data_, idx_, status_, response_, holder_);
   }
 
   void Done(const Status& status) override {
@@ -593,9 +698,13 @@ class MultiRaftBatcher::SubCallbackTask : public ThreadPoolTask {
   }
 
  private:
+  // Keeps the slot's callback, which stays in the batch, alive.
   BatchData data_;
   size_t idx_;
   Status status_;
+  const LWConsensusResponsePB* response_;
+  // Keeps response_ valid until the callback returns.
+  std::shared_ptr<void> holder_;
   bool ran_ = false;
 };
 
@@ -608,25 +717,221 @@ void MultiRaftBatcher::DispatchSubCallbacks(
         data->batch_res.consensus_response_size(), num_requests);
     YB_LOG_EVERY_N_SECS(ERROR, 1) << status << ", destination: " << data->dest_uuid;
   }
-  if (status.ok()) {
-    // Written before any sub-callback is dispatched, which publishes it to the pool threads.
-    data->responses.reserve(num_requests);
-    for (const auto& response : data->batch_res.consensus_response()) {
-      data->responses.push_back(&response);
-    }
-  } else {
-    IncrementCounter(data->envelopes_failed);
+  if (!status.ok()) {
+    IncrementCounter(data->metrics->envelopes_failed);
   }
+  const std::shared_ptr<void> holder = status.ok() ? data : nullptr;
+  auto response_it = data->batch_res.consensus_response().begin();
   // Each data sub-callback gets its own task because it does a full Raft response round
   // (majority tracking and building the next request). Heartbeat sub-callbacks are cheap and
   // run serially on this thread.
   for (size_t i = 0; i != num_requests; ++i) {
+    const LWConsensusResponsePB* response = nullptr;
+    if (status.ok()) {
+      response = &*response_it;
+      ++response_it;
+    }
     if (data_pool && data->response_callback_data[i].kind == RequestKind::kData) {
-      data_pool->Enqueue(new SubCallbackTask(data, i, status));
+      data_pool->Enqueue(new SubCallbackTask(data, i, status, response, holder));
     } else {
-      InvokeSubCallback(data, i, status);
+      InvokeSubCallback(data, i, status, response, holder);
     }
   }
+}
+
+void MultiRaftBatcher::EnqueueSlots(
+    const BatchData& data, const std::vector<SlotDelivery>& slots,
+    const std::shared_ptr<void>& holder, rpc::ThreadPool* pool) {
+  std::vector<SlotDelivery> heartbeats;
+  for (const auto& slot : slots) {
+    if (data->response_callback_data[slot.idx].kind == RequestKind::kData) {
+      pool->Enqueue(new SubCallbackTask(data, slot.idx, slot.status, slot.response, holder));
+    } else {
+      heartbeats.push_back(slot);
+    }
+  }
+  // A heartbeat callback can send its peer's next request, and with it an envelope, so it must
+  // not run on the reactor. They are cheap, so one task runs those of the frame in order.
+  if (!heartbeats.empty()) {
+    EnqueueOrRunInline(pool, [data, holder, heartbeats = std::move(heartbeats)] {
+      for (const auto& slot : heartbeats) {
+        InvokeSubCallback(data, slot.idx, slot.status, slot.response, holder);
+      }
+    });
+  }
+}
+
+void MultiRaftBatcher::ProcessPartialFrame(
+    const BatchData& data, Slice body, RefCntBuffer buffer, rpc::ThreadPool* pool) {
+  DCHECK(data->streamed);
+  auto frame = std::make_shared<StreamedFrame>(std::move(buffer), FrameArenaSize(body.size()));
+  auto& response = frame->response;
+  auto status = response.ParseFromSlice(body);
+  if (!status.ok()) {
+    LOG(DFATAL) << "Malformed MultiRaft partial response frame: " << status
+                << ", destination: " << data->dest_uuid;
+    return;
+  }
+  const auto num_entries = response.index_size();
+  if (num_entries == 0 || num_entries != response.consensus_response_size()) {
+    LOG(DFATAL) << "Malformed MultiRaft partial response frame: " << num_entries
+                << " indices for " << response.consensus_response_size()
+                << " responses, destination: " << data->dest_uuid;
+    return;
+  }
+  IncrementCounter(data->metrics->frames_received);
+  IncrementStats(data->metrics->frame_slots, num_entries);
+
+  const auto num_requests = data->response_callback_data.size();
+  std::vector<SlotDelivery> slots;
+  slots.reserve(num_entries);
+  std::vector<uint32_t> invalid;
+  {
+    std::lock_guard lock(data->slots_lock);
+    if (data->final_processed) {
+      // The final ran first, on the thread that failed the call, and has failed every slot this
+      // frame would answer.
+      return;
+    }
+    data->partials_processed = true;
+    auto response_it = response.consensus_response().begin();
+    for (auto idx : response.index()) {
+      const auto* slot_response = &*response_it;
+      ++response_it;
+      if (idx >= num_requests || data->answered[idx]) {
+        // Rare enough that the allocation under the lock does not matter.
+        invalid.push_back(idx);
+        continue;
+      }
+      data->answered[idx] = true;
+      slots.push_back({.idx = idx, .status = Status::OK(), .response = slot_response});
+    }
+  }
+  for (auto idx : invalid) {
+    LOG(DFATAL) << "MultiRaft response frame has an invalid index " << idx << " for "
+                << num_requests << " requests (duplicate or out of range), destination: "
+                << data->dest_uuid;
+  }
+  EnqueueSlots(data, slots, frame, pool);
+}
+
+void MultiRaftBatcher::ProcessStreamedFinal(
+    const BatchData& data, const Status& status, rpc::ThreadPool* pool) {
+  DCHECK(data->streamed);
+  const auto num_requests = data->response_callback_data.size();
+  std::vector<SlotDelivery> slots;
+  slots.reserve(num_requests);
+  std::vector<uint32_t> invalid;
+  std::vector<size_t> unanswered;
+  const auto& response = data->batch_res;
+  const auto num_entries = response.index_size();
+  const auto num_responses = response.consensus_response_size();
+  // What the final response carries, decided under the lock.
+  enum class Kind {
+    kFailed,        // The RPC failed: unanswered slots get its status.
+    kIndexed,       // The final lists the slots it answers.
+    kOldFollower,   // No index and no partial frame: every response in request order.
+    kMalformed,     // Unusable: unanswered slots get IllegalState.
+  };
+  Kind kind;
+  {
+    std::lock_guard lock(data->slots_lock);
+    data->final_processed = true;
+    if (!status.ok()) {
+      kind = Kind::kFailed;
+    } else if (num_entries == 0 && !data->partials_processed) {
+      kind = Kind::kOldFollower;
+    } else if (num_entries == num_responses) {
+      // A final with nothing left to answer (no index and no responses) is well formed.
+      kind = Kind::kIndexed;
+      auto response_it = response.consensus_response().begin();
+      for (auto idx : response.index()) {
+        const auto* slot_response = &*response_it;
+        ++response_it;
+        if (idx >= num_requests || data->answered[idx]) {
+          invalid.push_back(idx);
+          continue;
+        }
+        data->answered[idx] = true;
+        slots.push_back({.idx = idx, .status = Status::OK(), .response = slot_response});
+      }
+    } else {
+      kind = Kind::kMalformed;
+    }
+    if (kind != Kind::kOldFollower) {
+      for (size_t idx = 0; idx != num_requests; ++idx) {
+        if (!data->answered[idx]) {
+          unanswered.push_back(idx);
+        }
+      }
+    }
+  }
+
+  if (status.ok()) {
+    IncrementCounter(data->metrics->frames_received);
+    IncrementStats(data->metrics->frame_slots, num_responses);
+  }
+  for (auto idx : invalid) {
+    LOG(DFATAL) << "MultiRaft response frame has an invalid index " << idx << " for "
+                << num_requests << " requests (duplicate or out of range), destination: "
+                << data->dest_uuid;
+  }
+  switch (kind) {
+    case Kind::kFailed:
+      // The RPC failed as a whole, so it counts, as for a batch answered once.
+      IncrementCounter(data->metrics->envelopes_failed);
+      for (auto idx : unanswered) {
+        slots.push_back({.idx = idx, .status = status, .response = nullptr});
+      }
+      break;
+    case Kind::kOldFollower: {
+      // The follower did not stream: an old binary, its serial handler, or its
+      // enable_multi_raft_data_batching off.
+      Status slot_status;
+      if (num_responses != num_requests) {
+        slot_status = STATUS_FORMAT(
+            IllegalState, "MultiRaft response has $0 responses for $1 requests", num_responses,
+            num_requests);
+        YB_LOG_EVERY_N_SECS(ERROR, 1) << slot_status << ", destination: " << data->dest_uuid;
+        IncrementCounter(data->metrics->envelopes_failed);
+      }
+      auto response_it = response.consensus_response().begin();
+      for (size_t idx = 0; idx != num_requests; ++idx) {
+        const LWConsensusResponsePB* slot_response = nullptr;
+        if (slot_status.ok()) {
+          slot_response = &*response_it;
+          ++response_it;
+        }
+        slots.push_back({.idx = idx, .status = slot_status, .response = slot_response});
+      }
+      break;
+    }
+    case Kind::kMalformed:
+      if (num_entries == 0) {
+        LOG(DFATAL) << "MultiRaft final response has no index after partial frames: "
+                    << num_responses << " responses, destination: " << data->dest_uuid;
+      } else {
+        LOG(DFATAL) << "Malformed MultiRaft final response: " << num_entries << " indices for "
+                    << num_responses << " responses, destination: " << data->dest_uuid;
+      }
+      [[fallthrough]];
+    case Kind::kIndexed:
+      if (!unanswered.empty()) {
+        YB_LOG_EVERY_N_SECS(ERROR, 1)
+            << "MultiRaft response has no response for requests " << AsString(unanswered)
+            << " of " << num_requests << ", destination: " << data->dest_uuid;
+        IncrementCounter(data->metrics->envelopes_failed);
+        for (auto idx : unanswered) {
+          slots.push_back({
+              .idx = idx,
+              .status = STATUS_FORMAT(
+                  IllegalState, "MultiRaft response has no response for request $0", idx),
+              .response = nullptr});
+        }
+      }
+      break;
+  }
+  EnqueueSlots(data, slots, data, pool);
 }
 
 // Kept out of line as a uprobe attach point for timing envelopes.
@@ -646,9 +951,12 @@ ATTRIBUTE_NOINLINE void MultiRaftBatcher::SendBatchRequest(BatchData data) {
   IncrementCounterBy(metrics_->heartbeat_sub_requests, num_requests - num_data_requests);
   IncrementCounterBy(metrics_->data_sub_requests, num_data_requests);
 
+  // The only Reset: the batcher makes one attempt per batch, so the partial-response callback
+  // installed below never needs to be installed again after a Reset.
   data->controller.Reset();
   int64_t timeout_ms = int64_t{FLAGS_consensus_rpc_timeout_ms} * num_requests;
   rpc::ThreadPool* data_pool = nullptr;
+  const bool streamed = data->has_data() && FLAGS_enable_multi_raft_streaming_responses;
   if (data->has_data()) {
     // Data acks are latency-critical, like those of the direct UpdateConsensus path, which also
     // uses the high-priority pool. Heartbeat-only batches keep the normal pool and the uncapped
@@ -658,26 +966,67 @@ ATTRIBUTE_NOINLINE void MultiRaftBatcher::SendBatchRequest(BatchData data) {
       timeout_cap_ms = 2 * int64_t{FLAGS_consensus_rpc_timeout_ms};
     }
     timeout_ms = std::min(timeout_ms, timeout_cap_ms);
-    data->controller.set_invoke_callback_mode(rpc::InvokeCallbackMode::kThreadPoolHigh);
+    // A streamed batch is received on the reactor, which only enqueues to the High pool.
+    data->controller.set_invoke_callback_mode(
+        streamed ? rpc::InvokeCallbackMode::kReactorThread
+                 : rpc::InvokeCallbackMode::kThreadPoolHigh);
     data_pool = &messenger_->ThreadPool(rpc::ServicePriority::kHigh);
   }
   data->controller.set_timeout(MonoDelta::FromMilliseconds(timeout_ms));
-
-  // The response-clocked flush runs before the sub-callbacks are dispatched. Requests that were
-  // already pending go out without waiting for them, and requests that the sub-callbacks add
-  // next see that envelope in flight and accumulate behind it rather than each going out alone.
-  auto callback = [data, data_pool, weak_self = weak_from_this(),
-                   running_calls = running_calls_](const Status& status) {
-    data->completed.store(true, std::memory_order_release);
-    --*running_calls;
-    if (auto self = weak_self.lock()) {
-      self->BatchCompleted(*data);
-    }
-    DispatchSubCallbacks(data, status, data_pool);
-  };
   data->sender = sender_;
-  data->envelopes_failed = metrics_->envelopes_failed;
-  data->batched_response_processing_us = metrics_->batched_response_processing_us;
+  data->metrics = metrics_;
+
+  MultiRaftBatchSender::DoneCallback callback;
+  if (streamed) {
+    data->streamed = true;
+    {
+      std::lock_guard lock(data->slots_lock);
+      data->answered.resize(num_requests);
+    }
+    // Serialized in SendBatch, so this is still before the request is dead.
+    data->batch_req.set_stream_responses(true);
+    // Weak: the batch owns the controller, which holds the callback until the call takes it. While
+    // the call is in flight its final callback keeps the batch alive.
+    data->controller.set_partial_response_callback(
+        [weak_data = std::weak_ptr<MultiRaftConsensusData>(data), data_pool](
+            Slice body, RefCntBuffer buffer) {
+          if (auto data = weak_data.lock()) {
+            ProcessPartialFrame(data, body, std::move(buffer), data_pool);
+          }
+        });
+    // Runs on the reactor, or on the thread that failed the call (under the controller's lock for
+    // RpcController::MarkCallAsFailed, so it must not call into the controller). BatchCompleted
+    // is enqueued before the slots, but a slot task that adds its peer's next request may still
+    // run first, see this envelope in flight and wait for the response-clocked flush.
+    callback = [data, data_pool, weak_self = weak_from_this(),
+                running_calls = running_calls_](const Status& status) {
+      data->completed.store(true, std::memory_order_release);
+      --*running_calls;
+      // Inline only if the pool is shutting down, which on the reactor happens only while the
+      // messenger shuts down. MultiRaftManager::CompleteShutdown waits for running_calls, but
+      // only after StartShutdown has set every batcher's shutdown_, so a BatchCompleted that runs
+      // after that wait never prepares another batch.
+      EnqueueOrRunInline(data_pool, [weak_self, data] {
+        if (auto self = weak_self.lock()) {
+          self->BatchCompleted(*data);
+        }
+      });
+      ProcessStreamedFinal(data, status, data_pool);
+    };
+  } else {
+    // The response-clocked flush runs before the sub-callbacks are dispatched. Requests that were
+    // already pending go out without waiting for them, and requests that the sub-callbacks add
+    // next see that envelope in flight and accumulate behind it rather than each going out alone.
+    callback = [data, data_pool, weak_self = weak_from_this(),
+                running_calls = running_calls_](const Status& status) {
+      data->completed.store(true, std::memory_order_release);
+      --*running_calls;
+      if (auto self = weak_self.lock()) {
+        self->BatchCompleted(*data);
+      }
+      DispatchSubCallbacks(data, status, data_pool);
+    };
+  }
   sender_->SendBatch(data->batch_req, &data->batch_res, &data->controller, std::move(callback));
   data->msgs_holders.clear();
   data->sent.store(true, std::memory_order_release);

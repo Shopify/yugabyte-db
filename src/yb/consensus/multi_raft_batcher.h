@@ -80,8 +80,30 @@ std::unique_ptr<MultiRaftBatchSender> CreateMultiRaftBatchSender(
 // caller's LWReplicateMsgsHolder, which pins the log cache messages that the request's ops point
 // to. The envelope is serialized once, in MultiRaftBatchSender::SendBatch, and the holders are
 // released when SendBatch returns. A batch that is never sent (aborted at Shutdown) is never
-// serialized. The response is parsed in place, and each request's callback gets a pointer to its
-// own response together with a holder that keeps the batch, and with it the response, alive.
+// serialized. Responses are parsed in place, and each request's callback gets a pointer to its own
+// response together with a holder that keeps that response alive.
+//
+// An envelope is completed in one of two modes, chosen when it is sent:
+// - Answered once (heartbeat-only envelopes, and every envelope while
+//   FLAGS_enable_multi_raft_streaming_responses is off). The final response carries every
+//   request's response in request order. Its callback runs on the High pool for envelopes that
+//   carry data (the normal pool otherwise), does the response-clocked flush, then runs each
+//   heartbeat callback inline and gives each data callback its own High-pool task. Every holder
+//   is the batch. If the RPC fails, every request fails with its error.
+// - Streamed (envelopes that carry data, while the flag is on). The follower answers each request
+//   as soon as it completes, in partial response frames followed by the final response; every
+//   frame lists the requests it answers. Frames are received on the reactor, and so is the final
+//   unless the call is failed on another thread (RpcController::MarkCallAsFailed, or a send failure
+//   inside SendBatch), which then runs it. Receiving only parses the frame, marks its requests
+//   answered and enqueues: one High-pool task per data request, and one per frame for its
+//   heartbeats (a heartbeat callback can send the peer's next request, which may serialize an
+//   envelope). BatchCompleted and its response-clocked flush also run in a High-pool task, so no
+//   envelope is serialized on a reactor (unless the pool is shutting down, when tasks run inline
+//   on the enqueuing thread). A request answered by a partial frame
+//   gets that frame as its holder; one answered by the final gets the batch. A failed RPC fails
+//   only the requests no frame has answered, and an OK final that leaves a request unanswered
+//   fails it with IllegalState. A final without the list is from a follower that did not stream,
+//   and is taken as every response in request order.
 class MultiRaftBatcher : public std::enable_shared_from_this<MultiRaftBatcher> {
  private:
   // Tracks all the metadata for a single batch request, including a list of all
@@ -131,18 +153,18 @@ class MultiRaftBatcher : public std::enable_shared_from_this<MultiRaftBatcher> {
 
   enum class RequestKind { kHeartbeat, kData };
   // response is valid only while holder is alive. It is null, and holder empty, iff status is not
-  // OK. holder keeps the whole batch alive, with the responses of every request in it, so it must
-  // not be kept past the callback.
+  // OK. holder is the whole batch, or the partial response frame that answered this request
+  // together with every other response in it, so it must not be kept past the callback.
   using BatchResponseCallback = std::function<void(
       const Status& status, const LWConsensusResponsePB* response, std::shared_ptr<void> holder)>;
 
   // Adds the request to a batch. The batch references request instead of copying it, so request,
   // and everything it references, must stay unchanged and alive until the callback runs. holder
   // pins the messages that request's ops point to, and is released once the envelope has been
-  // serialized (or the batch is aborted). The callback runs exactly once: with each request's own
-  // response when the batch RPC succeeds, or with the batch's error. After Shutdown() it runs
-  // immediately with Aborted. The callback may run before this returns. Returns a handle to the
-  // batch the request was added to.
+  // serialized (or the batch is aborted). The callback runs exactly once: with the request's own
+  // response once a response frame answers it, or with an error if the batch RPC fails (or ends)
+  // before any frame answered it. After Shutdown() it runs immediately with Aborted. The callback
+  // may run before this returns. Returns a handle to the batch the request was added to.
   BatchHandle AddRequestToBatch(LWConsensusRequestPB* request,
                                 LWReplicateMsgsHolder holder,
                                 BatchResponseCallback callback,
@@ -155,6 +177,7 @@ class MultiRaftBatcher : public std::enable_shared_from_this<MultiRaftBatcher> {
 
  private:
   struct Metrics;
+  struct SlotDelivery;
   enum class FlushReason;
   class SubCallbackTask;
 
@@ -172,17 +195,31 @@ class MultiRaftBatcher : public std::enable_shared_from_this<MultiRaftBatcher> {
   // If data is null then we will not send a batch request.
   void SendBatchRequest(BatchData data);
 
-  // Completes every request of a sent batch. Data requests are dispatched to data_pool when it
-  // is set.
+  // Completes every request of a batch that was answered once. Data requests are dispatched to
+  // data_pool when it is set.
   static void DispatchSubCallbacks(
       const BatchData& data, Status status, rpc::ThreadPool* data_pool);
-  static void InvokeSubCallback(const BatchData& data, size_t idx, const Status& status);
+  static void InvokeSubCallback(
+      const BatchData& data, size_t idx, const Status& status,
+      const LWConsensusResponsePB* response, const std::shared_ptr<void>& holder);
+
+  // Streamed batches. Run on the reactor, except that the final can run on the thread that fails
+  // the call. They only parse, do bookkeeping and enqueue to pool.
+  static void ProcessPartialFrame(
+      const BatchData& data, Slice body, RefCntBuffer buffer, rpc::ThreadPool* pool);
+  static void ProcessStreamedFinal(
+      const BatchData& data, const Status& status, rpc::ThreadPool* pool);
+  // Enqueues the callbacks of the requests answered (or failed) by one frame.
+  static void EnqueueSlots(
+      const BatchData& data, const std::vector<SlotDelivery>& slots,
+      const std::shared_ptr<void>& holder, rpc::ThreadPool* pool);
 
   void ArmDataFlushDeadline() REQUIRES(mutex_);
   void CancelDataFlushDeadline() REQUIRES(mutex_);
   void DataFlushDeadlineExpired(rpc::ScheduledTaskId task_id);
 
-  // Bookkeeping for a completed envelope, plus the response-clocked flush.
+  // Bookkeeping for a completed envelope, plus the response-clocked flush. Runs on the thread that
+  // completed an envelope answered once, and in a High-pool task for a streamed envelope.
   void BatchCompleted(const MultiRaftConsensusData& data);
 
   rpc::Messenger* const messenger_;
@@ -190,7 +227,8 @@ class MultiRaftBatcher : public std::enable_shared_from_this<MultiRaftBatcher> {
   // Shared with each sent batch, which uses it to fail its RPC.
   const std::shared_ptr<MultiRaftBatchSender> sender_;
 
-  const std::unique_ptr<Metrics> metrics_;
+  // Shared with each sent batch, which may outlive the batcher.
+  const std::shared_ptr<Metrics> metrics_;
 
   std::shared_ptr<rpc::PeriodicTimer> periodic_flush_timer_;
 
