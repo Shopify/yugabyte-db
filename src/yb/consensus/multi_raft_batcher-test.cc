@@ -38,6 +38,7 @@
 #include "yb/util/mem_tracker.h"
 #include "yb/util/memory/arena.h"
 #include "yb/util/metrics.h"
+#include "yb/util/random_util.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_thread_holder.h"
@@ -1394,11 +1395,15 @@ TEST_F(MultiRaftBatcherTest, StreamedFailureAfterPartialsFailsUnanswered) {
 
 // The final can run on the thread that fails the call while a partial frame is being received on
 // the reactor. Each slot is then answered exactly once, by the frame or by the failure, and the
-// frame applies entirely or not at all.
+// frame applies entirely or not at all. One side starts after a random delay of up to about the
+// time the reactor takes to process the frame, so that the failure often lands while the frame is
+// processed.
 TEST_F(MultiRaftBatcherTest, StreamedMarkCallAsFailedOffReactor) {
-  constexpr size_t kIterations = 50;
-  constexpr size_t kSlots = 16;
+  constexpr size_t kIterations = 200;
+  constexpr size_t kSlots = 256;
+  constexpr int kMaxDelayUs = 60;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_batch_size) = kSlots;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_batch_size) = kSlots;
   CreateBatcher();
   // Keeps a data envelope in flight, so each round below is sent by the count cap.
   auto& blocker = Add("blocker", RequestKind::kData);
@@ -1408,31 +1413,48 @@ TEST_F(MultiRaftBatcherTest, StreamedMarkCallAsFailedOffReactor) {
   for (uint32_t i = 0; i < kSlots; i += 2) {
     even_slots.push_back(i);
   }
+  // Reused by every round once its batch is released.
+  std::vector<TestCall*> calls;
+  for (size_t i = 0; i != kSlots; ++i) {
+    calls.push_back(&NewCall(Format("t$0", i)));
+  }
   int dropped_by_sender = 0;
   int partial_first = 0;
   int final_first = 0;
   for (size_t iteration = 0; iteration != kIterations; ++iteration) {
-    std::vector<TestCall*> calls;
-    for (size_t i = 0; i != kSlots; ++i) {
-      calls.push_back(&Add(Format("t$0-$1", iteration, i), RequestKind::kData));
+    for (auto* call : calls) {
+      call->status = Status::OK();
+      call->response.Clear();
+      call->num_callbacks = 0;
+      call->done = false;
+      Submit(*call, RequestKind::kData);
     }
     const auto env = NumEnvelopes() - 1;
     ASSERT_EQ(env, iteration + 1);
     ASSERT_TRUE(GetEnvelope(env)->req.stream_responses());
     ASSERT_EQ(GetEnvelope(env)->tablet_ids.size(), kSlots);
     const auto frame = Frame(env, even_slots);
+    // Negative: the frame is delayed. Positive: the failure is.
+    const auto delay_us = RandomUniformInt(-kMaxDelayUs, kMaxDelayUs);
+    auto spin = [](int us) {
+      const auto until = MonoTime::Now() + MonoDelta::FromMicroseconds(us);
+      while (MonoTime::Now() < until) {
+      }
+    };
     CountDownLatch barrier(2);
     std::atomic<bool> delivered{false};
     TestThreadHolder threads;
-    threads.AddThreadFunctor([this, env, &frame, &barrier, &delivered] {
-      RunOnReactor(messenger_.get(), [this, env, &frame, &barrier, &delivered] {
+    threads.AddThreadFunctor([this, env, &frame, &barrier, &delivered, delay_us, &spin] {
+      RunOnReactor(messenger_.get(), [this, env, &frame, &barrier, &delivered, delay_us, &spin] {
         barrier.CountDown();
         barrier.Wait();
+        spin(-delay_us);
         delivered = sender_state_->DeliverPartial(env, frame);
       });
     });
     barrier.CountDown();
     barrier.Wait();
+    spin(delay_us);
     calls[1]->handle.MarkCallAsFailed();
     threads.JoinAll();
     ASSERT_TRUE(GetEnvelope(env)->marked_failed);
