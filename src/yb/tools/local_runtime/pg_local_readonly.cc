@@ -757,6 +757,9 @@ class FrozenCatalog {
     ns->set_database_type(YQL_DATABASE_PGSQL);
     *info.mutable_indexes() = table.indexes();
     if (table.has_index_info()) *info.mutable_index_info() = table.index_info();
+    // PgGate reports constraint violations against this OID, so a rewritten relation must name
+    // its logical OID rather than its relfilenode, as master does.
+    if (!table.pg_table_id().empty()) info.set_pg_table_id(table.pg_table_id());
     const auto& descriptor = VERIFY_RESULT_REF(Find(id));
     if (descriptor.application) {
       for (const auto& partition : descriptor.partitions) {

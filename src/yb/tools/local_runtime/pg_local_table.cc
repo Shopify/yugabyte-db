@@ -57,10 +57,14 @@ Status Validate(const tserver::PgCreateTableRequestPB& req) {
             logical >= kPgFirstNormalObjectId &&
             req.pg_table_oid().database_oid() == req.table_id().database_oid(),
         InvalidArgument, "Invalid transactional rewrite identity");
-  } else {
+  } else if (logical != 0 && logical != req.table_id().object_oid()) {
+    // Reindexing an index during a table rewrite sends its new relfilenode without the old one
+    // when the index's table properties are not cached (YbIndexSetNewRelfileNode); master
+    // accepts that. Table rewrites always name their source.
     SCHECK(
-        logical == 0 || logical == req.table_id().object_oid(), NotSupported,
-        "A distinct logical table OID requires a rewrite source");
+        req.base_table_id().object_oid() != 0 && logical >= kPgFirstNormalObjectId &&
+            req.pg_table_oid().database_oid() == req.table_id().database_oid(),
+        NotSupported, "A distinct logical table OID requires a rewrite source");
   }
   if (req.is_shared_table() || req.is_pg_catalog_table() || req.is_colocated_via_database() ||
       req.has_colocation_id() || req.tablegroup_oid().object_oid() != 0 ||

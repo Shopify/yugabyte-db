@@ -1681,6 +1681,40 @@ TEST_F(ReadonlyPgServerTest, PrimaryKeyRewrite) {
   ASSERT_EQ(ASSERT_RESULT(c.FetchRow<int64_t>("SELECT count(*) FROM empty_keys")), 0);
 }
 
+// A USING expression that is not a bare column rewrites the table, and the rewrite reindexes
+// every index on the column without naming the index's old relfilenode.
+TEST_F(ReadonlyPgServerTest, ColumnRewriteReindexes) {
+  auto server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          GetTestPath("column-rewrite"), Snapshot(), AllocateFreePort(),
+          CatalogMode::kSerializedTransactions));
+  auto c = ASSERT_RESULT(Connect(*server));
+  ASSERT_OK(c.Execute("CREATE TABLE typed_rows(k bigint PRIMARY KEY,v bigint NOT NULL,note text)"));
+  ASSERT_OK(c.Execute("CREATE UNIQUE INDEX typed_value ON typed_rows(v HASH) INCLUDE(note)"));
+  ASSERT_OK(c.Execute("INSERT INTO typed_rows VALUES(1,10,'one'),(2,20,'two')"));
+  ASSERT_OK(c.Execute("BEGIN"));
+  ASSERT_OK(c.Execute("SAVEPOINT before_rewrite"));
+  ASSERT_OK(c.Execute("ALTER TABLE typed_rows ALTER COLUMN v TYPE bigint USING v * 100"));
+  ASSERT_EQ(ASSERT_RESULT(c.FetchRow<int64_t>("SELECT sum(v)::bigint FROM typed_rows")), 3000);
+  ASSERT_OK(c.Execute("ROLLBACK TO before_rewrite"));
+  ASSERT_OK(c.Execute("COMMIT"));
+  ASSERT_OK(c.Execute("ALTER TABLE typed_rows ALTER COLUMN v TYPE bigint USING v + 1"));
+  ASSERT_OK(c.Execute("SET enable_seqscan=off"));
+  ASSERT_TRUE(ASSERT_RESULT(c.HasIndexScan("SELECT note FROM typed_rows WHERE v=21")));
+  ASSERT_EQ(
+      ASSERT_RESULT(c.FetchRow<std::string>("SELECT note FROM typed_rows WHERE v=21")), "two");
+  ASSERT_EQ(
+      ASSERT_RESULT(c.FetchRow<int64_t>("SELECT count(*) FROM typed_rows WHERE v=20")), 0);
+  const auto duplicate = c.Execute("INSERT INTO typed_rows VALUES(3,11,'three')");
+  ASSERT_NOK(duplicate);
+  ASSERT_STR_CONTAINS(
+      duplicate.ToString(), "duplicate key value violates unique constraint \"typed_value\"");
+  ASSERT_OK(c.Execute("INSERT INTO typed_rows VALUES(3,12,'three')"));
+  ASSERT_EQ(
+      ASSERT_RESULT(c.FetchRow<std::string>("SELECT note FROM typed_rows WHERE v=12")), "three");
+  ASSERT_OK(c.Execute("DROP TABLE typed_rows"));
+}
+
 TEST_F(ReadonlyPgServerTest, SchemaLifecycle) {
   const auto path = GetTestPath("schema-lifecycle");
   auto server = ASSERT_RESULT(
