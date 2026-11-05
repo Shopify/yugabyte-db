@@ -701,7 +701,9 @@ void OutboundCall::SetResponse(CallResponse&& resp) {
       SetFailed(status);
       return;
     }
-    if (SetState(RpcCallState::FINISHED_SUCCESS)) {
+    auto finished = SetState(RpcCallState::FINISHED_SUCCESS);
+    ReleasePartialResponseCallback();
+    if (finished) {
       InvokeCallback(now);
     }
   } else {
@@ -716,6 +718,50 @@ void OutboundCall::SetResponse(CallResponse&& resp) {
     auto status = STATUS(RemoteError, err->message());
     SetFailed(status, std::move(err));
   }
+}
+
+void OutboundCall::SetPartialResponseCallback(
+    std::shared_ptr<PartialResponseCallback> callback) {
+  DCHECK(callback && *callback);
+  std::lock_guard lock(mtx_);
+  partial_response_callback_ = std::move(callback);
+  has_partial_response_callback_ = true;
+}
+
+void OutboundCall::ReleasePartialResponseCallback() {
+  if (!has_partial_response_callback_) {
+    return;
+  }
+  std::shared_ptr<PartialResponseCallback> callback;
+  {
+    std::lock_guard lock(mtx_);
+    callback.swap(partial_response_callback_);
+  }
+}
+
+void OutboundCall::SetPartialResponse(CallResponse&& resp) {
+  if (test_ignore_response) {
+    LOG_WITH_PREFIX(WARNING) << "Skipping partial response processing: " << ToString();
+    return;
+  }
+
+  Slice body = resp.serialized_response();
+  if (method_metrics_) {
+    IncrementCounterBy(method_metrics_->response_bytes, body.size());
+  }
+
+  std::shared_ptr<PartialResponseCallback> callback;
+  {
+    std::lock_guard lock(mtx_);
+    callback = partial_response_callback_;
+  }
+  if (!callback) {
+    // A final transition on another thread (MarkCallAsFailed) released it after the connection
+    // checked IsFinished().
+    VLOG_WITH_PREFIX(1) << "Dropping partial response for a finished call: " << ToString();
+    return;
+  }
+  (*callback)(body, resp.data_holder());
 }
 
 void OutboundCall::SetQueued() {
@@ -745,7 +791,9 @@ void OutboundCall::SetFinished() {
     outbound_call_metrics_->time_to_response->Increment(
         MicrosecondsSinceStart(CoarseMonoClock::Now()));
   }
-  if (SetState(RpcCallState::FINISHED_SUCCESS)) {
+  auto finished = SetState(RpcCallState::FINISHED_SUCCESS);
+  ReleasePartialResponseCallback();
+  if (finished) {
     InvokeCallback();
   }
 }
@@ -753,8 +801,12 @@ void OutboundCall::SetFinished() {
 void OutboundCall::SetFailed(const Status &status, std::unique_ptr<ErrorStatusPB> err_pb) {
   TRACE_TO(trace_, "Call Failed.");
   bool invoke_callback;
+  // Moved out under mtx_ together with the state change, so the reactor cannot copy it after the
+  // call finished. Destroyed outside the lock, before the final callback runs.
+  std::shared_ptr<PartialResponseCallback> partial_response_callback;
   {
     std::lock_guard l(mtx_);
+    partial_response_callback.swap(partial_response_callback_);
     invoke_callback = SetState(RpcCallState::FINISHED_ERROR, status);
     if (invoke_callback) {
       status_ = status;
@@ -776,6 +828,7 @@ void OutboundCall::SetFailed(const Status &status, std::unique_ptr<ErrorStatusPB
       }
     }
   }
+  partial_response_callback.reset();
   if (invoke_callback) {
     InvokeCallback();
   }
@@ -794,11 +847,15 @@ void OutboundCall::SetTimedOut() {
 void OutboundCall::DoSetTimedOut(Status status) {
   TRACE_TO(trace_, "Call TimedOut.");
   bool invoke_callback;
+  // Same as in SetFailed.
+  std::shared_ptr<PartialResponseCallback> partial_response_callback;
   {
     std::lock_guard l(mtx_);
+    partial_response_callback.swap(partial_response_callback_);
     status_ = std::move(status);
     invoke_callback = SetState(RpcCallState::TIMED_OUT, status_);
   }
+  partial_response_callback.reset();
   if (invoke_callback) {
     InvokeCallback();
   }

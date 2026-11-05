@@ -34,6 +34,7 @@
 
 #include "yb/rpc/connection.h"
 #include "yb/rpc/connection_context.h"
+#include "yb/rpc/lightweight_message.h"
 #include "yb/rpc/rpc_metrics.h"
 #include "yb/rpc/service_if.h"
 
@@ -241,6 +242,10 @@ void InboundCall::QueueResponse(bool is_success) {
 
 std::string InboundCall::LogPrefix() const {
   return Format("$0: ", this);
+}
+
+Status InboundCall::RespondPartial(AnyMessageConstPtr response) {
+  return STATUS(NotSupported, "Partial responses are not supported by this protocol");
 }
 
 bool InboundCall::RespondTimedOutIfPending(const char* message) {

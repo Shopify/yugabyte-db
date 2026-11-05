@@ -180,6 +180,10 @@ class InboundCall : public RpcCall, public MPSCQueueEntry<InboundCall> {
 //  virtual const std::string& service_name() const = 0;
   virtual void RespondFailure(ErrorStatusPB::RpcErrorCodePB error_code, const Status& status) = 0;
 
+  // Sends a partial response frame, see YBInboundCall::RespondPartial. Protocols without partial
+  // frames return NotSupported.
+  virtual Status RespondPartial(AnyMessageConstPtr response);
+
   // Do appropriate actions when call is timed out.
   //
   // message contains human readable information on why call timed out.

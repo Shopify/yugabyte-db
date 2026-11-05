@@ -119,6 +119,10 @@ const Endpoint& LocalYBInboundCall::local_address() const {
   return endpoint;
 }
 
+Status LocalYBInboundCall::RespondPartial(AnyMessageConstPtr response) {
+  return STATUS(NotSupported, "Partial responses are not supported for local calls");
+}
+
 void LocalYBInboundCall::Respond(AnyMessageConstPtr resp, bool is_success) {
   // The handler is done with the caller's buffers. Release them before the caller gets the
   // response, so it can reuse them right away.

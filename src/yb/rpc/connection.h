@@ -187,7 +187,8 @@ class Connection final : public StreamContext, public std::enable_shared_from_th
 
   // An incoming packet has completed on the client side. This parses the
   // call response, looks up the CallAwaitingResponse, and calls the
-  // client callback.
+  // client callback. A partial response frame goes to the call's partial-response callback and
+  // leaves the call pending.
   Status HandleCallResponse(CallData* call_data) ON_REACTOR_THREAD;
 
   ConnectionContext& context() { return *context_; }
@@ -224,6 +225,8 @@ class Connection final : public StreamContext, public std::enable_shared_from_th
   CallStateListenerFactory* call_state_listener_factory();
 
  private:
+  void HandlePartialCallResponse(CallResponse&& resp) ON_REACTOR_THREAD;
+
   // Marks the given call as failed and schedules destruction of the connection.
   void FailCallAndDestroyConnection(const OutboundDataPtr& outbound_data,
                                     const Status& status) ON_REACTOR_THREAD;

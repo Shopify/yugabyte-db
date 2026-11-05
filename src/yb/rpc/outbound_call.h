@@ -161,6 +161,12 @@ class CallResponse {
     return !header_.is_error();
   }
 
+  // Return true if this is a partial response frame, see ResponseHeader.partial.
+  bool is_partial() const {
+    DCHECK(parsed_);
+    return header_.partial();
+  }
+
   // Return the call ID that this response is related to.
   int32_t call_id() const {
     DCHECK(parsed_);
@@ -330,6 +336,20 @@ class OutboundCall : public RpcCall {
 
   // Fill in the call response.
   void SetResponse(CallResponse&& resp) ON_REACTOR_THREAD;
+
+  // Installs the partial-response callback (see RpcController::set_partial_response_callback).
+  // Only called before the call is queued.
+  void SetPartialResponseCallback(std::shared_ptr<PartialResponseCallback> callback)
+      EXCLUDES(mtx_);
+
+  // Whether a partial-response callback was installed. Fixed before the call is queued, so it is
+  // safe to read from any thread, and stays true after the callback is released.
+  bool has_partial_response_callback() const { return has_partial_response_callback_; }
+
+  // Delivers a partial response frame to the partial-response callback. The connection drops
+  // frames for finished calls before calling this. Does not change the call state, the timeout,
+  // the trace or the response-time metric.
+  void SetPartialResponse(CallResponse&& resp) ON_REACTOR_THREAD EXCLUDES(mtx_);
 
   bool IsTimedOut() const;
 
@@ -521,6 +541,10 @@ class OutboundCall : public RpcCall {
 
   Result<uint32_t> TimeoutMs() const;
 
+  // Releases the partial-response callback once the call has reached a final state. Paths that
+  // already hold mtx_ move the callback out themselves.
+  void ReleasePartialResponseCallback() EXCLUDES(mtx_);
+
   // ----------------------------------------------------------------------------------------------
   // Private fields set in constructor
   // ----------------------------------------------------------------------------------------------
@@ -545,6 +569,13 @@ class OutboundCall : public RpcCall {
   std::unique_ptr<ErrorStatusPB> error_pb_ GUARDED_BY(mtx_);
   Status thread_pool_failure_ GUARDED_BY(mtx_);
 
+  // Shared, so that a partial callback running on the reactor keeps its own reference: the
+  // reactor copies the pointer under mtx_ and invokes it outside the lock, while a final
+  // transition on any thread moves it out under mtx_ and destroys it outside the lock. The
+  // callback is destroyed when the last of the two lets go, never while it runs. Null unless the
+  // caller asked for partial frames, so other calls pay nothing beyond the empty pointer.
+  std::shared_ptr<PartialResponseCallback> partial_response_callback_ GUARDED_BY(mtx_);
+
   // ----------------------------------------------------------------------------------------------
 
   InvokeCallbackTask callback_task_;
@@ -564,8 +595,11 @@ class OutboundCall : public RpcCall {
   // are annotated with NO_THREAD_SAFETY_ANALYSIS.
   CallResponse call_response_ GUARDED_BY_REACTOR_THREAD;
 
-  // TEST only flag to reproduce stuck OutboundCall scenario.
+  // TEST only flag to reproduce stuck OutboundCall scenario. Partial frames are ignored too.
   bool test_ignore_response = false;
+
+  // Set with partial_response_callback_ before the call is queued, and never reset.
+  bool has_partial_response_callback_ = false;
 
   // ----------------------------------------------------------------------------------------------
   // Atomic fields

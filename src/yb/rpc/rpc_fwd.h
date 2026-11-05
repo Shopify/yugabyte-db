@@ -161,6 +161,12 @@ constexpr ScheduledTaskId kInvalidTaskId = -1;
 using ProxyPtr = std::shared_ptr<Proxy>;
 using ResponseCallback = std::function<void()>;
 
+// Receives one partial response frame of an outbound call, see
+// RpcController::set_partial_response_callback. body is the serialized response message of the
+// frame and points into holder: it is valid only while holder is alive. The callback may keep
+// holder past its return to keep the bytes; holder pins exactly the frame's own buffer.
+using PartialResponseCallback = std::function<void(Slice body, RefCntBuffer holder)>;
+
 YB_DEFINE_ENUM(ServicePriority, (kNormal)(kHigh));
 
 // Specifies how to run callback for async outbound call.

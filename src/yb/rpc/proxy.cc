@@ -184,6 +184,9 @@ void Proxy::AsyncLocalCall(
     RpcController* controller, ResponseCallback callback,
     const bool force_run_callback_on_reactor, bool send_metadata,
     std::shared_ptr<void> buffers_holder) {
+  // A local call has no partial frames. Drop the callback now, so it is released like on a
+  // remote call by the time the final callback runs.
+  controller->partial_response_callback_.reset();
   controller->call_ = std::make_shared<LocalOutboundCall>(
       *method, outbound_call_metrics_, resp, controller, context_->rpc_metrics(),
       std::move(callback),
@@ -222,6 +225,12 @@ void Proxy::AsyncRemoteCall(
       context_->rpc_metrics(), std::move(callback),
       GetCallbackThreadPool(force_run_callback_on_reactor, controller->invoke_callback_mode()),
       send_metadata ? context_->metadata_serializer_factory() : nullptr));
+  // Moved before PrepareCall, so a send failure releases it like any other final transition, and
+  // the controller keeps no reference to it.
+  if (controller->partial_response_callback_) {
+    controller->call_->SetPartialResponseCallback(
+        std::move(controller->partial_response_callback_));
+  }
   if (!PrepareCall(req, controller)) {
     return;
   }

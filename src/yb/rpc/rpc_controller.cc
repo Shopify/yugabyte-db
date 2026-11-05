@@ -73,14 +73,27 @@ void RpcController::Swap(RpcController* other) {
   std::swap(allow_local_calls_in_curr_thread_, other->allow_local_calls_in_curr_thread_);
   std::swap(call_, other->call_);
   std::swap(invoke_callback_mode_, other->invoke_callback_mode_);
+  std::swap(partial_response_callback_, other->partial_response_callback_);
 }
 
 void RpcController::Reset() {
+  // Destroyed outside lock_: its captures may run arbitrary destructors.
+  auto partial_response_callback = std::move(partial_response_callback_);
   std::lock_guard l(lock_);
   if (call_) {
     CHECK(FinishedUnlocked());
   }
   call_.reset();
+}
+
+void RpcController::set_partial_response_callback(PartialResponseCallback callback) {
+  partial_response_callback_ =
+      callback ? std::make_shared<PartialResponseCallback>(std::move(callback)) : nullptr;
+}
+
+PartialResponseCallback RpcController::TakePartialResponseCallback() {
+  auto callback = std::move(partial_response_callback_);
+  return callback ? std::move(*callback) : PartialResponseCallback();
 }
 
 bool RpcController::finished() const {
