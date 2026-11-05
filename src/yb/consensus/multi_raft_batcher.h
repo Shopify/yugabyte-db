@@ -41,9 +41,16 @@ class MultiRaftBatchSender {
 
   virtual ~MultiRaftBatchSender() = default;
 
-  // Must invoke done exactly once. req, resp and controller stay valid until then.
+  // Must invoke done exactly once. done may run before SendBatch returns, on this or another
+  // thread.
+  // - req references requests that belong to their Raft peers. It must be serialized before
+  //   SendBatch returns and must not be read afterwards. The proxy serializes it in
+  //   Proxy::PrepareCall. A local call would read req later, but a batcher always sends to a
+  //   remote HostPort, so the envelope never goes through LocalOutboundCall.
+  // - resp and controller stay valid until done has run. resp is parsed in place: the parsed
+  //   messages live on resp's arena and point into the buffer of controller's call.
   virtual void SendBatch(
-      const MultiRaftConsensusRequestPB& req, MultiRaftConsensusResponsePB* resp,
+      const LWMultiRaftConsensusRequestPB& req, LWMultiRaftConsensusResponsePB* resp,
       rpc::RpcController* controller, DoneCallback done) = 0;
 
   // Fails a batch RPC that SendBatch issued on controller and that has not completed, so that
@@ -56,7 +63,7 @@ class MultiRaftBatchSender {
 std::unique_ptr<MultiRaftBatchSender> CreateMultiRaftBatchSender(
     rpc::ProxyCache* proxy_cache, const HostPort& hostport);
 
-// - MultiRaftBatcher batches ConsensusRequestPBs from the local peers of different tablets that
+// - MultiRaftBatcher batches Raft requests from the local peers of different tablets that
 //   replicate to the same remote server (a tserver, or a master for sys catalog peers), and sends
 //   each batch as one MultiRaftUpdateConsensus RPC.
 // - Heartbeats (RequestKind::kHeartbeat) are sent every FLAGS_multi_raft_heartbeat_interval_ms
@@ -68,6 +75,13 @@ std::unique_ptr<MultiRaftBatchSender> CreateMultiRaftBatchSender(
 // - A request that would push the batch past FLAGS_multi_raft_data_batch_size data requests or
 //   FLAGS_multi_raft_batch_bytes bytes sends the current batch first.
 // - Multiple batches may be in flight concurrently, but only one is built at a time.
+//
+// Nothing is copied on the way. The envelope references each added request, together with the
+// caller's LWReplicateMsgsHolder, which pins the log cache messages that the request's ops point
+// to. The envelope is serialized once, in MultiRaftBatchSender::SendBatch, and the holders are
+// released when SendBatch returns. A batch that is never sent (aborted at Shutdown) is never
+// serialized. The response is parsed in place, and each request's callback gets a pointer to its
+// own response together with a holder that keeps the batch, and with it the response, alive.
 class MultiRaftBatcher : public std::enable_shared_from_this<MultiRaftBatcher> {
  private:
   // Tracks all the metadata for a single batch request, including a list of all
@@ -116,15 +130,21 @@ class MultiRaftBatcher : public std::enable_shared_from_this<MultiRaftBatcher> {
   void Start();
 
   enum class RequestKind { kHeartbeat, kData };
-  using BatchResponseCallback = std::function<void(const Status&)>;
+  // response is valid only while holder is alive. It is null, and holder empty, iff status is not
+  // OK. holder keeps the whole batch alive, with the responses of every request in it, so it must
+  // not be kept past the callback.
+  using BatchResponseCallback = std::function<void(
+      const Status& status, const LWConsensusResponsePB* response, std::shared_ptr<void> holder)>;
 
-  // When called adds the request to a batch (request data will be swapped).
-  // If the batch executes sucessfully then the response is populated and the callback is executed.
-  // If the batch rpc call fails the response will NOT be populated and the callback will be
-  // executed with an error status. After Shutdown() the callback runs immediately with Aborted.
-  // Returns a handle to the batch the request was added to.
-  BatchHandle AddRequestToBatch(ConsensusRequestPB* request,
-                                ConsensusResponsePB* response,
+  // Adds the request to a batch. The batch references request instead of copying it, so request,
+  // and everything it references, must stay unchanged and alive until the callback runs. holder
+  // pins the messages that request's ops point to, and is released once the envelope has been
+  // serialized (or the batch is aborted). The callback runs exactly once: with each request's own
+  // response when the batch RPC succeeds, or with the batch's error. After Shutdown() it runs
+  // immediately with Aborted. The callback may run before this returns. Returns a handle to the
+  // batch the request was added to.
+  BatchHandle AddRequestToBatch(LWConsensusRequestPB* request,
+                                LWReplicateMsgsHolder holder,
                                 BatchResponseCallback callback,
                                 RequestKind kind);
 
@@ -140,7 +160,7 @@ class MultiRaftBatcher : public std::enable_shared_from_this<MultiRaftBatcher> {
 
   // Adds the request, and returns in pre_add_batch / post_add_batch any batches to send.
   BatchHandle AddRequestUnlocked(
-      ConsensusRequestPB* request, ConsensusResponsePB* response, BatchResponseCallback callback,
+      LWConsensusRequestPB* request, LWReplicateMsgsHolder* holder, BatchResponseCallback callback,
       RequestKind kind, size_t request_bytes, BatchData* pre_add_batch, BatchData* post_add_batch)
       REQUIRES(mutex_);
 

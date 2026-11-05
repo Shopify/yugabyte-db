@@ -66,6 +66,7 @@
 #include "yb/util/scope_exit.h"
 #include "yb/util/status_callback.h"
 #include "yb/util/status_format.h"
+#include "yb/util/sync_point.h"
 #include "yb/util/threadpool.h"
 #include "yb/util/tsan_util.h"
 #include "yb/util/url-coding.h"
@@ -430,16 +431,19 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
       return;
     }
 
-    // TODO(lw_uc) support multiraft heartbeat with LW
-    update_request_->ToGoogleProtobuf(&heartbeat_request_);
-    update_response_->ToGoogleProtobuf(&heartbeat_response_);
+    // Copied while performing_update_mutex_ is still held. The copy owns its bytes: it borrows
+    // nothing from arena_. It has no ops, so there is nothing for a holder to pin.
+    heartbeat_arena_.Reset(ResetMode::kKeepFirst);
+    heartbeat_request_ = heartbeat_arena_.NewObject<LWConsensusRequestPB>(
+        &heartbeat_arena_, *update_request_);
     cur_heartbeat_id_++;
     processing_lock.unlock();
     performing_update_lock.unlock();
     performing_heartbeat_lock.release();
+    TEST_SYNC_POINT_CALLBACK("Peer::SendNextRequest:BeforeHeartbeatAdd", heartbeat_request_);
     multi_raft_batcher_->AddRequestToBatch(
-        &heartbeat_request_, &heartbeat_response_,
-        std::bind(&Peer::ProcessHeartbeatResponse, retain_self, _1),
+        heartbeat_request_, LWReplicateMsgsHolder(),
+        std::bind(&Peer::ProcessHeartbeatResponse, retain_self, _1, _2, _3),
         MultiRaftBatcher::RequestKind::kHeartbeat);
     return;
   }
@@ -452,7 +456,6 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
     if (direct_threshold == 0 || update_request_->SerializedSize() < direct_threshold) {
       // Batched requests are not traced: only the direct UpdateConsensus handler fills
       // trace_buffer.
-      update_request_->ToGoogleProtobuf(&batched_request_);
       // ProcessBatchedResponse can run before AddRequestToBatch returns: inline if the batcher is
       // shut down, or on another thread once the batch is sent. So everything it reads is written
       // here, peer_lock_ is released before the add, and after the add only the round-checked
@@ -470,9 +473,14 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
       }
       processing_lock.unlock();
       performing_update_lock.release();
+      TEST_SYNC_POINT_CALLBACK("Peer::SendNextRequest:BeforeBatchedAdd", update_request_);
+      // The envelope references update_request_, and through it arena_ and the members it refs,
+      // until it is serialized. The update lock stays held until ProcessBatchedResponse, so
+      // nothing rebuilds them before then. retain_self keeps this peer alive until the batch
+      // releases the callback, which is after the envelope is serialized.
       auto handle = multi_raft_batcher_->AddRequestToBatch(
-          &batched_request_, &batched_response_,
-          std::bind(&Peer::ProcessBatchedResponse, retain_self, _1),
+          update_request_, std::move(msgs_holder),
+          std::bind(&Peer::ProcessBatchedResponse, retain_self, _1, _2, _3),
           MultiRaftBatcher::RequestKind::kData);
       std::lock_guard lock(batched_round_lock_);
       if (batched_round_ == round && batched_round_outstanding_) {
@@ -514,7 +522,7 @@ std::unique_lock<simple_spinlock> Peer::StartProcessingUnlocked() {
 }
 
 bool Peer::ProcessResponseWithStatus(const Status& status,
-                                     LWConsensusResponsePB* response) {
+                                     const LWConsensusResponsePB* response) {
   if (!status.ok()) {
     if (status.IsRemoteError()) {
       // Most controller errors are caused by network issues or corner cases like shutdown and
@@ -610,9 +618,10 @@ void Peer::ProcessResponse(TracePtr trace) {
   }
 }
 
-void Peer::ProcessHeartbeatResponse(const Status& status) {
+void Peer::ProcessHeartbeatResponse(
+    const Status& status, const LWConsensusResponsePB* response, std::shared_ptr<void> holder) {
   DCHECK(performing_heartbeat_mutex_.is_locked()) << "Got a heartbeat when nothing was pending.";
-  DCHECK(heartbeat_request_.ops().empty()) << "Got a heartbeat with a non-zero number of ops.";
+  DCHECK(heartbeat_request_->ops().empty()) << "Got a heartbeat with a non-zero number of ops.";
   // last_rpc_start_time_ is left alone: a batched heartbeat never sets it, and it may time a data
   // or remote bootstrap call on controller_ that is still outstanding, which the stuck-call
   // detector in SignalRequest must keep seeing.
@@ -631,9 +640,7 @@ void Peer::ProcessHeartbeatResponse(const Status& status) {
     return;
   }
 
-  // TODO(lw_uc) support multiraft heartbeat with LW
-  auto lw_response = rpc::CopySharedMessage(heartbeat_response_);
-  bool more_pending = ProcessResponseWithStatus(status, lw_response.get());
+  bool more_pending = ProcessResponseWithStatus(status, response);
 
   if (more_pending) {
     auto performing_update_lock = LockPerformingUpdate(std::try_to_lock);
@@ -648,9 +655,12 @@ void Peer::ProcessHeartbeatResponse(const Status& status) {
 }
 
 // Kept out of line as a uprobe attach point for timing Raft rounds.
-ATTRIBUTE_NOINLINE void Peer::ProcessBatchedResponse(const Status& status) {
+ATTRIBUTE_NOINLINE void Peer::ProcessBatchedResponse(
+    const Status& status, const LWConsensusResponsePB* response, std::shared_ptr<void> holder) {
   DCHECK(performing_update_mutex_.is_locked())
       << "Got a batched response when nothing was pending.";
+  TEST_SYNC_POINT_CALLBACK(
+      "Peer::ProcessBatchedResponse", const_cast<LWConsensusResponsePB*>(response));
   {
     std::lock_guard lock(batched_round_lock_);
     batched_round_outstanding_ = false;
@@ -665,15 +675,7 @@ ATTRIBUTE_NOINLINE void Peer::ProcessBatchedResponse(const Status& status) {
     return;
   }
 
-  // When the batch RPC fails, the batcher does not swap a response in, so batched_response_ still
-  // holds an earlier round's response.
-  bool more_pending;
-  if (status.ok()) {
-    auto lw_response = rpc::CopySharedMessage(batched_response_);
-    more_pending = ProcessResponseWithStatus(status, lw_response.get());
-  } else {
-    more_pending = ProcessResponseWithStatus(status, /* response= */ nullptr);
-  }
+  bool more_pending = ProcessResponseWithStatus(status, response);
 
   if (more_pending) {
     processing_lock.unlock();

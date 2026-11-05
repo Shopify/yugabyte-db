@@ -21,17 +21,22 @@
 
 #include <gtest/gtest.h>
 
+#include "yb/consensus/consensus.messages.h"
 #include "yb/consensus/consensus.pb.h"
 #include "yb/consensus/metadata.pb.h"
 #include "yb/consensus/multi_raft_batcher.h"
 #include "yb/consensus/multi_raft_batcher-test-util.h"
+#include "yb/consensus/replicate_msgs_holder.h"
 
+#include "yb/rpc/lightweight_message.h"
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/proxy.h"
 
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/countdown_latch.h"
 #include "yb/util/logging_test_util.h"
+#include "yb/util/mem_tracker.h"
+#include "yb/util/memory/arena.h"
 #include "yb/util/metrics.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/test_macros.h"
@@ -78,12 +83,17 @@ constexpr auto kNeverMs = 3600 * 1000;
 // A request added to the batcher, and what its callback observed.
 struct TestCall {
   std::string tablet_id;
-  ConsensusRequestPB request;
+  ThreadSafeArena arena;
+  // On arena. The batcher references it until the callback runs.
+  LWConsensusRequestPB* request = nullptr;
+  // A copy of the response the callback got, made after on_callback returns.
   ConsensusResponsePB response;
   MultiRaftBatcher::BatchHandle handle;
   std::function<void()> on_callback;
 
   Status status;
+  bool had_response = false;
+  bool had_holder = false;
   bool on_high_pool = false;
   std::thread::id thread_id;
   std::atomic<int> num_callbacks{0};
@@ -151,25 +161,39 @@ class MultiRaftBatcherTest : public YBTest {
   // Creates a call without adding it to the batcher.
   TestCall& NewCall(
       const std::string& tablet_id, size_t payload_bytes = 100,
-      std::function<void()> on_callback = {}) {
+      std::function<void()> on_callback = {}, int num_ops = 0) {
     auto& call = *calls_.emplace_back(std::make_unique<TestCall>());
     call.tablet_id = tablet_id;
-    call.request = MakeRequest(tablet_id, payload_bytes);
+    call.request = call.arena.NewObject<LWConsensusRequestPB>(
+        &call.arena, MakeRequest(tablet_id, payload_bytes, num_ops));
     call.on_callback = std::move(on_callback);
     return call;
   }
 
   // Adds a call created by NewCall to the batcher. Safe to call from any thread.
-  void Submit(TestCall& call, RequestKind kind) {
+  void Submit(
+      TestCall& call, RequestKind kind, LWReplicateMsgsHolder holder = LWReplicateMsgsHolder()) {
     auto* high_pool = &messenger_->ThreadPool(rpc::ServicePriority::kHigh);
     call.handle = batcher_->AddRequestToBatch(
-        &call.request, &call.response, [&call, high_pool](const Status& status) {
+        call.request, std::move(holder),
+        [&call, high_pool](
+            const Status& status, const LWConsensusResponsePB* response,
+            std::shared_ptr<void> holder) {
+          // A response comes with a holder, and only on success.
+          EXPECT_EQ(response != nullptr, status.ok()) << call.tablet_id << ": " << status;
+          EXPECT_EQ(holder != nullptr, status.ok()) << call.tablet_id << ": " << status;
           call.status = status;
+          call.had_response = response != nullptr;
+          call.had_holder = holder != nullptr;
           call.on_high_pool = high_pool->OwnsThisThread();
           call.thread_id = std::this_thread::get_id();
           ++call.num_callbacks;
           if (call.on_callback) {
             call.on_callback();
+          }
+          // Read after on_callback, which may block: holder keeps the response valid.
+          if (response) {
+            response->ToGoogleProtobuf(&call.response);
           }
           call.done.store(true, std::memory_order_release);
         },
@@ -702,10 +726,12 @@ TEST_F(MultiRaftBatcherTest, ShutdownAbortsPendingBatch) {
   for (auto* call : {&h2, &d3}) {
     ASSERT_TRUE(IsDone(*call));
     ASSERT_TRUE(call->status.IsAborted()) << call->status;
+    ASSERT_FALSE(call->had_response);
   }
   auto& d4 = Add("t4", RequestKind::kData);
   ASSERT_TRUE(IsDone(d4));
   ASSERT_TRUE(d4.status.IsAborted()) << d4.status;
+  ASSERT_FALSE(d4.had_response);
 
   // The envelope in flight at shutdown still completes its callbacks and sends nothing new.
   Complete(0);
@@ -774,7 +800,7 @@ TEST_F(MultiRaftBatcherTest, DataSubCallbacksRunAsSeparateHighPoolTasks) {
   ASSERT_EQ(concurrent.load(), 2);
 }
 
-TEST_F(MultiRaftBatcherTest, EnvelopeFailureFansOutWithoutSwap) {
+TEST_F(MultiRaftBatcherTest, EnvelopeFailureFansOutNullResponse) {
   CreateBatcher();
   auto& h1 = Add("t1", RequestKind::kHeartbeat);
   h1.response.set_responder_uuid("stale-t1");
@@ -784,10 +810,17 @@ TEST_F(MultiRaftBatcherTest, EnvelopeFailureFansOutWithoutSwap) {
   const auto d2_before = d2.response.SerializeAsString();
 
   // The fake still fills the batch response, which the batcher must not hand out.
-  Complete(0, STATUS(TimedOut, "Envelope timed out"));
+  ASSERT_TRUE(sender_state_->FailWithResponses(
+      0, STATUS(TimedOut, "Envelope timed out"),
+      [](size_t, const ConsensusRequestPB& request, ConsensusResponsePB* response) {
+        response->set_responder_uuid(request.tablet_id() + "-resp");
+      }));
+  ASSERT_EQ(GetEnvelope(0)->responses.size(), 2);
   for (auto* call : {&h1, &d2}) {
     ASSERT_NO_FATALS(WaitDone(*call));
     ASSERT_TRUE(call->status.IsTimedOut()) << call->status;
+    ASSERT_FALSE(call->had_response);
+    ASSERT_FALSE(call->had_holder);
   }
   ASSERT_EQ(h1.response.SerializeAsString(), h1_before);
   ASSERT_EQ(d2.response.SerializeAsString(), d2_before);
@@ -980,15 +1013,12 @@ TEST_F(MultiRaftBatcherTest, EnvelopeOpsMetric) {
   CreateBatcher();
   auto& h1 = NewCall("t1");
   Submit(h1, RequestKind::kHeartbeat);
-  auto& d2 = NewCall("t2");
-  d2.request = MakeRequest("t2", 100, /* num_ops= */ 3);
+  auto& d2 = NewCall("t2", 100, {}, /* num_ops= */ 3);
   Submit(d2, RequestKind::kData);
   ASSERT_EQ(NumEnvelopes(), 1);
-  auto& d3 = NewCall("t3");
-  d3.request = MakeRequest("t3", 100, /* num_ops= */ 2);
+  auto& d3 = NewCall("t3", 100, {}, /* num_ops= */ 2);
   Submit(d3, RequestKind::kData);
-  auto& d4 = NewCall("t4");
-  d4.request = MakeRequest("t4", 100, /* num_ops= */ 4);
+  auto& d4 = NewCall("t4", 100, {}, /* num_ops= */ 4);
   Submit(d4, RequestKind::kData);
   Complete(0);
   ASSERT_EQ(NumEnvelopes(), 2);

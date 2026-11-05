@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "yb/consensus/consensus.messages.h"
 #include "yb/consensus/consensus.pb.h"
 #include "yb/consensus/multi_raft_batcher.h"
 
@@ -28,9 +29,18 @@ namespace yb::consensus {
 
 // One MultiRaftUpdateConsensus RPC captured by FakeBatchSender.
 struct FakeBatchEnvelope {
+  // What went on the wire: the envelope serialized inside SendBatch, as the proxy does, and parsed
+  // back.
   MultiRaftConsensusRequestPB req;
   std::vector<std::string> tablet_ids;
-  MultiRaftConsensusResponsePB* resp = nullptr;
+  // The batcher's envelope, valid only inside SendBatch (in the send hook), null afterwards.
+  const LWMultiRaftConsensusRequestPB* lw_req = nullptr;
+  // The batch's response. Valid only until the envelope is completed, null afterwards: the batch
+  // may be released as soon as its done callback has run.
+  LWMultiRaftConsensusResponsePB* resp = nullptr;
+  // The sub-responses written into resp by Complete, in order. For address comparisons only: they
+  // live as long as the batch.
+  std::vector<const LWConsensusResponsePB*> responses;
   rpc::RpcController* controller = nullptr;
   MonoDelta timeout;
   rpc::InvokeCallbackMode callback_mode = rpc::InvokeCallbackMode::kThreadPoolNormal;
@@ -44,10 +54,11 @@ struct FakeBatchEnvelope {
 // What a FakeBatchSender has sent. Shared by the sender, which the batcher owns, and the test.
 class FakeBatchSenderState {
  public:
-  // Fills the response to the request at the given index of an envelope.
+  // Fills the response to the request at the given index of an envelope. request is the wire
+  // copy. response is copied into the batch's response on its arena.
   using FillResponse = std::function<void(
       size_t idx, const ConsensusRequestPB& request, ConsensusResponsePB* response)>;
-  // Runs on the sending thread, inside SendBatch, after the envelope is recorded.
+  // Runs on the sending thread, inside SendBatch, after the envelope is serialized and recorded.
   using SendHook = std::function<void(size_t envelope_idx)>;
 
   size_t NumEnvelopes() {
@@ -71,21 +82,14 @@ class FakeBatchSenderState {
   // envelope was already completed.
   bool Complete(
       size_t idx, const Status& status, const FillResponse& fill, int num_responses = -1) {
-    auto envelope = GetEnvelope(idx);
-    auto done = TakeDone(envelope.get());
-    if (!done) {
-      return false;
-    }
-    if (status.ok()) {
-      if (num_responses < 0) {
-        num_responses = envelope->req.consensus_request_size();
-      }
-      for (int i = 0; i != num_responses; ++i) {
-        fill(i, envelope->req.consensus_request(i), envelope->resp->add_consensus_response());
-      }
-    }
-    done(status);
-    return true;
+    return DoComplete(idx, status, status.ok() ? fill : FillResponse(), num_responses);
+  }
+
+  // Fills one sub-response per request using fill, then completes the envelope with the error
+  // status: a well-formed response that the batcher must not hand out.
+  bool FailWithResponses(size_t idx, const Status& status, const FillResponse& fill) {
+    CHECK(!status.ok());
+    return DoComplete(idx, status, fill, /* num_responses= */ -1);
   }
 
   // Fails the uncompleted envelope sent on controller with TimedOut, as RpcController does.
@@ -99,6 +103,7 @@ class FakeBatchSenderState {
           envelope.marked_failed = true;
           done = std::move(envelope.done);
           envelope.done = nullptr;
+          envelope.resp = nullptr;
           break;
         }
       }
@@ -111,13 +116,39 @@ class FakeBatchSenderState {
  private:
   friend class FakeBatchSender;
 
+  bool DoComplete(
+      size_t idx, const Status& status, const FillResponse& fill, int num_responses) {
+    auto envelope = GetEnvelope(idx);
+    auto [done, resp] = TakeDone(envelope.get());
+    if (!done) {
+      return false;
+    }
+    if (fill) {
+      if (num_responses < 0) {
+        num_responses = envelope->req.consensus_request_size();
+      }
+      for (int i = 0; i != num_responses; ++i) {
+        ConsensusResponsePB response;
+        fill(i, envelope->req.consensus_request(i), &response);
+        auto* lw_response = resp->add_consensus_response();
+        lw_response->CopyFrom(response);
+        envelope->responses.push_back(lw_response);
+      }
+    }
+    done(status);
+    return true;
+  }
+
   // Drops the sender's reference to the batch with the callback, as the RPC layer does after
-  // invoking it.
-  MultiRaftBatchSender::DoneCallback TakeDone(FakeBatchEnvelope* envelope) {
+  // invoking it, and returns the response to fill. Only the caller that gets done may use it.
+  std::pair<MultiRaftBatchSender::DoneCallback, LWMultiRaftConsensusResponsePB*> TakeDone(
+      FakeBatchEnvelope* envelope) {
     std::lock_guard lock(mutex_);
     auto done = std::move(envelope->done);
     envelope->done = nullptr;
-    return done;
+    auto* resp = envelope->resp;
+    envelope->resp = nullptr;
+    return {std::move(done), resp};
   }
 
   void Record(std::shared_ptr<FakeBatchEnvelope> envelope) {
@@ -145,20 +176,25 @@ class FakeBatchSender : public MultiRaftBatchSender {
   explicit FakeBatchSender(std::shared_ptr<FakeBatchSenderState> state)
       : state_(std::move(state)) {}
 
+  // Serializes req before returning, as Proxy::PrepareCall does, and never reads it afterwards.
   void SendBatch(
-      const MultiRaftConsensusRequestPB& req, MultiRaftConsensusResponsePB* resp,
+      const LWMultiRaftConsensusRequestPB& req, LWMultiRaftConsensusResponsePB* resp,
       rpc::RpcController* controller, DoneCallback done) override {
     auto envelope = std::make_shared<FakeBatchEnvelope>();
-    envelope->req = req;
-    for (const auto& request : req.consensus_request()) {
+    // Partial: neither the LW serializer nor the LW parser on the follower checks required fields.
+    CHECK(envelope->req.ParsePartialFromString(req.SerializeAsString()));
+    for (const auto& request : envelope->req.consensus_request()) {
       envelope->tablet_ids.push_back(request.tablet_id());
     }
+    envelope->lw_req = &req;
     envelope->resp = resp;
     envelope->controller = controller;
     envelope->timeout = controller->timeout();
     envelope->callback_mode = controller->invoke_callback_mode();
     envelope->done = std::move(done);
+    auto* recorded = envelope.get();
     state_->Record(std::move(envelope));
+    recorded->lw_req = nullptr;
   }
 
   // There is no RPC call to fail, so fail the envelope instead.

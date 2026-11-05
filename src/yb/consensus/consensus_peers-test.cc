@@ -57,6 +57,7 @@
 #include "yb/util/metrics.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/status_log.h"
+#include "yb/util/sync_point.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_thread_holder.h"
 #include "yb/util/test_util.h"
@@ -911,29 +912,43 @@ TEST_F(ConsensusPeersTest, HeartbeatOnlyBatcherSendsDataDirectly) {
   ASSERT_EQ(CounterValue(METRIC_multi_raft_data_sends_direct), 0);
 }
 
-// When the batch RPC fails, batched_response_ still holds an earlier round's response, which must
-// not be processed.
-TEST_F(ConsensusPeersTest, EnvelopeFailureIgnoresStaleBatchedResponse) {
+// When the batch RPC fails, a response in the envelope, even a well-formed one, is not processed:
+// the peer gets no response.
+TEST_F(ConsensusPeersTest, EnvelopeFailureIgnoresWellFormedResponse) {
   ASSERT_NO_FATALS(SetUpBatcher(/* heartbeat_batching= */ false, /* data_batching= */ true));
   auto test_peer = NewTestPeer(kFollowerUuid);
   auto& peer = *test_peer.peer;
   ASSERT_NO_FATALS(Negotiate(test_peer));
   const auto last_received = message_queue_->GetTrackedPeerForTests(kFollowerUuid).last_received;
 
+  std::atomic<int> num_responses{0};
+  std::atomic<bool> got_response{false};
+  SyncPointScope sync_point;
+  sync_point->SetCallBack(
+      "Peer::ProcessBatchedResponse", [&num_responses, &got_response](void* arg) {
+        got_response = got_response || arg != nullptr;
+        ++num_responses;
+      });
+  sync_point->EnableProcessing();
+
   AppendReplicateMessagesToQueue(message_queue_.get(), clock_, 1, 3);
   ASSERT_OK(peer.SignalRequest(RequestTriggerMode::kNonEmptyOnly));
   ASSERT_NO_FATALS(WaitForEnvelopes(1));
 
-  // A well-formed success that acknowledges every op.
-  auto& stale = *peer.TEST_batched_response();
-  stale.set_responder_uuid(kFollowerUuid);
-  stale.set_responder_term(0);
-  *stale.mutable_status()->mutable_last_received() = MakeOpId(0, 3);
-  *stale.mutable_status()->mutable_last_received_current_leader() = MakeOpId(0, 3);
-  stale.mutable_status()->set_last_committed_idx(3);
-
-  ASSERT_NO_FATALS(CompleteEnvelope(0, STATUS(TimedOut, "Envelope timed out")));
+  // A well-formed success that acknowledges every op, in an envelope that fails.
+  ASSERT_TRUE(sender_state_->FailWithResponses(
+      0, STATUS(TimedOut, "Envelope timed out"),
+      [](size_t, const ConsensusRequestPB&, ConsensusResponsePB* response) {
+        response->set_responder_uuid(kFollowerUuid);
+        response->set_responder_term(0);
+        *response->mutable_status()->mutable_last_received() = MakeOpId(0, 3);
+        *response->mutable_status()->mutable_last_received_current_leader() = MakeOpId(0, 3);
+        response->mutable_status()->set_last_committed_idx(3);
+      }));
+  ASSERT_EQ(GetEnvelope(0)->responses.size(), 1);
   ASSERT_NO_FATALS(WaitIdle(test_peer));
+  ASSERT_EQ(num_responses.load(), 1);
+  ASSERT_FALSE(got_response.load());
   ASSERT_EQ(peer.failed_attempts(), 1);
   ASSERT_EQ(message_queue_->GetTrackedPeerForTests(kFollowerUuid).last_received, last_received);
   ASSERT_FALSE(consensus_->IsMajorityReplicated(1));

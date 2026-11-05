@@ -190,9 +190,6 @@ class Peer : public std::enable_shared_from_this<Peer> {
   // The handle of the outstanding batched data request, if any.
   MultiRaftBatcher::BatchHandle TEST_batched_handle() const;
 
-  // Response object that the multi-Raft batcher fills for batched data requests.
-  ConsensusResponsePB* TEST_batched_response() { return &batched_response_; }
-
  private:
   void SendNextRequest(RequestTriggerMode trigger_mode);
 
@@ -200,11 +197,15 @@ class Peer : public std::enable_shared_from_this<Peer> {
   // requires IO or may block.
   void ProcessResponse(TracePtr trace);
 
-  // Signals that a heartbeat response was received from the peer.
-  void ProcessHeartbeatResponse(const Status& status);
+  // Signals that the multi-Raft batcher completed a batched heartbeat. response is null iff status
+  // is not OK, and is valid while holder is alive.
+  void ProcessHeartbeatResponse(
+      const Status& status, const LWConsensusResponsePB* response, std::shared_ptr<void> holder);
 
-  // Signals that the multi-Raft batcher completed a batched data request.
-  void ProcessBatchedResponse(const Status& status);
+  // Signals that the multi-Raft batcher completed a batched data request. response is null iff
+  // status is not OK, and is valid while holder is alive.
+  void ProcessBatchedResponse(
+      const Status& status, const LWConsensusResponsePB* response, std::shared_ptr<void> holder);
 
   // If the call has been outstanding for longer than its timeout plus
   // consensus_stuck_peer_call_threshold_ms, logs it and, if
@@ -216,7 +217,7 @@ class Peer : public std::enable_shared_from_this<Peer> {
   // Returns true if there are more pending ops to process, false otherwise. response is not read
   // if status is not OK.
   bool ProcessResponseWithStatus(const Status& status,
-                                 LWConsensusResponsePB* response);
+                                 const LWConsensusResponsePB* response);
 
   // Fetch the desired remote bootstrap request from the queue and send it to the peer. The callback
   // goes to ProcessRemoteBootstrapResponse().
@@ -258,19 +259,21 @@ class Peer : public std::enable_shared_from_this<Peer> {
   PeerMessageQueue* queue_;
   uint64_t failed_attempts_ = 0;
 
-  // The latest consensus update request and response stored in arena_.
+  // The latest consensus update request and response stored in arena_. Rebuilt only by
+  // SendNextRequest, under performing_update_mutex_. update_request_ refs tablet_id_, leader_uuid_
+  // and peer_pb_. A batched data request is update_request_ itself, referenced by its multi-Raft
+  // envelope: it holds performing_update_mutex_ until ProcessBatchedResponse, so update_request_
+  // and arena_ stay untouched until then.
   ThreadSafeArena arena_;
   LWConsensusRequestPB* update_request_ = nullptr;
   LWConsensusResponsePB* update_response_ = nullptr;
 
-  // Latest heartbeat request and response
-  ConsensusRequestPB heartbeat_request_;
-  ConsensusResponsePB heartbeat_response_;
-
-  // Latest data request and response sent through the multi-Raft batcher. A batched data request
-  // holds performing_update_mutex_ until ProcessBatchedResponse, so there is at most one.
-  ConsensusRequestPB batched_request_;
-  ConsensusResponsePB batched_response_;
+  // The latest heartbeat sent through the multi-Raft batcher, a copy of update_request_. The
+  // heartbeat path releases performing_update_mutex_, so update_request_ can be rebuilt while the
+  // heartbeat waits in a batch. Guarded by performing_heartbeat_mutex_, which is held until
+  // ProcessHeartbeatResponse: rebuilt only by the next heartbeat.
+  ThreadSafeArena heartbeat_arena_;
+  LWConsensusRequestPB* heartbeat_request_ = nullptr;
 
   // The outstanding batched data request, for the stuck-call detector in SignalRequest.
   // ProcessBatchedResponse, and the next round's send, can run before AddRequestToBatch returns

@@ -16,8 +16,10 @@
 
 #include "yb/common/wire_protocol.h"
 
-#include "yb/consensus/consensus_meta.h"
+#include "yb/consensus/consensus.messages.h"
 #include "yb/consensus/consensus.proxy.h"
+#include "yb/consensus/consensus_meta.h"
+#include "yb/consensus/replicate_msgs_holder.h"
 
 #include "yb/gutil/casts.h"
 #include "yb/gutil/port.h"
@@ -29,6 +31,7 @@
 #include "yb/util/dist_trace.h"
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
+#include "yb/util/memory/arena.h"
 #include "yb/util/metrics.h"
 #include "yb/util/size_literals.h"
 #include "yb/util/thread_pool.h"
@@ -155,10 +158,9 @@ using rpc::PeriodicTimer;
 
 namespace {
 
-// One request of a batch: where to put its response, and the callback that completes it
-// (Peer::ProcessHeartbeatResponse or Peer::ProcessBatchedResponse, by kind).
+// One request of a batch: the callback that completes it (Peer::ProcessHeartbeatResponse or
+// Peer::ProcessBatchedResponse, by kind).
 struct ResponseCallbackData {
-  ConsensusResponsePB* resp;
   MultiRaftBatcher::BatchResponseCallback callback;
   MultiRaftBatcher::RequestKind kind;
 };
@@ -169,7 +171,7 @@ class ProxyBatchSender : public MultiRaftBatchSender {
       : proxy_(proxy_cache, hostport) {}
 
   void SendBatch(
-      const MultiRaftConsensusRequestPB& req, MultiRaftConsensusResponsePB* resp,
+      const LWMultiRaftConsensusRequestPB& req, LWMultiRaftConsensusResponsePB* resp,
       rpc::RpcController* controller, DoneCallback done) override {
     proxy_.MultiRaftUpdateConsensusAsync(
         req, resp, controller, [controller, done = std::move(done)] {
@@ -188,11 +190,34 @@ std::unique_ptr<MultiRaftBatchSender> CreateMultiRaftBatchSender(
   return std::make_unique<ProxyBatchSender>(proxy_cache, hostport);
 }
 
+// - batch_req is serialized in SendBatch and must not be read after it returns. Its sub-requests
+//   belong to their Raft peers and may be rebuilt as soon as their slot is delivered. Anything
+//   needed later (the destination, the request count) is recorded separately: dest_uuid and
+//   response_callback_data.size().
+// - Each sub-request, and the Peer members it references (Peer::update_request_ refs the
+//   Peer's tablet id and uuids), is kept alive until serialization by its slot's callback, which
+//   binds a strong reference to the Peer. So no slot callback is moved out, cleared or reset
+//   before SendBatch has returned. Batches that are never serialized (Shutdown, an add after
+//   Shutdown) may run their callbacks at once.
+// - A slot's response points into batch_res, which lives on arena, and into the buffer of
+//   controller's call. The holder passed to each callback is this batch, so controller is never
+//   Reset once it has been sent.
 struct MultiRaftBatcher::MultiRaftConsensusData {
-  MultiRaftConsensusRequestPB batch_req;
-  MultiRaftConsensusResponsePB batch_res;
+  // Declared before the messages that live on it.
+  ThreadSafeArena arena;
+  LWMultiRaftConsensusRequestPB batch_req{&arena};
+  LWMultiRaftConsensusResponsePB batch_res{&arena};
   rpc::RpcController controller;
   std::vector<ResponseCallbackData> response_callback_data;
+  // Pins the log cache messages that the ops of the sub-requests point to, one per slot. Cleared
+  // as soon as SendBatch returns. Slot callbacks may already be running on other threads by then,
+  // so these are kept apart from response_callback_data.
+  std::vector<LWReplicateMsgsHolder> msgs_holders;
+  // The response of each slot, in request order. Filled once, before any slot callback runs, if
+  // the batch RPC succeeded with one response per request.
+  std::vector<const LWConsensusResponsePB*> responses;
+  // Copied from the first sub-request. Every sub-request goes to the same server.
+  std::string dest_uuid;
   size_t num_data_requests = 0;
   size_t num_ops = 0;
   size_t total_bytes = 0;
@@ -339,9 +364,9 @@ MultiRaftBatcher::~MultiRaftBatcher() {
 
 // Kept out of line as a uprobe attach point for timing Raft rounds.
 ATTRIBUTE_NOINLINE MultiRaftBatcher::BatchHandle MultiRaftBatcher::AddRequestToBatch(
-    ConsensusRequestPB* request, ConsensusResponsePB* response, BatchResponseCallback callback,
+    LWConsensusRequestPB* request, LWReplicateMsgsHolder holder, BatchResponseCallback callback,
     RequestKind kind) {
-  const auto request_bytes = request->ByteSizeLong();
+  const auto request_bytes = request->SerializedSize();
   BatchData pre_add_batch;
   BatchData post_add_batch;
   BatchHandle handle;
@@ -352,12 +377,12 @@ ATTRIBUTE_NOINLINE MultiRaftBatcher::BatchHandle MultiRaftBatcher::AddRequestToB
       aborted = true;
     } else {
       handle = AddRequestUnlocked(
-          request, response, std::move(callback), kind, request_bytes, &pre_add_batch,
+          request, &holder, std::move(callback), kind, request_bytes, &pre_add_batch,
           &post_add_batch);
     }
   }
   if (aborted) {
-    callback(STATUS(Aborted, "MultiRaft shutdown"));
+    callback(STATUS(Aborted, "MultiRaft shutdown"), /* response= */ nullptr, /* holder= */ {});
     return handle;
   }
   SendBatchRequest(std::move(pre_add_batch));
@@ -366,7 +391,7 @@ ATTRIBUTE_NOINLINE MultiRaftBatcher::BatchHandle MultiRaftBatcher::AddRequestToB
 }
 
 MultiRaftBatcher::BatchHandle MultiRaftBatcher::AddRequestUnlocked(
-    ConsensusRequestPB* request, ConsensusResponsePB* response, BatchResponseCallback callback,
+    LWConsensusRequestPB* request, LWReplicateMsgsHolder* holder, BatchResponseCallback callback,
     RequestKind kind, size_t request_bytes, BatchData* pre_add_batch, BatchData* post_add_batch) {
   const bool is_data = kind == RequestKind::kData;
 
@@ -383,18 +408,20 @@ MultiRaftBatcher::BatchHandle MultiRaftBatcher::AddRequestUnlocked(
     }
   }
 
+  if (current_batch_->empty()) {
+    current_batch_->dest_uuid = request->dest_uuid().ToBuffer();
+  }
   current_batch_->response_callback_data.push_back({
-    .resp = response,
     .callback = std::move(callback),
     .kind = kind,
   });
+  current_batch_->msgs_holders.push_back(std::move(*holder));
   current_batch_->total_bytes += request_bytes;
-  current_batch_->num_ops += request->ops_size();
+  current_batch_->num_ops += request->ops().size();
   if (is_data) {
     ++current_batch_->num_data_requests;
   }
-  // Add a ConsensusRequestPB to the batch
-  current_batch_->batch_req.add_consensus_request()->Swap(request);
+  current_batch_->batch_req.mutable_consensus_request()->push_back_ref(request);
   BatchHandle handle(current_batch_);
 
   if (FLAGS_multi_raft_batch_size > 0
@@ -536,9 +563,10 @@ void MultiRaftBatcher::InvokeSubCallback(
                      data->batched_response_processing_us
       ? MonoTime::Now() : MonoTime();
   if (status.ok()) {
-    callback_data.resp->Swap(data->batch_res.mutable_consensus_response(narrow_cast<int>(idx)));
+    callback_data.callback(status, data->responses[idx], data);
+  } else {
+    callback_data.callback(status, /* response= */ nullptr, /* holder= */ {});
   }
-  callback_data.callback(status);
   if (start.Initialized()) {
     data->batched_response_processing_us->Increment(
         (MonoTime::Now() - start).ToMicroseconds());
@@ -574,17 +602,19 @@ class MultiRaftBatcher::SubCallbackTask : public ThreadPoolTask {
 void MultiRaftBatcher::DispatchSubCallbacks(
     const BatchData& data, Status status, rpc::ThreadPool* data_pool) {
   const auto num_requests = data->response_callback_data.size();
-  if (status.ok() && data->batch_res.consensus_response_size() != std::ssize(
-          data->response_callback_data)) {
+  if (status.ok() && data->batch_res.consensus_response_size() != num_requests) {
     status = STATUS_FORMAT(
         IllegalState, "MultiRaft response has $0 responses for $1 requests",
         data->batch_res.consensus_response_size(), num_requests);
-    // Every sub-request in an envelope goes to the same server.
-    YB_LOG_EVERY_N_SECS(ERROR, 1)
-        << status << ", destination: "
-        << data->batch_req.consensus_request(0).dest_uuid();
+    YB_LOG_EVERY_N_SECS(ERROR, 1) << status << ", destination: " << data->dest_uuid;
   }
-  if (!status.ok()) {
+  if (status.ok()) {
+    // Written before any sub-callback is dispatched, which publishes it to the pool threads.
+    data->responses.reserve(num_requests);
+    for (const auto& response : data->batch_res.consensus_response()) {
+      data->responses.push_back(&response);
+    }
+  } else {
     IncrementCounter(data->envelopes_failed);
   }
   // Each data sub-callback gets its own task because it does a full Raft response round
@@ -607,7 +637,7 @@ ATTRIBUTE_NOINLINE void MultiRaftBatcher::SendBatchRequest(BatchData data) {
   // TODO(#16670): give consensus its own root trace.
   auto detach_token = dist_trace::DetachTraceContext();
 
-  const auto num_requests = data->batch_req.consensus_request_size();
+  const auto num_requests = narrow_cast<int>(data->response_callback_data.size());
   IncrementCounter(metrics_->envelopes_sent);
   IncrementStats(metrics_->envelope_sub_requests, num_requests);
   IncrementStats(metrics_->envelope_bytes, data->total_bytes);
@@ -649,6 +679,7 @@ ATTRIBUTE_NOINLINE void MultiRaftBatcher::SendBatchRequest(BatchData data) {
   data->envelopes_failed = metrics_->envelopes_failed;
   data->batched_response_processing_us = metrics_->batched_response_processing_us;
   sender_->SendBatch(data->batch_req, &data->batch_res, &data->controller, std::move(callback));
+  data->msgs_holders.clear();
   data->sent.store(true, std::memory_order_release);
 }
 
@@ -667,9 +698,11 @@ void MultiRaftBatcher::Shutdown() {
     batch = std::make_shared<MultiRaftConsensusData>();
     batch.swap(current_batch_);
   }
+  // The batch was never sent, so nothing has serialized or will serialize its requests.
+  batch->msgs_holders.clear();
   static const Status status = STATUS(Aborted, "MultiRaft shutdown");
   for (const auto& callback : batch->response_callback_data) {
-    callback.callback(status);
+    callback.callback(status, /* response= */ nullptr, /* holder= */ {});
   }
 }
 
