@@ -1516,8 +1516,9 @@ TEST_F(MultiRaftBatcherTest, StreamedMissingIndex) {
   ASSERT_EQ(CounterValue(METRIC_multi_raft_envelopes_failed) - failed_before, 1);
 }
 
-// A duplicate or out-of-range index is logged at DFATAL, which is fatal in debug builds, and
-// ignored: each slot is answered once, by the first frame that names it.
+// A duplicate or out-of-range index, in a partial frame or in the final, is logged at DFATAL, which
+// is fatal in debug builds, and ignored: each slot is answered once, by the first frame that names
+// it.
 TEST_F(MultiRaftBatcherTest, YB_NEVER_DEBUG_TEST(StreamedDuplicateIndexIgnored)) {
   CreateBatcher();
   auto& d0 = NewCall("t0");
@@ -1531,6 +1532,8 @@ TEST_F(MultiRaftBatcherTest, YB_NEVER_DEBUG_TEST(StreamedDuplicateIndexIgnored))
 
   auto repeats_slot_1 = Frame(env, {1, 2});
   repeats_slot_1.mutable_consensus_response(0)->set_responder_uuid("duplicate");
+  repeats_slot_1.add_index(9);
+  repeats_slot_1.add_consensus_response()->set_responder_uuid("out-of-range");
   ASSERT_TRUE(DeliverOnReactor(env, repeats_slot_1));
   ASSERT_NO_FATALS(WaitDone(d2));
 
@@ -1545,7 +1548,7 @@ TEST_F(MultiRaftBatcherTest, YB_NEVER_DEBUG_TEST(StreamedDuplicateIndexIgnored))
     ASSERT_OK(call->status);
     ASSERT_EQ(call->response.responder_uuid(), call->tablet_id + "-resp");
   }
-  ASSERT_EQ(log_waiter.GetEventCount(), 3);
+  ASSERT_EQ(log_waiter.GetEventCount(), 4);
   ASSERT_EQ(CounterValue(METRIC_multi_raft_envelopes_failed) - failed_before, 0);
 }
 
