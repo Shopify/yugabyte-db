@@ -4165,6 +4165,14 @@ void EnableMultiRaftBatching(ExternalMiniCluster* cluster) {
   }
 }
 
+// Makes every tablet server's batchers stream the responses of envelopes that carry data, including
+// across restarts. Takes effect for each envelope sent afterwards.
+void EnableMultiRaftStreaming(ExternalMiniCluster* cluster) {
+  constexpr auto kFlag = "enable_multi_raft_streaming_responses";
+  ASSERT_OK(cluster->SetFlagOnTServers(kFlag, "true"));
+  cluster->AddExtraFlagOnTServers(kFlag, "true");
+}
+
 int64_t ServerMetric(ExternalTabletServer* ts, const char* metric, const char* field = "value") {
   if (!ts->IsProcessAlive()) {
     return 0;
@@ -4294,6 +4302,43 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingWorkload) {
   ASSERT_GT(SumServerMetric(
       cluster_.get(), "multi_raft_batched_response_processing_us", "total_count"), 0);
   ASSERT_GT(SumServerMetric(cluster_.get(), "multi_raft_update_sub_requests_concurrent"), 0);
+  ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_envelopes_failed"), 0);
+  ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_update_deadline_responses"), 0);
+
+  ASSERT_NO_FATALS(AssertNoBatchingErrorLines(error_lines.get()));
+  ClusterVerifier cluster_verifier(cluster_.get());
+  ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
+  ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
+      workload.table_name(), ClusterVerifier::AT_LEAST, workload.rows_inserted()));
+}
+
+// The same workload with streamed responses: followers answer each request of an envelope as soon
+// as it completes, in partial frames, and leaders deliver each response from its frame. No frame
+// breaks the protocol (that would fail requests, or be logged at DFATAL and caught by the log
+// scan), and the replicas converge.
+TEST_F(RaftConsensusITest, MultiRaftBatchingStreamingWorkload) {
+  CreateCluster("raft_consensus-itest-cluster", {}, {});
+  ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
+  ASSERT_NO_FATALS(EnableMultiRaftStreaming(cluster_.get()));
+  auto error_lines = WatchForBatchingErrorLines(cluster_.get());
+
+  TestYcqlWorkload workload(cluster_.get());
+  workload.set_num_tablets(6);
+  workload.set_num_write_threads(4);
+  workload.set_write_batch_size(1);
+  workload.Setup(client::YBTableType::YQL_TABLE_TYPE);
+  workload.Start();
+  ASSERT_OK(WaitFor(
+      [&workload] { return workload.rows_inserted() >= 2000; }, 60s * kTimeMultiplier,
+      "Rows inserted"));
+  workload.StopAndJoin();
+
+  ASSERT_GT(SumServerMetric(cluster_.get(), "multi_raft_data_sub_requests"), 0);
+  ASSERT_GT(SumServerMetric(cluster_.get(), "multi_raft_frames_received"), 0);
+  ASSERT_GT(SumServerMetric(cluster_.get(), "multi_raft_frame_slots", "total_count"), 0);
+  ASSERT_GT(SumServerMetric(cluster_.get(), "multi_raft_update_frames_sent"), 0);
+  ASSERT_GT(SumServerMetric(
+      cluster_.get(), "multi_raft_batched_response_processing_us", "total_count"), 0);
   ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_envelopes_failed"), 0);
   ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_update_deadline_responses"), 0);
 
