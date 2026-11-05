@@ -22,6 +22,7 @@
       "$BUILD_ROOT/bin/yb-bulk_load",
       "$BUILD_ROOT/bin/yb-fs_pin",
       "$BUILD_ROOT/bin/yb-generate_partitions_main",
+      "$BUILD_ROOT/bin/yb-local-readonly",
       "$BUILD_ROOT/bin/yb-master",
       "$BUILD_ROOT/bin/yb-pbc-dump",
       "$BUILD_ROOT/bin/yb-ts-cli",
@@ -88,8 +89,7 @@
       "$BUILD_ROOT/share/initial_sys_catalog_snapshot",
       "$BUILD_ROOT/share/ysql_conn_mgr.template.conf",
       "$BUILD_ROOT/share/ysql_migrations",
-      "sample/*.sql",
-      "Linux-only:https://downloads.yugabyte.com/ybc/${YBC_VERSION}/ybc-${YBC_VERSION}-${YBCOS}-${ARCH}.tar.gz"
+      "sample/*.sql"
     ],
     "tools": [
       "bin/yb-prof.py",
