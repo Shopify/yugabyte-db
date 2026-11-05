@@ -230,7 +230,7 @@ class RpcContext {
   // are all called off the reactor thread (service handlers run on the service pool). The caller
   // serializes its own calls; RespondPartial concurrent with the final response is a caller bug.
   //
-  // Returns NotSupported for calls without frames (local calls, non-YB protocols), IllegalState
+  // Returns NotSupported for calls without frames (local calls), IllegalState
   // after the final response (also a DFATAL), otherwise the status of queueing the frame. A
   // caller can fall back to answering everything in the final response on any error.
   Status RespondPartial(AnyMessageConstPtr response);
