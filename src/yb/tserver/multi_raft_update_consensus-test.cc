@@ -454,6 +454,26 @@ TEST_F(MultiRaftUpdateConsensusTest, ErrorIsolation) {
   ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(4), tablets_[0].last));
 }
 
+// When every sub-request fails before dispatch, the handler thread fills every slot and answers.
+TEST_F(MultiRaftUpdateConsensusTest, AllSubRequestsFailBeforeDispatch) {
+  ASSERT_NO_FATALS(StartServer(1));
+  const auto concurrent_before = ConcurrentSubRequests();
+  const auto deadline_responses_before = DeadlineResponses();
+  auto wrong_uuid = Heartbeat(tablets_[0]);
+  wrong_uuid.set_dest_uuid("no-such-server");
+  auto unknown_tablet = Heartbeat(tablets_[0]);
+  unknown_tablet.set_tablet_id("no-such-tablet");
+  auto envelope = SendAsync({wrong_uuid, unknown_tablet}, 30s);
+  ASSERT_OK(Wait(envelope.get()));
+  ASSERT_LT(envelope->elapsed(), 5s);
+  ASSERT_EQ(ConcurrentSubRequests() - concurrent_before, 2);
+  ASSERT_EQ(DeadlineResponses(), deadline_responses_before);
+  ASSERT_EQ(envelope->resp.consensus_response(0).error().code(),
+            TabletServerErrorPB::WRONG_SERVER_UUID);
+  ASSERT_EQ(envelope->resp.consensus_response(1).error().code(),
+            TabletServerErrorPB::TABLET_NOT_FOUND);
+}
+
 // A tablet shut down while its sub-request waits for the log completes that sub-request with an
 // error, well before the log would have become durable.
 TEST_F(MultiRaftUpdateConsensusTest, ShutdownWhileWaitingForLog) {
