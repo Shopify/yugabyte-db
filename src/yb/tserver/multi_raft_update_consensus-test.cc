@@ -597,6 +597,20 @@ class MultiRaftUpdateConsensusTest : public TabletServerTestBase {
     return prototype.Instantiate(mini_server_->server()->metric_entity());
   }
 
+  // The server records a frame's metrics right after queueing it, so the final callback can run
+  // before they are recorded.
+  Status WaitForFramesSent(int64_t expected) {
+    return WaitFor(
+        [this, expected] { return FramesSent() >= expected; }, 10s,
+        Format("$0 frames sent", expected));
+  }
+
+  Status WaitForStatsCount(const scoped_refptr<EventStats>& stats, uint64_t expected) {
+    return WaitFor(
+        [&stats, expected] { return stats->TotalCount() >= expected; }, 10s,
+        Format("$0 values recorded", expected));
+  }
+
   std::shared_ptr<MemTracker> InboundCallsTracker() {
     auto calls = mini_server_->server()->mem_tracker()->FindChild("Call");
     CHECK(calls);
@@ -1570,6 +1584,7 @@ TEST_F(MultiRaftUpdateConsensusTest, StreamedCoalescesCoincidingCompletions) {
   ASSERT_FALSE(sends[0].final);
   ASSERT_EQ(sends[1].num_slots, 3);
   ASSERT_TRUE(sends[1].final);
+  ASSERT_OK(WaitForFramesSent(frames_before + 2));
   ASSERT_EQ(FramesSent() - frames_before, 2);
   for (size_t i = 0; i != tablets_.size(); ++i) {
     ASSERT_NO_FATALS(AssertSlotOk(
@@ -1722,12 +1737,14 @@ TEST_F(MultiRaftUpdateConsensusTest, StreamedLateCompletionDropped) {
     Consensus(paused)->TEST_PauseUpdateConsensus(false);
   });
   const auto deadline_responses_before = DeadlineResponses();
+  const auto frames_before = FramesSent();
   StreamSyncPoints sync_points;
   envelope = SendRecordedAsync({Data(&tablets_[0], 1, true), Data(&paused, 1, true)}, 2s);
   auto result = ASSERT_RESULT(WaitStreamed(envelope.get()));
   ASSERT_EQ(DeadlineResponses() - deadline_responses_before, 1);
   ASSERT_EQ(result.FinalIndices(), (std::set<uint32_t>{1}));
   ASSERT_NO_FATALS(AssertSlotError(result.merged.consensus_response(1), AppStatusPB::TIMED_OUT));
+  ASSERT_OK(WaitForFramesSent(frames_before + 2));
   const auto frames_sent = FramesSent();
   const auto num_sends = sync_points.sends().size();
   ASSERT_EQ(num_sends, 2);
@@ -1841,6 +1858,7 @@ TEST_F(MultiRaftUpdateConsensusTest, SlotWaitMetric) {
   auto envelope = SendAsync(OneOpPerTablet());
   ASSERT_OK(Wait(envelope.get()));
   ASSERT_GE(envelope->elapsed(), kDiskDelay);
+  ASSERT_OK(WaitForStatsCount(slot_wait, count_before + tablets_.size()));
   ASSERT_EQ(slot_wait->TotalCount() - count_before, tablets_.size());
   // Each of the two fast slots waited for the slow one.
   const auto barrier_sum = slot_wait->TotalSum() - sum_before;
@@ -1852,6 +1870,7 @@ TEST_F(MultiRaftUpdateConsensusTest, SlotWaitMetric) {
   envelope = SendRecordedAsync(OneOpPerTablet());
   ASSERT_RESULT(WaitStreamed(envelope.get()));
   ASSERT_GE(envelope->elapsed(), kDiskDelay);
+  ASSERT_OK(WaitForStatsCount(slot_wait, count_before + tablets_.size()));
   ASSERT_EQ(slot_wait->TotalCount() - count_before, tablets_.size());
   const auto streamed_sum = slot_wait->TotalSum() - sum_before;
   LOG(INFO) << "Slot wait with streaming: " << streamed_sum << " us";
@@ -1869,6 +1888,8 @@ TEST_F(MultiRaftUpdateConsensusTest, StreamedFrameMetrics) {
   const auto frame_slots_before = frame_slots->TotalSum();
   auto result = ASSERT_RESULT(SendStreamed(std::move(requests)));
   ASSERT_GT(result.partials.size(), 0);
+  ASSERT_OK(WaitForFramesSent(frames_before + result.partials.size() + 1));
+  ASSERT_OK(WaitForStatsCount(frame_slots, frame_count_before + result.partials.size() + 1));
   ASSERT_EQ(FramesSent() - frames_before, result.partials.size() + 1);
   ASSERT_EQ(frame_slots->TotalCount() - frame_count_before, result.partials.size() + 1);
   ASSERT_EQ(frame_slots->TotalSum() - frame_slots_before, tablets_.size());
@@ -1934,6 +1955,7 @@ TEST_F(MultiRaftUpdateConsensusTest, StreamedPartialFailureFallsBack) {
   ASSERT_EQ(sends[1].num_slots, tablets_.size());
   ASSERT_EQ(result.partials.size(), 0);
   ASSERT_EQ(result.FinalIndices(), (std::set<uint32_t>{0, 1, 2}));
+  ASSERT_OK(WaitForFramesSent(frames_before + 1));
   ASSERT_EQ(FramesSent() - frames_before, 1);
   for (size_t i = 0; i != tablets_.size(); ++i) {
     ASSERT_NO_FATALS(AssertSlotOk(
