@@ -1146,16 +1146,21 @@ TEST_F(MultiRaftBatcherTest, ShutdownBeforeSerializeNeverSerializes) {
   ASSERT_OK(d1.status);
 }
 
-// A slot's response stays valid until its callback returns, however long that takes. The batch
-// that holds it is released once every callback has returned and the RPC layer has dropped it.
+// A slot's response stays valid until its callback returns, however long the callback blocks. The
+// batch that holds it is released once every callback has returned and the RPC layer has dropped
+// it.
 TEST_F(MultiRaftBatcherTest, BatchedResponseOutlivesDispatch) {
   CreateBatcher();
   auto& d1 = NewCall("t1");
   auto& h2 = NewCall("t2");
   std::atomic<bool> d1_batch_alive{false};
   std::atomic<bool> h2_batch_alive{false};
-  d1.on_callback = [&d1, &d1_batch_alive] {
-    std::this_thread::sleep_for(300ms);
+  CountDownLatch d1_entered(1);
+  CountDownLatch release_d1(1);
+  auto release_on_failure = ScopeExit([&release_d1] { release_d1.CountDown(); });
+  d1.on_callback = [&d1, &d1_batch_alive, &d1_entered, &release_d1] {
+    d1_entered.CountDown();
+    release_d1.Wait();
     d1_batch_alive = !d1.handle.expired();
   };
   h2.on_callback = [&h2, &h2_batch_alive] {
@@ -1165,10 +1170,13 @@ TEST_F(MultiRaftBatcherTest, BatchedResponseOutlivesDispatch) {
   Submit(d1, RequestKind::kData);
   ASSERT_EQ(NumEnvelopes(), 1);
   Complete(0);
-  // The heartbeat callback ran inline and the data callback is still sleeping.
+  // The heartbeat callback ran inline, and the data callback is blocked until released.
   ASSERT_TRUE(IsDone(h2));
   ASSERT_TRUE(h2_batch_alive.load());
+  ASSERT_TRUE(d1_entered.WaitFor(10s));
   ASSERT_FALSE(d1.handle.expired());
+  ASSERT_FALSE(IsDone(d1));
+  release_d1.CountDown();
   ASSERT_NO_FATALS(WaitDone(d1));
   ASSERT_TRUE(d1_batch_alive.load());
   for (auto* call : {&d1, &h2}) {

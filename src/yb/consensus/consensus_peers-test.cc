@@ -963,6 +963,58 @@ TEST_F(ConsensusPeersTest, EnvelopeFailureIgnoresWellFormedResponse) {
   ASSERT_FALSE(consensus_->IsMajorityReplicated(1));
 }
 
+// Only peers that batch heartbeats create the heartbeat arena, and one heartbeat fits in its first
+// buffer, so resetting it for the next heartbeat keeps a single buffer.
+TEST_F(ConsensusPeersTest, HeartbeatArenaOnlyForBatchedHeartbeats) {
+  ASSERT_NO_FATALS(SetUpBatcher(/* heartbeat_batching= */ false, /* data_batching= */ true));
+  auto direct = NewTestPeer(kFollowerUuid, /* with_batcher= */ false);
+  auto data_only = NewTestPeer(kFollower2Uuid);
+  for (const auto* test_peer : {&direct, &data_only}) {
+    ASSERT_NO_FATALS(Negotiate(*test_peer));
+  }
+  AppendReplicateMessagesToQueue(message_queue_.get(), clock_, 1, 2);
+  ASSERT_OK(direct.peer->SignalRequest(RequestTriggerMode::kNonEmptyOnly));
+  ASSERT_OK(data_only.peer->SignalRequest(RequestTriggerMode::kNonEmptyOnly));
+  ASSERT_NO_FATALS(WaitForEnvelopes(1));
+  ASSERT_NO_FATALS(CompleteUntilIdle(data_only));
+  ASSERT_NO_FATALS(WaitIdle(direct));
+  // Heartbeats, or requests that advance the commit index, which go through the batcher.
+  ASSERT_OK(direct.peer->SignalRequest(RequestTriggerMode::kAlwaysSend));
+  ASSERT_NO_FATALS(WaitIdle(direct));
+  // The first may still advance the commit index; a later one is a direct heartbeat.
+  for (int i = 0; i != 3 && data_only.proxy->NumRequests() < 2; ++i) {
+    ASSERT_OK(data_only.peer->SignalRequest(RequestTriggerMode::kAlwaysSend));
+    ASSERT_NO_FATALS(CompleteUntilIdle(data_only));
+  }
+  ASSERT_EQ(direct.follower->received(), Range(1, 2));
+  ASSERT_EQ(data_only.follower->received(), Range(1, 2));
+  ASSERT_GE(direct.proxy->NumRequests(), 3);
+  ASSERT_GE(data_only.proxy->NumRequests(), 2);
+  for (const auto* test_peer : {&direct, &data_only}) {
+    ASSERT_EQ(test_peer->peer->TEST_heartbeat_arena_footprint(), 0);
+  }
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_heartbeat_batcher) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_batch_size) = 1;
+  for (int i = 0; i != 3; ++i) {
+    const auto num_envelopes = NumEnvelopes();
+    ASSERT_OK(data_only.peer->SignalRequest(RequestTriggerMode::kAlwaysSend));
+    ASSERT_NO_FATALS(WaitForEnvelopes(num_envelopes + 1));
+    ASSERT_TRUE(GetEnvelope(num_envelopes)->req.consensus_request(0).ops().empty());
+    ASSERT_NO_FATALS(CompleteEnvelope(num_envelopes));
+    ASSERT_NO_FATALS(WaitIdle(data_only));
+    const auto used = data_only.peer->TEST_heartbeat_arena_used_bytes();
+    const auto current_footprint = data_only.peer->TEST_heartbeat_arena_footprint();
+    LOG(INFO) << "Heartbeat arena: used " << used << ", footprint " << current_footprint;
+    ASSERT_GT(used, 0);
+    // A single buffer, with room for production ids, which are longer than this test's
+    // (32-character tablet id and uuids).
+    ASSERT_EQ(current_footprint, Peer::kHeartbeatArenaSize);
+    ASSERT_LE(used + 128, current_footprint);
+  }
+  ASSERT_EQ(direct.peer->TEST_heartbeat_arena_footprint(), 0);
+}
+
 // The envelope references update_request_, which is unchanged from the add until the response:
 // what goes on the wire is the request as it was added, and no new round starts before the
 // response.

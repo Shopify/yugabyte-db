@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -133,6 +134,10 @@ typedef std::shared_ptr<Peer> PeerPtr;
 
 class Peer : public std::enable_shared_from_this<Peer> {
  public:
+  // Initial size of the batched heartbeat arena, which holds one heartbeat: a ConsensusRequestPB
+  // without ops, whose strings are a tablet id and two server uuids.
+  static constexpr size_t kHeartbeatArenaSize = 1024;
+
   Peer(const RaftPeerPB& peer, std::string tablet_id, std::string leader_uuid,
        PeerProxyPtr proxy, PeerMessageQueue* queue, MultiRaftBatcherPtr multi_raft_batcher,
        ThreadPoolToken* raft_pool_token, Consensus* consensus, rpc::Messenger* messenger);
@@ -189,6 +194,11 @@ class Peer : public std::enable_shared_from_this<Peer> {
 
   // The handle of the outstanding batched data request, if any.
   MultiRaftBatcher::BatchHandle TEST_batched_handle() const;
+
+  // Memory footprint and used bytes of the batched heartbeat arena, both 0 if it was never
+  // created. Only while no heartbeat is being built.
+  size_t TEST_heartbeat_arena_footprint() const;
+  size_t TEST_heartbeat_arena_used_bytes();
 
  private:
   void SendNextRequest(RequestTriggerMode trigger_mode);
@@ -271,8 +281,10 @@ class Peer : public std::enable_shared_from_this<Peer> {
   // The latest heartbeat sent through the multi-Raft batcher, a copy of update_request_. The
   // heartbeat path releases performing_update_mutex_, so update_request_ can be rebuilt while the
   // heartbeat waits in a batch. Guarded by performing_heartbeat_mutex_, which is held until
-  // ProcessHeartbeatResponse: rebuilt only by the next heartbeat.
-  ThreadSafeArena heartbeat_arena_;
+  // ProcessHeartbeatResponse: rebuilt only by the next heartbeat. The arena is created by the
+  // first batched heartbeat, so that peers that never batch heartbeats (the default) do not carry
+  // it, and is sized to hold one heartbeat, so that resetting it keeps a single buffer.
+  std::optional<ThreadSafeArena> heartbeat_arena_;
   LWConsensusRequestPB* heartbeat_request_ = nullptr;
 
   // The outstanding batched data request, for the stuck-call detector in SignalRequest.

@@ -268,6 +268,14 @@ MultiRaftBatcher::BatchHandle Peer::TEST_batched_handle() const {
   return batched_handle_;
 }
 
+size_t Peer::TEST_heartbeat_arena_footprint() const {
+  return heartbeat_arena_ ? heartbeat_arena_->memory_footprint() : 0;
+}
+
+size_t Peer::TEST_heartbeat_arena_used_bytes() {
+  return heartbeat_arena_ ? heartbeat_arena_->UsedBytes() : 0;
+}
+
 void Peer::DumpToHtml(std::ostream& out) const {
   const auto peer_pb_str = EscapeForHtmlToString("Peer PB: " + peer_pb_.DebugString());
   out << "Peer:" << std::endl;
@@ -433,9 +441,13 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
 
     // Copied while performing_update_mutex_ is still held. The copy owns its bytes: it borrows
     // nothing from arena_. It has no ops, so there is nothing for a holder to pin.
-    heartbeat_arena_.Reset(ResetMode::kKeepFirst);
-    heartbeat_request_ = heartbeat_arena_.NewObject<LWConsensusRequestPB>(
-        &heartbeat_arena_, *update_request_);
+    if (heartbeat_arena_) {
+      heartbeat_arena_->Reset(ResetMode::kKeepFirst);
+    } else {
+      heartbeat_arena_.emplace(kHeartbeatArenaSize);
+    }
+    heartbeat_request_ = heartbeat_arena_->NewObject<LWConsensusRequestPB>(
+        &*heartbeat_arena_, *update_request_);
     cur_heartbeat_id_++;
     processing_lock.unlock();
     performing_update_lock.unlock();
