@@ -48,6 +48,7 @@
 #include "yb/rpc/rtest.service.h"
 #include "yb/rpc/service_if.h"
 #include "yb/rpc/service_pool.h"
+#include "yb/util/countdown_latch.h"
 #include "yb/util/faststring.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/metrics.h"
@@ -107,6 +108,31 @@ class CalculatorServiceMethods {
 
 // Implementation of CalculatorService which just implements the generic
 // RPC handler (no generated code).
+// Lets a test coordinate with CalculatorService::PartialFrames, which runs on a service thread.
+struct PartialFramesTestState {
+  // Counted down after the first num_partials frames are queued.
+  CountDownLatch partials_sent{1};
+  // Waited on after them, if the request sets hold_after_partials.
+  CountDownLatch resume{1};
+  // Waited on before the final response, if the request sets hold_before_final.
+  CountDownLatch resume_final{1};
+  // Counted down when the handler is done, after its last frame.
+  CountDownLatch done{1};
+
+  std::mutex mutex;
+  // RespondPartial results, in call order.
+  std::vector<Status> statuses GUARDED_BY(mutex);
+
+  std::vector<Status> GetStatuses() {
+    std::lock_guard lock(mutex);
+    return statuses;
+  }
+};
+
+// Installs the state used by PartialFrames handlers; nullptr removes it. The caller keeps it
+// alive while any PartialFrames call may run.
+void SetPartialFramesTestState(PartialFramesTestState* state);
+
 class GenericCalculatorService : public ServiceIf {
  public:
   GenericCalculatorService() {

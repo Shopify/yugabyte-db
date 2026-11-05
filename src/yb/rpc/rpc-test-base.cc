@@ -240,6 +240,8 @@ void GenericCalculatorService::DoRepeatedEcho(InboundCall* incoming) {
 
 namespace {
 
+std::atomic<PartialFramesTestState*> partial_frames_test_state{nullptr};
+
 class CalculatorService: public CalculatorServiceIf {
  public:
   explicit CalculatorService(const scoped_refptr<MetricEntity>& entity,
@@ -348,6 +350,54 @@ class CalculatorService: public CalculatorServiceIf {
     } else {
       resp->set_name(forwarded_resp.name());
       context.RespondSuccess();
+    }
+  }
+
+  void PartialFrames(
+      const rpc_test::PartialFramesRequestPB* req, rpc_test::PartialFramesResponsePB* resp,
+      RpcContext context) override {
+    auto* state = partial_frames_test_state.load(std::memory_order_acquire);
+    const auto payload = req->payload();
+    uint32_t seq = 0;
+    auto send_partial = [&context, &payload, &seq, state] {
+      rpc_test::PartialFramesResponsePB frame;
+      frame.set_seq(seq);
+      frame.set_payload(payload);
+      auto status = context.RespondPartial(AnyMessageConstPtr(&frame));
+      if (status.ok()) {
+        ++seq;
+      }
+      if (state) {
+        std::lock_guard lock(state->mutex);
+        state->statuses.push_back(status);
+      }
+    };
+    for (uint32_t i = 0; i != req->num_partials(); ++i) {
+      send_partial();
+    }
+    if (state) {
+      state->partials_sent.CountDown();
+      if (req->hold_after_partials()) {
+        state->resume.Wait();
+      }
+    }
+    for (uint32_t i = 0; i != req->num_late_partials(); ++i) {
+      send_partial();
+    }
+    if (state && req->hold_before_final()) {
+      state->resume_final.Wait();
+    }
+    if (req->close_connection()) {
+      context.CloseConnection();
+    }
+    resp->set_seq(seq);
+    resp->set_payload(payload);
+    context.RespondSuccess();
+    if (req->partial_after_final()) {
+      send_partial();
+    }
+    if (state) {
+      state->done.CountDown();
     }
   }
 
@@ -522,6 +572,10 @@ class AbacusService: public rpc_test::AbacusServiceIf {
 };
 
 } // namespace
+
+void SetPartialFramesTestState(PartialFramesTestState* state) {
+  partial_frames_test_state.store(state, std::memory_order_release);
+}
 
 TestServer::TestServer(std::unique_ptr<Messenger>&& messenger,
                        const TestServerOptions& options)

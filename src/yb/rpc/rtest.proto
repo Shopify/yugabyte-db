@@ -143,6 +143,31 @@ message ForwardResponsePB {
   optional string name = 1; // Name of server that handled this request.
 }
 
+// Exercises partial response frames. The handler sends num_partials partial frames, optionally
+// holds (see PartialFramesTestState), sends num_late_partials more, optionally holds again, then
+// sends the final response.
+// Every frame is a PartialFramesResponsePB: partial frames carry seq 0, 1, ..., and the final
+// carries the number of partial frames the handler sent before it.
+message PartialFramesRequestPB {
+  optional uint32 num_partials = 1;
+  // Wait for PartialFramesTestState::resume after the first num_partials frames.
+  optional bool hold_after_partials = 2;
+  optional uint32 num_late_partials = 3;
+  // Wait for PartialFramesTestState::resume_final before the final response.
+  optional bool hold_before_final = 4;
+  // Close the connection right before the final response.
+  optional bool close_connection = 5;
+  // After the final response, call RespondPartial once more.
+  optional bool partial_after_final = 6;
+  // Echoed in every frame.
+  optional bytes payload = 7;
+}
+
+message PartialFramesResponsePB {
+  optional uint32 seq = 1;
+  optional bytes payload = 2;
+}
+
 service CalculatorService {
   rpc Add(AddRequestPB) returns(AddResponsePB);
   rpc Sleep(SleepRequestPB) returns(SleepResponsePB);
@@ -155,6 +180,7 @@ service CalculatorService {
   rpc Ping(PingRequestPB) returns (PingResponsePB);
   rpc Disconnect(DisconnectRequestPB) returns (DisconnectResponsePB);
   rpc Forward(ForwardRequestPB) returns (ForwardResponsePB);
+  rpc PartialFrames(PartialFramesRequestPB) returns (PartialFramesResponsePB);
 
   rpc Lightweight(LightweightRequestPB) returns (LightweightResponsePB) {
     option (yb.rpc.lightweight_method).sides = SERVICE;
