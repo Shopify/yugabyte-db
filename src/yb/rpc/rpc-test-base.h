@@ -106,20 +106,14 @@ class CalculatorServiceMethods {
   }
 };
 
-// Implementation of CalculatorService which just implements the generic
-// RPC handler (no generated code).
 // Lets a test coordinate with CalculatorService::PartialFrames, which runs on a service thread.
 struct PartialFramesTestState {
-  // Counted down after the first num_partials frames are queued.
-  CountDownLatch partials_sent{1};
-  // Waited on after them, if the request sets hold_after_partials.
+  // Waited on after the first num_partials frames, if the request sets hold_after_partials.
   CountDownLatch resume{1};
   // Waited on before the final response, if the request sets hold_before_final.
   CountDownLatch resume_final{1};
   // Counted down when the handler is done, after its last frame.
   CountDownLatch done{1};
-  // Handlers between start and done.
-  std::atomic<int> handlers_running{0};
 
   std::mutex mutex;
   // RespondPartial results, in call order.
@@ -131,10 +125,23 @@ struct PartialFramesTestState {
   }
 };
 
-// Installs the state used by PartialFrames handlers; nullptr removes it. The caller keeps it
-// alive while any PartialFrames call may run.
-void SetPartialFramesTestState(PartialFramesTestState* state);
+// Installs a PartialFramesTestState for PartialFrames handlers while it lives. On destruction it
+// releases a handler that a failed test left held, uninstalls the state, and waits until no
+// handler can still use it. Declare it after the state it installs, so it is destroyed first.
+class ScopedPartialFramesTestState {
+ public:
+  explicit ScopedPartialFramesTestState(PartialFramesTestState* state);
+  ~ScopedPartialFramesTestState();
 
+  ScopedPartialFramesTestState(const ScopedPartialFramesTestState&) = delete;
+  void operator=(const ScopedPartialFramesTestState&) = delete;
+
+ private:
+  PartialFramesTestState* const state_;
+};
+
+// Implementation of CalculatorService which just implements the generic
+// RPC handler (no generated code).
 class GenericCalculatorService : public ServiceIf {
  public:
   GenericCalculatorService() {

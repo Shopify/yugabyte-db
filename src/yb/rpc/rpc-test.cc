@@ -65,7 +65,6 @@
 #include "yb/util/logging_test_util.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/result.h"
-#include "yb/util/scope_exit.h"
 #include "yb/util/status_format.h"
 #include "yb/util/status_log.h"
 #include "yb/util/test_macros.h"
@@ -1078,17 +1077,6 @@ class PartialFramesSetup {
     proxy_cache_ = std::make_unique<ProxyCache>(client_messenger_.get());
     proxy_ = std::make_unique<CalculatorServiceProxy>(proxy_cache_.get(), server_addr_);
     metric_entity_ = test->metric_entity();
-    SetPartialFramesTestState(&state_);
-  }
-
-  // Releases a handler that a failed test left held, so the server can shut down.
-  ~PartialFramesSetup() {
-    state_.resume.CountDown();
-    state_.resume_final.CountDown();
-    WARN_NOT_OK(
-        WaitFor([this] { return state_.handlers_running == 0; }, 30s, "Handlers done"),
-        "PartialFrames handlers still running");
-    SetPartialFramesTestState(nullptr);
   }
 
   CalculatorServiceProxy& proxy() { return *proxy_; }
@@ -1122,6 +1110,7 @@ class PartialFramesSetup {
   std::unique_ptr<CalculatorServiceProxy> proxy_;
   MetricEntityPtr metric_entity_;
   PartialFramesTestState state_;
+  ScopedPartialFramesTestState state_scope_{&state_};
 };
 
 // Records what a call delivers to its partial and final callbacks, in delivery order.
@@ -1175,7 +1164,6 @@ class FrameRecorder {
     return Status::OK();
   }
 
-  bool final_done() const { return final_latch_.count() == 0; }
   size_t final_order() const { return final_order_; }
   const std::string& final_thread_name() const { return final_thread_name_; }
 
@@ -1571,7 +1559,6 @@ TEST_F(TestRpc, PartialCallbackReleasedOnFinish) {
   enum class Finish { kOk, kTimeout, kMarkCallAsFailed };
   for (auto finish : {Finish::kOk, Finish::kTimeout, Finish::kMarkCallAsFailed}) {
     SCOPED_TRACE(Format("finish: $0", std::to_underlying(finish)));
-    setup.state().partials_sent.Reset(1);
     setup.state().resume.Reset(1);
     setup.state().resume_final.Reset(1);
     setup.state().done.Reset(1);
@@ -1640,7 +1627,8 @@ TEST_F(TestRpc, PartialCallbackReleasedOnFinish) {
   }
 }
 
-// Reset() releases a callback that no call took, and moving a controller moves its callback.
+// Reset() releases a callback that no call took, moving a controller moves its callback, and
+// TakePartialResponseCallback() hands the callback over once.
 TEST_F(TestRpc, ResetClearsPartialCallback) {
   auto token = std::make_shared<int>(0);
   RpcController controller;
@@ -1652,14 +1640,26 @@ TEST_F(TestRpc, ResetClearsPartialCallback) {
   moved.Reset();
   ASSERT_EQ(token.use_count(), 1);
   ASSERT_FALSE(moved.TakePartialResponseCallback());
+
+  size_t calls = 0;
+  moved.set_partial_response_callback([token, &calls](Slice, RefCntBuffer) { ++calls; });
+  ASSERT_EQ(token.use_count(), 2);
+  {
+    auto taken = moved.TakePartialResponseCallback();
+    ASSERT_TRUE(taken);
+    ASSERT_FALSE(moved.TakePartialResponseCallback());
+    ASSERT_EQ(token.use_count(), 2);
+    taken(Slice(), RefCntBuffer());
+    ASSERT_EQ(calls, 1U);
+  }
+  ASSERT_EQ(token.use_count(), 1);
 }
 
 // A local call has no frames: RespondPartial returns NotSupported, the final still arrives, and
 // the partial-response callback is dropped when the call starts.
 TEST_F(TestRpc, LocalCallRespondPartialNotSupported) {
   PartialFramesTestState state;
-  SetPartialFramesTestState(&state);
-  auto se = ScopeExit([] { SetPartialFramesTestState(nullptr); });
+  ScopedPartialFramesTestState state_scope(&state);
   HostPort server_addr;
   StartTestServerWithGeneratedCode(&server_addr);
   HostPort empty_addr;
