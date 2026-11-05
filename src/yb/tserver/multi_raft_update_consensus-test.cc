@@ -36,6 +36,7 @@
 #include "yb/consensus/raft_consensus.h"
 
 #include "yb/rpc/messenger.h"
+#include "yb/rpc/rpc_context.h"
 #include "yb/rpc/rpc_controller.h"
 #include "yb/rpc/service_pool.h"
 #include "yb/rpc/thread_pool.h"
@@ -303,6 +304,49 @@ class MultiRaftUpdateConsensusTest : public TabletServerTestBase {
     return ServerCounter(METRIC_multi_raft_update_deadline_responses);
   }
 
+  std::shared_ptr<MemTracker> InboundCallsTracker() {
+    auto calls = mini_server_->server()->mem_tracker()->FindChild("Call");
+    CHECK(calls);
+    auto inbound_calls = calls->FindChild("Inbound RPC");
+    CHECK(inbound_calls);
+    return inbound_calls;
+  }
+
+  // The params of the inbound call of the first envelope handled concurrently from now on.
+  class ParamsCapture {
+   public:
+    ParamsCapture() {
+      auto* sync_point = SyncPoint::GetInstance();
+      sync_point->SetCallBack("MultiRaftUpdateConsensus::Params", [this](void* arg) {
+        std::lock_guard lock(mutex_);
+        if (!captured_) {
+          params_ = *static_cast<std::shared_ptr<rpc::RpcCallParams>*>(arg);
+          captured_ = true;
+        }
+      });
+      sync_point->EnableProcessing();
+    }
+
+    ~ParamsCapture() {
+      SyncPoint::GetInstance()->SetCallBack("MultiRaftUpdateConsensus::Params", [](void*) {});
+    }
+
+    bool captured() {
+      std::lock_guard lock(mutex_);
+      return captured_;
+    }
+
+    bool alive() {
+      std::lock_guard lock(mutex_);
+      return !params_.expired();
+    }
+
+   private:
+    std::mutex mutex_;
+    bool captured_ = false;
+    std::weak_ptr<rpc::RpcCallParams> params_;
+  };
+
   // Holds tablet's update_mutex_ for about duration: sends it a direct UpdateConsensus with one op
   // and TEST_DelayUpdate, which sleeps under the mutex after UpdateReplica, and returns once that
   // sleep has started. direct_done is set when the direct call returns.
@@ -477,29 +521,66 @@ TEST_F(MultiRaftUpdateConsensusTest, DeadlinePartialResponse) {
 }
 
 // Once the RPC is answered, a sub-request that is still running no longer keeps the inbound call
-// alive. The paused sub-request ignores the deadline, so it outlives the response.
+// alive, although it still holds the call's params (which carry its request). The paused
+// sub-request ignores the deadline, so it outlives the response.
 TEST_F(MultiRaftUpdateConsensusTest, AnsweredEnvelopeReleasedWhileSubRequestPending) {
   ASSERT_NO_FATALS(StartServer(1));
   auto& paused = tablets_[0];
-  auto calls = mini_server_->server()->mem_tracker()->FindChild("Call");
-  ASSERT_NE(calls, nullptr);
-  auto inbound_calls = calls->FindChild("Inbound RPC");
-  ASSERT_NE(inbound_calls, nullptr);
+  auto inbound_calls = InboundCallsTracker();
   Consensus(paused)->TEST_PauseUpdateConsensus(true);
   auto unpause = ScopeExit([this, &paused] {
     Consensus(paused)->TEST_PauseUpdateConsensus(false);
   });
+  ParamsCapture params;
   auto envelope = SendAsync({Data(&paused, 1, true)}, 1s);
   ASSERT_OK(Wait(envelope.get()));
   ASSERT_NO_FATALS(AssertSlotError(envelope->resp.consensus_response(0), AppStatusPB::TIMED_OUT));
+  ASSERT_TRUE(params.captured());
   ASSERT_OK(WaitFor(
       [&inbound_calls] { return inbound_calls->consumption() == 0; }, 3s,
       "Inbound call released"));
-  // The sub-request was still paused the whole time.
+  // The call was released while its params were still held, and the sub-request was still paused
+  // the whole time.
+  ASSERT_TRUE(params.alive());
   ASSERT_NE(LastReceived(paused), paused.last);
 
   Consensus(paused)->TEST_PauseUpdateConsensus(false);
   ASSERT_OK(WaitForLastReceived(paused));
+  ASSERT_OK(WaitFor([&params] { return !params.alive(); }, 10s, "Params released"));
+}
+
+// A sub-request that is still running after the RPC was answered keeps the inbound call's params,
+// and with them its request, alive until it completes, and no longer.
+TEST_F(MultiRaftUpdateConsensusTest, SubRequestPinsParamsUntilDone) {
+  ASSERT_NO_FATALS(StartServer(2));
+  auto& paused = tablets_[1];
+  auto inbound_calls = InboundCallsTracker();
+  Consensus(paused)->TEST_PauseUpdateConsensus(true);
+  auto unpause = ScopeExit([this, &paused] {
+    Consensus(paused)->TEST_PauseUpdateConsensus(false);
+  });
+  const auto deadline_responses_before = DeadlineResponses();
+  ParamsCapture params;
+  auto envelope = SendAsync({Data(&tablets_[0], 1, true), Data(&paused, 2, true)}, 2s);
+  ASSERT_OK(Wait(envelope.get()));
+  ASSERT_EQ(DeadlineResponses() - deadline_responses_before, 1);
+  ASSERT_NO_FATALS(AssertSlotOk(envelope->resp.consensus_response(0), tablets_[0].last));
+  ASSERT_NO_FATALS(AssertSlotError(envelope->resp.consensus_response(1), AppStatusPB::TIMED_OUT));
+  ASSERT_TRUE(params.captured());
+  // Once the inbound call is gone, only the paused sub-request can hold the params.
+  ASSERT_OK(WaitFor(
+      [&inbound_calls] { return inbound_calls->consumption() == 0; }, 3s,
+      "Inbound call released"));
+  ASSERT_TRUE(params.alive());
+  ASSERT_NE(LastReceived(paused), paused.last);
+
+  Consensus(paused)->TEST_PauseUpdateConsensus(false);
+  ASSERT_OK(WaitForLastReceived(paused));
+  ASSERT_OK(WaitFor([&params] { return !params.alive(); }, 10s, "Params released"));
+  // The update ran on the request in the params: the ops it carried are in the log.
+  auto resp = ASSERT_RESULT(Send({Heartbeat(tablets_[0]), Heartbeat(paused)}));
+  ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(0), tablets_[0].last));
+  ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(1), paused.last));
 }
 
 // A sub-request's wait for its log ends at the envelope deadline even though the log is still
@@ -958,6 +1039,33 @@ TEST_F(MultiRaftUpdateConsensusTest, FlagOffUsesSerialHandler) {
   ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(0), tablets_[0].last));
   ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(1), tablets_[1].last));
   ASSERT_EQ(ConcurrentSubRequests(), concurrent_before);
+}
+
+// The serial handler fills each slot in request order from the sub-request's own update, with
+// per-sub-request error isolation.
+TEST_F(MultiRaftUpdateConsensusTest, SerialHandlerLw) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_data_batching) = false;
+  ASSERT_NO_FATALS(StartServer(2));
+  const auto concurrent_before = ConcurrentSubRequests();
+  auto wrong_uuid = Heartbeat(tablets_[0]);
+  wrong_uuid.set_dest_uuid("no-such-server");
+  auto first = Data(&tablets_[0], 2, /* commit= */ true);
+  auto second = Data(&tablets_[1], 3, /* commit= */ false);
+  auto resp = ASSERT_RESULT(Send({first, wrong_uuid, second}));
+  ASSERT_EQ(ConcurrentSubRequests(), concurrent_before);
+  ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(0), tablets_[0].last));
+  ASSERT_TRUE(resp.consensus_response(1).has_error());
+  ASSERT_EQ(resp.consensus_response(1).error().code(), TabletServerErrorPB::WRONG_SERVER_UUID);
+  ASSERT_FALSE(resp.consensus_response(1).has_status());
+  ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(2), tablets_[1].last));
+  for (int i : {0, 2}) {
+    ASSERT_EQ(resp.consensus_response(i).responder_uuid(), server_uuid_)
+        << resp.consensus_response(i).ShortDebugString();
+    ASSERT_EQ(resp.consensus_response(i).responder_term(), term_)
+        << resp.consensus_response(i).ShortDebugString();
+  }
+  ASSERT_EQ(LastReceived(tablets_[0]), tablets_[0].last);
+  ASSERT_EQ(LastReceived(tablets_[1]), tablets_[1].last);
 }
 
 TEST_F(MultiRaftUpdateConsensusTest, EmptyEnvelope) {
