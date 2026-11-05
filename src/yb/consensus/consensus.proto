@@ -390,10 +390,24 @@ message ConsensusResponsePB {
 
 message MultiRaftConsensusRequestPB {
   repeated ConsensusRequestPB consensus_request = 1;
+
+  // Asks the follower to stream the responses: each response is sent in a partial response frame
+  // as soon as its request completes, and the final response carries the rest. The caller must
+  // accept partial frames (RpcController::set_partial_response_callback). A follower that handles
+  // envelopes serially, or predates this field, ignores it and answers once without index.
+  optional bool stream_responses = 2;
 }
 
 message MultiRaftConsensusResponsePB {
   repeated ConsensusResponsePB consensus_response = 1;
+
+  // Set on every frame (partial and final) of a call that asked for stream_responses and was
+  // streamed: index(i) is the position in consensus_request of the request that
+  // consensus_response(i) answers. Each request is answered in exactly one frame, so a streamed
+  // final carries only the responses no earlier frame carried, and may carry fewer than there
+  // were requests. Without index (including an envelope without requests, which is never
+  // streamed) the response is the full array in request order.
+  repeated uint32 index = 2 [packed = true];
 }
 
 // A message reflecting the status of an in-flight transaction.
