@@ -49,6 +49,7 @@ using namespace std::literals;
 DECLARE_int32(consensus_rpc_timeout_ms);
 DECLARE_bool(enable_multi_raft_data_batching);
 DECLARE_bool(enable_multi_raft_heartbeat_batcher);
+DECLARE_bool(enable_multi_raft_streaming_responses);
 DECLARE_uint64(multi_raft_batch_bytes);
 DECLARE_uint64(multi_raft_batch_size);
 DECLARE_uint32(multi_raft_data_batch_size);
@@ -67,10 +68,12 @@ METRIC_DECLARE_counter(multi_raft_flush_deadline);
 METRIC_DECLARE_counter(multi_raft_flush_immediate);
 METRIC_DECLARE_counter(multi_raft_flush_response_clocked);
 METRIC_DECLARE_counter(multi_raft_flush_timer);
+METRIC_DECLARE_counter(multi_raft_frames_received);
 METRIC_DECLARE_counter(multi_raft_heartbeat_sub_requests);
 METRIC_DECLARE_event_stats(multi_raft_envelope_bytes);
 METRIC_DECLARE_event_stats(multi_raft_envelope_ops);
 METRIC_DECLARE_event_stats(multi_raft_envelope_sub_requests);
+METRIC_DECLARE_event_stats(multi_raft_frame_slots);
 
 namespace yb::consensus {
 
@@ -95,6 +98,7 @@ struct TestCall {
   bool had_response = false;
   bool had_holder = false;
   bool on_high_pool = false;
+  bool on_reactor = false;
   std::thread::id thread_id;
   std::atomic<int> num_callbacks{0};
   std::atomic<bool> done{false};
@@ -186,6 +190,7 @@ class MultiRaftBatcherTest : public YBTest {
           call.had_response = response != nullptr;
           call.had_holder = holder != nullptr;
           call.on_high_pool = high_pool->OwnsThisThread();
+          call.on_reactor = IsReactorThread();
           call.thread_id = std::this_thread::get_id();
           ++call.num_callbacks;
           if (call.on_callback) {
@@ -240,12 +245,85 @@ class MultiRaftBatcherTest : public YBTest {
         num_responses));
   }
 
+  static void FillResponse(
+      size_t, const ConsensusRequestPB& request, ConsensusResponsePB* response) {
+    response->set_responder_uuid(request.tablet_id() + "-resp");
+  }
+
+  // A response frame of the envelope for the requests at indices, each answered as by Complete.
+  // Lists them in index unless with_index is false.
+  MultiRaftConsensusResponsePB Frame(
+      size_t envelope_idx, const std::vector<uint32_t>& indices, bool with_index = true) {
+    return sender_state_->MakeFrame(envelope_idx, indices, &FillResponse, with_index);
+  }
+
+  // Delivers a partial frame on a reactor thread, as the RPC layer does, and returns whether the
+  // fake delivered it. The slot tasks it enqueues may still be running.
+  bool DeliverOnReactor(size_t envelope_idx, const MultiRaftConsensusResponsePB& frame) {
+    bool delivered = false;
+    RunOnReactor(messenger_.get(), [this, envelope_idx, &frame, &delivered] {
+      delivered = sender_state_->DeliverPartial(envelope_idx, frame);
+    });
+    return delivered;
+  }
+
+  // Completes a streamed envelope on a reactor thread, with frame as the final response if status
+  // is OK, as the RPC layer does with InvokeCallbackMode::kReactorThread.
+  void CompleteOnReactor(
+      size_t envelope_idx, const Status& status,
+      const MultiRaftConsensusResponsePB& frame = MultiRaftConsensusResponsePB()) {
+    bool completed = false;
+    RunOnReactor(messenger_.get(), [this, envelope_idx, &status, &frame, &completed] {
+      completed = sender_state_->CompleteWithFrame(envelope_idx, status, frame);
+    });
+    ASSERT_TRUE(completed);
+  }
+
+  // Sends the calls in one streamed envelope and returns its index. They are parked behind an
+  // envelope that carries one data request and is not streamed, and sent by the response-clocked
+  // flush when that one completes. No data envelope may be in flight.
+  size_t SendStreamed(const std::vector<std::pair<TestCall*, RequestKind>>& calls) {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = false;
+    const auto blocker_idx = NumEnvelopes();
+    auto& blocker = Add(Format("blocker-$0", blocker_idx), RequestKind::kData);
+    CHECK_EQ(NumEnvelopes(), blocker_idx + 1);
+    for (const auto& [call, kind] : calls) {
+      Submit(*call, kind);
+    }
+    CHECK_EQ(NumEnvelopes(), blocker_idx + 1);
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = true;
+    CHECK(sender_state_->Complete(blocker_idx, Status::OK(), &FillResponse));
+    CHECK_OK(WaitFor([this, &blocker] { return IsDone(blocker); }, 10s, "Blocker"));
+    CHECK_EQ(NumEnvelopes(), blocker_idx + 2);
+    auto envelope = GetEnvelope(blocker_idx + 1);
+    CHECK(envelope->req.stream_responses());
+    CHECK_EQ(static_cast<size_t>(envelope->req.consensus_request_size()), calls.size());
+    return blocker_idx + 1;
+  }
+
+  std::vector<std::pair<TestCall*, RequestKind>> DataCalls(std::vector<TestCall*> calls) {
+    std::vector<std::pair<TestCall*, RequestKind>> result;
+    for (auto* call : calls) {
+      result.emplace_back(call, RequestKind::kData);
+    }
+    return result;
+  }
+
   bool IsDone(const TestCall& call) {
     return call.done.load(std::memory_order_acquire);
   }
 
   void WaitDone(const TestCall& call) {
     ASSERT_OK(WaitFor([this, &call] { return IsDone(call); }, 10s, "Callback " + call.tablet_id));
+  }
+
+  // Waits for the call's callback and for its batch to be released, which happens after every
+  // task that holds it, BatchCompleted included, has run.
+  void WaitReleased(const TestCall& call) {
+    ASSERT_NO_FATALS(WaitDone(call));
+    ASSERT_OK(WaitFor(
+        [&call] { return call.handle.expired(); }, 10s,
+        "Batch of " + call.tablet_id + " released"));
   }
 
   void WaitAllDone() {
@@ -1185,6 +1263,719 @@ TEST_F(MultiRaftBatcherTest, BatchedResponseOutlivesDispatch) {
     ASSERT_EQ(call->response.responder_uuid(), call->tablet_id + "-resp");
   }
   ASSERT_OK(WaitFor([&d1] { return d1.handle.expired(); }, 10s, "Batch released"));
+}
+
+// A data envelope sent while streaming is on asks the follower to stream, takes its final callback
+// on the reactor and installs a partial-response callback. One sent while it is off does none of
+// that.
+TEST_F(MultiRaftBatcherTest, StreamedEnvelopeOptsIn) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = true;
+  CreateBatcher();
+  auto& d1 = Add("t1", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  auto streamed = GetEnvelope(0);
+  ASSERT_TRUE(streamed->req.stream_responses());
+  ASSERT_EQ(streamed->callback_mode, rpc::InvokeCallbackMode::kReactorThread);
+  ASSERT_TRUE(streamed->had_partial_callback);
+  ASSERT_NO_FATALS(CompleteOnReactor(0, Status::OK(), Frame(0, {0})));
+  ASSERT_NO_FATALS(WaitReleased(d1));
+  ASSERT_OK(d1.status);
+  ASSERT_EQ(d1.response.responder_uuid(), "t1-resp");
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = false;
+  auto& d2 = Add("t2", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 2);
+  auto answered_once = GetEnvelope(1);
+  ASSERT_FALSE(answered_once->req.has_stream_responses());
+  ASSERT_EQ(answered_once->callback_mode, rpc::InvokeCallbackMode::kThreadPoolHigh);
+  ASSERT_FALSE(answered_once->had_partial_callback);
+  Complete(1);
+  ASSERT_NO_FATALS(WaitDone(d2));
+  ASSERT_OK(d2.status);
+}
+
+TEST_F(MultiRaftBatcherTest, HeartbeatOnlyEnvelopeNeverStreamed) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_batch_size) = 2;
+  CreateBatcher();
+  auto& h1 = Add("t1", RequestKind::kHeartbeat);
+  auto& h2 = Add("t2", RequestKind::kHeartbeat);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  auto envelope = GetEnvelope(0);
+  ASSERT_FALSE(envelope->req.has_stream_responses());
+  ASSERT_EQ(envelope->callback_mode, rpc::InvokeCallbackMode::kThreadPoolNormal);
+  ASSERT_FALSE(envelope->had_partial_callback);
+  Complete(0);
+  for (auto* call : {&h1, &h2}) {
+    ASSERT_TRUE(IsDone(*call));
+    ASSERT_EQ(call->thread_id, std::this_thread::get_id());
+    ASSERT_OK(call->status);
+  }
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_frames_received), 0);
+}
+
+// A partial frame delivers the slots it answers, each in its own High-pool task, while the others
+// wait for their frames. Each slot's response stays valid until its callback returns, while later
+// frames are received.
+TEST_F(MultiRaftBatcherTest, StreamedPerSlotDelivery) {
+  CreateBatcher();
+  auto& d0 = NewCall("t0");
+  auto& d1 = NewCall("t1");
+  auto& d2 = NewCall("t2");
+  CountDownLatch d1_entered(1);
+  CountDownLatch release_d1(1);
+  auto release_on_failure = ScopeExit([&release_d1] { release_d1.CountDown(); });
+  d1.on_callback = [&d1_entered, &release_d1] {
+    d1_entered.CountDown();
+    release_d1.Wait();
+  };
+  const auto env = SendStreamed(DataCalls({&d0, &d1, &d2}));
+  ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {1})));
+  ASSERT_TRUE(d1_entered.WaitFor(10s));
+  ASSERT_TRUE(d1.on_high_pool);
+  ASSERT_FALSE(d1.on_reactor);
+  ASSERT_OK(d1.status);
+  ASSERT_TRUE(d1.had_response);
+  ASSERT_TRUE(d1.had_holder);
+  ASSERT_FALSE(IsDone(d0));
+  ASSERT_FALSE(IsDone(d2));
+
+  // This frame's buffers are allocated while slot 1's callback still uses its frame. If slot 1's
+  // frame had been freed, they would likely reuse its memory.
+  ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {2})));
+  ASSERT_NO_FATALS(WaitDone(d2));
+  ASSERT_OK(d2.status);
+  ASSERT_TRUE(d2.on_high_pool);
+  ASSERT_EQ(d2.response.responder_uuid(), "t2-resp");
+  ASSERT_FALSE(IsDone(d0));
+
+  ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK(), Frame(env, {0})));
+  ASSERT_NO_FATALS(WaitDone(d0));
+  ASSERT_OK(d0.status);
+  ASSERT_TRUE(d0.on_high_pool);
+  ASSERT_FALSE(d0.on_reactor);
+  ASSERT_EQ(d0.response.responder_uuid(), "t0-resp");
+
+  release_d1.CountDown();
+  ASSERT_NO_FATALS(WaitReleased(d1));
+  ASSERT_EQ(d1.response.responder_uuid(), "t1-resp");
+  for (auto* call : {&d0, &d1, &d2}) {
+    ASSERT_EQ(call->num_callbacks.load(), 1) << call->tablet_id;
+  }
+}
+
+// A failed final fails only the slots that no frame answered, and counts once.
+TEST_F(MultiRaftBatcherTest, StreamedFailureAfterPartialsFailsUnanswered) {
+  CreateBatcher();
+  auto& d0 = NewCall("t0");
+  auto& d1 = NewCall("t1");
+  auto& d2 = NewCall("t2");
+  const auto env = SendStreamed(DataCalls({&d0, &d1, &d2}));
+  const auto failed_before = CounterValue(METRIC_multi_raft_envelopes_failed);
+  ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {1})));
+  ASSERT_NO_FATALS(WaitDone(d1));
+  ASSERT_OK(d1.status);
+  ASSERT_NO_FATALS(CompleteOnReactor(env, STATUS(TimedOut, "Envelope timed out")));
+  ASSERT_NO_FATALS(WaitReleased(d0));
+  for (auto* call : {&d0, &d2}) {
+    ASSERT_NO_FATALS(WaitDone(*call));
+    ASSERT_TRUE(call->status.IsTimedOut()) << call->status;
+    ASSERT_FALSE(call->had_response);
+    ASSERT_FALSE(call->had_holder);
+    ASSERT_TRUE(call->on_high_pool);
+  }
+  ASSERT_OK(d1.status);
+  ASSERT_EQ(d1.response.responder_uuid(), "t1-resp");
+  for (auto* call : {&d0, &d1, &d2}) {
+    ASSERT_EQ(call->num_callbacks.load(), 1) << call->tablet_id;
+  }
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_envelopes_failed) - failed_before, 1);
+}
+
+// The final can run on the thread that fails the call while a partial frame is being received on
+// the reactor. Each slot is then answered exactly once, by the frame or by the failure, and the
+// frame applies entirely or not at all.
+TEST_F(MultiRaftBatcherTest, StreamedMarkCallAsFailedOffReactor) {
+  constexpr size_t kIterations = 50;
+  constexpr size_t kSlots = 16;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_batch_size) = kSlots;
+  CreateBatcher();
+  // Keeps a data envelope in flight, so each round below is sent by the count cap.
+  auto& blocker = Add("blocker", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = true;
+  std::vector<uint32_t> even_slots;
+  for (uint32_t i = 0; i < kSlots; i += 2) {
+    even_slots.push_back(i);
+  }
+  int dropped_by_sender = 0;
+  int partial_first = 0;
+  int final_first = 0;
+  for (size_t iteration = 0; iteration != kIterations; ++iteration) {
+    std::vector<TestCall*> calls;
+    for (size_t i = 0; i != kSlots; ++i) {
+      calls.push_back(&Add(Format("t$0-$1", iteration, i), RequestKind::kData));
+    }
+    const auto env = NumEnvelopes() - 1;
+    ASSERT_EQ(env, iteration + 1);
+    ASSERT_TRUE(GetEnvelope(env)->req.stream_responses());
+    ASSERT_EQ(GetEnvelope(env)->tablet_ids.size(), kSlots);
+    const auto frame = Frame(env, even_slots);
+    CountDownLatch barrier(2);
+    std::atomic<bool> delivered{false};
+    TestThreadHolder threads;
+    threads.AddThreadFunctor([this, env, &frame, &barrier, &delivered] {
+      RunOnReactor(messenger_.get(), [this, env, &frame, &barrier, &delivered] {
+        barrier.CountDown();
+        barrier.Wait();
+        delivered = sender_state_->DeliverPartial(env, frame);
+      });
+    });
+    barrier.CountDown();
+    barrier.Wait();
+    calls[1]->handle.MarkCallAsFailed();
+    threads.JoinAll();
+    ASSERT_TRUE(GetEnvelope(env)->marked_failed);
+    // Released once every slot task, and BatchCompleted, has run, so the next round's adds are not
+    // flushed by this envelope's completion.
+    ASSERT_NO_FATALS(WaitReleased(*calls[0]));
+    size_t ok = 0;
+    for (size_t i = 0; i != kSlots; ++i) {
+      auto& call = *calls[i];
+      ASSERT_TRUE(IsDone(call));
+      ASSERT_EQ(call.num_callbacks.load(), 1) << call.tablet_id;
+      if (call.status.ok()) {
+        ASSERT_EQ(i % 2, 0U) << call.tablet_id;
+        ASSERT_EQ(call.response.responder_uuid(), call.tablet_id + "-resp");
+        ++ok;
+      } else {
+        ASSERT_TRUE(call.status.IsTimedOut()) << call.tablet_id << ": " << call.status;
+      }
+    }
+    ASSERT_TRUE(ok == 0 || ok == kSlots / 2) << ok;
+    if (!delivered) {
+      ++dropped_by_sender;
+    } else if (ok) {
+      ++partial_first;
+    } else {
+      ++final_first;
+    }
+  }
+  LOG(INFO) << "Frame dropped by the sender: " << dropped_by_sender
+            << ", applied before the failure: " << partial_first
+            << ", received concurrently and dropped after the failure: " << final_first;
+  // The frame and the failure both delivered slots in some rounds.
+  ASSERT_GT(partial_first, 0);
+  Complete(0);
+  ASSERT_NO_FATALS(WaitDone(blocker));
+}
+
+// An OK final that leaves a slot unanswered fails it with IllegalState, and counts once.
+TEST_F(MultiRaftBatcherTest, StreamedMissingIndex) {
+  CreateBatcher();
+  auto& d0 = NewCall("t0");
+  auto& d1 = NewCall("t1");
+  auto& d2 = NewCall("t2");
+  const auto env = SendStreamed(DataCalls({&d0, &d1, &d2}));
+  const auto failed_before = CounterValue(METRIC_multi_raft_envelopes_failed);
+  StringWaiterLogSink log_waiter(
+      "MultiRaft response has no response for requests [1] of 3, destination: follower-1");
+  ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
+  ASSERT_NO_FATALS(WaitDone(d0));
+  ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK(), Frame(env, {2})));
+  ASSERT_NO_FATALS(WaitReleased(d0));
+  ASSERT_TRUE(d1.status.IsIllegalState()) << d1.status;
+  ASSERT_FALSE(d1.had_response);
+  for (auto* call : {&d0, &d2}) {
+    ASSERT_OK(call->status);
+    ASSERT_EQ(call->response.responder_uuid(), call->tablet_id + "-resp");
+  }
+  ASSERT_TRUE(log_waiter.IsEventOccurred());
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_envelopes_failed) - failed_before, 1);
+}
+
+// A duplicate or out-of-range index is logged at DFATAL, which is fatal in debug builds, and
+// ignored: each slot is answered once, by the first frame that names it.
+TEST_F(MultiRaftBatcherTest, YB_NEVER_DEBUG_TEST(StreamedDuplicateIndexIgnored)) {
+  CreateBatcher();
+  auto& d0 = NewCall("t0");
+  auto& d1 = NewCall("t1");
+  auto& d2 = NewCall("t2");
+  const auto env = SendStreamed(DataCalls({&d0, &d1, &d2}));
+  const auto failed_before = CounterValue(METRIC_multi_raft_envelopes_failed);
+  StringWaiterLogSink log_waiter("MultiRaft response frame has an invalid index");
+  ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {1})));
+  ASSERT_NO_FATALS(WaitDone(d1));
+
+  auto repeats_slot_1 = Frame(env, {1, 2});
+  repeats_slot_1.mutable_consensus_response(0)->set_responder_uuid("duplicate");
+  ASSERT_TRUE(DeliverOnReactor(env, repeats_slot_1));
+  ASSERT_NO_FATALS(WaitDone(d2));
+
+  auto final_frame = Frame(env, {0, 2});
+  final_frame.mutable_consensus_response(1)->set_responder_uuid("duplicate");
+  final_frame.add_index(7);
+  final_frame.add_consensus_response()->set_responder_uuid("out-of-range");
+  ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK(), final_frame));
+  ASSERT_NO_FATALS(WaitReleased(d0));
+  for (auto* call : {&d0, &d1, &d2}) {
+    ASSERT_EQ(call->num_callbacks.load(), 1) << call->tablet_id;
+    ASSERT_OK(call->status);
+    ASSERT_EQ(call->response.responder_uuid(), call->tablet_id + "-resp");
+  }
+  ASSERT_EQ(log_waiter.GetEventCount(), 3);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_envelopes_failed) - failed_before, 0);
+}
+
+// A partial frame that does not parse, has no index, or whose index does not match its responses
+// is logged at DFATAL, which is fatal in debug builds, and dropped. Its slots fail at the final.
+TEST_F(MultiRaftBatcherTest, YB_NEVER_DEBUG_TEST(StreamedMalformedPartialDropped)) {
+  CreateBatcher();
+  auto& d0 = NewCall("t0");
+  auto& d1 = NewCall("t1");
+  auto& d2 = NewCall("t2");
+  const auto env = SendStreamed(DataCalls({&d0, &d1, &d2}));
+  const auto failed_before = CounterValue(METRIC_multi_raft_envelopes_failed);
+  const auto frames_before = CounterValue(METRIC_multi_raft_frames_received);
+  StringWaiterLogSink log_waiter("Malformed MultiRaft partial response frame");
+  auto mismatched = Frame(env, {1});
+  mismatched.add_index(2);
+  ASSERT_TRUE(DeliverOnReactor(env, mismatched));
+  ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {1}, /* with_index= */ false)));
+  bool delivered = false;
+  RunOnReactor(messenger_.get(), [this, env, &delivered] {
+    // Wire type 7 does not exist.
+    delivered = sender_state_->DeliverPartialBytes(env, Slice("\x0f\x0f\x0f", 3));
+  });
+  ASSERT_TRUE(delivered);
+  ASSERT_EQ(log_waiter.GetEventCount(), 3);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_frames_received), frames_before);
+
+  // A well-formed frame after them is delivered.
+  ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
+  ASSERT_NO_FATALS(WaitDone(d0));
+  ASSERT_OK(d0.status);
+  ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK(), Frame(env, {2})));
+  ASSERT_NO_FATALS(WaitReleased(d0));
+  ASSERT_TRUE(d1.status.IsIllegalState()) << d1.status;
+  ASSERT_EQ(d1.num_callbacks.load(), 1);
+  ASSERT_OK(d2.status);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_frames_received) - frames_before, 2);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_envelopes_failed) - failed_before, 1);
+}
+
+// A final without index after no partial frame comes from a follower that did not stream: every
+// response, in request order. With the wrong number of responses, every slot fails as for an
+// envelope answered once.
+TEST_F(MultiRaftBatcherTest, OldFollowerFinalWithoutIndex) {
+  CreateBatcher();
+  auto& d0 = NewCall("t0");
+  auto& h1 = NewCall("t1");
+  auto& d2 = NewCall("t2");
+  auto env = SendStreamed({
+      {&d0, RequestKind::kData}, {&h1, RequestKind::kHeartbeat}, {&d2, RequestKind::kData}});
+  const auto failed_before = CounterValue(METRIC_multi_raft_envelopes_failed);
+  ASSERT_NO_FATALS(CompleteOnReactor(
+      env, Status::OK(), Frame(env, {0, 1, 2}, /* with_index= */ false)));
+  ASSERT_NO_FATALS(WaitReleased(d0));
+  for (auto* call : {&d0, &h1, &d2}) {
+    ASSERT_TRUE(IsDone(*call));
+    ASSERT_OK(call->status);
+    ASSERT_EQ(call->response.responder_uuid(), call->tablet_id + "-resp");
+    ASSERT_TRUE(call->on_high_pool);
+  }
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_envelopes_failed), failed_before);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_frames_received), 1);
+  ASSERT_EQ(Stats(METRIC_multi_raft_frame_slots)->TotalSum(), 3);
+
+  auto& d3 = NewCall("t3");
+  auto& h4 = NewCall("t4");
+  auto& d5 = NewCall("t5");
+  env = SendStreamed({
+      {&d3, RequestKind::kData}, {&h4, RequestKind::kHeartbeat}, {&d5, RequestKind::kData}});
+  StringWaiterLogSink log_waiter("2 responses for 3 requests, destination: follower-1");
+  ASSERT_NO_FATALS(CompleteOnReactor(
+      env, Status::OK(), Frame(env, {0, 1}, /* with_index= */ false)));
+  ASSERT_NO_FATALS(WaitReleased(d3));
+  for (auto* call : {&d3, &h4, &d5}) {
+    ASSERT_TRUE(IsDone(*call));
+    ASSERT_TRUE(call->status.IsIllegalState()) << call->status;
+    ASSERT_FALSE(call->had_response);
+  }
+  ASSERT_TRUE(log_waiter.IsEventOccurred());
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_envelopes_failed) - failed_before, 1);
+}
+
+// Heartbeat callbacks of a streamed envelope can send an envelope, so they leave the reactor.
+TEST_F(MultiRaftBatcherTest, StreamedHeartbeatSlotsOffReactor) {
+  CreateBatcher();
+  auto& h0 = NewCall("t0");
+  auto& d1 = NewCall("t1");
+  auto& h2 = NewCall("t2");
+  const auto env = SendStreamed({
+      {&h0, RequestKind::kHeartbeat}, {&d1, RequestKind::kData}, {&h2, RequestKind::kHeartbeat}});
+  ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
+  ASSERT_NO_FATALS(WaitDone(h0));
+  ASSERT_OK(h0.status);
+  ASSERT_FALSE(h0.on_reactor);
+  ASSERT_TRUE(h0.on_high_pool);
+  ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK(), Frame(env, {2, 1})));
+  ASSERT_NO_FATALS(WaitReleased(h2));
+  for (auto* call : {&d1, &h2}) {
+    ASSERT_OK(call->status);
+    ASSERT_FALSE(call->on_reactor);
+    ASSERT_TRUE(call->on_high_pool);
+    ASSERT_EQ(call->response.responder_uuid(), call->tablet_id + "-resp");
+  }
+}
+
+// With response clocking, a streamed envelope stays in flight until its final frame, even when
+// partial frames have answered every slot. The final's response-clocked flush then sends the
+// parked request from a High-pool thread.
+TEST_F(MultiRaftBatcherTest, LegacyClockWaitsForFinal) {
+  CreateBatcher();
+  auto& d0 = NewCall("t0");
+  auto& d1 = NewCall("t1");
+  const auto env = SendStreamed(DataCalls({&d0, &d1}));
+  struct SendThread {
+    bool on_high_pool;
+    bool on_reactor;
+  };
+  std::mutex mutex;
+  std::unordered_map<size_t, SendThread> send_threads;
+  auto* high_pool = &messenger_->ThreadPool(rpc::ServicePriority::kHigh);
+  sender_state_->SetSendHook([&mutex, &send_threads, high_pool](size_t envelope_idx) {
+    std::lock_guard lock(mutex);
+    send_threads[envelope_idx] = {high_pool->OwnsThisThread(), IsReactorThread()};
+  });
+  auto& d2 = Add("t2", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), env + 1);
+  const auto clocked_before = CounterValue(METRIC_multi_raft_flush_response_clocked);
+
+  ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
+  ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {1})));
+  ASSERT_NO_FATALS(WaitDone(d0));
+  ASSERT_NO_FATALS(WaitDone(d1));
+  ASSERT_EQ(NumEnvelopes(), env + 1);
+  ASSERT_FALSE(IsDone(d2));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_response_clocked), clocked_before);
+
+  // Nothing is left to answer.
+  ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK()));
+  ASSERT_OK(WaitFor([this, env] { return NumEnvelopes() == env + 2; }, 10s, "Clocked flush"));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_response_clocked), clocked_before + 1);
+  ASSERT_EQ(GetEnvelope(env + 1)->tablet_ids, Tablets({"t2"}));
+  {
+    std::lock_guard lock(mutex);
+    ASSERT_TRUE(send_threads.contains(env + 1));
+    ASSERT_TRUE(send_threads[env + 1].on_high_pool);
+    ASSERT_FALSE(send_threads[env + 1].on_reactor);
+  }
+  ASSERT_NO_FATALS(CompleteOnReactor(env + 1, Status::OK(), Frame(env + 1, {0})));
+  ASSERT_NO_FATALS(WaitDone(d2));
+  ASSERT_OK(d2.status);
+}
+
+// No envelope is serialized on a reactor thread, whatever the streamed frames make the batcher
+// and its callers send: re-adds from data and heartbeat callbacks, and response-clocked flushes.
+TEST_F(MultiRaftBatcherTest, NoSerializationOnReactor) {
+  CreateBatcher();
+  std::atomic<int> sends_on_reactor{0};
+  std::atomic<int> sends_on_high_pool{0};
+  auto* high_pool = &messenger_->ThreadPool(rpc::ServicePriority::kHigh);
+  auto& d0b = NewCall("t0b");
+  auto& h1b = NewCall("t1b");
+  auto& d0 = NewCall("t0", 100, [this, &d0b] { Submit(d0b, RequestKind::kData); });
+  auto& h1 = NewCall("t1", 100, [this, &h1b] { Submit(h1b, RequestKind::kHeartbeat); });
+  auto& d2 = NewCall("t2");
+  const auto env = SendStreamed({
+      {&d0, RequestKind::kData}, {&h1, RequestKind::kHeartbeat}, {&d2, RequestKind::kData}});
+  sender_state_->SetSendHook([&sends_on_reactor, &sends_on_high_pool, high_pool](size_t) {
+    if (IsReactorThread()) {
+      ++sends_on_reactor;
+    }
+    if (high_pool->OwnsThisThread()) {
+      ++sends_on_high_pool;
+    }
+  });
+  auto& d3 = Add("t3", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), env + 1);
+
+  // The callbacks re-add behind the envelope in flight.
+  ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0, 1})));
+  ASSERT_NO_FATALS(WaitDone(d0));
+  ASSERT_NO_FATALS(WaitDone(h1));
+  ASSERT_EQ(NumEnvelopes(), env + 1);
+  ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK(), Frame(env, {2})));
+  ASSERT_OK(WaitFor([this, env] { return NumEnvelopes() == env + 2; }, 10s, "Clocked flush"));
+  ASSERT_EQ(GetEnvelope(env + 1)->tablet_ids, Tablets({"t3", "t0b", "t1b"}));
+  ASSERT_NO_FATALS(WaitDone(d2));
+
+  const auto next = env + 1;
+  ASSERT_TRUE(DeliverOnReactor(next, Frame(next, {1})));
+  ASSERT_NO_FATALS(CompleteOnReactor(next, Status::OK(), Frame(next, {2, 0})));
+  for (auto* call : {&d3, &d0b, &h1b}) {
+    ASSERT_NO_FATALS(WaitDone(*call));
+    ASSERT_OK(call->status);
+  }
+  ASSERT_NO_FATALS(WaitReleased(d3));
+  ASSERT_EQ(NumEnvelopes(), env + 2);
+  ASSERT_EQ(sends_on_reactor.load(), 0);
+  ASSERT_EQ(sends_on_high_pool.load(), 1);
+}
+
+// The flag is read when an envelope is sent, and the envelope keeps that mode until it completes.
+TEST_F(MultiRaftBatcherTest, StreamingFlagReadPerEnvelope) {
+  CreateBatcher();
+  auto& d0 = NewCall("t0");
+  auto& d1 = NewCall("t1");
+  const auto env = SendStreamed(DataCalls({&d0, &d1}));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = false;
+  ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
+  ASSERT_NO_FATALS(WaitDone(d0));
+  ASSERT_OK(d0.status);
+  auto& d2 = Add("t2", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), env + 1);
+  ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK(), Frame(env, {1})));
+  ASSERT_OK(WaitFor([this, env] { return NumEnvelopes() == env + 2; }, 10s, "Clocked flush"));
+  auto answered_once = GetEnvelope(env + 1);
+  ASSERT_FALSE(answered_once->req.has_stream_responses());
+  ASSERT_EQ(answered_once->callback_mode, rpc::InvokeCallbackMode::kThreadPoolHigh);
+  ASSERT_FALSE(answered_once->had_partial_callback);
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = true;
+  Complete(env + 1);
+  for (auto* call : {&d1, &d2}) {
+    ASSERT_NO_FATALS(WaitDone(*call));
+    ASSERT_OK(call->status);
+    ASSERT_EQ(call->response.responder_uuid(), call->tablet_id + "-resp");
+  }
+}
+
+// With the flag off, an envelope carrying data is completed as before: its callback runs on the
+// High pool (here, on the completing thread), the response-clocked flush runs there before the
+// sub-callbacks, heartbeat callbacks run inline and data callbacks in their own tasks.
+TEST_F(MultiRaftBatcherTest, StreamingOffPathUnchanged) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = false;
+  CreateBatcher();
+  std::mutex mutex;
+  std::unordered_map<size_t, std::thread::id> send_threads;
+  sender_state_->SetSendHook([&mutex, &send_threads](size_t envelope_idx) {
+    std::lock_guard lock(mutex);
+    send_threads[envelope_idx] = std::this_thread::get_id();
+  });
+  auto& h1 = Add("t1", RequestKind::kHeartbeat);
+  auto& d2 = Add("t2", RequestKind::kData);
+  auto& d3 = Add("t3", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  Complete(0);
+  ASSERT_EQ(NumEnvelopes(), 2);
+  ASSERT_TRUE(IsDone(h1));
+  ASSERT_EQ(h1.thread_id, std::this_thread::get_id());
+  ASSERT_NO_FATALS(WaitDone(d2));
+  ASSERT_TRUE(d2.on_high_pool);
+  {
+    std::lock_guard lock(mutex);
+    ASSERT_EQ(send_threads[1], std::this_thread::get_id());
+  }
+  for (size_t i = 0; i != 2; ++i) {
+    auto envelope = GetEnvelope(i);
+    ASSERT_FALSE(envelope->req.has_stream_responses());
+    ASSERT_EQ(envelope->callback_mode, rpc::InvokeCallbackMode::kThreadPoolHigh);
+    ASSERT_FALSE(envelope->had_partial_callback);
+  }
+  Complete(1);
+  ASSERT_NO_FATALS(WaitDone(d3));
+  for (auto* call : {&h1, &d2, &d3}) {
+    ASSERT_OK(call->status);
+    ASSERT_EQ(call->response.responder_uuid(), call->tablet_id + "-resp");
+  }
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_frames_received), 0);
+}
+
+// Every frame of a streamed envelope counts, partial or final, with its number of responses. A
+// failed final is no frame. A final with nothing left to answer counts, with no responses.
+TEST_F(MultiRaftBatcherTest, StreamedFrameMetrics) {
+  CreateBatcher();
+  auto frame_slots = Stats(METRIC_multi_raft_frame_slots);
+  auto& d0 = NewCall("t0");
+  auto& d1 = NewCall("t1");
+  auto& d2 = NewCall("t2");
+  auto& d3 = NewCall("t3");
+  auto env = SendStreamed(DataCalls({&d0, &d1, &d2, &d3}));
+  ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
+  ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {2, 1})));
+  ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK(), Frame(env, {3})));
+  ASSERT_NO_FATALS(WaitReleased(d0));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_frames_received), 3);
+  ASSERT_EQ(frame_slots->TotalCount(), 3);
+  ASSERT_EQ(frame_slots->TotalSum(), 4);
+  ASSERT_EQ(frame_slots->MaxValue(), 2);
+
+  auto& d4 = NewCall("t4");
+  auto& d5 = NewCall("t5");
+  env = SendStreamed(DataCalls({&d4, &d5}));
+  ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
+  ASSERT_NO_FATALS(CompleteOnReactor(env, STATUS(NetworkError, "Connection reset")));
+  ASSERT_NO_FATALS(WaitReleased(d4));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_frames_received), 4);
+  ASSERT_EQ(frame_slots->TotalCount(), 4);
+  ASSERT_EQ(frame_slots->TotalSum(), 5);
+
+  auto& d6 = NewCall("t6");
+  auto& d7 = NewCall("t7");
+  env = SendStreamed(DataCalls({&d6, &d7}));
+  ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {1, 0})));
+  ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK()));
+  ASSERT_NO_FATALS(WaitReleased(d6));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_frames_received), 6);
+  ASSERT_EQ(frame_slots->TotalCount(), 6);
+  ASSERT_EQ(frame_slots->TotalSum(), 7);
+  ASSERT_EQ(frame_slots->MinValue(), 0);
+  for (auto* call : {&d0, &d1, &d2, &d3, &d6, &d7}) {
+    ASSERT_OK(call->status);
+  }
+}
+
+// With streaming, multi_raft_envelopes_failed counts an RPC that failed, and once an OK final that
+// leaves slots unanswered, however many. Slots answered by partial frames do not prevent the
+// count of a failed RPC.
+TEST_F(MultiRaftBatcherTest, StreamedEnvelopesFailedMetric) {
+  CreateBatcher();
+  auto failed = [this] { return CounterValue(METRIC_multi_raft_envelopes_failed); };
+  struct Case {
+    std::vector<uint32_t> partial;
+    Status final_status;
+    std::vector<uint32_t> final_indices;
+    int64_t expected;
+  };
+  const std::vector<Case> cases = {
+      {{1}, STATUS(TimedOut, "Envelope timed out"), {}, 1},
+      {{0}, Status::OK(), {}, 1},
+      {{0}, Status::OK(), {1, 2}, 0},
+      {{0, 1, 2}, STATUS(NetworkError, "Connection reset"), {}, 1},
+      {{0, 1, 2}, Status::OK(), {}, 0},
+  };
+  for (size_t i = 0; i != cases.size(); ++i) {
+    const auto& c = cases[i];
+    auto& d0 = NewCall(Format("t$0-0", i));
+    auto& d1 = NewCall(Format("t$0-1", i));
+    auto& d2 = NewCall(Format("t$0-2", i));
+    const auto env = SendStreamed(DataCalls({&d0, &d1, &d2}));
+    const auto before = failed();
+    ASSERT_TRUE(DeliverOnReactor(env, Frame(env, c.partial)));
+    ASSERT_NO_FATALS(CompleteOnReactor(env, c.final_status, Frame(env, c.final_indices)));
+    ASSERT_NO_FATALS(WaitReleased(d0));
+    size_t num_ok = 0;
+    for (auto* call : {&d0, &d1, &d2}) {
+      ASSERT_EQ(call->num_callbacks.load(), 1);
+      num_ok += call->status.ok();
+    }
+    ASSERT_EQ(num_ok, c.partial.size() + c.final_indices.size()) << "case " << i;
+    ASSERT_EQ(failed() - before, c.expected) << "case " << i;
+  }
+}
+
+// A streamed batch is released once its final and every slot task have run, whatever completes
+// it: nothing that the RPC layer keeps after the final, such as the partial-response callback,
+// holds it.
+TEST_F(MultiRaftBatcherTest, StreamedBatchReleased) {
+  CreateBatcher();
+  for (int mode = 0; mode != 3; ++mode) {
+    auto& d0 = NewCall(Format("t$0-0", mode));
+    auto& d1 = NewCall(Format("t$0-1", mode));
+    const auto env = SendStreamed(DataCalls({&d0, &d1}));
+    ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
+    ASSERT_NO_FATALS(WaitDone(d0));
+    ASSERT_FALSE(d0.handle.expired());
+    switch (mode) {
+      case 0:
+        ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK(), Frame(env, {1})));
+        break;
+      case 1:
+        ASSERT_NO_FATALS(CompleteOnReactor(env, STATUS(TimedOut, "Envelope timed out")));
+        break;
+      case 2:
+        d1.handle.MarkCallAsFailed();
+        ASSERT_TRUE(GetEnvelope(env)->marked_failed);
+        break;
+    }
+    ASSERT_NO_FATALS(WaitDone(d1));
+    ASSERT_EQ(d1.status.ok(), mode == 0) << d1.status;
+    ASSERT_OK(WaitFor([&d0] { return d0.handle.expired(); }, 10s, Format("Mode $0", mode)));
+  }
+}
+
+// A slot's peer may rebuild its request in place once a partial frame answered it, while the
+// envelope is still in flight. Nothing that completes the envelope reads the request again: the
+// failure is logged with the destination recorded at the add.
+TEST_F(MultiRaftBatcherTest, StreamedMissingIndexAfterSlotRebuilt) {
+  CreateBatcher();
+  auto& d0 = NewCall("t0");
+  auto& d1 = NewCall("t1");
+  const auto env = SendStreamed(DataCalls({&d0, &d1}));
+  ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
+  ASSERT_NO_FATALS(WaitDone(d0));
+  ASSERT_OK(d0.status);
+  d0.request->dup_dest_uuid("rebuilt-destination");
+  d0.request->dup_tablet_id("rebuilt-tablet");
+  StringWaiterLogSink right_destination(
+      "MultiRaft response has no response for requests [1] of 2, destination: follower-1");
+  StringWaiterLogSink rebuilt_destination("rebuilt-destination");
+  ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK()));
+  ASSERT_NO_FATALS(WaitReleased(d1));
+  ASSERT_TRUE(d1.status.IsIllegalState()) << d1.status;
+  ASSERT_TRUE(right_destination.IsEventOccurred());
+  ASSERT_FALSE(rebuilt_destination.IsEventOccurred());
+}
+
+// When the High pool rejects a slot task (it is shutting down), the callback runs inline, which on
+// the reactor happens only during messenger shutdown.
+TEST_F(MultiRaftBatcherTest, StreamedEnqueueFailureRunsInline) {
+  messenger_->ThreadPool(rpc::ServicePriority::kHigh).Shutdown();
+  CreateBatcher();
+  auto& d0 = NewCall("t0");
+  auto& h1 = NewCall("t1");
+  const auto env = SendStreamed({{&d0, RequestKind::kData}, {&h1, RequestKind::kHeartbeat}});
+  ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
+  ASSERT_TRUE(IsDone(d0));
+  ASSERT_TRUE(d0.on_reactor);
+  ASSERT_OK(d0.status);
+  ASSERT_EQ(d0.response.responder_uuid(), "t0-resp");
+  ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK(), Frame(env, {1})));
+  ASSERT_TRUE(IsDone(h1));
+  ASSERT_TRUE(h1.on_reactor);
+  ASSERT_OK(h1.status);
+  ASSERT_EQ(h1.response.responder_uuid(), "t1-resp");
+}
+
+// A slot answered by a partial frame keeps its response, and its callback the batch, while the
+// final completes the envelope and the other slots finish. The batch is released once that
+// callback returns.
+TEST_F(MultiRaftBatcherTest, StreamedResponseOutlivesFinal) {
+  CreateBatcher();
+  auto& d0 = NewCall("t0");
+  auto& d1 = NewCall("t1");
+  CountDownLatch d1_entered(1);
+  CountDownLatch release_d1(1);
+  auto release_on_failure = ScopeExit([&release_d1] { release_d1.CountDown(); });
+  d1.on_callback = [&d1_entered, &release_d1] {
+    d1_entered.CountDown();
+    release_d1.Wait();
+  };
+  const auto env = SendStreamed(DataCalls({&d0, &d1}));
+  ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {1})));
+  ASSERT_TRUE(d1_entered.WaitFor(10s));
+  ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK(), Frame(env, {0})));
+  ASSERT_NO_FATALS(WaitDone(d0));
+  ASSERT_OK(d0.status);
+  ASSERT_FALSE(d1.handle.expired());
+  ASSERT_FALSE(IsDone(d1));
+  release_d1.CountDown();
+  ASSERT_NO_FATALS(WaitReleased(d1));
+  ASSERT_OK(d1.status);
+  ASSERT_TRUE(d1.had_holder);
+  ASSERT_EQ(d1.response.responder_uuid(), "t1-resp");
 }
 
 // A batcher exists when either batching flag is set.

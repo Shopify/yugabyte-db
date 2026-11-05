@@ -34,7 +34,9 @@
 #include "yb/consensus/consensus.proxy.h"
 #include "yb/consensus/log.h"
 #include "yb/consensus/metadata.pb.h"
+#include "yb/consensus/multi_raft_batcher.h"
 #include "yb/consensus/raft_consensus.h"
+#include "yb/consensus/replicate_msgs_holder.h"
 
 #include "yb/gutil/thread_annotations.h"
 
@@ -59,7 +61,9 @@
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/cgroups.h"
 #include "yb/util/countdown_latch.h"
+#include "yb/util/logging_test_util.h"
 #include "yb/util/mem_tracker.h"
+#include "yb/util/memory/arena.h"
 #include "yb/util/metrics.h"
 #include "yb/util/random_util.h"
 #include "yb/util/scope_exit.h"
@@ -75,7 +79,12 @@ DECLARE_bool(allow_encryption_at_rest);
 DECLARE_bool(disable_auto_flags_management);
 DECLARE_bool(enable_leader_failure_detection);
 DECLARE_bool(enable_multi_raft_data_batching);
+DECLARE_bool(enable_multi_raft_streaming_responses);
 DECLARE_bool(enforce_xcluster_guarded_lease);
+DECLARE_uint64(multi_raft_batch_size);
+DECLARE_uint32(multi_raft_data_flush_delay_ms);
+DECLARE_uint64(multi_raft_heartbeat_interval_ms);
+DECLARE_uint32(multi_raft_rpc_timeout_ms);
 DECLARE_int32(multi_raft_update_max_threads);
 DECLARE_int32(raft_heartbeat_interval_ms);
 DECLARE_bool(TEST_multi_raft_update_fail_partial_frames);
@@ -83,6 +92,10 @@ DECLARE_bool(use_preelection);
 
 METRIC_DECLARE_entity(server);
 METRIC_DECLARE_histogram(handler_latency_yb_consensus_ConsensusService_MultiRaftUpdateConsensus);
+METRIC_DECLARE_counter(multi_raft_envelopes_failed);
+METRIC_DECLARE_counter(multi_raft_envelopes_sent);
+METRIC_DECLARE_event_stats(multi_raft_frame_slots);
+METRIC_DECLARE_counter(multi_raft_frames_received);
 METRIC_DECLARE_counter(multi_raft_update_deadline_responses);
 METRIC_DECLARE_event_stats(multi_raft_update_frame_slots);
 METRIC_DECLARE_counter(multi_raft_update_frames_sent);
@@ -101,6 +114,12 @@ namespace {
 
 constexpr auto kFakeLeader = "fake-leader";
 constexpr auto kFakePeer = "fake-peer";
+
+// Every line the leader's batcher logs when a response frame breaks the streaming protocol or
+// leaves a request unanswered.
+constexpr auto kLeaderFrameErrors =
+    "Malformed MultiRaft|has an invalid index|has no response for request|"
+    "has no index after partial frames|responses for [0-9]+ requests";
 
 // Kept short so that the tests about election timeouts are fast: the minimum election timeout is
 // leader_failure_max_missed_heartbeat_periods (6) heartbeat intervals.
@@ -347,6 +366,7 @@ class MultiRaftUpdateConsensusTest : public TabletServerTestBase {
   }
 
   void TearDown() override {
+    ShutDownBatcher();
     SyncPoint::GetInstance()->DisableProcessing();
     SyncPoint::GetInstance()->ClearAllCallBacks();
     TabletServerTestBase::TearDown();
@@ -401,6 +421,99 @@ class MultiRaftUpdateConsensusTest : public TabletServerTestBase {
     for (int i = 0; i != resp.consensus_response_size(); ++i) {
       ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(i), OpId::Min()));
     }
+  }
+
+  // A request the test, as leader, sends through a MultiRaftBatcher, and what its callback got.
+  struct BatchedCall {
+    consensus::LWConsensusRequestPB* request = nullptr;
+    consensus::MultiRaftBatcher::BatchHandle handle;
+    Status status;
+    ConsensusResponsePB response;
+    bool had_holder = false;
+    std::atomic<bool> done{false};
+  };
+
+  // A MultiRaftBatcher to the server with the production sender, as the leader's Raft peers use
+  // it. It sends data requests only when one is added with nothing in flight, or at
+  // multi_raft_batch_size requests.
+  void CreateBatcher() {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_heartbeat_interval_ms) = 3600 * 1000;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_flush_delay_ms) = 3600 * 1000;
+    batcher_metric_entity_ = METRIC_ENTITY_server.Instantiate(&batcher_metric_registry_, "leader");
+    batcher_ = std::make_shared<consensus::MultiRaftBatcher>(
+        client_messenger_.get(),
+        consensus::CreateMultiRaftBatchSender(
+            proxy_cache_.get(), HostPort::FromBoundEndpoint(mini_server_->bound_rpc_addr())),
+        &batcher_running_calls_, batcher_metric_entity_);
+    batcher_->Start();
+  }
+
+  BatchedCall& AddToBatcher(const ConsensusRequestPB& request) {
+    auto& call = *batched_calls_.emplace_back(std::make_unique<BatchedCall>());
+    call.request = batcher_arena_.NewObject<consensus::LWConsensusRequestPB>(
+        &batcher_arena_, request);
+    call.handle = batcher_->AddRequestToBatch(
+        call.request, consensus::LWReplicateMsgsHolder(),
+        [&call](
+            const Status& status, const consensus::LWConsensusResponsePB* response,
+            std::shared_ptr<void> holder) {
+          call.status = status;
+          call.had_holder = holder != nullptr;
+          if (response) {
+            response->ToGoogleProtobuf(&call.response);
+          }
+          call.done.store(true, std::memory_order_release);
+        },
+        consensus::MultiRaftBatcher::RequestKind::kData);
+    return call;
+  }
+
+  static bool IsDone(const BatchedCall& call) {
+    return call.done.load(std::memory_order_acquire);
+  }
+
+  // Waits until every batched call's callback has run and its batch, which holds the callback, is
+  // gone, so that nothing references the calls or their requests.
+  void ShutDownBatcher() {
+    if (!batcher_) {
+      return;
+    }
+    batcher_->Shutdown();
+    for (const auto& call : batched_calls_) {
+      CHECK_OK(WaitFor(
+          [&call] { return IsDone(*call) && call->handle.expired(); }, 60s,
+          "Batched call finished"));
+    }
+    batcher_.reset();
+  }
+
+  int64_t LeaderCounter(const CounterPrototype& prototype) {
+    return prototype.Instantiate(batcher_metric_entity_)->value();
+  }
+
+  // Sends one write op for each of tablets_[0..2] in one envelope through the batcher, and returns
+  // their calls. They are sent by the count cap, behind an envelope for tablets_[3] that is held in
+  // flight by pausing that tablet until they are sent.
+  void SendThroughBatcher(std::vector<BatchedCall*>* calls) {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_batch_size) = 3;
+    auto& blocker_tablet = tablets_[3];
+    Consensus(blocker_tablet)->TEST_PauseUpdateConsensus(true);
+    BatchedCall* blocker;
+    {
+      auto unpause = ScopeExit([this, &blocker_tablet] {
+        Consensus(blocker_tablet)->TEST_PauseUpdateConsensus(false);
+      });
+      blocker = &AddToBatcher(Data(&blocker_tablet, 1, /* commit= */ false));
+      ASSERT_EQ(LeaderCounter(METRIC_multi_raft_envelopes_sent), 1);
+      calls->clear();
+      for (size_t i = 0; i != 3; ++i) {
+        calls->push_back(&AddToBatcher(Data(&tablets_[i], 1, /* commit= */ false)));
+      }
+      ASSERT_EQ(LeaderCounter(METRIC_multi_raft_envelopes_sent), 2);
+      ASSERT_FALSE(IsDone(*blocker));
+    }
+    ASSERT_OK(WaitFor([blocker] { return IsDone(*blocker); }, 10s, "Blocker answered"));
+    ASSERT_OK(blocker->status);
   }
 
   ConsensusRequestPB MakeRequest(const TestTablet& tablet) {
@@ -763,6 +876,13 @@ class MultiRaftUpdateConsensusTest : public TabletServerTestBase {
   std::string server_uuid_;
   int64_t term_ = 1;
   std::vector<TestTablet> tablets_;
+  MetricRegistry batcher_metric_registry_;
+  MetricEntityPtr batcher_metric_entity_;
+  std::atomic<int> batcher_running_calls_{0};
+  // The requests and callback state of batched calls, which outlive the batcher's batches.
+  ThreadSafeArena batcher_arena_;
+  std::vector<std::unique_ptr<BatchedCall>> batched_calls_;
+  std::shared_ptr<consensus::MultiRaftBatcher> batcher_;
 };
 
 // Response slots are in request order even when the sub-requests complete in another order, and
@@ -2031,6 +2151,157 @@ TEST_F(MultiRaftUpdateConsensusTest, StreamedPartialFailureFallsBack) {
     ASSERT_NO_FATALS(AssertSlotOk(
         result.merged.consensus_response(narrow_cast<int>(i)), tablets_[i].last));
   }
+}
+
+// A leader's batcher that streams gets each request's response as soon as the follower completes
+// it: a paused tablet does not hold up the other requests of its envelope. Every frame the server
+// sends passes the batcher's checks, and the batch is released once everything has run.
+TEST_F(MultiRaftUpdateConsensusTest, BatcherStreamsAroundSlowSlot) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = true;
+  ASSERT_NO_FATALS(StartServer(4));
+  ASSERT_NO_FATALS(CreateBatcher());
+  RegexWaiterLogSink frame_errors(kLeaderFrameErrors);
+  auto& paused = tablets_[1];
+  Consensus(paused)->TEST_PauseUpdateConsensus(true);
+  auto unpause = ScopeExit([this, &paused] {
+    Consensus(paused)->TEST_PauseUpdateConsensus(false);
+  });
+  const auto frames_sent_before = FramesSent();
+  std::vector<BatchedCall*> calls;
+  ASSERT_NO_FATALS(SendThroughBatcher(&calls));
+
+  ASSERT_OK(WaitFor(
+      [&calls] { return IsDone(*calls[0]) && IsDone(*calls[2]); }, 10s,
+      "Envelope-mates of the paused tablet answered"));
+  ASSERT_FALSE(IsDone(*calls[1]));
+  ASSERT_NE(LastReceived(paused), paused.last);
+  for (size_t i : {0, 2}) {
+    ASSERT_OK(calls[i]->status);
+    ASSERT_TRUE(calls[i]->had_holder);
+    ASSERT_NO_FATALS(AssertSlotOk(calls[i]->response, tablets_[i].last));
+  }
+
+  Consensus(paused)->TEST_PauseUpdateConsensus(false);
+  ASSERT_OK(WaitFor([&calls] { return IsDone(*calls[1]); }, 10s, "Paused tablet answered"));
+  ASSERT_OK(calls[1]->status);
+  ASSERT_NO_FATALS(AssertSlotOk(calls[1]->response, paused.last));
+  for (auto* call : calls) {
+    ASSERT_OK(WaitFor([call] { return call->handle.expired(); }, 10s, "Batch released"));
+  }
+
+  // The blocker's envelope, at least one partial frame, and the final of the second envelope.
+  const auto frames_received = LeaderCounter(METRIC_multi_raft_frames_received);
+  ASSERT_GE(frames_received, 3);
+  ASSERT_OK(WaitForFramesSent(frames_sent_before + frames_received));
+  ASSERT_EQ(FramesSent() - frames_sent_before, frames_received);
+  ASSERT_EQ(LeaderCounter(METRIC_multi_raft_envelopes_failed), 0);
+  ASSERT_FALSE(frame_errors.IsEventOccurred());
+}
+
+// A follower that does not stream (here its serial handler, with its data flag off) answers once,
+// without index. The streaming leader takes that as every response in request order, so the
+// requests complete together.
+TEST_F(MultiRaftUpdateConsensusTest, BatcherStreamingAgainstSerialFollower) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = true;
+  ASSERT_NO_FATALS(StartServer(4));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_data_batching) = false;
+  ASSERT_NO_FATALS(CreateBatcher());
+  RegexWaiterLogSink frame_errors(kLeaderFrameErrors);
+  auto& paused = tablets_[1];
+  Consensus(paused)->TEST_PauseUpdateConsensus(true);
+  auto unpause = ScopeExit([this, &paused] {
+    Consensus(paused)->TEST_PauseUpdateConsensus(false);
+  });
+  const auto frames_sent_before = FramesSent();
+  const auto frames_received_before = LeaderCounter(METRIC_multi_raft_frames_received);
+  std::vector<BatchedCall*> calls;
+  ASSERT_NO_FATALS(SendThroughBatcher(&calls));
+
+  // The first request is processed, but its response waits for the paused one.
+  ASSERT_OK(WaitForLastReceived(tablets_[0]));
+  SleepFor(300ms * kTimeMultiplier);
+  for (auto* call : calls) {
+    ASSERT_FALSE(IsDone(*call));
+  }
+
+  Consensus(paused)->TEST_PauseUpdateConsensus(false);
+  for (size_t i = 0; i != calls.size(); ++i) {
+    auto* call = calls[i];
+    ASSERT_OK(WaitFor([call] { return IsDone(*call); }, 10s, "Answered"));
+    ASSERT_OK(call->status);
+    ASSERT_NO_FATALS(AssertSlotOk(call->response, tablets_[i].last));
+    ASSERT_OK(WaitFor([call] { return call->handle.expired(); }, 10s, "Batch released"));
+  }
+  // The final of each envelope.
+  ASSERT_EQ(LeaderCounter(METRIC_multi_raft_frames_received) - frames_received_before, 2);
+  ASSERT_EQ(FramesSent(), frames_sent_before);
+  ASSERT_EQ(LeaderCounter(METRIC_multi_raft_envelopes_failed), 0);
+  ASSERT_FALSE(frame_errors.IsEventOccurred());
+}
+
+// Failing a streamed envelope through its handle, as the stuck-call detector does, fails only the
+// request no frame answered. With the production sender the final callback then runs on this
+// thread, under the controller's lock, so it must not call back into the controller. The
+// follower's final is held until the call has expired on the client, as it would have when the
+// detector fires: a final that reaches a call failed before its expiry is parsed into the
+// response of a batch that may be gone.
+TEST_F(MultiRaftUpdateConsensusTest, BatcherStreamedMarkCallAsFailed) {
+  constexpr auto kTimeout = 1s;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_rpc_timeout_ms) =
+      narrow_cast<uint32_t>(ToMilliseconds(kTimeout));
+  ASSERT_NO_FATALS(StartServer(4));
+  ASSERT_NO_FATALS(CreateBatcher());
+  auto& paused = tablets_[1];
+  Consensus(paused)->TEST_PauseUpdateConsensus(true);
+  auto unpause = ScopeExit([this, &paused] {
+    Consensus(paused)->TEST_PauseUpdateConsensus(false);
+  });
+  const auto frames_sent_before = FramesSent();
+  std::vector<BatchedCall*> calls;
+  ASSERT_NO_FATALS(SendThroughBatcher(&calls));
+  const auto sent = MonoTime::Now();
+
+  CountDownLatch release_final(1);
+  std::atomic<bool> final_held{false};
+  SyncPointScope sync_point;
+  auto release_on_failure = ScopeExit([&release_final] { release_final.CountDown(); });
+  sync_point->SetCallBack(
+      "MultiRaftUpdateState::SenderBeforeSend", [&release_final, &final_held](void* arg) {
+        if (static_cast<MultiRaftUpdateSyncPointArg*>(arg)->final) {
+          final_held = true;
+          release_final.WaitFor(60s);
+        }
+      });
+  sync_point->EnableProcessing();
+
+  ASSERT_OK(WaitFor(
+      [&calls] { return IsDone(*calls[0]) && IsDone(*calls[2]); }, 10s,
+      "Envelope-mates of the paused tablet answered"));
+  ASSERT_FALSE(IsDone(*calls[1]));
+  ASSERT_FALSE(final_held.load());
+
+  calls[1]->handle.MarkCallAsFailed();
+  ASSERT_OK(WaitFor([&calls] { return IsDone(*calls[1]); }, 10s, "Paused tablet failed"));
+  ASSERT_TRUE(calls[1]->status.IsTimedOut()) << calls[1]->status;
+  for (size_t i : {0, 2}) {
+    ASSERT_OK(calls[i]->status);
+    ASSERT_NO_FATALS(AssertSlotOk(calls[i]->response, tablets_[i].last));
+  }
+  ASSERT_EQ(LeaderCounter(METRIC_multi_raft_envelopes_failed), 1);
+  const auto frames_received = LeaderCounter(METRIC_multi_raft_frames_received);
+  ASSERT_OK(WaitForFramesSent(frames_sent_before + frames_received));
+
+  // The follower still answers the paused request, after the call failed and expired.
+  Consensus(paused)->TEST_PauseUpdateConsensus(false);
+  ASSERT_OK(WaitFor([&final_held] { return final_held.load(); }, 10s, "Final held"));
+  SleepFor(sent + kTimeout + 1s * kTimeMultiplier - MonoTime::Now());
+  release_final.CountDown();
+  ASSERT_OK(WaitForFramesSent(frames_sent_before + frames_received + 1));
+  for (auto* call : calls) {
+    ASSERT_OK(WaitFor([call] { return call->handle.expired(); }, 10s, "Batch released"));
+  }
+  ASSERT_EQ(LeaderCounter(METRIC_multi_raft_frames_received), frames_received);
 }
 
 // The multi_raft_update pool runs in the cgroup of the messenger's high-priority pool, where the

@@ -46,6 +46,7 @@
 #include "yb/consensus/multi_raft_batcher.h"
 #include "yb/consensus/multi_raft_batcher-test-util.h"
 #include "yb/consensus/opid_util.h"
+#include "yb/consensus/replicate_msgs_holder.h"
 
 #include "yb/fs/fs_manager.h"
 
@@ -82,6 +83,7 @@ DECLARE_int32(consensus_stuck_peer_call_threshold_ms);
 DECLARE_bool(enable_consensus_exponential_backoff);
 DECLARE_bool(enable_multi_raft_data_batching);
 DECLARE_bool(enable_multi_raft_heartbeat_batcher);
+DECLARE_bool(enable_multi_raft_streaming_responses);
 DECLARE_uint64(multi_raft_batch_size);
 DECLARE_uint64(multi_raft_data_direct_threshold_bytes);
 DECLARE_uint32(multi_raft_data_flush_delay_ms);
@@ -168,6 +170,8 @@ class RecordingQueueObserver : public TestRaftConsensusQueueIface {
 class TestFollower {
  public:
   explicit TestFollower(std::string uuid) : uuid_(std::move(uuid)) {}
+
+  const std::string& uuid() const { return uuid_; }
 
   ConsensusResponsePB Update(const ConsensusRequestPB& request) {
     ConsensusResponsePB response;
@@ -503,6 +507,11 @@ class ConsensusPeersTest : public YBTest {
 
   void TestEnvelopeFailure(const Status& status);
 
+  size_t SendStreamedRound(
+      const std::vector<const TestPeer*>& peers, std::vector<uint32_t>* slots);
+
+  void DeliverPartial(size_t envelope_idx, const std::vector<uint32_t>& slots);
+
   DelayablePeerProxy<NoOpTestPeerProxy>* NewRemotePeer(
       const string& peer_name,
       std::shared_ptr<Peer>* peer) {
@@ -544,6 +553,8 @@ class ConsensusPeersTest : public YBTest {
   std::unique_ptr<rpc::ThreadPool> raft_notifications_pool_;
 
   std::unique_ptr<Messenger> batcher_messenger_;
+  // Holds the requests that tests add to the batcher themselves.
+  ThreadSafeArena blocker_arena_;
   std::atomic<int> running_calls_{0};
   std::shared_ptr<FakeBatchSenderState> sender_state_ = std::make_shared<FakeBatchSenderState>();
   std::shared_ptr<MultiRaftBatcher> batcher_;
@@ -1577,6 +1588,186 @@ TEST_F(ConsensusPeersTest, YB_NEVER_DEBUG_TEST(StuckBatchIsDetectedAndFailed)) {
   ASSERT_OK(peer.SignalRequest(RequestTriggerMode::kAlwaysSend));
   ASSERT_NO_FATALS(CompleteUntilIdle(test_peer));
   ASSERT_EQ(test_peer.follower->received(), Range(1, 2));
+}
+
+// Sends ops 1-2 to every peer in one streamed envelope, and returns its index and each peer's slot
+// in it. The peers' requests park behind an envelope that is not streamed and carries a data
+// request no peer owns, and are sent by its response-clocked flush.
+size_t ConsensusPeersTest::SendStreamedRound(
+    const std::vector<const TestPeer*>& peers, std::vector<uint32_t>* slots) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = false;
+  ConsensusRequestPB blocker;
+  blocker.set_dest_uuid("blocker");
+  blocker.set_tablet_id(kTabletId);
+  blocker.set_caller_uuid(kLeaderUuid);
+  blocker.set_caller_term(1);
+  // Serialized before the add returns: nothing is in flight, so it is sent at once.
+  auto* blocker_request = blocker_arena_.NewObject<LWConsensusRequestPB>(&blocker_arena_, blocker);
+  batcher_->AddRequestToBatch(
+      blocker_request, LWReplicateMsgsHolder(),
+      [](const Status&, const LWConsensusResponsePB*, std::shared_ptr<void>) {},
+      MultiRaftBatcher::RequestKind::kData);
+  CHECK_EQ(NumEnvelopes(), 1U);
+  AppendReplicateMessagesToQueue(message_queue_.get(), clock_, 1, 2);
+  for (const auto* test_peer : peers) {
+    CHECK_OK(test_peer->peer->SignalRequest(RequestTriggerMode::kNonEmptyOnly));
+    CHECK_OK(WaitFor([test_peer] {
+      return !test_peer->peer->TEST_batched_handle().expired();
+    }, 10s, "Request parked"));
+  }
+  CHECK(raft_pool_->WaitFor(10s));
+  CHECK_EQ(NumEnvelopes(), 1U);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = true;
+  CHECK(sender_state_->Complete(
+      0, Status::OK(), [](size_t, const ConsensusRequestPB&, ConsensusResponsePB*) {}));
+  CHECK_OK(WaitFor([this] { return NumEnvelopes() == 2; }, 10s, "Streamed envelope sent"));
+  auto envelope = GetEnvelope(1);
+  CHECK(envelope->req.stream_responses());
+  CHECK_EQ(static_cast<size_t>(envelope->req.consensus_request_size()), peers.size());
+  slots->clear();
+  for (size_t p = 0; p != peers.size(); ++p) {
+    const auto& uuid = peers[p]->follower->uuid();
+    for (int i = 0; i != envelope->req.consensus_request_size(); ++i) {
+      if (envelope->req.consensus_request(i).dest_uuid() == uuid) {
+        slots->push_back(i);
+      }
+    }
+    CHECK_EQ(slots->size(), p + 1) << uuid;
+  }
+  return 1;
+}
+
+// Answers the given slots of a streamed envelope from their followers, in a partial frame on the
+// batcher's reactor.
+void ConsensusPeersTest::DeliverPartial(size_t envelope_idx, const std::vector<uint32_t>& slots) {
+  auto frame = sender_state_->MakeFrame(envelope_idx, slots, FollowerResponses());
+  bool delivered = false;
+  RunOnReactor(batcher_messenger_.get(), [this, envelope_idx, &frame, &delivered] {
+    delivered = sender_state_->DeliverPartial(envelope_idx, frame);
+  });
+  ASSERT_TRUE(delivered);
+}
+
+// A streamed envelope stuck with a peer's slot unanswered is found by that peer's stuck-call
+// detector and failed. A peer whose slot a partial frame answered has moved on: its handle no
+// longer reaches the envelope, and the failure does not affect it. The detector logs at DFATAL,
+// which is fatal in debug builds.
+TEST_F(ConsensusPeersTest, YB_NEVER_DEBUG_TEST(StuckDetectorWithStreaming)) {
+  ASSERT_NO_FATALS(SetUpBatcher(/* heartbeat_batching= */ false, /* data_batching= */ true));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_flush_delay_ms) = kNeverMs;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_rpc_timeout_ms) = 50;
+  auto answered = NewTestPeer(kFollowerUuid);
+  auto stuck = NewTestPeer(kFollower2Uuid);
+  for (const auto* test_peer : {&answered, &stuck}) {
+    ASSERT_NO_FATALS(Negotiate(*test_peer));
+  }
+  std::vector<uint32_t> slots;
+  const auto env = SendStreamedRound({&answered, &stuck}, &slots);
+  auto* const env_controller = GetEnvelope(env)->controller;
+  ASSERT_EQ(GetEnvelope(env)->timeout, 50ms);
+
+  ASSERT_NO_FATALS(DeliverPartial(env, {slots[0]}));
+  ASSERT_OK(WaitFor([&answered, env_controller] {
+    return answered.peer->TEST_batched_handle().TEST_controller() != env_controller;
+  }, 10s, "Answered peer moved on"));
+  ASSERT_EQ(stuck.peer->TEST_batched_handle().TEST_controller(), env_controller);
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_consensus_stuck_peer_call_threshold_ms) = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_consensus_force_recover_from_stuck_peer_call) = true;
+  StringWaiterLogSink log_waiter("Found an RPC call in stuck state");
+  ASSERT_OK(WaitFor([&stuck] {
+    EXPECT_OK(stuck.peer->SignalRequest(RequestTriggerMode::kNonEmptyOnly));
+    return stuck.peer->failed_attempts() == 1;
+  }, 10s, "Stuck call failed"));
+  ASSERT_TRUE(log_waiter.IsEventOccurred());
+  ASSERT_TRUE(GetEnvelope(env)->marked_failed);
+  ASSERT_EQ(stuck.peer->failed_attempts(), 1);
+  ASSERT_TRUE(stuck.follower->received().empty());
+  ASSERT_EQ(answered.peer->failed_attempts(), 0);
+  ASSERT_EQ(answered.follower->received(), Range(1, 2));
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_consensus_stuck_peer_call_threshold_ms) = kNeverMs;
+  ASSERT_OK(stuck.peer->SignalRequest(RequestTriggerMode::kAlwaysSend));
+  ASSERT_NO_FATALS(CompleteUntilIdle(stuck));
+  ASSERT_EQ(stuck.follower->received(), Range(1, 2));
+  ASSERT_NO_FATALS(CompleteUntilIdle(answered));
+  ASSERT_EQ(answered.peer->failed_attempts(), 0);
+}
+
+// Failing a streamed envelope fails only the slots that no frame answered. That holds even when
+// the failure comes through the handle of a peer whose slot is already answered but whose slot
+// task has not yet cleared its handle, as the stuck-call detector of that peer could do: that
+// peer still gets its response.
+TEST_F(ConsensusPeersTest, MarkCallAsFailedFailsOnlyUnansweredSlot) {
+  ASSERT_NO_FATALS(SetUpBatcher(/* heartbeat_batching= */ false, /* data_batching= */ true));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_flush_delay_ms) = kNeverMs;
+  auto answered = NewTestPeer(kFollowerUuid);
+  auto unanswered = NewTestPeer(kFollower2Uuid);
+  for (const auto* test_peer : {&answered, &unanswered}) {
+    ASSERT_NO_FATALS(Negotiate(*test_peer));
+  }
+  std::vector<uint32_t> slots;
+  const auto env = SendStreamedRound({&answered, &unanswered}, &slots);
+  auto* const env_controller = GetEnvelope(env)->controller;
+
+  // Holds the answered peer's slot task before it clears the peer's handle.
+  CountDownLatch entered(1);
+  CountDownLatch release(1);
+  std::vector<std::string> responders;
+  std::mutex mutex;
+  SyncPointScope sync_point;
+  auto release_on_failure = ScopeExit([&release] { release.CountDown(); });
+  sync_point->SetCallBack(
+      "Peer::ProcessBatchedResponse", [&entered, &release, &responders, &mutex](void* arg) {
+        auto* response = static_cast<const LWConsensusResponsePB*>(arg);
+        auto responder = response ? response->responder_uuid().ToBuffer() : "failed";
+        {
+          std::lock_guard lock(mutex);
+          responders.push_back(responder);
+        }
+        if (responder == kFollowerUuid) {
+          entered.CountDown();
+          release.Wait();
+        }
+      });
+  sync_point->EnableProcessing();
+
+  ASSERT_NO_FATALS(DeliverPartial(env, {slots[0]}));
+  ASSERT_TRUE(entered.WaitFor(10s));
+  auto answered_handle = answered.peer->TEST_batched_handle();
+  ASSERT_EQ(answered_handle.TEST_controller(), env_controller);
+  ASSERT_FALSE(answered_handle.finished());
+
+  answered_handle.MarkCallAsFailed();
+  ASSERT_TRUE(GetEnvelope(env)->marked_failed);
+  ASSERT_OK(WaitFor([&unanswered] {
+    return unanswered.peer->failed_attempts() == 1;
+  }, 10s, "Unanswered slot failed"));
+  ASSERT_TRUE(answered_handle.finished());
+  release.CountDown();
+  ASSERT_OK(WaitFor([&answered, env_controller] {
+    return answered.follower->received() == Range(1, 2) &&
+           answered.peer->TEST_batched_handle().TEST_controller() != env_controller;
+  }, 10s, "Answered slot processed"));
+  ASSERT_EQ(answered.peer->failed_attempts(), 0);
+  ASSERT_TRUE(unanswered.follower->received().empty());
+  {
+    std::lock_guard lock(mutex);
+    ASSERT_EQ(std::count(responders.begin(), responders.end(), kFollowerUuid), 1);
+    ASSERT_EQ(std::count(responders.begin(), responders.end(), "failed"), 1);
+  }
+
+  // After its slot task, the answered peer's handle no longer reaches the envelope.
+  auto handle = answered.peer->TEST_batched_handle();
+  if (handle.expired()) {
+    ASSERT_TRUE(handle.finished());
+    ASSERT_FALSE(handle.timeout().Initialized());
+  }
+  sync_point->ClearAllCallBacks();
+  ASSERT_OK(unanswered.peer->SignalRequest(RequestTriggerMode::kAlwaysSend));
+  ASSERT_NO_FATALS(CompleteUntilIdle(unanswered));
+  ASSERT_EQ(unanswered.follower->received(), Range(1, 2));
+  ASSERT_NO_FATALS(CompleteUntilIdle(answered));
 }
 
 void ConsensusPeersTest::SendBatchedHeartbeatThenData(const TestPeer& test_peer) {
