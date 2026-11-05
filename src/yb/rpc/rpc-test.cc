@@ -1081,7 +1081,13 @@ class PartialFramesSetup {
     SetPartialFramesTestState(&state_);
   }
 
+  // Releases a handler that a failed test left held, so the server can shut down.
   ~PartialFramesSetup() {
+    state_.resume.CountDown();
+    state_.resume_final.CountDown();
+    WARN_NOT_OK(
+        WaitFor([this] { return state_.handlers_running == 0; }, 30s, "Handlers done"),
+        "PartialFrames handlers still running");
     SetPartialFramesTestState(nullptr);
   }
 

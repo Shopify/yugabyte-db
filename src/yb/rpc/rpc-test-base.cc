@@ -357,6 +357,9 @@ class CalculatorService: public CalculatorServiceIf {
       const rpc_test::PartialFramesRequestPB* req, rpc_test::PartialFramesResponsePB* resp,
       RpcContext context) override {
     auto* state = partial_frames_test_state.load(std::memory_order_acquire);
+    if (state) {
+      ++state->handlers_running;
+    }
     const auto payload = req->payload();
     uint32_t seq = 0;
     auto send_partial = [&context, &payload, &seq, state] {
@@ -398,6 +401,7 @@ class CalculatorService: public CalculatorServiceIf {
     }
     if (state) {
       state->done.CountDown();
+      --state->handlers_running;
     }
   }
 

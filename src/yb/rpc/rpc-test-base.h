@@ -118,6 +118,8 @@ struct PartialFramesTestState {
   CountDownLatch resume_final{1};
   // Counted down when the handler is done, after its last frame.
   CountDownLatch done{1};
+  // Handlers between start and done.
+  std::atomic<int> handlers_running{0};
 
   std::mutex mutex;
   // RespondPartial results, in call order.
