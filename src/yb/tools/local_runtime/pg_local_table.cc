@@ -30,6 +30,7 @@
 #include "yb/common/wire_protocol.h"
 #include "yb/dockv/partition.h"
 
+DECLARE_int32(ysql_num_shards_per_tserver);
 DECLARE_string(ysql_yb_default_replica_identity);
 
 namespace yb::local_runtime {
@@ -297,7 +298,11 @@ Result<tablet::TableInfoPB> BuildLocalTable(const tserver::PgCreateTableRequestP
   if (!schema.has_column_ids()) schema.InitColumnIdsByDefault();
   auto properties = schema.table_properties();
   properties.SetTransactional(true);
-  properties.SetNumTablets(req.num_tablets() > 0 ? req.num_tablets() : (has_hash ? 4 : 1));
+  // As on a one-tserver universe when ysql_num_shards_per_tserver is set; 4 otherwise.
+  const int32_t default_hash_tablets =
+      FLAGS_ysql_num_shards_per_tserver > 0 ? FLAGS_ysql_num_shards_per_tserver : 4;
+  properties.SetNumTablets(
+      req.num_tablets() > 0 ? req.num_tablets() : (has_hash ? default_hash_tablets : 1));
   PgReplicaIdentity identity;
   SCHECK(
       PgReplicaIdentity_Parse(FLAGS_ysql_yb_default_replica_identity, &identity), InvalidArgument,
