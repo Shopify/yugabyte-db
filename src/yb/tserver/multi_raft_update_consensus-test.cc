@@ -963,6 +963,14 @@ TEST_F(MultiRaftUpdateConsensusTest, SameTabletHeartbeatAndData) {
     auto resp = ASSERT_RESULT(Send(test_case.heartbeat_first_in_request
         ? std::vector<ConsensusRequestPB>{heartbeat, data}
         : std::vector<ConsensusRequestPB>{data, heartbeat}));
+    // The envelope can be answered from inside UpdateAsync, before the second request reaches
+    // AfterUpdate.
+    ASSERT_OK(WaitFor(
+        [&order] {
+          std::lock_guard lock(order.mutex);
+          return order.ran_heartbeat.size() >= 2;
+        },
+        10s, "Both requests passed AfterUpdate"));
     {
       std::lock_guard lock(order.mutex);
       ASSERT_EQ(order.ran_heartbeat,
