@@ -120,8 +120,8 @@ class MultiRaftBatcher : public std::enable_shared_from_this<MultiRaftBatcher> {
    public:
     BatchHandle() = default;
 
-    // Fails the whole batch RPC through MultiRaftBatchSender::MarkCallAsFailed, unless it has
-    // finished.
+    // Fails the batch RPC through MultiRaftBatchSender::MarkCallAsFailed, unless it has finished.
+    // Every request of the batch that no response frame has answered yet gets the failure.
     void MarkCallAsFailed() const;
     std::string CallStateDebugString() const;
     // The batch RPC's timeout.

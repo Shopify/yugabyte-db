@@ -1586,6 +1586,53 @@ TEST_F(MultiRaftBatcherTest, YB_NEVER_DEBUG_TEST(StreamedMalformedPartialDropped
   ASSERT_EQ(CounterValue(METRIC_multi_raft_envelopes_failed) - failed_before, 1);
 }
 
+// A final that cannot be matched to its requests (an index count that differs from its responses,
+// or responses without index after partial frames) is logged at DFATAL, which is fatal in debug
+// builds, and nothing is taken from it: every slot no earlier frame answered fails with
+// IllegalState, once, and the envelope counts once.
+TEST_F(MultiRaftBatcherTest, YB_NEVER_DEBUG_TEST(StreamedMalformedFinal)) {
+  CreateBatcher();
+  struct Case {
+    const char* log_text;
+    bool with_index;
+  };
+  const std::vector<Case> cases = {
+      {"Malformed MultiRaft final response: 1 indices for 2 responses", true},
+      {"MultiRaft final response has no index after partial frames", false},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.log_text);
+    auto& d0 = NewCall(Format("t$0-0", c.with_index));
+    auto& d1 = NewCall(Format("t$0-1", c.with_index));
+    auto& d2 = NewCall(Format("t$0-2", c.with_index));
+    const auto env = SendStreamed(DataCalls({&d0, &d1, &d2}));
+    const auto failed_before = CounterValue(METRIC_multi_raft_envelopes_failed);
+    StringWaiterLogSink log_waiter(c.log_text);
+    ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
+    ASSERT_NO_FATALS(WaitDone(d0));
+    auto final_frame = Frame(env, {1, 2}, c.with_index);
+    if (c.with_index) {
+      final_frame.clear_index();
+      final_frame.add_index(1);
+    }
+    ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK(), final_frame));
+    ASSERT_NO_FATALS(WaitReleased(d1));
+    ASSERT_NO_FATALS(WaitReleased(d2));
+    ASSERT_OK(d0.status);
+    ASSERT_EQ(d0.response.responder_uuid(), d0.tablet_id + "-resp");
+    for (auto* call : {&d1, &d2}) {
+      ASSERT_TRUE(call->status.IsIllegalState()) << call->tablet_id << ": " << call->status;
+      ASSERT_STR_CONTAINS(call->status.message().ToBuffer(), "has no response for request");
+      ASSERT_FALSE(call->had_response);
+    }
+    for (auto* call : {&d0, &d1, &d2}) {
+      ASSERT_EQ(call->num_callbacks.load(), 1) << call->tablet_id;
+    }
+    ASSERT_EQ(log_waiter.GetEventCount(), 1);
+    ASSERT_EQ(CounterValue(METRIC_multi_raft_envelopes_failed) - failed_before, 1);
+  }
+}
+
 // A final without index after no partial frame comes from a follower that did not stream: every
 // response, in request order. With the wrong number of responses, every slot fails as for an
 // envelope answered once.

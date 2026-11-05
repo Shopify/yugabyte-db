@@ -207,7 +207,8 @@ Status Peer::SignalRequest(RequestTriggerMode trigger_mode) {
     // timeout is not initialized, then we won't be able to recover it (we didn't see this situation
     // in production).
     // A batched data request is sent on its batch's controller, and controller_ still holds the
-    // state of the last direct call. Failing the batch fails every request in it.
+    // state of the last direct call. Failing the batch fails every request in it that no
+    // response frame has answered yet.
     bool batched;
     MultiRaftBatcher::BatchHandle batched_handle;
     CoarseTimePoint batched_send_time;
