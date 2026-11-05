@@ -2198,6 +2198,45 @@ TEST_F(MultiRaftUpdateConsensusTest, BatcherStreamsAroundSlowSlot) {
   ASSERT_FALSE(frame_errors.IsEventOccurred());
 }
 
+// Many streamed envelopes whose requests complete together, so frames are built concurrently and
+// the final follows partial frames closely. The leader receives every request's response exactly
+// once from the real follower's frames: none is missing, duplicated or malformed.
+TEST_F(MultiRaftUpdateConsensusTest, BatcherStreamsCoincidingCompletions) {
+  constexpr int kRounds = 200;
+  constexpr size_t kTablets = 8;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = true;
+  ASSERT_NO_FATALS(StartServer(kTablets));
+  ASSERT_NO_FATALS(CreateBatcher());
+  RegexWaiterLogSink frame_errors(kLeaderFrameErrors);
+  const auto frames_sent_before = FramesSent();
+  for (int round = 0; round != kRounds; ++round) {
+    // The first request goes out alone; the others wait for its response and then go out
+    // together (in more than one envelope if that response arrives during the adds).
+    std::vector<BatchedCall*> calls;
+    for (size_t i = 0; i != kTablets; ++i) {
+      calls.push_back(&AddToBatcher(Data(&tablets_[i], 1, /* commit= */ false)));
+    }
+    for (size_t i = 0; i != kTablets; ++i) {
+      auto* call = calls[i];
+      ASSERT_OK(WaitFor([call] { return IsDone(*call); }, 10s, "Answered"));
+      ASSERT_TRUE(call->status.ok())
+          << "round " << round << ", tablet " << i << ": " << call->status;
+      ASSERT_NO_FATALS(AssertSlotOk(call->response, tablets_[i].last));
+    }
+    for (auto* call : calls) {
+      ASSERT_OK(WaitFor([call] { return call->handle.expired(); }, 10s, "Batch released"));
+    }
+  }
+  ASSERT_GE(LeaderCounter(METRIC_multi_raft_envelopes_sent), 2 * kRounds);
+  const auto frames_received = LeaderCounter(METRIC_multi_raft_frames_received);
+  ASSERT_OK(WaitForFramesSent(frames_sent_before + frames_received));
+  ASSERT_EQ(FramesSent() - frames_sent_before, frames_received);
+  ASSERT_EQ(LeaderCounter(METRIC_multi_raft_envelopes_failed), 0);
+  ASSERT_FALSE(frame_errors.IsEventOccurred());
+  LOG(INFO) << "Frames received: " << frames_received << " for "
+            << LeaderCounter(METRIC_multi_raft_envelopes_sent) << " envelopes";
+}
+
 // A follower that does not stream (here its serial handler, with its data flag off) answers once,
 // without index. The streaming leader takes that as every response in request order, so the
 // requests complete together.
