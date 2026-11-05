@@ -3138,8 +3138,9 @@ class MultiRaftUpdateState : public std::enable_shared_from_this<MultiRaftUpdate
 // arena) stay alive until the task and RaftConsensus::UpdateAsync drop it: after the update,
 // including its durability wait and FinishUpdate, completes. Replicate messages appended from the
 // sub-request also hold the params, until they are applied and evicted from the log cache, as on
-// the direct UpdateConsensus path. The response is a message of its own, kept by the state once
-// the sub-request completes; the task's tablet peer and consensus are released before then.
+// the direct UpdateConsensus path. The response is a message of its own, which the state keeps
+// once the sub-request completes. The tablet peer and consensus are released when the task and
+// the completion callback return, so they may be gone before the RPC is answered.
 //
 // Accepted cost: a sub-request still running after the response, for example one blocked on the
 // tablet's update_mutex_ or a slow log past the deadline, pins the whole envelope buffer rather
