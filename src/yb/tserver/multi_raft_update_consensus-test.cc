@@ -198,6 +198,13 @@ class StreamSyncPoints {
         completions_.push_back({info.index, info.accepted});
       }
     });
+    sync_point->SetCallBack("MultiRaftUpdateState::DeadlineExpired", [this](void* arg) {
+      auto& info = *static_cast<MultiRaftUpdateSyncPointArg*>(arg);
+      std::lock_guard lock(mutex_);
+      if (Track(info.envelope)) {
+        deadline_timed_out_.push_back(info.num_slots);
+      }
+    });
     sync_point->SetCallBack("MultiRaftUpdateState::SenderBeforeSend", [this](void* arg) {
       auto& info = *static_cast<MultiRaftUpdateSyncPointArg*>(arg);
       {
@@ -260,6 +267,16 @@ class StreamSyncPoints {
     }, 30s, Format("Request $0 completed, accepted: $1", index, accepted));
   }
 
+  // Waits until the deadline has fired, and returns how many slots it timed out.
+  Result<size_t> WaitDeadline() {
+    RETURN_NOT_OK(WaitFor([this] {
+      std::lock_guard lock(mutex_);
+      return !deadline_timed_out_.empty();
+    }, 30s, "Deadline fired"));
+    std::lock_guard lock(mutex_);
+    return deadline_timed_out_.front();
+  }
+
   std::vector<Send> sends() {
     std::lock_guard lock(mutex_);
     return sends_;
@@ -292,6 +309,8 @@ class StreamSyncPoints {
   const void* envelope_ GUARDED_BY(mutex_) = nullptr;
   std::vector<Send> sends_ GUARDED_BY(mutex_);
   std::vector<Completion> completions_ GUARDED_BY(mutex_);
+  // Slots timed out by each DeadlineExpired.
+  std::vector<size_t> deadline_timed_out_ GUARDED_BY(mutex_);
   size_t releases_ GUARDED_BY(mutex_) = 0;
   bool held_ GUARDED_BY(mutex_) = false;
 };
@@ -1664,6 +1683,57 @@ TEST_F(MultiRaftUpdateConsensusTest, StreamedDeadlineRacesCompletion) {
   ASSERT_NO_FATALS(AssertSlotOk(result.merged.consensus_response(0), tablets_[0].last));
   ASSERT_NO_FATALS(AssertSlotError(result.merged.consensus_response(1), AppStatusPB::TIMED_OUT));
   ASSERT_EQ(sync_points.sends().size(), 2);
+}
+
+// The deadline fires while every slot is already ready, one of them waiting for the busy sender.
+// It times nothing out, counts nothing, and the sender sends the final.
+TEST_F(MultiRaftUpdateConsensusTest, StreamedDeadlineWithEverySlotReady) {
+  ASSERT_NO_FATALS(StartServer(2));
+  std::unique_ptr<Envelope> envelope;
+  const auto deadline_responses_before = DeadlineResponses();
+  StreamSyncPoints sync_points(
+      /* hold_send= */ 1, /* hold_release= */ 0, /* hold_update= */ tablets_[1].id);
+  // As in StreamedDeadlineRacesCompletion, the steps after the deadline wait for no timer.
+  envelope = SendRecordedAsync(
+      {Data(&tablets_[0], 1, true), Data(&tablets_[1], 1, true)}, 6s * kTimeMultiplier);
+  // The sender holds slot 0's frame, and slot 1 becomes ready behind it.
+  ASSERT_OK(sync_points.WaitHeld());
+  sync_points.ResumeUpdate();
+  ASSERT_OK(sync_points.WaitCompleted(1, /* accepted= */ true));
+  ASSERT_EQ(ASSERT_RESULT(sync_points.WaitDeadline()), 0);
+  sync_points.Resume();
+  auto result = ASSERT_RESULT(WaitStreamed(envelope.get()));
+  ASSERT_EQ(result.PartialIndices(), (std::set<uint32_t>{0}));
+  ASSERT_EQ(result.FinalIndices(), (std::set<uint32_t>{1}));
+  ASSERT_NO_FATALS(AssertSlotOk(result.merged.consensus_response(0), tablets_[0].last));
+  ASSERT_NO_FATALS(AssertSlotOk(result.merged.consensus_response(1), tablets_[1].last));
+  ASSERT_EQ(DeadlineResponses(), deadline_responses_before);
+  // Only the held sender sent.
+  ASSERT_EQ(sync_points.sends().size(), 2);
+}
+
+// When every sub-request fails before dispatch, the handler thread sends the final, with index,
+// before the deadline and without partial frames.
+TEST_F(MultiRaftUpdateConsensusTest, StreamedAllSubRequestsFailBeforeDispatch) {
+  ASSERT_NO_FATALS(StartServer(1));
+  const auto deadline_responses_before = DeadlineResponses();
+  const auto frames_before = FramesSent();
+  auto wrong_uuid = Heartbeat(tablets_[0]);
+  wrong_uuid.set_dest_uuid("no-such-server");
+  auto unknown_tablet = Heartbeat(tablets_[0]);
+  unknown_tablet.set_tablet_id("no-such-tablet");
+  auto envelope = SendRecordedAsync({wrong_uuid, unknown_tablet}, 30s);
+  auto result = ASSERT_RESULT(WaitStreamed(envelope.get()));
+  ASSERT_LT(envelope->elapsed(), 5s);
+  ASSERT_EQ(result.partials.size(), 0);
+  ASSERT_EQ(result.FinalIndices(), (std::set<uint32_t>{0, 1}));
+  ASSERT_EQ(result.merged.consensus_response(0).error().code(),
+            TabletServerErrorPB::WRONG_SERVER_UUID);
+  ASSERT_EQ(result.merged.consensus_response(1).error().code(),
+            TabletServerErrorPB::TABLET_NOT_FOUND);
+  ASSERT_OK(WaitForFramesSent(frames_before + 1));
+  ASSERT_EQ(FramesSent() - frames_before, 1);
+  ASSERT_EQ(DeadlineResponses(), deadline_responses_before);
 }
 
 // A completion appended after the sender found the ready list empty, but before it gave up its

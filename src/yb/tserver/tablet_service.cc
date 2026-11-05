@@ -3014,7 +3014,8 @@ CoarseTimePoint MultiRaftUpdateDeadline(CoarseTimePoint client_deadline) {
 //
 // Each sub-request's slot goes pending -> ready -> sent. It becomes ready when the sub-request
 // completes or when the deadline times it out, whichever comes first (a result is taken only from
-// pending), and sent once a frame carrying it is queued.
+// pending). In streaming mode it becomes sent when the sender takes it for a frame, and goes back
+// to ready if that frame cannot be sent.
 //
 // Without stream_responses the RPC is answered once, by whoever makes the last slot ready, with
 // resp_ in request order and without index.
@@ -3033,9 +3034,11 @@ CoarseTimePoint MultiRaftUpdateDeadline(CoarseTimePoint client_deadline) {
 //
 // Slots are completed, and frames therefore sent, on the handler thread (pre-dispatch failures),
 // multi_raft_update pool threads, raft_notifications_pool (durability waits), messenger scheduler
-// threads (the envelope deadline, a durability-wait timer aborted at shutdown) and threads that
-// shut a pool down (dropped tasks). None is a reactor thread, where RespondPartial cannot keep
-// frames in order.
+// threads (the envelope deadline, a durability-wait timer aborted at shutdown), threads that shut
+// a pool down (dropped tasks), and any thread whose enqueue onto a closing pool runs the task's
+// Done inline: the handler thread while it dispatches (multi_raft_update pool), or a log thread
+// that fires a durability waiter or closes the log (raft_notifications_pool). None is a reactor
+// thread, where RespondPartial cannot keep frames in order.
 //
 // A ready slot keeps the sub-request's own response, allocated for RaftConsensus::UpdateAsync,
 // which frames reference (push_back_ref). Frames are serialized before RespondPartial or
@@ -3255,6 +3258,10 @@ class MultiRaftUpdateState : public std::enable_shared_from_this<MultiRaftUpdate
       } else {
         slots = FillResponseUnlocked();
       }
+    }
+    if (stream_) {
+      MultiRaftUpdateSyncPointArg arg{.envelope = this, .num_slots = timed_out};
+      TEST_SYNC_POINT_CALLBACK("MultiRaftUpdateState::DeadlineExpired", &arg);
     }
     // In streaming mode every slot can already be ready, waiting for a busy sender; the deadline
     // then changes nothing.
@@ -3682,8 +3689,9 @@ void ConsensusServiceImpl::MultiRaftUpdateConsensusConcurrently(
     state->ArmDeadline(&messenger_->scheduler(), deadline);
   }
   // Every sub-request is dispatched before the failed ones are completed: completing a slot can
-  // make the handler thread send a frame, which must not delay the dispatch. In streaming mode the
-  // failed slots then go out together.
+  // make the handler thread send a frame, which should not delay the dispatch. That still happens
+  // when the pool is shutting down, since Enqueue then completes the task inline. In streaming
+  // mode the failed slots go out together.
   for (size_t i = 0; i != num_requests; ++i) {
     auto& sub_request = sub_requests[i];
     if (sub_request.status.ok()) {

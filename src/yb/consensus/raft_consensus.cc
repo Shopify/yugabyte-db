@@ -1688,8 +1688,10 @@ Status RaftConsensus::Update(
 // WaitForWrites()'s loop. A tick runs that loop's body once (WriteNotYetDurable), so the deadline,
 // the term check, and the failure-detector snooze and vote withholding while the append is pending
 // keep WaitForWrites()'s order and raft_heartbeat_interval_ms cadence. The log callback and the
-// timer only re-post to raft_notifications_pool: neither the appender thread nor the scheduler
-// thread runs consensus work. Holds the RaftConsensus alive until completion.
+// timer only re-post to raft_notifications_pool: neither the log thread nor the scheduler thread
+// runs consensus work. If the pool rejects the post (it is shutting down), the wait fails on that
+// thread, and the caller's callback runs there with the error. Holds the RaftConsensus alive until
+// completion.
 class RaftConsensus::AsyncWriteWait : public std::enable_shared_from_this<AsyncWriteWait> {
  public:
   AsyncWriteWait(

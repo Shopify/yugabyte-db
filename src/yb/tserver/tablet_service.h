@@ -77,9 +77,10 @@ struct MultiRaftUpdateMetrics;
 
 // The argument of the test sync points of a MultiRaftUpdateConsensus RPC whose responses are
 // streamed: MultiRaftUpdateState::Completed (a sub-request's result was handled),
-// MultiRaftUpdateState::SenderBeforeSend (the sender took slots for a frame and has not built it)
-// and MultiRaftUpdateState::SenderBeforeRelease (the sender found nothing to send and is about to
-// give up its role).
+// MultiRaftUpdateState::DeadlineExpired (the deadline has set the slots still pending to TimedOut
+// and has not sent anything yet), MultiRaftUpdateState::SenderBeforeSend (the sender took
+// slots for a frame and has not built it) and MultiRaftUpdateState::SenderBeforeRelease (the
+// sender found nothing to send and is about to give up its role).
 struct MultiRaftUpdateSyncPointArg {
   // The same for every sync point of one RPC.
   const void* envelope = nullptr;
@@ -88,6 +89,7 @@ struct MultiRaftUpdateSyncPointArg {
   size_t index = 0;
   bool accepted = false;
   // SenderBeforeSend: the number of slots taken for the frame, and whether it is the final.
+  // DeadlineExpired: the number of slots it timed out.
   size_t num_slots = 0;
   bool final = false;
 };
