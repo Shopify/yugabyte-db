@@ -59,6 +59,7 @@
 #include "yb/util/test_util.h"
 #include "yb/yql/pgwrapper/libpq_utils.h"
 
+DECLARE_int32(ysql_num_shards_per_tserver);
 DECLARE_bool(yb_enable_read_committed_isolation);
 DECLARE_string(ysql_sequence_cache_method);
 
@@ -2014,6 +2015,28 @@ TEST_F(ReadonlyPgServerTest, StandaloneHashRanges) {
   ASSERT_EQ(
       ASSERT_RESULT(connection.FetchRow<std::string>("SELECT v FROM range_table WHERE k=1")),
       "one");
+}
+
+TEST_F(ReadonlyPgServerTest, DefaultHashTabletsFollowShardFlag) {
+  auto server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          GetTestPath("shard-flag"), Snapshot(), AllocateFreePort(),
+          CatalogMode::kSerializedTransactions));
+  auto connection = ASSERT_RESULT(Connect(*server));
+  const auto tablets = [&connection](const std::string& table) -> Result<int64_t> {
+    return connection.FetchRow<int64_t>(
+        "SELECT num_tablets::bigint FROM yb_table_properties('" + table + "'::regclass)");
+  };
+  ASSERT_OK(connection.Execute("CREATE TABLE default_shards (h bigint PRIMARY KEY)"));
+  ASSERT_EQ(ASSERT_RESULT(tablets("default_shards")), 4);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_num_shards_per_tserver) = 1;
+  ASSERT_OK(connection.Execute("CREATE TABLE one_shard (h bigint PRIMARY KEY)"));
+  ASSERT_EQ(ASSERT_RESULT(tablets("one_shard")), 1);
+  ASSERT_OK(connection.Execute(
+      "CREATE TABLE explicit_shards (h bigint PRIMARY KEY) SPLIT INTO 2 TABLETS"));
+  ASSERT_EQ(ASSERT_RESULT(tablets("explicit_shards")), 2);
+  ASSERT_OK(connection.Execute("INSERT INTO one_shard SELECT generate_series(1, 100)"));
+  ASSERT_EQ(ASSERT_RESULT(connection.FetchRow<int64_t>("SELECT count(*) FROM one_shard")), 100);
 }
 
 TEST_F(ReadonlyPgServerTest, CreatesAndWritesApplicationTables) {
