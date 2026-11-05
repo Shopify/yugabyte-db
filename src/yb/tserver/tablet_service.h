@@ -475,8 +475,8 @@ class ConsensusServiceImpl : public consensus::ConsensusServiceIf {
   // error isolation. With enable_multi_raft_data_batching set (read once per RPC), the
   // sub-requests are processed concurrently (MultiRaftUpdateConsensusConcurrently); otherwise one
   // after another on the handler thread.
-  void MultiRaftUpdateConsensus(const consensus::MultiRaftConsensusRequestPB *req,
-                                consensus::MultiRaftConsensusResponsePB *resp,
+  void MultiRaftUpdateConsensus(const consensus::LWMultiRaftConsensusRequestPB* req,
+                                consensus::LWMultiRaftConsensusResponsePB* resp,
                                 rpc::RpcContext context) override;
 
   void RequestConsensusVote(const consensus::VoteRequestPB* req,
@@ -529,8 +529,8 @@ class ConsensusServiceImpl : public consensus::ConsensusServiceIf {
   // other sub-requests wait for them. The wait for durability does not hold a thread
   // (RaftConsensus::UpdateAsync). The RPC is answered when the last slot is filled, or at the
   // deadline with the unfilled slots set to TimedOut.
-  void MultiRaftUpdateConsensusConcurrently(const consensus::MultiRaftConsensusRequestPB* req,
-                                            consensus::MultiRaftConsensusResponsePB* resp,
+  void MultiRaftUpdateConsensusConcurrently(const consensus::LWMultiRaftConsensusRequestPB* req,
+                                            consensus::LWMultiRaftConsensusResponsePB* resp,
                                             rpc::RpcContext context);
 
   TabletPeerLookupIf* tablet_manager_;
