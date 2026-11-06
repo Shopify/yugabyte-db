@@ -4341,6 +4341,20 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingStreamingWorkload) {
       cluster_.get(), "multi_raft_batched_response_processing_us", "total_count"), 0);
   ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_envelopes_failed"), 0);
   ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_update_deadline_responses"), 0);
+  // What sent the envelopes, and how long data requests waited, under the flush flags the
+  // environment set; for comparing runs.
+  std::string flushes;
+  for (const auto* reason :
+       {"paced_inline", "paced_timer", "immediate", "response_clocked", "deadline", "count_cap",
+        "bytes_cap", "timer"}) {
+    flushes += Format(
+        " $0=$1", reason,
+        SumServerMetric(cluster_.get(), Format("multi_raft_flush_$0", reason).c_str()));
+  }
+  LOG(INFO) << "Multi-Raft flushes:" << flushes << ", data add to send: count="
+            << SumServerMetric(cluster_.get(), "multi_raft_data_add_to_send_us", "total_count")
+            << " sum_us="
+            << SumServerMetric(cluster_.get(), "multi_raft_data_add_to_send_us", "total_sum");
 
   ASSERT_NO_FATALS(AssertNoBatchingErrorLines(error_lines.get()));
   ClusterVerifier cluster_verifier(cluster_.get());
