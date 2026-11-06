@@ -1602,6 +1602,9 @@ TEST_F(ConsensusPeersTest, YB_NEVER_DEBUG_TEST(StuckBatchIsDetectedAndFailed)) {
 // request no peer owns, and are sent by its response-clocked flush.
 size_t ConsensusPeersTest::SendStreamedRound(
     const std::vector<const TestPeer*>& peers, std::vector<uint32_t>* slots) {
+  // The requests wait for the blocker's completion only under response clocking; pacing would
+  // send them on its timer, in envelopes of their own.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_flush_window_us) = 0;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = false;
   ConsensusRequestPB blocker;
   blocker.set_dest_uuid("blocker");
