@@ -41,6 +41,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <unordered_map>
 
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/dynamic_message.h>
@@ -60,6 +61,7 @@
 #include "yb/common/pg_catversions.h"
 #include "yb/common/transaction.h"
 #include "yb/common/wire_protocol.h"
+#include "yb/common/ysql_operation_lease.h"
 
 #include "yb/consensus/metadata.pb.h"
 
@@ -143,15 +145,13 @@ DEFINE_NON_RUNTIME_string(from_snapshot, "",
     "Copy a --snapshot_dir into --data_dir first, then behave like --resume.");
 DEFINE_NON_RUNTIME_int32(run_seconds, 0,
     "Stay up this long after loading, tservers heartbeating; 0 = until SIGINT/SIGTERM.");
-DEFINE_NON_RUNTIME_int32(heartbeat_interval_ms, 1000, "Hollow tserver heartbeat interval.");
-DEFINE_NON_RUNTIME_int32(full_metrics_beat_period, 5,
-    "Send the tablet metrics payload (storage_metadata + leader_info) every Nth heartbeat, "
-    "matching the real tserver's 5s metrics cadence.");
-DEFINE_NON_RUNTIME_bool(send_lease_refreshes, true,
-    "Send the per-second RefreshYsqlLease RPC from every hollow tserver.");
-DEFINE_NON_RUNTIME_int32(connectivity_check_interval_ms, 60000,
-    "ListTabletServers interval per hollow tserver, matching the real tserver's connectivity "
-    "poller.");
+// Tserver flags the hollow tservers follow; the spawned yb-tserver gets the same values.
+DECLARE_int32(heartbeat_interval_ms);
+DECLARE_int32(tserver_heartbeat_metrics_interval_ms);
+DECLARE_bool(enable_ysql_operation_lease);
+DECLARE_uint64(ysql_lease_refresher_interval_ms);
+DECLARE_bool(tserver_heartbeat_metrics_send_tablet_metadata_on_change);
+
 DEFINE_NON_RUNTIME_string(master_bin, "", "Path to the yb-master binary (required).");
 DEFINE_NON_RUNTIME_string(tserver_bin, "", "Path to the yb-tserver binary (required).");
 DEFINE_NON_RUNTIME_string(ysqlsh_bin, "",
@@ -335,6 +335,28 @@ class HollowTServer {
     tablets_.erase(tablet_id);
     dirty_.erase(tablet_id);
     removed_.insert(tablet_id);
+    storage_acked_.erase(tablet_id);
+    compaction_acked_.erase(tablet_id);
+  }
+
+  // Hollow tablet sizes never change, so acked entries are only resent after a full report.
+  bool SendStorageMetadata(const string& tablet_id) REQUIRES(mutex_) {
+    if (FLAGS_tserver_heartbeat_metrics_send_tablet_metadata_on_change &&
+        storage_acked_.contains(tablet_id)) {
+      return false;
+    }
+    storage_pending_.insert(tablet_id);
+    return true;
+  }
+
+  // Same for compaction statuses: hollow tablets never compact.
+  bool SendFullCompactionStatus(const string& tablet_id) REQUIRES(mutex_) {
+    if (FLAGS_tserver_heartbeat_metrics_send_tablet_metadata_on_change &&
+        compaction_acked_.contains(tablet_id)) {
+      return false;
+    }
+    compaction_pending_.insert(tablet_id);
+    return true;
   }
 
   size_t NumTablets() {
@@ -361,15 +383,13 @@ class HollowTServer {
     }
   }
 
-  // mirror_tmpl, when set, is a captured real-tserver request used as the payload; the metrics
-  // shape then follows metrics_override instead of the hb_seq_ cadence.
+  // mirror_tmpl, when set, is a captured real-tserver request used as the payload.
   void FillHeartbeat(const string& universe_uuid, const master::TSHeartbeatRequestPB* mirror_tmpl,
-                     std::optional<bool> metrics_override, master::TSHeartbeatRequestPB* req) {
+                     bool metrics_beat, master::TSHeartbeatRequestPB* req) {
     req->Clear();
     std::lock_guard l(mutex_);
-    const bool metrics_beat = metrics_override.has_value()
-        ? *metrics_override
-        : hb_seq_ % FLAGS_full_metrics_beat_period == 0;
+    storage_pending_.clear();
+    compaction_pending_.clear();
     ++hb_seq_;
     // Registration and full reports need synthetic state the template can't carry.
     if (mirror_tmpl != nullptr && !needs_registration_ && !full_report_active_) {
@@ -380,6 +400,7 @@ class HollowTServer {
     auto* instance = req->mutable_common()->mutable_ts_instance();
     instance->set_permanent_uuid(uuid_);
     instance->set_instance_seqno(instance_seqno_);
+    req->set_tserver_list_version(tserver_list_version_);
     if (!universe_uuid.empty()) {
       req->set_universe_uuid(universe_uuid);
     }
@@ -431,30 +452,30 @@ class HollowTServer {
       path_metric->set_used_space(tablets_.size() * (kSstBytes + kWalBytes));
       path_metric->set_total_space(1ULL << 40);
       for (const auto& [tablet_id, info] : tablets_) {
-        auto* storage = req->add_storage_metadata();
-        storage->set_tablet_id(tablet_id);
-        storage->set_sst_file_size(kSstBytes);
-        storage->set_wal_file_size(kWalBytes);
-        storage->set_uncompressed_sst_file_size(kSstBytes * 3 / 2);
-        storage->set_total_size(kSstBytes + kWalBytes);
-        storage->set_vector_index_size(0);
-        storage->set_has_active_vector_index_backfill(false);
-        storage->set_may_have_orphaned_post_split_data(false);
-        // The real provider adds leader_info for every hosted tablet, not just led ones;
-        // followers report NO_MAJORITY_REPLICATED_LEASE without an expiration.
-        auto* leader = req->add_leader_info();
-        leader->set_tablet_id(tablet_id);
+        if (SendStorageMetadata(tablet_id)) {
+          auto* storage = req->add_storage_metadata();
+          storage->set_tablet_id(tablet_id);
+          storage->set_sst_file_size(kSstBytes);
+          storage->set_wal_file_size(kWalBytes);
+          storage->set_uncompressed_sst_file_size(kSstBytes * 3 / 2);
+          storage->set_total_size(kSstBytes + kWalBytes);
+          storage->set_vector_index_size(0);
+          storage->set_has_active_vector_index_backfill(false);
+          storage->set_may_have_orphaned_post_split_data(false);
+        }
+        // The real provider adds leader_info only for tablets this tserver leads.
         if (info.leader_uuid == uuid_) {
+          auto* leader = req->add_leader_info();
+          leader->set_tablet_id(tablet_id);
           leader->set_leader_lease_status(consensus::LeaderLeaseStatus::HAS_LEASE);
           leader->set_ht_lease_expiration((now_micros + 2 * 1000 * 1000) << 12);
-        } else {
-          leader->set_leader_lease_status(
-              consensus::LeaderLeaseStatus::NO_MAJORITY_REPLICATED_LEASE);
         }
-        auto* compaction = req->add_full_compaction_statuses();
-        compaction->set_tablet_id(tablet_id);
-        compaction->set_full_compaction_state(tablet::IDLE);
-        compaction->set_last_full_compaction_time(0);
+        if (SendFullCompactionStatus(tablet_id)) {
+          auto* compaction = req->add_full_compaction_statuses();
+          compaction->set_tablet_id(tablet_id);
+          compaction->set_full_compaction_state(tablet::IDLE);
+          compaction->set_last_full_compaction_time(0);
+        }
       }
     }
   }
@@ -478,6 +499,9 @@ class HollowTServer {
     if (resp.has_tablet_report_limit()) {
       tablet_report_limit_ = resp.tablet_report_limit();
     }
+    if (resp.has_tserver_list_update()) {
+      ApplyTServerListUpdateUnlocked(resp.tserver_list_update());
+    }
     if (resp.has_ysql_catalog_version()) {
       ysql_catalog_version_ = resp.ysql_catalog_version();
     }
@@ -493,7 +517,15 @@ class HollowTServer {
         dirty_.erase(update.tablet_id());
       }
     }
+    if (resp.tablet_metadata_processed()) {
+      storage_acked_.insert(storage_pending_.begin(), storage_pending_.end());
+      compaction_acked_.insert(compaction_pending_.begin(), compaction_pending_.end());
+    }
+    storage_pending_.clear();
+    compaction_pending_.clear();
     if (resp.needs_full_tablet_report()) {
+      storage_acked_.clear();
+      compaction_acked_.clear();
       full_report_queue_.clear();
       for (const auto& [tablet_id, _] : tablets_) {
         full_report_queue_.push_back(tablet_id);
@@ -583,6 +615,7 @@ class HollowTServer {
     auto* instance = req->mutable_common()->mutable_ts_instance();
     instance->set_permanent_uuid(uuid_);
     instance->set_instance_seqno(instance_seqno_);
+    req->set_tserver_list_version(tserver_list_version_);
     req->clear_registration();
     // The template carries the real tserver's fingerprint; ours decides whether the master
     // sends us catalog versions, exactly as for a real tserver.
@@ -650,28 +683,42 @@ class HollowTServer {
     }
     int i = 0;
     for (const auto& [tablet_id, info] : tablets_) {
-      if (!tmpl_storage.empty()) {
+      if (!tmpl_storage.empty() && SendStorageMetadata(tablet_id)) {
         auto* storage = req->add_storage_metadata();
         *storage = tmpl_storage.Get(i % tmpl_storage.size());
         storage->set_tablet_id(tablet_id);
       }
-      if (!tmpl_compactions.empty()) {
+      if (!tmpl_compactions.empty() && SendFullCompactionStatus(tablet_id)) {
         auto* compaction = req->add_full_compaction_statuses();
         *compaction = tmpl_compactions.Get(i % tmpl_compactions.size());
         compaction->set_tablet_id(tablet_id);
       }
-      if (!tmpl_leaders.empty()) {
+      if (!tmpl_leaders.empty() && info.leader_uuid == uuid_) {
         auto* leader = req->add_leader_info();
-        if (info.leader_uuid == uuid_ && leader_tmpl_idx >= 0) {
-          *leader = tmpl_leaders.Get(leader_tmpl_idx);
-        } else {
-          leader->set_leader_lease_status(
-              consensus::LeaderLeaseStatus::NO_MAJORITY_REPLICATED_LEASE);
-        }
+        *leader = tmpl_leaders.Get(
+            leader_tmpl_idx >= 0 ? leader_tmpl_idx : i % tmpl_leaders.size());
         leader->set_tablet_id(tablet_id);
       }
       ++i;
     }
+  }
+
+  // Same rules as TabletServer::ApplyTServerListUpdate; a stale delta has nothing new.
+  void ApplyTServerListUpdateUnlocked(const master::TServerListUpdatePB& update)
+      REQUIRES(mutex_) {
+    if (!update.full() && update.version() <= tserver_list_version_) {
+      return;
+    }
+    if (update.full()) {
+      known_tservers_.clear();
+    }
+    for (const auto& uuid : update.removed()) {
+      known_tservers_.erase(uuid);
+    }
+    for (const auto& entry : update.tservers()) {
+      known_tservers_[entry.instance().permanent_uuid()] = entry.alive();
+    }
+    tserver_list_version_ = update.version();
   }
 
   void FillTabletReport(master::TSHeartbeatRequestPB* req) REQUIRES(mutex_) {
@@ -758,6 +805,10 @@ class HollowTServer {
   std::map<string, TabletInfo> tablets_ GUARDED_BY(mutex_);
   std::set<string> dirty_ GUARDED_BY(mutex_);
   std::set<string> removed_ GUARDED_BY(mutex_);
+  std::set<string> storage_acked_ GUARDED_BY(mutex_);
+  std::set<string> storage_pending_ GUARDED_BY(mutex_);
+  std::set<string> compaction_acked_ GUARDED_BY(mutex_);
+  std::set<string> compaction_pending_ GUARDED_BY(mutex_);
   std::deque<string> full_report_queue_ GUARDED_BY(mutex_);
   bool full_report_active_ GUARDED_BY(mutex_) = false;
   bool full_report_started_ GUARDED_BY(mutex_) = false;
@@ -774,6 +825,8 @@ class HollowTServer {
   uint64_t hb_seq_ GUARDED_BY(mutex_) = 0;
   uint64_t ysql_catalog_version_ GUARDED_BY(mutex_) = 0;
   std::map<uint32_t, CatalogVersion> db_catalog_versions_ GUARDED_BY(mutex_);
+  uint64_t tserver_list_version_ GUARDED_BY(mutex_) = 0;
+  std::unordered_map<string, bool> known_tservers_ GUARDED_BY(mutex_);  // uuid -> alive
 
  public:
   bool MarkRegistrationInFlight() {
@@ -918,6 +971,12 @@ class HollowTSAdminService : public tserver::TabletServerAdminServiceIf {
                             tserver::GetPgSocketDirResponsePB)
   HOLLOW_UNSUPPORTED_METHOD(GetActiveRbsInfo, tserver::GetActiveRbsInfoRequestPB,
                             tserver::GetActiveRbsInfoResponsePB)
+  HOLLOW_UNSUPPORTED_METHOD(TableBackfillChunk, tserver::TableBackfillChunkRequestPB,
+                            tserver::TableBackfillChunkResponsePB)
+  HOLLOW_UNSUPPORTED_METHOD(AlterTabletTier, tserver::AlterTabletTierRequestPB,
+                            tserver::AlterTabletTierResponsePB)
+  HOLLOW_UNSUPPORTED_METHOD(GetTabletTierInfo, tserver::GetTabletTierInfoRequestPB,
+                            tserver::GetTabletTierInfoResponsePB)
 #undef HOLLOW_UNSUPPORTED_METHOD
 
  private:
@@ -1101,6 +1160,9 @@ class HollowTSService : public tserver::TabletServerServiceIf {
   HOLLOW_UNSUPPORTED_METHOD(GetMetrics, tserver::GetMetricsRequestPB, tserver::GetMetricsResponsePB)
   HOLLOW_UNSUPPORTED_METHOD(AdminExecutePgsql, tserver::AdminExecutePgsqlRequestPB,
                             tserver::AdminExecutePgsqlResponsePB)
+  HOLLOW_UNSUPPORTED_METHOD(SetActiveTableIdsForMetrics,
+                            tserver::SetActiveTableIdsForMetricsRequestPB,
+                            tserver::SetActiveTableIdsForMetricsResponsePB)
   HOLLOW_UNSUPPORTED_METHOD(GetLocalPgTxnSnapshot, tserver::GetLocalPgTxnSnapshotRequestPB,
                             tserver::GetLocalPgTxnSnapshotResponsePB)
   HOLLOW_UNSUPPORTED_METHOD(GetTserverCatalogMessageLists,
@@ -1182,8 +1244,6 @@ class MirrorState {
     const auto& method = header.remote_method().method_name();
     // Only idempotent boot-time reads are safe to resend per hollow tserver: the relay also
     // carries the bench client's own DDL, and replaying that would corrupt the catalog.
-    // ListTabletServers is the real tserver's periodic connectivity check; the scheduler sends
-    // that one per hollow tserver itself.
     static const std::set<string> kReplayMethods = {
         "GetMasterRegistration", "ListMasters", "GetAutoFlagsConfig",
         "GetFullUniverseKeyRegistry"};
@@ -2448,6 +2508,7 @@ class MasterLoadBench {
     LOG(INFO) << "Idle" << (FLAGS_run_seconds > 0 ? Format(" for $0s", FLAGS_run_seconds) : "")
               << "; SIGINT/SIGTERM stops the run";
     while (!g_stop_requested.load(std::memory_order_acquire) && MonoTime::Now() < idle_deadline) {
+      RETURN_NOT_OK(CheckMasterAlive());
       SleepFor(500ms);
     }
     if (!FLAGS_snapshot_dir.empty()) {
@@ -2535,6 +2596,7 @@ class MasterLoadBench {
     const std::vector<string> extra_flags =
         strings::Split(FLAGS_master_flags, ",", strings::SkipEmpty());
     argv.insert(argv.end(), extra_flags.begin(), extra_flags.end());
+    argv.push_back(Format("--enable_ysql_operation_lease=$0", FLAGS_enable_ysql_operation_lease));
     string program = FLAGS_master_bin;
     if (!FLAGS_master_cpus.empty()) {
       argv.insert(argv.begin(), {"taskset", "-c", FLAGS_master_cpus});
@@ -2568,11 +2630,23 @@ class MasterLoadBench {
       if (status.ok() && !resp.has_error()) {
         break;
       }
+      RETURN_NOT_OK(CheckMasterAlive());
       SCHECK(MonoTime::Now() < deadline, TimedOut, "Master did not become ready");
       SleepFor(500ms);
     }
     LOG(INFO) << "Master is ready";
     return Status::OK();
+  }
+
+  // IsRunning() sees an unreaped child as alive; WaitNoBlock reaps it and reports the exit.
+  Status CheckMasterAlive() {
+    int exit_code = 0;
+    const auto status = master_process_->WaitNoBlock(&exit_code);
+    if (status.IsTimedOut()) {
+      return Status::OK();
+    }
+    RETURN_NOT_OK(status);
+    return STATUS_FORMAT(RuntimeError, "yb-master exited with status $0", exit_code);
   }
 
   Status StartRealTserver() {
@@ -2605,6 +2679,13 @@ class MasterLoadBench {
     const std::vector<string> extra_flags =
         strings::Split(FLAGS_tserver_flags, ",", strings::SkipEmpty());
     argv.insert(argv.end(), extra_flags.begin(), extra_flags.end());
+    argv.push_back(Format("--enable_ysql_operation_lease=$0", FLAGS_enable_ysql_operation_lease));
+    argv.push_back(
+        Format("--ysql_lease_refresher_interval_ms=$0", FLAGS_ysql_lease_refresher_interval_ms));
+    argv.push_back(Format("--tserver_heartbeat_metrics_interval_ms=$0",
+                          FLAGS_tserver_heartbeat_metrics_interval_ms));
+    argv.push_back(Format("--tserver_heartbeat_metrics_send_tablet_metadata_on_change=$0",
+                          FLAGS_tserver_heartbeat_metrics_send_tablet_metadata_on_change));
     tserver_process_ = std::make_unique<Subprocess>(FLAGS_tserver_bin, argv);
     RETURN_NOT_OK(tserver_process_->Start());
     LOG(INFO) << "Started yb-tserver pid " << tserver_process_->pid();
@@ -2680,10 +2761,8 @@ class MasterLoadBench {
           measured > 0 ? static_cast<int64_t>(measured) : FLAGS_heartbeat_interval_ms);
     }
     if (method == "RefreshYsqlLease") {
-      return FLAGS_send_lease_refreshes ? MonoDelta(1000ms) : MonoDelta();
-    }
-    if (method == "ListTabletServers") {
-      return MonoDelta::FromMilliseconds(FLAGS_connectivity_check_interval_ms);
+      return IsYsqlLeaseEnabled()
+          ? MonoDelta::FromMilliseconds(FLAGS_ysql_lease_refresher_interval_ms) : MonoDelta();
     }
     if (method == kYsqlConnect) {
       return FLAGS_ysql_connect_interval_ms > 0
@@ -2700,7 +2779,7 @@ class MasterLoadBench {
     const auto& tservers = registry_.tservers();
     auto now = MonoTime::Now();
     const auto metrics_period =
-        MonoDelta::FromMilliseconds(FLAGS_heartbeat_interval_ms) * FLAGS_full_metrics_beat_period;
+        MonoDelta::FromMilliseconds(FLAGS_tserver_heartbeat_metrics_interval_ms);
     for (size_t i = 0; i < tservers.size(); ++i) {
       auto& ts = *tservers[i];
       for (const char* method : kDefaultMethods) {
@@ -2826,27 +2905,22 @@ class MasterLoadBench {
       std::lock_guard l(universe_uuid_mutex_);
       universe_uuid = universe_uuid_;
     }
+    // Metrics go on the wall clock as in the real tserver; mirror mode follows its measured period.
+    const auto now = MonoTime::Now();
+    const auto measured = mirror_state_ ? mirror_state_->MeasuredMetricsPeriodMs() : 0;
+    const auto period = MonoDelta::FromMilliseconds(static_cast<int64_t>(
+        measured > 0 ? measured : FLAGS_tserver_heartbeat_metrics_interval_ms));
+    const bool want_metrics =
+        !ts->last_metrics_beat.Initialized() || now >= ts->last_metrics_beat + period;
+    if (want_metrics) {
+      ts->last_metrics_beat = now;
+    }
     std::shared_ptr<const master::TSHeartbeatRequestPB> tmpl;
-    std::optional<bool> metrics_override;
     if (mirror_state_) {
-      const auto now = MonoTime::Now();
-      const auto measured = mirror_state_->MeasuredMetricsPeriodMs();
-      const auto period = MonoDelta::FromMilliseconds(static_cast<int64_t>(
-          measured > 0
-              ? measured
-              : FLAGS_full_metrics_beat_period * FLAGS_heartbeat_interval_ms));
-      const bool want_metrics =
-          !ts->last_metrics_beat.Initialized() || now >= ts->last_metrics_beat + period;
       tmpl = mirror_state_->TemplateFor(want_metrics);
-      if (tmpl) {
-        metrics_override = want_metrics;
-        if (want_metrics) {
-          ts->last_metrics_beat = now;
-        }
-      }
     }
     ts->MarkRegistrationInFlight();
-    ts->FillHeartbeat(universe_uuid, tmpl.get(), metrics_override, &ts->hb_req);
+    ts->FillHeartbeat(universe_uuid, tmpl.get(), want_metrics, &ts->hb_req);
     ts->hb_controller.Reset();
     ts->hb_controller.set_timeout(15s);
     ts->heartbeat_sent_time = MonoTime::Now();
@@ -2921,8 +2995,7 @@ class MasterLoadBench {
         });
   }
 
-  // The real tserver's connectivity poller lists all tservers once a minute and pings them;
-  // only the master call is reproduced.
+  // ListTabletServers, sent only when a scenario directive asks for it.
   void SendConnectivityCheck(HollowTServer* ts, MethodSchedule* schedule,
                              std::shared_ptr<ScheduledRun> run) {
     ts->connectivity_controller.Reset();
