@@ -69,16 +69,19 @@ std::unique_ptr<MultiRaftBatchSender> CreateMultiRaftBatchSender(
 //   each batch as one MultiRaftUpdateConsensus RPC.
 // - Heartbeats (RequestKind::kHeartbeat) are sent every FLAGS_multi_raft_heartbeat_interval_ms
 //   ms, once the batch reaches FLAGS_multi_raft_batch_size requests, or with the next batch that
-//   carries data. Adding one never sends a batch or arms a data timer.
+//   carries data. Adding one sends a batch only through a size limit, and never arms a data
+//   timer.
 // - Data requests (RequestKind::kData) follow one of two policies, chosen on each add (and, for
 //   the response clock, on each completion) by FLAGS_multi_raft_data_flush_window_us:
 //   - 0, response clocking: a data request is sent immediately when no batch carrying data to
 //     this server is in flight. Otherwise it waits until such a batch completes or
 //     FLAGS_multi_raft_data_flush_delay_ms elapses, whichever is first. A streamed batch stays in
 //     flight until its final response, however many requests partial frames have answered.
-//   - Above 0, pacing: batches carrying data to this server go out at most once per window. A
-//     data request is sent immediately when a window has passed since the last one was sent (or
-//     none was). Otherwise it waits for one timer, armed for the end of that window. Completions
+//   - Above 0, pacing: batches carrying data to this server go out at most once per window,
+//     except when a size limit or the heartbeat timer sends one. A data request is sent
+//     immediately when, at its add, a window has passed since the last one was sent (or none
+//     was). Otherwise it waits for one timer, armed for the end of that window; an add delayed on
+//     the batcher's lock past that end arms a time already past, which fires at once. Completions
 //     and response frames send nothing: back-pressure does not need a response clock, because
 //     each Raft peer has at most one data request parked or in flight. Every batch that carries
 //     data restarts the window, whatever sent it (a cap, a timer, a completion), so a request
@@ -237,7 +240,8 @@ class MultiRaftBatcher : public std::enable_shared_from_this<MultiRaftBatcher> {
   void CancelDataFlushDeadline() REQUIRES(mutex_);
   void DataFlushDeadlineExpired(rpc::ScheduledTaskId task_id);
 
-  // Arms the pacing timer for time unless it is armed already. It runs on a scheduler io thread.
+  // Arms the pacing task for time unless one is armed. The task (PacingTaskExpired) runs on a
+  // scheduler io thread.
   void ArmPacingTask(std::chrono::steady_clock::time_point time) REQUIRES(mutex_);
   void CancelPacingTask() REQUIRES(mutex_);
   void PacingTaskExpired(rpc::ScheduledTaskId task_id);

@@ -2353,8 +2353,9 @@ TEST_F(MultiRaftBatcherTest, PacedIgnoresCompletion) {
   }
 }
 
-// Under pacing, heartbeat adds send nothing and arm no timer, even when the window has passed. They
-// ride the next data envelope, whether it goes out inline or by the pacing timer.
+// Under pacing, heartbeat adds (no size limit set) send nothing and arm no timer, even when the
+// window has passed. They ride the next data envelope, whether it goes out inline or by the
+// pacing timer.
 TEST_F(MultiRaftBatcherTest, PacedHeartbeatsUnchanged) {
   const auto window = 300ms * kTimeMultiplier;
   SetWindow(window);

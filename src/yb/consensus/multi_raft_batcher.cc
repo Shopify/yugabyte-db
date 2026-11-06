@@ -83,12 +83,13 @@ DEFINE_RUNTIME_uint32(multi_raft_data_flush_delay_ms, 2,
 TAG_FLAG(multi_raft_data_flush_delay_ms, advanced);
 
 DEFINE_RUNTIME_uint32(multi_raft_data_flush_window_us, 0,
-    "Minimum interval, in microseconds, between two multi-Raft batches carrying data to the same "
-    "server. A data request added once the interval has passed since the last such batch was sent "
-    "is sent at once; one added earlier waits for the interval to end, or for a batch size limit "
-    "to send it. 0 keeps response clocking instead: a data request is sent at once when no batch "
-    "carrying data to the server is in flight, and otherwise waits for one to complete or for "
-    "multi_raft_data_flush_delay_ms. Read on each add.");
+    "Interval, in microseconds, at which multi-Raft batches carrying data to the same server are "
+    "paced. A data request added once the interval has passed since the last such batch was sent "
+    "is sent at once; one added earlier waits for the interval to end. Batch size limits and the "
+    "multi_raft_heartbeat_interval_ms timer can send a batch earlier. 0 keeps response clocking "
+    "instead: a data request is sent at once when no batch carrying data to the server is in "
+    "flight, and otherwise waits for one to complete or for multi_raft_data_flush_delay_ms. Read "
+    "on each add.");
 TAG_FLAG(multi_raft_data_flush_window_us, advanced);
 
 DEFINE_RUNTIME_uint32(multi_raft_data_batch_size, 32,
@@ -695,15 +696,16 @@ void MultiRaftBatcher::DataFlushDeadlineExpired(rpc::ScheduledTaskId task_id) {
 }
 
 void MultiRaftBatcher::ArmPacingTask(std::chrono::steady_clock::time_point time) {
-  // A task already armed keeps its time, even if the window flag changed since: the window is
-  // read only when a request parks.
+  // A task already armed keeps its time, even if the window flag changed since: the armed time is
+  // computed only when a request parks.
   if (pacing_task_ != rpc::kInvalidTaskId) {
     return;
   }
   std::weak_ptr<MultiRaftBatcher> weak_self = shared_from_this();
   // An absolute time, so that the time spent between the add and here does not stretch the
-  // window. It is in the future when called from an add, which sends inline once the window has
-  // passed; a past time would fire at once. The task cannot observe pacing_task_ before it is
+  // window. It is in the future relative to the add time, since an add whose window has passed
+  // sends inline. An add delayed on mutex_ past the end of the window arms a time already past,
+  // which fires at once from the scheduler. The task cannot observe pacing_task_ before it is
   // assigned, because it takes mutex_, which is held here.
   pacing_task_ = messenger_->scheduler().Schedule(
       [weak_self](rpc::ScheduledTaskId task_id, const Status& status) {
