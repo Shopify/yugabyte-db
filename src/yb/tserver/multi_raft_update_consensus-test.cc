@@ -2135,6 +2135,8 @@ TEST_F(MultiRaftUpdateConsensusTest, SlotWaitMetric) {
   constexpr auto kDiskDelay = 1s;
   SetSlowDisk(tablets_[0], kDiskDelay);
   auto slot_wait = ServerStats(METRIC_multi_raft_update_slot_wait_us);
+  // StartServer's heartbeat envelope records its slot waits after its response is queued.
+  ASSERT_OK(WaitForStatsCount(slot_wait, tablets_.size()));
   auto count_before = slot_wait->TotalCount();
   auto sum_before = slot_wait->TotalSum();
   auto envelope = SendAsync(OneOpPerTablet());
