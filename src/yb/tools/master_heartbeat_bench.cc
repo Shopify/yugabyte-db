@@ -709,6 +709,8 @@ class HollowTSAdminService : public tserver::TabletServerAdminServiceIf {
                             tserver::AlterTabletTierResponsePB)
   HOLLOW_UNSUPPORTED_METHOD(GetTabletTierInfo, tserver::GetTabletTierInfoRequestPB,
                             tserver::GetTabletTierInfoResponsePB)
+  HOLLOW_UNSUPPORTED_METHOD(TableBackfillChunk, tserver::TableBackfillChunkRequestPB,
+                            tserver::TableBackfillChunkResponsePB)
 #undef HOLLOW_UNSUPPORTED_METHOD
 
  private:
