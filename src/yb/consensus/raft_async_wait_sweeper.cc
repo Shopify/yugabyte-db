@@ -24,8 +24,10 @@ Status RaftAsyncWaitSweeper::ShutdownStatus() {
   return STATUS(Aborted, "Scheduler is shutting down", "" /* msg2 */, Errno(ESHUTDOWN));
 }
 
-RaftAsyncWaitSweeper::RaftAsyncWaitSweeper(rpc::Scheduler* scheduler)
-    : scheduler_(*scheduler), timer_id_(rpc::kInvalidTaskId) {}
+RaftAsyncWaitSweeper::RaftAsyncWaitSweeper(
+    rpc::Scheduler* scheduler, Clock::duration coalesce_window)
+    : scheduler_(*scheduler), coalesce_window_(coalesce_window),
+      timer_id_(rpc::kInvalidTaskId) {}
 
 RaftAsyncWaitSweeper::~RaftAsyncWaitSweeper() {
   // Owners shut the sweeper down first. Without that, the pending entries are still completed
@@ -157,8 +159,8 @@ void RaftAsyncWaitSweeper::TimerFired(rpc::ScheduledTaskId task_id, const Status
       shut_down = true;
     } else {
       ++counters_.expiries;
-      const auto now = Clock::now();
-      while (!entries_.empty() && entries_.begin()->first.first <= now) {
+      const auto limit = Clock::now() + coalesce_window_;
+      while (!entries_.empty() && entries_.begin()->first.first <= limit) {
         due.push_back(std::move(entries_.begin()->second));
         entries_.erase(entries_.begin());
       }

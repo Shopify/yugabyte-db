@@ -1705,8 +1705,10 @@ Status RaftConsensus::Update(
 // RaftAsyncWaitSweeper. The sweeper serves every wait from one scheduler task, which saves a
 // Schedule and an Abort per tick on the io threads that also run the multi-Raft batcher's flush
 // and pacing timers. Both sources are armed with the same delay and post the same Tick, so the
-// cadence and the side effects (WriteNotYetDurable) are the same; Finish aborts the timer or
-// removes the entry. While a wait is idle, the timer's capture or the sweeper entry is its only
+// cadence and the side effects (WriteNotYetDurable) are the same, except that the sweeper may
+// fire a tick up to RaftAsyncWaitSweeper::kCoalesceWindow early (a tick that then finds the
+// deadline not yet passed re-arms for the rest of it); Finish aborts the timer or removes the
+// entry. While a wait is idle, the timer's capture or the sweeper entry is its only
 // strong reference, and the wait holds the RaftConsensus alive until it completes.
 //
 // The log callback and a tick only post to raft_notifications_pool, so neither the log thread nor

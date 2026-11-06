@@ -152,11 +152,11 @@ class RaftAsyncWaitSweeperTest : public YBTest {
     YBTest::TearDown();
   }
 
-  void CreateSweeper() {
+  void CreateSweeper(Clock::duration coalesce_window = RaftAsyncWaitSweeper::kCoalesceWindow) {
     if (sweeper_) {
       sweeper_->Shutdown(RaftAsyncWaitSweeper::ShutdownStatus());
     }
-    sweeper_ = std::make_shared<RaftAsyncWaitSweeper>(&*scheduler_);
+    sweeper_ = std::make_shared<RaftAsyncWaitSweeper>(&*scheduler_, coalesce_window);
   }
 
   Result<RaftAsyncWaitSweeper::Handle> Register(int id, Clock::duration delay) {
@@ -216,7 +216,7 @@ TEST_F(RaftAsyncWaitSweeperTest, RearmOnlyForNewEarliest) {
 
   ASSERT_OK(recorder_.WaitDue(4));
   ASSERT_EQ(recorder_.due(), (std::vector<int>{1, 2, 3, 4}));
-  ASSERT_GE(recorder_.due_times()[0] - start, 300ms);
+  ASSERT_GE(recorder_.due_times()[0] - start, 300ms - RaftAsyncWaitSweeper::kCoalesceWindow);
   // One task per remaining entry after the first fired: each expiry re-arms for the next.
   ASSERT_OK(WaitNoOutstanding());
   ASSERT_EQ(Counters().scheduled, 5);
@@ -275,8 +275,28 @@ TEST_F(RaftAsyncWaitSweeperTest, DueTogetherFireInOneExpiry) {
   ASSERT_EQ(Counters().scheduled, 1);
 }
 
-// Sub-millisecond delays fire in order and not before they are due.
+// Entries due within the coalescing window of the earliest fire with it, possibly early; one due
+// later waits for a task of its own.
+TEST_F(RaftAsyncWaitSweeperTest, CoalescingWindow) {
+  CreateSweeper(50ms);
+  const auto start = Clock::now();
+  ASSERT_OK(Register(1, 200ms));
+  ASSERT_OK(Register(2, 230ms));
+  ASSERT_OK(Register(3, 1s));
+  ASSERT_OK(recorder_.WaitDue(2));
+  ASSERT_EQ(recorder_.due(), (std::vector<int>{1, 2}));
+  // Entry 2 fired with entry 1.
+  ASSERT_EQ(Counters().expiries, 1);
+  ASSERT_EQ(Counters().due, 2);
+  ASSERT_OK(recorder_.WaitDue(3));
+  ASSERT_GE(recorder_.due_times()[2] - start, 1s - 50ms);
+  ASSERT_EQ(Counters().expiries, 2);
+  ASSERT_EQ(Counters().scheduled, 2);
+}
+
+// Sub-millisecond delays fire in order and, without a coalescing window, not before they are due.
 TEST_F(RaftAsyncWaitSweeperTest, SubMillisecondDelaysInOrder) {
+  CreateSweeper(0s);
   const auto start = Clock::now();
   for (int i = 9; i != 0; --i) {
     ASSERT_OK(Register(i, i * 100us));

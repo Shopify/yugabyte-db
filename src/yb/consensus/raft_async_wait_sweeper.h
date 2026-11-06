@@ -43,11 +43,13 @@ namespace yb::consensus {
 // Timer. At most one scheduler task is armed, for the earliest due time, with the steady_clock
 // time-point overload of Scheduler::Schedule. Register arms a new task only for an entry due
 // before the armed time, and aborts the old one. Remove never touches the scheduler, so a task can
-// fire with nothing due and just re-arm. A firing task takes every entry already due and re-arms
-// for the next one; the scheduler fires late enough that entries registered microseconds apart, as
-// the ticks of waits that started together are, usually fire together. A task that is no longer
-// the armed one (aborted, or superseded) does nothing. A non-OK status on the armed task means the
-// scheduler is shutting down, and is handled as Shutdown(status), so no entry is stranded.
+// fire with nothing due and just re-arm. A firing task takes every entry due within
+// coalesce_window of now, so an entry may fire up to that much early, and re-arms for the next
+// one. Without the window, the ticks of waits that started together, which re-register from
+// different raft_notifications_pool threads and so are due at slightly different times (more so
+// on a loaded server), would each take a task of their own. A task that is no longer the armed one
+// (aborted, or superseded) does nothing. A non-OK status on the armed task means the scheduler is
+// shutting down, and is handled as Shutdown(status), so no entry is stranded.
 //
 // Shutdown(status) takes every pending entry and calls OnShutdown(status) on each. A Register
 // after that stores nothing and returns the shutdown status, and the caller completes the entry
@@ -61,6 +63,9 @@ namespace yb::consensus {
 class RaftAsyncWaitSweeper : public std::enable_shared_from_this<RaftAsyncWaitSweeper> {
  public:
   using Clock = std::chrono::steady_clock;
+
+  // Within the resolution of CoarseMonoClock, from which AsyncWriteWait computes its delays.
+  static constexpr Clock::duration kCoalesceWindow = std::chrono::milliseconds(2);
 
   class Entry {
    public:
@@ -94,7 +99,8 @@ class RaftAsyncWaitSweeper : public std::enable_shared_from_this<RaftAsyncWaitSw
   // finishes its wait with. Owners shut the sweeper down with it.
   static Status ShutdownStatus();
 
-  explicit RaftAsyncWaitSweeper(rpc::Scheduler* scheduler);
+  explicit RaftAsyncWaitSweeper(
+      rpc::Scheduler* scheduler, Clock::duration coalesce_window = kCoalesceWindow);
   ~RaftAsyncWaitSweeper();
 
   RaftAsyncWaitSweeper(const RaftAsyncWaitSweeper&) = delete;
@@ -124,6 +130,7 @@ class RaftAsyncWaitSweeper : public std::enable_shared_from_this<RaftAsyncWaitSw
   Entries ShutdownUnlocked(const Status& status) REQUIRES(mutex_);
 
   rpc::Scheduler& scheduler_;
+  const Clock::duration coalesce_window_;
 
   mutable std::mutex mutex_;
   std::map<Key, std::shared_ptr<Entry>> entries_ GUARDED_BY(mutex_);
