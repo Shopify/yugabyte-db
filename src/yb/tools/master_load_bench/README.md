@@ -40,7 +40,7 @@ Writes into `/tmp/mlb-prep`:
 
 - `topology.txt`: one `cloud region zone percent` line per zone named by the tablespaces'
   `replica_placement` blocks. Percentages follow the per-zone tserver counts in the repo's
-  production `cluster_configs/gdb.yml`; without `--globaldb-repo` every zone gets an equal
+  production inventory `inventories/production/yugabyte.yml`; without `--globaldb-repo` every zone gets an equal
   share. `read_replica_placement` (observer) zones are not live-tserver zones and are skipped.
 - `roles.sql`: `CREATE ROLE` for every role the dump references, so the dump's own
   "role exists" guards take the production branch.
