@@ -44,6 +44,7 @@
 #include "yb/util/test_thread_holder.h"
 #include "yb/util/test_util.h"
 #include "yb/util/thread_pool.h"
+#include "yb/util/tsan_util.h"
 
 using namespace std::literals;
 
@@ -55,6 +56,7 @@ DECLARE_uint64(multi_raft_batch_bytes);
 DECLARE_uint64(multi_raft_batch_size);
 DECLARE_uint32(multi_raft_data_batch_size);
 DECLARE_uint32(multi_raft_data_flush_delay_ms);
+DECLARE_uint32(multi_raft_data_flush_window_us);
 DECLARE_uint64(multi_raft_heartbeat_interval_ms);
 DECLARE_uint32(multi_raft_rpc_timeout_ms);
 
@@ -67,10 +69,13 @@ METRIC_DECLARE_counter(multi_raft_flush_bytes_cap);
 METRIC_DECLARE_counter(multi_raft_flush_count_cap);
 METRIC_DECLARE_counter(multi_raft_flush_deadline);
 METRIC_DECLARE_counter(multi_raft_flush_immediate);
+METRIC_DECLARE_counter(multi_raft_flush_paced_inline);
+METRIC_DECLARE_counter(multi_raft_flush_paced_timer);
 METRIC_DECLARE_counter(multi_raft_flush_response_clocked);
 METRIC_DECLARE_counter(multi_raft_flush_timer);
 METRIC_DECLARE_counter(multi_raft_frames_received);
 METRIC_DECLARE_counter(multi_raft_heartbeat_sub_requests);
+METRIC_DECLARE_event_stats(multi_raft_data_add_to_send_us);
 METRIC_DECLARE_event_stats(multi_raft_envelope_bytes);
 METRIC_DECLARE_event_stats(multi_raft_envelope_ops);
 METRIC_DECLARE_event_stats(multi_raft_envelope_sub_requests);
@@ -79,6 +84,7 @@ METRIC_DECLARE_event_stats(multi_raft_frame_slots);
 namespace yb::consensus {
 
 using RequestKind = MultiRaftBatcher::RequestKind;
+using std::chrono::steady_clock;
 
 namespace {
 
@@ -340,6 +346,16 @@ class MultiRaftBatcherTest : public YBTest {
       auto status = WaitFor([this, call] { return IsDone(*call); }, 1s, "Callback");
       (void)status;
     }
+  }
+
+  // Turns pacing on (window above 0) or off for the adds that follow.
+  void SetWindow(std::chrono::microseconds window) {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_flush_window_us) =
+        static_cast<uint32_t>(window.count());
+  }
+
+  steady_clock::time_point SentAt(size_t envelope_idx) {
+    return GetEnvelope(envelope_idx)->sent_at;
   }
 
   int64_t CounterValue(const CounterPrototype& proto) {
@@ -2050,6 +2066,633 @@ TEST_F(MultiRaftBatcherTest, StreamedResponseOutlivesFinal) {
   ASSERT_OK(d1.status);
   ASSERT_TRUE(d1.had_holder);
   ASSERT_EQ(d1.response.responder_uuid(), "t1-resp");
+}
+
+// With pacing, the first data request a batcher ever gets goes out at once, as a paced flush:
+// "never sent" counts as a window that has passed.
+TEST_F(MultiRaftBatcherTest, PacedFirstAddImmediate) {
+  SetWindow(200ms * kTimeMultiplier);
+  CreateBatcher();
+  auto& d1 = Add("t1", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ASSERT_EQ(GetEnvelope(0)->tablet_ids, Tablets({"t1"}));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_inline), 1);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_immediate), 0);
+  Complete(0);
+  ASSERT_NO_FATALS(WaitDone(d1));
+  ASSERT_OK(d1.status);
+  ASSERT_EQ(d1.num_callbacks.load(), 1);
+}
+
+// A data request added once the window has passed goes out at once, although the previous data
+// envelope is still in flight.
+TEST_F(MultiRaftBatcherTest, PacedInlineFlushAfterWindow) {
+  const auto window = 100ms * kTimeMultiplier;
+  SetWindow(window);
+  CreateBatcher();
+  auto& d1 = Add("t1", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  std::this_thread::sleep_until(SentAt(0) + window + 10ms);
+  auto& d2 = Add("t2", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 2);
+  ASSERT_EQ(GetEnvelope(1)->tablet_ids, Tablets({"t2"}));
+  ASSERT_GE(SentAt(1) - SentAt(0), window);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_inline), 2);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_timer), 0);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_immediate), 0);
+  Complete(0);
+  Complete(1);
+  for (auto* call : {&d1, &d2}) {
+    ASSERT_NO_FATALS(WaitDone(*call));
+    ASSERT_OK(call->status);
+    ASSERT_EQ(call->num_callbacks.load(), 1);
+  }
+}
+
+// A data request added within the window parks, and the pacing timer sends it at the end of the
+// window, not before.
+TEST_F(MultiRaftBatcherTest, PacedParkAndTimer) {
+  const auto window = 200ms * kTimeMultiplier;
+  SetWindow(window);
+  CreateBatcher();
+  const auto before_first = steady_clock::now();
+  auto& d1 = Add("t1", RequestKind::kData);
+  auto& d2 = Add("t2", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_timer), 0);
+  ASSERT_OK(WaitFor([this] { return NumEnvelopes() == 2; }, 10s, "Pacing timer flush"));
+  ASSERT_EQ(GetEnvelope(1)->tablet_ids, Tablets({"t2"}));
+  // The window starts when the first envelope is prepared, which is after before_first.
+  ASSERT_GE(SentAt(1) - before_first, window);
+  ASSERT_LT(SentAt(1) - SentAt(0), window + 5s);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_timer), 1);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_inline), 1);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_deadline), 0);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_response_clocked), 0);
+  Complete(0);
+  Complete(1);
+  for (auto* call : {&d1, &d2}) {
+    ASSERT_NO_FATALS(WaitDone(*call));
+    ASSERT_OK(call->status);
+    ASSERT_EQ(call->num_callbacks.load(), 1);
+  }
+}
+
+// A window below a millisecond is kept: the parked request goes out no earlier than the window
+// after the first envelope, and well before a millisecond-scale clock or timer would send it.
+TEST_F(MultiRaftBatcherTest, PacedSubMillisecondWindow) {
+  constexpr auto kWindow = 500us;
+  constexpr auto kAddGap = 100us;
+  constexpr int kRounds = 10;
+  SetWindow(kWindow);
+  CreateBatcher();
+  int parked_rounds = 0;
+  std::vector<int64_t> gaps_us;
+  for (int round = 0; round != kRounds; ++round) {
+    // Past the window of the previous round's last envelope.
+    std::this_thread::sleep_for(2ms);
+    const auto envelopes = NumEnvelopes();
+    const auto paced_inline = CounterValue(METRIC_multi_raft_flush_paced_inline);
+    const auto before_first = steady_clock::now();
+    Add(Format("r$0-a", round), RequestKind::kData);
+    ASSERT_EQ(NumEnvelopes(), envelopes + 1);
+    ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_inline), paced_inline + 1);
+    const auto gap_end = steady_clock::now() + kAddGap;
+    while (steady_clock::now() < gap_end) {
+    }
+    Add(Format("r$0-b", round), RequestKind::kData);
+    if (NumEnvelopes() != envelopes + 1) {
+      // Descheduled past the window between the two adds: the second went out inline.
+      ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_inline), paced_inline + 2);
+      continue;
+    }
+    ++parked_rounds;
+    ASSERT_OK(WaitFor(
+        [this, envelopes] { return NumEnvelopes() == envelopes + 2; }, 10s, "Pacing timer flush"));
+    const auto first_sent = SentAt(envelopes);
+    const auto second_sent = SentAt(envelopes + 1);
+    gaps_us.push_back(ToMicroseconds(second_sent - first_sent));
+    ASSERT_GE(second_sent - before_first, kWindow) << "round " << round;
+    ASSERT_LT(second_sent - first_sent, 5ms) << "round " << round;
+  }
+  LOG(INFO) << "Parked rounds: " << parked_rounds << ", first to second envelope (us): "
+            << AsString(gaps_us);
+  ASSERT_GE(parked_rounds, kRounds / 2);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_timer), parked_rounds);
+  for (size_t i = 0; i != NumEnvelopes(); ++i) {
+    Complete(i);
+  }
+}
+
+// A cap flush of a parked batch cancels its pacing timer and starts a new window: the next parked
+// request waits a full window from the cap flush, not from the envelope before it, and no empty or
+// duplicate envelope goes out.
+TEST_F(MultiRaftBatcherTest, PacedTimerCancelledByCapFlush) {
+  const auto window = 1s * kTimeMultiplier;
+  SetWindow(window);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_batch_size) = 2;
+  CreateBatcher();
+  Add("t1", RequestKind::kData);
+  Add("t2", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_timer), 0);
+  // Far enough into the window to tell a timer armed by t2 from one armed by the cap flush.
+  std::this_thread::sleep_for(window / 3);
+  Add("t3", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  const auto before_cap = steady_clock::now();
+  Add("t4", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 2);
+  ASSERT_EQ(GetEnvelope(1)->tablet_ids, Tablets({"t2", "t3"}));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_count_cap), 1);
+
+  ASSERT_OK(WaitFor([this] { return NumEnvelopes() == 3; }, 10s, "Pacing timer flush"));
+  ASSERT_EQ(GetEnvelope(2)->tablet_ids, Tablets({"t4"}));
+  ASSERT_GE(SentAt(2) - before_cap, window);
+  // A negative check: nothing else is armed.
+  std::this_thread::sleep_for(300ms * kTimeMultiplier);
+  ASSERT_EQ(NumEnvelopes(), 3);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_timer), 1);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_inline), 1);
+  for (size_t i = 0; i != NumEnvelopes(); ++i) {
+    Complete(i);
+  }
+  for (auto& call : calls_) {
+    ASSERT_NO_FATALS(WaitDone(*call));
+    ASSERT_OK(call->status);
+    ASSERT_EQ(call->num_callbacks.load(), 1);
+  }
+}
+
+// A cap flush takes the parked data and cancels the pacing timer, and a heartbeat then parks
+// alone. No heartbeat-only envelope goes out before the heartbeat timer, nothing counts as a paced
+// timer flush, and the heartbeat rides the next data envelope.
+TEST_F(MultiRaftBatcherTest, PacedTimerLeavesHeartbeatOnlyBatch) {
+  const auto window = 300ms * kTimeMultiplier;
+  SetWindow(window);
+  const auto big_bytes = RequestBytes("t2", 100);
+  const auto small_bytes = RequestBytes("t3", 10);
+  // t2 and t3 together exceed the cap, t3 and t4 do not.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_batch_bytes) = big_bytes + small_bytes / 2;
+  ASSERT_LE(2 * small_bytes, FLAGS_multi_raft_batch_bytes);
+  CreateBatcher();
+  Add("t1", RequestKind::kData, 10);
+  Add("t2", RequestKind::kData, 100);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  auto& h3 = Add("t3", RequestKind::kHeartbeat, 10);
+  ASSERT_EQ(NumEnvelopes(), 2);
+  ASSERT_EQ(GetEnvelope(1)->tablet_ids, Tablets({"t2"}));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_bytes_cap), 1);
+
+  // A negative check: well past the window of either envelope.
+  std::this_thread::sleep_for(2 * window);
+  ASSERT_EQ(NumEnvelopes(), 2);
+  ASSERT_FALSE(IsDone(h3));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_timer), 0);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_timer), 0);
+
+  Add("t4", RequestKind::kData, 10);
+  ASSERT_EQ(NumEnvelopes(), 3);
+  ASSERT_EQ(GetEnvelope(2)->tablet_ids, Tablets({"t3", "t4"}));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_inline), 2);
+  for (size_t i = 0; i != NumEnvelopes(); ++i) {
+    Complete(i);
+  }
+  for (auto& call : calls_) {
+    ASSERT_NO_FATALS(WaitDone(*call));
+    ASSERT_OK(call->status);
+    ASSERT_EQ(call->num_callbacks.load(), 1);
+  }
+}
+
+// The count and byte caps split batches under pacing as under response clocking.
+TEST_F(MultiRaftBatcherTest, PacedCapsStillApply) {
+  SetWindow(std::chrono::milliseconds(kNeverMs));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_batch_size) = 2;
+  const auto request_bytes = RequestBytes("t1");
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_batch_bytes) = 2 * request_bytes + request_bytes / 2;
+  CreateBatcher();
+  Add("t1", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  Add("t2", RequestKind::kData);
+  Add("t3", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+
+  // The data count cap, before the add.
+  Add("t4", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 2);
+  ASSERT_EQ(GetEnvelope(1)->tablet_ids, Tablets({"t2", "t3"}));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_count_cap), 1);
+
+  // The byte cap, before the add.
+  Add("t5", RequestKind::kHeartbeat);
+  ASSERT_EQ(NumEnvelopes(), 2);
+  Add("t6", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 3);
+  ASSERT_EQ(GetEnvelope(2)->tablet_ids, Tablets({"t4", "t5"}));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_bytes_cap), 1);
+
+  // The request count cap, after the add.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_batch_size) = 2;
+  Add("t7", RequestKind::kHeartbeat);
+  ASSERT_EQ(NumEnvelopes(), 4);
+  ASSERT_EQ(GetEnvelope(3)->tablet_ids, Tablets({"t6", "t7"}));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_count_cap), 2);
+
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_inline), 1);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_timer), 0);
+  for (size_t i = 0; i != NumEnvelopes(); ++i) {
+    Complete(i);
+  }
+  for (auto& call : calls_) {
+    ASSERT_NO_FATALS(WaitDone(*call));
+    ASSERT_OK(call->status);
+    ASSERT_EQ(call->num_callbacks.load(), 1);
+  }
+}
+
+// Under pacing, neither the completion of an envelope answered once nor the frames and final of a
+// streamed envelope send the parked batch.
+TEST_F(MultiRaftBatcherTest, PacedIgnoresCompletion) {
+  SetWindow(std::chrono::milliseconds(kNeverMs));
+  for (bool streamed : {false, true}) {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = streamed;
+    CreateBatcher();
+    const auto env = NumEnvelopes();
+    const auto prefix = streamed ? "s" : "o";
+    auto& h0 = Add(Format("$0-t0", prefix), RequestKind::kHeartbeat);
+    auto& d1 = Add(Format("$0-t1", prefix), RequestKind::kData);
+    ASSERT_EQ(NumEnvelopes(), env + 1);
+    ASSERT_EQ(GetEnvelope(env)->req.stream_responses(), streamed);
+    auto& d2 = Add(Format("$0-t2", prefix), RequestKind::kData);
+    ASSERT_EQ(NumEnvelopes(), env + 1);
+
+    if (streamed) {
+      ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {1})));
+      ASSERT_NO_FATALS(WaitDone(d1));
+      ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK(), Frame(env, {0})));
+    } else {
+      Complete(env);
+    }
+    // BatchCompleted, inline or posted, has run once the batch is released.
+    ASSERT_NO_FATALS(WaitReleased(h0));
+    ASSERT_NO_FATALS(WaitReleased(d1));
+    for (auto* call : {&h0, &d1}) {
+      ASSERT_OK(call->status);
+      ASSERT_EQ(call->num_callbacks.load(), 1);
+    }
+    ASSERT_EQ(NumEnvelopes(), env + 1) << "streamed: " << streamed;
+    ASSERT_FALSE(IsDone(d2));
+    ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_response_clocked), 0);
+
+    batcher_->Shutdown();
+    ASSERT_TRUE(IsDone(d2));
+    ASSERT_TRUE(d2.status.IsAborted()) << d2.status;
+    ASSERT_EQ(d2.num_callbacks.load(), 1);
+  }
+}
+
+// Under pacing, heartbeat adds send nothing and arm no timer, even when the window has passed. They
+// ride the next data envelope, whether it goes out inline or by the pacing timer.
+TEST_F(MultiRaftBatcherTest, PacedHeartbeatsUnchanged) {
+  const auto window = 300ms * kTimeMultiplier;
+  SetWindow(window);
+  CreateBatcher();
+  Add("t1", RequestKind::kHeartbeat);
+  // A negative check: no data envelope was ever sent, and nothing may arm a timer.
+  std::this_thread::sleep_for(2 * window);
+  ASSERT_EQ(NumEnvelopes(), 0);
+
+  Add("t2", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ASSERT_EQ(GetEnvelope(0)->tablet_ids, Tablets({"t1", "t2"}));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_inline), 1);
+
+  Add("t3", RequestKind::kHeartbeat);
+  Add("t4", RequestKind::kData);
+  Add("t5", RequestKind::kHeartbeat);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ASSERT_OK(WaitFor([this] { return NumEnvelopes() == 2; }, 10s, "Pacing timer flush"));
+  ASSERT_EQ(GetEnvelope(1)->tablet_ids, Tablets({"t3", "t4", "t5"}));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_timer), 1);
+
+  // A negative check: the window has passed, and a heartbeat still does not send.
+  Add("t6", RequestKind::kHeartbeat);
+  std::this_thread::sleep_for(2 * window);
+  ASSERT_EQ(NumEnvelopes(), 2);
+
+  Add("t7", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 3);
+  ASSERT_EQ(GetEnvelope(2)->tablet_ids, Tablets({"t6", "t7"}));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_inline), 2);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_timer), 1);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_timer), 0);
+  for (size_t i = 0; i != NumEnvelopes(); ++i) {
+    Complete(i);
+  }
+  for (auto& call : calls_) {
+    ASSERT_NO_FATALS(WaitDone(*call));
+    ASSERT_OK(call->status);
+    ASSERT_EQ(call->num_callbacks.load(), 1);
+  }
+}
+
+// The window is read on each add and each completion, and switching it at runtime strands nothing
+// and sends nothing twice: a deadline or pacing timer armed under the old policy still sends what
+// is parked, and whatever sends it first cancels the other.
+TEST_F(MultiRaftBatcherTest, PacingFlipAtRuntime) {
+  const auto delay = 300ms * kTimeMultiplier;
+  const auto long_window = 1s * kTimeMultiplier;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_flush_delay_ms) =
+      static_cast<uint32_t>(ToMilliseconds(delay));
+  CreateBatcher();
+
+  // 0 -> above 0, with the deadline armed for a parked request.
+  Add("a1", RequestKind::kData);
+  Add("a2", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_immediate), 1);
+  SetWindow(long_window);
+  // Parks within the window and arms the pacing timer, due after the deadline.
+  Add("a3", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ASSERT_OK(WaitFor([this] { return NumEnvelopes() == 2; }, 10s, "Deadline flush"));
+  ASSERT_EQ(GetEnvelope(1)->tablet_ids, Tablets({"a2", "a3"}));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_deadline), 1);
+  // A negative check: past the pacing timer a3 armed.
+  std::this_thread::sleep_until(SentAt(0) + long_window + 300ms * kTimeMultiplier);
+  ASSERT_EQ(NumEnvelopes(), 2);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_timer), 0);
+  Complete(0);
+  Complete(1);
+
+  // Above 0 -> 0, with the pacing timer armed for a parked request and no completion.
+  const auto window = 300ms * kTimeMultiplier;
+  SetWindow(window);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_flush_delay_ms) = kNeverMs;
+  Add("b1", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 3);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_inline), 1);
+  Add("b2", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 3);
+  SetWindow(0us);
+  // b1 is in flight, so this parks and arms the deadline, which never fires.
+  Add("b3", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 3);
+  ASSERT_OK(WaitFor([this] { return NumEnvelopes() == 4; }, 10s, "Pacing timer flush"));
+  ASSERT_EQ(GetEnvelope(3)->tablet_ids, Tablets({"b2", "b3"}));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_timer), 1);
+
+  // Above 0 -> 0 again, now completed: the completion's response-clocked flush sends the parked
+  // request and cancels its pacing timer.
+  SetWindow(long_window);
+  Add("b4", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 4);
+  SetWindow(0us);
+  Complete(2);
+  ASSERT_EQ(NumEnvelopes(), 5);
+  ASSERT_EQ(GetEnvelope(4)->tablet_ids, Tablets({"b4"}));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_response_clocked), 1);
+  // A negative check: past the pacing timer b4 armed.
+  std::this_thread::sleep_until(SentAt(3) + long_window + 300ms * kTimeMultiplier);
+  ASSERT_EQ(NumEnvelopes(), 5);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_timer), 1);
+
+  Complete(3);
+  Complete(4);
+  for (auto& call : calls_) {
+    ASSERT_NO_FATALS(WaitDone(*call));
+    ASSERT_OK(call->status);
+    ASSERT_EQ(call->num_callbacks.load(), 1);
+  }
+  std::unordered_map<std::string, int> sent;
+  for (size_t i = 0; i != NumEnvelopes(); ++i) {
+    for (const auto& tablet_id : GetEnvelope(i)->tablet_ids) {
+      ++sent[tablet_id];
+    }
+  }
+  ASSERT_EQ(sent.size(), calls_.size());
+  for (const auto& [tablet_id, count] : sent) {
+    ASSERT_EQ(count, 1) << tablet_id;
+  }
+}
+
+// multi_raft_data_add_to_send_us records, for each data request and under either policy, how long
+// it waited in the batcher: about 0 when sent at once, about the deadline behind an envelope in
+// flight, about the window when paced. Heartbeats are not recorded.
+TEST_F(MultiRaftBatcherTest, AddToSendMetric) {
+  const auto delay = 200ms * kTimeMultiplier;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_flush_delay_ms) =
+      static_cast<uint32_t>(ToMilliseconds(delay));
+  CreateBatcher();
+  auto stats = Stats(METRIC_multi_raft_data_add_to_send_us);
+  auto max_us = [&stats] { return static_cast<int64_t>(stats->MaxValue()); };
+
+  // Response clocking: an immediate flush, then a request parked until the deadline.
+  Add("t1", RequestKind::kHeartbeat);
+  Add("t2", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ASSERT_EQ(stats->TotalCount(), 1);
+  ASSERT_LT(max_us(), ToMicroseconds(delay));
+  const auto before_parked = steady_clock::now();
+  Add("t3", RequestKind::kData);
+  const auto after_parked = steady_clock::now();
+  ASSERT_OK(WaitFor([this] { return NumEnvelopes() == 2; }, 10s, "Deadline flush"));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_deadline), 1);
+  ASSERT_EQ(stats->TotalCount(), 2);
+  // The deadline is armed inside the add, and t3's add time is before after_parked.
+  ASSERT_GE(max_us(), ToMicroseconds(delay - (after_parked - before_parked)));
+  ASSERT_LT(max_us(), ToMicroseconds(delay + 5s));
+
+  // Pacing: an inline flush, then a request parked for the rest of the window.
+  const auto window = 200ms * kTimeMultiplier;
+  SetWindow(window);
+  std::this_thread::sleep_until(SentAt(1) + window + 10ms);
+  const auto count_before = stats->TotalCount();
+  const auto sum_before = stats->TotalSum();
+  const auto before_inline = steady_clock::now();
+  Add("t4", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 3);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_inline), 1);
+  Add("t5", RequestKind::kHeartbeat);
+  Add("t6", RequestKind::kData);
+  const auto after_paced = steady_clock::now();
+  ASSERT_OK(WaitFor([this] { return NumEnvelopes() == 4; }, 10s, "Pacing timer flush"));
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_timer), 1);
+  ASSERT_EQ(stats->TotalCount(), count_before + 2);
+  // t4 waited about 0 and t6 the rest of the window, which started after before_inline.
+  const auto paced_sum = static_cast<int64_t>(stats->TotalSum() - sum_before);
+  ASSERT_GE(paced_sum, ToMicroseconds(window - (after_paced - before_inline)));
+  ASSERT_LT(paced_sum, ToMicroseconds(window + 5s));
+  ASSERT_LT(static_cast<int64_t>(stats->MinValue()), ToMicroseconds(delay));
+
+  for (size_t i = 0; i != NumEnvelopes(); ++i) {
+    Complete(i);
+  }
+  for (auto& call : calls_) {
+    ASSERT_NO_FATALS(WaitDone(*call));
+    ASSERT_OK(call->status);
+  }
+  ASSERT_EQ(static_cast<int64_t>(stats->TotalCount()),
+            CounterValue(METRIC_multi_raft_data_sub_requests));
+}
+
+// With pacing and streaming, no envelope is serialized on a reactor: the pacing timer sends from a
+// scheduler thread, re-adds from slot tasks send inline from the High pool, and the frames and
+// final send nothing.
+TEST_F(MultiRaftBatcherTest, PacedStreamedSendsOffReactor) {
+  const auto window = 100ms * kTimeMultiplier;
+  SetWindow(window);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = true;
+  std::atomic<int> sends_on_reactor{0};
+  std::atomic<int> sends_on_high_pool{0};
+  auto* high_pool = &messenger_->ThreadPool(rpc::ServicePriority::kHigh);
+  sender_state_->SetSendHook([&sends_on_reactor, &sends_on_high_pool, high_pool](size_t) {
+    if (IsReactorThread()) {
+      ++sends_on_reactor;
+    }
+    if (high_pool->OwnsThisThread()) {
+      ++sends_on_high_pool;
+    }
+  });
+  // The hook captures locals, and a pacing timer may still send after the last assertion.
+  auto clear_hook = ScopeExit([this] { sender_state_->SetSendHook({}); });
+  CreateBatcher();
+  auto& d0c = NewCall("t0c");
+  auto& d0b = NewCall("t0b", 100, [this, &d0c] { Submit(d0c, RequestKind::kData); });
+  auto& d0 = NewCall("t0", 100, [this, &d0b] { Submit(d0b, RequestKind::kData); });
+  Submit(d0, RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ASSERT_TRUE(GetEnvelope(0)->req.stream_responses());
+
+  // d0's slot task re-adds within the window: it parks, and the pacing timer sends it.
+  ASSERT_TRUE(DeliverOnReactor(0, Frame(0, {0})));
+  ASSERT_NO_FATALS(WaitDone(d0));
+  ASSERT_OK(WaitFor([this] { return NumEnvelopes() == 2; }, 10s, "Pacing timer flush"));
+  ASSERT_EQ(GetEnvelope(1)->tablet_ids, Tablets({"t0b"}));
+  ASSERT_NO_FATALS(CompleteOnReactor(0, Status::OK()));
+  ASSERT_NO_FATALS(WaitReleased(d0));
+  ASSERT_EQ(NumEnvelopes(), 2);
+
+  // d0b's slot task re-adds after the window: it goes out inline from the High pool.
+  std::this_thread::sleep_until(SentAt(1) + window + 10ms);
+  ASSERT_NO_FATALS(CompleteOnReactor(1, Status::OK(), Frame(1, {0})));
+  ASSERT_NO_FATALS(WaitDone(d0b));
+  ASSERT_OK(WaitFor([this] { return NumEnvelopes() == 3; }, 10s, "Inline flush"));
+  ASSERT_EQ(GetEnvelope(2)->tablet_ids, Tablets({"t0c"}));
+  ASSERT_NO_FATALS(CompleteOnReactor(2, Status::OK(), Frame(2, {0})));
+  ASSERT_NO_FATALS(WaitReleased(d0c));
+  for (auto* call : {&d0, &d0b, &d0c}) {
+    ASSERT_OK(call->status);
+    ASSERT_EQ(call->num_callbacks.load(), 1);
+  }
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_timer), 1);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_inline), 2);
+  ASSERT_EQ(sends_on_reactor.load(), 0);
+  ASSERT_EQ(sends_on_high_pool.load(), 1);
+}
+
+// Shutdown aborts a parked request and cancels its pacing timer, and a timer that outlives the
+// batcher touches nothing.
+TEST_F(MultiRaftBatcherTest, PacedShutdownWithTimerArmed) {
+  const auto window = 300ms * kTimeMultiplier;
+  SetWindow(window);
+  CreateBatcher();
+  auto& d1 = Add("t1", RequestKind::kData);
+  auto& d2 = Add("t2", RequestKind::kData);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  batcher_->Shutdown();
+  ASSERT_TRUE(IsDone(d2));
+  ASSERT_TRUE(d2.status.IsAborted()) << d2.status;
+  batcher_.reset();
+  // A negative check: past the window.
+  std::this_thread::sleep_for(2 * window);
+  ASSERT_EQ(NumEnvelopes(), 1);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_paced_timer), 0);
+  Complete(0);
+  ASSERT_NO_FATALS(WaitDone(d1));
+  ASSERT_OK(d1.status);
+  for (auto* call : {&d1, &d2}) {
+    ASSERT_EQ(call->num_callbacks.load(), 1);
+  }
+}
+
+// Several threads add data and heartbeats under a short window, with caps and the heartbeat timer
+// active, and fail some batches through the handle, while another completes envelopes as they
+// appear. Pacing timers race cap flushes and adds. Every request is sent exactly once and every
+// callback runs exactly once.
+TEST_F(MultiRaftBatcherTest, PacedConcurrentAdds) {
+  constexpr int kThreads = 4;
+  constexpr int kRequestsPerThread = 300;
+  SetWindow(200us);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_heartbeat_interval_ms) = 5;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_batch_size) = 4;
+  CreateBatcher();
+
+  std::vector<std::vector<TestCall*>> per_thread(kThreads);
+  for (int t = 0; t != kThreads; ++t) {
+    for (int i = 0; i != kRequestsPerThread; ++i) {
+      per_thread[t].push_back(&NewCall(Format("t$0-$1", t, i)));
+    }
+  }
+  std::atomic<int> adders_running{kThreads};
+  TestThreadHolder holder;
+  for (int t = 0; t != kThreads; ++t) {
+    holder.AddThread([this, &calls = per_thread[t], &adders_running] {
+      int i = 0;
+      for (auto* call : calls) {
+        Submit(*call, i % 5 == 0 ? RequestKind::kHeartbeat : RequestKind::kData);
+        if (i % 10 == 3) {
+          call->handle.MarkCallAsFailed();
+        }
+        // Sometimes past the window, so that inline flushes, timer flushes and caps all occur.
+        std::this_thread::sleep_for(std::chrono::microseconds(RandomUniformInt(0, 300)));
+        ++i;
+      }
+      --adders_running;
+    });
+  }
+  std::atomic<bool> completer_failed{false};
+  holder.AddThread([this, &adders_running, &completer_failed] {
+    size_t next = 0;
+    const auto deadline = CoarseMonoClock::Now() + 60s;
+    for (;;) {
+      while (next < NumEnvelopes()) {
+        sender_state_->Complete(next++, Status::OK(), &FillResponse);
+      }
+      if (adders_running.load() == 0 && std::all_of(
+              calls_.begin(), calls_.end(), [this](const auto& call) { return IsDone(*call); })) {
+        return;
+      }
+      if (CoarseMonoClock::Now() > deadline) {
+        completer_failed = true;
+        return;
+      }
+      std::this_thread::sleep_for(1ms);
+    }
+  });
+  holder.JoinAll();
+  ASSERT_FALSE(completer_failed.load());
+
+  std::unordered_map<std::string, int> sent;
+  for (size_t i = 0; i != NumEnvelopes(); ++i) {
+    for (const auto& tablet_id : GetEnvelope(i)->tablet_ids) {
+      ++sent[tablet_id];
+    }
+  }
+  ASSERT_EQ(sent.size(), calls_.size());
+  for (const auto& call : calls_) {
+    ASSERT_EQ(sent[call->tablet_id], 1) << call->tablet_id;
+    ASSERT_EQ(call->num_callbacks.load(), 1) << call->tablet_id;
+  }
+  LOG(INFO) << "Envelopes: " << NumEnvelopes()
+            << ", paced inline: " << CounterValue(METRIC_multi_raft_flush_paced_inline)
+            << ", paced timer: " << CounterValue(METRIC_multi_raft_flush_paced_timer)
+            << ", count cap: " << CounterValue(METRIC_multi_raft_flush_count_cap)
+            << ", timer: " << CounterValue(METRIC_multi_raft_flush_timer);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_immediate), 0);
+  ASSERT_EQ(CounterValue(METRIC_multi_raft_flush_response_clocked), 0);
+  ASSERT_EQ(running_calls_.load(), 0);
 }
 
 // A batcher exists when either batching flag is set.
