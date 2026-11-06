@@ -548,8 +548,9 @@ class ConsensusServiceImpl : public consensus::ConsensusServiceIf {
 
   // Each sub-request's steps up to its log append (the same steps as UpdateConsensus, which can
   // block on the tablet's update_mutex_ or a write stall, and include applying committed
-  // operations) run as one task on multi_raft_update_pool_, so neither the handler thread nor
-  // other sub-requests wait for them. The wait for durability does not hold a thread
+  // operations) run as one task on multi_raft_update_pool_, so other sub-requests do not wait for
+  // them. With multi_raft_update_inline_first, the handler thread runs one of them itself, after
+  // dispatching the others. The wait for durability does not hold a thread
   // (RaftConsensus::UpdateAsync). Without stream_responses the RPC is answered once, when the
   // last sub-request completes or at the deadline with the others set to TimedOut. With it, each
   // completed response goes out in a partial frame as soon as possible, and the final response
@@ -562,6 +563,7 @@ class ConsensusServiceImpl : public consensus::ConsensusServiceIf {
   rpc::Messenger* const messenger_;
   std::unique_ptr<rpc::ThreadPool> multi_raft_update_pool_;
   scoped_refptr<Counter> multi_raft_update_sub_requests_concurrent_;
+  scoped_refptr<Counter> multi_raft_update_inline_sub_requests_;
   // Shared with the state of every envelope in progress, which can outlive this service.
   std::shared_ptr<const MultiRaftUpdateMetrics> multi_raft_update_metrics_;
 };

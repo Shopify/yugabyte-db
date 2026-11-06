@@ -15,6 +15,7 @@
 // and a fake peer, so the server's replicas are followers of whatever the test sends.
 
 #include <atomic>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -85,6 +86,7 @@ DECLARE_uint64(multi_raft_batch_size);
 DECLARE_uint32(multi_raft_data_flush_delay_ms);
 DECLARE_uint64(multi_raft_heartbeat_interval_ms);
 DECLARE_uint32(multi_raft_rpc_timeout_ms);
+DECLARE_bool(multi_raft_update_inline_first);
 DECLARE_int32(multi_raft_update_max_threads);
 DECLARE_int32(raft_heartbeat_interval_ms);
 DECLARE_bool(TEST_multi_raft_update_fail_partial_frames);
@@ -99,6 +101,9 @@ METRIC_DECLARE_counter(multi_raft_frames_received);
 METRIC_DECLARE_counter(multi_raft_update_deadline_responses);
 METRIC_DECLARE_event_stats(multi_raft_update_frame_slots);
 METRIC_DECLARE_counter(multi_raft_update_frames_sent);
+METRIC_DECLARE_counter(multi_raft_update_inline_sub_requests);
+METRIC_DECLARE_event_stats(multi_raft_update_pool_queue_time_us);
+METRIC_DECLARE_event_stats(multi_raft_update_pool_run_time_us);
 METRIC_DECLARE_event_stats(multi_raft_update_slot_wait_us);
 METRIC_DECLARE_counter(multi_raft_update_sub_requests_concurrent);
 
@@ -333,6 +338,39 @@ class StreamSyncPoints {
   size_t releases_ GUARDED_BY(mutex_) = 0;
   bool held_ GUARDED_BY(mutex_) = false;
 };
+
+// Records, by tablet, the thread on which each sub-request starts its update
+// (MultiRaftUpdateTask::BeforeUpdate). On destruction it clears every sync-point callback and
+// waits for those still running.
+class UpdateThreads {
+ public:
+  UpdateThreads() {
+    sync_point_->SetCallBack("MultiRaftUpdateTask::BeforeUpdate", [this](void* arg) {
+      auto& req = *static_cast<consensus::LWConsensusRequestPB*>(arg);
+      auto* thread = Thread::current_thread();
+      std::lock_guard lock(mutex_);
+      threads_[req.tablet_id().ToBuffer()].push_back(thread ? thread->name() : "");
+    });
+    sync_point_->EnableProcessing();
+  }
+
+  // The threads of the updates of tablet_id so far.
+  std::vector<std::string> Get(const TabletId& tablet_id) {
+    std::lock_guard lock(mutex_);
+    return threads_[tablet_id];
+  }
+
+ private:
+  std::mutex mutex_;
+  std::map<std::string, std::vector<std::string>> threads_ GUARDED_BY(mutex_);
+  // Destroyed first.
+  SyncPointScope sync_point_;
+};
+
+// Threads of the consensus service (the messenger's high-priority pool) and of the multi-Raft
+// update pool.
+constexpr auto kServiceThread = "-high-pri";
+constexpr auto kPoolThread = "multi_raft_update";
 
 void AssertSlotOk(const ConsensusResponsePB& slot, const OpId& last_received) {
   ASSERT_FALSE(slot.has_error()) << slot.ShortDebugString();
@@ -723,6 +761,18 @@ class MultiRaftUpdateConsensusTest : public TabletServerTestBase {
 
   int64_t FramesSent() {
     return ServerCounter(METRIC_multi_raft_update_frames_sent);
+  }
+
+  int64_t InlineSubRequests() {
+    return ServerCounter(METRIC_multi_raft_update_inline_sub_requests);
+  }
+
+  // Asserts that the only update of tablet ran on a thread whose name contains thread.
+  void AssertUpdateThread(UpdateThreads* threads, const TestTablet& tablet, const char* thread) {
+    auto names = threads->Get(tablet.id);
+    ASSERT_EQ(names.size(), 1) << tablet.id << ": " << AsString(names);
+    LOG(INFO) << "Update of " << tablet.id << " ran on " << names[0];
+    ASSERT_STR_CONTAINS(names[0], thread);
   }
 
   scoped_refptr<EventStats> ServerStats(const EventStatsPrototype& prototype) {
@@ -2341,6 +2391,167 @@ TEST_F(MultiRaftUpdateConsensusTest, BatcherStreamedMarkCallAsFailed) {
     ASSERT_OK(WaitFor([call] { return call->handle.expired(); }, 10s, "Batch released"));
   }
   ASSERT_EQ(LeaderCounter(METRIC_multi_raft_frames_received), frames_received);
+}
+
+// With multi_raft_update_inline_first, the handler thread runs the first sub-request itself and
+// the others go to the pool.
+TEST_F(MultiRaftUpdateConsensusTest, InlineFirstRunsOnHandlerThread) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_update_inline_first) = true;
+  ASSERT_NO_FATALS(StartServer(3));
+  const auto inline_before = InlineSubRequests();
+  const auto concurrent_before = ConcurrentSubRequests();
+  UpdateThreads threads;
+  auto resp = ASSERT_RESULT(Send(OneOpPerTablet()));
+  for (size_t i = 0; i != tablets_.size(); ++i) {
+    ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(narrow_cast<int>(i)), tablets_[i].last));
+  }
+  ASSERT_NO_FATALS(AssertUpdateThread(&threads, tablets_[0], kServiceThread));
+  ASSERT_NO_FATALS(AssertUpdateThread(&threads, tablets_[1], kPoolThread));
+  ASSERT_NO_FATALS(AssertUpdateThread(&threads, tablets_[2], kPoolThread));
+  ASSERT_EQ(InlineSubRequests() - inline_before, 1);
+  ASSERT_EQ(ConcurrentSubRequests() - concurrent_before, tablets_.size());
+}
+
+// The sub-request run inline is the first one that passed the pre-dispatch checks.
+TEST_F(MultiRaftUpdateConsensusTest, InlineFirstSkipsFailedSlotZero) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_update_inline_first) = true;
+  ASSERT_NO_FATALS(StartServer(3));
+  const auto inline_before = InlineSubRequests();
+  UpdateThreads threads;
+  auto wrong_uuid = Heartbeat(tablets_[0]);
+  wrong_uuid.set_dest_uuid("no-such-server");
+  auto resp = ASSERT_RESULT(Send(
+      {wrong_uuid, Data(&tablets_[1], 1, true), Data(&tablets_[2], 1, true)}));
+  ASSERT_EQ(resp.consensus_response(0).error().code(), TabletServerErrorPB::WRONG_SERVER_UUID);
+  ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(1), tablets_[1].last));
+  ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(2), tablets_[2].last));
+  ASSERT_TRUE(threads.Get(tablets_[0].id).empty());
+  ASSERT_NO_FATALS(AssertUpdateThread(&threads, tablets_[1], kServiceThread));
+  ASSERT_NO_FATALS(AssertUpdateThread(&threads, tablets_[2], kPoolThread));
+  ASSERT_EQ(InlineSubRequests() - inline_before, 1);
+}
+
+// An envelope whose only dispatchable sub-request runs inline never uses the pool, and the inline
+// run is not counted in the pool's metrics.
+TEST_F(MultiRaftUpdateConsensusTest, InlineFirstSingleSubRequestSkipsPool) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_update_inline_first) = true;
+  // StartServer's heartbeat envelope has one sub-request too.
+  ASSERT_NO_FATALS(StartServer(1));
+  const auto inline_before = InlineSubRequests();
+  UpdateThreads threads;
+  auto unknown_tablet = Heartbeat(tablets_[0]);
+  unknown_tablet.set_tablet_id("no-such-tablet");
+  auto resp = ASSERT_RESULT(Send({unknown_tablet, Data(&tablets_[0], 1, false)}));
+  ASSERT_EQ(resp.consensus_response(0).error().code(), TabletServerErrorPB::TABLET_NOT_FOUND);
+  ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(1), tablets_[0].last));
+  ASSERT_NO_FATALS(AssertUpdateThread(&threads, tablets_[0], kServiceThread));
+  ASSERT_EQ(InlineSubRequests() - inline_before, 1);
+  // Nothing has been queued to the pool since the server started.
+  ASSERT_EQ(ServerStats(METRIC_multi_raft_update_pool_queue_time_us)->TotalCount(), 0);
+  ASSERT_EQ(ServerStats(METRIC_multi_raft_update_pool_run_time_us)->TotalCount(), 0);
+}
+
+// The inline sub-request's frame of a streamed envelope goes out like the others, with the right
+// indices.
+TEST_F(MultiRaftUpdateConsensusTest, InlineFirstWithStreaming) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_update_inline_first) = true;
+  ASSERT_NO_FATALS(StartServer(3));
+  constexpr auto kDiskDelay = 1s;
+  SetSlowDisk(tablets_[2], kDiskDelay);
+  const auto inline_before = InlineSubRequests();
+  UpdateThreads threads;
+  std::vector<ConsensusRequestPB> requests;
+  for (size_t i = 0; i != tablets_.size(); ++i) {
+    requests.push_back(Data(&tablets_[i], narrow_cast<int>(i) + 1, /* commit= */ i != 2));
+  }
+  auto envelope = SendRecordedAsync(std::move(requests));
+  auto result = ASSERT_RESULT(WaitStreamed(envelope.get()));
+  ASSERT_GE(envelope->elapsed(), kDiskDelay);
+  // The inline slot did not wait for the slow one.
+  ASSERT_TRUE(result.PartialIndices().contains(0)) << AsString(result.PartialIndices());
+  ASSERT_EQ(result.FinalIndices(), (std::set<uint32_t>{2}));
+  for (size_t i = 0; i != tablets_.size(); ++i) {
+    ASSERT_NO_FATALS(AssertSlotOk(
+        result.merged.consensus_response(narrow_cast<int>(i)), tablets_[i].last));
+  }
+  ASSERT_NO_FATALS(AssertUpdateThread(&threads, tablets_[0], kServiceThread));
+  ASSERT_NO_FATALS(AssertUpdateThread(&threads, tablets_[1], kPoolThread));
+  ASSERT_NO_FATALS(AssertUpdateThread(&threads, tablets_[2], kPoolThread));
+  ASSERT_EQ(InlineSubRequests() - inline_before, 1);
+}
+
+// The inline sub-request blocked on its tablet's update_mutex_ does not hold up the others, which
+// were queued to the pool before it ran.
+TEST_F(MultiRaftUpdateConsensusTest, InlineFirstHeldMutexDoesNotBlockMates) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_update_inline_first) = true;
+  ASSERT_NO_FATALS(StartServer(3));
+  TestThreadHolder thread_holder;
+  std::atomic<bool> direct_done{false};
+  ASSERT_NO_FATALS(HoldUpdateMutex(&tablets_[0], 3s, &thread_holder, &direct_done));
+  const auto inline_before = InlineSubRequests();
+  UpdateThreads threads;
+
+  auto envelope = SendAsync(
+      {Heartbeat(tablets_[0]), Data(&tablets_[1], 1, true), Data(&tablets_[2], 1, true)});
+  ASSERT_OK(WaitForLastReceived(tablets_[1], 1s));
+  ASSERT_OK(WaitForLastReceived(tablets_[2], 1s));
+  // Still held: the handler thread is blocked in the first sub-request.
+  ASSERT_FALSE(direct_done.load());
+  ASSERT_FALSE(envelope->finished());
+  ASSERT_NO_FATALS(AssertUpdateThread(&threads, tablets_[0], kServiceThread));
+  ASSERT_NO_FATALS(AssertUpdateThread(&threads, tablets_[1], kPoolThread));
+  ASSERT_NO_FATALS(AssertUpdateThread(&threads, tablets_[2], kPoolThread));
+
+  ASSERT_OK(Wait(envelope.get()));
+  for (size_t i = 0; i != tablets_.size(); ++i) {
+    ASSERT_NO_FATALS(AssertSlotOk(
+        envelope->resp.consensus_response(narrow_cast<int>(i)), tablets_[i].last));
+  }
+  ASSERT_EQ(InlineSubRequests() - inline_before, 1);
+  thread_holder.JoinAll();
+}
+
+// An envelope whose inline sub-request is blocked on update_mutex_ past the deadline is still
+// answered at the deadline, with the others' results: either the deadline task answers, or the
+// inline sub-request gives up waiting for the mutex at the deadline.
+TEST_F(MultiRaftUpdateConsensusTest, InlineFirstHeldMutexAnsweredAtDeadline) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_update_inline_first) = true;
+  ASSERT_NO_FATALS(StartServer(2));
+  TestThreadHolder thread_holder;
+  std::atomic<bool> direct_done{false};
+  ASSERT_NO_FATALS(HoldUpdateMutex(&tablets_[0], 4s, &thread_holder, &direct_done));
+  const auto deadline_responses_before = DeadlineResponses();
+  UpdateThreads threads;
+
+  auto envelope = SendAsync({Heartbeat(tablets_[0]), Data(&tablets_[1], 1, true)}, 2s);
+  ASSERT_OK(Wait(envelope.get()));
+  ASSERT_GE(envelope->elapsed(), 1500ms);
+  ASSERT_LT(envelope->elapsed(), 3s);
+  ASSERT_FALSE(direct_done.load());
+  const auto& slot = envelope->resp.consensus_response(0);
+  ASSERT_NO_FATALS(AssertSlotError(slot, AppStatusPB::TIMED_OUT));
+  LOG(INFO) << "Inline slot: " << slot.error().status().message() << ", deadline responses: "
+            << DeadlineResponses() - deadline_responses_before;
+  ASSERT_NO_FATALS(AssertSlotOk(envelope->resp.consensus_response(1), tablets_[1].last));
+  ASSERT_NO_FATALS(AssertUpdateThread(&threads, tablets_[0], kServiceThread));
+  thread_holder.JoinAll();
+  ASSERT_TRUE(direct_done.load());
+  ASSERT_NO_FATALS(AssertSlotOk(
+      ASSERT_RESULT(Send({Heartbeat(tablets_[0])})).consensus_response(0), tablets_[0].last));
+}
+
+// With multi_raft_update_inline_first off, every sub-request runs on the pool.
+TEST_F(MultiRaftUpdateConsensusTest, InlineFirstOffUnchanged) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_update_inline_first) = false;
+  ASSERT_NO_FATALS(StartServer(3));
+  const auto inline_before = InlineSubRequests();
+  UpdateThreads threads;
+  auto resp = ASSERT_RESULT(Send(OneOpPerTablet()));
+  for (size_t i = 0; i != tablets_.size(); ++i) {
+    ASSERT_NO_FATALS(AssertSlotOk(resp.consensus_response(narrow_cast<int>(i)), tablets_[i].last));
+    ASSERT_NO_FATALS(AssertUpdateThread(&threads, tablets_[i], kPoolThread));
+  }
+  ASSERT_EQ(InlineSubRequests(), inline_before);
 }
 
 // The multi_raft_update pool runs in the cgroup of the messenger's high-priority pool, where the
