@@ -21,7 +21,15 @@
 // then runs a small workload on one tserver where each check exercises an observable effect: tablet
 // count, read committed, upsert, index backfill and reltuples, a CBO bitmap plan, md5 and SCRAM
 // logins, the tracked query text and query id, PG log files, ASH samples and a replication slot
-// LSN type.
+// LSN type. Then it restarts the master on the full file, so the restart-only
+// master_join_existing_universe takes effect, and checks that the master runs it, that every
+// tserver heartbeats to the restarted master and that DDL works. After a catalog version bump, a
+// new backend looks up each table of the preload list without a catalog cache miss, while an
+// unlisted table does miss. Last, the metrics snapshotter rows show which whitelist tokens the
+// snapshotter actually matched.
+// Where production differs from what its configuration intends (tserver keys that are not
+// gflags, whitelist tokens that match nothing, shadowed scram-sha-256 hba lines, master-only flags
+// in the tserver profile), the test asserts what production does, not what was intended.
 //
 // Flagfile grammar. The active lines are byte-for-byte what the deployment renders, so a fresh
 // render diffs cleanly against the files. Lines the test cannot apply are kept as markers:
@@ -36,10 +44,11 @@
 //   Any other line starting with '#': free-form comment.
 //   Blank line: ignored.
 // A line starting with "# PROD " that is not one of the two marker forms fails the test, and so
-// does a comment that looks like a mistyped marker: '#', optional whitespace, then "prod" in any
-// case followed by whitespace or '-' ("#PROD --", "# prod --"; "# Production ..." stays a
-// comment). A typo'd marker would otherwise be a plain comment whose key silently leaves both the
-// expected and the read-back sets.
+// does a comment that looks like a mistyped marker or a commented-out flag line. After the leading
+// run of '#' and whitespace, such a comment starts with "prod" in any case followed by whitespace
+// or '-' ("#PROD --", "# prod --", "## PROD --"; "# Production ..." stays a comment), or with
+// "--" and a key character ("#--key=1", "# --key=1"). Either would otherwise be a plain comment
+// whose key silently leaves both the expected and the read-back sets.
 // The value is everything after the first '=', verbatim, quotes included. Any other line is an
 // error: in a gflags flagfile, a non-blank line starting with neither '-' nor '#' is a
 // program-name filter that silently disables every line after it. gflags has no inline trailing
@@ -63,8 +72,10 @@
 // The flagfiles hold all the expectations. The only other data are the three lists below, each
 // carrying facts a flagfile cannot: kBootstrapDeferredFlags, kKnownUnrecognizedFlags and
 // kOtherDaemonOnlyFlags. When the production profile is corrected, the files change by diff and
-// the lists shrink; a kKnownUnrecognizedFlags or kOtherDaemonOnlyFlags row whose key leaves the
-// profile fails the test.
+// the lists shrink; a row of any of them whose key leaves the profile fails the test. The preload
+// check also keeps, as workload rather than expectations, a query per listed catalog table that
+// looks the table up; a listed table without one fails the test, so a table added to the list
+// cannot pass unexercised.
 
 #include <sys/stat.h>
 
@@ -73,6 +84,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <map>
 #include <optional>
 #include <regex>
@@ -85,12 +97,28 @@
 #include <utility>
 #include <vector>
 
+#include "yb/client/client.h"
+#include "yb/client/table_handle.h"
+#include "yb/client/yb_table_name.h"
+
+#include "yb/common/ql_value.h"
+#include "yb/common/transaction.h"
+
 #include "yb/gutil/strings/join.h"
 
 #include "yb/integration-tests/external_mini_cluster.h"
 
+#include "yb/master/master_cluster.pb.h"
+#include "yb/master/master_cluster.proxy.h"
+#include "yb/master/master_defaults.h"
+
+#include "yb/qlexpr/ql_rowblock.h"
+
+#include "yb/rpc/rpc_controller.h"
+
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/csv_util.h"
+#include "yb/util/curl_util.h"
 #include "yb/util/env.h"
 #include "yb/util/env_util.h"
 #include "yb/util/enums.h"
@@ -259,16 +287,28 @@ bool IsSpace(char c) {
   return std::isspace(static_cast<unsigned char>(c));
 }
 
-// True for a comment that looks like a mistyped marker ("#PROD --", "# prod --", "#  PROD --").
-// Such a line would otherwise be a plain comment: its key would leave both the expected and the
-// read-back sets, so no assertion would notice the marker is gone.
-bool IsNearMissMarker(std::string_view line) {
-  auto rest = line.substr(1);
-  while (!rest.empty() && IsSpace(rest.front())) {
+bool IsKeyChar(char c) {
+  return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+// For a comment that looks like a mistyped marker ("#PROD --", "# prod --", "## PROD --") or a
+// commented-out flag line ("#--key=1", "# --key=1"), returns what it looks like. Such a line
+// would otherwise be a plain comment: its key would leave both the expected and the read-back
+// sets, so no assertion would notice the line is gone.
+std::optional<std::string_view> NearMissComment(std::string_view line) {
+  auto rest = line;
+  while (!rest.empty() && (rest.front() == '#' || IsSpace(rest.front()))) {
     rest.remove_prefix(1);
   }
-  return rest.size() > 4 && ToLower(rest.substr(0, 4)) == "prod" &&
-         (IsSpace(rest[4]) || rest[4] == '-');
+  if (rest.size() > 4 && ToLower(rest.substr(0, 4)) == "prod" &&
+      (IsSpace(rest[4]) || rest[4] == '-')) {
+    return "a mistyped marker (markers start with exactly '# PROD ')";
+  }
+  if (rest.size() > 2 && rest.starts_with("--") && IsKeyChar(rest[2])) {
+    return "a commented-out flag line (a production line the test does not apply must be a "
+           "'# PROD' marker)";
+  }
+  return std::nullopt;
 }
 
 // Returns std::nullopt for a comment or blank line.
@@ -307,11 +347,8 @@ Result<std::optional<ProfileEntry>> ParseProfileLine(std::string_view line) {
         "'[SUBSTITUTED: harness]'): '$0'", line);
   }
   if (line.starts_with("#")) {
-    if (IsNearMissMarker(line)) {
-      return STATUS_FORMAT(
-          InvalidArgument,
-          "Comment looks like a mistyped marker (markers start with exactly '# PROD '): '$0'",
-          line);
+    if (const auto near_miss = NearMissComment(line)) {
+      return STATUS_FORMAT(InvalidArgument, "Comment looks like $0: '$1'", *near_miss, line);
     }
     return std::nullopt;
   }
@@ -431,6 +468,7 @@ std::string StripPgQuotes(const std::string& s) {
 }
 
 YB_STRONGLY_TYPED_BOOL(StripQuotes);
+YB_STRONGLY_TYPED_BOOL(IncludeBootstrapDeferred);
 
 // The value comparison rule from the top-of-file comment.
 bool ProfileValuesMatch(
@@ -584,6 +622,14 @@ Result<std::string> ExplainText(PGConn* conn, const std::string& explain) {
   return JoinStrings(lines, "\n");
 }
 
+// Catalog cache misses of one catalog table, summed over the databases of a tserver's PG. Every
+// list miss and negative miss is also counted as a table miss.
+struct CatCacheMisses {
+  int64_t table = 0;
+  int64_t list = 0;
+  int64_t negative = 0;
+};
+
 }  // namespace
 
 class PgProductionProfileTest : public LibPqTestBase {
@@ -693,7 +739,7 @@ class PgProductionProfileTest : public LibPqTestBase {
     return daemon == kMasterDaemon ? master_profile_ : tserver_profile_;
   }
 
-  void CheckFlagReadback();
+  void CheckFlagReadback(IncludeBootstrapDeferred include_deferred);
   void CheckOtherDaemonOnlyFlags();
   void CheckPgConfCsv(PGConn* conn);
   void CheckPgTaggedFlags(PGConn* conn);
@@ -710,6 +756,12 @@ class PgProductionProfileTest : public LibPqTestBase {
   void CheckPgLogFiles();
   void CheckAsh(PGConn* conn);
   void CheckReplicationSlot(PGConn* conn);
+  void CheckMasterRestart();
+  void CheckTServersHeartbeat(size_t leader_idx);
+  void CheckCatalogPreload(PGConn* conn);
+  void CheckMetricsSnapshotter();
+
+  Result<std::map<std::string, CatCacheMisses>> ReadCatCacheMisses();
 
   Result<PGConn> ConnectAsSuperuserAgain() {
     return ConnectTcp(*pg_ts, kSuperuser, kSuperuserPassword, kDefaultDb, kLoginTimeoutSec);
@@ -746,21 +798,33 @@ class PgProductionProfileTest : public LibPqTestBase {
 
   DaemonProfile master_profile_;
   DaemonProfile tserver_profile_;
-  // Paths passed to --flagfile. The master copy leaves out kBootstrapDeferredFlags.
+  // Paths passed to --flagfile. The master copy leaves out kBootstrapDeferredFlags until
+  // CheckMasterRestart rewrites it with the full file.
   std::string master_flagfile_;
   std::string tserver_flagfile_;
 
   // Writes the profile to dest without the active lines of kBootstrapDeferredFlags, for booting a
-  // fresh cluster.
+  // fresh cluster. A row with no active line fails: the copy would silently equal the full file,
+  // and the master restart would have nothing left to apply.
   static Status WriteCopyWithoutDeferredFlags(
       const DaemonProfile& profile, const std::string& dest) {
     std::string out;
+    std::set<std::string> left_out;
     for (auto line : SplitLines(profile.contents)) {
       auto entry = VERIFY_RESULT(ParseProfileLine(line));
       if (entry && entry->kind == ProfileEntryKind::kActive && IsBootstrapDeferred(entry->key)) {
+        left_out.insert(entry->key);
         continue;
       }
       out.append(line).append("\n");
+    }
+    for (const auto& key : kBootstrapDeferredFlags) {
+      if (!left_out.contains(key)) {
+        return STATUS_FORMAT(
+            NotFound,
+            "$0: kBootstrapDeferredFlags row $1 has no active line in the profile; remove the row "
+            "if the profile dropped it", profile.daemon, key);
+      }
     }
     return WriteStringToFile(Env::Default(), out, dest);
   }
@@ -825,6 +889,14 @@ TEST_F(PgProductionProfileTest, FlagfilesParseCleanly) {
       if (!status.ok()) {
         failures.push_back(status.message().ToBuffer());
       }
+    }
+  }
+
+  for (const auto& key : kBootstrapDeferredFlags) {
+    if (!profiles[kMasterDaemon].FindActive(key)) {
+      failures.push_back(Format(
+          "$0: kBootstrapDeferredFlags row $1 has no active line in the profile; remove the row "
+          "if the profile dropped it", kMasterDaemon, key));
     }
   }
 
@@ -937,7 +1009,7 @@ std::string OrNull(const std::optional<std::string>& value) {
 // that silently did not apply (gflags ignores an unknown name in a flagfile) or a new harness
 // override then fails by name, and so does a SUBSTITUTED key the harness stopped overriding, whose
 // marker should become an active line.
-void PgProductionProfileTest::CheckFlagReadback() {
+void PgProductionProfileTest::CheckFlagReadback(IncludeBootstrapDeferred include_deferred) {
   std::set<DaemonKey> expected_m;
   std::set<DaemonKey> m;
   std::map<DaemonKey, std::string> file_values;
@@ -953,8 +1025,9 @@ void PgProductionProfileTest::CheckFlagReadback() {
       // Skipped here, and what covers them:
       // - DROPPED markers carry no value; FlagfilesParseCleanly checks the key is still a known,
       //   non-deprecated flag.
-      // - kBootstrapDeferredFlags are not in the master's boot copy, so the master runs the
-      //   default; FlagfilesParseCleanly checks the full file's value against --helpxml.
+      // - kBootstrapDeferredFlags, until the master restarts on the full file: they are not in
+      //   the master's boot copy, so the master runs the default; FlagfilesParseCleanly checks
+      //   the full file's value against --helpxml.
       // - kKnownUnrecognizedFlags are not gflags; CheckPgTaggedFlags checks the GUCs they were
       //   meant for.
       // - kOtherDaemonOnlyFlags keys in the profile of the daemon that does not define them:
@@ -963,7 +1036,7 @@ void PgProductionProfileTest::CheckFlagReadback() {
         continue;
       }
       if (entry.kind == ProfileEntryKind::kActive) {
-        if (daemon == kMasterDaemon && IsBootstrapDeferred(entry.key)) {
+        if (daemon == kMasterDaemon && !include_deferred && IsBootstrapDeferred(entry.key)) {
           continue;
         }
         if (daemon == kTServerDaemon && FindKnownUnrecognized(entry.key)) {
@@ -1674,11 +1747,511 @@ void PgProductionProfileTest::CheckReplicationSlot(PGConn* conn) {
       << "Replication slot: pp_slot is still listed after pg_drop_replication_slot";
 }
 
+// master_join_existing_universe makes a master that starts without a sys catalog refuse to create
+// a universe, so a fresh cluster cannot boot with it; on a restart against existing data it has
+// no effect beyond its value. The boot copy leaves it out, and restarting the master on the full
+// file at the same path, with argv unchanged, is how the profile's value reaches the master.
+void PgProductionProfileTest::CheckMasterRestart() {
+  ASSERT_EQ(cluster_->num_masters(), 1) << "Master restart: the check restarts the only master";
+  auto* master = cluster_->master(0);
+  const auto master_name = Format("$0-0", kMasterDaemon);
+  std::vector<const ProfileEntry*> deferred;
+  for (const auto& key : kBootstrapDeferredFlags) {
+    const auto* entry = master_profile_.FindActive(key);
+    ASSERT_NE(entry, nullptr) << "Master restart: kBootstrapDeferredFlags key --" << key
+                              << " has no active line in the master profile";
+    deferred.push_back(entry);
+  }
+
+  // The premise: the master booted without the deferred lines, so only the restart below can
+  // make it run the file value.
+  for (const auto* entry : deferred) {
+    const auto live = master->GetFlag(entry->key);
+    ASSERT_TRUE(live.ok()) << "Master restart: " << master_name << ": GetFlag(" << entry->key
+                           << ") before the restart failed: " << live.status();
+    ASSERT_FALSE(ProfileValuesMatch(entry->value, *live))
+        << "Master restart: " << master_name << " already runs --" << entry->key << "=" << *live
+        << ", the file value '" << entry->value << "', before the restart; the boot copy should "
+        << "leave the line out, or the restart proves nothing";
+  }
+
+  ASSERT_OK(WriteFullCopy(master_profile_, master_flagfile_));
+  master->Shutdown();
+  ASSERT_OK(master->Restart());
+
+  for (const auto* entry : deferred) {
+    const auto live = master->GetFlag(entry->key);
+    ASSERT_TRUE(live.ok()) << "Master restart: " << master_name << ": GetFlag(" << entry->key
+                           << ") after the restart failed: " << live.status();
+    ASSERT_OK(CheckProfileValue(
+        Format("Master restart: $0 --$1 after the restart", master_name, entry->key),
+        entry->value, *live));
+  }
+
+  size_t leader_idx = 0;
+  Status leader_status;
+  const auto status = WaitFor([&]() -> Result<bool> {
+    auto idx = cluster_->GetLeaderMasterIndex();
+    if (!idx.ok()) {
+      leader_status = idx.status();
+      return false;
+    }
+    leader_idx = *idx;
+    return true;
+  }, MonoDelta::FromSeconds(60 * kTimeMultiplier), "Leader master after the restart");
+  ASSERT_TRUE(status.ok()) << "Master restart: no leader master: " << status
+                           << "; last error: " << leader_status;
+
+  // The other values again: the master now runs the full file.
+  ASSERT_NO_FATALS(CheckFlagReadback(IncludeBootstrapDeferred::kTrue));
+  // Satisfied by the registry the master reloads, not by heartbeats; CheckTServersHeartbeat is
+  // the proof the tservers are back.
+  ASSERT_OK(cluster_->WaitForTabletServerCount(
+      cluster_->num_tablet_servers(), MonoDelta::FromSeconds(60 * kTimeMultiplier)));
+  ASSERT_NO_FATALS(CheckTServersHeartbeat(leader_idx));
+
+  auto fresh_conn = ASSERT_RESULT(ConnectAsSuperuserAgain());
+  ASSERT_OK(fresh_conn.Execute("CREATE TABLE t2 (k int PRIMARY KEY)"));
+}
+
+// The restarted master reloads the tserver registry from the sys catalog and gives each loaded
+// entry a last heartbeat time of the load, so the registered tserver count and the alive bit hold
+// before any tserver has reached it. Once the leader has answered ListTabletServers, the registry
+// is loaded; a tserver whose millis_since_heartbeat in a later response is below the time since
+// that answer has heartbeated after the load.
+void PgProductionProfileTest::CheckTServersHeartbeat(size_t leader_idx) {
+  auto proxy = cluster_->GetMasterProxy<master::MasterClusterProxy>(leader_idx);
+  std::optional<MonoTime> registry_loaded;
+  std::map<std::string, std::string> states;
+  Status last_error;
+  const auto status = WaitFor([&]() -> Result<bool> {
+    const auto sent = MonoTime::Now();
+    master::ListTabletServersRequestPB req;
+    master::ListTabletServersResponsePB resp;
+    rpc::RpcController controller;
+    controller.set_timeout(MonoDelta::FromSeconds(5 * kTimeMultiplier));
+    auto rpc_status = proxy.ListTabletServers(req, &resp, &controller);
+    if (rpc_status.ok() && resp.has_error()) {
+      rpc_status = STATUS_FORMAT(RemoteError, "$0", resp.error().ShortDebugString());
+    }
+    // Not a verdict on any tserver: retried, and reported if it never clears.
+    if (!rpc_status.ok()) {
+      last_error = rpc_status;
+      return false;
+    }
+    if (!registry_loaded) {
+      registry_loaded = MonoTime::Now();
+      return false;
+    }
+    const auto since_load_ms = sent.GetDeltaSince(*registry_loaded).ToMilliseconds();
+    std::unordered_map<std::string, const master::ListTabletServersResponsePB::Entry*> by_uuid;
+    for (const auto& entry : resp.servers()) {
+      by_uuid[entry.instance_id().permanent_uuid()] = &entry;
+    }
+    bool all_heartbeated = true;
+    for (const auto& [name, ts] : DaemonsOf(kTServerDaemon)) {
+      auto& state = states[Format("$0 ($1)", name, ts->uuid())];
+      const auto it = by_uuid.find(ts->uuid());
+      if (it == by_uuid.end()) {
+        state = "not registered";
+      } else if (!it->second->has_millis_since_heartbeat()) {
+        state = "no heartbeat time";
+      } else if (it->second->millis_since_heartbeat() >= since_load_ms) {
+        state = Format(
+            "last heartbeat $0 ms ago, not after the registry load (at most $1 ms ago)",
+            it->second->millis_since_heartbeat(), since_load_ms);
+      } else {
+        state = Format("heartbeated $0 ms ago", it->second->millis_since_heartbeat());
+        continue;
+      }
+      all_heartbeated = false;
+    }
+    return all_heartbeated;
+  }, MonoDelta::FromSeconds(30 * kTimeMultiplier), "Every tserver heartbeats to the new master");
+  std::vector<std::string> lines;
+  for (const auto& [ts, state] : states) {
+    lines.push_back(Format("$0: $1", ts, state));
+  }
+  ASSERT_TRUE(status.ok())
+      << (registry_loaded
+              ? "Master restart: not every tserver heartbeated to the restarted master: "
+              : "Master restart: ListTabletServers never succeeded on the restarted master, so "
+                "tserver liveness is unknown: ")
+      << status << "; last ListTabletServers error: " << last_error << "\n"
+      << JoinStrings(lines, "\n");
+  LOG(INFO) << "Tservers after the master restart: " << JoinStrings(lines, "; ");
+}
+
+Result<std::map<std::string, CatCacheMisses>> PgProductionProfileTest::ReadCatCacheMisses() {
+  const auto url = Format(
+      "http://$0:$1/metrics?reset_histograms=false", pg_ts->bind_host(),
+      pg_ts->pgsql_http_port());
+  EasyCurl curl;
+  faststring buf;
+  RETURN_NOT_OK_PREPEND(
+      curl.FetchURL(url, &buf, /* timeout_sec= */ 10 * kTimeMultiplier),
+      Format("Catalog preload: fetching $0", url));
+  std::map<std::string, CatCacheMisses> misses;
+  for (const auto& metric : ParseJsonMetrics(buf.ToString())) {
+    const auto table = metric.labels.find("table_name");
+    // Not a per-table catalog cache metric.
+    if (table == metric.labels.end()) {
+      continue;
+    }
+    auto& table_misses = misses[table->second];
+    if (metric.name.find("yb_ysqlserver_CatalogCacheTableMisses") != std::string::npos) {
+      table_misses.table += metric.value;
+    } else if (metric.name.find("yb_ysqlserver_CatalogCacheListMisses") != std::string::npos) {
+      table_misses.list += metric.value;
+    } else if (metric.name.find("yb_ysqlserver_CatalogCacheNegMisses") != std::string::npos) {
+      table_misses.negative += metric.value;
+    }
+  }
+  return misses;
+}
+
+namespace {
+
+// Splits on ',' exactly as metrics_snapshotter.cc's CSVToSet does (boost::split on ","): no
+// trimming, and empty tokens are kept.
+std::vector<std::string> SplitOnCommaRaw(const std::string& s) {
+  std::vector<std::string> tokens;
+  size_t pos = 0;
+  for (;;) {
+    const auto end = s.find(',', pos);
+    if (end == std::string::npos) {
+      tokens.push_back(s.substr(pos));
+      return tokens;
+    }
+    tokens.push_back(s.substr(pos, end - pos));
+    pos = end + 1;
+  }
+}
+
+std::string TrimWhitespace(std::string_view s) {
+  while (!s.empty() && IsSpace(s.front())) {
+    s.remove_prefix(1);
+  }
+  while (!s.empty() && IsSpace(s.back())) {
+    s.remove_suffix(1);
+  }
+  return std::string(s);
+}
+
+bool HasWhitespace(const std::string& s) {
+  return std::any_of(s.begin(), s.end(), IsSpace);
+}
+
+std::string CatCacheMissesToString(const CatCacheMisses& misses) {
+  return Format(
+      "$0 table misses ($1 list, $2 negative)", misses.table, misses.list, misses.negative);
+}
+
+// Whitelist tokens that DoMetricsSnapshot (metrics_snapshotter.cc) handles itself, with the rows
+// each tserver writes for them on every snapshot: node_up with entity_type "tserver", the cpu and
+// disk rows with "table". The cpu rows are written only when the /proc tick reads succeed. Any
+// other token is matched against the tserver's Prometheus metric names and written, with
+// entity_type "tserver", under its own name. Every row's node is the writing tserver's uuid.
+const std::map<std::string, std::vector<std::string>> kSnapshotterTokenRows = {
+  {"cpu_usage", {"cpu_usage_user", "cpu_usage_system"}},
+  {"disk_usage", {"total_disk", "free_disk"}},
+  {"node_up", {"node_up"}},
+};
+
+std::vector<std::string> SnapshotRowsOf(const std::string& token) {
+  const auto it = kSnapshotterTokenRows.find(token);
+  return it == kSnapshotterTokenRows.end() ? std::vector<std::string>{token} : it->second;
+}
+
+std::string MetricsByNodeToString(const std::map<std::string, std::set<std::string>>& by_node) {
+  std::vector<std::string> lines;
+  for (const auto& [node, metrics] : by_node) {
+    lines.push_back(Format(
+        "node $0: {$1}", node, JoinStrings(std::vector(metrics.begin(), metrics.end()), ", ")));
+  }
+  return lines.empty() ? "no rows" : JoinStrings(lines, "\n");
+}
+
+}  // namespace
+
+// After a breaking catalog version bump, a new backend preloads its catalog caches, so a lookup
+// in a preloaded table is a cache hit. Each listed table gets a lookup below that misses when the
+// table is not preloaded, which a run without the list shows, so a zero miss delta shows the
+// table was preloaded; the exceptions are the tables every connection preloads anyway. An
+// unlisted, unpreloaded table looked up in the same window must miss, because an unemitted or
+// renamed metric reads as zero. The new backend logs in as carol, a
+// non-superuser, over the socket: role membership checks short-circuit for a superuser without
+// reading pg_auth_members. She is granted SELECT on t for the EXPLAIN. The metrics come from
+// pg_ts's PG, so the backend runs on pg_ts.
+void PgProductionProfileTest::CheckCatalogPreload(PGConn* conn) {
+  static constexpr auto kListKey = "ysql_catalog_preload_additional_table_list";
+  // Neither in the profile's list, nor among PG's default additional tables, nor among the tables
+  // every connection preloads. count(*) looks up its aggregate.
+  static constexpr auto kUnlistedTable = "pg_aggregate";
+  static constexpr auto kUnlistedLookup = "SELECT count(*) FROM t WHERE a IN (1, 2, 3)";
+  struct CatalogLookup {
+    std::vector<std::string> tables;
+    std::string description;
+    std::function<Status(PGConn*)> run;
+  };
+  const auto fetch = [](const std::string& query) {
+    return [query](PGConn* c) { return ResultToStatus(c->Fetch(query)); };
+  };
+  const std::vector<CatalogLookup> lookups = {
+    // The planner reads t's column statistics, and looks up the = operator of the IN lists and
+    // the index operator families it belongs to.
+    {{"pg_amop", "pg_operator", "pg_statistic"}, Format("EXPLAIN (COSTS OFF) $0", kCboQuery),
+     [](PGConn* c) { return ResultToStatus(ExplainCboQuery(c)); }},
+    // Every connection fills the pg_auth_members cache (YbPrefetchRequiredData) and preloads
+    // pg_namespace (a relcache core table) whatever the list says, so their zeros show nothing
+    // about the list line.
+    {{"pg_auth_members"}, "pg_has_role as carol",
+     fetch("SELECT pg_has_role(current_user, 'pg_read_all_data', 'MEMBER')")},
+    {{"pg_namespace"}, "regnamespace", fetch("SELECT 'public'::regnamespace")},
+    {{"pg_range"}, "multirange", fetch("SELECT int4multirange(int4range(1, 3))")},
+  };
+
+  const auto* list_entry = tserver_profile_.FindActive(kListKey);
+  ASSERT_NE(list_entry, nullptr) << "Catalog preload: the tserver profile sets no --" << kListKey;
+  // PG splits the list on ',' without trimming and ignores a token that names no catalog table.
+  const auto listed = SplitOnCommaRaw(list_entry->value);
+  std::set<std::string> looked_up;
+  for (const auto& lookup : lookups) {
+    looked_up.insert(lookup.tables.begin(), lookup.tables.end());
+  }
+  std::vector<std::string> failures;
+  for (const auto& table : listed) {
+    if (table.empty() || HasWhitespace(table)) {
+      failures.push_back(Format(
+          "Catalog preload: --$0 token '$1' names no catalog table (PG does not trim tokens), so "
+          "production preloads nothing for it", kListKey, table));
+    } else if (!looked_up.contains(table)) {
+      failures.push_back(Format(
+          "Catalog preload: no lookup of listed table $0; add a query that misses on it when it "
+          "is not preloaded", table));
+    }
+  }
+  for (const auto& table : looked_up) {
+    if (std::find(listed.begin(), listed.end(), table) == listed.end()) {
+      failures.push_back(Format(
+          "Catalog preload: lookup of $0, which --$1 no longer lists; remove it", table, kListKey));
+    }
+  }
+  if (std::find(listed.begin(), listed.end(), kUnlistedTable) != listed.end()) {
+    failures.push_back(Format(
+        "Catalog preload: the control table $0 is now listed; pick another unpreloaded table",
+        kUnlistedTable));
+  }
+  ASSERT_TRUE(failures.empty()) << JoinStrings(failures, "\n");
+
+  ASSERT_OK(conn->Execute("GRANT SELECT ON t TO carol"));
+  ASSERT_OK(BumpCatalogVersion(1, conn));
+  const auto before = ASSERT_RESULT(ReadCatCacheMisses());
+  {
+    auto carol = ASSERT_RESULT(ConnectUnixSocket(*pg_ts, "carol", kDefaultDb, kLoginTimeoutSec));
+    for (const auto& lookup : lookups) {
+      ASSERT_OK_PREPEND(lookup.run(&carol), "Catalog preload: " + lookup.description);
+    }
+    const auto count = ASSERT_RESULT(carol.FetchRow<int64_t>(kUnlistedLookup));
+    ASSERT_EQ(count, 3) << "Catalog preload: " << kUnlistedLookup;
+  }
+  const auto after = ASSERT_RESULT(ReadCatCacheMisses());
+
+  const auto delta = [&before, &after](const std::string& table) {
+    CatCacheMisses result;
+    if (auto it = after.find(table); it != after.end()) {
+      result = it->second;
+    }
+    if (auto it = before.find(table); it != before.end()) {
+      result.table -= it->second.table;
+      result.list -= it->second.list;
+      result.negative -= it->second.negative;
+    }
+    return result;
+  };
+  std::vector<std::string> report;
+  std::vector<std::string> missed;
+  for (const auto& table : listed) {
+    const auto table_delta = delta(table);
+    report.push_back(Format("$0: $1", table, CatCacheMissesToString(table_delta)));
+    if (table_delta.table != 0) {
+      missed.push_back(table);
+    }
+  }
+  const auto control_delta = delta(kUnlistedTable);
+  report.push_back(Format(
+      "$0 (unlisted control): $1", kUnlistedTable, CatCacheMissesToString(control_delta)));
+  LOG(INFO) << "Catalog cache misses in the new backend:\n" << JoinStrings(report, "\n");
+  ASSERT_GT(control_delta.table, 0)
+      << "Catalog preload: the unlisted table " << kUnlistedTable << " shows no miss after "
+      << kUnlistedLookup << "; the catalog cache miss metric on tserver 0 is not live, so zeros "
+      << "for the listed tables would prove nothing:\n" << JoinStrings(report, "\n");
+  ASSERT_TRUE(missed.empty())
+      << "Catalog preload: listed tables missed the catalog cache in a new backend after a "
+      << "catalog version bump: " << JoinStrings(missed, ", ") << "\n" << JoinStrings(report, "\n");
+}
+
+// The rows show what production parses from its whitelist. The deployed whitelist is rendered with
+// ", " separators and the snapshotter splits it on ',' without trimming, so a token with a leading
+// space matches nothing and writes no row. This shows current production behavior; the
+// expectations come from the file, so they update by themselves when the rendering drops the
+// spaces. The table exists only because of the master profile's
+// --master_enable_metrics_snapshotter, and rows only because of the tserver profile's
+// --tserver_enable_metrics_snapshotter; both default to false.
+void PgProductionProfileTest::CheckMetricsSnapshotter() {
+  static constexpr auto kWhitelistKey = "metrics_snapshotter_tserver_metrics_whitelist";
+  const auto* whitelist = tserver_profile_.FindActive(kWhitelistKey);
+  ASSERT_NE(whitelist, nullptr) << "Metrics snapshotter: the tserver profile sets no --"
+                                << kWhitelistKey;
+  // Tokens the snapshotter handles itself are written by every tserver on every snapshot. A
+  // server metric is written by each tserver that exports it, which depends on the metric rather
+  // than on the whitelist, so only at least one tserver is expected to write it.
+  std::set<std::string> on_every_node;
+  std::set<std::string> on_some_node;
+  std::set<std::string> never;
+  // Server metrics that a padded token names; they must exist, or their absence shows nothing.
+  std::set<std::string> padded_server_metrics;
+  for (const auto& token : SplitOnCommaRaw(whitelist->value)) {
+    const auto trimmed = TrimWhitespace(token);
+    // An empty token matches no metric and writes no row; there is nothing to expect.
+    if (trimmed.empty()) {
+      continue;
+    }
+    const auto rows = SnapshotRowsOf(trimmed);
+    const bool handled_by_snapshotter = kSnapshotterTokenRows.contains(trimmed);
+    if (trimmed == token) {
+      (handled_by_snapshotter ? on_every_node : on_some_node).insert(rows.begin(), rows.end());
+    } else {
+      never.insert(rows.begin(), rows.end());
+      if (!handled_by_snapshotter) {
+        padded_server_metrics.insert(trimmed);
+      }
+    }
+  }
+  for (const auto& name : never) {
+    ASSERT_FALSE(on_every_node.contains(name) || on_some_node.contains(name))
+        << "Metrics snapshotter: row " << name << " comes from both a whitespace-padded and an "
+        << "exact token of --" << kWhitelistKey << "; its absence can no longer be expected";
+  }
+  const auto set_to_string = [](const std::set<std::string>& names) {
+    return "{" + JoinStrings(std::vector(names.begin(), names.end()), ", ") + "}";
+  };
+  LOG(INFO) << "Metrics snapshotter rows expected on every node: " << set_to_string(on_every_node)
+            << "; on at least one node: " << set_to_string(on_some_node)
+            << "; never: " << set_to_string(never);
+
+  // Premise of the never-present check for the server metrics.
+  for (const auto& [name, ts] : DaemonsOf(kTServerDaemon)) {
+    const auto url = Format("http://$0/prometheus-metrics", ts->bound_http_hostport());
+    EasyCurl curl;
+    faststring buf;
+    ASSERT_OK_PREPEND(
+        curl.FetchURL(url, &buf, /* timeout_sec= */ 10 * kTimeMultiplier),
+        Format("Metrics snapshotter: fetching $0 of $1", url, name));
+    std::set<std::string> exported;
+    for (auto line : SplitLines(buf.ToString())) {
+      const auto end = line.find_first_of("{ ");
+      if (!line.starts_with("#") && end != std::string_view::npos) {
+        exported.emplace(line.substr(0, end));
+      }
+    }
+    for (const auto& metric : padded_server_metrics) {
+      ASSERT_TRUE(exported.contains(metric))
+          << "Metrics snapshotter: " << name << " does not export " << metric << " at " << url
+          << ", so its missing row would not show that the padded token matched nothing";
+    }
+  }
+
+  ASSERT_OK(EnsureClientCreated());
+  const client::YBTableName table_name(
+      YQL_DATABASE_CQL, master::kSystemNamespaceName, kMetricsSnapshotsTableName);
+  const auto exists = client_->TableExists(table_name);
+  ASSERT_TRUE(exists.ok()) << "Metrics snapshotter: could not check whether "
+                           << table_name.ToString() << " exists: " << exists.status();
+  ASSERT_TRUE(*exists) << "Metrics snapshotter: " << table_name.ToString() << " does not exist; "
+                       << "the master creates it only while --master_enable_metrics_snapshotter "
+                       << "is true";
+  client::TableHandle table;
+  ASSERT_OK(table.Open(table_name, client_.get()));
+
+  std::map<std::string, std::set<std::string>> metrics_by_node;
+  // (node, metric) -> earliest ts, in microseconds.
+  std::map<std::pair<std::string, std::string>, int64_t> first_ts;
+  std::vector<std::string> missing;
+  const auto start = MonoTime::Now();
+  const auto status = WaitFor([&]() -> Result<bool> {
+    metrics_by_node.clear();
+    first_ts.clear();
+    missing.clear();
+    client::TableIteratorOptions options;
+    options.columns = std::vector<std::string>{"node", "metric", "ts"};
+    // The default handler is LOG(FATAL).
+    Status scan_status;
+    options.error_handler = [&scan_status](const Status& s) { scan_status = s; };
+    for (const auto& row : client::TableRange(table, options)) {
+      const auto& node = row.column(0).string_value();
+      const auto& metric = row.column(1).string_value();
+      const auto ts = row.column(2).timestamp_value_pb();
+      metrics_by_node[node].insert(metric);
+      auto [it, inserted] = first_ts.emplace(std::pair(node, metric), ts);
+      if (!inserted) {
+        it->second = std::min(it->second, ts);
+      }
+    }
+    RETURN_NOT_OK_PREPEND(scan_status, Format("Scanning $0", table_name.ToString()));
+    for (const auto& [name, ts] : DaemonsOf(kTServerDaemon)) {
+      const auto& node_metrics = metrics_by_node[ts->uuid()];
+      for (const auto& metric : on_every_node) {
+        if (!node_metrics.contains(metric)) {
+          missing.push_back(Format("$0 (node $1) has no $2 row", name, ts->uuid(), metric));
+        }
+      }
+    }
+    for (const auto& metric : on_some_node) {
+      if (std::none_of(metrics_by_node.begin(), metrics_by_node.end(), [&metric](const auto& e) {
+            return e.second.contains(metric);
+          })) {
+        missing.push_back(Format("no node has a $0 row", metric));
+      }
+    }
+    return missing.empty();
+  }, MonoDelta::FromSeconds(30 * kTimeMultiplier), "Metrics snapshotter rows");
+  ASSERT_TRUE(status.ok())
+      << "Metrics snapshotter: " << status << "\n" << JoinStrings(missing, "\n") << "\nRows of "
+      << table_name.ToString() << " by node:\n" << MetricsByNodeToString(metrics_by_node);
+
+  std::vector<std::string> timings;
+  for (const auto& [name, ts] : DaemonsOf(kTServerDaemon)) {
+    for (const auto& [metric, first] : first_ts) {
+      if (metric.first == ts->uuid()) {
+        timings.push_back(Format("$0 $1 first at $2", name, metric.second, first));
+      }
+    }
+  }
+  LOG(INFO) << "Metrics snapshotter rows found after " << MonoTime::Now().GetDeltaSince(start)
+            << ":\n" << MetricsByNodeToString(metrics_by_node) << "\n"
+            << JoinStrings(timings, "\n");
+
+  std::vector<std::string> present;
+  for (const auto& [node, metrics] : metrics_by_node) {
+    for (const auto& metric : never) {
+      if (metrics.contains(metric)) {
+        present.push_back(Format("node $0 has a $1 row", node, metric));
+      }
+    }
+  }
+  ASSERT_TRUE(present.empty())
+      << "Metrics snapshotter: rows of whitespace-padded whitelist tokens:\n"
+      << JoinStrings(present, "\n") << "\nRows by node:\n"
+      << MetricsByNodeToString(metrics_by_node);
+}
+
 // Boots the cluster with the profile (UpdateMiniClusterOptions passes the copies by --flagfile)
 // and checks that every flag took effect: gflag readback, PG GUC provenance and the hba rules,
-// then a smoke workload in which each check exercises one observable effect of the profile.
+// then a smoke workload in which each check exercises one observable effect of the profile, then
+// the restart-only master flag, the catalog preload list and the metrics snapshotter whitelist.
 TEST_F(PgProductionProfileTest, ClusterRunsProductionProfile) {
-  ASSERT_NO_FATALS(CheckFlagReadback());
+  ASSERT_NO_FATALS(CheckFlagReadback(IncludeBootstrapDeferred::kFalse));
   ASSERT_NO_FATALS(CheckOtherDaemonOnlyFlags());
   auto conn = ASSERT_RESULT(ConnectAsSuperuser());
   ASSERT_NO_FATALS(CheckPgConfCsv(&conn));
@@ -1702,6 +2275,10 @@ TEST_F(PgProductionProfileTest, ClusterRunsProductionProfile) {
   ASSERT_NO_FATALS(CheckPgLogFiles());
   ASSERT_NO_FATALS(CheckAsh(&conn));
   ASSERT_NO_FATALS(CheckReplicationSlot(&conn));
+
+  ASSERT_NO_FATALS(CheckMasterRestart());
+  ASSERT_NO_FATALS(CheckCatalogPreload(&conn));
+  ASSERT_NO_FATALS(CheckMetricsSnapshotter());
 }
 
 }  // namespace yb::pgwrapper
