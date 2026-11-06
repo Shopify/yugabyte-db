@@ -1113,7 +1113,11 @@ class PartialFramesSetup {
   ScopedPartialFramesTestState state_scope_{&state_};
 };
 
-// Records what a call delivers to its partial and final callbacks, in delivery order.
+// Records what a call delivers to its partial and final callbacks, in delivery order. The
+// callbacks share the recorded state, as a partial callback may still run after the final one
+// (when the call is failed from another thread). The destructor waits for the final callback, so
+// that the call never writes to a response or controller, or runs a hook on locals, that the test
+// has destroyed after an early exit: declare the recorder after them.
 class FrameRecorder {
  public:
   struct Partial {
@@ -1129,10 +1133,27 @@ class FrameRecorder {
 
   using PartialHook = std::function<void(const Partial&)>;
 
+  FrameRecorder() = default;
+
+  FrameRecorder(const FrameRecorder&) = delete;
+  void operator=(const FrameRecorder&) = delete;
+
+  ~FrameRecorder() {
+    if (!final_handed_out_) {
+      return;
+    }
+    // Longer than any call timeout used with it, so that a call nobody answers still finishes.
+    const auto timeout = 60s * kTimeMultiplier;
+    if (!state_->final_latch.WaitFor(timeout)) {
+      LOG(FATAL) << "No final callback after " << timeout.count()
+                 << " s; the call would outlive its response and controller";
+    }
+  }
+
   PartialResponseCallback PartialCallback(PartialHook hook = nullptr) {
-    return [this, hook = std::move(hook)](Slice body, RefCntBuffer holder) {
+    return [state = state_, hook = std::move(hook)](Slice body, RefCntBuffer holder) {
       Partial partial;
-      partial.order = next_order_.fetch_add(1);
+      partial.order = state->next_order.fetch_add(1);
       partial.body_size = body.size();
       partial.thread_name = CurrentThreadName();
       rpc_test::PartialFramesResponsePB frame;
@@ -1143,38 +1164,39 @@ class FrameRecorder {
       if (hook) {
         hook(partial);
       }
-      std::lock_guard lock(mutex_);
-      partials_.push_back(std::move(partial));
+      std::lock_guard lock(state->mutex);
+      state->partials.push_back(std::move(partial));
     };
   }
 
   ResponseCallback FinalCallback(std::function<void()> hook = nullptr) {
-    return [this, hook = std::move(hook)] {
-      final_order_ = next_order_.fetch_add(1);
-      final_thread_name_ = CurrentThreadName();
+    final_handed_out_ = true;
+    return [state = state_, hook = std::move(hook)] {
+      state->final_order = state->next_order.fetch_add(1);
+      state->final_thread_name = CurrentThreadName();
       if (hook) {
         hook();
       }
-      final_latch_.CountDown();
+      state->final_latch.CountDown();
     };
   }
 
   Status WaitFinal() {
-    SCHECK(final_latch_.WaitFor(30s * kTimeMultiplier), TimedOut, "No final callback");
+    SCHECK(state_->final_latch.WaitFor(30s * kTimeMultiplier), TimedOut, "No final callback");
     return Status::OK();
   }
 
-  size_t final_order() const { return final_order_; }
-  const std::string& final_thread_name() const { return final_thread_name_; }
+  size_t final_order() const { return state_->final_order; }
+  const std::string& final_thread_name() const { return state_->final_thread_name; }
 
   std::vector<Partial> partials() {
-    std::lock_guard lock(mutex_);
-    return partials_;
+    std::lock_guard lock(state_->mutex);
+    return state_->partials;
   }
 
   size_t num_partials() {
-    std::lock_guard lock(mutex_);
-    return partials_.size();
+    std::lock_guard lock(state_->mutex);
+    return state_->partials.size();
   }
 
   Status WaitPartials(size_t count) {
@@ -1184,15 +1206,24 @@ class FrameRecorder {
   }
 
   int64_t PartialBodyBytes() {
-    std::lock_guard lock(mutex_);
+    std::lock_guard lock(state_->mutex);
     int64_t result = 0;
-    for (const auto& partial : partials_) {
+    for (const auto& partial : state_->partials) {
       result += partial.body_size;
     }
     return result;
   }
 
  private:
+  struct State {
+    std::atomic<size_t> next_order{0};
+    std::atomic<size_t> final_order{std::numeric_limits<size_t>::max()};
+    std::string final_thread_name;
+    CountDownLatch final_latch{1};
+    std::mutex mutex;
+    std::vector<Partial> partials GUARDED_BY(mutex);
+  };
+
   static std::string CurrentThreadName() {
     auto* thread = Thread::current_thread();
     return thread ? thread->name() : std::string();
@@ -1219,12 +1250,8 @@ class FrameRecorder {
            holder.data() + body_offset == body.cdata();
   }
 
-  std::atomic<size_t> next_order_{0};
-  std::atomic<size_t> final_order_{std::numeric_limits<size_t>::max()};
-  std::string final_thread_name_;
-  CountDownLatch final_latch_{1};
-  std::mutex mutex_;
-  std::vector<Partial> partials_ GUARDED_BY(mutex_);
+  const std::shared_ptr<State> state_ = std::make_shared<State>();
+  bool final_handed_out_ = false;
 };
 
 bool IsClientReactorThread(const std::string& thread_name) {
