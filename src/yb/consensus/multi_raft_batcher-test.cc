@@ -2188,7 +2188,7 @@ TEST_F(MultiRaftBatcherTest, PacedSubMillisecondWindow) {
 // request waits a full window from the cap flush, not from the envelope before it, and no empty or
 // duplicate envelope goes out.
 TEST_F(MultiRaftBatcherTest, PacedTimerCancelledByCapFlush) {
-  const auto window = 1s * kTimeMultiplier;
+  const std::chrono::milliseconds window = 1s * kTimeMultiplier;
   SetWindow(window);
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_batch_size) = 2;
   CreateBatcher();
