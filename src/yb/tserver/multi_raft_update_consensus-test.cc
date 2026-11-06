@@ -859,13 +859,24 @@ class MultiRaftUpdateConsensusTest : public TabletServerTestBase {
   };
 
   // Holds tablet's update_mutex_ for about duration: sends it a direct UpdateConsensus with one op
-  // and TEST_DelayUpdate, which sleeps under the mutex after UpdateReplica, and returns once that
-  // sleep has started. direct_done is set when the direct call returns.
+  // and TEST_DelayUpdate, which sleeps under the mutex after UpdateReplica, and returns once
+  // UpdateReplica has run with the mutex held. direct_done is set when the direct call returns.
   void HoldUpdateMutex(
       TestTablet* tablet, MonoDelta duration, TestThreadHolder* thread_holder,
       std::atomic<bool>* direct_done) {
     auto consensus = Consensus(*tablet);
     consensus->TEST_DelayUpdate(duration);
+    // Clearing the delay ends a hold in progress, and an update that takes the mutex after the
+    // hold must not read the delay and hold it again. So the hold is ended by clearing the delay,
+    // no later than its own end (the delay is read after this point), or at once at an early test
+    // exit.
+    const auto hold_end = CoarseMonoClock::now() + duration.ToSteadyDuration();
+    thread_holder->AddThread([consensus, hold_end, &stop = thread_holder->stop_flag()] {
+      while (CoarseMonoClock::now() < hold_end && !stop.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(10ms);
+      }
+      consensus->TEST_DelayUpdate(MonoDelta::kZero);
+    });
     auto request = rpc::CopySharedMessage(Data(tablet, 1, /* commit= */ true));
     thread_holder->AddThreadFunctor([this, request, direct_done] {
       auto response = rpc::MakeSharedMessage<consensus::LWConsensusResponsePB>();
@@ -875,12 +886,7 @@ class MultiRaftUpdateConsensusTest : public TabletServerTestBase {
       ASSERT_FALSE(response->has_error()) << response->ShortDebugString();
       direct_done->store(true);
     });
-    // UpdateReplica has run once the op is received; the sleep under the mutex follows at once,
-    // after the delay is read. Margin for a loaded host, where clearing the delay right away could
-    // win that read.
     ASSERT_OK(WaitForLastReceived(*tablet));
-    SleepFor(100ms * kTimeMultiplier);
-    consensus->TEST_DelayUpdate(MonoDelta::kZero);
   }
 
   // Sends {Heartbeat(tablets_[0]), Data(tablets_[1])} with tablets_[1] paused, deletes tablets_[0]
