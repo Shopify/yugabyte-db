@@ -4532,8 +4532,8 @@ void RaftConsensusITest::TestMultiRaftBatchingFollowerCrash(bool streamed) {
 
   ASSERT_OK(victim->Pause());
   SleepFor(3s);
-  // Envelopes to the stopped server timed out on the other servers, each failing every Raft
-  // request it carried.
+  // Envelopes to the stopped server timed out on the other servers, each failing the Raft
+  // requests it carried that no frame had answered.
   const auto envelopes_failed = SumServerMetric(
       cluster_.get(), "multi_raft_envelopes_failed", "value", victim);
   ASSERT_OK(victim->Resume());

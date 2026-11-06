@@ -127,11 +127,14 @@ METRIC_DEFINE_counter(server, multi_raft_envelopes_failed,
     "Number of MultiRaftUpdateConsensus RPCs sent by multi-Raft batchers that failed, failing "
     "each Raft request they carried that had no response yet with the same error: the RPC "
     "itself failed (for example it timed out, the connection failed, or the sending or receiving "
-    "server shut down), or its responses did not answer every request exactly once. Without "
-    "enable_multi_raft_streaming_responses that is every request of the RPC. With it, requests "
-    "already answered by an earlier response frame keep their response, and an RPC whose final "
-    "response leaves requests unanswered counts once. Errors returned for individual Raft "
-    "requests are not counted, nor are batches aborted at shutdown before being sent.");
+    "server shut down), or its responses did not match its requests: for an RPC answered once, a "
+    "response count that differs from the request count; for an RPC whose responses were "
+    "streamed (enable_multi_raft_streaming_responses), a final response that leaves requests "
+    "unanswered. Answered once, every request of the RPC fails. Streamed, requests already "
+    "answered by an earlier response frame keep their response, and the RPC counts once however "
+    "many requests are left. Duplicate or out-of-range request indices in a response frame are "
+    "logged and skipped, not counted. Errors returned for individual Raft requests are not "
+    "counted, nor are batches aborted at shutdown before being sent.");
 METRIC_DEFINE_event_stats(server, multi_raft_envelope_sub_requests,
     "Multi-Raft Envelope Sub-Requests", yb::MetricUnit::kRequests,
     "Number of Raft requests in each MultiRaftUpdateConsensus RPC.");

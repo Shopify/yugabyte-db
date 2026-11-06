@@ -373,10 +373,11 @@ DEFINE_test_flag(bool, cdc_fail_before_setting_barrier, false,
 
 DEFINE_NON_RUNTIME_int32(multi_raft_update_max_threads, 256,
     "Maximum number of threads that process the Raft requests carried by "
-    "MultiRaftUpdateConsensus RPCs when enable_multi_raft_data_batching is set. A thread is held "
-    "while a request is applied and appended to the log, including any wait for the tablet's "
-    "update lock or a write stall, but not while the log append becomes durable. Threads are "
-    "created on demand.");
+    "MultiRaftUpdateConsensus RPCs when enable_multi_raft_data_batching is set, except the one "
+    "per RPC that multi_raft_update_inline_first runs on the RPC handler thread. A thread is "
+    "held while a request is applied and appended to the log, including any wait for the "
+    "tablet's update lock or a write stall, but not while the log append becomes durable. "
+    "Threads are created on demand.");
 TAG_FLAG(multi_raft_update_max_threads, advanced);
 
 DEFINE_RUNTIME_bool(multi_raft_update_inline_first, false,
@@ -411,10 +412,11 @@ METRIC_DEFINE_event_stats(server, multi_raft_update_frame_slots,
     "MultiRaftUpdateConsensus RPC whose responses were streamed.");
 METRIC_DEFINE_event_stats(server, multi_raft_update_slot_wait_us,
     "Multi-Raft Update Slot Wait", yb::MetricUnit::kMicroseconds,
-    "Time from the completion of a Raft request received inside a MultiRaftUpdateConsensus RPC "
-    "handled concurrently (enable_multi_raft_data_batching) until the response frame that "
-    "carries its response was queued. Without stream_responses this is the wait for the rest of "
-    "the RPC; with it, the wait for a frame. RPCs handled serially are not counted.");
+    "Time from when a Raft request received inside a MultiRaftUpdateConsensus RPC handled "
+    "concurrently (enable_multi_raft_data_batching) completed, failed or was timed out by the "
+    "RPC's deadline, until the response frame that carries its response was queued. Without "
+    "stream_responses this is the wait for the rest of the RPC; with it, the wait for a frame. "
+    "RPCs handled serially are not counted.");
 METRIC_DEFINE_event_stats(server, multi_raft_update_pool_queue_time_us,
     "Multi-Raft Update Queue Time", yb::MetricUnit::kMicroseconds,
     "Time a Raft request received inside a MultiRaftUpdateConsensus RPC waited for a thread of "
