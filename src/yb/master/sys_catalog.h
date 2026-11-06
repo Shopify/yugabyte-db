@@ -495,6 +495,12 @@ class SysCatalogTable {
   // Ticks the durability waits that raft_notifications_pool_ runs, whose threads register with
   // it, so it is declared before the pool and destroyed after it. Created in SetupTabletPeer(),
   // since Start() runs before the messenger exists, and shut down in StartShutdown().
+  // SetupTabletPeer() also runs when a master's remote bootstrap of the sys catalog is retried,
+  // after the previous tablet peer has shut down or never started; it then shuts the previous
+  // sweeper down and creates a new one, as it does multi_raft_manager_. Keep it per call rather
+  // than create-once: a sys catalog set up again after GoIntoShellMode(), whose StartShutdown()
+  // shut the sweeper down, would otherwise fail every wait at once (that path would also need
+  // the thread pools GoIntoShellMode() resets).
   std::shared_ptr<consensus::RaftAsyncWaitSweeper> raft_async_wait_sweeper_;
 
   // Thread pool for callbacks on Raft replication events.

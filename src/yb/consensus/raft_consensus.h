@@ -194,8 +194,9 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // waited for, when the wait target is already durable, or when the wait cannot be armed (the
   // async wait sweeper is shut down). Otherwise it runs on raft_notifications_pool, except for a
   // wait finished by a shutdown: then on the thread whose post to the closing pool runs the
-  // step's Done (a log thread, or a scheduler io thread for a tick), on a scheduler io thread at
-  // scheduler shutdown, or on the thread that shuts the sweeper down. See AsyncWriteWait.
+  // step's Done (a log thread, or a scheduler io thread for a tick), on the thread that shuts
+  // raft_notifications_pool down (a queued step it drops), on a scheduler io thread at scheduler
+  // shutdown, or on the thread that shuts the sweeper down. See AsyncWriteWait.
   void UpdateAsync(
       std::shared_ptr<LWConsensusRequestPB> request, LWConsensusResponsePB* response,
       CoarseTimePoint deadline, UpdateCallback callback);
@@ -894,8 +895,9 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
 
   // Ticks the durability waits of UpdateAsync() that start with raft_async_wait_use_sweeper set.
   // Owned by the server's tablet manager or sys catalog, like raft_notifications_pool_, and
-  // outlives every thread that can start or tick a wait. Null (per-wait timers) for instances
-  // built directly by tests.
+  // outlives every thread that can start or tick a wait of this instance: the sys catalog
+  // replaces its sweeper only once this instance's tablet peer has shut down. Null (per-wait
+  // timers) for instances built directly by tests.
   RaftAsyncWaitSweeper* const raft_async_wait_sweeper_;
 
   CoarseTimePoint disable_pre_elections_until_ = CoarseTimePoint::min();

@@ -63,6 +63,8 @@ DECLARE_bool(enable_leader_failure_detection);
 DECLARE_bool(never_fsync);
 DECLARE_bool(TEST_pause_before_wal_sync);
 DECLARE_int64(protege_synchronization_timeout_ms);
+DECLARE_bool(raft_async_wait_use_sweeper);
+DECLARE_int32(raft_heartbeat_interval_ms);
 DECLARE_int32(retryable_request_timeout_secs);
 
 METRIC_DECLARE_entity(table);
@@ -1041,6 +1043,47 @@ TEST_F(RaftConsensusTest, AsyncWriteWaitStepsRunInSystemHighCgroup) {
   ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
   ASSERT_EQ(OpId::FromPB(response.status().last_received()), OpId(1, 1));
   ASSERT_TRUE(cgroup_log.IsEventOccurred());
+}
+
+// A consensus built without an async wait sweeper ticks its durability waits from a timer per wait
+// even with raft_async_wait_use_sweeper set: the wait outlives several ticks and completes OK.
+TEST_F(RaftConsensusTest, AsyncWriteWaitWithoutSweeperUsesTimer) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_raft_async_wait_use_sweeper) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_raft_heartbeat_interval_ms) = 50;
+  Cgroup root(nullptr, "");
+  Cgroup system_high(&root, "no-such-cgroup-async-write-wait-test");
+  SetUpConsensus(
+      kMinimumTerm, /* num_peers= */ 3,
+      std::make_unique<SystemHighCgroupPeerProxyFactory>(&system_high));
+  SetUpGeneralExpectations();
+  ConsensusBootstrapInfo info;
+  ASSERT_OK(consensus_->Start(info));
+  log_->TEST_SetAllOpIdsSafe(false);
+
+  auto request_ptr = rpc::MakeSharedMessage<LWConsensusRequestPB>();
+  auto& request = *request_ptr;
+  LWConsensusResponsePB response(&request.arena());
+  request = MakeConsensusRequest(/* caller_term= */ 1, config_.peers(0).permanent_uuid(),
+                                 OpId::Min());
+  AddNoOpToConsensusRequest(&request, OpId(1, 1));
+
+  // Not durable when the wait starts, so Start() arms the first tick.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_wal_sync) = true;
+  std::atomic<bool> done{false};
+  Status status;
+  consensus_->UpdateAsync(
+      request_ptr, &response, CoarseBigDeadline(), [&done, &status](const Status& s) {
+        status = s;
+        done.store(true, std::memory_order_release);
+      });
+  // About six tick intervals.
+  SleepFor(300ms);
+  ASSERT_FALSE(done.load(std::memory_order_acquire));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_wal_sync) = false;
+  ASSERT_OK(WaitFor([&done] { return done.load(std::memory_order_acquire); }, 10s, "Update"));
+  ASSERT_OK(status);
+  ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
+  ASSERT_EQ(OpId::FromPB(response.status().last_received()), OpId(1, 1));
 }
 
 class RaftConsensusLeaderTransferTest : public RaftConsensusTest {

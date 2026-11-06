@@ -603,6 +603,10 @@ void SysCatalogTable::SetupTabletPeer(const scoped_refptr<tablet::RaftGroupMetad
                                                                       &master_->proxy_cache(),
                                                                       local_peer_pb_.cloud_info(),
                                                                       metric_entity_);
+  // The previous peer, if any, has shut down or never started (see the member comment).
+  if (raft_async_wait_sweeper_) {
+    raft_async_wait_sweeper_->Shutdown(consensus::RaftAsyncWaitSweeper::ShutdownStatus());
+  }
   raft_async_wait_sweeper_ = std::make_shared<consensus::RaftAsyncWaitSweeper>(
       &master_->messenger()->scheduler());
 
