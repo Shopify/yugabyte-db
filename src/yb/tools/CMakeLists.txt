@@ -89,6 +89,7 @@ target_link_libraries(master-heartbeat-bench
 add_executable(master-load-bench master_load_bench.cc)
 target_link_libraries(master-load-bench
   master_proto
+  tserver
   tserver_admin_proto
   tserver_service_proto
   consensus_metadata_proto
