@@ -412,8 +412,10 @@ TEST_F(RaftAsyncWaitSweeperTest, SweeperDropsReferenceOutsideMutex) {
   auto make_entry = [this, &destroyed](int id) {
     return std::make_shared<ReentrantEntry>(&recorder_, id, sweeper_.get(), &destroyed);
   };
-  TestThreadHolder thread_holder;
+  // Declared before the holder: the thread counts it down, and may still be running at an early
+  // exit.
   CountDownLatch done(1);
+  TestThreadHolder thread_holder;
   thread_holder.AddThreadFunctor([this, &make_entry, &destroyed, &done] {
     // Remove.
     auto handle = ASSERT_RESULT(sweeper_->Register(make_entry(1), 1h));

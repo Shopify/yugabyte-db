@@ -1517,8 +1517,9 @@ TEST_F(ConsensusPeersTest, ConcurrentStuckDetectorAndBatchedSends) {
   auto& peer = *test_peer.peer;
   ASSERT_NO_FATALS(Negotiate(test_peer));
 
-  std::atomic<bool> stop{false};
   TestThreadHolder holder;
+  // The holder's own flag, so that its destructor also stops these threads at an early exit.
+  auto& stop = holder.stop_flag();
   holder.AddThread([this, &peer] {
     for (int i = 1; i <= kNumOps; ++i) {
       AppendReplicateMessagesToQueue(message_queue_.get(), clock_, i, 1);
@@ -1550,8 +1551,7 @@ TEST_F(ConsensusPeersTest, ConcurrentStuckDetectorAndBatchedSends) {
   ASSERT_OK(WaitFor([&test_peer] {
     return test_peer.follower->last_received().index == kNumOps;
   }, 30s, "All ops received"));
-  stop = true;
-  holder.JoinAll();
+  holder.Stop();
 
   ASSERT_NO_FATALS(CompleteUntilIdle(test_peer));
   ASSERT_EQ(test_peer.follower->received(), Range(1, kNumOps));

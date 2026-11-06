@@ -1276,8 +1276,9 @@ TEST_F(MultiRaftUpdateConsensusTest, DistinctTabletsOverlap) {
 // succeeds once the mutex is free.
 TEST_F(MultiRaftUpdateConsensusTest, HeldUpdateMutexDoesNotBlockEnvelopeMates) {
   ASSERT_NO_FATALS(StartServer(3));
-  TestThreadHolder thread_holder;
+  // Declared before the holder: the thread writes it, and may still be running at an early exit.
   std::atomic<bool> direct_done{false};
+  TestThreadHolder thread_holder;
   ASSERT_NO_FATALS(HoldUpdateMutex(&tablets_[0], 3s, &thread_holder, &direct_done));
 
   auto envelope = SendAsync(
@@ -1654,8 +1655,9 @@ TEST_F(MultiRaftUpdateConsensusTest, FlagFlipWithEnvelopesInFlight) {
   ASSERT_EQ(ConcurrentSubRequests(), concurrent_before);
 
   // Off to on while a serial envelope is stuck behind a held update_mutex_.
-  TestThreadHolder thread_holder;
+  // Declared before the holder: the thread writes it, and may still be running at an early exit.
   std::atomic<bool> direct_done{false};
+  TestThreadHolder thread_holder;
   constexpr auto kHold = 2s;
   ASSERT_NO_FATALS(HoldUpdateMutex(&tablets_[0], kHold, &thread_holder, &direct_done));
   envelope = SendAsync({Heartbeat(tablets_[0]), Data(&tablets_[1], 1, true)});
@@ -2532,8 +2534,9 @@ TEST_F(MultiRaftUpdateConsensusTest, InlineFirstWithStreaming) {
 TEST_F(MultiRaftUpdateConsensusTest, InlineFirstHeldMutexDoesNotBlockMates) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_update_inline_first) = true;
   ASSERT_NO_FATALS(StartServer(3));
-  TestThreadHolder thread_holder;
+  // Declared before the holder: the thread writes it, and may still be running at an early exit.
   std::atomic<bool> direct_done{false};
+  TestThreadHolder thread_holder;
   ASSERT_NO_FATALS(HoldUpdateMutex(&tablets_[0], 3s, &thread_holder, &direct_done));
   const auto inline_before = InlineSubRequests();
   UpdateThreads threads;
@@ -2564,8 +2567,9 @@ TEST_F(MultiRaftUpdateConsensusTest, InlineFirstHeldMutexDoesNotBlockMates) {
 TEST_F(MultiRaftUpdateConsensusTest, InlineFirstHeldMutexAnsweredAtDeadline) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_update_inline_first) = true;
   ASSERT_NO_FATALS(StartServer(2));
-  TestThreadHolder thread_holder;
+  // Declared before the holder: the thread writes it, and may still be running at an early exit.
   std::atomic<bool> direct_done{false};
+  TestThreadHolder thread_holder;
   ASSERT_NO_FATALS(HoldUpdateMutex(&tablets_[0], 4s, &thread_holder, &direct_done));
   const auto deadline_responses_before = DeadlineResponses();
   UpdateThreads threads;

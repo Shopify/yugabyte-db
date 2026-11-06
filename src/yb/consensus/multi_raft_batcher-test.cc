@@ -589,6 +589,7 @@ TEST_F(MultiRaftBatcherTest, ConcurrentAdds) {
   const auto total = kThreads * kRequestsPerThread;
 
   std::atomic<int> adders_running{kThreads};
+  std::atomic<bool> completer_failed{false};
   TestThreadHolder holder;
   for (int t = 0; t != kThreads; ++t) {
     holder.AddThread([this, &calls = per_thread[t], &adders_running] {
@@ -606,7 +607,6 @@ TEST_F(MultiRaftBatcherTest, ConcurrentAdds) {
       --adders_running;
     });
   }
-  std::atomic<bool> completer_failed{false};
   holder.AddThread([this, &adders_running, &completer_failed] {
     size_t next = 0;
     const auto deadline = CoarseMonoClock::Now() + 60s;
@@ -2638,6 +2638,7 @@ TEST_F(MultiRaftBatcherTest, PacedConcurrentAdds) {
     }
   }
   std::atomic<int> adders_running{kThreads};
+  std::atomic<bool> completer_failed{false};
   TestThreadHolder holder;
   for (int t = 0; t != kThreads; ++t) {
     holder.AddThread([this, &calls = per_thread[t], &adders_running] {
@@ -2654,7 +2655,6 @@ TEST_F(MultiRaftBatcherTest, PacedConcurrentAdds) {
       --adders_running;
     });
   }
-  std::atomic<bool> completer_failed{false};
   holder.AddThread([this, &adders_running, &completer_failed] {
     size_t next = 0;
     const auto deadline = CoarseMonoClock::Now() + 60s;
