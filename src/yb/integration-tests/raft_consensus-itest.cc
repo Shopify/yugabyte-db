@@ -1650,7 +1650,7 @@ TEST_F(RaftConsensusITest, InsertWithCrashyNodes) {
   // log area.
   ts_flags.push_back("--log_preallocate_segments=false");
 
-  CreateCluster("raft_consensus-itest-cluster", ts_flags, master_flags);
+  ASSERT_NO_FATALS(CreateCluster("raft_consensus-itest-cluster", ts_flags, master_flags));
 
   TestYcqlWorkload workload(cluster_.get());
   workload.set_timeout_allowed(true);
@@ -1725,7 +1725,7 @@ void RaftConsensusITest::DoTestChurnyElections(bool with_latency) {
     ts_flags.push_back("--consensus_inject_latency_ms_in_notifications=50");
   }
 
-  CreateCluster("raft_consensus-itest-cluster", ts_flags, master_flags);
+  ASSERT_NO_FATALS(CreateCluster("raft_consensus-itest-cluster", ts_flags, master_flags));
 
   TestYcqlWorkload workload(cluster_.get());
   workload.set_timeout_allowed(true);
@@ -2296,7 +2296,7 @@ TEST_F(RaftConsensusITest, TestStepDownWithSlowFollower) {
     "--tserver_unresponsive_timeout_ms=5000"s,
     "--use_create_table_leader_hint=false"s,
   };
-  BuildAndStart(ts_flags, master_flags);
+  ASSERT_NO_FATALS(BuildAndStart(ts_flags, master_flags));
 
   vector<TServerDetails *> tservers = TServerDetailsVector(tablet_servers_);
   ASSERT_OK(StartElection(tservers[0], tablet_id_, MonoDelta::FromSeconds(10)));
