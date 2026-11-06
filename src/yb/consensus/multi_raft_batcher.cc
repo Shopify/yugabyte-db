@@ -89,7 +89,8 @@ DEFINE_RUNTIME_uint32(multi_raft_data_flush_window_us, 0,
     "multi_raft_heartbeat_interval_ms timer can send a batch earlier. 0 keeps response clocking "
     "instead: a data request is sent at once when no batch carrying data to the server is in "
     "flight, and otherwise waits for one to complete or for multi_raft_data_flush_delay_ms. Read "
-    "on each add.");
+    "on each data add and when a batch carrying data completes, so a change also applies to "
+    "requests already waiting.");
 TAG_FLAG(multi_raft_data_flush_window_us, advanced);
 
 DEFINE_RUNTIME_uint32(multi_raft_data_batch_size, 32,
