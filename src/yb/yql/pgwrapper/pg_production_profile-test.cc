@@ -17,7 +17,11 @@
 // unknown names inside a flagfile, so a renamed or removed flag never stops startup; every flag has
 // to be looked up by name instead. FlagfilesParseCleanly checks acceptance with --helpxml, without
 // a cluster. ClusterRunsProductionProfile boots a cluster with the files and checks the effect:
-// gflag values read back from every daemon, PG GUCs and their provenance, and the hba rules.
+// gflag values read back from every daemon, PG GUCs and their provenance, and the hba rules. It
+// then runs a small workload on one tserver where each check pins an observable effect: tablet
+// count, read committed, upsert, index backfill and reltuples, a CBO bitmap plan, md5 and SCRAM
+// logins, the tracked query text and query id, PG log files, ASH samples and a replication slot
+// LSN type.
 //
 // Flagfile grammar. The active lines are byte-for-byte what the deployment renders, so a fresh
 // render diffs cleanly against the files. Lines the test cannot apply are kept as markers:
@@ -62,6 +66,8 @@
 // the lists shrink; a kKnownUnrecognizedFlags or kOtherDaemonOnlyFlags row whose key leaves the
 // profile fails the test.
 
+#include <sys/stat.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -83,13 +89,16 @@
 
 #include "yb/integration-tests/external_mini_cluster.h"
 
+#include "yb/util/backoff_waiter.h"
 #include "yb/util/csv_util.h"
 #include "yb/util/env.h"
 #include "yb/util/env_util.h"
 #include "yb/util/enums.h"
+#include "yb/util/errno.h"
 #include "yb/util/faststring.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
+#include "yb/util/monotime.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/path_util.h"
 #include "yb/util/pg_util.h"
@@ -98,6 +107,8 @@
 #include "yb/util/strongly_typed_bool.h"
 #include "yb/util/subprocess.h"
 #include "yb/util/test_macros.h"
+#include "yb/util/test_thread_holder.h"
+#include "yb/util/tsan_util.h"
 
 #include "yb/yql/pgwrapper/libpq_test_base.h"
 #include "yb/yql/pgwrapper/libpq_utils.h"
@@ -567,6 +578,12 @@ Result<HelpXmlFlags> RunHelpXml(const std::string& daemon, const std::string& fl
   return VERIFY_RESULT_PREPEND(ParseHelpXml(output), Format("$0 --helpxml", daemon));
 }
 
+// EXPLAIN output as one string, one plan line per line.
+Result<std::string> ExplainText(PGConn* conn, const std::string& explain) {
+  const auto lines = VERIFY_RESULT_PREPEND(conn->FetchRows<std::string>(explain), explain);
+  return JoinStrings(lines, "\n");
+}
+
 }  // namespace
 
 class PgProductionProfileTest : public LibPqTestBase {
@@ -642,7 +659,7 @@ class PgProductionProfileTest : public LibPqTestBase {
 
   // LibPqTestBase::ConnectToDBWithReplication, authenticated as the superuser.
   static Result<PGConn> ConnectReplication(
-      const ExternalTabletServer& ts, const std::string& dbname) {
+      const ExternalTabletServer& ts, const std::string& dbname, size_t connect_timeout_sec = 0) {
     return PGConnBuilder({
       .host = ts.bind_host(),
       .port = ts.pgsql_rpc_port(),
@@ -650,6 +667,7 @@ class PgProductionProfileTest : public LibPqTestBase {
       .user = kSuperuser,
       .password = kSuperuserPassword,
       .replication = "database",
+      .connect_timeout = connect_timeout_sec,
     }).Connect(/* simple_query_protocol= */ true);
   }
 
@@ -681,6 +699,21 @@ class PgProductionProfileTest : public LibPqTestBase {
   void CheckPgTaggedFlags(PGConn* conn);
   void CheckHbaRules(PGConn* conn);
   void CheckHbaBehavior(PGConn* conn);
+  void CheckDdl(PGConn* conn);
+  void CheckReadCommitted(PGConn* conn);
+  void CheckUpsert(PGConn* conn);
+  void CheckIndexBackfill(PGConn* conn);
+  void CheckCboPlan(PGConn* conn);
+  void CheckMd5Auth(PGConn* conn);
+  void CheckScramAuth(PGConn* conn);
+  void CheckIdleQueryText(PGConn* conn);
+  void CheckPgLogFiles();
+  void CheckAsh(PGConn* conn);
+  void CheckReplicationSlot(PGConn* conn);
+
+  Result<PGConn> ConnectAsSuperuserAgain() {
+    return ConnectTcp(*pg_ts, kSuperuser, kSuperuserPassword, kDefaultDb, kLoginTimeoutSec);
+  }
 
   static constexpr auto kDefaultDb = "yugabyte";
   static constexpr auto kSuperuser = "yugabyte";
@@ -691,6 +724,25 @@ class PgProductionProfileTest : public LibPqTestBase {
   // Bounds a login that should succeed on a tserver already known to accept logins, so a
   // regression fails fast instead of retrying for the default 60 s.
   static constexpr size_t kLoginTimeoutSec = 10;
+
+  // The smoke workload's table: k = 1..kNumRows, a = k, b = kNumRows - k, so a small bound on
+  // either a or b selects only a few rows.
+  static constexpr int kNumRows = 10000;
+  static constexpr auto kCreateTableStatement =
+      "CREATE TABLE t (k int PRIMARY KEY, a int, b int, v int)";
+  static constexpr auto kIndexA = "t_a_idx";
+  static constexpr auto kIndexB = "t_b_idx";
+  // An OR over two separately indexed, selective columns, which the CBO plans as a bitmap scan
+  // once t is analyzed. No hint and no planner GUC is set: the plan comes from the profile. The
+  // bounds are equality lists because t's indexes are hash-sharded on their column, the YSQL
+  // default; a range bound such as a < 10 cannot be an index condition there, and the plan
+  // becomes a sequential scan.
+  static constexpr auto kCboQuery = "SELECT * FROM t WHERE a IN (1, 2, 3) OR b IN (1, 2, 3)";
+  static constexpr auto kBitmapTableScanNode = "YB Bitmap Table Scan";
+
+  static Result<std::string> ExplainCboQuery(PGConn* conn) {
+    return ExplainText(conn, Format("EXPLAIN (COSTS OFF) $0", kCboQuery));
+  }
 
   DaemonProfile master_profile_;
   DaemonProfile tserver_profile_;
@@ -1267,8 +1319,330 @@ void PgProductionProfileTest::CheckHbaBehavior(PGConn* conn) {
       "no password supplied");
 }
 
+namespace {
+
+// "md5" or "SCRAM-SHA-256", from the role's stored password, without printing the verifier.
+Result<std::string> StoredPasswordMethod(PGConn* conn, const std::string& role) {
+  return conn->FetchRow<std::string>(Format(
+      "SELECT CASE WHEN rolpassword IS NULL THEN '<none>' WHEN rolpassword LIKE 'md5%' THEN 'md5' "
+      "ELSE split_part(rolpassword, '$$', 1) END FROM pg_authid WHERE rolname = '$0'", role));
+}
+
+// Looks up a ysql_pg_conf_csv element by name and returns its value without PG quoting.
+Result<std::string> PgConfCsvValue(const DaemonProfile& profile, const std::string& name) {
+  for (const auto& element : VERIFY_RESULT(ReadProfileCsv(profile, "ysql_pg_conf_csv"))) {
+    const auto eq = element.find('=');
+    if (eq != std::string::npos && element.substr(0, eq) == name) {
+      return StripPgQuotes(element.substr(eq + 1));
+    }
+  }
+  return STATUS_FORMAT(NotFound, "$0: ysql_pg_conf_csv has no $1 element", profile.daemon, name);
+}
+
+}  // namespace
+
+// Pins --ysql_num_tablets: the profile value beats the fixture's --ysql_num_tablets=-1 only because
+// the flagfile comes after it in argv.
+void PgProductionProfileTest::CheckDdl(PGConn* conn) {
+  const auto* num_tablets_entry = tserver_profile_.FindActive("ysql_num_tablets");
+  ASSERT_NE(num_tablets_entry, nullptr) << "DDL: the tserver profile sets no --ysql_num_tablets";
+  ASSERT_OK(conn->Execute(kCreateTableStatement));
+  const auto num_tablets = ASSERT_RESULT(conn->FetchRow<int64_t>(
+      "SELECT num_tablets FROM yb_table_properties('t'::regclass)"));
+  ASSERT_OK(CheckProfileValue(
+      "DDL: --ysql_num_tablets against the tablet count of table t", num_tablets_entry->value,
+      std::to_string(num_tablets)));
+
+  ASSERT_OK(conn->ExecuteFormat(
+      "INSERT INTO t SELECT k, k, $0 - k, k FROM generate_series(1, $0) k", kNumRows));
+}
+
+// Pins --yb_enable_read_committed_isolation and --ysql_default_transaction_isolation (a
+// single-quoted value). Without the first, YSQL runs READ COMMITTED as REPEATABLE READ, and A's
+// second read would still see the value from its snapshot.
+void PgProductionProfileTest::CheckReadCommitted(PGConn* conn) {
+  auto session_a = ASSERT_RESULT(ConnectAsSuperuserAgain());
+  const auto isolation = ASSERT_RESULT(
+      session_a.FetchRow<std::string>("SHOW yb_effective_transaction_isolation_level"));
+  ASSERT_EQ(isolation, "read committed")
+      << "Read committed: effective isolation level of a fresh session";
+
+  const auto read_v = "SELECT v FROM t WHERE k = 1";
+  ASSERT_OK(session_a.Execute("BEGIN"));
+  const auto first_read = ASSERT_RESULT(session_a.FetchRow<int32_t>(read_v));
+  ASSERT_EQ(first_read, 1) << "Read committed: session A's first read of t.v for k = 1";
+  ASSERT_OK(conn->Execute("UPDATE t SET v = -1 WHERE k = 1"));
+  const auto second_read = ASSERT_RESULT(session_a.FetchRow<int32_t>(read_v));
+  ASSERT_EQ(second_read, -1)
+      << "Read committed: session A's second read of t.v for k = 1, in the same transaction, after "
+      << "session B committed v = -1";
+  // An open transaction would stall the online CREATE INDEX below until statement_timeout.
+  ASSERT_OK(session_a.Execute("COMMIT"));
+}
+
+// Smoke check for --yb_insert_on_conflict_read_batch_size: every key already exists, so each row
+// takes the DO UPDATE path.
+void PgProductionProfileTest::CheckUpsert(PGConn* conn) {
+  const auto upserted = ASSERT_RESULT(conn->FetchRow<int64_t>(Format(
+      "WITH upserted AS (INSERT INTO t SELECT k, k, $0 - k, 2 * k FROM generate_series(1, $0) k "
+      "ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v RETURNING 1) SELECT count(*) FROM upserted",
+      kNumRows)));
+  ASSERT_EQ(upserted, kNumRows) << "Upsert: rows affected in table t";
+  const auto [num_rows, num_updated] = ASSERT_RESULT((conn->FetchRow<int64_t, int64_t>(
+      "SELECT count(*), count(*) FILTER (WHERE v = 2 * k) FROM t")));
+  ASSERT_EQ(num_rows, kNumRows) << "Upsert: rows in table t";
+  ASSERT_EQ(num_updated, kNumRows) << "Upsert: rows of table t with the upserted v = 2 * k";
+}
+
+// Smoke check for the backfill flags, and pins yb_enable_update_reltuples_after_create_index:
+// nothing has analyzed t (auto-analyze is off), so only the backfill can set reltuples.
+void PgProductionProfileTest::CheckIndexBackfill(PGConn* conn) {
+  const auto reltuples_query = "SELECT reltuples FROM pg_class WHERE oid = 't'::regclass";
+  const auto reltuples_before = ASSERT_RESULT(conn->FetchRow<float>(reltuples_query));
+  ASSERT_EQ(reltuples_before, -1)
+      << "Index backfill: reltuples of table t before any index or ANALYZE";
+
+  for (const auto& [index, column] : {std::pair{kIndexA, "a"}, std::pair{kIndexB, "b"}}) {
+    ASSERT_OK(conn->ExecuteFormat("CREATE INDEX $0 ON t ($1)", index, column));
+    const auto [valid, ready] = ASSERT_RESULT((conn->FetchRow<bool, bool>(Format(
+        "SELECT indisvalid, indisready FROM pg_index WHERE indexrelid = '$0'::regclass",
+        index))));
+    ASSERT_TRUE(valid && ready) << "Index backfill: index " << index << " indisvalid " << valid
+                                << ", indisready " << ready;
+  }
+
+  // Each index's own lookup must carry the condition: a full index scan with a storage filter
+  // would also name the index in the plan.
+  for (const auto& [index, column] : {std::pair{kIndexA, "a"}, std::pair{kIndexB, "b"}}) {
+    const auto count_query = Format("SELECT count(*) FROM t WHERE $0 IN (1, 2, 3, 4, 5)", column);
+    const auto plan =
+        ASSERT_RESULT(ExplainText(conn, Format("EXPLAIN (COSTS OFF) $0", count_query)));
+    ASSERT_TRUE(
+        plan.find(Format("using $0 on t", index)) != std::string::npos &&
+        plan.find("Index Cond: ") != std::string::npos)
+        << "Index backfill: plan of " << count_query << " does not look up " << index << ":\n"
+        << plan;
+    const auto count = ASSERT_RESULT(conn->FetchRow<int64_t>(count_query));
+    ASSERT_EQ(count, 5) << "Index backfill: " << count_query << ", plan:\n" << plan;
+  }
+
+  const auto reltuples_after = ASSERT_RESULT(conn->FetchRow<float>(reltuples_query));
+  ASSERT_TRUE(reltuples_after > 0 && std::abs(reltuples_after - kNumRows) <= 0.1 * kNumRows)
+      << "Index backfill: reltuples of table t is " << reltuples_after << " after both indexes ("
+      << reltuples_before << " before), expected within 10% of the " << kNumRows
+      << " rows inserted";
+}
+
+// Pins --ysql_yb_enable_cbo and the CSV's yb_enable_bitmapscan.
+void PgProductionProfileTest::CheckCboPlan(PGConn* conn) {
+  ASSERT_OK(conn->Execute("ANALYZE t"));
+  const auto plan = ASSERT_RESULT(ExplainCboQuery(conn));
+  LOG(INFO) << "Plan of " << kCboQuery << ":\n" << plan;
+  for (const auto& expected : {std::string(kBitmapTableScanNode),
+                               Format("Bitmap Index Scan on $0", kIndexA),
+                               Format("Bitmap Index Scan on $0", kIndexB)}) {
+    ASSERT_TRUE(plan.find(expected) != std::string::npos)
+        << "CBO plan: no '" << expected << "' in the plan of " << kCboQuery << ":\n" << plan;
+  }
+  auto keys = ASSERT_RESULT(conn->FetchRows<int32_t>(
+      Format("SELECT k FROM ($0) q", kCboQuery)));
+  std::sort(keys.begin(), keys.end());
+  const std::vector<int32_t> expected_keys = {
+      1, 2, 3, kNumRows - 3, kNumRows - 2, kNumRows - 1};
+  ASSERT_EQ(keys, expected_keys) << "CBO plan: keys returned by " << kCboQuery;
+}
+
+// Pins the CSV's password_encryption=md5 and the hba md5 lines: an md5-stored password cannot
+// authenticate through a scram-sha-256 line.
+void PgProductionProfileTest::CheckMd5Auth(PGConn* conn) {
+  static constexpr auto kPassword = "alice-placeholder-password";
+  ASSERT_OK(conn->ExecuteFormat("CREATE ROLE alice LOGIN PASSWORD '$0'", kPassword));
+  const auto method = ASSERT_RESULT(StoredPasswordMethod(conn, "alice"));
+  ASSERT_EQ(method, "md5") << "md5 auth: role alice's stored password method";
+  auto alice = ASSERT_RESULT(ConnectTcp(*pg_ts, "alice", kPassword, kDefaultDb, kLoginTimeoutSec));
+  const auto user = ASSERT_RESULT(alice.FetchRow<std::string>("SELECT current_user"));
+  ASSERT_EQ(user, "alice");
+  ASSERT_NOK_STR_CONTAINS(
+      ConnectTcp(*pg_ts, "alice", "wrong-password", kDefaultDb, kRejectedConnectTimeoutSec),
+      "password authentication failed for user \"alice\"");
+}
+
+// The hba order as deployed: the md5 lines come before the scram-sha-256 lines for the same
+// addresses, so the scram lines never match. bob authenticates through an md5 line, which accepts
+// a SCRAM-stored password by running the SCRAM exchange.
+void PgProductionProfileTest::CheckScramAuth(PGConn* conn) {
+  static constexpr auto kPassword = "bob-placeholder-password";
+  ASSERT_OK(conn->Execute("SET password_encryption = 'scram-sha-256'"));
+  ASSERT_OK(conn->ExecuteFormat("CREATE ROLE bob LOGIN PASSWORD '$0'", kPassword));
+  ASSERT_OK(conn->Execute("RESET password_encryption"));
+  const auto method = ASSERT_RESULT(StoredPasswordMethod(conn, "bob"));
+  ASSERT_EQ(method, "SCRAM-SHA-256") << "SCRAM auth: role bob's stored password method";
+  auto bob = ASSERT_RESULT(ConnectTcp(*pg_ts, "bob", kPassword, kDefaultDb, kLoginTimeoutSec));
+  const auto user = ASSERT_RESULT(bob.FetchRow<std::string>("SELECT current_user"));
+  ASSERT_EQ(user, "bob");
+}
+
+// Pins track_activity_query_size (the default would cut the text at 1023 bytes) and
+// compute_query_id. An idle backend keeps reporting its last query and query id.
+void PgProductionProfileTest::CheckIdleQueryText(PGConn* conn) {
+  static constexpr size_t kDefaultTrackActivityQuerySize = 1024;
+  const auto query = "SELECT 1 /* " + std::string(5000, 'x') + " */";
+  auto session_a = ASSERT_RESULT(ConnectAsSuperuserAgain());
+  const auto pid = ASSERT_RESULT(session_a.FetchRow<int32_t>("SELECT pg_backend_pid()"));
+  ASSERT_OK(ResultToStatus(session_a.Fetch(query)));
+
+  const auto rows = ASSERT_RESULT((conn->FetchRows<
+      std::optional<int32_t>, std::optional<int64_t>, std::optional<std::string>>(Format(
+      "SELECT length(query), query_id, state FROM pg_stat_activity WHERE pid = $0", pid))));
+  ASSERT_EQ(rows.size(), 1) << "Query text: pg_stat_activity rows for session A (pid " << pid
+                            << ")";
+  const auto& [length, query_id, state] = rows.front();
+  ASSERT_TRUE(length.has_value()) << "Query text: pid " << pid << " has a NULL query";
+  ASSERT_GT(static_cast<size_t>(*length), kDefaultTrackActivityQuerySize)
+      << "Query text: pid " << pid << ", state " << OrNull(state);
+  ASSERT_EQ(static_cast<size_t>(*length), query.size())
+      << "Query text: length of pid " << pid << "'s query, state " << OrNull(state);
+  ASSERT_TRUE(query_id.has_value()) << "Query text: pid " << pid << " has a NULL query_id";
+}
+
+// Pins --logtostderr=false (PG writes its own log files only then) and the CSV's log_filename,
+// log_file_mode, log_line_prefix and log_statement=ddl, against the CREATE TABLE above.
+void PgProductionProfileTest::CheckPgLogFiles() {
+  const auto log_dir = ASSERT_RESULT(pg_ts->GetFlag("log_dir"));
+  const auto log_filename = ASSERT_RESULT(PgConfCsvValue(tserver_profile_, "log_filename"));
+  const auto mode_text = ASSERT_RESULT(PgConfCsvValue(tserver_profile_, "log_file_mode"));
+  // The file name is a strftime pattern; match the literal text around the escapes.
+  const auto first_escape = log_filename.find('%');
+  const auto last_escape = log_filename.rfind('%');
+  ASSERT_TRUE(first_escape != std::string::npos && last_escape + 2 <= log_filename.size())
+      << "PG log files: unsupported log_filename '" << log_filename << "'";
+  const auto prefix = log_filename.substr(0, first_escape);
+  const auto suffix = log_filename.substr(last_escape + 2);
+  char* mode_end = nullptr;
+  const auto expected_mode = std::strtol(mode_text.c_str(), &mode_end, 8);
+  ASSERT_TRUE(!mode_text.empty() && *mode_end == '\0')
+      << "PG log files: log_file_mode '" << mode_text << "' is not an octal number";
+  const auto expected_line = Format("statement: $0", kCreateTableStatement);
+
+  std::vector<std::string> log_files;
+  std::string waiting_for;
+  const auto status = WaitFor([&]() -> Result<bool> {
+    log_files.clear();
+    const auto names = VERIFY_RESULT(Env::Default()->GetChildren(log_dir, ExcludeDots::kTrue));
+    for (const auto& name : names) {
+      if (name.starts_with(prefix) && name.ends_with(suffix)) {
+        log_files.push_back(JoinPathSegments(log_dir, name));
+      }
+    }
+    if (log_files.empty()) {
+      waiting_for = Format("a file named $0*$1 in $2", prefix, suffix, log_dir);
+      return false;
+    }
+    for (const auto& path : log_files) {
+      faststring contents;
+      RETURN_NOT_OK(ReadFileToString(Env::Default(), path, &contents));
+      std::istringstream in(contents.ToString());
+      for (std::string line; std::getline(in, line);) {
+        if (line.find(expected_line) != std::string::npos &&
+            line.find("[POSTGRES] ") != std::string::npos &&
+            line.find("application=") != std::string::npos) {
+          return true;
+        }
+      }
+    }
+    waiting_for = Format(
+        "a line with '$0', '[POSTGRES] ' and 'application=' in $1", expected_line,
+        JoinStrings(log_files, ", "));
+    return false;
+  }, MonoDelta::FromSeconds(10 * kTimeMultiplier), "PG log file with the CREATE TABLE statement");
+  ASSERT_TRUE(status.ok()) << "PG log files: gave up waiting for " << waiting_for << ": " << status;
+
+  for (const auto& path : log_files) {
+    struct stat st;
+    ASSERT_EQ(stat(path.c_str(), &st), 0)
+        << "PG log files: stat " << path << ": " << ErrnoToString(errno);
+    ASSERT_EQ(static_cast<int64_t>(st.st_mode & 0777), static_cast<int64_t>(expected_mode))
+        << "PG log files: mode of " << path << " is " << std::oct << (st.st_mode & 0777)
+        << ", expected " << expected_mode << " (log_file_mode '" << mode_text << "')";
+  }
+  LOG(INFO) << "PG log files: " << JoinStrings(log_files, ", ");
+}
+
+// Pins --ysql_yb_enable_ash. Background samples of the tserver itself would satisfy an unfiltered
+// count, so only the sleeping backend's samples count.
+void PgProductionProfileTest::CheckAsh(PGConn* conn) {
+  auto sleeper = ASSERT_RESULT(ConnectAsSuperuserAgain());
+  const auto pid = ASSERT_RESULT(sleeper.FetchRow<int32_t>("SELECT pg_backend_pid()"));
+  Status sleep_status;
+  TestThreadHolder thread_holder;
+  thread_holder.AddThreadFunctor([&sleeper, &sleep_status] {
+    sleep_status = ResultToStatus(sleeper.Fetch("SELECT pg_sleep(3)"));
+  });
+  int64_t num_samples = 0;
+  const auto status = WaitFor([&]() -> Result<bool> {
+    num_samples = VERIFY_RESULT(conn->FetchRow<int64_t>(Format(
+        "SELECT count(*) FROM yb_active_session_history WHERE pid = $0", pid)));
+    return num_samples > 0;
+  }, MonoDelta::FromSeconds(30 * kTimeMultiplier), "ASH samples of the sleeping backend");
+  thread_holder.JoinAll();
+  ASSERT_TRUE(status.ok()) << "ASH: no yb_active_session_history sample with pid " << pid
+                           << " (the backend running pg_sleep): " << status;
+  ASSERT_TRUE(sleep_status.ok()) << "ASH: pg_sleep on pid " << pid << ": " << sleep_status;
+  LOG(INFO) << "ASH: " << num_samples << " samples of pid " << pid;
+}
+
+// Pins the tserver/PG side of --ysql_yb_allow_replication_slot_lsn_types: walsender.c rejects an
+// LSN type in CREATE_REPLICATION_SLOT unless it is on. The master side (xrepl_catalog_manager.cc)
+// relies on AutoFlag promotion on a fresh cluster, because the master profile does not set the
+// flag; this is not a master profile check. The logical replication connection names a database,
+// so it also exercises the hba lines' "all" database match.
+void PgProductionProfileTest::CheckReplicationSlot(PGConn* conn) {
+  static constexpr auto kSlotLsnTypeQuery =
+      "SELECT yb_lsn_type FROM pg_replication_slots WHERE slot_name = 'pp_slot'";
+  {
+    auto replication = ASSERT_RESULT(ConnectReplication(*pg_ts, kDefaultDb, kLoginTimeoutSec));
+    ASSERT_OK(ResultToStatus(
+        replication.Fetch("CREATE_REPLICATION_SLOT pp_slot LOGICAL yboutput HYBRID_TIME")));
+  }
+  const auto lsn_types =
+      ASSERT_RESULT(conn->FetchRows<std::optional<std::string>>(kSlotLsnTypeQuery));
+  ASSERT_EQ(lsn_types.size(), 1) << "Replication slot: pg_replication_slots rows for pp_slot";
+  ASSERT_EQ(lsn_types.front().value_or("<NULL>"), std::string("HYBRID_TIME"))
+      << "Replication slot: yb_lsn_type of pp_slot";
+
+  // The tserver reports a slot as active for ysql_cdc_active_replication_slot_window_ms after its
+  // last activity, which creation counts as, and an active slot cannot be dropped. The window is
+  // not a profile flag; the drop is retried until it closes rather than shortened by a test-only
+  // override.
+  const auto window_ms = ASSERT_RESULT(
+      pg_ts->GetFlag("ysql_cdc_active_replication_slot_window_ms"));
+  const auto window_ms_value = ParseInteger(window_ms);
+  ASSERT_TRUE(window_ms_value.has_value())
+      << "ysql_cdc_active_replication_slot_window_ms is '" << window_ms << "'";
+  const auto window = MonoDelta::FromMilliseconds(*window_ms_value);
+  Status last_drop_status;
+  const auto status = WaitFor([&]() -> Result<bool> {
+    last_drop_status =
+        ResultToStatus(conn->Fetch("SELECT pg_drop_replication_slot('pp_slot')"));
+    if (last_drop_status.ok()) {
+      return true;
+    }
+    if (last_drop_status.message().ToBuffer().find("is active") != std::string::npos) {
+      return false;
+    }
+    return last_drop_status;
+  }, (window + MonoDelta::FromSeconds(30)) * kTimeMultiplier, "Drop replication slot pp_slot");
+  ASSERT_TRUE(status.ok()) << "Replication slot: dropping pp_slot (active window " << window_ms
+                           << " ms): " << status << "; last attempt: " << last_drop_status;
+  const auto rows_after_drop =
+      ASSERT_RESULT(conn->FetchRows<std::optional<std::string>>(kSlotLsnTypeQuery));
+  ASSERT_TRUE(rows_after_drop.empty())
+      << "Replication slot: pp_slot is still listed after pg_drop_replication_slot";
+}
+
 // Boots the cluster with the profile (UpdateMiniClusterOptions passes the copies by --flagfile)
-// and checks that every flag took effect: gflag readback, PG GUC provenance and the hba rules.
+// and checks that every flag took effect: gflag readback, PG GUC provenance and the hba rules,
+// then a smoke workload in which each check pins one observable effect of the profile.
 TEST_F(PgProductionProfileTest, ClusterRunsProductionProfile) {
   ASSERT_NO_FATALS(CheckFlagReadback());
   ASSERT_NO_FATALS(CheckOtherDaemonOnlyFlags());
@@ -1277,6 +1651,23 @@ TEST_F(PgProductionProfileTest, ClusterRunsProductionProfile) {
   ASSERT_NO_FATALS(CheckPgTaggedFlags(&conn));
   ASSERT_NO_FATALS(CheckHbaRules(&conn));
   ASSERT_NO_FATALS(CheckHbaBehavior(&conn));
+
+  // Smoke workload, one observable effect of the profile per check. t and its indexes stay for
+  // the checks that follow.
+  ASSERT_NO_FATALS(CheckDdl(&conn));
+  ASSERT_NO_FATALS(CheckReadCommitted(&conn));
+  ASSERT_NO_FATALS(CheckUpsert(&conn));
+  ASSERT_NO_FATALS(CheckIndexBackfill(&conn));
+  ASSERT_NO_FATALS(CheckCboPlan(&conn));
+  // ysql_enable_auto_analyze=false has no check of its own: CheckFlagReadback pins it, and the
+  // readback is the proof, since CBO=on turns auto-analyze on by default only when the flag is
+  // unset. CheckIndexBackfill relies on it: no ANALYZE runs before the explicit one.
+  ASSERT_NO_FATALS(CheckMd5Auth(&conn));
+  ASSERT_NO_FATALS(CheckScramAuth(&conn));
+  ASSERT_NO_FATALS(CheckIdleQueryText(&conn));
+  ASSERT_NO_FATALS(CheckPgLogFiles());
+  ASSERT_NO_FATALS(CheckAsh(&conn));
+  ASSERT_NO_FATALS(CheckReplicationSlot(&conn));
 }
 
 }  // namespace yb::pgwrapper
