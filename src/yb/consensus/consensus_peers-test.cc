@@ -87,6 +87,7 @@ DECLARE_bool(enable_multi_raft_streaming_responses);
 DECLARE_uint64(multi_raft_batch_size);
 DECLARE_uint64(multi_raft_data_direct_threshold_bytes);
 DECLARE_uint32(multi_raft_data_flush_delay_ms);
+DECLARE_uint32(multi_raft_data_flush_window_us);
 DECLARE_uint64(multi_raft_heartbeat_interval_ms);
 DECLARE_uint32(multi_raft_rpc_timeout_ms);
 DECLARE_int32(raft_heartbeat_interval_ms);
@@ -807,6 +808,8 @@ TEST_F(ConsensusPeersTest, TestDontSendOneRpcPerWriteWhenPeerIsDown) {
 // response handler sends goes through the batcher too.
 TEST_F(ConsensusPeersTest, BatchedDataHoldsUpdateLockUntilResponse) {
   ASSERT_NO_FATALS(SetUpBatcher(/* heartbeat_batching= */ false, /* data_batching= */ true));
+  // The envelope callback runs on the High pool only when responses are not streamed.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = false;
   auto test_peer = NewTestPeer(kFollowerUuid);
   auto& peer = *test_peer.peer;
   ASSERT_NO_FATALS(Negotiate(test_peer));
@@ -1189,6 +1192,8 @@ TEST_F(ConsensusPeersTest, BatchedResponseNotCopied) {
 // envelope is serialized, even after the peer is closed and released by everyone else.
 TEST_F(ConsensusPeersTest, BatchKeepsClosedPeerAliveUntilSerialized) {
   ASSERT_NO_FATALS(SetUpBatcher(/* heartbeat_batching= */ false, /* data_batching= */ true));
+  // The parked request must wait for the envelope's completion, i.e. response clocking.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_flush_window_us) = 0;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_flush_delay_ms) = kNeverMs;
   auto in_flight = NewTestPeer(kFollowerUuid);
   auto parked = NewTestPeer(kFollower2Uuid);
@@ -1474,6 +1479,8 @@ TEST_F(ConsensusPeersTest, SynchronousCompletionKeepsLatestHandle) {
   ASSERT_NO_FATALS(SetUpBatcher(
       /* heartbeat_batching= */ false, /* data_batching= */ true,
       /* inline_sub_callbacks= */ true));
+  // The completion sends the next round only under response clocking; pacing would park it.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_data_flush_window_us) = 0;
   auto test_peer = NewTestPeer(kFollowerUuid);
   auto& peer = *test_peer.peer;
   ASSERT_NO_FATALS(Negotiate(test_peer));
