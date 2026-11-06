@@ -299,6 +299,7 @@ class HollowTServer {
     info.leader_uuid = leader_uuid;
     info.schema_version = schema_version;
     dirty_.insert(tablet_id);
+    heartbeat_asap.store(true);
   }
 
   // The master re-sends AlterSchema while any replica reports an older version than the
@@ -311,6 +312,7 @@ class HollowTServer {
     }
     it->second.schema_version = std::max(it->second.schema_version, schema_version);
     dirty_.insert(tablet_id);
+    heartbeat_asap.store(true);
   }
 
   bool HasTablet(const string& tablet_id) {
@@ -337,6 +339,7 @@ class HollowTServer {
     removed_.insert(tablet_id);
     storage_acked_.erase(tablet_id);
     compaction_acked_.erase(tablet_id);
+    heartbeat_asap.store(true);
   }
 
   // Hollow tablet sizes never change, so acked entries are only resent after a full report.
@@ -577,6 +580,10 @@ class HollowTServer {
       }
     }
   }
+
+  // Set by RPC handlers when the tablet report changed; the scheduler then sends the next
+  // heartbeat at once instead of waiting for the period, as the real heartbeater's TriggerASAP.
+  std::atomic<bool> heartbeat_asap{false};
 
   // Scheduler-thread-only state.
   std::map<string, MethodSchedule> schedules;
@@ -2809,13 +2816,18 @@ class MasterLoadBench {
           } else if (!interval.Initialized()) {
             continue;
           }
-          if (now < schedule.next) {
+          const bool asap =
+              method == "TSHeartbeat" && !schedule.run && ts->heartbeat_asap.load();
+          if (now < schedule.next && !asap) {
             continue;
           }
           // One in flight per tserver and method, as the real tserver's synchronous senders;
           // ysql_connect connections are independent of each other.
           if (method != kYsqlConnect && schedule.in_flight.exchange(true)) {
             continue;
+          }
+          if (asap) {
+            ts->heartbeat_asap.store(false);
           }
           schedule.next = interval.Initialized() ? now + interval : now;
           if (schedule.remaining > 0) {
