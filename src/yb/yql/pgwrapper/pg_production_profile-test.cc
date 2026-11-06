@@ -1438,9 +1438,10 @@ void PgProductionProfileTest::CheckIndexBackfill(PGConn* conn) {
       << " rows inserted";
 }
 
-// Pins --ysql_yb_enable_cbo through the row estimates: only the CBO cost model reads the ANALYZE
-// statistics, which give one row per listed value of the unique columns a and b; legacy_mode and
-// off estimate 100 and 10 rows per index scan. The plan shape comes out under every yb_enable_cbo
+// The row estimates show the planner uses the ANALYZE statistics, which give one row per listed
+// value of the unique columns a and b. That holds for --ysql_yb_enable_cbo=on and the legacy_stats
+// modes; off and legacy_mode estimate 10 and 100 rows per index scan. CheckFlagReadback and
+// CheckPgTaggedFlags pin the exact value on. The plan shape comes out under every yb_enable_cbo
 // mode, so it shows only that bitmap scans are on. The CSV's yb_enable_bitmapscan turns them on,
 // and CBO=on would too as a dynamic default; CheckPgConfCsv pins that the CSV's value is the one
 // in effect.
@@ -1472,8 +1473,8 @@ void PgProductionProfileTest::CheckCboPlan(PGConn* conn) {
         << costed_plan;
     ASSERT_EQ(match[1].str(), kAnalyzedRowsPerIndexScan)
         << "CBO plan: row estimate of the Bitmap Index Scan on " << index
-        << ", expected the ANALYZE statistics' estimate; another value means the CBO cost model "
-        << "is not planning:\n" << costed_plan;
+        << ", expected the estimate from the ANALYZE statistics; another value means the planner "
+        << "is not using them:\n" << costed_plan;
   }
 }
 
