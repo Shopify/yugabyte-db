@@ -18,7 +18,7 @@
 // to be looked up by name instead. FlagfilesParseCleanly checks acceptance with --helpxml, without
 // a cluster. ClusterRunsProductionProfile boots a cluster with the files and checks the effect:
 // gflag values read back from every daemon, PG GUCs and their provenance, and the hba rules. It
-// then runs a small workload on one tserver where each check pins an observable effect: tablet
+// then runs a small workload on one tserver where each check exercises an observable effect: tablet
 // count, read committed, upsert, index backfill and reltuples, a CBO bitmap plan, md5 and SCRAM
 // logins, the tracked query text and query id, PG log files, ASH samples and a replication slot
 // LSN type.
@@ -732,8 +732,8 @@ class PgProductionProfileTest : public LibPqTestBase {
       "CREATE TABLE t (k int PRIMARY KEY, a int, b int, v int)";
   static constexpr auto kIndexA = "t_a_idx";
   static constexpr auto kIndexB = "t_b_idx";
-  // An OR over two separately indexed, selective columns, which the CBO plans as a bitmap scan
-  // once t is analyzed. No hint and no planner GUC is set: the plan comes from the profile. The
+  // An OR over two separately indexed, selective columns, which plans as a bitmap scan once t is
+  // analyzed. No hint and no planner GUC is set: the plan comes from the profile's settings. The
   // bounds are equality lists because t's indexes are hash-sharded on their column, the YSQL
   // default; a range bound such as a < 10 cannot be an index condition there, and the plan
   // becomes a sequential scan.
@@ -1342,7 +1342,7 @@ Result<std::string> PgConfCsvValue(const DaemonProfile& profile, const std::stri
 }  // namespace
 
 // Pins --ysql_num_tablets: the profile value beats the fixture's --ysql_num_tablets=-1 only because
-// the flagfile comes after it in argv.
+// the flagfile comes after it in argv. Without it the table would get one tablet per tserver.
 void PgProductionProfileTest::CheckDdl(PGConn* conn) {
   const auto* num_tablets_entry = tserver_profile_.FindActive("ysql_num_tablets");
   ASSERT_NE(num_tablets_entry, nullptr) << "DDL: the tserver profile sets no --ysql_num_tablets";
@@ -1357,9 +1357,12 @@ void PgProductionProfileTest::CheckDdl(PGConn* conn) {
       "INSERT INTO t SELECT k, k, $0 - k, k FROM generate_series(1, $0) k", kNumRows));
 }
 
-// Pins --yb_enable_read_committed_isolation and --ysql_default_transaction_isolation (a
-// single-quoted value). Without the first, YSQL runs READ COMMITTED as REPEATABLE READ, and A's
-// second read would still see the value from its snapshot.
+// Read committed as the profile configures it, with --yb_enable_read_committed_isolation and
+// --ysql_default_transaction_isolation (a single-quoted value). Without the first, YSQL runs READ
+// COMMITTED as REPEATABLE READ, and A's second read would still see the value from its snapshot.
+// In a release build this does not pin the profile's lines: both defaults are the same values
+// (the first defaults to false only in debug builds). CheckFlagReadback and CheckPgTaggedFlags
+// pin the lines.
 void PgProductionProfileTest::CheckReadCommitted(PGConn* conn) {
   auto session_a = ASSERT_RESULT(ConnectAsSuperuserAgain());
   const auto isolation = ASSERT_RESULT(
@@ -1394,8 +1397,10 @@ void PgProductionProfileTest::CheckUpsert(PGConn* conn) {
   ASSERT_EQ(num_updated, kNumRows) << "Upsert: rows of table t with the upserted v = 2 * k";
 }
 
-// Smoke check for the backfill flags, and pins yb_enable_update_reltuples_after_create_index:
-// nothing has analyzed t (auto-analyze is off), so only the backfill can set reltuples.
+// Smoke check for the backfill flags. reltuples shows yb_enable_update_reltuples_after_create_index
+// is on: nothing has analyzed t (auto-analyze is off), so only the backfill can set it. The CSV
+// turns the GUC on, and CBO=on would too as a dynamic default; CheckPgConfCsv pins that the CSV's
+// value is the one in effect.
 void PgProductionProfileTest::CheckIndexBackfill(PGConn* conn) {
   const auto reltuples_query = "SELECT reltuples FROM pg_class WHERE oid = 't'::regclass";
   const auto reltuples_before = ASSERT_RESULT(conn->FetchRow<float>(reltuples_query));
@@ -1433,8 +1438,14 @@ void PgProductionProfileTest::CheckIndexBackfill(PGConn* conn) {
       << " rows inserted";
 }
 
-// Pins --ysql_yb_enable_cbo and the CSV's yb_enable_bitmapscan.
+// Pins --ysql_yb_enable_cbo through the row estimates: only the CBO cost model reads the ANALYZE
+// statistics, which give one row per listed value of the unique columns a and b; legacy_mode and
+// off estimate 100 and 10 rows per index scan. The plan shape comes out under every yb_enable_cbo
+// mode, so it shows only that bitmap scans are on. The CSV's yb_enable_bitmapscan turns them on,
+// and CBO=on would too as a dynamic default; CheckPgConfCsv pins that the CSV's value is the one
+// in effect.
 void PgProductionProfileTest::CheckCboPlan(PGConn* conn) {
+  static constexpr auto kAnalyzedRowsPerIndexScan = "3";
   ASSERT_OK(conn->Execute("ANALYZE t"));
   const auto plan = ASSERT_RESULT(ExplainCboQuery(conn));
   LOG(INFO) << "Plan of " << kCboQuery << ":\n" << plan;
@@ -1450,10 +1461,24 @@ void PgProductionProfileTest::CheckCboPlan(PGConn* conn) {
   const std::vector<int32_t> expected_keys = {
       1, 2, 3, kNumRows - 3, kNumRows - 2, kNumRows - 1};
   ASSERT_EQ(keys, expected_keys) << "CBO plan: keys returned by " << kCboQuery;
+
+  const auto costed_plan = ASSERT_RESULT(ExplainText(conn, Format("EXPLAIN $0", kCboQuery)));
+  for (const auto& index : {kIndexA, kIndexB}) {
+    const std::regex estimate_re(Format(
+        R"(Bitmap Index Scan on $0 +\(cost=[0-9.]+\.\.[0-9.]+ rows=([0-9]+) )", index));
+    std::smatch match;
+    ASSERT_TRUE(std::regex_search(costed_plan, match, estimate_re))
+        << "CBO plan: no row estimate for the Bitmap Index Scan on " << index << " in:\n"
+        << costed_plan;
+    ASSERT_EQ(match[1].str(), kAnalyzedRowsPerIndexScan)
+        << "CBO plan: row estimate of the Bitmap Index Scan on " << index
+        << ", expected the ANALYZE statistics' estimate; another value means the CBO cost model "
+        << "is not planning:\n" << costed_plan;
+  }
 }
 
-// Pins the CSV's password_encryption=md5 and the hba md5 lines: an md5-stored password cannot
-// authenticate through a scram-sha-256 line.
+// Pins the CSV's password_encryption=md5 (the PG default is scram-sha-256) and the hba md5 lines:
+// an md5-stored password cannot authenticate through a scram-sha-256 line.
 void PgProductionProfileTest::CheckMd5Auth(PGConn* conn) {
   static constexpr auto kPassword = "alice-placeholder-password";
   ASSERT_OK(conn->ExecuteFormat("CREATE ROLE alice LOGIN PASSWORD '$0'", kPassword));
@@ -1482,8 +1507,10 @@ void PgProductionProfileTest::CheckScramAuth(PGConn* conn) {
   ASSERT_EQ(user, "bob");
 }
 
-// Pins track_activity_query_size (the default would cut the text at 1023 bytes) and
-// compute_query_id. An idle backend keeps reporting its last query and query id.
+// Pins track_activity_query_size (the default would cut the text at 1023 bytes). An idle backend
+// keeps reporting its last query and query id. The query id is a smoke check of compute_query_id:
+// it catches off, but the PG default auto computes ids too, because pg_stat_statements and ASH are
+// always loaded and ask for them; CheckPgConfCsv pins the CSV's value.
 void PgProductionProfileTest::CheckIdleQueryText(PGConn* conn) {
   static constexpr size_t kDefaultTrackActivityQuerySize = 1024;
   const auto query = "SELECT 1 /* " + std::string(5000, 'x') + " */";
@@ -1505,8 +1532,9 @@ void PgProductionProfileTest::CheckIdleQueryText(PGConn* conn) {
   ASSERT_TRUE(query_id.has_value()) << "Query text: pid " << pid << " has a NULL query_id";
 }
 
-// Pins --logtostderr=false (PG writes its own log files only then) and the CSV's log_filename,
-// log_file_mode, log_line_prefix and log_statement=ddl, against the CREATE TABLE above.
+// Pins the CSV's log_filename, log_file_mode, log_line_prefix and log_statement=ddl against the
+// CREATE TABLE above; each default would fail a check below. PG writes its own log files only while
+// --logtostderr is false, which is also the glog default, so CheckFlagReadback pins that line.
 void PgProductionProfileTest::CheckPgLogFiles() {
   const auto log_dir = ASSERT_RESULT(pg_ts->GetFlag("log_dir"));
   const auto log_filename = ASSERT_RESULT(PgConfCsvValue(tserver_profile_, "log_filename"));
@@ -1522,7 +1550,9 @@ void PgProductionProfileTest::CheckPgLogFiles() {
   const auto expected_mode = std::strtol(mode_text.c_str(), &mode_end, 8);
   ASSERT_TRUE(!mode_text.empty() && *mode_end == '\0')
       << "PG log files: log_file_mode '" << mode_text << "' is not an octal number";
-  const auto expected_line = Format("statement: $0", kCreateTableStatement);
+  // log_min_duration_statement also logs a slow statement, as "LOG:  duration: N ms  statement:
+  // ...". Matching from the message start keeps that line from standing in for log_statement.
+  const auto expected_line = Format("LOG:  statement: $0", kCreateTableStatement);
 
   std::vector<std::string> log_files;
   std::string waiting_for;
@@ -1568,8 +1598,9 @@ void PgProductionProfileTest::CheckPgLogFiles() {
   LOG(INFO) << "PG log files: " << JoinStrings(log_files, ", ");
 }
 
-// Pins --ysql_yb_enable_ash. Background samples of the tserver itself would satisfy an unfiltered
-// count, so only the sleeping backend's samples count.
+// ASH samples a PG backend, as --ysql_yb_enable_ash=true asks. That is also the flag's default,
+// so CheckFlagReadback pins the profile line. Background samples of the tserver itself would
+// satisfy an unfiltered count, so only the sleeping backend's samples count.
 void PgProductionProfileTest::CheckAsh(PGConn* conn) {
   auto sleeper = ASSERT_RESULT(ConnectAsSuperuserAgain());
   const auto pid = ASSERT_RESULT(sleeper.FetchRow<int32_t>("SELECT pg_backend_pid()"));
@@ -1591,10 +1622,12 @@ void PgProductionProfileTest::CheckAsh(PGConn* conn) {
   LOG(INFO) << "ASH: " << num_samples << " samples of pid " << pid;
 }
 
-// Pins the tserver/PG side of --ysql_yb_allow_replication_slot_lsn_types: walsender.c rejects an
-// LSN type in CREATE_REPLICATION_SLOT unless it is on. The master side (xrepl_catalog_manager.cc)
-// relies on AutoFlag promotion on a fresh cluster, because the master profile does not set the
-// flag; this is not a master profile check. The logical replication connection names a database,
+// Exercises the tserver/PG side of --ysql_yb_allow_replication_slot_lsn_types: walsender.c rejects
+// an LSN type in CREATE_REPLICATION_SLOT unless it is on. It is an AutoFlag, promoted on a fresh
+// cluster whatever the profile says, so this shows the effect without pinning the profile line;
+// CheckFlagReadback and CheckPgTaggedFlags pin it. The master side (xrepl_catalog_manager.cc) also
+// relies on AutoFlag promotion, because the master profile does not set the flag; this is not a
+// master profile check. The logical replication connection names a database,
 // so it also exercises the hba lines' "all" database match.
 void PgProductionProfileTest::CheckReplicationSlot(PGConn* conn) {
   static constexpr auto kSlotLsnTypeQuery =
@@ -1642,7 +1675,7 @@ void PgProductionProfileTest::CheckReplicationSlot(PGConn* conn) {
 
 // Boots the cluster with the profile (UpdateMiniClusterOptions passes the copies by --flagfile)
 // and checks that every flag took effect: gflag readback, PG GUC provenance and the hba rules,
-// then a smoke workload in which each check pins one observable effect of the profile.
+// then a smoke workload in which each check exercises one observable effect of the profile.
 TEST_F(PgProductionProfileTest, ClusterRunsProductionProfile) {
   ASSERT_NO_FATALS(CheckFlagReadback());
   ASSERT_NO_FATALS(CheckOtherDaemonOnlyFlags());
