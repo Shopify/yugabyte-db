@@ -69,6 +69,10 @@ namespace yb {
 
 class Cgroup;
 
+namespace consensus {
+class RaftAsyncWaitSweeper;
+}
+
 namespace tserver {
 class CatchUpServiceTest;
 class UpdateTransactionResponsePB;
@@ -192,6 +196,7 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
       ThreadPool* raft_pool,
       ThreadPool* snapshot_cleanup_pool,
       rpc::ThreadPool* raft_notifications_pool,
+      consensus::RaftAsyncWaitSweeper* raft_async_wait_sweeper,
       ThreadPool* tablet_prepare_pool,
       consensus::RetryableRequests* retryable_requests,
       std::shared_ptr<TabletBootstrapStateManager> bootstrap_state_manager,

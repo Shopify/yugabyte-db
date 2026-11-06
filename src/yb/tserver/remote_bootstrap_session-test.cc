@@ -155,6 +155,7 @@ void RemoteBootstrapSessionTest::SetUpTabletPeer() {
       raft_pool_.get(),
       raft_pool_.get() /* snapshot_cleanup_pool */,
       raft_notifications_pool_.get(),
+      nullptr /* raft_async_wait_sweeper */,
       tablet_prepare_pool_.get(),
       &retryable_requests,
       bootstrap_state_manager,

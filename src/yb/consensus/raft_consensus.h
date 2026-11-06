@@ -80,6 +80,7 @@ class ConsensusMetadata;
 class Peer;
 class PeerProxyFactory;
 class PeerManager;
+class RaftAsyncWaitSweeper;
 class ReplicaState;
 struct ElectionResult;
 
@@ -121,6 +122,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
     TableType table_type,
     ThreadPool* raft_pool,
     rpc::ThreadPool* raft_notifications_pool,
+    RaftAsyncWaitSweeper* raft_async_wait_sweeper,
     RetryableRequests* retryable_requests,
     MultiRaftManager* multi_raft_manager);
 
@@ -142,7 +144,8 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
     Callback<void(std::shared_ptr<StateChangeContext> context)> mark_dirty_clbk,
     TableType table_type,
     RetryableRequests* retryable_requests,
-    rpc::ThreadPool* raft_notifications_pool = nullptr);
+    rpc::ThreadPool* raft_notifications_pool = nullptr,
+    RaftAsyncWaitSweeper* raft_async_wait_sweeper = nullptr);
 
   virtual ~RaftConsensus() override;
 
@@ -186,9 +189,13 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // as Update() does (test hooks, update_mutex_, write stalls). Then, instead of parking the
   // thread in WaitForWrites(), it calls callback once with the status Update() would have
   // returned, after the durability wait and the post-durability steps (StartElection,
-  // POST_UPDATE). The callback runs on the calling thread when nothing needs to be waited for
-  // or the wait target is already durable, otherwise on raft_notifications_pool. response must
-  // stay valid until callback has been called; request is kept alive for as long as it is needed.
+  // POST_UPDATE). response must stay valid until callback has been called; request is kept alive
+  // for as long as it is needed. The callback runs on the calling thread when nothing needs to be
+  // waited for, when the wait target is already durable, or when the wait cannot be armed (the
+  // async wait sweeper is shut down). Otherwise it runs on raft_notifications_pool, except for a
+  // wait finished by a shutdown: then on the thread whose post to the closing pool runs the
+  // step's Done (a log thread, or a scheduler io thread for a tick), on a scheduler io thread at
+  // scheduler shutdown, or on the thread that shuts the sweeper down. See AsyncWriteWait.
   void UpdateAsync(
       std::shared_ptr<LWConsensusRequestPB> request, LWConsensusResponsePB* response,
       CoarseTimePoint deadline, UpdateCallback callback);
@@ -884,6 +891,12 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // Runs the durability waits of UpdateAsync(). Null for instances built directly by tests, which
   // then cannot use UpdateAsync().
   rpc::ThreadPool* const raft_notifications_pool_;
+
+  // Ticks the durability waits of UpdateAsync() that start with raft_async_wait_use_sweeper set.
+  // Owned by the server's tablet manager or sys catalog, like raft_notifications_pool_, and
+  // outlives every thread that can start or tick a wait. Null (per-wait timers) for instances
+  // built directly by tests.
+  RaftAsyncWaitSweeper* const raft_async_wait_sweeper_;
 
   CoarseTimePoint disable_pre_elections_until_ = CoarseTimePoint::min();
 

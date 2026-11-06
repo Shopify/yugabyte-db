@@ -95,6 +95,7 @@ class BackgroundTask;
 class XClusterSafeTimeTest;
 
 namespace consensus {
+class RaftAsyncWaitSweeper;
 class RaftConfigPB;
 } // namespace consensus
 
@@ -204,6 +205,9 @@ class TSTabletManager : public tserver::TabletPeerLookupIf, public tablet::Table
   TabletFlusher& tablet_flusher() const { return *tablet_flusher_; }
   rpc::ThreadPool* raft_notifications_pool() const {
     return raft_notifications_pool_.get();
+  }
+  consensus::RaftAsyncWaitSweeper* raft_async_wait_sweeper() const {
+    return raft_async_wait_sweeper_.get();
   }
   ThreadPool* read_pool() const { return read_pool_.get(); }
   ThreadPool* append_pool() const { return append_pool_.get(); }
@@ -906,6 +910,11 @@ class TSTabletManager : public tserver::TabletPeerLookupIf, public tablet::Table
 
   // Thread pool for Raft-related operations, shared between all tablets.
   std::unique_ptr<ThreadPool> raft_pool_;
+
+  // Ticks the durability waits that raft_notifications_pool_ runs, whose threads register with
+  // it, so it is declared before the pool and destroyed after it. Created in Init(), when the
+  // messenger exists, and shut down in StartShutdown().
+  std::shared_ptr<consensus::RaftAsyncWaitSweeper> raft_async_wait_sweeper_;
 
   // Thread pool for Raft replication callback operations.
   std::unique_ptr<rpc::ThreadPool> raft_notifications_pool_;

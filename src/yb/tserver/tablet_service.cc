@@ -3048,12 +3048,14 @@ CoarseTimePoint MultiRaftUpdateDeadline(CoarseTimePoint client_deadline) {
 // Slots are completed, and frames therefore sent, on: the handler thread (pre-dispatch failures,
 // and with multi_raft_update_inline_first the update it runs itself, when that completes without
 // waiting for the log); multi_raft_update pool threads; raft_notifications_pool (durability
-// waits); messenger scheduler threads (the envelope deadline, a durability-wait timer aborted at
-// shutdown); threads that shut a pool down (dropped tasks); and any thread whose enqueue onto a
-// closing pool runs the task's Done inline: the handler thread while it dispatches
-// (multi_raft_update pool), or a log thread that fires a durability waiter or closes the log, or a
-// scheduler thread that ticks a durability wait (raft_notifications_pool). None is a reactor
-// thread, where RespondPartial cannot keep frames in order.
+// waits); messenger scheduler threads (the envelope deadline, and a durability wait's timer or the
+// async wait sweeper's task run at scheduler shutdown); threads that shut a pool or the async wait
+// sweeper down (dropped tasks, pending waits); any thread whose enqueue onto a closing pool runs
+// the task's Done inline: the handler thread while it dispatches (multi_raft_update pool), or a
+// log thread that fires a durability waiter or closes the log, or a scheduler thread that ticks a
+// durability wait (raft_notifications_pool); and a thread whose durability wait finds the async
+// wait sweeper shut down: the thread that runs the update, or raft_notifications_pool for a tick.
+// None is a reactor thread, where RespondPartial cannot keep frames in order.
 //
 // A ready slot keeps the sub-request's own response, allocated for RaftConsensus::UpdateAsync,
 // which frames reference (push_back_ref). Frames are serialized before RespondPartial or

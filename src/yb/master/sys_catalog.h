@@ -67,6 +67,10 @@ class Schema;
 class FsManager;
 class ThreadPool;
 
+namespace consensus {
+class RaftAsyncWaitSweeper;
+}
+
 namespace tserver {
 class WriteRequestPB;
 class WriteResponsePB;
@@ -487,6 +491,11 @@ class SysCatalogTable {
 
   // Thread pool for Raft-related operations
   std::unique_ptr<ThreadPool> raft_pool_;
+
+  // Ticks the durability waits that raft_notifications_pool_ runs, whose threads register with
+  // it, so it is declared before the pool and destroyed after it. Created in SetupTabletPeer(),
+  // since Start() runs before the messenger exists, and shut down in StartShutdown().
+  std::shared_ptr<consensus::RaftAsyncWaitSweeper> raft_async_wait_sweeper_;
 
   // Thread pool for callbacks on Raft replication events.
   std::unique_ptr<rpc::ThreadPool> raft_notifications_pool_;

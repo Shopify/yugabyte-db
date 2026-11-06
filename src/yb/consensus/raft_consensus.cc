@@ -48,6 +48,7 @@
 #include "yb/consensus/opid_util.h"
 #include "yb/consensus/peer_manager.h"
 #include "yb/consensus/quorum_util.h"
+#include "yb/consensus/raft_async_wait_sweeper.h"
 #include "yb/consensus/replica_state.h"
 #include "yb/consensus/state_change_context.h"
 
@@ -305,6 +306,13 @@ DEFINE_RUNTIME_bool(enable_wal_sync_on_consensus_update, true,
     "them, so a committed entry can have exactly one bounded copy while the leader's stays "
     "unsynced. The leader's own WAL, RF=1, and a partitioned node get no bound from this flag.");
 
+DEFINE_RUNTIME_bool(raft_async_wait_use_sweeper, false,
+    "Tick the pending asynchronous log-durability waits of Raft requests processed concurrently "
+    "(enable_multi_raft_data_batching) from one timer per server instead of a timer per wait. "
+    "The ticks keep the same cadence and effect. Read when a wait starts; a wait keeps the "
+    "mechanism it started with. Turning it off is the kill switch.");
+TAG_FLAG(raft_async_wait_use_sweeper, advanced);
+
 namespace yb::consensus {
 
 using rpc::PeriodicTimer;
@@ -396,6 +404,7 @@ shared_ptr<RaftConsensus> RaftConsensus::Create(
     TableType table_type,
     ThreadPool* raft_pool,
     rpc::ThreadPool* raft_notifications_pool,
+    RaftAsyncWaitSweeper* raft_async_wait_sweeper,
     RetryableRequests* retryable_requests,
     MultiRaftManager* multi_raft_manager) {
 
@@ -452,7 +461,8 @@ shared_ptr<RaftConsensus> RaftConsensus::Create(
       mark_dirty_clbk,
       table_type,
       retryable_requests,
-      raft_notifications_pool);
+      raft_notifications_pool,
+      raft_async_wait_sweeper);
 }
 
 RaftConsensus::RaftConsensus(
@@ -466,7 +476,7 @@ RaftConsensus::RaftConsensus(
     const scoped_refptr<log::Log>& log, shared_ptr<MemTracker> parent_mem_tracker,
     Callback<void(std::shared_ptr<StateChangeContext> context)> mark_dirty_clbk,
     TableType table_type, RetryableRequests* retryable_requests,
-    rpc::ThreadPool* raft_notifications_pool)
+    rpc::ThreadPool* raft_notifications_pool, RaftAsyncWaitSweeper* raft_async_wait_sweeper)
     : raft_pool_concurrent_token_(std::move(raft_pool_concurrent_token)),
       log_(log),
       clock_(clock),
@@ -492,6 +502,7 @@ RaftConsensus::RaftConsensus(
       update_raft_config_dns_latency_(
           METRIC_dns_resolve_latency_during_update_raft_config.Instantiate(table_metric_entity)),
       raft_notifications_pool_(raft_notifications_pool),
+      raft_async_wait_sweeper_(raft_async_wait_sweeper),
       split_parent_tablet_id_(
           cmeta->has_split_parent_tablet_id() ? cmeta->split_parent_tablet_id() : ""),
       clone_source_info_(cmeta->clone_source_info()) {
@@ -1684,15 +1695,31 @@ Status RaftConsensus::Update(
 
 // Asynchronous form of the tail of Update(): WaitForWrites() then FinishUpdate(), without a thread
 // parked in between. Completion comes from whichever happens first: the log reports
-// wait_for_op_id durable (AddSafeOpIdWaiter), or a tick of the timer that replaces
-// WaitForWrites()'s loop. A tick runs that loop's body once (WriteNotYetDurable), so the deadline,
-// the term check, and the failure-detector snooze and vote withholding while the append is pending
-// keep WaitForWrites()'s order and raft_heartbeat_interval_ms cadence. The log callback and the
-// timer only re-post to raft_notifications_pool: neither the log thread nor the scheduler thread
-// runs consensus work. If the pool rejects the post (it is shutting down), the wait fails on that
-// thread, and the caller's callback runs there with the error. Holds the RaftConsensus alive until
-// completion.
-class RaftConsensus::AsyncWriteWait : public std::enable_shared_from_this<AsyncWriteWait> {
+// wait_for_op_id durable (AddSafeOpIdWaiter), or a tick that replaces WaitForWrites()'s loop. A
+// tick runs that loop's body once (WriteNotYetDurable), so the deadline, the term check, and the
+// failure-detector snooze and vote withholding while the append is pending keep WaitForWrites()'s
+// order and raft_heartbeat_interval_ms cadence.
+//
+// Ticks come from one of two sources, fixed when the wait starts: a messenger-scheduler timer per
+// wait, or, with raft_async_wait_use_sweeper and a sweeper, an entry in the server's
+// RaftAsyncWaitSweeper. The sweeper serves every wait from one scheduler task, which saves a
+// Schedule and an Abort per tick on the io threads that also run the multi-Raft batcher's flush
+// and pacing timers. Both sources are armed with the same delay and post the same Tick, so the
+// cadence and the side effects (WriteNotYetDurable) are the same; Finish aborts the timer or
+// removes the entry. While a wait is idle, the timer's capture or the sweeper entry is its only
+// strong reference, and the wait holds the RaftConsensus alive until it completes.
+//
+// The log callback and a tick only post to raft_notifications_pool, so neither the log thread nor
+// the scheduler thread runs consensus work, with these exceptions, where Finish and the caller's
+// callback run on the thread named. A post the closing pool rejects or drops runs Step's Done on
+// the posting thread (a log thread that fires a waiter or closes the log, a scheduler io thread
+// for a tick) or the thread that shuts the pool down. A scheduler shutdown with the wait's timer,
+// or the sweeper's, armed finishes the wait on a scheduler io thread. Sweeper shutdown finishes it
+// on the thread that shuts the sweeper down. A registration that finds the sweeper shut down
+// finishes it on the registering thread: the caller of UpdateAsync, or a raft_notifications_pool
+// thread running Tick.
+class RaftConsensus::AsyncWriteWait : public std::enable_shared_from_this<AsyncWriteWait>,
+                                      public RaftAsyncWaitSweeper::Entry {
  public:
   AsyncWriteWait(
       std::shared_ptr<RaftConsensus> consensus, std::shared_ptr<LWConsensusRequestPB> request,
@@ -1704,9 +1731,12 @@ class RaftConsensus::AsyncWriteWait : public std::enable_shared_from_this<AsyncW
     // As in WaitForWrites(), durability is checked at least once even if the deadline has already
     // passed: AddSafeOpIdWaiter() returns 0 for an already-durable target.
     Status status;
+    Status tick_status;
     bool durable = false;
     {
       std::lock_guard lock(mutex_);
+      use_sweeper_ = FLAGS_raft_async_wait_use_sweeper &&
+                     consensus_->raft_async_wait_sweeper_ != nullptr;
       std::weak_ptr<AsyncWriteWait> weak_self = shared_from_this();
       auto waiter_id = consensus_->log_->AddSafeOpIdWaiter(
           result_.wait_for_op_id, [weak_self](const Status& status) {
@@ -1722,14 +1752,25 @@ class RaftConsensus::AsyncWriteWait : public std::enable_shared_from_this<AsyncW
         durable = true;
       } else {
         log_waiter_id_ = *waiter_id;
-        ScheduleTickUnlocked(CoarseMonoClock::Now());
+        tick_status = ScheduleTickUnlocked(CoarseMonoClock::Now());
       }
     }
     if (durable) {
       Complete(Status::OK());
     } else if (!status.ok()) {
       Complete(status);
+    } else if (!tick_status.ok()) {
+      Finish(tick_status);
     }
+  }
+
+  void OnDue() override {
+    auto self = shared_from_this();
+    Post([self] { self->Tick(); });
+  }
+
+  void OnShutdown(const Status& status) override {
+    Finish(status);
   }
 
  private:
@@ -1767,9 +1808,16 @@ class RaftConsensus::AsyncWriteWait : public std::enable_shared_from_this<AsyncW
     consensus_->raft_notifications_pool_->Enqueue(new Step(shared_from_this(), std::move(f)));
   }
 
-  void ScheduleTickUnlocked(CoarseTimePoint now) REQUIRES(mutex_) {
+  // Arms the next tick. Returns the sweeper's shutdown status if it is shut down, which the caller
+  // passes to Finish() after releasing mutex_.
+  Status ScheduleTickUnlocked(CoarseTimePoint now) REQUIRES(mutex_) {
     auto delay = std::clamp<CoarseDuration>(
         deadline_ - now, CoarseDuration::zero(), FLAGS_raft_heartbeat_interval_ms * 1ms);
+    if (use_sweeper_) {
+      sweeper_handle_ = VERIFY_RESULT(
+          consensus_->raft_async_wait_sweeper_->Register(shared_from_this(), delay));
+      return Status::OK();
+    }
     auto self = shared_from_this();
     timer_id_ = consensus_->peer_proxy_factory_->messenger()->scheduler().Schedule(
         [self](const Status& status) {
@@ -1781,6 +1829,7 @@ class RaftConsensus::AsyncWriteWait : public std::enable_shared_from_this<AsyncW
           self->Post([self] { self->Tick(); });
         },
         delay);
+    return Status::OK();
   }
 
   void Tick() {
@@ -1790,6 +1839,7 @@ class RaftConsensus::AsyncWriteWait : public std::enable_shared_from_this<AsyncW
         return;
       }
       timer_id_ = rpc::kInvalidTaskId;
+      sweeper_handle_ = {};
     }
     auto now = CoarseMonoClock::Now();
     if (consensus_->log_->IsSafeOpIdToApply(result_.wait_for_op_id)) {
@@ -1807,15 +1857,21 @@ class RaftConsensus::AsyncWriteWait : public std::enable_shared_from_this<AsyncW
       Finish(status);
       return;
     }
-    std::lock_guard lock(mutex_);
-    if (!finished_) {
-      ScheduleTickUnlocked(now);
+    {
+      std::lock_guard lock(mutex_);
+      if (!finished_) {
+        status = ScheduleTickUnlocked(now);
+      }
+    }
+    if (!status.ok()) {
+      Finish(status);
     }
   }
 
   // Completes the wait with status unless it has already completed.
   void Finish(const Status& status) {
     rpc::ScheduledTaskId timer_id;
+    RaftAsyncWaitSweeper::Handle sweeper_handle;
     uint64_t log_waiter_id;
     {
       std::lock_guard lock(mutex_);
@@ -1824,10 +1880,16 @@ class RaftConsensus::AsyncWriteWait : public std::enable_shared_from_this<AsyncW
       }
       finished_ = true;
       timer_id = std::exchange(timer_id_, rpc::kInvalidTaskId);
+      sweeper_handle = std::exchange(sweeper_handle_, {});
       log_waiter_id = std::exchange(log_waiter_id_, 0);
     }
     if (timer_id != rpc::kInvalidTaskId) {
       consensus_->peer_proxy_factory_->messenger()->scheduler().Abort(timer_id);
+    }
+    // The entry may already have left the sweeper (fired or shut down); Remove ignores it then.
+    // The caller holds a reference to this wait, so the entry's is never the last one here.
+    if (sweeper_handle.id != 0) {
+      consensus_->raft_async_wait_sweeper_->Remove(sweeper_handle);
     }
     if (log_waiter_id != 0) {
       consensus_->log_->RemoveSafeOpIdWaiter(log_waiter_id);
@@ -1852,7 +1914,11 @@ class RaftConsensus::AsyncWriteWait : public std::enable_shared_from_this<AsyncW
 
   std::mutex mutex_;
   bool finished_ GUARDED_BY(mutex_) = false;
+  // Set once, in Start().
+  bool use_sweeper_ GUARDED_BY(mutex_) = false;
+  // The armed tick: timer_id_ for a per-wait timer, sweeper_handle_ for the sweeper.
   rpc::ScheduledTaskId timer_id_ GUARDED_BY(mutex_) = rpc::kInvalidTaskId;
+  RaftAsyncWaitSweeper::Handle sweeper_handle_ GUARDED_BY(mutex_);
   uint64_t log_waiter_id_ GUARDED_BY(mutex_) = 0;
 };
 

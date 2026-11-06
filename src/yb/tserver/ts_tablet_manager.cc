@@ -65,6 +65,7 @@
 #include "yb/consensus/multi_raft_batcher.h"
 #include "yb/consensus/opid_util.h"
 #include "yb/consensus/quorum_util.h"
+#include "yb/consensus/raft_async_wait_sweeper.h"
 #include "yb/consensus/raft_consensus.h"
 #include "yb/consensus/retryable_requests.h"
 #include "yb/consensus/state_change_context.h"
@@ -853,6 +854,8 @@ Status TSTabletManager::Init() {
                                                                       &server_->proxy_cache(),
                                                                       local_peer_pb_.cloud_info(),
                                                                       server_->metric_entity());
+  raft_async_wait_sweeper_ = std::make_shared<consensus::RaftAsyncWaitSweeper>(
+      &server_->messenger()->scheduler());
 
   if (FLAGS_enable_wait_queues && !PREDICT_FALSE(FLAGS_disable_deadlock_detection)) {
     waiting_txn_registry_ = std::make_unique<docdb::LocalWaitingTxnRegistry>(
@@ -2814,6 +2817,7 @@ void TSTabletManager::OpenTablet(
         raft_pool(),
         snapshot_cleanup_pool(),
         raft_notifications_pool(),
+        raft_async_wait_sweeper_.get(),
         tablet_prepare_pool(),
         &retryable_requests,
         bootstrap_state_manager,
@@ -3043,6 +3047,13 @@ void TSTabletManager::StartShutdown() {
   }
 
   multi_raft_manager_->StartShutdown();
+
+  // Before the messenger's scheduler shuts down. Finishes every pending wait, which releases its
+  // RaftConsensus. A wait that starts later (the multi_raft_update pool runs until the services
+  // shut down) finishes at once with the same status.
+  if (raft_async_wait_sweeper_) {
+    raft_async_wait_sweeper_->Shutdown(consensus::RaftAsyncWaitSweeper::ShutdownStatus());
+  }
 
   if (waiting_txn_registry_) {
     waiting_txn_registry_->StartShutdown();

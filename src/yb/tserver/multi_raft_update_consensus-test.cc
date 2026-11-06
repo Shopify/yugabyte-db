@@ -36,6 +36,7 @@
 #include "yb/consensus/log.h"
 #include "yb/consensus/metadata.pb.h"
 #include "yb/consensus/multi_raft_batcher.h"
+#include "yb/consensus/raft_async_wait_sweeper.h"
 #include "yb/consensus/raft_consensus.h"
 #include "yb/consensus/replicate_msgs_holder.h"
 
@@ -88,6 +89,7 @@ DECLARE_uint64(multi_raft_heartbeat_interval_ms);
 DECLARE_uint32(multi_raft_rpc_timeout_ms);
 DECLARE_bool(multi_raft_update_inline_first);
 DECLARE_int32(multi_raft_update_max_threads);
+DECLARE_bool(raft_async_wait_use_sweeper);
 DECLARE_int32(raft_heartbeat_interval_ms);
 DECLARE_bool(TEST_multi_raft_update_fail_partial_frames);
 DECLARE_bool(use_preelection);
@@ -775,6 +777,29 @@ class MultiRaftUpdateConsensusTest : public TabletServerTestBase {
     ASSERT_STR_CONTAINS(names[0], thread);
   }
 
+  consensus::RaftAsyncWaitSweeper& Sweeper() {
+    return *mini_server_->server()->tablet_manager()->raft_async_wait_sweeper();
+  }
+
+  uint64_t SweeperRegistrations() {
+    return Sweeper().TEST_counters().registered;
+  }
+
+  // Asserts that durability waits registered with the sweeper since registered_before, at least
+  // min_registrations times, exactly when raft_async_wait_use_sweeper is set, so that a run with
+  // it set is not vacuous. A wait registers right after it adds its log waiter.
+  void AssertSweeperUse(uint64_t registered_before, uint64_t min_registrations = 1) {
+    if (FLAGS_raft_async_wait_use_sweeper) {
+      ASSERT_OK(WaitFor(
+          [this, registered_before, min_registrations] {
+            return SweeperRegistrations() >= registered_before + min_registrations;
+          },
+          5s, "Waits registered with the sweeper"));
+    } else {
+      ASSERT_EQ(SweeperRegistrations(), registered_before);
+    }
+  }
+
   scoped_refptr<EventStats> ServerStats(const EventStatsPrototype& prototype) {
     return prototype.Instantiate(mini_server_->server()->metric_entity());
   }
@@ -1033,9 +1058,11 @@ TEST_F(MultiRaftUpdateConsensusTest, ShutdownWhileWaitingForLog) {
   ASSERT_NO_FATALS(StartServer(2));
   auto& shut_down = tablets_[0];
   SetSlowDisk(shut_down, 3s);
+  const auto registered_before = SweeperRegistrations();
   auto envelope = SendAsync({Data(&shut_down, 1, false), Data(&tablets_[1], 1, true)});
   ASSERT_OK(WaitForLastReceived(shut_down));
   ASSERT_FALSE(envelope->finished());
+  ASSERT_NO_FATALS(AssertSweeperUse(registered_before));
 
   TestThreadHolder thread_holder;
   thread_holder.AddThreadFunctor([peer = shut_down.peer] {
@@ -1057,9 +1084,11 @@ TEST_F(MultiRaftUpdateConsensusTest, NotificationPoolShutdownCompletesWait) {
   ASSERT_NO_FATALS(StartServer(1));
   auto& tablet = tablets_[0];
   SetSlowDisk(tablet, 1s);
+  const auto registered_before = SweeperRegistrations();
   auto envelope = SendAsync({Data(&tablet, 1, false)});
   ASSERT_OK(WaitForLastReceived(tablet));
   ASSERT_FALSE(envelope->finished());
+  ASSERT_NO_FATALS(AssertSweeperUse(registered_before));
   mini_server_->server()->tablet_manager()->raft_notifications_pool()->Shutdown();
   ASSERT_OK(Wait(envelope.get()));
   ASSERT_LT(envelope->elapsed(), 5s);
@@ -1163,9 +1192,11 @@ TEST_F(MultiRaftUpdateConsensusTest, DurabilityWaitEndsAtDeadline) {
   auto& tablet = tablets_[0];
   auto* log = tablet.peer->log();
   SetSlowDisk(tablet, 10s);
+  const auto registered_before = SweeperRegistrations();
   auto envelope = SendAsync({Data(&tablet, 1, false)}, 3s);
   ASSERT_OK(WaitFor(
       [log] { return log->TEST_num_safe_op_id_waiters() == 1; }, 2s, "Waiting for the log"));
+  ASSERT_NO_FATALS(AssertSweeperUse(registered_before));
   ASSERT_OK(Wait(envelope.get()));
   ASSERT_NO_FATALS(AssertSlotError(envelope->resp.consensus_response(0), AppStatusPB::TIMED_OUT));
   ASSERT_OK(WaitFor(
@@ -1225,8 +1256,10 @@ TEST_F(MultiRaftUpdateConsensusTest, DistinctTabletsOverlap) {
     SetSlowDisk(tablet, kDiskDelay);
     requests.push_back(Data(&tablet, 1, false));
   }
+  const auto registered_before = SweeperRegistrations();
   auto envelope = SendAsync(std::move(requests));
   ASSERT_OK(Wait(envelope.get()));
+  ASSERT_NO_FATALS(AssertSweeperUse(registered_before));
   for (size_t i = 0; i != tablets_.size(); ++i) {
     ASSERT_NO_FATALS(AssertSlotOk(
         envelope->resp.consensus_response(narrow_cast<int>(i)), tablets_[i].last));
@@ -1275,9 +1308,12 @@ TEST_F(MultiRaftUpdateConsensusTest, SlowLogNoElection) {
 
   constexpr auto kDiskDelay = 2500ms;
   SetSlowDisk(tablet, kDiskDelay);
+  const auto registered_before = SweeperRegistrations();
   auto envelope = SendAsync({Data(&tablet, 1, false)});
   SleepFor(1200ms);
   ASSERT_FALSE(envelope->finished());
+  // With the sweeper, the wait has re-registered on every tick so far.
+  ASSERT_NO_FATALS(AssertSweeperUse(registered_before, /* min_registrations= */ 5));
   auto vote = ASSERT_RESULT(RequestVote(MakeVoteRequest(tablet, 3, false)));
   ASSERT_FALSE(vote.vote_granted()) << vote.ShortDebugString();
   ASSERT_EQ(vote.consensus_error().code(), consensus::ConsensusErrorPB::LEADER_IS_ALIVE)
@@ -1295,8 +1331,10 @@ TEST_F(MultiRaftUpdateConsensusTest, TermChangeWhileWaitingForLog) {
   ASSERT_NO_FATALS(StartServer(1));
   auto& tablet = tablets_[0];
   SetSlowDisk(tablet, 3s);
+  const auto registered_before = SweeperRegistrations();
   auto envelope = SendAsync({Data(&tablet, 1, false)});
   ASSERT_OK(WaitForLastReceived(tablet));
+  ASSERT_NO_FATALS(AssertSweeperUse(registered_before));
 
   auto vote = ASSERT_RESULT(RequestVote(MakeVoteRequest(tablet, 2, true)));
   ASSERT_TRUE(vote.vote_granted()) << vote.ShortDebugString();
@@ -1364,6 +1402,7 @@ TEST_F(MultiRaftUpdateConsensusTest, PostDurabilityStepsAfterDurability) {
   consensus->SetFaultHooks(hooks);
   constexpr auto kDiskDelay = 1s;
   SetSlowDisk(tablet, kDiskDelay);
+  const auto registered_before = SweeperRegistrations();
   auto envelope = SendAsync({request});
   ASSERT_OK(WaitFor(
       [&consensus, &tablet] { return consensus->GetLastCommittedOpId() == tablet.last; }, 10s,
@@ -1376,6 +1415,7 @@ TEST_F(MultiRaftUpdateConsensusTest, PostDurabilityStepsAfterDurability) {
   // Had the election started before durability, the term change would have failed the wait.
   ASSERT_NO_FATALS(AssertSlotOk(envelope->resp.consensus_response(0), tablet.last));
   ASSERT_EQ(hooks->durable_at_post_update(), std::vector<bool>{true});
+  ASSERT_NO_FATALS(AssertSweeperUse(registered_before));
   // Not on the log appender thread, which runs group commit for every tablet of the log.
   auto thread_names = hooks->thread_names();
   ASSERT_EQ(thread_names.size(), 1);
@@ -1420,8 +1460,10 @@ TEST_F(MultiRaftUpdateConsensusTest, HeartbeatWaitBoundedByInterval) {
   auto& tablet = tablets_[0];
   constexpr auto kDiskDelay = 3s;
   SetSlowDisk(tablet, kDiskDelay);
+  const auto registered_before = SweeperRegistrations();
   auto data = SendAsync({Data(&tablet, 1, false)});
   ASSERT_OK(WaitForLastReceived(tablet));
+  ASSERT_NO_FATALS(AssertSweeperUse(registered_before));
 
   // The heartbeat waits for last_received, which is the data op that is not durable yet.
   auto heartbeat = SendAsync({Heartbeat(tablet)}, 60s);
@@ -2552,6 +2594,144 @@ TEST_F(MultiRaftUpdateConsensusTest, InlineFirstOffUnchanged) {
     ASSERT_NO_FATALS(AssertUpdateThread(&threads, tablets_[i], kPoolThread));
   }
   ASSERT_EQ(InlineSubRequests(), inline_before);
+}
+
+// With the sweeper, many concurrent durability waits share one scheduler task: the sweeper arms
+// far fewer tasks than the waits register ticks, and at most one at a time (two while an aborted
+// one has not run yet). A timer per wait would keep one task armed per pending wait.
+TEST_F(MultiRaftUpdateConsensusTest, SweeperOneTimerForManyWaits) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_raft_async_wait_use_sweeper) = true;
+  constexpr size_t kNumWaits = 8;
+  ASSERT_NO_FATALS(StartServer(kNumWaits));
+  constexpr auto kDiskDelay = 1s;
+  std::vector<ConsensusRequestPB> requests;
+  for (auto& tablet : tablets_) {
+    SetSlowDisk(tablet, kDiskDelay);
+    requests.push_back(Data(&tablet, 1, false));
+  }
+  const auto before = Sweeper().TEST_counters();
+  auto envelope = SendAsync(std::move(requests));
+  ASSERT_OK(Wait(envelope.get()));
+  for (size_t i = 0; i != tablets_.size(); ++i) {
+    ASSERT_NO_FATALS(AssertSlotOk(
+        envelope->resp.consensus_response(narrow_cast<int>(i)), tablets_[i].last));
+  }
+  ASSERT_EQ(Sweeper().TEST_num_pending(), 0);
+  const auto after = Sweeper().TEST_counters();
+  const auto registered = after.registered - before.registered;
+  const auto scheduled = after.scheduled - before.scheduled;
+  const auto aborted = after.aborted - before.aborted;
+  const auto expiries = after.expiries - before.expiries;
+  const auto due = after.due - before.due;
+  LOG(INFO) << "Sweeper for " << kNumWaits << " waits of " << AsString(kDiskDelay)
+            << ": registered " << registered << ", scheduled " << scheduled << ", aborted "
+            << aborted << ", expiries " << expiries << ", due " << due
+            << ", max outstanding " << after.max_outstanding;
+  // Every wait registered once at its start and once per tick (heartbeat interval 100 ms).
+  ASSERT_GE(registered, kNumWaits * 5);
+  ASSERT_LE(scheduled * 4, registered);
+  ASSERT_LE(after.max_outstanding, 2);
+}
+
+// Sweeper shutdown at tablet manager shutdown finishes the pending waits, so each sub-request is
+// answered with the abort status at once, not at the deadline or when the log catches up.
+TEST_F(MultiRaftUpdateConsensusTest, SweeperShutdownFailsPendingWaits) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_raft_async_wait_use_sweeper) = true;
+  ASSERT_NO_FATALS(StartServer(3));
+  // No tick before the shutdown, so that only the shutdown can finish the waits.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_raft_heartbeat_interval_ms) = 20000;
+  constexpr auto kDiskDelay = 5s;
+  std::vector<ConsensusRequestPB> requests;
+  for (auto& tablet : tablets_) {
+    SetSlowDisk(tablet, kDiskDelay);
+    requests.push_back(Data(&tablet, 1, false));
+  }
+  auto envelope = SendAsync(std::move(requests), 60s);
+  ASSERT_OK(WaitFor(
+      [this] { return Sweeper().TEST_num_pending() == tablets_.size(); }, 10s,
+      "Every wait pending in the sweeper"));
+  ASSERT_FALSE(envelope->finished());
+  const auto shutdown_start = MonoTime::Now();
+  mini_server_->server()->tablet_manager()->StartShutdown();
+  ASSERT_OK(Wait(envelope.get()));
+  LOG(INFO) << "Answered " << MonoTime::Now() - shutdown_start << " after the shutdown started";
+  ASSERT_LT(envelope->elapsed(), kDiskDelay - 2s);
+  for (int i = 0; i != envelope->resp.consensus_response_size(); ++i) {
+    const auto& slot = envelope->resp.consensus_response(i);
+    ASSERT_NO_FATALS(AssertSlotError(slot, AppStatusPB::ABORTED));
+    ASSERT_STR_CONTAINS(slot.error().status().message(), "Scheduler is shutting down");
+  }
+  ASSERT_EQ(Sweeper().TEST_num_pending(), 0);
+}
+
+// A durability wait that starts after the sweeper shut down finishes at once with the shutdown
+// status and leaves nothing behind, whether it starts on a pool thread or inline on the handler
+// thread.
+TEST_F(MultiRaftUpdateConsensusTest, SweeperRegisterAfterShutdown) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_raft_async_wait_use_sweeper) = true;
+  ASSERT_NO_FATALS(StartServer(1));
+  auto& tablet = tablets_[0];
+  auto* log = tablet.peer->log();
+  Sweeper().Shutdown(consensus::RaftAsyncWaitSweeper::ShutdownStatus());
+  SetSlowDisk(tablet, 3s);
+  for (bool inline_first : {false, true}) {
+    SCOPED_TRACE(Format("inline first: $0", inline_first));
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_update_inline_first) = inline_first;
+    const auto inline_before = InlineSubRequests();
+    auto envelope = SendAsync({Data(&tablet, 1, false)});
+    ASSERT_OK(Wait(envelope.get()));
+    ASSERT_LT(envelope->elapsed(), 2s);
+    const auto& slot = envelope->resp.consensus_response(0);
+    ASSERT_NO_FATALS(AssertSlotError(slot, AppStatusPB::ABORTED));
+    ASSERT_STR_CONTAINS(slot.error().status().message(), "Scheduler is shutting down");
+    ASSERT_EQ(InlineSubRequests() - inline_before, inline_first ? 1 : 0);
+    // The log waiter was removed, and the sweeper kept nothing.
+    ASSERT_EQ(log->TEST_num_safe_op_id_waiters(), 0);
+    ASSERT_EQ(Sweeper().TEST_num_pending(), 0);
+  }
+  ASSERT_EQ(Sweeper().TEST_counters().registered, 0);
+  SetSlowDisk(tablet, 0s);
+}
+
+// A wait keeps the tick source it started with when raft_async_wait_use_sweeper changes, in both
+// directions, and both waits complete.
+TEST_F(MultiRaftUpdateConsensusTest, SweeperFlagFlipMidWait) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_raft_async_wait_use_sweeper) = false;
+  ASSERT_NO_FATALS(StartServer(2));
+  auto& timer_tablet = tablets_[0];
+  auto& sweeper_tablet = tablets_[1];
+  constexpr auto kDiskDelay = 2s;
+  SetSlowDisk(timer_tablet, kDiskDelay);
+  SetSlowDisk(sweeper_tablet, kDiskDelay);
+
+  auto timer_wait = SendAsync({Data(&timer_tablet, 1, false)});
+  ASSERT_OK(WaitFor(
+      [log = timer_tablet.peer->log()] { return log->TEST_num_safe_op_id_waiters() == 1; }, 2s,
+      "Timer wait started"));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_raft_async_wait_use_sweeper) = true;
+  // Several ticks of the first wait, none through the sweeper.
+  SleepFor(400ms);
+  ASSERT_FALSE(timer_wait->finished());
+  ASSERT_EQ(SweeperRegistrations(), 0);
+
+  auto sweeper_wait = SendAsync({Data(&sweeper_tablet, 1, false)});
+  ASSERT_OK(WaitFor(
+      [this] { return SweeperRegistrations() >= 1; }, 2s, "Sweeper wait started"));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_raft_async_wait_use_sweeper) = false;
+  const auto registered = SweeperRegistrations();
+  // The second wait keeps ticking through the sweeper.
+  SleepFor(400ms);
+  ASSERT_FALSE(sweeper_wait->finished());
+  ASSERT_GE(SweeperRegistrations(), registered + 2);
+  ASSERT_LE(Sweeper().TEST_num_pending(), 1);
+
+  ASSERT_OK(Wait(timer_wait.get()));
+  ASSERT_OK(Wait(sweeper_wait.get()));
+  ASSERT_NO_FATALS(AssertSlotOk(timer_wait->resp.consensus_response(0), timer_tablet.last));
+  ASSERT_NO_FATALS(AssertSlotOk(sweeper_wait->resp.consensus_response(0), sweeper_tablet.last));
+  ASSERT_GE(timer_wait->elapsed(), kDiskDelay - 500ms);
+  ASSERT_GE(sweeper_wait->elapsed(), kDiskDelay - 500ms);
+  ASSERT_EQ(Sweeper().TEST_num_pending(), 0);
 }
 
 // The multi_raft_update pool runs in the cgroup of the messenger's high-priority pool, where the
