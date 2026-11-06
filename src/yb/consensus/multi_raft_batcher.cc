@@ -188,8 +188,9 @@ METRIC_DEFINE_event_stats(server, multi_raft_data_add_to_send_us,
     "being sent are not recorded.");
 METRIC_DEFINE_counter(server, multi_raft_frames_received,
     "Multi-Raft Response Frames Received", yb::MetricUnit::kMessages,
-    "Response frames, partial and final, received for MultiRaftUpdateConsensus RPCs sent with "
-    "enable_multi_raft_streaming_responses. A failed RPC has no final frame.");
+    "Response frames, partial and final, received for MultiRaftUpdateConsensus RPCs whose "
+    "responses were streamed: those carrying data requests, sent while "
+    "enable_multi_raft_streaming_responses was on. A failed RPC has no final frame.");
 METRIC_DEFINE_event_stats(server, multi_raft_frame_slots,
     "Multi-Raft Response Frame Slots", yb::MetricUnit::kRequests,
     "Number of Raft request responses in each response frame counted by "

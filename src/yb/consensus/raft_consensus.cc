@@ -309,8 +309,9 @@ DEFINE_RUNTIME_bool(enable_wal_sync_on_consensus_update, true,
 DEFINE_RUNTIME_bool(raft_async_wait_use_sweeper, false,
     "Tick the pending asynchronous log-durability waits of Raft requests processed concurrently "
     "(enable_multi_raft_data_batching) from one timer per server instead of a timer per wait. "
-    "The ticks keep the same cadence and effect. Read when a wait starts; a wait keeps the "
-    "mechanism it started with. Turning it off is the kill switch.");
+    "The ticks have the same effect at the same cadence, except that ticks due within 2 ms of "
+    "each other run together, so one can come up to 2 ms early. Read when a wait starts; a wait "
+    "keeps the mechanism it started with. Turning it off is the kill switch.");
 TAG_FLAG(raft_async_wait_use_sweeper, advanced);
 
 namespace yb::consensus {
