@@ -878,8 +878,11 @@ class MultiRaftUpdateConsensusTest : public TabletServerTestBase {
       ASSERT_FALSE(response->has_error()) << response->ShortDebugString();
       direct_done->store(true);
     });
-    // UpdateReplica has run once the op is received; the sleep under the mutex follows at once.
+    // UpdateReplica has run once the op is received; the sleep under the mutex follows at once,
+    // after the delay is read. Margin for a loaded host, where clearing the delay right away could
+    // win that read.
     ASSERT_OK(WaitForLastReceived(*tablet));
+    SleepFor(100ms * kTimeMultiplier);
     consensus->TEST_DelayUpdate(MonoDelta::kZero);
   }
 

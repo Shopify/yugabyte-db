@@ -10,6 +10,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -294,18 +295,26 @@ TEST_F(RaftAsyncWaitSweeperTest, CoalescingWindow) {
   ASSERT_EQ(Counters().scheduled, 2);
 }
 
-// Sub-millisecond delays fire in order and, without a coalescing window, not before they are due.
+// Sub-millisecond delays fire in due order and, without a coalescing window, not before they are
+// due. Registered in reverse order of their delays, so most of them become the new earliest.
 TEST_F(RaftAsyncWaitSweeperTest, SubMillisecondDelaysInOrder) {
   CreateSweeper(0s);
-  const auto start = Clock::now();
+  std::vector<std::pair<Clock::time_point, int>> due;
   for (int i = 9; i != 0; --i) {
-    ASSERT_OK(Register(i, i * 100us));
+    auto handle = ASSERT_RESULT(Register(i, i * 100us));
+    due.emplace_back(handle.due, i);
+  }
+  // Registration takes time too, so the due order is not necessarily 1..9.
+  std::sort(due.begin(), due.end());
+  std::vector<int> expected;
+  for (const auto& entry : due) {
+    expected.push_back(entry.second);
   }
   ASSERT_OK(recorder_.WaitDue(9));
-  ASSERT_EQ(recorder_.due(), (std::vector<int>{1, 2, 3, 4, 5, 6, 7, 8, 9}));
+  ASSERT_EQ(recorder_.due(), expected);
   auto times = recorder_.due_times();
-  for (int i = 0; i != 9; ++i) {
-    ASSERT_GE(times[i] - start, (i + 1) * 100us) << "Entry " << i + 1;
+  for (size_t i = 0; i != due.size(); ++i) {
+    ASSERT_GE(times[i], due[i].first) << "Entry " << due[i].second;
   }
 }
 
