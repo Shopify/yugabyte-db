@@ -47,6 +47,8 @@
 #include "yb/consensus/replicate_msgs_holder.h"
 #include "yb/consensus/multi_raft_batcher.h"
 
+#include "yb/gutil/port.h"
+
 #include "yb/rpc/periodic.h"
 #include "yb/rpc/rpc_controller.h"
 
@@ -64,6 +66,7 @@
 #include "yb/util/scope_exit.h"
 #include "yb/util/status_callback.h"
 #include "yb/util/status_format.h"
+#include "yb/util/sync_point.h"
 #include "yb/util/threadpool.h"
 #include "yb/util/tsan_util.h"
 #include "yb/util/url-coding.h"
@@ -88,7 +91,9 @@ TAG_FLAG(collect_update_consensus_traces, advanced);
 
 DECLARE_int32(raft_heartbeat_interval_ms);
 
+DECLARE_bool(enable_multi_raft_data_batching);
 DECLARE_bool(enable_multi_raft_heartbeat_batcher);
+DECLARE_uint64(multi_raft_data_direct_threshold_bytes);
 
 DEFINE_test_flag(double, fault_crash_on_leader_request_fraction, 0.0,
                  "Fraction of the time when the leader will crash just before sending an "
@@ -132,7 +137,7 @@ using rpc::PeriodicTimer;
 
 Peer::Peer(
     const RaftPeerPB& peer_pb, string tablet_id, string leader_uuid, PeerProxyPtr proxy,
-    PeerMessageQueue* queue, MultiRaftHeartbeatBatcherPtr multi_raft_batcher,
+    PeerMessageQueue* queue, MultiRaftBatcherPtr multi_raft_batcher,
     ThreadPoolToken* raft_pool_token, Consensus* consensus, rpc::Messenger* messenger)
     : tablet_id_(std::move(tablet_id)),
       leader_uuid_(std::move(leader_uuid)),
@@ -168,6 +173,27 @@ Status Peer::Init() {
   return Status::OK();
 }
 
+template <class Call>
+void Peer::CheckStuckCall(Call& call, CoarseTimePoint call_start_time) {
+  auto timeout = call.timeout();
+  if (FLAGS_consensus_stuck_peer_call_threshold_ms <= 0 || !timeout.Initialized()) {
+    return;
+  }
+  const MonoDelta stuck_threshold = FLAGS_consensus_stuck_peer_call_threshold_ms * 1ms;
+  auto now = CoarseMonoClock::Now();
+  if (call_start_time != CoarseTimePoint::min() &&
+      now > call_start_time + stuck_threshold + timeout && !call.finished()) {
+    YB_LOG_WITH_PREFIX_EVERY_N_SECS(DFATAL, 1) << Format(
+        "Found an RPC call in stuck state - timeout: $0, last_rpc_start_time: $1, "
+        "stuck threshold: $2, force recover: $3, call state: $4",
+        timeout, call_start_time, stuck_threshold,
+        FLAGS_consensus_force_recover_from_stuck_peer_call, call.CallStateDebugString());
+    if (FLAGS_consensus_force_recover_from_stuck_peer_call) {
+      call.MarkCallAsFailed();
+    }
+  }
+}
+
 Status Peer::SignalRequest(RequestTriggerMode trigger_mode) {
   // If the peer is currently sending, return Status::OK().
   // If there are new requests in the queue we'll get them on ProcessResponse().
@@ -180,22 +206,22 @@ Status Peer::SignalRequest(RequestTriggerMode trigger_mode) {
     // the outstanding call as failed. Note: if there is no outstanding call in controller or
     // timeout is not initialized, then we won't be able to recover it (we didn't see this situation
     // in production).
-    auto timeout = controller_.timeout();
-    if (FLAGS_consensus_stuck_peer_call_threshold_ms > 0 && timeout.Initialized()) {
-      const MonoDelta stuck_threshold = FLAGS_consensus_stuck_peer_call_threshold_ms * 1ms;
-      auto now = CoarseMonoClock::Now();
-      auto last_rpc_start_time = last_rpc_start_time_.load(std::memory_order_acquire);
-      if (last_rpc_start_time != CoarseTimePoint::min() &&
-          now > last_rpc_start_time + stuck_threshold + timeout && !controller_.finished()) {
-        YB_LOG_WITH_PREFIX_EVERY_N_SECS(DFATAL, 1) << Format(
-            "Found an RPC call in stuck state - timeout: $0, last_rpc_start_time: $1, "
-            "stuck threshold: $2, force recover: $3, call state: $4",
-            timeout, last_rpc_start_time, stuck_threshold,
-            FLAGS_consensus_force_recover_from_stuck_peer_call, controller_.CallStateDebugString());
-        if (FLAGS_consensus_force_recover_from_stuck_peer_call) {
-          controller_.MarkCallAsFailed();
-        }
-      }
+    // A batched data request is sent on its batch's controller, and controller_ still holds the
+    // state of the last direct call. Failing the batch fails every request in it that no
+    // response frame has answered yet.
+    bool batched;
+    MultiRaftBatcher::BatchHandle batched_handle;
+    CoarseTimePoint batched_send_time;
+    {
+      std::lock_guard lock(batched_round_lock_);
+      batched = batched_round_outstanding_;
+      batched_handle = batched_handle_;
+      batched_send_time = batched_send_time_;
+    }
+    if (batched) {
+      CheckStuckCall(batched_handle, batched_send_time);
+    } else {
+      CheckStuckCall(controller_, last_rpc_start_time_.load(std::memory_order_acquire));
     }
     TRACE("Could not get the lock to send update request for peer $0", peer_pb().permanent_uuid());
     return Status::OK();
@@ -236,6 +262,19 @@ Status Peer::SignalRequest(RequestTriggerMode trigger_mode) {
     performing_update_lock.release();
   }
   return status;
+}
+
+MultiRaftBatcher::BatchHandle Peer::TEST_batched_handle() const {
+  std::lock_guard lock(batched_round_lock_);
+  return batched_handle_;
+}
+
+size_t Peer::TEST_heartbeat_arena_footprint() const {
+  return heartbeat_arena_ ? heartbeat_arena_->memory_footprint() : 0;
+}
+
+size_t Peer::TEST_heartbeat_arena_used_bytes() {
+  return heartbeat_arena_ ? heartbeat_arena_->UsedBytes() : 0;
 }
 
 void Peer::DumpToHtml(std::ostream& out) const {
@@ -388,9 +427,11 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
 
   MAYBE_FAULT(FLAGS_TEST_fault_crash_on_leader_request_fraction);
 
-  // Heartbeat batching allows for network layer savings by reducing CPU cycles
-  // spent on computing state, context switching (sending/receiving RPC's)
-  // and serializing/deserializing protobufs.
+  // Batching requests for different tablets to the same server into one RPC saves CPU cycles
+  // spent on context switching (sending/receiving RPC's) and per-RPC processing. A heartbeat
+  // releases performing_update_mutex_ and holds performing_heartbeat_mutex_ instead, so a data
+  // request can be sent while it is parked in a batch or in flight; minimum_viable_heartbeat_ then
+  // discards its response.
   if (req_is_heartbeat && multi_raft_batcher_
       && FLAGS_enable_multi_raft_heartbeat_batcher) {
     auto performing_heartbeat_lock = LockPerformingHeartbeat(std::try_to_lock);
@@ -399,17 +440,68 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
       return;
     }
 
-    // TODO(lw_uc) support multiraft heartbeat with LW
-    update_request_->ToGoogleProtobuf(&heartbeat_request_);
-    update_response_->ToGoogleProtobuf(&heartbeat_response_);
+    // Copied while performing_update_mutex_ is still held. The copy owns its bytes: it borrows
+    // nothing from arena_. It has no ops, so there is nothing for a holder to pin.
+    if (heartbeat_arena_) {
+      heartbeat_arena_->Reset(ResetMode::kKeepFirst);
+    } else {
+      heartbeat_arena_.emplace(kHeartbeatArenaSize);
+    }
+    heartbeat_request_ = heartbeat_arena_->NewObject<LWConsensusRequestPB>(
+        &*heartbeat_arena_, *update_request_);
     cur_heartbeat_id_++;
     processing_lock.unlock();
     performing_update_lock.unlock();
     performing_heartbeat_lock.release();
+    TEST_SYNC_POINT_CALLBACK("Peer::SendNextRequest:BeforeHeartbeatAdd", heartbeat_request_);
     multi_raft_batcher_->AddRequestToBatch(
-        &heartbeat_request_, &heartbeat_response_,
-        std::bind(&Peer::ProcessHeartbeatResponse, retain_self, _1));
+        heartbeat_request_, LWReplicateMsgsHolder(),
+        std::bind(&Peer::ProcessHeartbeatResponse, retain_self, _1, _2, _3),
+        MultiRaftBatcher::RequestKind::kHeartbeat);
     return;
+  }
+
+  // A batched data request keeps performing_update_mutex_ held until ProcessBatchedResponse, as a
+  // direct one does until ProcessResponse. So each peer has at most one data request in a pending
+  // batch or in flight, and envelopes cannot reorder a tablet's requests.
+  if (!req_is_heartbeat && multi_raft_batcher_ && FLAGS_enable_multi_raft_data_batching) {
+    const auto direct_threshold = FLAGS_multi_raft_data_direct_threshold_bytes;
+    if (direct_threshold == 0 || update_request_->SerializedSize() < direct_threshold) {
+      // Batched requests are not traced: only the direct UpdateConsensus handler fills
+      // trace_buffer.
+      // ProcessBatchedResponse can run before AddRequestToBatch returns: inline if the batcher is
+      // shut down, or on another thread once the batch is sent. So everything it reads is written
+      // here, peer_lock_ is released before the add, and after the add only the round-checked
+      // handle store touches the peer.
+      minimum_viable_heartbeat_ = cur_heartbeat_id_ + 1;
+      const auto send_time = CoarseMonoClock::now();
+      last_rpc_start_time_.store(send_time, std::memory_order_release);
+      uint64_t round;
+      {
+        std::lock_guard lock(batched_round_lock_);
+        round = ++batched_round_;
+        batched_round_outstanding_ = true;
+        batched_handle_ = MultiRaftBatcher::BatchHandle();
+        batched_send_time_ = send_time;
+      }
+      processing_lock.unlock();
+      performing_update_lock.release();
+      TEST_SYNC_POINT_CALLBACK("Peer::SendNextRequest:BeforeBatchedAdd", update_request_);
+      // The envelope references update_request_, and through it arena_ and the members it refs,
+      // until it is serialized. The update lock stays held until ProcessBatchedResponse, so
+      // nothing rebuilds them before then. retain_self keeps this peer alive until the batch
+      // releases the callback, which is after the envelope is serialized.
+      auto handle = multi_raft_batcher_->AddRequestToBatch(
+          update_request_, std::move(msgs_holder),
+          std::bind(&Peer::ProcessBatchedResponse, retain_self, _1, _2, _3),
+          MultiRaftBatcher::RequestKind::kData);
+      std::lock_guard lock(batched_round_lock_);
+      if (batched_round_ == round && batched_round_outstanding_) {
+        batched_handle_ = std::move(handle);
+      }
+      return;
+    }
+    multi_raft_batcher_->RecordDirectDataSend();
   }
 
   TracePtr trace(Trace::CurrentTrace());
@@ -443,7 +535,7 @@ std::unique_lock<simple_spinlock> Peer::StartProcessingUnlocked() {
 }
 
 bool Peer::ProcessResponseWithStatus(const Status& status,
-                                     LWConsensusResponsePB* response) {
+                                     const LWConsensusResponsePB* response) {
   if (!status.ok()) {
     if (status.IsRemoteError()) {
       // Most controller errors are caused by network issues or corner cases like shutdown and
@@ -539,10 +631,13 @@ void Peer::ProcessResponse(TracePtr trace) {
   }
 }
 
-void Peer::ProcessHeartbeatResponse(const Status& status) {
+void Peer::ProcessHeartbeatResponse(
+    const Status& status, const LWConsensusResponsePB* response, std::shared_ptr<void> holder) {
   DCHECK(performing_heartbeat_mutex_.is_locked()) << "Got a heartbeat when nothing was pending.";
-  DCHECK(heartbeat_request_.ops().empty()) << "Got a heartbeat with a non-zero number of ops.";
-  last_rpc_start_time_.store(CoarseTimePoint::min(), std::memory_order_release);
+  DCHECK(heartbeat_request_->ops().empty()) << "Got a heartbeat with a non-zero number of ops.";
+  // last_rpc_start_time_ is left alone: a batched heartbeat never sets it, and it may time a data
+  // or remote bootstrap call on controller_ that is still outstanding, which the stuck-call
+  // detector in SignalRequest must keep seeing.
 
   auto performing_heartbeat_lock = LockPerformingHeartbeat(std::adopt_lock);
   auto processing_lock = StartProcessingUnlocked();
@@ -558,9 +653,7 @@ void Peer::ProcessHeartbeatResponse(const Status& status) {
     return;
   }
 
-  // TODO(lw_uc) support multiraft heartbeat with LW
-  auto lw_response = rpc::CopySharedMessage(heartbeat_response_);
-  bool more_pending = ProcessResponseWithStatus(status, lw_response.get());
+  bool more_pending = ProcessResponseWithStatus(status, response);
 
   if (more_pending) {
     auto performing_update_lock = LockPerformingUpdate(std::try_to_lock);
@@ -568,6 +661,36 @@ void Peer::ProcessHeartbeatResponse(const Status& status) {
       return;
     }
     performing_heartbeat_lock.unlock();
+    processing_lock.unlock();
+    performing_update_lock.release();
+    SendNextRequest(RequestTriggerMode::kAlwaysSend);
+  }
+}
+
+// Kept out of line as a uprobe attach point for timing Raft rounds.
+ATTRIBUTE_NOINLINE void Peer::ProcessBatchedResponse(
+    const Status& status, const LWConsensusResponsePB* response, std::shared_ptr<void> holder) {
+  DCHECK(performing_update_mutex_.is_locked())
+      << "Got a batched response when nothing was pending.";
+  TEST_SYNC_POINT_CALLBACK(
+      "Peer::ProcessBatchedResponse", const_cast<LWConsensusResponsePB*>(response));
+  {
+    std::lock_guard lock(batched_round_lock_);
+    batched_round_outstanding_ = false;
+    batched_handle_ = MultiRaftBatcher::BatchHandle();
+    batched_send_time_ = CoarseTimePoint::min();
+  }
+  last_rpc_start_time_.store(CoarseTimePoint::min(), std::memory_order_release);
+
+  auto performing_update_lock = LockPerformingUpdate(std::adopt_lock);
+  auto processing_lock = StartProcessingUnlocked();
+  if (!processing_lock.owns_lock()) {
+    return;
+  }
+
+  bool more_pending = ProcessResponseWithStatus(status, response);
+
+  if (more_pending) {
     processing_lock.unlock();
     performing_update_lock.release();
     SendNextRequest(RequestTriggerMode::kAlwaysSend);
@@ -717,6 +840,11 @@ void RpcPeerProxy::LeaderElectionLostAsync(
 void RpcPeerProxy::StartRemoteBootstrap(
     const StartRemoteBootstrapRequestPB* request, StartRemoteBootstrapResponsePB* response,
     rpc::RpcController* controller, const rpc::ResponseCallback& callback) {
+  // The remote peer answers only after the leader has promoted it, which the leader can do only
+  // after this call completes, so it must time out. Without this, the call would use whatever
+  // timeout the controller kept from an earlier direct UpdateConsensus call, or none at all if
+  // every request to the peer went through the multi-Raft batcher.
+  controller->set_timeout(MonoDelta::FromMilliseconds(FLAGS_consensus_rpc_timeout_ms));
   consensus_proxy_->StartRemoteBootstrapAsync(*request, response, controller, callback);
 }
 

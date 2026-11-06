@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -49,6 +50,7 @@
 #include "yb/consensus/consensus.pb.h"
 #include "yb/consensus/consensus_util.h"
 #include "yb/consensus/metadata.pb.h"
+#include "yb/consensus/multi_raft_batcher.h"
 
 #include "yb/gutil/integral_types.h"
 
@@ -89,7 +91,8 @@ namespace consensus {
 // messages to be processed. This function takes a parameter allowing to send requests only if
 // the queue is not empty, or to force-send a request even if it is empty.
 //
-// ProcessResponse() Called a response from a peer is received.
+// ProcessResponse() Called a response from a peer is received. Requests sent through the
+// multi-Raft batcher complete in ProcessHeartbeatResponse() and ProcessBatchedResponse() instead.
 //
 // The following state diagrams describe what happens when a state changing method is called.
 //
@@ -131,8 +134,12 @@ typedef std::shared_ptr<Peer> PeerPtr;
 
 class Peer : public std::enable_shared_from_this<Peer> {
  public:
+  // Initial size of the batched heartbeat arena, which holds one heartbeat: a ConsensusRequestPB
+  // without ops, whose strings are a tablet id and two server uuids.
+  static constexpr size_t kHeartbeatArenaSize = 1024;
+
   Peer(const RaftPeerPB& peer, std::string tablet_id, std::string leader_uuid,
-       PeerProxyPtr proxy, PeerMessageQueue* queue, MultiRaftHeartbeatBatcherPtr multi_raft_batcher,
+       PeerProxyPtr proxy, PeerMessageQueue* queue, MultiRaftBatcherPtr multi_raft_batcher,
        ThreadPoolToken* raft_pool_token, Consensus* consensus, rpc::Messenger* messenger);
 
   // Initializes a peer and get its status.
@@ -182,6 +189,17 @@ class Peer : public std::enable_shared_from_this<Peer> {
 
   void DumpToHtml(std::ostream& out) const;
 
+  // True while a request holds performing_update_mutex_.
+  bool TEST_performing_update() const { return performing_update_mutex_.is_locked(); }
+
+  // The handle of the outstanding batched data request, if any.
+  MultiRaftBatcher::BatchHandle TEST_batched_handle() const;
+
+  // Memory footprint and used bytes of the batched heartbeat arena, both 0 if it was never
+  // created. Only while no heartbeat is being built.
+  size_t TEST_heartbeat_arena_footprint() const;
+  size_t TEST_heartbeat_arena_used_bytes();
+
  private:
   void SendNextRequest(RequestTriggerMode trigger_mode);
 
@@ -189,12 +207,27 @@ class Peer : public std::enable_shared_from_this<Peer> {
   // requires IO or may block.
   void ProcessResponse(TracePtr trace);
 
-  // Signals that a heartbeat response was received from the peer.
-  void ProcessHeartbeatResponse(const Status& status);
+  // Signals that the multi-Raft batcher completed a batched heartbeat. response is null iff status
+  // is not OK, and is valid while holder is alive.
+  void ProcessHeartbeatResponse(
+      const Status& status, const LWConsensusResponsePB* response, std::shared_ptr<void> holder);
 
-  // Returns true if there are more pending ops to process, false otherwise.
+  // Signals that the multi-Raft batcher completed a batched data request. response is null iff
+  // status is not OK, and is valid while holder is alive.
+  void ProcessBatchedResponse(
+      const Status& status, const LWConsensusResponsePB* response, std::shared_ptr<void> holder);
+
+  // If the call has been outstanding for longer than its timeout plus
+  // consensus_stuck_peer_call_threshold_ms, logs it and, if
+  // consensus_force_recover_from_stuck_peer_call is set, fails it. Call is an RpcController or a
+  // MultiRaftBatcher::BatchHandle.
+  template <class Call>
+  void CheckStuckCall(Call& call, CoarseTimePoint call_start_time);
+
+  // Returns true if there are more pending ops to process, false otherwise. response is not read
+  // if status is not OK.
   bool ProcessResponseWithStatus(const Status& status,
-                                 LWConsensusResponsePB* response);
+                                 const LWConsensusResponsePB* response);
 
   // Fetch the desired remote bootstrap request from the queue and send it to the peer. The callback
   // goes to ProcessRemoteBootstrapResponse().
@@ -236,14 +269,35 @@ class Peer : public std::enable_shared_from_this<Peer> {
   PeerMessageQueue* queue_;
   uint64_t failed_attempts_ = 0;
 
-  // The latest consensus update request and response stored in arena_.
+  // The latest consensus update request and response stored in arena_. Rebuilt only by
+  // SendNextRequest, under performing_update_mutex_. update_request_ refs tablet_id_, leader_uuid_
+  // and peer_pb_. A batched data request is update_request_ itself, referenced by its multi-Raft
+  // envelope: it holds performing_update_mutex_ until ProcessBatchedResponse, so update_request_
+  // and arena_ stay untouched until then.
   ThreadSafeArena arena_;
   LWConsensusRequestPB* update_request_ = nullptr;
   LWConsensusResponsePB* update_response_ = nullptr;
 
-  // Latest heartbeat request and response
-  ConsensusRequestPB heartbeat_request_;
-  ConsensusResponsePB heartbeat_response_;
+  // The latest heartbeat sent through the multi-Raft batcher, a copy of update_request_. The
+  // heartbeat path releases performing_update_mutex_, so update_request_ can be rebuilt while the
+  // heartbeat waits in a batch. Guarded by performing_heartbeat_mutex_, which is held until
+  // ProcessHeartbeatResponse: rebuilt only by the next heartbeat. The arena is created by the
+  // first batched heartbeat, so that peers that never batch heartbeats (the default) do not carry
+  // it, and is sized to hold one heartbeat, so that resetting it keeps a single buffer.
+  std::optional<ThreadSafeArena> heartbeat_arena_;
+  LWConsensusRequestPB* heartbeat_request_ = nullptr;
+
+  // The outstanding batched data request, for the stuck-call detector in SignalRequest.
+  // ProcessBatchedResponse, and the next round's send, can run before AddRequestToBatch returns
+  // the handle, so the handle is stored only if its round is still the current one and has not
+  // completed.
+  mutable simple_spinlock batched_round_lock_;
+  uint64_t batched_round_ GUARDED_BY(batched_round_lock_) = 0;
+  bool batched_round_outstanding_ GUARDED_BY(batched_round_lock_) = false;
+  MultiRaftBatcher::BatchHandle batched_handle_ GUARDED_BY(batched_round_lock_);
+  // Send time of the outstanding batched data request. Read with batched_handle_ under
+  // batched_round_lock_, so the detector never pairs one round's handle with another's send time.
+  CoarseTimePoint batched_send_time_ GUARDED_BY(batched_round_lock_) = CoarseTimePoint::min();
 
   // Each time a heartbeat request is sent this value is incremented.
   int64_t cur_heartbeat_id_ = 0;
@@ -274,9 +328,11 @@ class Peer : public std::enable_shared_from_this<Peer> {
   // peers whenever we go more than 'FLAGS_raft_heartbeat_interval_ms' without sending actual data.
   std::shared_ptr<rpc::PeriodicTimer> heartbeater_;
 
-  // Batcher that currently batches heartbeat requests that are sent by each consensus peer
-  // on a per tserver level
-  MultiRaftHeartbeatBatcherPtr multi_raft_batcher_;
+  // Batcher shared by the peers of all tablets that replicate to the same server. Carries
+  // heartbeats when enable_multi_raft_heartbeat_batcher is set, and data requests when
+  // enable_multi_raft_data_batching is set. Null if neither flag was set when this peer was
+  // created.
+  MultiRaftBatcherPtr multi_raft_batcher_;
 
   // Thread pool used to construct requests to this peer.
   ThreadPoolToken* raft_pool_token_;

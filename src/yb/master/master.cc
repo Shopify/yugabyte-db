@@ -342,7 +342,8 @@ Status Master::RegisterServices() {
 
   RETURN_NOT_OK(RegisterService(
       FLAGS_master_consensus_svc_queue_length,
-      std::make_shared<ConsensusServiceImpl>(metric_entity(), catalog_manager_.get()),
+      std::make_shared<ConsensusServiceImpl>(
+          metric_entity(), catalog_manager_.get(), messenger()),
       rpc::ServicePriority::kHigh));
 
   RETURN_NOT_OK(RegisterService(

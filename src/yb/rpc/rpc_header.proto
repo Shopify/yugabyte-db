@@ -119,7 +119,18 @@ message ResponseHeader {
   // is the first byte after the bytes for this protobuf.
   repeated uint32 sidecar_offsets = 3;
 
+  // Set on a partial response frame: one part of the call's response, sent before the final
+  // (non-partial) frame. The call stays pending until the final frame arrives. A partial frame
+  // has no sidecars, is never an error, and is framed and CRC-protected like a final one.
+  //
+  // The opt-in belongs to the application: a server may send partial frames for a call only
+  // when the request asked for them. A client that predates this field would take a partial
+  // frame for the final response. See RpcContext::RespondPartial and
+  // RpcController::set_partial_response_callback.
+  optional bool partial = 5 [ default = false ];
+
   // CRC32C for message body and header without CRC field. Use 15 as max 1 byte tag.
+  // Must stay the last field: the CRC is written into the last bytes of the serialized header.
   optional fixed32 crc = 15;
 }
 

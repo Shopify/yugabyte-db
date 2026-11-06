@@ -88,6 +88,41 @@ class HeartbeatOutboundData : public StringOutboundData {
       StringOutboundData(kEmptyMsgLengthPrefix, kMsgLengthPrefixLength, "Heartbeat") {}
 };
 
+// A serialized partial response frame. Owns its buffer until the connection has sent or dropped
+// it; nothing waits for the transfer.
+class PartialResponseOutboundData : public OutboundData {
+ public:
+  PartialResponseOutboundData(RefCntBuffer buffer, int32_t call_id)
+      : buffer_(std::move(buffer)), call_id_(call_id) {}
+
+  void Transferred(const Status& status, const ConnectionPtr& conn) override {
+    if (!status.ok()) {
+      YB_LOG_EVERY_N_SECS(WARNING, 10) << "Connection torn down before " << ToString()
+                                       << " could be sent: " << status;
+    }
+  }
+
+  void Serialize(ByteBlocks* output) override {
+    output->emplace_back(std::move(buffer_));
+  }
+
+  std::string ToString() const override {
+    return Format("Partial response for call id $0", call_id_);
+  }
+
+  bool DumpPB(const DumpRunningRpcsRequestPB& req, RpcCallInProgressPB* resp) override {
+    return false;
+  }
+
+  size_t ObjectSize() const override { return sizeof(*this); }
+
+  size_t DynamicMemoryUsage() const override { return DynamicMemoryUsageOf(buffer_); }
+
+ private:
+  RefCntBuffer buffer_;
+  const int32_t call_id_;
+};
+
 } // namespace
 
 using google::protobuf::FieldDescriptor;
@@ -526,6 +561,32 @@ void YBInboundCall::ApplicationErrorToPB(int error_ext_id, const std::string& me
     LOG(DFATAL) << "Unable to find application error extension ID " << error_ext_id
                 << " (message=" << message << ")";
   }
+}
+
+Status YBInboundCall::RespondPartial(AnyMessageConstPtr response) {
+  if (responded_.load(std::memory_order_acquire)) {
+    LOG_WITH_PREFIX(DFATAL) << "RespondPartial called after the final response";
+    return STATUS(IllegalState, "RespondPartial called after the final response");
+  }
+  auto conn = connection();
+  DCHECK(!conn->reactor()->IsCurrentThread())
+      << "RespondPartial on the reactor thread could overtake frames queued from other threads";
+
+  ResponseHeader resp_hdr;
+  resp_hdr.set_call_id(header_.call_id);
+  resp_hdr.set_partial(true);
+  auto use_crc = FLAGS_rpc_enable_crc;
+  if (use_crc) {
+    resp_hdr.set_crc(0);
+  }
+  auto body_size = response.SerializedSize();
+  auto [buffer, header_size] = VERIFY_RESULT(SerializeResponse(
+      body_size, /* additional_size= */ 0, resp_hdr, response));
+  if (use_crc) {
+    StoreCrc(buffer, header_size, buffer.size() - header_size, /* sidecars= */ nullptr);
+  }
+  return conn->QueueOutboundData(
+      std::make_shared<PartialResponseOutboundData>(std::move(buffer), header_.call_id));
 }
 
 void YBInboundCall::Respond(AnyMessageConstPtr response, bool is_success) {

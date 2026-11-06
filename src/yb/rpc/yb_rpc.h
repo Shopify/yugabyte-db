@@ -178,6 +178,28 @@ class YBInboundCall : public InboundCall {
   void RespondApplicationError(int error_ext_id, const std::string& message,
                                const google::protobuf::MessageLite& app_error_pb);
 
+  // Serializes 'response' as a partial response frame (ResponseHeader.partial) and queues it on
+  // the connection. The call stays open: the final RespondSuccess/RespondFailure still has to be
+  // sent, and only it records handler latency. A partial frame carries no sidecars, so any
+  // sidecars added to the call go out with the final response.
+  //
+  // 'response' is fully serialized, or not used at all, by the time this returns, so the caller
+  // may destroy or reuse it on every return path.
+  //
+  // Send partial frames only if the request asked for them: the RPC layer cannot check that, and
+  // a client that did not opt in, or predates partial frames, cannot handle them.
+  //
+  // Frames reach the wire in the order RespondPartial and Respond* were called, provided all of
+  // them are called off the reactor thread: on the reactor the connection queues data directly,
+  // ahead of data queued from other threads. The caller serializes its own calls: calling this
+  // concurrently with the final response is a caller bug, because the already-responded check is
+  // not atomic with it.
+  //
+  // Returns IllegalState (and logs a DFATAL) if the final response was already queued, otherwise
+  // the status of queueing the frame. On a connection that is shutting down queueing normally
+  // succeeds, and the frame is dropped together with the connection.
+  Status RespondPartial(AnyMessageConstPtr response) override;
+
   // Convert an application error extension to an ErrorStatusPB.
   // These ErrorStatusPB objects are what are returned in application error responses.
   static void ApplicationErrorToPB(int error_ext_id, const std::string& message,

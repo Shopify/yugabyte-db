@@ -431,7 +431,10 @@ void TabletServerIntegrationTestBase::BuildAndStart(
     const std::vector<std::string>& ts_flags,
     const std::vector<std::string>& master_flags,
     bool enable_ysql) {
-  CreateCluster("raft_consensus-itest-cluster", ts_flags, master_flags, enable_ysql);
+  // Stops at a failed start: CreateClient() and the cluster calls after it CHECK-fail on a master
+  // that did not start, which aborts the whole test binary.
+  ASSERT_NO_FATALS(
+      CreateCluster("raft_consensus-itest-cluster", ts_flags, master_flags, enable_ysql));
   client_ = ASSERT_RESULT(CreateClient());
   ASSERT_NO_FATALS(CreateTable());
   WaitForTSAndReplicas();

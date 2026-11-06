@@ -142,9 +142,9 @@ class TabletPeerTest : public YBTabletTest {
     addr->set_host("fake-host");
     addr->set_port(0);
 
-    multi_raft_manager_ = std::make_unique<consensus::MultiRaftManager>(messenger_.get(),
-                                                                        proxy_cache_.get(),
-                                                                        config_peer.cloud_info());
+    multi_raft_manager_ = std::make_unique<consensus::MultiRaftManager>(
+        messenger_.get(), proxy_cache_.get(), config_peer.cloud_info(),
+        METRIC_ENTITY_server.Instantiate(&metric_registry_, "test-server"));
 
     // "Bootstrap" and start the TabletPeer.
     tablet_peer_.reset(new TabletPeer(
@@ -243,6 +243,7 @@ class TabletPeerTest : public YBTabletTest {
                                            raft_pool_.get(),
                                            raft_pool_.get() /* snapshot_cleanup_pool */,
                                            raft_notifications_pool_.get(),
+                                           nullptr /* raft_async_wait_sweeper */,
                                            tablet_prepare_pool_.get(),
                                            &retryable_requests,
                                            bootstrap_state_manager,

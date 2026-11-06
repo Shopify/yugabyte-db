@@ -48,6 +48,7 @@
 #include "yb/rpc/rtest.service.h"
 #include "yb/rpc/service_if.h"
 #include "yb/rpc/service_pool.h"
+#include "yb/util/countdown_latch.h"
 #include "yb/util/faststring.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/metrics.h"
@@ -103,6 +104,40 @@ class CalculatorServiceMethods {
         rpc_test::CalculatorServiceIf::static_service_name(), kSleepMethodName);
     return &method;
   }
+};
+
+// Lets a test coordinate with CalculatorService::PartialFrames, which runs on a service thread.
+struct PartialFramesTestState {
+  // Waited on after the first num_partials frames, if the request sets hold_after_partials.
+  CountDownLatch resume{1};
+  // Waited on before the final response, if the request sets hold_before_final.
+  CountDownLatch resume_final{1};
+  // Counted down when the handler is done, after its last frame.
+  CountDownLatch done{1};
+
+  std::mutex mutex;
+  // RespondPartial results, in call order.
+  std::vector<Status> statuses GUARDED_BY(mutex);
+
+  std::vector<Status> GetStatuses() {
+    std::lock_guard lock(mutex);
+    return statuses;
+  }
+};
+
+// Installs a PartialFramesTestState for PartialFrames handlers while it lives. On destruction it
+// releases a handler that a failed test left held, uninstalls the state, and waits until no
+// handler can still use it. Declare it after the state it installs, so it is destroyed first.
+class ScopedPartialFramesTestState {
+ public:
+  explicit ScopedPartialFramesTestState(PartialFramesTestState* state);
+  ~ScopedPartialFramesTestState();
+
+  ScopedPartialFramesTestState(const ScopedPartialFramesTestState&) = delete;
+  void operator=(const ScopedPartialFramesTestState&) = delete;
+
+ private:
+  PartialFramesTestState* const state_;
 };
 
 // Implementation of CalculatorService which just implements the generic

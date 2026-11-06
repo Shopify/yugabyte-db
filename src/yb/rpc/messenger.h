@@ -313,6 +313,11 @@ class Messenger : public ProxyContext {
     return scheduler_;
   }
 
+  // The cgroup of the high-priority thread pool (and the io threads); null without QoS.
+  Cgroup* system_high_cgroup() const {
+    return system_high_cgroup_;
+  }
+
   IoService& io_service() override {
     return io_thread_pool_.io_service();
   }

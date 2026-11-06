@@ -441,6 +441,11 @@ Status Connection::HandleCallResponse(CallData* call_data) {
   CallResponse resp;
   RETURN_NOT_OK(resp.ParseFrom(call_data));
 
+  if (PREDICT_FALSE(resp.is_partial())) {
+    HandlePartialCallResponse(std::move(resp));
+    return Status::OK();
+  }
+
   ++responded_call_count_;
   auto awaiting = active_calls_.find(resp.call_id());
   if (awaiting == active_calls_.end()) {
@@ -462,6 +467,33 @@ Status Connection::HandleCallResponse(CallData* call_data) {
   call->SetResponse(std::move(resp));
 
   return Status::OK();
+}
+
+// A partial frame leaves the call pending: the entry stays in active_calls_ until the final
+// frame or expiry, and the frame does not count as a response in responded_call_count_. A frame
+// is dropped if its entry is gone, was reset on expiry (the call timed out), or holds a call that
+// already finished (for example failed through RpcController::MarkCallAsFailed on another
+// thread). Partial frames neither extend nor reset the call's expiration.
+void Connection::HandlePartialCallResponse(CallResponse&& resp) {
+  if (PREDICT_FALSE(!resp.is_success())) {
+    LOG_WITH_PREFIX(DFATAL) << "Partial response frame marked as an error, call id "
+                            << resp.call_id() << ". Ignoring.";
+    return;
+  }
+  auto awaiting = active_calls_.find(resp.call_id());
+  if (awaiting == active_calls_.end() || !awaiting->call || awaiting->call->IsFinished()) {
+    VLOG_WITH_PREFIX(1) << "Dropping partial response for call id " << resp.call_id()
+                        << " which is no longer pending";
+    return;
+  }
+  // Copied: the callback may change active_calls_, for example by shutting the connection down.
+  auto call = awaiting->call;
+  if (PREDICT_FALSE(!call->has_partial_response_callback())) {
+    LOG_WITH_PREFIX(DFATAL) << "Got a partial response for a call that did not ask for one, "
+                            << "call id " << resp.call_id() << ". Ignoring.";
+    return;
+  }
+  call->SetPartialResponse(std::move(resp));
 }
 
 std::string Connection::ToString() const {

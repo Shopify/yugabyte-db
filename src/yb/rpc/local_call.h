@@ -104,6 +104,9 @@ class LocalYBInboundCall : public YBInboundCall, public RpcCallParams {
   // Fails the outbound call with TimedOut, unless this call has already responded.
   void TimeOut();
 
+  // A local call has no frames to send, so the caller must answer with the final response only.
+  Status RespondPartial(AnyMessageConstPtr response) override;
+
   const Endpoint& remote_address() const override;
   const Endpoint& local_address() const override;
   CoarseTimePoint GetClientDeadline() const override { return deadline_; }

@@ -23,11 +23,13 @@
 #include "yb/rpc/rpc_controller.h"
 #include "yb/rpc/yb_rpc.h"
 
+#include "yb/util/backoff_waiter.h"
 #include "yb/util/debug-util.h"
 #include "yb/util/flags.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/random_util.h"
 #include "yb/util/result.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/status_format.h"
 #include "yb/util/status_log.h"
 #include "yb/util/test_macros.h"
@@ -240,6 +242,12 @@ void GenericCalculatorService::DoRepeatedEcho(InboundCall* incoming) {
 
 namespace {
 
+std::atomic<PartialFramesTestState*> partial_frames_test_state{nullptr};
+// PartialFrames handlers that may use partial_frames_test_state. A handler counts itself before
+// it loads the state and stops after its last use, so once the state is uninstalled and this is
+// zero, no handler can use the old state.
+std::atomic<int> partial_frames_handlers_running{0};
+
 class CalculatorService: public CalculatorServiceIf {
  public:
   explicit CalculatorService(const scoped_refptr<MetricEntity>& entity,
@@ -348,6 +356,53 @@ class CalculatorService: public CalculatorServiceIf {
     } else {
       resp->set_name(forwarded_resp.name());
       context.RespondSuccess();
+    }
+  }
+
+  void PartialFrames(
+      const rpc_test::PartialFramesRequestPB* req, rpc_test::PartialFramesResponsePB* resp,
+      RpcContext context) override {
+    ++partial_frames_handlers_running;
+    auto se = ScopeExit([] { --partial_frames_handlers_running; });
+    auto* state = partial_frames_test_state.load();
+    const auto payload = req->payload();
+    uint32_t seq = 0;
+    auto send_partial = [&context, &payload, &seq, state] {
+      rpc_test::PartialFramesResponsePB frame;
+      frame.set_seq(seq);
+      frame.set_payload(payload);
+      auto status = context.RespondPartial(AnyMessageConstPtr(&frame));
+      if (status.ok()) {
+        ++seq;
+      }
+      if (state) {
+        std::lock_guard lock(state->mutex);
+        state->statuses.push_back(status);
+      }
+    };
+    for (uint32_t i = 0; i != req->num_partials(); ++i) {
+      send_partial();
+    }
+    if (state && req->hold_after_partials()) {
+      state->resume.Wait();
+    }
+    for (uint32_t i = 0; i != req->num_late_partials(); ++i) {
+      send_partial();
+    }
+    if (state && req->hold_before_final()) {
+      state->resume_final.Wait();
+    }
+    if (req->close_connection()) {
+      context.CloseConnection();
+    }
+    resp->set_seq(seq);
+    resp->set_payload(payload);
+    context.RespondSuccess();
+    if (req->partial_after_final()) {
+      send_partial();
+    }
+    if (state) {
+      state->done.CountDown();
     }
   }
 
@@ -522,6 +577,21 @@ class AbacusService: public rpc_test::AbacusServiceIf {
 };
 
 } // namespace
+
+ScopedPartialFramesTestState::ScopedPartialFramesTestState(PartialFramesTestState* state)
+    : state_(state) {
+  partial_frames_test_state.store(state_);
+}
+
+ScopedPartialFramesTestState::~ScopedPartialFramesTestState() {
+  state_->resume.CountDown();
+  state_->resume_final.CountDown();
+  partial_frames_test_state.store(nullptr);
+  WARN_NOT_OK(
+      WaitFor([] { return partial_frames_handlers_running.load() == 0; }, 30s,
+              "PartialFrames handlers done"),
+      "PartialFrames handlers still running");
+}
 
 TestServer::TestServer(std::unique_ptr<Messenger>&& messenger,
                        const TestServerOptions& options)

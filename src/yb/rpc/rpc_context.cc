@@ -172,6 +172,10 @@ void RpcContext::RespondSuccess() {
   responded_ = true;
 }
 
+Status RpcContext::RespondPartial(AnyMessageConstPtr response) {
+  return call_->RespondPartial(response);
+}
+
 void RpcContext::RespondFailure(const Status &status) {
   call_->RecordHandlingCompleted();
   TRACE_EVENT_ASYNC_END2("rpc_call", "RPC", this,

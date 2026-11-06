@@ -246,6 +246,7 @@ Status TabletPeer::InitTabletPeer(
     ThreadPool* raft_pool,
     ThreadPool* snapshot_cleanup_pool,
     rpc::ThreadPool* raft_notifications_pool,
+    consensus::RaftAsyncWaitSweeper* raft_async_wait_sweeper,
     ThreadPool* tablet_prepare_pool,
     consensus::RetryableRequests* retryable_requests,
     std::shared_ptr<TabletBootstrapStateManager> bootstrap_state_manager,
@@ -308,6 +309,7 @@ Status TabletPeer::InitTabletPeer(
         tablet_->table_type(),
         raft_pool,
         raft_notifications_pool,
+        raft_async_wait_sweeper,
         retryable_requests,
         multi_raft_manager);
     has_consensus_.store(true, std::memory_order_release);

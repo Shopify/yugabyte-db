@@ -41,6 +41,8 @@
 
 #include <boost/ptr_container/ptr_vector.hpp>
 
+#include <google/protobuf/io/coded_stream.h>
+
 #include <gtest/gtest.h>
 
 #include "yb/gutil/map-util.h"
@@ -50,6 +52,7 @@
 #include "yb/rpc/network_error.h"
 #include "yb/rpc/proxy.h"
 #include "yb/rpc/rpc_controller.h"
+#include "yb/rpc/rpc_header.pb.h"
 #include "yb/rpc/secure_stream.h"
 #include "yb/rpc/serialization.h"
 #include "yb/rpc/tcp_stream.h"
@@ -73,6 +76,8 @@
 
 METRIC_DECLARE_histogram(handler_latency_yb_rpc_test_CalculatorService_Sleep);
 METRIC_DECLARE_event_stats(rpc_incoming_queue_time);
+METRIC_DECLARE_counter(proxy_response_bytes_yb_rpc_test_CalculatorService_Echo);
+METRIC_DECLARE_counter(proxy_response_bytes_yb_rpc_test_CalculatorService_PartialFrames);
 METRIC_DECLARE_counter(tcp_bytes_sent);
 METRIC_DECLARE_counter(tcp_bytes_received);
 METRIC_DECLARE_counter(rpcs_timed_out_early_in_queue);
@@ -84,6 +89,7 @@ DECLARE_bool(TEST_pause_calculator_echo_request);
 DECLARE_bool(binary_call_parser_reject_on_mem_tracker_hard_limit);
 DECLARE_bool(enable_rpc_keepalive);
 DECLARE_int32(num_connections_to_server);
+DECLARE_bool(rpc_enable_crc);
 DECLARE_int64(rpc_throttle_threshold_bytes);
 DECLARE_int32(stream_compression_algo);
 DECLARE_int64(memory_limit_hard_bytes);
@@ -1056,6 +1062,746 @@ TEST_F(TestRpc, LocalCallReleasesBuffersHolderBeforeResponse) {
   latch.Wait();
   ASSERT_OK(controller.status());
   ASSERT_TRUE(released_before_response);
+}
+
+namespace {
+
+// Server and client for partial-frame tests. The client uses one connection, so a later call
+// on the same proxy completes only after the client has processed every earlier frame.
+class PartialFramesSetup {
+ public:
+  explicit PartialFramesSetup(RpcTestBase* test) {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_connections_to_server) = 1;
+    test->StartTestServerWithGeneratedCode(&server_addr_);
+    client_messenger_ = test->CreateAutoShutdownMessengerHolder("Client");
+    proxy_cache_ = std::make_unique<ProxyCache>(client_messenger_.get());
+    proxy_ = std::make_unique<CalculatorServiceProxy>(proxy_cache_.get(), server_addr_);
+    metric_entity_ = test->metric_entity();
+  }
+
+  CalculatorServiceProxy& proxy() { return *proxy_; }
+  PartialFramesTestState& state() { return state_; }
+  Messenger* client_messenger() { return client_messenger_.get(); }
+  const HostPort& server_addr() const { return server_addr_; }
+
+  // A call on the same connection: once it returns, every frame sent before it was processed.
+  Status Barrier() {
+    rpc_test::EchoRequestPB req;
+    req.set_data("barrier");
+    rpc_test::EchoResponsePB resp;
+    RpcController controller;
+    controller.set_timeout(30s);
+    RETURN_NOT_OK(proxy_->Echo(req, &resp, &controller));
+    SCHECK_EQ(resp.data(), req.data(), IllegalState, "Wrong echo");
+    return Status::OK();
+  }
+
+  // Bytes counted in the PartialFrames proxy response-bytes metric so far.
+  int64_t ResponseBytes() {
+    auto counter = GetCounter(
+        metric_entity_, METRIC_proxy_response_bytes_yb_rpc_test_CalculatorService_PartialFrames);
+    return counter.ok() ? (*counter)->value() : 0;
+  }
+
+ private:
+  HostPort server_addr_;
+  AutoShutdownMessengerHolder client_messenger_;
+  std::unique_ptr<ProxyCache> proxy_cache_;
+  std::unique_ptr<CalculatorServiceProxy> proxy_;
+  MetricEntityPtr metric_entity_;
+  PartialFramesTestState state_;
+  ScopedPartialFramesTestState state_scope_{&state_};
+};
+
+// Records what a call delivers to its partial and final callbacks, in delivery order. The
+// callbacks share the recorded state, as a partial callback may still run after the final one
+// (when the call is failed from another thread). The destructor waits for the final callback,
+// then stops the partial hooks and waits for a running one, so that the call never writes to a
+// response or controller, or runs a hook on locals, that the test has destroyed after an early
+// exit: declare the recorder after them.
+class FrameRecorder {
+ public:
+  struct Partial {
+    uint32_t seq = 0;
+    std::string payload;
+    size_t order = 0;
+    size_t body_size = 0;
+    std::string thread_name;
+    ResponseHeader header;
+    // The holder contains exactly this frame (header and body), and body points into it.
+    bool holder_is_frame = false;
+  };
+
+  using PartialHook = std::function<void(const Partial&)>;
+
+  FrameRecorder() = default;
+
+  FrameRecorder(const FrameRecorder&) = delete;
+  void operator=(const FrameRecorder&) = delete;
+
+  ~FrameRecorder() {
+    if (final_handed_out_) {
+      // Longer than any call timeout used with it, so that a call nobody answers still finishes.
+      const auto timeout = 60s * kTimeMultiplier;
+      if (!state_->final_latch.WaitFor(timeout)) {
+        LOG(FATAL) << "No final callback after " << timeout.count()
+                   << " s; the call would outlive its response and controller";
+      }
+    }
+    // Bounded, so that a hook that never returns fails the test instead of hanging it.
+    const auto timeout = 30s * kTimeMultiplier;
+    std::unique_lock lock(state_->mutex);
+    state_->hooks_stopped = true;
+    if (!state_->hooks_running_cond.wait_for(
+            lock, timeout, [this] { return state_->hooks_running == 0; })) {
+      LOG(FATAL) << "Partial hook still running after " << timeout.count()
+                 << " s; its captured state would be destroyed under it";
+    }
+  }
+
+  PartialResponseCallback PartialCallback(PartialHook hook = nullptr) {
+    return [state = state_, hook = std::move(hook)](Slice body, RefCntBuffer holder) {
+      Partial partial;
+      partial.order = state->next_order.fetch_add(1);
+      partial.body_size = body.size();
+      partial.thread_name = CurrentThreadName();
+      rpc_test::PartialFramesResponsePB frame;
+      CHECK(frame.ParseFromArray(body.data(), narrow_cast<int>(body.size())));
+      partial.seq = frame.seq();
+      partial.payload = frame.payload();
+      partial.holder_is_frame = ParseFrame(body, holder, &partial.header);
+      if (hook) {
+        {
+          // Entered under the mutex that the destructor takes, before the hook can run.
+          std::lock_guard lock(state->mutex);
+          if (state->hooks_stopped) {
+            return;
+          }
+          ++state->hooks_running;
+        }
+        hook(partial);
+        std::lock_guard lock(state->mutex);
+        --state->hooks_running;
+        state->hooks_running_cond.notify_all();
+      }
+      std::lock_guard lock(state->mutex);
+      state->partials.push_back(std::move(partial));
+    };
+  }
+
+  ResponseCallback FinalCallback(std::function<void()> hook = nullptr) {
+    final_handed_out_ = true;
+    return [state = state_, hook = std::move(hook)] {
+      state->final_order = state->next_order.fetch_add(1);
+      state->final_thread_name = CurrentThreadName();
+      if (hook) {
+        hook();
+      }
+      state->final_latch.CountDown();
+    };
+  }
+
+  Status WaitFinal() {
+    SCHECK(state_->final_latch.WaitFor(30s * kTimeMultiplier), TimedOut, "No final callback");
+    return Status::OK();
+  }
+
+  size_t final_order() const { return state_->final_order; }
+  const std::string& final_thread_name() const { return state_->final_thread_name; }
+
+  std::vector<Partial> partials() {
+    std::lock_guard lock(state_->mutex);
+    return state_->partials;
+  }
+
+  size_t num_partials() {
+    std::lock_guard lock(state_->mutex);
+    return state_->partials.size();
+  }
+
+  Status WaitPartials(size_t count) {
+    return WaitFor(
+        [this, count] { return num_partials() >= count; }, 30s * kTimeMultiplier,
+        Format("$0 partial frames delivered", count));
+  }
+
+  int64_t PartialBodyBytes() {
+    std::lock_guard lock(state_->mutex);
+    int64_t result = 0;
+    for (const auto& partial : state_->partials) {
+      result += partial.body_size;
+    }
+    return result;
+  }
+
+ private:
+  struct State {
+    std::atomic<size_t> next_order{0};
+    std::atomic<size_t> final_order{std::numeric_limits<size_t>::max()};
+    std::string final_thread_name;
+    CountDownLatch final_latch{1};
+    std::mutex mutex;
+    std::vector<Partial> partials GUARDED_BY(mutex);
+    // Under mutex.
+    bool hooks_stopped = false;
+    int hooks_running = 0;
+    std::condition_variable hooks_running_cond;
+  };
+
+  static std::string CurrentThreadName() {
+    auto* thread = Thread::current_thread();
+    return thread ? thread->name() : std::string();
+  }
+
+  // The holder is the frame's call data: varint header length, header, varint body length, body.
+  static bool ParseFrame(Slice body, const RefCntBuffer& holder, ResponseHeader* header) {
+    google::protobuf::io::CodedInputStream in(holder.udata(), narrow_cast<int>(holder.size()));
+    uint32_t header_len = 0;
+    if (!in.ReadVarint32(&header_len)) {
+      return false;
+    }
+    auto limit = in.PushLimit(header_len);
+    if (!header->ParseFromCodedStream(&in)) {
+      return false;
+    }
+    in.PopLimit(limit);
+    uint32_t body_len = 0;
+    if (!in.ReadVarint32(&body_len)) {
+      return false;
+    }
+    auto body_offset = static_cast<size_t>(in.CurrentPosition());
+    return body_len == body.size() && body_offset + body_len == holder.size() &&
+           holder.data() + body_offset == body.cdata();
+  }
+
+  const std::shared_ptr<State> state_ = std::make_shared<State>();
+  bool final_handed_out_ = false;
+};
+
+bool IsClientReactorThread(const std::string& thread_name) {
+  return thread_name.starts_with("Client_reactor");
+}
+
+rpc_test::PartialFramesRequestPB PartialFramesRequest(uint32_t num_partials) {
+  rpc_test::PartialFramesRequestPB req;
+  req.set_num_partials(num_partials);
+  req.set_payload("partial frames payload");
+  return req;
+}
+
+// The call's entry stays in the connection with its call reset after the call timed out.
+Status WaitResetOnExpiration(RpcController* controller) {
+  return WaitFor(
+      [controller] {
+        return controller->CallStateDebugString().find("kResetOnExpiration") != std::string::npos;
+      },
+      30s * kTimeMultiplier, "Call entry reset on expiration");
+}
+
+} // namespace
+
+// Partial frames arrive in order on the reactor thread, all before the final callback, and the
+// response-bytes metric counts each frame's body once.
+TEST_F(TestRpc, PartialFramesInOrderBeforeFinal) {
+  constexpr uint32_t kNumPartials = 5;
+  PartialFramesSetup setup(this);
+  auto req = PartialFramesRequest(kNumPartials);
+  rpc_test::PartialFramesResponsePB resp;
+  RpcController controller;
+  controller.set_timeout(30s);
+  FrameRecorder recorder;
+  controller.set_partial_response_callback(recorder.PartialCallback());
+  setup.proxy().PartialFramesAsync(req, &resp, &controller, recorder.FinalCallback());
+  ASSERT_OK(recorder.WaitFinal());
+  ASSERT_OK(controller.status());
+  ASSERT_EQ(resp.seq(), kNumPartials);
+  ASSERT_EQ(resp.payload(), req.payload());
+
+  ASSERT_TRUE(setup.state().done.WaitFor(30s));
+  auto statuses = setup.state().GetStatuses();
+  ASSERT_EQ(statuses.size(), kNumPartials);
+  for (const auto& status : statuses) {
+    ASSERT_OK(status);
+  }
+
+  auto partials = recorder.partials();
+  ASSERT_EQ(partials.size(), kNumPartials);
+  for (uint32_t i = 0; i != kNumPartials; ++i) {
+    const auto& partial = partials[i];
+    ASSERT_EQ(partial.seq, i);
+    ASSERT_EQ(partial.payload, req.payload());
+    ASSERT_LT(partial.order, recorder.final_order());
+    ASSERT_TRUE(IsClientReactorThread(partial.thread_name)) << partial.thread_name;
+    ASSERT_TRUE(partial.holder_is_frame);
+    ASSERT_TRUE(partial.header.partial());
+    ASSERT_FALSE(partial.header.is_error());
+    ASSERT_EQ(partial.header.sidecar_offsets_size(), 0);
+    ASSERT_EQ(partial.header.call_id(), controller.call_id());
+  }
+  ASSERT_EQ(
+      setup.ResponseBytes(),
+      recorder.PartialBodyBytes() + static_cast<int64_t>(resp.ByteSizeLong()));
+}
+
+// With the final callback on the reactor thread, it starts only after the last partial callback
+// returned.
+TEST_F(TestRpc, PartialFramesWithReactorFinal) {
+  constexpr uint32_t kNumPartials = 5;
+  PartialFramesSetup setup(this);
+  auto req = PartialFramesRequest(kNumPartials);
+  rpc_test::PartialFramesResponsePB resp;
+  RpcController controller;
+  controller.set_timeout(30s);
+  controller.set_invoke_callback_mode(InvokeCallbackMode::kReactorThread);
+  std::atomic<size_t> partials_returned{0};
+  size_t partials_returned_at_final = 0;
+  FrameRecorder recorder;
+  controller.set_partial_response_callback(recorder.PartialCallback(
+      [&partials_returned](const FrameRecorder::Partial&) {
+        // Gives a final that could overtake the partial callback the time to do so.
+        std::this_thread::sleep_for(20ms);
+        ++partials_returned;
+      }));
+  setup.proxy().PartialFramesAsync(
+      req, &resp, &controller,
+      recorder.FinalCallback([&partials_returned, &partials_returned_at_final] {
+        partials_returned_at_final = partials_returned.load();
+      }));
+  ASSERT_OK(recorder.WaitFinal());
+  ASSERT_OK(controller.status());
+  ASSERT_EQ(resp.seq(), kNumPartials);
+  ASSERT_EQ(partials_returned_at_final, kNumPartials);
+  ASSERT_TRUE(IsClientReactorThread(recorder.final_thread_name()))
+      << recorder.final_thread_name();
+  ASSERT_TRUE(setup.state().done.WaitFor(30s));
+}
+
+// A call that times out after some partial frames gets TimedOut, and frames sent after the
+// timeout are not delivered.
+TEST_F(TestRpc, TimeoutAfterPartials) {
+  PartialFramesSetup setup(this);
+  auto req = PartialFramesRequest(2);
+  req.set_hold_after_partials(true);
+  req.set_num_late_partials(2);
+  rpc_test::PartialFramesResponsePB resp;
+  RpcController controller;
+  controller.set_timeout(2s * kTimeMultiplier);
+  FrameRecorder recorder;
+  controller.set_partial_response_callback(recorder.PartialCallback());
+  setup.proxy().PartialFramesAsync(req, &resp, &controller, recorder.FinalCallback());
+  ASSERT_OK(recorder.WaitFinal());
+  ASSERT_TRUE(controller.status().IsTimedOut()) << controller.status();
+  // Both on-time frames arrived before the timeout.
+  ASSERT_EQ(recorder.num_partials(), 2U);
+  ASSERT_OK(WaitResetOnExpiration(&controller));
+
+  setup.state().resume.CountDown();
+  ASSERT_TRUE(setup.state().done.WaitFor(30s));
+  auto statuses = setup.state().GetStatuses();
+  ASSERT_EQ(statuses.size(), 4U);
+  for (const auto& status : statuses) {
+    ASSERT_OK(status);
+  }
+  ASSERT_OK(setup.Barrier());
+  ASSERT_EQ(recorder.num_partials(), 2U);
+  ASSERT_EQ(setup.ResponseBytes(), recorder.PartialBodyBytes());
+}
+
+// The server closes the connection after two partial frames. The final callback gets a network
+// error, and no partial frame is delivered after it.
+TEST_F(TestRpc, ConnectionResetAfterPartials) {
+  PartialFramesSetup setup(this);
+  auto req = PartialFramesRequest(2);
+  req.set_hold_after_partials(true);
+  req.set_close_connection(true);
+  rpc_test::PartialFramesResponsePB resp;
+  RpcController controller;
+  controller.set_timeout(30s);
+  FrameRecorder recorder;
+  controller.set_partial_response_callback(recorder.PartialCallback());
+  setup.proxy().PartialFramesAsync(req, &resp, &controller, recorder.FinalCallback());
+  ASSERT_OK(recorder.WaitPartials(2));
+  setup.state().resume.CountDown();
+  ASSERT_OK(recorder.WaitFinal());
+  ASSERT_TRUE(controller.status().IsNetworkError()) << controller.status();
+  ASSERT_TRUE(setup.state().done.WaitFor(30s));
+
+  std::this_thread::sleep_for(500ms * kTimeMultiplier);
+  auto partials = recorder.partials();
+  ASSERT_EQ(partials.size(), 2U);
+  for (const auto& partial : partials) {
+    ASSERT_LT(partial.order, recorder.final_order());
+  }
+}
+
+// A partial frame for a call without a partial-response callback is a protocol violation. It is
+// a DFATAL, so the release build checks that the frame is dropped: only the final reaches the
+// caller, and the connection stays usable.
+TEST_F(TestRpc, YB_NEVER_DEBUG_TEST(PartialWithoutCallbackDropped)) {
+  constexpr uint32_t kNumPartials = 3;
+  PartialFramesSetup setup(this);
+  auto req = PartialFramesRequest(kNumPartials);
+  rpc_test::PartialFramesResponsePB resp;
+  RpcController controller;
+  controller.set_timeout(30s);
+  ASSERT_OK(setup.proxy().PartialFrames(req, &resp, &controller));
+  ASSERT_EQ(resp.seq(), kNumPartials);
+  ASSERT_EQ(resp.payload(), req.payload());
+  ASSERT_TRUE(setup.state().done.WaitFor(30s));
+  auto statuses = setup.state().GetStatuses();
+  ASSERT_EQ(statuses.size(), kNumPartials);
+  for (const auto& status : statuses) {
+    ASSERT_OK(status);
+  }
+  ASSERT_OK(setup.Barrier());
+  ASSERT_EQ(setup.ResponseBytes(), static_cast<int64_t>(resp.ByteSizeLong()));
+}
+
+// RespondPartial after the final response returns IllegalState (a DFATAL) and sends nothing.
+TEST_F(TestRpc, YB_NEVER_DEBUG_TEST(RespondPartialAfterFinal)) {
+  PartialFramesSetup setup(this);
+  ASSERT_OK(setup.Barrier());
+  auto received_counter = ASSERT_RESULT(GetCounter(metric_entity(), METRIC_tcp_bytes_received));
+
+  // Bytes received (by client and server) for a call and a barrier call after it.
+  auto run = [&setup, &received_counter](bool partial_after_final) -> Result<int64_t> {
+    setup.state().done.Reset(1);
+    {
+      std::lock_guard lock(setup.state().mutex);
+      setup.state().statuses.clear();
+    }
+    auto before = received_counter->value();
+    auto req = PartialFramesRequest(0);
+    req.set_partial_after_final(partial_after_final);
+    rpc_test::PartialFramesResponsePB resp;
+    RpcController controller;
+    controller.set_timeout(30s);
+    FrameRecorder recorder;
+    controller.set_partial_response_callback(recorder.PartialCallback());
+    setup.proxy().PartialFramesAsync(req, &resp, &controller, recorder.FinalCallback());
+    RETURN_NOT_OK(recorder.WaitFinal());
+    RETURN_NOT_OK(controller.status());
+    SCHECK(setup.state().done.WaitFor(30s), TimedOut, "Handler not done");
+    auto statuses = setup.state().GetStatuses();
+    if (partial_after_final) {
+      SCHECK_EQ(statuses.size(), 1U, IllegalState, "Expected one RespondPartial");
+      SCHECK(statuses[0].IsIllegalState(), IllegalState, statuses[0].ToString());
+    } else {
+      SCHECK(statuses.empty(), IllegalState, "Unexpected RespondPartial");
+    }
+    RETURN_NOT_OK(setup.Barrier());
+    SCHECK_EQ(recorder.num_partials(), 0U, IllegalState, "Unexpected partial frame");
+    return received_counter->value() - before;
+  };
+  auto bytes_without = ASSERT_RESULT(run(false));
+  auto bytes_with = ASSERT_RESULT(run(true));
+  LOG(INFO) << "Bytes received without: " << bytes_without << ", with: " << bytes_with;
+  // A partial frame takes at least 15 bytes. Call ids are varints, so their sizes can differ by a
+  // few bytes between the two runs.
+  ASSERT_LE(std::abs(bytes_with - bytes_without), 4);
+}
+
+// Fail the call from the test thread after one partial frame: the later partial frames, which
+// reach the client while the connection still tracks the failed call, are not delivered.
+TEST_F(TestRpc, MarkCallAsFailedDropsLatePartials) {
+  PartialFramesSetup setup(this);
+  auto req = PartialFramesRequest(1);
+  req.set_hold_after_partials(true);
+  req.set_num_late_partials(2);
+  req.set_hold_before_final(true);
+  rpc_test::PartialFramesResponsePB resp;
+  RpcController controller;
+  controller.set_timeout(3s * kTimeMultiplier);
+  FrameRecorder recorder;
+  controller.set_partial_response_callback(recorder.PartialCallback());
+  setup.proxy().PartialFramesAsync(req, &resp, &controller, recorder.FinalCallback());
+  ASSERT_OK(recorder.WaitPartials(1));
+  controller.MarkCallAsFailed();
+  ASSERT_OK(recorder.WaitFinal());
+  ASSERT_TRUE(controller.status().IsTimedOut()) << controller.status();
+
+  setup.state().resume.CountDown();
+  ASSERT_OK(WaitFor(
+      [&setup] { return setup.state().GetStatuses().size() == 3U; }, 30s * kTimeMultiplier,
+      "Late partial frames sent"));
+  for (const auto& status : setup.state().GetStatuses()) {
+    ASSERT_OK(status);
+  }
+  ASSERT_OK(setup.Barrier());
+  // The late frames reached the client before the call's entry expired, so they were dropped
+  // because the call had finished.
+  ASSERT_EQ(controller.CallStateDebugString().find("kResetOnExpiration"), std::string::npos);
+  ASSERT_EQ(recorder.num_partials(), 1U);
+  ASSERT_EQ(setup.ResponseBytes(), recorder.PartialBodyBytes());
+
+  // Sending the final after the expiry keeps it away from the finished call.
+  ASSERT_OK(WaitResetOnExpiration(&controller));
+  setup.state().resume_final.CountDown();
+  ASSERT_TRUE(setup.state().done.WaitFor(30s));
+  ASSERT_OK(setup.Barrier());
+  ASSERT_EQ(recorder.num_partials(), 1U);
+}
+
+// Existing methods behave the same with and without a partial-response callback, and the
+// callback is never invoked.
+TEST_F(TestRpc, NoOptInNoChange) {
+  PartialFramesSetup setup(this);
+  ASSERT_OK(setup.Barrier());
+  auto echo_bytes = ASSERT_RESULT(GetCounter(
+      metric_entity(), METRIC_proxy_response_bytes_yb_rpc_test_CalculatorService_Echo));
+  for (auto with_callback : {false, true}) {
+    SCOPED_TRACE(Format("with_callback: $0", with_callback));
+    auto token = std::make_shared<int>(0);
+    std::atomic<size_t> partial_calls{0};
+    auto install = [&](RpcController* controller) {
+      if (with_callback) {
+        controller->set_partial_response_callback([token, &partial_calls](Slice, RefCntBuffer) {
+          ++partial_calls;
+        });
+      }
+    };
+
+    {
+      rpc_test::EchoRequestPB req;
+      req.set_data("echo data");
+      rpc_test::EchoResponsePB resp;
+      RpcController controller;
+      controller.set_timeout(30s);
+      install(&controller);
+      auto before = echo_bytes->value();
+      ASSERT_OK(setup.proxy().Echo(req, &resp, &controller));
+      ASSERT_EQ(resp.data(), req.data());
+      ASSERT_EQ(echo_bytes->value() - before, static_cast<int64_t>(resp.ByteSizeLong()));
+    }
+    {
+      rpc_test::SleepRequestPB req;
+      req.set_sleep_micros(1000);
+      req.set_return_app_error(true);
+      rpc_test::SleepResponsePB resp;
+      RpcController controller;
+      controller.set_timeout(30s);
+      install(&controller);
+      auto status = setup.proxy().Sleep(req, &resp, &controller);
+      ASSERT_TRUE(status.IsRemoteError()) << status;
+      ASSERT_NE(controller.error_response(), nullptr);
+    }
+    {
+      setup.state().done.Reset(1);
+      auto req = PartialFramesRequest(0);
+      rpc_test::PartialFramesResponsePB resp;
+      RpcController controller;
+      controller.set_timeout(30s);
+      install(&controller);
+      ASSERT_OK(setup.proxy().PartialFrames(req, &resp, &controller));
+      ASSERT_EQ(resp.seq(), 0U);
+      ASSERT_TRUE(setup.state().done.WaitFor(30s));
+    }
+    ASSERT_EQ(partial_calls, 0U);
+    ASSERT_EQ(token.use_count(), 1);
+  }
+}
+
+// A shared_ptr captured by the partial-response callback is unique again once the final
+// callback has run, however the call finished. The controller keeps no reference once the call
+// started.
+TEST_F(TestRpc, PartialCallbackReleasedOnFinish) {
+  PartialFramesSetup setup(this);
+
+  enum class Finish { kOk, kTimeout, kMarkCallAsFailed };
+  for (auto finish : {Finish::kOk, Finish::kTimeout, Finish::kMarkCallAsFailed}) {
+    SCOPED_TRACE(Format("finish: $0", std::to_underlying(finish)));
+    setup.state().resume.Reset(1);
+    setup.state().resume_final.Reset(1);
+    setup.state().done.Reset(1);
+    auto token = std::make_shared<int>(0);
+    auto req = PartialFramesRequest(1);
+    req.set_hold_after_partials(true);
+    req.set_hold_before_final(finish == Finish::kMarkCallAsFailed);
+    rpc_test::PartialFramesResponsePB resp;
+    RpcController controller;
+    controller.set_timeout(finish == Finish::kOk ? 30s : 3s * kTimeMultiplier);
+    FrameRecorder recorder;
+    controller.set_partial_response_callback(
+        [token, callback = recorder.PartialCallback()](Slice body, RefCntBuffer holder) {
+          callback(body, std::move(holder));
+        });
+    ASSERT_EQ(token.use_count(), 2);
+    setup.proxy().PartialFramesAsync(req, &resp, &controller, recorder.FinalCallback());
+    ASSERT_OK(recorder.WaitPartials(1));
+    // Held by the call only.
+    ASSERT_EQ(token.use_count(), 2);
+    ASSERT_FALSE(controller.TakePartialResponseCallback());
+
+    switch (finish) {
+      case Finish::kOk:
+        setup.state().resume.CountDown();
+        ASSERT_OK(recorder.WaitFinal());
+        ASSERT_OK(controller.status());
+        ASSERT_EQ(token.use_count(), 1);
+        break;
+      case Finish::kTimeout:
+        ASSERT_OK(recorder.WaitFinal());
+        ASSERT_TRUE(controller.status().IsTimedOut()) << controller.status();
+        ASSERT_EQ(token.use_count(), 1);
+        ASSERT_OK(WaitResetOnExpiration(&controller));
+        setup.state().resume.CountDown();
+        break;
+      case Finish::kMarkCallAsFailed:
+        controller.MarkCallAsFailed();
+        ASSERT_OK(recorder.WaitFinal());
+        ASSERT_TRUE(controller.status().IsTimedOut()) << controller.status();
+        ASSERT_EQ(token.use_count(), 1);
+        setup.state().resume.CountDown();
+        ASSERT_OK(WaitResetOnExpiration(&controller));
+        setup.state().resume_final.CountDown();
+        break;
+    }
+    ASSERT_TRUE(setup.state().done.WaitFor(30s));
+    ASSERT_OK(setup.Barrier());
+    ASSERT_EQ(token.use_count(), 1);
+  }
+
+  // The request cannot be serialized, so the proxy fails the call before AsyncRequest returns.
+  {
+    auto token = std::make_shared<int>(0);
+    rpc_test::PingRequestPB req;  // Missing the required id.
+    rpc_test::PingResponsePB resp;
+    RpcController controller;
+    controller.set_timeout(30s);
+    controller.set_partial_response_callback([token](Slice, RefCntBuffer) {});
+    ASSERT_EQ(token.use_count(), 2);
+    FrameRecorder recorder;
+    setup.proxy().PingAsync(req, &resp, &controller, recorder.FinalCallback());
+    ASSERT_EQ(token.use_count(), 1);
+    ASSERT_OK(recorder.WaitFinal());
+    ASSERT_TRUE(controller.status().IsInvalidArgument()) << controller.status();
+  }
+}
+
+// Reset() releases a callback that no call took, moving a controller moves its callback, and
+// TakePartialResponseCallback() hands the callback over once.
+TEST_F(TestRpc, ResetClearsPartialCallback) {
+  auto token = std::make_shared<int>(0);
+  RpcController controller;
+  controller.set_partial_response_callback([token](Slice, RefCntBuffer) {});
+  ASSERT_EQ(token.use_count(), 2);
+  RpcController moved(std::move(controller));
+  ASSERT_EQ(token.use_count(), 2);
+  ASSERT_FALSE(controller.TakePartialResponseCallback());
+  moved.Reset();
+  ASSERT_EQ(token.use_count(), 1);
+  ASSERT_FALSE(moved.TakePartialResponseCallback());
+
+  size_t calls = 0;
+  moved.set_partial_response_callback([token, &calls](Slice, RefCntBuffer) { ++calls; });
+  ASSERT_EQ(token.use_count(), 2);
+  {
+    auto taken = moved.TakePartialResponseCallback();
+    ASSERT_TRUE(taken);
+    ASSERT_FALSE(moved.TakePartialResponseCallback());
+    ASSERT_EQ(token.use_count(), 2);
+    taken(Slice(), RefCntBuffer());
+    ASSERT_EQ(calls, 1U);
+  }
+  ASSERT_EQ(token.use_count(), 1);
+}
+
+// A local call has no frames: RespondPartial returns NotSupported, the final still arrives, and
+// the partial-response callback is dropped when the call starts.
+TEST_F(TestRpc, LocalCallRespondPartialNotSupported) {
+  PartialFramesTestState state;
+  ScopedPartialFramesTestState state_scope(&state);
+  HostPort server_addr;
+  StartTestServerWithGeneratedCode(&server_addr);
+  HostPort empty_addr;
+  ProxyCache proxy_cache(server_messenger());
+  CalculatorServiceProxy proxy(&proxy_cache, empty_addr);
+
+  auto token = std::make_shared<int>(0);
+  auto req = PartialFramesRequest(2);
+  rpc_test::PartialFramesResponsePB resp;
+  RpcController controller;
+  controller.set_timeout(30s);
+  FrameRecorder recorder;
+  controller.set_partial_response_callback(
+      [token, callback = recorder.PartialCallback()](Slice body, RefCntBuffer holder) {
+        callback(body, std::move(holder));
+      });
+  ASSERT_EQ(token.use_count(), 2);
+  proxy.PartialFramesAsync(req, &resp, &controller, recorder.FinalCallback());
+  ASSERT_EQ(token.use_count(), 1);
+  ASSERT_OK(recorder.WaitFinal());
+  ASSERT_OK(controller.status());
+  ASSERT_EQ(resp.seq(), 0U);
+  ASSERT_TRUE(state.done.WaitFor(30s));
+  auto statuses = state.GetStatuses();
+  ASSERT_EQ(statuses.size(), 2U);
+  for (const auto& status : statuses) {
+    ASSERT_TRUE(status.IsNotSupported()) << status;
+  }
+  ASSERT_EQ(recorder.num_partials(), 0U);
+}
+
+// Partial frames carry a valid CRC when rpc_enable_crc is set, and none otherwise.
+TEST_F(TestRpc, PartialFramesWithCrc) {
+  constexpr uint32_t kNumPartials = 3;
+  PartialFramesSetup setup(this);
+  for (auto use_crc : {false, true}) {
+    SCOPED_TRACE(Format("use_crc: $0", use_crc));
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_enable_crc) = use_crc;
+    setup.state().done.Reset(1);
+    auto req = PartialFramesRequest(kNumPartials);
+    req.set_payload(RandomHumanReadableString(1000));
+    rpc_test::PartialFramesResponsePB resp;
+    RpcController controller;
+    controller.set_timeout(30s);
+    FrameRecorder recorder;
+    controller.set_partial_response_callback(recorder.PartialCallback());
+    setup.proxy().PartialFramesAsync(req, &resp, &controller, recorder.FinalCallback());
+    ASSERT_OK(recorder.WaitFinal());
+    ASSERT_OK(controller.status());
+    ASSERT_EQ(resp.seq(), kNumPartials);
+    ASSERT_EQ(resp.payload(), req.payload());
+    auto partials = recorder.partials();
+    ASSERT_EQ(partials.size(), kNumPartials);
+    for (uint32_t i = 0; i != kNumPartials; ++i) {
+      ASSERT_EQ(partials[i].seq, i);
+      ASSERT_EQ(partials[i].payload, req.payload());
+      ASSERT_TRUE(partials[i].holder_is_frame);
+      ASSERT_TRUE(partials[i].header.partial());
+      ASSERT_EQ(partials[i].header.has_crc(), use_crc);
+    }
+    ASSERT_TRUE(setup.state().done.WaitFor(30s));
+  }
+}
+
+// A call forced to look stuck ignores partial frames as it ignores the final response.
+TEST_F(TestRpc, ForcedStuckCallIgnoresPartials) {
+  PartialFramesSetup setup(this);
+  auto token = std::make_shared<int>(0);
+  auto req = PartialFramesRequest(2);
+  rpc_test::PartialFramesResponsePB resp;
+  RpcController controller;
+  controller.set_timeout(30s);
+  controller.TEST_force_stuck_outbound_call();
+  FrameRecorder recorder;
+  controller.set_partial_response_callback(
+      [token, callback = recorder.PartialCallback()](Slice body, RefCntBuffer holder) {
+        callback(body, std::move(holder));
+      });
+  setup.proxy().PartialFramesAsync(req, &resp, &controller, recorder.FinalCallback());
+  ASSERT_TRUE(setup.state().done.WaitFor(30s));
+  ASSERT_EQ(setup.state().GetStatuses().size(), 2U);
+  ASSERT_OK(setup.Barrier());
+  ASSERT_EQ(recorder.num_partials(), 0U);
+  ASSERT_FALSE(controller.finished());
+  ASSERT_EQ(token.use_count(), 2);
+
+  controller.MarkCallAsFailed();
+  ASSERT_OK(recorder.WaitFinal());
+  ASSERT_TRUE(controller.status().IsTimedOut()) << controller.status();
+  ASSERT_EQ(token.use_count(), 1);
+  ASSERT_EQ(recorder.num_partials(), 0U);
 }
 
 #if YB_GPERFTOOLS_TCMALLOC

@@ -216,6 +216,25 @@ class RpcContext {
 
   static void RespondSuccess(InboundCall* call);
 
+  // Sends 'response' as a partial response frame: one part of this call's response, delivered to
+  // the caller's partial-response callback before the final response. The context is not
+  // consumed, handler latency is not recorded, and a final RespondSuccess/RespondFailure is still
+  // required. 'response' is a separate message, not this call's response PB; it is serialized
+  // before this returns, or not used at all, so the caller may destroy or reuse it right after.
+  //
+  // Call it only if the request asked for partial frames: the RPC layer cannot check that, and a
+  // client that did not opt in (or predates partial frames) cannot handle them. Partial frames
+  // carry no sidecars.
+  //
+  // Frames reach the wire in the order RespondPartial and Respond* were called, provided they
+  // are all called off the reactor thread (service handlers run on the service pool). The caller
+  // serializes its own calls; RespondPartial concurrent with the final response is a caller bug.
+  //
+  // Returns NotSupported for calls without frames (local calls), IllegalState
+  // after the final response (also a DFATAL), otherwise the status of queueing the frame. A
+  // caller can fall back to answering everything in the final response on any error.
+  Status RespondPartial(AnyMessageConstPtr response);
+
   // Respond with an error to the client. This sends back an error with the code
   // ERROR_APPLICATION. Because there is no more specific error code passed back
   // to the client, most applications should create a custom error PB extension

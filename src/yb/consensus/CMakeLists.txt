@@ -125,6 +125,7 @@ set(CONSENSUS_SRCS
   multi_raft_batcher.cc
   peer_manager.cc
   quorum_util.cc
+  raft_async_wait_sweeper.cc
   raft_consensus.cc
   replica_state.cc
   replicate_msgs_holder.cc
@@ -166,7 +167,9 @@ ADD_YB_TEST(log_anchor_registry-test)
 ADD_YB_TEST(log_cache-test)
 ADD_YB_TEST(log_index-test)
 ADD_YB_TEST(mt-log-test)
+ADD_YB_TEST(multi_raft_batcher-test)
 ADD_YB_TEST(quorum_util-test)
+ADD_YB_TEST(raft_async_wait_sweeper-test)
 ADD_YB_TEST(raft_consensus_quorum-test)
 ADD_YB_TEST(replica_state-test)
 ADD_YB_TEST(log_util-test)

@@ -52,7 +52,9 @@ class ErrorStatusPB;
 // Controller for managing properties of a single RPC call, on the client side.
 //
 // An RpcController maps to exactly one call and is not thread-safe. RpcController can be reused
-// for another call to avoid extra destruction/construction, see RpcController::Reset.
+// for another call to avoid extra destruction/construction, see RpcController::Reset. A call has
+// one final response; it may also deliver partial response frames before it, if the caller
+// installed a partial-response callback (see set_partial_response_callback).
 // The client may use this class prior to sending an RPC in order to set properties such
 // as the call's timeout.
 //
@@ -72,7 +74,8 @@ class RpcController {
   void Swap(RpcController* other);
 
   // Reset this controller so it may be used with another call.
-  // Note that reset doesn't reset controller's properties except the call itself.
+  // Note that reset doesn't reset controller's properties except the call itself and a
+  // partial-response callback that no call has taken yet.
   void Reset();
 
   // Return true if the call has finished.
@@ -139,6 +142,30 @@ class RpcController {
 
   InvokeCallbackMode invoke_callback_mode() { return invoke_callback_mode_; }
 
+  // Asks for the partial response frames of the next call made with this controller. Set it
+  // before the call; the server sends partial frames only if the request asks for them, which is
+  // the application's protocol (the RPC layer only delivers them).
+  //
+  // - The callback runs on the reactor thread, once per frame in frame order, and must not block.
+  //   It gets the frame body and a holder that owns it, see PartialResponseCallback.
+  // - When the final response completes the call on the reactor (a response, a timeout, a
+  //   connection failure), no partial callback runs after the final callback. A final triggered
+  //   on another thread (MarkCallAsFailed, a send failure inside the proxy) can race with a
+  //   partial callback already in progress on the reactor, which may finish after the final
+  //   callback started. Callers needing exactly-once delivery per item must synchronize the two.
+  // - Frames arriving after the call finished (timed out, failed, or completed) are dropped. The
+  //   call's timeout covers the whole call; partial frames do not extend it.
+  // - Partial frames have no sidecars. Their bodies count toward the method's response bytes.
+  // - The proxy moves the callback into the call when the call starts, and the call releases it
+  //   when it reaches a final state, before the final callback is invoked (an in-progress partial
+  //   callback keeps its own reference until it returns). So the callback may capture state that
+  //   owns this controller. Local calls never deliver partial frames and drop the callback.
+  void set_partial_response_callback(PartialResponseCallback callback);
+
+  // Moves the partial-response callback out of the controller, leaving none set. For code that
+  // completes calls without a proxy; the proxy moves the callback into the call itself.
+  PartialResponseCallback TakePartialResponseCallback();
+
   // Return the configured timeout.
   MonoDelta timeout() const;
 
@@ -203,6 +230,11 @@ class RpcController {
 
   // Taken by the next call, so it does not stay referenced from the controller.
   std::shared_ptr<void> local_call_buffers_holder_;
+
+  // Taken by the next call, so it does not stay referenced from the controller. Never shared
+  // while the controller holds it; a pointer keeps controllers without a callback small, and the
+  // call takes it without another allocation.
+  std::shared_ptr<PartialResponseCallback> partial_response_callback_;
 
   DISALLOW_COPY_AND_ASSIGN(RpcController);
 };

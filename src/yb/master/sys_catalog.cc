@@ -58,6 +58,7 @@
 #include "yb/consensus/multi_raft_batcher.h"
 #include "yb/consensus/opid_util.h"
 #include "yb/consensus/quorum_util.h"
+#include "yb/consensus/raft_async_wait_sweeper.h"
 #include "yb/consensus/retryable_requests.h"
 #include "yb/consensus/state_change_context.h"
 
@@ -246,6 +247,12 @@ void SysCatalogTable::StartShutdown() {
 
   if (multi_raft_manager_) {
     multi_raft_manager_->StartShutdown();
+  }
+
+  // As in TSTabletManager::StartShutdown: before the messenger's scheduler shuts down, finishing
+  // every pending wait.
+  if (raft_async_wait_sweeper_) {
+    raft_async_wait_sweeper_->Shutdown(consensus::RaftAsyncWaitSweeper::ShutdownStatus());
   }
 }
 
@@ -598,7 +605,14 @@ void SysCatalogTable::SetupTabletPeer(const scoped_refptr<tablet::RaftGroupMetad
 
   multi_raft_manager_ = std::make_unique<consensus::MultiRaftManager>(master_->messenger(),
                                                                       &master_->proxy_cache(),
-                                                                      local_peer_pb_.cloud_info());
+                                                                      local_peer_pb_.cloud_info(),
+                                                                      metric_entity_);
+  // The previous peer, if any, has shut down or never started (see the member comment).
+  if (raft_async_wait_sweeper_) {
+    raft_async_wait_sweeper_->Shutdown(consensus::RaftAsyncWaitSweeper::ShutdownStatus());
+  }
+  raft_async_wait_sweeper_ = std::make_shared<consensus::RaftAsyncWaitSweeper>(
+      &master_->messenger()->scheduler());
 
   if (!persistence_gate_) {
     // With the op's term: a catalog write admitted while this master was ready in an earlier term
@@ -731,6 +745,7 @@ Status SysCatalogTable::OpenTablet(const scoped_refptr<tablet::RaftGroupMetadata
           raft_pool(),
           snapshot_cleanup_pool(),
           raft_notifications_pool(),
+          raft_async_wait_sweeper_.get(),
           tablet_prepare_pool(),
           &retryable_requests,
           bootstrap_state_manager,
