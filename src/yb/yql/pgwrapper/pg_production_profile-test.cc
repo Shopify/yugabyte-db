@@ -1948,15 +1948,19 @@ std::string CatCacheMissesToString(const CatCacheMisses& misses) {
 }
 
 // Whitelist tokens that DoMetricsSnapshot (metrics_snapshotter.cc) handles itself, with the rows
-// each tserver writes for them on every snapshot: node_up with entity_type "tserver", the cpu and
-// disk rows with "table". The cpu rows are written only when the /proc tick reads succeed. Any
-// other token is matched against the tserver's Prometheus metric names and written, with
-// entity_type "tserver", under its own name. Every row's node is the writing tserver's uuid.
+// it writes for them: node_up and the connection counts with entity_type "tserver", the cpu and
+// disk rows with "table". Each tserver writes the node_up, cpu and disk rows on every snapshot,
+// the cpu rows only when the /proc tick reads succeed. The ysql_conn_mgr rows are written only
+// while the YSQL connection manager runs with enable_ysql_conn_mgr_stats. Any other token is
+// matched against the tserver's Prometheus metric names and written, with entity_type
+// "tserver", under its own name. Every row's node is the writing tserver's uuid.
 const std::map<std::string, std::vector<std::string>> kSnapshotterTokenRows = {
   {"cpu_usage", {"cpu_usage_user", "cpu_usage_system"}},
   {"disk_usage", {"total_disk", "free_disk"}},
   {"node_up", {"node_up"}},
+  {"ysql_conn_mgr", {"total_logical_connections", "total_physical_connections"}},
 };
+const std::string kConnMgrToken = "ysql_conn_mgr";
 
 std::vector<std::string> SnapshotRowsOf(const std::string& token) {
   const auto it = kSnapshotterTokenRows.find(token);
@@ -2103,9 +2107,9 @@ void PgProductionProfileTest::CheckMetricsSnapshotter() {
   const auto* whitelist = tserver_profile_.FindActive(kWhitelistKey);
   ASSERT_NE(whitelist, nullptr) << "Metrics snapshotter: the tserver profile sets no --"
                                 << kWhitelistKey;
-  // Tokens the snapshotter handles itself are written by every tserver on every snapshot. A
-  // server metric is written by each tserver that exports it, which depends on the metric rather
-  // than on the whitelist, so only at least one tserver is expected to write it.
+  // Tokens the snapshotter handles itself, ysql_conn_mgr aside, are written by every tserver on
+  // every snapshot. A server metric is written by each tserver that exports it, which depends on
+  // the metric rather than on the whitelist, so only at least one tserver is expected to write it.
   std::set<std::string> on_every_node;
   std::set<std::string> on_some_node;
   std::set<std::string> never;
@@ -2115,6 +2119,16 @@ void PgProductionProfileTest::CheckMetricsSnapshotter() {
     const auto trimmed = TrimWhitespace(token);
     // An empty token matches no metric and writes no row; there is nothing to expect.
     if (trimmed.empty()) {
+      continue;
+    }
+    // Its rows need the YSQL connection manager, which production does not run and this test
+    // skips for, so neither form says anything about how the whitelist is parsed.
+    if (trimmed == kConnMgrToken) {
+      ASSERT_NE(trimmed, token)
+          << "Metrics snapshotter: --" << kWhitelistKey << " lists " << kConnMgrToken
+          << ", whose rows (" << JoinStrings(SnapshotRowsOf(kConnMgrToken), ", ")
+          << ") need the YSQL connection manager, which neither production nor this test runs; "
+          << "decide its expectation";
       continue;
     }
     const auto rows = SnapshotRowsOf(trimmed);
