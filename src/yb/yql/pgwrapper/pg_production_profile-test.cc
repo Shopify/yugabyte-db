@@ -688,6 +688,9 @@ class PgProductionProfileTest : public LibPqTestBase {
   // Bounds a login that is expected to be rejected: PGConn::Connect retries most rejections,
   // including "no password supplied", until its deadline (60 s by default).
   static constexpr size_t kRejectedConnectTimeoutSec = 3;
+  // Bounds a login that should succeed on a tserver already known to accept logins, so a
+  // regression fails fast instead of retrying for the default 60 s.
+  static constexpr size_t kLoginTimeoutSec = 10;
 
   DaemonProfile master_profile_;
   DaemonProfile tserver_profile_;
@@ -889,13 +892,17 @@ void PgProductionProfileTest::CheckFlagReadback() {
   std::map<DaemonKey, std::vector<std::string>> live_values;
   // M is keyed by daemon type, so also require all daemons of a type to agree.
   std::vector<std::string> inconsistent;
+  // Kept out of M: a SUBSTITUTED key that cannot be read would otherwise pass as "differs".
+  std::vector<std::string> read_errors;
+  std::set<DaemonKey> unreadable;
   for (const auto& daemon : {kMasterDaemon, kTServerDaemon}) {
     const auto daemons = DaemonsOf(daemon);
     for (const auto& entry : ProfileOf(daemon).entries) {
       // Skipped here, and what covers them:
-      // - DROPPED markers carry no value; T1 checks the key is still a known, non-deprecated flag.
+      // - DROPPED markers carry no value; FlagfilesParseCleanly checks the key is still a known,
+      //   non-deprecated flag.
       // - kBootstrapDeferredFlags are not in the master's boot copy, so the master runs the
-      //   default; T1 checks the full file's value against --helpxml.
+      //   default; FlagfilesParseCleanly checks the full file's value against --helpxml.
       // - kKnownUnrecognizedFlags are not gflags; CheckPgTaggedFlags checks the GUCs they were
       //   meant for.
       // - kOtherDaemonOnlyFlags keys in the profile of the daemon that does not define them:
@@ -920,21 +927,25 @@ void PgProductionProfileTest::CheckFlagReadback() {
         expected_m.insert(daemon_key);
       }
       file_values[daemon_key] = entry.value;
+      size_t num_read = 0;
       size_t num_differ = 0;
       for (const auto& [name, process] : daemons) {
         auto live = process->GetFlag(entry.key);
         if (live.ok()) {
+          ++num_read;
           num_differ += !ProfileValuesMatch(entry.value, *live);
           live_values[daemon_key].push_back(Format("$0 '$1'", name, *live));
         } else {
-          ++num_differ;
-          live_values[daemon_key].push_back(Format("$0 <$1>", name, live.status()));
+          read_errors.push_back(Format(
+              "$0: GetFlag($1) failed: $2", name, entry.key, live.status()));
+          live_values[daemon_key].push_back(Format("$0 <read failed>", name));
+          unreadable.insert(daemon_key);
         }
       }
       if (num_differ > 0) {
         m.insert(daemon_key);
       }
-      if (num_differ != 0 && num_differ != daemons.size()) {
+      if (num_differ != 0 && num_differ != num_read) {
         inconsistent.push_back(Format(
             "$0 --$1: daemons disagree (file '$2'; live $3)", daemon, entry.key, entry.value,
             JoinStrings(live_values[daemon_key], ", ")));
@@ -946,17 +957,23 @@ void PgProductionProfileTest::CheckFlagReadback() {
 
   std::set<DaemonKey> reported(m);
   reported.insert(expected_m.begin(), expected_m.end());
+  reported.insert(unreadable.begin(), unreadable.end());
   std::vector<std::string> details;
   for (const auto& daemon_key : reported) {
-    const auto* verdict = !expected_m.contains(daemon_key)
-        ? "UNEXPECTED: active value did not apply"
-        : !m.contains(daemon_key) ? "UNEXPECTED: SUBSTITUTED value is no longer overridden"
-                                  : "SUBSTITUTED, differs as expected";
+    const char* verdict = "SUBSTITUTED, differs as expected";
+    if (unreadable.contains(daemon_key)) {
+      verdict = "UNEXPECTED: GetFlag failed";
+    } else if (!expected_m.contains(daemon_key)) {
+      verdict = "UNEXPECTED: active value did not apply";
+    } else if (!m.contains(daemon_key)) {
+      verdict = "UNEXPECTED: SUBSTITUTED value is no longer overridden";
+    }
     details.push_back(Format(
         "$0 --$1 [$2]: file '$3'; live $4", daemon_key.first, daemon_key.second, verdict,
         file_values[daemon_key], JoinStrings(live_values[daemon_key], ", ")));
   }
-  ASSERT_TRUE(m == expected_m && inconsistent.empty())
+  ASSERT_TRUE(read_errors.empty() && m == expected_m && inconsistent.empty())
+      << JoinStrings(read_errors, "\n") << "\n"
       << "M:           " << DaemonKeysToString(m) << "\n"
       << "SUBSTITUTED: " << DaemonKeysToString(expected_m) << "\n"
       << JoinStrings(details, "\n") << "\n" << JoinStrings(inconsistent, "\n");
@@ -1234,7 +1251,7 @@ void PgProductionProfileTest::CheckHbaBehavior(PGConn* conn) {
   // Not discriminating on its own: WritePgHbaConfig (pg_wrapper.cc) appends
   // "local all yugabyte trust" whatever the profile says, while
   // ysql_trust_local_yugabyte_connections is at its default (true).
-  ASSERT_OK(ConnectUnixSocket(*pg_ts, kSuperuser));
+  ASSERT_OK(ConnectUnixSocket(*pg_ts, kSuperuser, kDefaultDb, kLoginTimeoutSec));
   ASSERT_NOK_STR_CONTAINS(
       ConnectTcp(*pg_ts, kSuperuser, /* password= */ "", kDefaultDb, kRejectedConnectTimeoutSec),
       "no password supplied");
@@ -1242,7 +1259,7 @@ void PgProductionProfileTest::CheckHbaBehavior(PGConn* conn) {
   // A passwordless non-superuser: only the profile's "local all all trust" lets carol in over the
   // socket, and over TCP the md5 lines ask for a password she does not have.
   ASSERT_OK(conn->Execute("CREATE ROLE carol LOGIN"));
-  auto carol = ASSERT_RESULT(ConnectUnixSocket(*pg_ts, "carol"));
+  auto carol = ASSERT_RESULT(ConnectUnixSocket(*pg_ts, "carol", kDefaultDb, kLoginTimeoutSec));
   ASSERT_FALSE(ASSERT_RESULT(
       carol.FetchRow<bool>("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")));
   ASSERT_NOK_STR_CONTAINS(
