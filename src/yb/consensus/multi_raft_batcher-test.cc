@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -39,7 +41,6 @@
 #include "yb/util/memory/arena.h"
 #include "yb/util/metrics.h"
 #include "yb/util/random_util.h"
-#include "yb/util/scope_exit.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_thread_holder.h"
 #include "yb/util/test_util.h"
@@ -83,7 +84,10 @@ METRIC_DECLARE_event_stats(multi_raft_frame_slots);
 
 namespace yb::consensus {
 
+class MultiRaftBatcherTest;
+
 using RequestKind = MultiRaftBatcher::RequestKind;
+using ScopedSendHook = FakeBatchSenderState::ScopedSendHook;
 using std::chrono::steady_clock;
 
 namespace {
@@ -99,7 +103,6 @@ struct TestCall {
   // A copy of the response the callback got, made after on_callback returns.
   ConsensusResponsePB response;
   MultiRaftBatcher::BatchHandle handle;
-  std::function<void()> on_callback;
 
   Status status;
   bool had_response = false;
@@ -109,6 +112,73 @@ struct TestCall {
   std::thread::id thread_id;
   std::atomic<int> num_callbacks{0};
   std::atomic<bool> done{false};
+
+  // Called by the callback: runs on_callback if one is installed.
+  void RunOnCallback() {
+    std::function<void()> callback;
+    {
+      std::lock_guard lock(callback_mutex_);
+      if (!on_callback_) {
+        return;
+      }
+      // Entered under the mutex that ScopedOnCallback takes, before the callback can run.
+      callback = on_callback_;
+      ++callbacks_running_;
+    }
+    callback();
+    callback = nullptr;
+    std::lock_guard lock(callback_mutex_);
+    --callbacks_running_;
+    callbacks_running_cond_.notify_all();
+  }
+
+ private:
+  friend class ScopedOnCallback;
+  friend class yb::consensus::MultiRaftBatcherTest;
+
+  std::mutex callback_mutex_;
+  std::condition_variable callbacks_running_cond_;
+  // Set by NewCall, for callbacks that capture only state the fixture owns, or by
+  // ScopedOnCallback.
+  std::function<void()> on_callback_;
+  int callbacks_running_ = 0;
+};
+
+// Installs a call's on_callback for its lifetime. On destruction it runs release, which unblocks a
+// callback waiting on the test, then uninstalls the callback and waits for a running one to
+// return; one that has not started yet runs nothing. So the callback never runs after the locals
+// it captures, on success or on an early ASSERT exit: declare the scope after them.
+class ScopedOnCallback {
+ public:
+  ScopedOnCallback(
+      TestCall& call, std::function<void()> on_callback, std::function<void()> release = {})
+      : call_(call), release_(std::move(release)) {
+    std::lock_guard lock(call_.callback_mutex_);
+    CHECK(!call_.on_callback_) << call_.tablet_id;
+    call_.on_callback_ = std::move(on_callback);
+  }
+
+  ~ScopedOnCallback() {
+    if (release_) {
+      release_();
+    }
+    // Bounded, so that a callback that is never released fails the test instead of hanging it.
+    const auto timeout = 30s * kTimeMultiplier;
+    std::unique_lock lock(call_.callback_mutex_);
+    call_.on_callback_ = nullptr;
+    if (!call_.callbacks_running_cond_.wait_for(
+            lock, timeout, [this] { return call_.callbacks_running_ == 0; })) {
+      LOG(FATAL) << "on_callback of " << call_.tablet_id << " still running after "
+                 << timeout.count() << " s; its captured state would be destroyed under it";
+    }
+  }
+
+  ScopedOnCallback(const ScopedOnCallback&) = delete;
+  void operator=(const ScopedOnCallback&) = delete;
+
+ private:
+  TestCall& call_;
+  const std::function<void()> release_;
 };
 
 std::vector<std::string> Tablets(std::initializer_list<std::string> ids) {
@@ -169,7 +239,8 @@ class MultiRaftBatcherTest : public YBTest {
     return MakeRequest(tablet_id, payload_bytes).ByteSizeLong();
   }
 
-  // Creates a call without adding it to the batcher.
+  // Creates a call without adding it to the batcher. on_callback may capture only state that the
+  // fixture owns; use ScopedOnCallback for one that captures test body locals.
   TestCall& NewCall(
       const std::string& tablet_id, size_t payload_bytes = 100,
       std::function<void()> on_callback = {}, int num_ops = 0) {
@@ -177,7 +248,7 @@ class MultiRaftBatcherTest : public YBTest {
     call.tablet_id = tablet_id;
     call.request = call.arena.NewObject<LWConsensusRequestPB>(
         &call.arena, MakeRequest(tablet_id, payload_bytes, num_ops));
-    call.on_callback = std::move(on_callback);
+    call.on_callback_ = std::move(on_callback);
     return call;
   }
 
@@ -200,9 +271,7 @@ class MultiRaftBatcherTest : public YBTest {
           call.on_reactor = IsReactorThread();
           call.thread_id = std::this_thread::get_id();
           ++call.num_callbacks;
-          if (call.on_callback) {
-            call.on_callback();
-          }
+          call.RunOnCallback();
           // Read after on_callback, which may block: holder keeps the response valid.
           if (response) {
             response->ToGoogleProtobuf(&call.response);
@@ -289,22 +358,25 @@ class MultiRaftBatcherTest : public YBTest {
   // Sends the calls in one streamed envelope and returns its index. They are parked behind an
   // envelope that carries one data request and is not streamed, and sent by the response-clocked
   // flush when that one completes. No data envelope may be in flight.
-  size_t SendStreamed(const std::vector<std::pair<TestCall*, RequestKind>>& calls) {
+  Result<size_t> SendStreamed(const std::vector<std::pair<TestCall*, RequestKind>>& calls) {
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = false;
     const auto blocker_idx = NumEnvelopes();
     auto& blocker = Add(Format("blocker-$0", blocker_idx), RequestKind::kData);
-    CHECK_EQ(NumEnvelopes(), blocker_idx + 1);
+    SCHECK_EQ(NumEnvelopes(), blocker_idx + 1, IllegalState, "Blocker not sent");
     for (const auto& [call, kind] : calls) {
       Submit(*call, kind);
     }
-    CHECK_EQ(NumEnvelopes(), blocker_idx + 1);
+    SCHECK_EQ(NumEnvelopes(), blocker_idx + 1, IllegalState, "Calls not parked");
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = true;
-    CHECK(sender_state_->Complete(blocker_idx, Status::OK(), &FillResponse));
-    CHECK_OK(WaitFor([this, &blocker] { return IsDone(blocker); }, 10s, "Blocker"));
-    CHECK_EQ(NumEnvelopes(), blocker_idx + 2);
+    SCHECK(sender_state_->Complete(blocker_idx, Status::OK(), &FillResponse), IllegalState,
+           "Blocker already completed");
+    RETURN_NOT_OK(WaitFor([this, &blocker] { return IsDone(blocker); }, 10s, "Blocker"));
+    SCHECK_EQ(NumEnvelopes(), blocker_idx + 2, IllegalState, "Calls not sent");
     auto envelope = GetEnvelope(blocker_idx + 1);
-    CHECK(envelope->req.stream_responses());
-    CHECK_EQ(static_cast<size_t>(envelope->req.consensus_request_size()), calls.size());
+    SCHECK(envelope->req.stream_responses(), IllegalState, "Envelope not streamed");
+    SCHECK_EQ(
+        static_cast<size_t>(envelope->req.consensus_request_size()), calls.size(), IllegalState,
+        "Calls not in one envelope");
     return blocker_idx + 1;
   }
 
@@ -341,10 +413,14 @@ class MultiRaftBatcherTest : public YBTest {
         pending.push_back(call.get());
       }
     }
+    // Give dispatched tasks a chance to finish; ignore calls that were never completed. One
+    // budget for all, so that a test that fails with many calls in flight is not held for a
+    // second per call.
+    const auto deadline = steady_clock::now() + 1s;
     for (auto* call : pending) {
-      // Give dispatched tasks a chance to finish; ignore calls that were never completed.
-      auto status = WaitFor([this, call] { return IsDone(*call); }, 1s, "Callback");
-      (void)status;
+      while (!IsDone(*call) && steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(1ms);
+      }
     }
   }
 
@@ -799,13 +875,16 @@ TEST_F(MultiRaftBatcherTest, HeartbeatOnlyEnvelopeUnchanged) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_multi_raft_batch_size) = 3;
   CreateBatcher();
   std::vector<std::string> order;
-  auto record = [&order](const std::string& id) {
-    return [&order, id] { order.push_back(id); };
-  };
-  auto& h1 = Add("t1", RequestKind::kHeartbeat, 100, record("t1"));
-  auto& h2 = Add("t2", RequestKind::kHeartbeat, 100, record("t2"));
+  auto& h1 = NewCall("t1");
+  auto& h2 = NewCall("t2");
+  auto& h3 = NewCall("t3");
+  ScopedOnCallback h1_callback(h1, [&order] { order.push_back("t1"); });
+  ScopedOnCallback h2_callback(h2, [&order] { order.push_back("t2"); });
+  ScopedOnCallback h3_callback(h3, [&order] { order.push_back("t3"); });
+  Submit(h1, RequestKind::kHeartbeat);
+  Submit(h2, RequestKind::kHeartbeat);
   ASSERT_EQ(NumEnvelopes(), 0);
-  auto& h3 = Add("t3", RequestKind::kHeartbeat, 100, record("t3"));
+  Submit(h3, RequestKind::kHeartbeat);
   ASSERT_EQ(NumEnvelopes(), 1);
   auto envelope = GetEnvelope(0);
   ASSERT_EQ(envelope->tablet_ids, Tablets({"t1", "t2", "t3"}));
@@ -894,8 +973,13 @@ TEST_F(MultiRaftBatcherTest, DataSubCallbacksRunAsSeparateHighPoolTasks) {
       ++concurrent;
     }
   };
-  auto& d2 = Add("t2", RequestKind::kData, 100, rendezvous);
-  auto& d3 = Add("t3", RequestKind::kData, 100, rendezvous);
+  auto release = [&latch] { latch.CountDown(2); };
+  auto& d2 = NewCall("t2");
+  auto& d3 = NewCall("t3");
+  ScopedOnCallback d2_callback(d2, rendezvous, release);
+  ScopedOnCallback d3_callback(d3, rendezvous, release);
+  Submit(d2, RequestKind::kData);
+  Submit(d3, RequestKind::kData);
   Complete(0);
   ASSERT_EQ(GetEnvelope(1)->tablet_ids, Tablets({"t2", "t3"}));
   Complete(1);
@@ -1064,8 +1148,8 @@ TEST_F(MultiRaftBatcherTest, BatchHandleTimeoutAndFinished) {
 
   // Completed while its sub-callback still holds the batch.
   CountDownLatch release_d1(1);
-  d1.on_callback = [&release_d1] { release_d1.Wait(); };
-  auto release_on_failure = ScopeExit([&release_d1] { release_d1.CountDown(); });
+  ScopedOnCallback d1_callback(
+      d1, [&release_d1] { release_d1.Wait(); }, [&release_d1] { release_d1.CountDown(); });
   Complete(0);
   ASSERT_FALSE(d1.handle.expired());
   ASSERT_TRUE(d1.handle.finished());
@@ -1169,7 +1253,7 @@ TEST_F(MultiRaftBatcherTest, EnvelopeReferencesRequest) {
   auto& h1 = NewCall("t1");
   auto& d2 = NewCall("t2");
   std::vector<const LWConsensusRequestPB*> referenced;
-  sender_state_->SetSendHook([this, &referenced](size_t envelope_idx) {
+  ScopedSendHook hook(sender_state_, [this, &referenced](size_t envelope_idx) {
     for (const auto& request : GetEnvelope(envelope_idx)->lw_req->consensus_request()) {
       referenced.push_back(&request);
     }
@@ -1196,7 +1280,7 @@ TEST_F(MultiRaftBatcherTest, HolderReleasedAfterSerialize) {
   auto holder = AddHeldOp(d1, &weak_msg);
   ASSERT_EQ(weak_msg.use_count(), 1);
   std::atomic<bool> alive_in_send{false};
-  sender_state_->SetSendHook([&weak_msg, &alive_in_send](size_t) {
+  ScopedSendHook hook(sender_state_, [&weak_msg, &alive_in_send](size_t) {
     alive_in_send = !weak_msg.expired();
   });
   Submit(d1, RequestKind::kData, std::move(holder));
@@ -1252,15 +1336,17 @@ TEST_F(MultiRaftBatcherTest, BatchedResponseOutlivesDispatch) {
   std::atomic<bool> h2_batch_alive{false};
   CountDownLatch d1_entered(1);
   CountDownLatch release_d1(1);
-  auto release_on_failure = ScopeExit([&release_d1] { release_d1.CountDown(); });
-  d1.on_callback = [&d1, &d1_batch_alive, &d1_entered, &release_d1] {
-    d1_entered.CountDown();
-    release_d1.Wait();
-    d1_batch_alive = !d1.handle.expired();
-  };
-  h2.on_callback = [&h2, &h2_batch_alive] {
+  ScopedOnCallback d1_callback(
+      d1,
+      [&d1, &d1_batch_alive, &d1_entered, &release_d1] {
+        d1_entered.CountDown();
+        release_d1.Wait();
+        d1_batch_alive = !d1.handle.expired();
+      },
+      [&release_d1] { release_d1.CountDown(); });
+  ScopedOnCallback h2_callback(h2, [&h2, &h2_batch_alive] {
     h2_batch_alive = !h2.handle.expired();
-  };
+  });
   Submit(h2, RequestKind::kHeartbeat);
   Submit(d1, RequestKind::kData);
   ASSERT_EQ(NumEnvelopes(), 1);
@@ -1341,12 +1427,14 @@ TEST_F(MultiRaftBatcherTest, StreamedPerSlotDelivery) {
   auto& d2 = NewCall("t2");
   CountDownLatch d1_entered(1);
   CountDownLatch release_d1(1);
-  auto release_on_failure = ScopeExit([&release_d1] { release_d1.CountDown(); });
-  d1.on_callback = [&d1_entered, &release_d1] {
-    d1_entered.CountDown();
-    release_d1.Wait();
-  };
-  const auto env = SendStreamed(DataCalls({&d0, &d1, &d2}));
+  ScopedOnCallback d1_callback(
+      d1,
+      [&d1_entered, &release_d1] {
+        d1_entered.CountDown();
+        release_d1.Wait();
+      },
+      [&release_d1] { release_d1.CountDown(); });
+  const auto env = ASSERT_RESULT(SendStreamed(DataCalls({&d0, &d1, &d2})));
   ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {1})));
   ASSERT_TRUE(d1_entered.WaitFor(10s));
   ASSERT_TRUE(d1.on_high_pool);
@@ -1387,7 +1475,7 @@ TEST_F(MultiRaftBatcherTest, StreamedFailureAfterPartialsFailsUnanswered) {
   auto& d0 = NewCall("t0");
   auto& d1 = NewCall("t1");
   auto& d2 = NewCall("t2");
-  const auto env = SendStreamed(DataCalls({&d0, &d1, &d2}));
+  const auto env = ASSERT_RESULT(SendStreamed(DataCalls({&d0, &d1, &d2})));
   const auto failed_before = CounterValue(METRIC_multi_raft_envelopes_failed);
   ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {1})));
   ASSERT_NO_FATALS(WaitDone(d1));
@@ -1514,7 +1602,7 @@ TEST_F(MultiRaftBatcherTest, StreamedMissingIndex) {
   auto& d0 = NewCall("t0");
   auto& d1 = NewCall("t1");
   auto& d2 = NewCall("t2");
-  const auto env = SendStreamed(DataCalls({&d0, &d1, &d2}));
+  const auto env = ASSERT_RESULT(SendStreamed(DataCalls({&d0, &d1, &d2})));
   const auto failed_before = CounterValue(METRIC_multi_raft_envelopes_failed);
   ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
   ASSERT_NO_FATALS(WaitDone(d0));
@@ -1540,7 +1628,7 @@ TEST_F(MultiRaftBatcherTest, YB_NEVER_DEBUG_TEST(StreamedDuplicateIndexIgnored))
   auto& d0 = NewCall("t0");
   auto& d1 = NewCall("t1");
   auto& d2 = NewCall("t2");
-  const auto env = SendStreamed(DataCalls({&d0, &d1, &d2}));
+  const auto env = ASSERT_RESULT(SendStreamed(DataCalls({&d0, &d1, &d2})));
   const auto failed_before = CounterValue(METRIC_multi_raft_envelopes_failed);
   StringWaiterLogSink log_waiter("MultiRaft response frame has an invalid index");
   ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {1})));
@@ -1575,7 +1663,7 @@ TEST_F(MultiRaftBatcherTest, YB_NEVER_DEBUG_TEST(StreamedMalformedPartialDropped
   auto& d0 = NewCall("t0");
   auto& d1 = NewCall("t1");
   auto& d2 = NewCall("t2");
-  const auto env = SendStreamed(DataCalls({&d0, &d1, &d2}));
+  const auto env = ASSERT_RESULT(SendStreamed(DataCalls({&d0, &d1, &d2})));
   const auto failed_before = CounterValue(METRIC_multi_raft_envelopes_failed);
   const auto frames_before = CounterValue(METRIC_multi_raft_frames_received);
   StringWaiterLogSink log_waiter("Malformed MultiRaft partial response frame");
@@ -1624,7 +1712,7 @@ TEST_F(MultiRaftBatcherTest, YB_NEVER_DEBUG_TEST(StreamedMalformedFinal)) {
     auto& d0 = NewCall(Format("t$0-0", c.with_index));
     auto& d1 = NewCall(Format("t$0-1", c.with_index));
     auto& d2 = NewCall(Format("t$0-2", c.with_index));
-    const auto env = SendStreamed(DataCalls({&d0, &d1, &d2}));
+    const auto env = ASSERT_RESULT(SendStreamed(DataCalls({&d0, &d1, &d2})));
     const auto failed_before = CounterValue(METRIC_multi_raft_envelopes_failed);
     StringWaiterLogSink log_waiter(c.log_text);
     ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
@@ -1660,8 +1748,8 @@ TEST_F(MultiRaftBatcherTest, OldFollowerFinalWithoutIndex) {
   auto& d0 = NewCall("t0");
   auto& h1 = NewCall("t1");
   auto& d2 = NewCall("t2");
-  auto env = SendStreamed({
-      {&d0, RequestKind::kData}, {&h1, RequestKind::kHeartbeat}, {&d2, RequestKind::kData}});
+  auto env = ASSERT_RESULT(SendStreamed({
+      {&d0, RequestKind::kData}, {&h1, RequestKind::kHeartbeat}, {&d2, RequestKind::kData}}));
   const auto failed_before = CounterValue(METRIC_multi_raft_envelopes_failed);
   ASSERT_NO_FATALS(CompleteOnReactor(
       env, Status::OK(), Frame(env, {0, 1, 2}, /* with_index= */ false)));
@@ -1679,8 +1767,8 @@ TEST_F(MultiRaftBatcherTest, OldFollowerFinalWithoutIndex) {
   auto& d3 = NewCall("t3");
   auto& h4 = NewCall("t4");
   auto& d5 = NewCall("t5");
-  env = SendStreamed({
-      {&d3, RequestKind::kData}, {&h4, RequestKind::kHeartbeat}, {&d5, RequestKind::kData}});
+  env = ASSERT_RESULT(SendStreamed({
+      {&d3, RequestKind::kData}, {&h4, RequestKind::kHeartbeat}, {&d5, RequestKind::kData}}));
   StringWaiterLogSink log_waiter("2 responses for 3 requests, destination: follower-1");
   ASSERT_NO_FATALS(CompleteOnReactor(
       env, Status::OK(), Frame(env, {0, 1}, /* with_index= */ false)));
@@ -1700,8 +1788,8 @@ TEST_F(MultiRaftBatcherTest, StreamedHeartbeatSlotsOffReactor) {
   auto& h0 = NewCall("t0");
   auto& d1 = NewCall("t1");
   auto& h2 = NewCall("t2");
-  const auto env = SendStreamed({
-      {&h0, RequestKind::kHeartbeat}, {&d1, RequestKind::kData}, {&h2, RequestKind::kHeartbeat}});
+  const auto env = ASSERT_RESULT(SendStreamed({
+      {&h0, RequestKind::kHeartbeat}, {&d1, RequestKind::kData}, {&h2, RequestKind::kHeartbeat}}));
   ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
   ASSERT_NO_FATALS(WaitDone(h0));
   ASSERT_OK(h0.status);
@@ -1724,7 +1812,7 @@ TEST_F(MultiRaftBatcherTest, LegacyClockWaitsForFinal) {
   CreateBatcher();
   auto& d0 = NewCall("t0");
   auto& d1 = NewCall("t1");
-  const auto env = SendStreamed(DataCalls({&d0, &d1}));
+  const auto env = ASSERT_RESULT(SendStreamed(DataCalls({&d0, &d1})));
   struct SendThread {
     bool on_high_pool;
     bool on_reactor;
@@ -1732,7 +1820,7 @@ TEST_F(MultiRaftBatcherTest, LegacyClockWaitsForFinal) {
   std::mutex mutex;
   std::unordered_map<size_t, SendThread> send_threads;
   auto* high_pool = &messenger_->ThreadPool(rpc::ServicePriority::kHigh);
-  sender_state_->SetSendHook([&mutex, &send_threads, high_pool](size_t envelope_idx) {
+  ScopedSendHook hook(sender_state_, [&mutex, &send_threads, high_pool](size_t envelope_idx) {
     std::lock_guard lock(mutex);
     send_threads[envelope_idx] = {high_pool->OwnsThisThread(), IsReactorThread()};
   });
@@ -1776,9 +1864,9 @@ TEST_F(MultiRaftBatcherTest, NoSerializationOnReactor) {
   auto& d0 = NewCall("t0", 100, [this, &d0b] { Submit(d0b, RequestKind::kData); });
   auto& h1 = NewCall("t1", 100, [this, &h1b] { Submit(h1b, RequestKind::kHeartbeat); });
   auto& d2 = NewCall("t2");
-  const auto env = SendStreamed({
-      {&d0, RequestKind::kData}, {&h1, RequestKind::kHeartbeat}, {&d2, RequestKind::kData}});
-  sender_state_->SetSendHook([&sends_on_reactor, &sends_on_high_pool, high_pool](size_t) {
+  const auto env = ASSERT_RESULT(SendStreamed({
+      {&d0, RequestKind::kData}, {&h1, RequestKind::kHeartbeat}, {&d2, RequestKind::kData}}));
+  ScopedSendHook hook(sender_state_, [&sends_on_reactor, &sends_on_high_pool, high_pool](size_t) {
     if (IsReactorThread()) {
       ++sends_on_reactor;
     }
@@ -1821,7 +1909,7 @@ TEST_F(MultiRaftBatcherTest, StreamingFlagReadPerEnvelope) {
   CreateBatcher();
   auto& d0 = NewCall("t0");
   auto& d1 = NewCall("t1");
-  const auto env = SendStreamed(DataCalls({&d0, &d1}));
+  const auto env = ASSERT_RESULT(SendStreamed(DataCalls({&d0, &d1})));
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_multi_raft_streaming_responses) = false;
   ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
   ASSERT_NO_FATALS(WaitDone(d0));
@@ -1852,7 +1940,7 @@ TEST_F(MultiRaftBatcherTest, StreamingOffPathUnchanged) {
   CreateBatcher();
   std::mutex mutex;
   std::unordered_map<size_t, std::thread::id> send_threads;
-  sender_state_->SetSendHook([&mutex, &send_threads](size_t envelope_idx) {
+  ScopedSendHook hook(sender_state_, [&mutex, &send_threads](size_t envelope_idx) {
     std::lock_guard lock(mutex);
     send_threads[envelope_idx] = std::this_thread::get_id();
   });
@@ -1894,7 +1982,7 @@ TEST_F(MultiRaftBatcherTest, StreamedFrameMetrics) {
   auto& d1 = NewCall("t1");
   auto& d2 = NewCall("t2");
   auto& d3 = NewCall("t3");
-  auto env = SendStreamed(DataCalls({&d0, &d1, &d2, &d3}));
+  auto env = ASSERT_RESULT(SendStreamed(DataCalls({&d0, &d1, &d2, &d3})));
   ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
   ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {2, 1})));
   ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK(), Frame(env, {3})));
@@ -1906,7 +1994,7 @@ TEST_F(MultiRaftBatcherTest, StreamedFrameMetrics) {
 
   auto& d4 = NewCall("t4");
   auto& d5 = NewCall("t5");
-  env = SendStreamed(DataCalls({&d4, &d5}));
+  env = ASSERT_RESULT(SendStreamed(DataCalls({&d4, &d5})));
   ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
   ASSERT_NO_FATALS(CompleteOnReactor(env, STATUS(NetworkError, "Connection reset")));
   ASSERT_NO_FATALS(WaitReleased(d4));
@@ -1916,7 +2004,7 @@ TEST_F(MultiRaftBatcherTest, StreamedFrameMetrics) {
 
   auto& d6 = NewCall("t6");
   auto& d7 = NewCall("t7");
-  env = SendStreamed(DataCalls({&d6, &d7}));
+  env = ASSERT_RESULT(SendStreamed(DataCalls({&d6, &d7})));
   ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {1, 0})));
   ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK()));
   ASSERT_NO_FATALS(WaitReleased(d6));
@@ -1953,7 +2041,7 @@ TEST_F(MultiRaftBatcherTest, StreamedEnvelopesFailedMetric) {
     auto& d0 = NewCall(Format("t$0-0", i));
     auto& d1 = NewCall(Format("t$0-1", i));
     auto& d2 = NewCall(Format("t$0-2", i));
-    const auto env = SendStreamed(DataCalls({&d0, &d1, &d2}));
+    const auto env = ASSERT_RESULT(SendStreamed(DataCalls({&d0, &d1, &d2})));
     const auto before = failed();
     ASSERT_TRUE(DeliverOnReactor(env, Frame(env, c.partial)));
     ASSERT_NO_FATALS(CompleteOnReactor(env, c.final_status, Frame(env, c.final_indices)));
@@ -1976,7 +2064,7 @@ TEST_F(MultiRaftBatcherTest, StreamedBatchReleased) {
   for (int mode = 0; mode != 3; ++mode) {
     auto& d0 = NewCall(Format("t$0-0", mode));
     auto& d1 = NewCall(Format("t$0-1", mode));
-    const auto env = SendStreamed(DataCalls({&d0, &d1}));
+    const auto env = ASSERT_RESULT(SendStreamed(DataCalls({&d0, &d1})));
     ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
     ASSERT_NO_FATALS(WaitDone(d0));
     ASSERT_FALSE(d0.handle.expired());
@@ -2005,7 +2093,7 @@ TEST_F(MultiRaftBatcherTest, StreamedMissingIndexAfterSlotRebuilt) {
   CreateBatcher();
   auto& d0 = NewCall("t0");
   auto& d1 = NewCall("t1");
-  const auto env = SendStreamed(DataCalls({&d0, &d1}));
+  const auto env = ASSERT_RESULT(SendStreamed(DataCalls({&d0, &d1})));
   ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
   ASSERT_NO_FATALS(WaitDone(d0));
   ASSERT_OK(d0.status);
@@ -2026,7 +2114,8 @@ TEST_F(MultiRaftBatcherTest, StreamedEnqueueFailureRunsInline) {
   CreateBatcher();
   auto& d0 = NewCall("t0");
   auto& h1 = NewCall("t1");
-  const auto env = SendStreamed({{&d0, RequestKind::kData}, {&h1, RequestKind::kHeartbeat}});
+  const auto env = ASSERT_RESULT(
+      SendStreamed({{&d0, RequestKind::kData}, {&h1, RequestKind::kHeartbeat}}));
   ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {0})));
   ASSERT_TRUE(IsDone(d0));
   ASSERT_TRUE(d0.on_reactor);
@@ -2048,12 +2137,14 @@ TEST_F(MultiRaftBatcherTest, StreamedResponseOutlivesFinal) {
   auto& d1 = NewCall("t1");
   CountDownLatch d1_entered(1);
   CountDownLatch release_d1(1);
-  auto release_on_failure = ScopeExit([&release_d1] { release_d1.CountDown(); });
-  d1.on_callback = [&d1_entered, &release_d1] {
-    d1_entered.CountDown();
-    release_d1.Wait();
-  };
-  const auto env = SendStreamed(DataCalls({&d0, &d1}));
+  ScopedOnCallback d1_callback(
+      d1,
+      [&d1_entered, &release_d1] {
+        d1_entered.CountDown();
+        release_d1.Wait();
+      },
+      [&release_d1] { release_d1.CountDown(); });
+  const auto env = ASSERT_RESULT(SendStreamed(DataCalls({&d0, &d1})));
   ASSERT_TRUE(DeliverOnReactor(env, Frame(env, {1})));
   ASSERT_TRUE(d1_entered.WaitFor(10s));
   ASSERT_NO_FATALS(CompleteOnReactor(env, Status::OK(), Frame(env, {0})));
@@ -2549,7 +2640,7 @@ TEST_F(MultiRaftBatcherTest, PacedStreamedSendsOffReactor) {
   std::atomic<int> sends_on_reactor{0};
   std::atomic<int> sends_on_high_pool{0};
   auto* high_pool = &messenger_->ThreadPool(rpc::ServicePriority::kHigh);
-  sender_state_->SetSendHook([&sends_on_reactor, &sends_on_high_pool, high_pool](size_t) {
+  ScopedSendHook hook(sender_state_, [&sends_on_reactor, &sends_on_high_pool, high_pool](size_t) {
     if (IsReactorThread()) {
       ++sends_on_reactor;
     }
@@ -2557,8 +2648,6 @@ TEST_F(MultiRaftBatcherTest, PacedStreamedSendsOffReactor) {
       ++sends_on_high_pool;
     }
   });
-  // The hook captures locals, and a pacing timer may still send after the last assertion.
-  auto clear_hook = ScopeExit([this] { sender_state_->SetSendHook({}); });
   CreateBatcher();
   auto& d0c = NewCall("t0c");
   auto& d0b = NewCall("t0b", 100, [this, &d0c] { Submit(d0c, RequestKind::kData); });

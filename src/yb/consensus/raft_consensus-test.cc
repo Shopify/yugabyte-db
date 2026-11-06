@@ -55,9 +55,11 @@
 #include "yb/util/logging_test_util.h"
 #include "yb/util/mem_tracker.h"
 #include "yb/util/metrics.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/status_log.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
+#include "yb/util/tsan_util.h"
 
 DECLARE_bool(enable_leader_failure_detection);
 DECLARE_bool(never_fsync);
@@ -1030,6 +1032,14 @@ TEST_F(RaftConsensusTest, AsyncWriteWaitStepsRunInSystemHighCgroup) {
   StringWaiterLogSink cgroup_log("Failed to move thread to cgroup");
   std::atomic<bool> done{false};
   Status status;
+  // The update writes response and status after an early exit too: wait for it before they are
+  // destroyed.
+  auto wait_for_update = ScopeExit([&done] {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_wal_sync) = false;
+    CHECK_OK(WaitFor(
+        [&done] { return done.load(std::memory_order_acquire); }, 30s * kTimeMultiplier,
+        "Update before its response is destroyed"));
+  });
   consensus_->UpdateAsync(
       request_ptr, &response, CoarseBigDeadline(), [&done, &status](const Status& s) {
         status = s;
@@ -1071,6 +1081,14 @@ TEST_F(RaftConsensusTest, AsyncWriteWaitWithoutSweeperUsesTimer) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_wal_sync) = true;
   std::atomic<bool> done{false};
   Status status;
+  // The update writes response and status after an early exit too: wait for it before they are
+  // destroyed.
+  auto wait_for_update = ScopeExit([&done] {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_wal_sync) = false;
+    CHECK_OK(WaitFor(
+        [&done] { return done.load(std::memory_order_acquire); }, 30s * kTimeMultiplier,
+        "Update before its response is destroyed"));
+  });
   consensus_->UpdateAsync(
       request_ptr, &response, CoarseBigDeadline(), [&done, &status](const Status& s) {
         status = s;

@@ -102,6 +102,8 @@ using std::shared_ptr;
 using std::unique_ptr;
 using std::string;
 
+using ScopedSendHook = FakeBatchSenderState::ScopedSendHook;
+
 const char* kTableId = "test-peers-table";
 const char* kTabletId = "test-peers-tablet";
 const char* kLeaderUuid = "peer-0";
@@ -1116,7 +1118,7 @@ TEST_F(ConsensusPeersTest, LwHeartbeatWhileDataRoundRebuilt) {
     events.push_back("data");
   });
   sync_point->EnableProcessing();
-  sender_state_->SetSendHook([&mutex, &events](size_t) {
+  ScopedSendHook hook(sender_state_, [&mutex, &events](size_t) {
     std::lock_guard lock(mutex);
     events.push_back("send");
   });
@@ -1486,7 +1488,7 @@ TEST_F(ConsensusPeersTest, SynchronousCompletionKeepsLatestHandle) {
   ASSERT_NO_FATALS(Negotiate(test_peer));
 
   std::atomic<bool> next_round_sent_inside_add{false};
-  sender_state_->SetSendHook([this, &next_round_sent_inside_add](size_t envelope_idx) {
+  ScopedSendHook hook(sender_state_, [this, &next_round_sent_inside_add](size_t envelope_idx) {
     if (envelope_idx != 0) {
       return;
     }

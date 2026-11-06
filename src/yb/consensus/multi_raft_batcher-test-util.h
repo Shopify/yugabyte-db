@@ -13,6 +13,7 @@
 #pragma once
 
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -31,6 +32,7 @@
 #include "yb/util/source_location.h"
 #include "yb/util/status.h"
 #include "yb/util/thread.h"
+#include "yb/util/tsan_util.h"
 
 namespace yb::consensus {
 
@@ -98,6 +100,28 @@ class FakeBatchSenderState {
   // Runs on the sending thread, inside SendBatch, after the envelope is serialized and recorded.
   using SendHook = std::function<void(size_t envelope_idx)>;
 
+  // Installs a send hook for its lifetime. On destruction it uninstalls the hook and waits for
+  // every running invocation to return, so a hook never runs after the locals it captures: declare
+  // it after them. Sends can come from pool, timer and reactor threads after the test body has
+  // returned, on success as well as on an early ASSERT exit. The hook must not destroy its scope.
+  class ScopedSendHook {
+   public:
+    ScopedSendHook(std::shared_ptr<FakeBatchSenderState> state, SendHook hook)
+        : state_(std::move(state)) {
+      state_->SetSendHook(std::move(hook));
+    }
+
+    ~ScopedSendHook() {
+      state_->ClearSendHook();
+    }
+
+    ScopedSendHook(const ScopedSendHook&) = delete;
+    void operator=(const ScopedSendHook&) = delete;
+
+   private:
+    const std::shared_ptr<FakeBatchSenderState> state_;
+  };
+
   size_t NumEnvelopes() {
     std::lock_guard lock(mutex_);
     return envelopes_.size();
@@ -107,11 +131,6 @@ class FakeBatchSenderState {
     std::lock_guard lock(mutex_);
     CHECK_LT(idx, envelopes_.size());
     return envelopes_[idx];
-  }
-
-  void SetSendHook(SendHook hook) {
-    std::lock_guard lock(mutex_);
-    send_hook_ = std::move(hook);
   }
 
   // Completes the envelope with status, on this thread. With an OK status, first fills
@@ -217,6 +236,23 @@ class FakeBatchSenderState {
  private:
   friend class FakeBatchSender;
 
+  void SetSendHook(SendHook hook) {
+    std::lock_guard lock(mutex_);
+    CHECK(!send_hook_) << "One send hook at a time";
+    send_hook_ = std::move(hook);
+  }
+
+  // Bounded, so that a hook that never returns fails the test instead of hanging it.
+  void ClearSendHook() {
+    const auto timeout = std::chrono::seconds(30) * kTimeMultiplier;
+    std::unique_lock lock(mutex_);
+    send_hook_ = nullptr;
+    if (!hooks_running_cond_.wait_for(lock, timeout, [this] { return hooks_running_ == 0; })) {
+      LOG(FATAL) << hooks_running_ << " send hook(s) still running after " << timeout.count()
+                 << " s; their captured state would be destroyed under them";
+    }
+  }
+
   bool DoComplete(
       size_t idx, const Status& status, const FillResponse& fill, int num_responses) {
     auto envelope = GetEnvelope(idx);
@@ -263,15 +299,25 @@ class FakeBatchSenderState {
       idx = envelopes_.size();
       envelopes_.push_back(std::move(envelope));
       hook = send_hook_;
+      // Entered under the mutex that ClearSendHook takes, before the hook can run.
+      if (hook) {
+        ++hooks_running_;
+      }
     }
     if (hook) {
       hook(idx);
+      hook = nullptr;
+      std::lock_guard lock(mutex_);
+      --hooks_running_;
+      hooks_running_cond_.notify_all();
     }
   }
 
   std::mutex mutex_;
   std::vector<std::shared_ptr<FakeBatchEnvelope>> envelopes_;
   SendHook send_hook_;
+  int hooks_running_ = 0;
+  std::condition_variable hooks_running_cond_;
 };
 
 // Captures envelopes instead of sending them, so that tests can complete them on demand.

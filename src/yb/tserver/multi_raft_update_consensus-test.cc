@@ -830,19 +830,14 @@ class MultiRaftUpdateConsensusTest : public TabletServerTestBase {
   class ParamsCapture {
    public:
     ParamsCapture() {
-      auto* sync_point = SyncPoint::GetInstance();
-      sync_point->SetCallBack("MultiRaftUpdateConsensus::Params", [this](void* arg) {
+      sync_point_->SetCallBack("MultiRaftUpdateConsensus::Params", [this](void* arg) {
         std::lock_guard lock(mutex_);
         if (!captured_) {
           params_ = *static_cast<std::shared_ptr<rpc::RpcCallParams>*>(arg);
           captured_ = true;
         }
       });
-      sync_point->EnableProcessing();
-    }
-
-    ~ParamsCapture() {
-      SyncPoint::GetInstance()->SetCallBack("MultiRaftUpdateConsensus::Params", [](void*) {});
+      sync_point_->EnableProcessing();
     }
 
     bool captured() {
@@ -859,6 +854,8 @@ class MultiRaftUpdateConsensusTest : public TabletServerTestBase {
     std::mutex mutex_;
     bool captured_ = false;
     std::weak_ptr<rpc::RpcCallParams> params_;
+    // Destroyed first: waits for a running callback.
+    SyncPointScope sync_point_;
   };
 
   // Holds tablet's update_mutex_ for about duration: sends it a direct UpdateConsensus with one op
@@ -1222,7 +1219,7 @@ TEST_F(MultiRaftUpdateConsensusTest, PoolShutdownCompletesQueuedSubRequest) {
           ->TEST_get_service());
   ASSERT_NE(service, nullptr);
   std::atomic<int> started{0};
-  auto* sync_point = SyncPoint::GetInstance();
+  SyncPointScope sync_point;
   sync_point->SetCallBack("MultiRaftUpdateTask::BeforeUpdate", [&started](void*) { ++started; });
   sync_point->EnableProcessing();
   Consensus(paused)->TEST_PauseUpdateConsensus(true);
