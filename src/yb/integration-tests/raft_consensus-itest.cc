@@ -4362,10 +4362,18 @@ void AssertNoBatchingErrorLines(LogWaiter* waiter) {
 } // namespace
 
 std::unique_ptr<LogWaiter> RaftConsensusITest::StartMultiRaftBatchingCluster(bool streamed) {
+  // Each step stops at a fatal failure: setting flags on a cluster that did not start would crash
+  // the test instead of failing it. The caller checks HasFatalFailure().
   CreateCluster("raft_consensus-itest-cluster", {}, {});
+  if (HasFatalFailure()) {
+    return nullptr;
+  }
   EnableMultiRaftBatching(cluster_.get());
-  if (streamed) {
+  if (streamed && !HasFatalFailure()) {
     EnableStreamingAndPacing(cluster_.get());
+  }
+  if (HasFatalFailure()) {
+    return nullptr;
   }
   return WatchForBatchingErrorLines(cluster_.get());
 }
@@ -4907,7 +4915,7 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingStreamingPacingToggleUnderLoad) {
     {false, true}, {false, false}, {true, false}, {true, true},
     {true, false}, {false, false}, {false, true}, {true, true},
   }};
-  CreateCluster("raft_consensus-itest-cluster", {}, {});
+  ASSERT_NO_FATALS(CreateCluster("raft_consensus-itest-cluster", {}, {}));
   ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
   ASSERT_NO_FATALS(EnableStreamingAndPacing(cluster_.get()));
   auto error_lines = WatchForBatchingErrorLines(cluster_.get());
@@ -5014,7 +5022,7 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingStreamingToSerialFollower) {
       "handler_latency_yb_consensus_ConsensusService_MultiRaftUpdateConsensus";
   constexpr auto kDirectHandlerCalls =
       "handler_latency_yb_consensus_ConsensusService_UpdateConsensus";
-  CreateCluster("raft_consensus-itest-cluster", {}, {});
+  ASSERT_NO_FATALS(CreateCluster("raft_consensus-itest-cluster", {}, {}));
   ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
   ASSERT_NO_FATALS(EnableStreamingAndPacing(cluster_.get()));
   // Not restarted, so the runtime flag is enough.
