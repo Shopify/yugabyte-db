@@ -10,7 +10,7 @@ in a dump happens here, so the result can be inspected before a load.
 Writes into DIR:
   topology.txt   one 'cloud region zone percent' line per zone named by the replica_placement
                  blocks; percentages follow the production tserver counts in --globaldb-repo's
-                 cluster_configs/gdb.yml, equal split without it
+                 inventories/production/yugabyte.yml, equal split without it
   roles.sql      CREATE ROLE for every role the dumps reference, so their own "role exists"
                  guards take the production branch instead of skipping ownership
   <basename>     a copy of each input with the requested edits plus FUNCTION_SEARCH_PATHS, the
@@ -44,7 +44,7 @@ FUNCTION_SEARCH_PATHS = {
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
 # Inside a globaldb-yugabyte checkout: production tserver counts, and the files ansible installs
 # on every node.
-GLOBALDB_CLUSTER_CONFIG = "tools/ansible/inventories/production/cluster_configs/gdb.yml"
+GLOBALDB_CLUSTER_CONFIG = "tools/ansible/inventories/production/yugabyte.yml"
 GLOBALDB_NODE_FILES = "tools/ansible/collections/ansible_collections/shopify/yugabyte/roles/node/files"
 
 
@@ -98,30 +98,59 @@ def collect_zones(paths):
 
 
 def read_zone_counts(path):
-    """{zone: tserver count} from the tservers: section of a cluster_configs/*.yml. Only
-    'zones:' maps with per-zone 'count:' entries are read, so no YAML library is needed."""
+    """{zone: tserver count} from yugabyte_tserver_region_lookup in the production inventory:
+    per region 'zones: [letters]' and 'count_per_zone', with 'count_by_zone' overrides. Read
+    by indentation so no YAML library is needed; retired regions with count 0 are left out."""
     counts = {}
-    tservers_indent = None  # indent of the 'tservers:' key while inside its section
-    pending = None
+    lookup_indent = region_indent = None
+    region, zones, per_zone, by_zone, in_by_zone = None, [], 0, {}, False
+
+    def flush():
+        for z in zones:
+            n = by_zone.get(z, per_zone)
+            if n > 0:
+                counts[f"{region}-{z}"] = n
+
     for line in read_lines(path):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         indent = len(line) - len(line.lstrip())
-        if tservers_indent is not None and indent <= tservers_indent:
-            tservers_indent = None
-        if tservers_indent is None:
-            if line.strip() == "tservers:":
-                tservers_indent = indent
+        stripped = line.strip()
+        if lookup_indent is not None and indent <= lookup_indent:
+            flush()
+            lookup_indent = None
+        if lookup_indent is None:
+            if stripped == "yugabyte_tserver_region_lookup:":
+                lookup_indent = indent
+                region_indent = None
             continue
-        key_match = re.match(r"\s*([A-Za-z0-9-]+):\s*$", line)
-        count_match = re.match(r"\s*count:\s*(\d+)\s*$", line)
-        if count_match and pending:
-            counts[pending] = int(count_match.group(1))
-            pending = None
-        elif key_match:
-            pending = key_match.group(1)
+        if region_indent is None or indent == region_indent:
+            match = re.match(r"([A-Za-z0-9-]+):$", stripped)
+            if match:
+                flush()
+                region_indent = indent
+                region, zones, per_zone, by_zone, in_by_zone = match.group(1), [], 0, {}, False
+            continue
+        match = re.match(r"zones:\s*\[([^\]]*)\]$", stripped)
+        if match:
+            zones = [z.strip() for z in match.group(1).split(",") if z.strip()]
+            in_by_zone = False
+            continue
+        match = re.match(r"count_per_zone:\s*(\d+)$", stripped)
+        if match:
+            per_zone = int(match.group(1))
+            in_by_zone = False
+            continue
+        if stripped == "count_by_zone:":
+            in_by_zone = True
+            continue
+        match = re.match(r"([a-z]):\s*(\d+)$", stripped)
+        if match and in_by_zone:
+            by_zone[match.group(1)] = int(match.group(2))
+    if lookup_indent is not None:
+        flush()
     if not counts:
-        sys.exit(f"{path}: no 'count:' entries under tservers:")
+        sys.exit(f"{path}: no tserver counts under yugabyte_tserver_region_lookup")
     return counts
 
 
