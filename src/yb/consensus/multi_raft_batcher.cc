@@ -78,8 +78,18 @@ TAG_FLAG(enable_multi_raft_streaming_responses, advanced);
 DEFINE_RUNTIME_uint32(multi_raft_data_flush_delay_ms, 2,
     "Maximum time, in milliseconds, that a data request waits in a multi-Raft batch while another "
     "batch carrying data to the same server is in flight. The batch is sent earlier if one of "
-    "those in-flight batches completes first.");
+    "those in-flight batches completes first. Ignored while multi_raft_data_flush_window_us is "
+    "above 0.");
 TAG_FLAG(multi_raft_data_flush_delay_ms, advanced);
+
+DEFINE_RUNTIME_uint32(multi_raft_data_flush_window_us, 0,
+    "Minimum interval, in microseconds, between two multi-Raft batches carrying data to the same "
+    "server. A data request added once the interval has passed since the last such batch was sent "
+    "is sent at once; one added earlier waits for the interval to end, or for a batch size limit "
+    "to send it. 0 keeps response clocking instead: a data request is sent at once when no batch "
+    "carrying data to the server is in flight, and otherwise waits for one to complete or for "
+    "multi_raft_data_flush_delay_ms. Read on each add.");
+TAG_FLAG(multi_raft_data_flush_window_us, advanced);
 
 DEFINE_RUNTIME_uint32(multi_raft_data_batch_size, 32,
     "Maximum number of data requests in one multi-Raft batch. A data request that would exceed "
@@ -132,13 +142,24 @@ METRIC_DEFINE_event_stats(server, multi_raft_envelope_ops,
 METRIC_DEFINE_counter(server, multi_raft_flush_immediate,
     "Multi-Raft Immediate Flushes", yb::MetricUnit::kRequests,
     "Multi-Raft batches sent as soon as a data request was added, because no batch carrying data "
-    "to that server was in flight.");
+    "to that server was in flight, while multi_raft_data_flush_window_us was 0.");
 METRIC_DEFINE_counter(server, multi_raft_flush_response_clocked,
     "Multi-Raft Response-Clocked Flushes", yb::MetricUnit::kRequests,
-    "Multi-Raft batches sent because a batch carrying data to the same server completed.");
+    "Multi-Raft batches sent because a batch carrying data to the same server completed, while "
+    "multi_raft_data_flush_window_us was 0.");
 METRIC_DEFINE_counter(server, multi_raft_flush_deadline,
     "Multi-Raft Deadline Flushes", yb::MetricUnit::kRequests,
-    "Multi-Raft batches sent because multi_raft_data_flush_delay_ms elapsed.");
+    "Multi-Raft batches sent because multi_raft_data_flush_delay_ms elapsed. The delay is armed "
+    "only while multi_raft_data_flush_window_us is 0.");
+METRIC_DEFINE_counter(server, multi_raft_flush_paced_inline,
+    "Multi-Raft Paced Inline Flushes", yb::MetricUnit::kRequests,
+    "Multi-Raft batches sent as soon as a data request was added, because "
+    "multi_raft_data_flush_window_us had passed since the last batch carrying data to that server "
+    "was sent, or none was.");
+METRIC_DEFINE_counter(server, multi_raft_flush_paced_timer,
+    "Multi-Raft Paced Timer Flushes", yb::MetricUnit::kRequests,
+    "Multi-Raft batches sent at the end of the multi_raft_data_flush_window_us interval that "
+    "followed the last batch carrying data to that server, for data requests added within it.");
 METRIC_DEFINE_counter(server, multi_raft_flush_count_cap,
     "Multi-Raft Count Cap Flushes", yb::MetricUnit::kRequests,
     "Multi-Raft batches sent because of a request count limit, either multi_raft_batch_size or "
@@ -159,6 +180,11 @@ METRIC_DEFINE_event_stats(server, multi_raft_batched_response_processing_us,
     "Multi-Raft Batched Response Processing Time", yb::MetricUnit::kMicroseconds,
     "Time spent processing the response of each Raft data request sent inside a "
     "MultiRaftUpdateConsensus RPC, i.e. running its response callback.");
+METRIC_DEFINE_event_stats(server, multi_raft_data_add_to_send_us,
+    "Multi-Raft Data Add To Send Time", yb::MetricUnit::kMicroseconds,
+    "Time each Raft data request waited in a multi-Raft batcher, from being added to a batch "
+    "until that batch's MultiRaftUpdateConsensus RPC was sent. Batches aborted at shutdown before "
+    "being sent are not recorded.");
 METRIC_DEFINE_counter(server, multi_raft_frames_received,
     "Multi-Raft Response Frames Received", yb::MetricUnit::kMessages,
     "Response frames, partial and final, received for MultiRaftUpdateConsensus RPCs sent with "
@@ -185,6 +211,8 @@ namespace {
 struct ResponseCallbackData {
   MultiRaftBatcher::BatchResponseCallback callback;
   MultiRaftBatcher::RequestKind kind;
+  // When a data request was added, for multi_raft_data_add_to_send_us. Read before SendBatch.
+  std::chrono::steady_clock::time_point add_time;
 };
 
 // Runs f on a thread pool. If the pool drops the task (it is shutting down), f runs inline in
@@ -348,6 +376,8 @@ struct MultiRaftBatcher::Metrics {
     flush_immediate = METRIC_multi_raft_flush_immediate.Instantiate(entity);
     flush_response_clocked = METRIC_multi_raft_flush_response_clocked.Instantiate(entity);
     flush_deadline = METRIC_multi_raft_flush_deadline.Instantiate(entity);
+    flush_paced_inline = METRIC_multi_raft_flush_paced_inline.Instantiate(entity);
+    flush_paced_timer = METRIC_multi_raft_flush_paced_timer.Instantiate(entity);
     flush_count_cap = METRIC_multi_raft_flush_count_cap.Instantiate(entity);
     flush_bytes_cap = METRIC_multi_raft_flush_bytes_cap.Instantiate(entity);
     flush_timer = METRIC_multi_raft_flush_timer.Instantiate(entity);
@@ -356,6 +386,7 @@ struct MultiRaftBatcher::Metrics {
     data_sends_direct = METRIC_multi_raft_data_sends_direct.Instantiate(entity);
     batched_response_processing_us =
         METRIC_multi_raft_batched_response_processing_us.Instantiate(entity);
+    data_add_to_send_us = METRIC_multi_raft_data_add_to_send_us.Instantiate(entity);
     frames_received = METRIC_multi_raft_frames_received.Instantiate(entity);
     frame_slots = METRIC_multi_raft_frame_slots.Instantiate(entity);
   }
@@ -368,6 +399,8 @@ struct MultiRaftBatcher::Metrics {
   CounterPtr flush_immediate;
   CounterPtr flush_response_clocked;
   CounterPtr flush_deadline;
+  CounterPtr flush_paced_inline;
+  CounterPtr flush_paced_timer;
   CounterPtr flush_count_cap;
   CounterPtr flush_bytes_cap;
   CounterPtr flush_timer;
@@ -375,6 +408,7 @@ struct MultiRaftBatcher::Metrics {
   CounterPtr data_sub_requests;
   CounterPtr data_sends_direct;
   EventStatsPtr batched_response_processing_us;
+  EventStatsPtr data_add_to_send_us;
   CounterPtr frames_received;
   EventStatsPtr frame_slots;
 };
@@ -386,6 +420,8 @@ enum class MultiRaftBatcher::FlushReason {
   kCountCap,
   kBytesCap,
   kTimer,
+  kPacedInline,
+  kPacedTimer,
 };
 
 void MultiRaftBatcher::BatchHandle::MarkCallAsFailed() const {
@@ -467,6 +503,9 @@ ATTRIBUTE_NOINLINE MultiRaftBatcher::BatchHandle MultiRaftBatcher::AddRequestToB
     LWConsensusRequestPB* request, LWReplicateMsgsHolder holder, BatchResponseCallback callback,
     RequestKind kind) {
   const auto request_bytes = request->SerializedSize();
+  // The pacing decision and multi_raft_data_add_to_send_us need it for data requests only.
+  const auto add_time = kind == RequestKind::kData
+      ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
   BatchData pre_add_batch;
   BatchData post_add_batch;
   BatchHandle handle;
@@ -477,7 +516,7 @@ ATTRIBUTE_NOINLINE MultiRaftBatcher::BatchHandle MultiRaftBatcher::AddRequestToB
       aborted = true;
     } else {
       handle = AddRequestUnlocked(
-          request, &holder, std::move(callback), kind, request_bytes, &pre_add_batch,
+          request, &holder, std::move(callback), kind, request_bytes, add_time, &pre_add_batch,
           &post_add_batch);
     }
   }
@@ -492,7 +531,8 @@ ATTRIBUTE_NOINLINE MultiRaftBatcher::BatchHandle MultiRaftBatcher::AddRequestToB
 
 MultiRaftBatcher::BatchHandle MultiRaftBatcher::AddRequestUnlocked(
     LWConsensusRequestPB* request, LWReplicateMsgsHolder* holder, BatchResponseCallback callback,
-    RequestKind kind, size_t request_bytes, BatchData* pre_add_batch, BatchData* post_add_batch) {
+    RequestKind kind, size_t request_bytes, std::chrono::steady_clock::time_point add_time,
+    BatchData* pre_add_batch, BatchData* post_add_batch) {
   const bool is_data = kind == RequestKind::kData;
 
   // Caps apply before the add, so a request never makes the batch exceed them. A request that
@@ -514,6 +554,7 @@ MultiRaftBatcher::BatchHandle MultiRaftBatcher::AddRequestUnlocked(
   current_batch_->response_callback_data.push_back({
     .callback = std::move(callback),
     .kind = kind,
+    .add_time = add_time,
   });
   current_batch_->msgs_holders.push_back(std::move(*holder));
   current_batch_->total_bytes += request_bytes;
@@ -528,9 +569,20 @@ MultiRaftBatcher::BatchHandle MultiRaftBatcher::AddRequestUnlocked(
       && current_batch_->response_callback_data.size() >= FLAGS_multi_raft_batch_size) {
     *post_add_batch = PrepareNextBatchRequest(FlushReason::kCountCap);
   } else if (is_data) {
-    // A pre-add flush that carried data counts as in flight here, so this request waits for it
-    // to complete (or for the deadline) instead of going out in a second envelope.
-    if (data_batches_in_flight_ == 0) {
+    // A pre-add flush that carried data counts here: under response clocking it is in flight, and
+    // under pacing it started a new window. Either way this request waits instead of going out in
+    // a second envelope right behind it.
+    const auto window_us = FLAGS_multi_raft_data_flush_window_us;
+    if (window_us > 0) {
+      const auto window = std::chrono::microseconds(window_us);
+      // add_time was read before mutex_, so it may precede last_data_send_; that only parks.
+      if (last_data_send_ == std::chrono::steady_clock::time_point::min() ||
+          add_time - last_data_send_ >= window) {
+        *post_add_batch = PrepareNextBatchRequest(FlushReason::kPacedInline);
+      } else {
+        ArmPacingTask(last_data_send_ + window);
+      }
+    } else if (data_batches_in_flight_ == 0) {
       *post_add_batch = PrepareNextBatchRequest(FlushReason::kImmediate);
     } else {
       ArmDataFlushDeadline();
@@ -560,12 +612,14 @@ MultiRaftBatcher::BatchData MultiRaftBatcher::PrepareNextBatchRequest(FlushReaso
     periodic_flush_timer_->Snooze();
   }
   CancelDataFlushDeadline();
+  CancelPacingTask();
   auto data = std::make_shared<MultiRaftConsensusData>();
   current_batch_.swap(data);
   auto running_calls = ++*running_calls_;
   LOG_IF(DFATAL, running_calls <= 0) << "Wrong number or running calls: " << running_calls;
   if (data->has_data()) {
     ++data_batches_in_flight_;
+    last_data_send_ = std::chrono::steady_clock::now();
   }
 
   switch (reason) {
@@ -586,6 +640,12 @@ MultiRaftBatcher::BatchData MultiRaftBatcher::PrepareNextBatchRequest(FlushReaso
       break;
     case FlushReason::kTimer:
       IncrementCounter(metrics_->flush_timer);
+      break;
+    case FlushReason::kPacedInline:
+      IncrementCounter(metrics_->flush_paced_inline);
+      break;
+    case FlushReason::kPacedTimer:
+      IncrementCounter(metrics_->flush_paced_timer);
       break;
   }
   return data;
@@ -634,6 +694,56 @@ void MultiRaftBatcher::DataFlushDeadlineExpired(rpc::ScheduledTaskId task_id) {
   SendBatchRequest(std::move(data));
 }
 
+void MultiRaftBatcher::ArmPacingTask(std::chrono::steady_clock::time_point time) {
+  // A task already armed keeps its time, even if the window flag changed since: the window is
+  // read only when a request parks.
+  if (pacing_task_ != rpc::kInvalidTaskId) {
+    return;
+  }
+  std::weak_ptr<MultiRaftBatcher> weak_self = shared_from_this();
+  // An absolute time, so that the time spent between the add and here does not stretch the
+  // window. It is in the future when called from an add, which sends inline once the window has
+  // passed; a past time would fire at once. The task cannot observe pacing_task_ before it is
+  // assigned, because it takes mutex_, which is held here.
+  pacing_task_ = messenger_->scheduler().Schedule(
+      [weak_self](rpc::ScheduledTaskId task_id, const Status& status) {
+        if (!status.ok()) {
+          return;
+        }
+        if (auto self = weak_self.lock()) {
+          self->PacingTaskExpired(task_id);
+        }
+      },
+      time);
+}
+
+void MultiRaftBatcher::CancelPacingTask() {
+  if (pacing_task_ == rpc::kInvalidTaskId) {
+    return;
+  }
+  // Abort runs the task asynchronously with an error status, which the task ignores.
+  messenger_->scheduler().Abort(pacing_task_);
+  pacing_task_ = rpc::kInvalidTaskId;
+}
+
+void MultiRaftBatcher::PacingTaskExpired(rpc::ScheduledTaskId task_id) {
+  BatchData data;
+  {
+    std::lock_guard lock(mutex_);
+    // The task may have fired after the batch that armed it was sent and a new task was armed.
+    if (pacing_task_ != task_id) {
+      return;
+    }
+    pacing_task_ = rpc::kInvalidTaskId;
+    // Every send cancels this task, so the batch still holds the data that armed it. Parked
+    // heartbeats alone would be left for the heartbeat timer.
+    if (current_batch_->has_data()) {
+      data = PrepareNextBatchRequest(FlushReason::kPacedTimer);
+    }
+  }
+  SendBatchRequest(std::move(data));
+}
+
 // Kept out of line as a uprobe attach point for timing envelopes. `used` keeps LTO from rewriting
 // the signature (it could pass only `data.has_data()` instead of the batch the probe keys on).
 __attribute__((used)) ATTRIBUTE_NOINLINE void MultiRaftBatcher::BatchCompleted(
@@ -646,8 +756,9 @@ __attribute__((used)) ATTRIBUTE_NOINLINE void MultiRaftBatcher::BatchCompleted(
     std::lock_guard lock(mutex_);
     LOG_IF(DFATAL, data_batches_in_flight_ == 0) << "No data batch in flight";
     --data_batches_in_flight_;
-    // Parked heartbeats alone are left for the timer.
-    if (current_batch_->has_data()) {
+    // Parked heartbeats alone are left for the timer. Under pacing a completion sends nothing:
+    // parked data has the pacing timer armed (or, after a switch at runtime, the deadline).
+    if (FLAGS_multi_raft_data_flush_window_us == 0 && current_batch_->has_data()) {
       next = PrepareNextBatchRequest(FlushReason::kResponseClocked);
     }
   }
@@ -1000,7 +1111,8 @@ ATTRIBUTE_NOINLINE void MultiRaftBatcher::SendBatchRequest(BatchData data) {
     // Runs on the reactor, or on the thread that failed the call (under the controller's lock for
     // RpcController::MarkCallAsFailed, so it must not call into the controller). BatchCompleted
     // is enqueued before the slots, but a slot task that adds its peer's next request may still
-    // run first, see this envelope in flight and wait for the response-clocked flush.
+    // run first: under response clocking it sees this envelope in flight and waits for the
+    // response-clocked flush.
     callback = [data, data_pool, weak_self = weak_from_this(),
                 running_calls = running_calls_](const Status& status) {
       data->completed.store(true, std::memory_order_release);
@@ -1017,9 +1129,10 @@ ATTRIBUTE_NOINLINE void MultiRaftBatcher::SendBatchRequest(BatchData data) {
       ProcessStreamedFinal(data, status, data_pool);
     };
   } else {
-    // The response-clocked flush runs before the sub-callbacks are dispatched. Requests that were
-    // already pending go out without waiting for them, and requests that the sub-callbacks add
-    // next see that envelope in flight and accumulate behind it rather than each going out alone.
+    // Under response clocking, the response-clocked flush runs before the sub-callbacks are
+    // dispatched. Requests that were already pending go out without waiting for them, and requests
+    // that the sub-callbacks add next see that envelope in flight and accumulate behind it rather
+    // than each going out alone.
     callback = [data, data_pool, weak_self = weak_from_this(),
                 running_calls = running_calls_](const Status& status) {
       data->completed.store(true, std::memory_order_release);
@@ -1029,6 +1142,17 @@ ATTRIBUTE_NOINLINE void MultiRaftBatcher::SendBatchRequest(BatchData data) {
       }
       DispatchSubCallbacks(data, status, data_pool);
     };
+  }
+  // Before SendBatch: the final can run inside it, and slot tasks may run before it returns.
+  if (data->has_data() && metrics_->data_add_to_send_us) {
+    const auto send_time = std::chrono::steady_clock::now();
+    for (const auto& slot : data->response_callback_data) {
+      if (slot.kind == RequestKind::kData) {
+        metrics_->data_add_to_send_us->Increment(
+            std::chrono::duration_cast<std::chrono::microseconds>(send_time - slot.add_time)
+                .count());
+      }
+    }
   }
   sender_->SendBatch(data->batch_req, &data->batch_res, &data->controller, std::move(callback));
   data->msgs_holders.clear();
@@ -1047,6 +1171,7 @@ void MultiRaftBatcher::Shutdown() {
     }
     shutdown_ = true;
     CancelDataFlushDeadline();
+    CancelPacingTask();
     batch = std::make_shared<MultiRaftConsensusData>();
     batch.swap(current_batch_);
   }

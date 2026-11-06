@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -70,6 +71,8 @@ struct FakeBatchEnvelope {
   // live as long as the batch.
   std::vector<const LWConsensusResponsePB*> responses;
   rpc::RpcController* controller = nullptr;
+  // When SendBatch was called.
+  std::chrono::steady_clock::time_point sent_at;
   MonoDelta timeout;
   rpc::InvokeCallbackMode callback_mode = rpc::InvokeCallbackMode::kThreadPoolNormal;
   // Whether the controller had a partial-response callback when the envelope was sent.
@@ -282,6 +285,7 @@ class FakeBatchSender : public MultiRaftBatchSender {
       const LWMultiRaftConsensusRequestPB& req, LWMultiRaftConsensusResponsePB* resp,
       rpc::RpcController* controller, DoneCallback done) override {
     auto envelope = std::make_shared<FakeBatchEnvelope>();
+    envelope->sent_at = std::chrono::steady_clock::now();
     // Partial: neither the LW serializer nor the LW parser on the follower checks required fields.
     CHECK(envelope->req.ParsePartialFromString(req.SerializeAsString()));
     for (const auto& request : envelope->req.consensus_request()) {

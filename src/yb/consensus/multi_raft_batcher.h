@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <memory>
 
 #include "yb/common/common_net.pb.h"
@@ -67,13 +68,29 @@ std::unique_ptr<MultiRaftBatchSender> CreateMultiRaftBatchSender(
 //   replicate to the same remote server (a tserver, or a master for sys catalog peers), and sends
 //   each batch as one MultiRaftUpdateConsensus RPC.
 // - Heartbeats (RequestKind::kHeartbeat) are sent every FLAGS_multi_raft_heartbeat_interval_ms
-//   ms, or once the batch reaches FLAGS_multi_raft_batch_size requests.
-// - Data requests (RequestKind::kData) are sent immediately when no batch carrying data to this
-//   server is in flight. Otherwise they accumulate until such a batch completes or
-//   FLAGS_multi_raft_data_flush_delay_ms elapses, whichever is first. Pending heartbeats ride
-//   along. The heartbeat timer remains a backstop.
-// - A request that would push the batch past FLAGS_multi_raft_data_batch_size data requests or
-//   FLAGS_multi_raft_batch_bytes bytes sends the current batch first.
+//   ms, once the batch reaches FLAGS_multi_raft_batch_size requests, or with the next batch that
+//   carries data. Adding one never sends a batch or arms a data timer.
+// - Data requests (RequestKind::kData) follow one of two policies, chosen on each add (and, for
+//   the response clock, on each completion) by FLAGS_multi_raft_data_flush_window_us:
+//   - 0, response clocking: a data request is sent immediately when no batch carrying data to
+//     this server is in flight. Otherwise it waits until such a batch completes or
+//     FLAGS_multi_raft_data_flush_delay_ms elapses, whichever is first. A streamed batch stays in
+//     flight until its final response, however many requests partial frames have answered.
+//   - Above 0, pacing: batches carrying data to this server go out at most once per window. A
+//     data request is sent immediately when a window has passed since the last one was sent (or
+//     none was). Otherwise it waits for one timer, armed for the end of that window. Completions
+//     and response frames send nothing: back-pressure does not need a response clock, because
+//     each Raft peer has at most one data request parked or in flight. Every batch that carries
+//     data restarts the window, whatever sent it (a cap, a timer, a completion), so a request
+//     added just after a cap flush waits a full window. A timer that finds only heartbeats left
+//     sends nothing and leaves them to the heartbeat timer.
+//   Changing the flag at runtime needs no migration: a deadline or pacing timer already armed
+//   fires and sends what is parked, any send cancels both, and the heartbeat timer remains the
+//   backstop under either policy. Pacing times are std::chrono::steady_clock, not
+//   CoarseMonoClock, whose 1-4 ms resolution cannot pace a window of tens of microseconds.
+// - Under either policy, a request that would push the batch past
+//   FLAGS_multi_raft_data_batch_size data requests or FLAGS_multi_raft_batch_bytes bytes sends the
+//   current batch first.
 // - Multiple batches may be in flight concurrently, but only one is built at a time.
 //
 // Nothing is copied on the way. The envelope references each added request, together with the
@@ -87,7 +104,8 @@ std::unique_ptr<MultiRaftBatchSender> CreateMultiRaftBatchSender(
 // - Answered once (heartbeat-only envelopes, and every envelope while
 //   FLAGS_enable_multi_raft_streaming_responses is off). The final response carries every
 //   request's response in request order. Its callback runs on the High pool for envelopes that
-//   carry data (the normal pool otherwise), does the response-clocked flush, then runs each
+//   carry data (the normal pool otherwise), runs BatchCompleted (the response-clocked flush under
+//   response clocking), then runs each
 //   heartbeat callback inline and gives each data callback its own High-pool task. Every holder
 //   is the batch. If the RPC fails, every request fails with its error.
 // - Streamed (envelopes that carry data, while the flag is on). The follower answers each request
@@ -97,9 +115,9 @@ std::unique_ptr<MultiRaftBatchSender> CreateMultiRaftBatchSender(
 //   inside SendBatch), which then runs it. Receiving only parses the frame, marks its requests
 //   answered and enqueues: one High-pool task per data request, and one per frame for its
 //   heartbeats (a heartbeat callback can send the peer's next request, which may serialize an
-//   envelope). BatchCompleted and its response-clocked flush also run in a High-pool task, so no
-//   envelope is serialized on a reactor (unless the pool is shutting down, when tasks run inline
-//   on the enqueuing thread). A request answered by a partial frame
+//   envelope). BatchCompleted, which sends a batch under response clocking, also runs in a
+//   High-pool task, so no envelope is serialized on a reactor (unless the pool is shutting down,
+//   when tasks run inline on the enqueuing thread). A request answered by a partial frame
 //   gets that frame as its holder; one answered by the final gets the batch. A failed RPC fails
 //   only the requests no frame has answered, and an OK final that leaves a request unanswered
 //   fails it with IllegalState. A final without the list is from a follower that did not stream,
@@ -182,10 +200,11 @@ class MultiRaftBatcher : public std::enable_shared_from_this<MultiRaftBatcher> {
   class SubCallbackTask;
 
   // Adds the request, and returns in pre_add_batch / post_add_batch any batches to send.
+  // add_time is when a data request was added (unset for heartbeats).
   BatchHandle AddRequestUnlocked(
       LWConsensusRequestPB* request, LWReplicateMsgsHolder* holder, BatchResponseCallback callback,
-      RequestKind kind, size_t request_bytes, BatchData* pre_add_batch, BatchData* post_add_batch)
-      REQUIRES(mutex_);
+      RequestKind kind, size_t request_bytes, std::chrono::steady_clock::time_point add_time,
+      BatchData* pre_add_batch, BatchData* post_add_batch) REQUIRES(mutex_);
 
   void PrepareAndSendBatchRequest();
 
@@ -218,8 +237,15 @@ class MultiRaftBatcher : public std::enable_shared_from_this<MultiRaftBatcher> {
   void CancelDataFlushDeadline() REQUIRES(mutex_);
   void DataFlushDeadlineExpired(rpc::ScheduledTaskId task_id);
 
-  // Bookkeeping for a completed envelope, plus the response-clocked flush. Runs on the thread that
-  // completed an envelope answered once, and in a High-pool task for a streamed envelope.
+  // Arms the pacing timer for time unless it is armed already. It runs on a scheduler io thread.
+  void ArmPacingTask(std::chrono::steady_clock::time_point time) REQUIRES(mutex_);
+  void CancelPacingTask() REQUIRES(mutex_);
+  void PacingTaskExpired(rpc::ScheduledTaskId task_id);
+
+  // Bookkeeping for a completed envelope, plus the response-clocked flush when
+  // FLAGS_multi_raft_data_flush_window_us is 0. Runs on the thread that completed an envelope
+  // answered once, and in a High-pool task for a streamed envelope (inline on the enqueuing thread,
+  // which may be the reactor, only while the pool shuts down).
   void BatchCompleted(const MultiRaftConsensusData& data);
 
   rpc::Messenger* const messenger_;
@@ -237,11 +263,21 @@ class MultiRaftBatcher : public std::enable_shared_from_this<MultiRaftBatcher> {
   std::shared_ptr<MultiRaftConsensusData> current_batch_ GUARDED_BY(mutex_);
 
   // Envelopes carrying data that are in flight to this host. Drives the immediate and
-  // response-clocked data flushes. Unlike running_calls_, which the manager shares across all
+  // response-clocked data flushes under response clocking; under pacing it is only kept current,
+  // for a switch back at runtime. Unlike running_calls_, which the manager shares across all
   // batchers to drain at shutdown, this is per destination and ignores heartbeat-only envelopes.
   size_t data_batches_in_flight_ GUARDED_BY(mutex_) = 0;
 
   rpc::ScheduledTaskId data_flush_deadline_task_ GUARDED_BY(mutex_) = rpc::kInvalidTaskId;
+
+  // When the last batch carrying data to this host was prepared, whatever sent it; the start of
+  // the current pacing window. min() means none was, and is tested with == before any arithmetic,
+  // which would overflow. Updated under response clocking too, so a switch to pacing at runtime
+  // starts from the real last send.
+  std::chrono::steady_clock::time_point last_data_send_ GUARDED_BY(mutex_) =
+      std::chrono::steady_clock::time_point::min();
+
+  rpc::ScheduledTaskId pacing_task_ GUARDED_BY(mutex_) = rpc::kInvalidTaskId;
 
   bool shutdown_ GUARDED_BY(mutex_) = false;
 
