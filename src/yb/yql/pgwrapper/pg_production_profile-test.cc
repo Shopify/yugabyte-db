@@ -20,16 +20,16 @@
 // gflag values read back from every daemon, PG GUCs and their provenance, and the hba rules. It
 // then runs a small workload on one tserver where each check exercises an observable effect: tablet
 // count, read committed, upsert, index backfill and reltuples, a CBO bitmap plan, md5 and SCRAM
-// logins, the tracked query text and query id, PG log files, ASH samples and a replication slot
-// LSN type. Then it restarts the master on the full file, so the restart-only
-// master_join_existing_universe takes effect, and checks that the master runs it, that every
-// tserver heartbeats to the restarted master and that DDL works. After a catalog version bump, a
-// new backend looks up each table of the preload list without a catalog cache miss, while an
-// unlisted table does miss. Last, the metrics snapshotter rows show which whitelist tokens the
-// snapshotter actually matched.
-// Where production differs from what its configuration intends (tserver keys that are not
-// gflags, whitelist tokens that match nothing, shadowed scram-sha-256 hba lines, master-only flags
-// in the tserver profile), the test asserts what production does, not what was intended.
+// logins, the tracked query text and query id, PG log files, ASH samples and a replication slot LSN
+// type. Then it restarts the master on the full file, so that master_join_existing_universe, which
+// only a restart can apply, takes effect, and checks that the master runs it along with the rest of
+// the profile, that every tserver heartbeats to the restarted master and that DDL works. After a
+// catalog version bump, a new backend looks up each table of the preload list without a catalog
+// cache miss, while an unlisted table does miss. Last, the metrics snapshotter rows show which
+// whitelist tokens the snapshotter actually matched.
+// Where production differs from what its configuration intends (tserver keys that are not gflags,
+// whitelist tokens that match nothing, shadowed scram-sha-256 hba lines, master-only flags in the
+// tserver profile), the test asserts what production does, not what was intended.
 //
 // Flagfile grammar. The active lines are byte-for-byte what the deployment renders, so a fresh
 // render diffs cleanly against the files. Lines the test cannot apply are kept as markers:
@@ -50,9 +50,10 @@
 // "--" and a key character ("#--key=1", "# --key=1"). Either would otherwise be a plain comment
 // whose key silently leaves both the expected and the read-back sets.
 // The value is everything after the first '=', verbatim, quotes included. Any other line is an
-// error: in a gflags flagfile, a non-blank line starting with neither '-' nor '#' is a
-// program-name filter that silently disables every line after it. gflags has no inline trailing
-// comments either; one would become part of the value.
+// error. A line starting with a single '-' or with whitespace is one a render never has, though
+// gflags would apply it; a non-blank line starting with neither '-' nor '#' is, in a gflags
+// flagfile, a program-name filter that silently disables every line after it. gflags has no inline
+// trailing comments either; one would become part of the value.
 //
 // Value comparison rule, file value against a value read back from a daemon:
 //   - booleans compare case-insensitively across true/false/1/0/on/off (gflags and PG spellings);
@@ -69,13 +70,16 @@
 // SUBSTITUTED markers, and a host-specific token inside a value is replaced and explained in a
 // '# NOTE:' comment. No host name, address, path or placement value goes into the files.
 //
-// The flagfiles hold all the expectations. The only other data are the three lists below, each
-// carrying facts a flagfile cannot: kBootstrapDeferredFlags, kKnownUnrecognizedFlags and
-// kOtherDaemonOnlyFlags. When the production profile is corrected, the files change by diff and
-// the lists shrink; a row of any of them whose key leaves the profile fails the test. The preload
-// check also keeps, as workload rather than expectations, a query per listed catalog table that
-// looks the table up; a listed table without one fails the test, so a table added to the list
-// cannot pass unexercised.
+// The flagfiles hold all the expectations. The only other data are three lists, each carrying facts
+// a flagfile cannot: kBootstrapDeferredFlags, kKnownUnrecognizedFlags and kOtherDaemonOnlyFlags.
+// When the production profile is corrected, the files change by diff and the lists shrink; a row of
+// any of them whose key leaves the profile fails the test. Two more tables hold facts about the
+// code rather than the profile. The preload check keeps a query per listed catalog table that looks
+// the table up; a listed table without one, or a query for a table the list no longer has, fails
+// the test, so a table added to the list cannot pass unexercised. kSnapshotterTokenRows mirrors the
+// whitelist tokens the metrics snapshotter handles itself and the rows it writes for them; an exact
+// ysql_conn_mgr token fails the test, because its rows need the YSQL connection manager, which
+// neither production nor this test runs.
 
 #include <sys/stat.h>
 
@@ -831,7 +835,8 @@ class PgProductionProfileTest : public LibPqTestBase {
 };
 
 // For each daemon, runs the binary on the full profile with --helpxml and checks that every
-// active key is a known, non-deprecated flag whose parsed value matches the file.
+// active key is a known, non-deprecated flag whose parsed value matches the file. Marker keys and
+// the rows of the three lists get their own checks.
 TEST_F(PgProductionProfileTest, FlagfilesParseCleanly) {
   std::map<std::string, DaemonProfile> profiles;
   std::map<std::string, HelpXmlFlags> xml;
@@ -865,7 +870,7 @@ TEST_F(PgProductionProfileTest, FlagfilesParseCleanly) {
         }
         continue;
       }
-      // Rows of the two lists are checked separately below.
+      // Checked separately below, against both binaries for kOtherDaemonOnlyFlags.
       if (daemon == kTServerDaemon && FindKnownUnrecognized(entry.key)) {
         continue;
       }
@@ -1373,9 +1378,9 @@ void PgProductionProfileTest::CheckHbaRules(PGConn* conn) {
 
 // conn is already logged in to pg_ts, so a rejected login below cannot be PG still starting.
 void PgProductionProfileTest::CheckHbaBehavior(PGConn* conn) {
-  // Not discriminating on its own: WritePgHbaConfig (pg_wrapper.cc) appends
-  // "local all yugabyte trust" whatever the profile says, while
-  // ysql_trust_local_yugabyte_connections is at its default (true).
+  // Not discriminating on its own: WritePgHbaConfig (pg_wrapper.cc) appends "local all yugabyte
+  // trust" whatever the profile says, while ysql_trust_local_yugabyte_connections is at its
+  // default (true).
   ASSERT_OK(ConnectUnixSocket(*pg_ts, kSuperuser, kDefaultDb, kLoginTimeoutSec));
   ASSERT_NOK_STR_CONTAINS(
       ConnectTcp(*pg_ts, kSuperuser, /* password= */ "", kDefaultDb, kRejectedConnectTimeoutSec),
@@ -1606,9 +1611,9 @@ void PgProductionProfileTest::CheckIdleQueryText(PGConn* conn) {
   ASSERT_TRUE(query_id.has_value()) << "Query text: pid " << pid << " has a NULL query_id";
 }
 
-// Pins the CSV's log_filename, log_file_mode, log_line_prefix and log_statement=ddl against the
-// CREATE TABLE above; each default would fail a check below. PG writes its own log files only while
-// --logtostderr is false, which is also the glog default, so CheckFlagReadback pins that line.
+// Pins the CSV's log_filename, log_file_mode, log_line_prefix and log_statement=ddl against
+// CheckDdl's CREATE TABLE; each default would fail a check below. PG writes its own log files only
+// while --logtostderr is false, which is also the glog default, so CheckFlagReadback pins it.
 void PgProductionProfileTest::CheckPgLogFiles() {
   const auto log_dir = ASSERT_RESULT(pg_ts->GetFlag("log_dir"));
   const auto log_filename = ASSERT_RESULT(PgConfCsvValue(tserver_profile_, "log_filename"));
@@ -1629,10 +1634,11 @@ void PgProductionProfileTest::CheckPgLogFiles() {
   const auto expected_line = Format("LOG:  statement: $0", kCreateTableStatement);
 
   std::vector<std::string> log_files;
-  std::string waiting_for;
+  std::string waiting_for = Format("a file named $0*$1 in $2", prefix, suffix, log_dir);
   const auto status = WaitFor([&]() -> Result<bool> {
     log_files.clear();
-    const auto names = VERIFY_RESULT(Env::Default()->GetChildren(log_dir, ExcludeDots::kTrue));
+    const auto names = VERIFY_RESULT_PREPEND(
+        Env::Default()->GetChildren(log_dir, ExcludeDots::kTrue), Format("Listing $0", log_dir));
     for (const auto& name : names) {
       if (name.starts_with(prefix) && name.ends_with(suffix)) {
         log_files.push_back(JoinPathSegments(log_dir, name));
@@ -1644,7 +1650,8 @@ void PgProductionProfileTest::CheckPgLogFiles() {
     }
     for (const auto& path : log_files) {
       faststring contents;
-      RETURN_NOT_OK(ReadFileToString(Env::Default(), path, &contents));
+      RETURN_NOT_OK_PREPEND(
+          ReadFileToString(Env::Default(), path, &contents), Format("Reading $0", path));
       std::istringstream in(contents.ToString());
       for (std::string line; std::getline(in, line);) {
         if (line.find(expected_line) != std::string::npos &&
@@ -1659,7 +1666,7 @@ void PgProductionProfileTest::CheckPgLogFiles() {
         JoinStrings(log_files, ", "));
     return false;
   }, MonoDelta::FromSeconds(10 * kTimeMultiplier), "PG log file with the CREATE TABLE statement");
-  ASSERT_TRUE(status.ok()) << "PG log files: gave up waiting for " << waiting_for << ": " << status;
+  ASSERT_TRUE(status.ok()) << "PG log files: waiting for " << waiting_for << ": " << status;
 
   for (const auto& path : log_files) {
     struct stat st;
@@ -1685,13 +1692,15 @@ void PgProductionProfileTest::CheckAsh(PGConn* conn) {
   });
   int64_t num_samples = 0;
   const auto status = WaitFor([&]() -> Result<bool> {
-    num_samples = VERIFY_RESULT(conn->FetchRow<int64_t>(Format(
-        "SELECT count(*) FROM yb_active_session_history WHERE pid = $0", pid)));
+    num_samples = VERIFY_RESULT_PREPEND(
+        conn->FetchRow<int64_t>(Format(
+            "SELECT count(*) FROM yb_active_session_history WHERE pid = $0", pid)),
+        "Querying yb_active_session_history");
     return num_samples > 0;
   }, MonoDelta::FromSeconds(30 * kTimeMultiplier), "ASH samples of the sleeping backend");
   thread_holder.JoinAll();
-  ASSERT_TRUE(status.ok()) << "ASH: no yb_active_session_history sample with pid " << pid
-                           << " (the backend running pg_sleep): " << status;
+  ASSERT_TRUE(status.ok()) << "ASH: waiting for a yb_active_session_history sample with pid "
+                           << pid << " (the backend running pg_sleep): " << status;
   ASSERT_TRUE(sleep_status.ok()) << "ASH: pg_sleep on pid " << pid << ": " << sleep_status;
   LOG(INFO) << "ASH: " << num_samples << " samples of pid " << pid;
 }
@@ -1701,8 +1710,8 @@ void PgProductionProfileTest::CheckAsh(PGConn* conn) {
 // cluster whatever the profile says, so this shows the effect without pinning the profile line;
 // CheckFlagReadback and CheckPgTaggedFlags pin it. The master side (xrepl_catalog_manager.cc) also
 // relies on AutoFlag promotion, because the master profile does not set the flag; this is not a
-// master profile check. The logical replication connection names a database,
-// so it also exercises the hba lines' "all" database match.
+// master profile check. The logical replication connection names a database, so it also exercises
+// the hba lines' "all" database match.
 void PgProductionProfileTest::CheckReplicationSlot(PGConn* conn) {
   static constexpr auto kSlotLsnTypeQuery =
       "SELECT yb_lsn_type FROM pg_replication_slots WHERE slot_name = 'pp_slot'";
@@ -1802,8 +1811,10 @@ void PgProductionProfileTest::CheckMasterRestart() {
   ASSERT_TRUE(status.ok()) << "Master restart: no leader master: " << status
                            << "; last error: " << leader_status;
 
-  // The other values again: the master now runs the full file.
+  // The other values again: the master now runs the full file. CheckFlagReadback leaves
+  // kOtherDaemonOnlyFlags to CheckOtherDaemonOnlyFlags, so both run.
   ASSERT_NO_FATALS(CheckFlagReadback(IncludeBootstrapDeferred::kTrue));
+  ASSERT_NO_FATALS(CheckOtherDaemonOnlyFlags());
   // Satisfied by the registry the master reloads, not by heartbeats; CheckTServersHeartbeat is
   // the proof the tservers are back.
   ASSERT_OK(cluster_->WaitForTabletServerCount(
@@ -1978,15 +1989,15 @@ std::string MetricsByNodeToString(const std::map<std::string, std::set<std::stri
 
 }  // namespace
 
-// After a breaking catalog version bump, a new backend preloads its catalog caches, so a lookup
-// in a preloaded table is a cache hit. Each listed table gets a lookup below that misses when the
-// table is not preloaded, which a run without the list shows, so a zero miss delta shows the
-// table was preloaded; the exceptions are the tables every connection preloads anyway. An
-// unlisted, unpreloaded table looked up in the same window must miss, because an unemitted or
-// renamed metric reads as zero. The new backend logs in as carol, a
-// non-superuser, over the socket: role membership checks short-circuit for a superuser without
-// reading pg_auth_members. She is granted SELECT on t for the EXPLAIN. The metrics come from
-// pg_ts's PG, so the backend runs on pg_ts.
+// After a breaking catalog version bump, a new backend preloads its catalog caches, so a lookup in
+// a preloaded table is a cache hit. Each listed table gets a lookup below that misses when the
+// table is not preloaded, which a run without the list shows, so a zero miss delta shows the table
+// was preloaded; the exceptions are the tables every connection preloads anyway. An unlisted,
+// unpreloaded table looked up in the same window must miss, because an unemitted or renamed metric
+// reads as zero. The new backend logs in as carol, a non-superuser, over the socket: role
+// membership checks short-circuit for a superuser without reading pg_auth_members. She is granted
+// SELECT on t for the EXPLAIN and the control query. The metrics come from pg_ts's PG, so the
+// backend runs on pg_ts.
 void PgProductionProfileTest::CheckCatalogPreload(PGConn* conn) {
   static constexpr auto kListKey = "ysql_catalog_preload_additional_table_list";
   // Neither in the profile's list, nor among PG's default additional tables, nor among the tables
