@@ -1115,9 +1115,10 @@ class PartialFramesSetup {
 
 // Records what a call delivers to its partial and final callbacks, in delivery order. The
 // callbacks share the recorded state, as a partial callback may still run after the final one
-// (when the call is failed from another thread). The destructor waits for the final callback, so
-// that the call never writes to a response or controller, or runs a hook on locals, that the test
-// has destroyed after an early exit: declare the recorder after them.
+// (when the call is failed from another thread). The destructor waits for the final callback,
+// then stops the partial hooks and waits for a running one, so that the call never writes to a
+// response or controller, or runs a hook on locals, that the test has destroyed after an early
+// exit: declare the recorder after them.
 class FrameRecorder {
  public:
   struct Partial {
@@ -1139,14 +1140,22 @@ class FrameRecorder {
   void operator=(const FrameRecorder&) = delete;
 
   ~FrameRecorder() {
-    if (!final_handed_out_) {
-      return;
+    if (final_handed_out_) {
+      // Longer than any call timeout used with it, so that a call nobody answers still finishes.
+      const auto timeout = 60s * kTimeMultiplier;
+      if (!state_->final_latch.WaitFor(timeout)) {
+        LOG(FATAL) << "No final callback after " << timeout.count()
+                   << " s; the call would outlive its response and controller";
+      }
     }
-    // Longer than any call timeout used with it, so that a call nobody answers still finishes.
-    const auto timeout = 60s * kTimeMultiplier;
-    if (!state_->final_latch.WaitFor(timeout)) {
-      LOG(FATAL) << "No final callback after " << timeout.count()
-                 << " s; the call would outlive its response and controller";
+    // Bounded, so that a hook that never returns fails the test instead of hanging it.
+    const auto timeout = 30s * kTimeMultiplier;
+    std::unique_lock lock(state_->mutex);
+    state_->hooks_stopped = true;
+    if (!state_->hooks_running_cond.wait_for(
+            lock, timeout, [this] { return state_->hooks_running == 0; })) {
+      LOG(FATAL) << "Partial hook still running after " << timeout.count()
+                 << " s; its captured state would be destroyed under it";
     }
   }
 
@@ -1162,7 +1171,18 @@ class FrameRecorder {
       partial.payload = frame.payload();
       partial.holder_is_frame = ParseFrame(body, holder, &partial.header);
       if (hook) {
+        {
+          // Entered under the mutex that the destructor takes, before the hook can run.
+          std::lock_guard lock(state->mutex);
+          if (state->hooks_stopped) {
+            return;
+          }
+          ++state->hooks_running;
+        }
         hook(partial);
+        std::lock_guard lock(state->mutex);
+        --state->hooks_running;
+        state->hooks_running_cond.notify_all();
       }
       std::lock_guard lock(state->mutex);
       state->partials.push_back(std::move(partial));
@@ -1222,6 +1242,10 @@ class FrameRecorder {
     CountDownLatch final_latch{1};
     std::mutex mutex;
     std::vector<Partial> partials GUARDED_BY(mutex);
+    // Under mutex.
+    bool hooks_stopped = false;
+    int hooks_running = 0;
+    std::condition_variable hooks_running_cond;
   };
 
   static std::string CurrentThreadName() {
