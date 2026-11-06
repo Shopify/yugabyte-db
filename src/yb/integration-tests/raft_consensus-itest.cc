@@ -4434,10 +4434,10 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingWorkloadStreamed) {
 }
 
 // Every multi-Raft batching metric, and the existing metrics that show how consensus RPCs behave,
-// are on the Prometheus page of a tablet server with batching on. Streaming and pacing are off:
-// their metrics are registered whatever the flags.
+// are on the Prometheus page of a tablet server with batching on. The test does not turn streaming
+// or pacing on; their metrics are registered whatever the flags.
 TEST_F(RaftConsensusITest, MultiRaftBatchingMetricsExported) {
-  CreateCluster("raft_consensus-itest-cluster", {}, {});
+  ASSERT_NO_FATALS(CreateCluster("raft_consensus-itest-cluster", {}, {}));
   ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
   auto error_lines = WatchForBatchingErrorLines(cluster_.get());
 
@@ -4671,7 +4671,7 @@ void RaftConsensusITest::TestMultiRaftBatchingDeleteTableUnderLoad(bool streamed
   ASSERT_OK(WaitForMoreRows(kept, 500));
   kept.StopAndJoin();
   // Closing a peer fails only its own slot of an envelope (the follower answers it with an error,
-  // in a frame of its own when streamed), never the envelope.
+  // in a partial frame or the final when streamed), never the envelope.
   ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_envelopes_failed"), envelopes_failed);
   for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
     auto* ts = cluster_->tablet_server(i);
@@ -4984,9 +4984,13 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingStreamingPacingToggleUnderLoad) {
   ASSERT_GT(paced_flushes_while_paced, 0);
   ASSERT_GT(clocked_flushes_while_not_paced, 0);
   // A streamed envelope gets at most a frame per request and a final, and carries at most a
-  // heartbeat and a data request per tablet. So the streamed envelopes outnumber the tolerance at
-  // least a hundredfold, and a leak of one in a hundred of them would exceed it.
-  ASSERT_GT(frames_while_streamed, (2 * kNumTablets + 1) * 100 * kOutboundCallsTolerance);
+  // heartbeat and a data request per tablet. So more than 100 x (tolerance + 1) x tablet servers
+  // envelopes were streamed, and a leak of one in a hundred of them leaves more calls than the
+  // tolerance on at least one tablet server.
+  ASSERT_GT(
+      frames_while_streamed,
+      (2 * kNumTablets + 1) * 100 * (kOutboundCallsTolerance + 1) *
+          static_cast<int64_t>(cluster_->num_tablet_servers()));
 
   ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_envelopes_failed"), 0);
   ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_update_deadline_responses"), 0);
