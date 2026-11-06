@@ -31,6 +31,8 @@
 //
 #include "yb/tablet/tablet_metrics.h"
 
+#include <cstring>
+
 #include "yb/common/pgsql_protocol.messages.h"
 
 #include "yb/util/metrics.h"
@@ -138,6 +140,19 @@ METRIC_DEFINE_counter(tablet, consistent_prefix_read_requests,
     "Consistent Prefix Read Requests",
     yb::MetricUnit::kRequests,
     "Number of consistent prefix read requests");
+
+METRIC_DEFINE_counter(tablet, consistent_prefix_read_rejected,
+    "Consistent Prefix Reads Rejected as Not Safe",
+    yb::MetricUnit::kRequests,
+    "Number of YSQL consistent prefix read requests rejected at a follower because the requested "
+    "read time was not yet safe. This tablet-level metric is not returned in per-query responses.");
+
+METRIC_DEFINE_event_stats(tablet, consistent_prefix_read_rejected_safe_time_deficit_us,
+    "Consistent Prefix Read Rejection Safe Time Deficit",
+    yb::MetricUnit::kMicroseconds,
+    "Requested read time minus sampled safe time in physical microseconds for consistent prefix "
+    "read rejections with non-sentinel timestamps. Logical-only shortfalls contribute zero. "
+    "This tablet-level metric is not returned in per-query responses.");
 
 METRIC_DEFINE_counter(tablet, picked_read_time_on_docdb,
     "Picked read time on docdb",
@@ -259,6 +274,9 @@ const CounterEntry kCounters[] = {
   {pggate::YB_STORAGE_COUNTER_BACKFILL_READS_REJECTED_BELOW_HISTORY_CUTOFF,
       TabletCounters::kBackfillReadsRejectedBelowHistoryCutoff,
       &METRIC_backfill_reads_rejected_below_history_cutoff},
+  {pggate::YB_STORAGE_COUNTER_CONSISTENT_PREFIX_READ_REJECTED,
+      TabletCounters::kConsistentPrefixReadRejected,
+      &METRIC_consistent_prefix_read_rejected},
 };
 
 const CounterEntry kCountersForPgStatStatements[] = {
@@ -298,6 +316,9 @@ const EventStatsEntry kEventStats[] = {
   {pggate::YB_STORAGE_EVENT_INTENTSDB_REMOVE_JOIN_GROUP_MICROS,
       TabletEventStats::kIntentDbRemoveThreadJoinDuration,
       &METRIC_intentsdb_rocksdb_remove_thread_join_group_micros},
+  {pggate::YB_STORAGE_EVENT_CONSISTENT_PREFIX_READ_REJECTED_SAFE_TIME_DEFICIT_US,
+      TabletEventStats::kConsistentPrefixReadRejectedSafeTimeDeficitUs,
+      &METRIC_consistent_prefix_read_rejected_safe_time_deficit_us},
 };
 
 const EventStatsEntry kEventStatsForPgStatStatements[] = {
@@ -364,7 +385,9 @@ TabletMetricsImpl::TabletMetricsImpl(const scoped_refptr<MetricEntity>& table_en
     gauges_(kElementsInTabletGauges) {
 
   for (const auto& stat : kEventStats) {
-    event_stats_[std::to_underlying(stat.event_stat)] = stat.prototype->Instantiate(table_entity);
+    const auto& entity = std::strcmp(stat.prototype->entity_type(), "tablet") == 0
+        ? tablet_entity : table_entity;
+    event_stats_[std::to_underlying(stat.event_stat)] = stat.prototype->Instantiate(entity);
   }
 
   for (const auto& counter : kCounters) {

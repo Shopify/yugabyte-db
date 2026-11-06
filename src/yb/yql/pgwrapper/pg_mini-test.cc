@@ -31,7 +31,9 @@
 #include "yb/common/common_flags.h"
 #include "yb/common/entity_ids.h"
 #include "yb/common/pgsql_error.h"
+#include "yb/common/read_hybrid_time.h"
 #include "yb/common/schema.h"
+#include "yb/common/wire_protocol.h"
 
 #include "yb/dockv/doc_key.h"
 #include "yb/dockv/value_type.h"
@@ -57,8 +59,10 @@
 #include "yb/tserver/pg_client.proxy.h"
 #include "yb/tserver/pg_client_service.h"
 #include "yb/tserver/tablet_server.h"
+#include "yb/tserver/tserver_service.proxy.h"
 
 #include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_metrics.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/transaction_participant.h"
 
@@ -83,6 +87,7 @@
 #include "yb/util/tsan_util.h"
 
 #include "yb/rpc/rpc_context.h"
+#include "yb/rpc/rpc_controller.h"
 
 #include "yb/yql/pggate/pggate_flags.h"
 
@@ -168,6 +173,7 @@ DECLARE_uint64(rpc_max_message_size);
 DECLARE_bool(ysql_enable_relcache_init_optimization);
 
 METRIC_DECLARE_entity(tablet);
+METRIC_DECLARE_event_stats(consistent_prefix_read_rejected_safe_time_deficit_us);
 METRIC_DECLARE_gauge_uint64(aborted_transactions_pending_cleanup);
 METRIC_DECLARE_histogram(handler_latency_outbound_transfer);
 METRIC_DECLARE_gauge_int64(rpc_busy_reactors);
@@ -300,6 +306,81 @@ TEST_F_EX(PgMiniTest, VerifyPgClientServiceCleanupQueue, PgMiniPgClientServiceCl
   ASSERT_OK(WaitFor([client_service, expected_count = connections.size() + kAshConnection]() {
     return client_service->TEST_SessionsCount() == expected_count;
   }, 4 * FLAGS_pg_client_session_expiration_ms * 1ms, "client session cleanup", 1s));
+}
+
+TEST_F(PgMiniTest, FollowerReadRejectionMetrics) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT PRIMARY KEY) SPLIT INTO 1 TABLETS"));
+  const auto table_id = ASSERT_RESULT(GetTableIDFromTableName("t"));
+  ASSERT_OK(WaitAllReplicasReady(cluster_.get(), table_id, 30s * kTimeMultiplier));
+  const auto followers =
+      ListTableTabletPeers(cluster_.get(), table_id, ListPeersFilter::kNonLeaders);
+  ASSERT_FALSE(followers.empty());
+  const auto& peer = followers.front();
+  const auto tablet = ASSERT_RESULT(peer->shared_tablet());
+  auto* ts = cluster_->find_tablet_server(peer->permanent_uuid());
+  ASSERT_NE(ts, nullptr);
+  tserver::TabletServerServiceProxy proxy(
+      &cluster_->proxy_cache(), HostPort::FromBoundEndpoint(ts->bound_rpc_addr()));
+
+  auto* metrics = tablet->metrics();
+  const auto rejected_before = metrics->Get(tablet::TabletCounters::kConsistentPrefixReadRejected);
+  const auto deficit = METRIC_consistent_prefix_read_rejected_safe_time_deficit_us.Instantiate(
+      tablet->GetTabletMetricsEntity());
+  const auto count_before = deficit->TotalCount();
+  const auto sum_before = deficit->TotalSum();
+  const auto safe_before = ASSERT_RESULT(tablet->SafeTime(
+      tablet::RequireLease::kFalse, ts->Now(), CoarseMonoClock::now() + 30s * kTimeMultiplier));
+  ASSERT_GT(safe_before, HybridTime::kInitial);
+  ASSERT_FALSE(safe_before.is_special());
+
+  // A future client read time exercises fast rejection without depending on replication lag.
+  const auto read_time = safe_before.AddDelta(1h);
+  tserver::ReadRequestPB req;
+  req.set_tablet_id(peer->tablet_id());
+  req.set_consistency_level(YBConsistencyLevel::CONSISTENT_PREFIX);
+  ReadHybridTime::SingleTime(read_time).ToPB(req.mutable_read_time());
+  auto* pg_req = req.add_pgsql_batch();
+  pg_req->set_client(YQL_CLIENT_PGSQL);
+  pg_req->set_stmt_id(1);
+  pg_req->set_table_id(table_id);
+  pg_req->set_schema_version(peer->tablet_metadata()->primary_table_schema_version());
+  pg_req->add_targets()->mutable_value()->set_int32_value(1);
+  pg_req->set_metrics_capture(PgsqlMetricsCaptureType::PGSQL_METRICS_CAPTURE_ALL);
+
+  tserver::ReadResponsePB resp;
+  rpc::RpcController controller;
+  controller.set_timeout(30s * kTimeMultiplier);
+  ASSERT_OK(proxy.Read(req, &resp, &controller));
+  ASSERT_TRUE(resp.has_error());
+  const auto status = StatusFromPB(resp.error().status());
+  ASSERT_TRUE(status.IsIllegalState()) << status;
+  ASSERT_EQ(status.message().ToBuffer(), "Requested read time is not safe at this follower.");
+  ASSERT_EQ(resp.pgsql_batch_size(), 0);
+  ASSERT_EQ(
+      metrics->Get(tablet::TabletCounters::kConsistentPrefixReadRejected), rejected_before + 1);
+  ASSERT_EQ(deficit->TotalCount(), count_before + 1);
+  const auto safe_after = ASSERT_RESULT(tablet->SafeTime(tablet::RequireLease::kFalse));
+  ASSERT_LT(safe_after.GetPhysicalValueMicros(), read_time.GetPhysicalValueMicros());
+  const auto observed_deficit = deficit->TotalSum() - sum_before;
+  ASSERT_GE(
+      observed_deficit, read_time.GetPhysicalValueMicros() - safe_after.GetPhysicalValueMicros());
+  ASSERT_LE(
+      observed_deficit, read_time.GetPhysicalValueMicros() - safe_before.GetPhysicalValueMicros());
+
+  // The same follower accepts a safe read without recording another rejection or deficit.
+  ReadHybridTime::SingleTime(safe_after).ToPB(req.mutable_read_time());
+  resp.Clear();
+  controller.Reset();
+  controller.set_timeout(30s * kTimeMultiplier);
+  ASSERT_OK(proxy.Read(req, &resp, &controller));
+  ASSERT_FALSE(resp.has_error()) << resp.DebugString();
+  ASSERT_EQ(resp.pgsql_batch_size(), 1);
+  ASSERT_EQ(resp.pgsql_batch(0).status(), PgsqlResponsePB::PGSQL_STATUS_OK);
+  ASSERT_EQ(
+      metrics->Get(tablet::TabletCounters::kConsistentPrefixReadRejected), rejected_before + 1);
+  ASSERT_EQ(deficit->TotalCount(), count_before + 1);
+  ASSERT_EQ(deficit->TotalSum(), sum_before + observed_deficit);
 }
 
 // Try to change this to test follower reads.
