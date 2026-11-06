@@ -138,6 +138,7 @@ class WriteRpc;
 
 struct InFlightOp;
 struct InFlightOpsGroupsWithMetadata;
+struct ReplicaSelectionDiagnostics;
 
 class RemoteTablet;
 using RemoteTabletPtr = scoped_refptr<RemoteTablet>;
