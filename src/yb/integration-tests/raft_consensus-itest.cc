@@ -503,6 +503,17 @@ class RaftConsensusITest : public TabletServerIntegrationTestBase {
   // at the bottom of this file.
   void RunPhantomAckScenario(PhantomAckScenarioResult* result);
 
+  // Multi-Raft batching scenarios, defined at the bottom of this file. Each creates the cluster
+  // with heartbeat and data batching on; with streamed, also with streamed responses and pacing,
+  // and then checks that both ran.
+  std::unique_ptr<LogWaiter> StartMultiRaftBatchingCluster(bool streamed);
+  void TestMultiRaftBatchingWorkload(bool streamed);
+  void TestMultiRaftBatchingFollowerCrash(bool streamed);
+  void TestMultiRaftBatchingLeaderStepDown(bool streamed);
+  void TestMultiRaftBatchingDeleteTableUnderLoad(bool streamed);
+  void TestMultiRaftBatchingTombstonedFollowerUnderLoad(bool streamed);
+  void TestMultiRaftBatchingKillSwitchUnderLoad(bool streamed);
+
   std::vector<scoped_refptr<yb::Thread> > threads_;
   CountDownLatch inserters_;
   ClockPtr clock_;
@@ -4165,12 +4176,18 @@ void EnableMultiRaftBatching(ExternalMiniCluster* cluster) {
   }
 }
 
-// Makes every tablet server's batchers stream the responses of envelopes that carry data, including
-// across restarts. Takes effect for each envelope sent afterwards.
-void EnableMultiRaftStreaming(ExternalMiniCluster* cluster) {
-  constexpr auto kFlag = "enable_multi_raft_streaming_responses";
-  ASSERT_OK(cluster->SetFlagOnTServers(kFlag, "true"));
-  cluster->AddExtraFlagOnTServers(kFlag, "true");
+// Makes every tablet server's batchers stream the responses of envelopes that carry data and pace
+// data envelopes on a window of window_us, including across restarts. Takes effect for each data
+// request added and each envelope sent afterwards.
+void EnableStreamingAndPacing(ExternalMiniCluster* cluster, uint32_t window_us = 100) {
+  const std::vector<std::pair<std::string, std::string>> flags = {
+    {"enable_multi_raft_streaming_responses", "true"},
+    {"multi_raft_data_flush_window_us", AsString(window_us)},
+  };
+  for (const auto& [flag, value] : flags) {
+    ASSERT_OK(cluster->SetFlagOnTServers(flag, value));
+    cluster->AddExtraFlagOnTServers(flag, value);
+  }
 }
 
 int64_t ServerMetric(ExternalTabletServer* ts, const char* metric, const char* field = "value") {
@@ -4197,6 +4214,43 @@ int64_t SumServerMetric(
 
 int64_t ConcurrentSubRequests(ExternalTabletServer* ts) {
   return ServerMetric(ts, "multi_raft_update_sub_requests_concurrent");
+}
+
+int64_t PacedFlushes(ExternalMiniCluster* cluster) {
+  return SumServerMetric(cluster, "multi_raft_flush_paced_inline") +
+         SumServerMetric(cluster, "multi_raft_flush_paced_timer");
+}
+
+// A test that turned streaming and pacing on must show that both ran, or it proves nothing about
+// them: leaders received response frames and paced data envelopes, and followers sent frames.
+// Followers count a frame after queueing it, hence the wait.
+void AssertStreamedAndPaced(ExternalMiniCluster* cluster) {
+  ASSERT_OK(WaitFor(
+      [cluster] { return SumServerMetric(cluster, "multi_raft_update_frames_sent") > 0; }, 30s,
+      "Followers sent response frames"));
+  const auto frames_received = SumServerMetric(cluster, "multi_raft_frames_received");
+  const auto paced_flushes = PacedFlushes(cluster);
+  LOG(INFO) << "Streamed and paced: frames received " << frames_received << ", frames sent "
+            << SumServerMetric(cluster, "multi_raft_update_frames_sent") << ", paced flushes "
+            << paced_flushes;
+  ASSERT_GT(frames_received, 0);
+  ASSERT_GT(paced_flushes, 0);
+}
+
+// What sent the envelopes, and how long data requests waited, under the flags of the test and the
+// environment; for comparing runs.
+void LogMultiRaftFlushes(ExternalMiniCluster* cluster) {
+  std::string flushes;
+  for (const auto* reason :
+       {"paced_inline", "paced_timer", "immediate", "response_clocked", "deadline", "count_cap",
+        "bytes_cap", "timer"}) {
+    flushes += Format(
+        " $0=$1", reason, SumServerMetric(cluster, Format("multi_raft_flush_$0", reason).c_str()));
+  }
+  LOG(INFO) << "Multi-Raft flushes:" << flushes << ", data add to send: count="
+            << SumServerMetric(cluster, "multi_raft_data_add_to_send_us", "total_count")
+            << " sum_us="
+            << SumServerMetric(cluster, "multi_raft_data_add_to_send_us", "total_sum");
 }
 
 // The ids of the tablets of the table that the tablet server hosts.
@@ -4255,15 +4309,38 @@ Status WaitForMoreRows(const TestYcqlWorkload& workload, int64_t delta) {
 }
 
 // Watches every tablet server's log, across restarts, for lines that no batching scenario may
-// produce: a Raft request stuck past its timeout (`Peer::CheckStuckCall`) and an envelope answered
-// with the wrong number of responses (`MultiRaftBatcher::DispatchSubCallbacks`). Neither stops
-// the process in a release build. A daemon has a single log listener, so the test must not
-// register another one while this is alive.
+// produce. None of them stops the process in a release build (the DFATALs among them do in debug):
+// - a Raft request stuck past its timeout (`Peer::CheckStuckCall`);
+// - an envelope answered once with the wrong number of responses ("responses for"; also a
+//   streamed envelope answered by a follower that did not stream);
+// - RPC-core partial response frames: a partial frame for a call that did not ask for one, or
+//   marked as an error (leader connection), and `RespondPartial` after the final response
+//   (follower);
+// - leader frame validation of a streamed envelope: a malformed partial or final frame, a
+//   duplicate or out-of-range index, a final with no index after partial frames, and an OK final
+//   that leaves requests unanswered;
+// - a follower that could not send a partial frame and answered the rest of the envelope in the
+//   final (only a test hook makes that happen on a remote call).
+// Masters run batchers too but are not watched; the log scan after each run covers their logs.
+// A daemon has a single log listener, so the test must not register another one while this is
+// alive.
 std::unique_ptr<LogWaiter> WatchForBatchingErrorLines(ExternalMiniCluster* cluster) {
   const auto tservers = cluster->tserver_daemons();
   return std::make_unique<LogWaiter>(
       std::vector<ExternalDaemon*>(tservers.begin(), tservers.end()),
-      std::vector<std::string>{"Found an RPC call in stuck state", "responses for"});
+      std::vector<std::string>{
+          "Found an RPC call in stuck state",
+          "responses for",
+          "Got a partial response for a call that did not ask for one",
+          "Partial response frame marked as an error",
+          "RespondPartial called after the final response",
+          "Malformed MultiRaft partial response frame",
+          "MultiRaft response frame has an invalid index",
+          "MultiRaft final response has no index after partial frames",
+          "Malformed MultiRaft final response",
+          "MultiRaft response has no response for request",
+          "answering the rest of it in the final response",
+      });
 }
 
 void AssertNoBatchingErrorLines(LogWaiter* waiter) {
@@ -4272,14 +4349,24 @@ void AssertNoBatchingErrorLines(LogWaiter* waiter) {
 
 } // namespace
 
+std::unique_ptr<LogWaiter> RaftConsensusITest::StartMultiRaftBatchingCluster(bool streamed) {
+  CreateCluster("raft_consensus-itest-cluster", {}, {});
+  EnableMultiRaftBatching(cluster_.get());
+  if (streamed) {
+    EnableStreamingAndPacing(cluster_.get());
+  }
+  return WatchForBatchingErrorLines(cluster_.get());
+}
+
 // A write workload over several tablets with heartbeat and data batching: leaders send both kinds
 // of requests in envelopes, followers process the envelopes concurrently, the leaders process the
 // batched data responses, and the replicas converge. Nothing stops or slows a follower, so no
-// envelope fails and none is answered at its deadline.
-TEST_F(RaftConsensusITest, MultiRaftBatchingWorkload) {
-  CreateCluster("raft_consensus-itest-cluster", {}, {});
-  ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
-  auto error_lines = WatchForBatchingErrorLines(cluster_.get());
+// envelope fails and none is answered at its deadline. Streamed, the followers answer each request
+// as it completes, in frames, and the leaders pace data envelopes: inline sends after the window
+// show that pacing decided the sends, not only the heartbeat timer or the caps.
+void RaftConsensusITest::TestMultiRaftBatchingWorkload(bool streamed) {
+  auto error_lines = StartMultiRaftBatchingCluster(streamed);
+  ASSERT_FALSE(HasFatalFailure());
 
   TestYcqlWorkload workload(cluster_.get());
   workload.set_num_tablets(6);
@@ -4298,12 +4385,18 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingWorkload) {
       },
       30s, "Batched heartbeats"));
 
+  LogMultiRaftFlushes(cluster_.get());
   ASSERT_GT(SumServerMetric(cluster_.get(), "multi_raft_data_sub_requests"), 0);
   ASSERT_GT(SumServerMetric(
       cluster_.get(), "multi_raft_batched_response_processing_us", "total_count"), 0);
   ASSERT_GT(SumServerMetric(cluster_.get(), "multi_raft_update_sub_requests_concurrent"), 0);
   ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_envelopes_failed"), 0);
   ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_update_deadline_responses"), 0);
+  if (streamed) {
+    ASSERT_NO_FATALS(AssertStreamedAndPaced(cluster_.get()));
+    ASSERT_GT(SumServerMetric(cluster_.get(), "multi_raft_frame_slots", "total_count"), 0);
+    ASSERT_GT(SumServerMetric(cluster_.get(), "multi_raft_flush_paced_inline"), 0);
+  }
 
   ASSERT_NO_FATALS(AssertNoBatchingErrorLines(error_lines.get()));
   ClusterVerifier cluster_verifier(cluster_.get());
@@ -4312,55 +4405,12 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingWorkload) {
       workload.table_name(), ClusterVerifier::AT_LEAST, workload.rows_inserted()));
 }
 
-// The same workload with streamed responses: followers answer each request of an envelope as soon
-// as it completes, in partial frames, and leaders deliver each response from its frame. No frame
-// breaks the protocol (that would fail requests, or be logged at DFATAL and caught by the log
-// scan), and the replicas converge.
-TEST_F(RaftConsensusITest, MultiRaftBatchingStreamingWorkload) {
-  CreateCluster("raft_consensus-itest-cluster", {}, {});
-  ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
-  ASSERT_NO_FATALS(EnableMultiRaftStreaming(cluster_.get()));
-  auto error_lines = WatchForBatchingErrorLines(cluster_.get());
+TEST_F(RaftConsensusITest, MultiRaftBatchingWorkload) {
+  TestMultiRaftBatchingWorkload(/* streamed= */ false);
+}
 
-  TestYcqlWorkload workload(cluster_.get());
-  workload.set_num_tablets(6);
-  workload.set_num_write_threads(4);
-  workload.set_write_batch_size(1);
-  workload.Setup(client::YBTableType::YQL_TABLE_TYPE);
-  workload.Start();
-  ASSERT_OK(WaitFor(
-      [&workload] { return workload.rows_inserted() >= 2000; }, 60s * kTimeMultiplier,
-      "Rows inserted"));
-  workload.StopAndJoin();
-
-  ASSERT_GT(SumServerMetric(cluster_.get(), "multi_raft_data_sub_requests"), 0);
-  ASSERT_GT(SumServerMetric(cluster_.get(), "multi_raft_frames_received"), 0);
-  ASSERT_GT(SumServerMetric(cluster_.get(), "multi_raft_frame_slots", "total_count"), 0);
-  ASSERT_GT(SumServerMetric(cluster_.get(), "multi_raft_update_frames_sent"), 0);
-  ASSERT_GT(SumServerMetric(
-      cluster_.get(), "multi_raft_batched_response_processing_us", "total_count"), 0);
-  ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_envelopes_failed"), 0);
-  ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_update_deadline_responses"), 0);
-  // What sent the envelopes, and how long data requests waited, under the flush flags the
-  // environment set; for comparing runs.
-  std::string flushes;
-  for (const auto* reason :
-       {"paced_inline", "paced_timer", "immediate", "response_clocked", "deadline", "count_cap",
-        "bytes_cap", "timer"}) {
-    flushes += Format(
-        " $0=$1", reason,
-        SumServerMetric(cluster_.get(), Format("multi_raft_flush_$0", reason).c_str()));
-  }
-  LOG(INFO) << "Multi-Raft flushes:" << flushes << ", data add to send: count="
-            << SumServerMetric(cluster_.get(), "multi_raft_data_add_to_send_us", "total_count")
-            << " sum_us="
-            << SumServerMetric(cluster_.get(), "multi_raft_data_add_to_send_us", "total_sum");
-
-  ASSERT_NO_FATALS(AssertNoBatchingErrorLines(error_lines.get()));
-  ClusterVerifier cluster_verifier(cluster_.get());
-  ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
-  ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
-      workload.table_name(), ClusterVerifier::AT_LEAST, workload.rows_inserted()));
+TEST_F(RaftConsensusITest, MultiRaftBatchingWorkloadStreamed) {
+  TestMultiRaftBatchingWorkload(/* streamed= */ true);
 }
 
 // Every multi-Raft batching metric, and the existing metrics that show how consensus RPCs behave,
@@ -4432,11 +4482,12 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingMetricsExported) {
 }
 
 // A tablet server that stops responding, and then crashes, while envelopes to it are in flight:
-// the envelopes to it fail as a whole, the leaders recover, and the replicas converge.
-TEST_F(RaftConsensusITest, MultiRaftBatchingFollowerCrash) {
-  CreateCluster("raft_consensus-itest-cluster", {}, {});
-  ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
-  auto error_lines = WatchForBatchingErrorLines(cluster_.get());
+// the envelopes to it fail, the leaders recover, and the replicas converge. A failed envelope
+// counts once whether or not it was streamed; streamed, it fails only the requests that no frame
+// answered, and frames cannot arrive from a stopped server, so the count still rises.
+void RaftConsensusITest::TestMultiRaftBatchingFollowerCrash(bool streamed) {
+  auto error_lines = StartMultiRaftBatchingCluster(streamed);
+  ASSERT_FALSE(HasFatalFailure());
 
   TestYcqlWorkload workload(cluster_.get());
   ASSERT_NO_FATALS(StartBatchedWriteWorkload(&workload));
@@ -4467,8 +4518,17 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingFollowerCrash) {
   ASSERT_OK(WaitFor(
       [victim] { return ConcurrentSubRequests(victim) > 0; }, 30s,
       "Restarted server receives envelopes"));
+  if (streamed) {
+    // The restarted server got the flags again, and streams.
+    ASSERT_OK(WaitFor(
+        [victim] { return ServerMetric(victim, "multi_raft_update_frames_sent") > 0; }, 30s,
+        "Restarted server sends response frames"));
+  }
   workload.StopAndJoin();
 
+  if (streamed) {
+    ASSERT_NO_FATALS(AssertStreamedAndPaced(cluster_.get()));
+  }
   ASSERT_NO_FATALS(AssertNoBatchingErrorLines(error_lines.get()));
   ClusterVerifier cluster_verifier(cluster_.get());
   ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
@@ -4476,13 +4536,20 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingFollowerCrash) {
       workload.table_name(), ClusterVerifier::AT_LEAST, workload.rows_inserted()));
 }
 
+TEST_F(RaftConsensusITest, MultiRaftBatchingFollowerCrash) {
+  TestMultiRaftBatchingFollowerCrash(/* streamed= */ false);
+}
+
+TEST_F(RaftConsensusITest, MultiRaftBatchingFollowerCrashStreamed) {
+  TestMultiRaftBatchingFollowerCrash(/* streamed= */ true);
+}
+
 // Leaders with batched data rounds in flight step down under load: other replicas take over, the
 // writes continue, and no acknowledged write is lost.
-TEST_F(RaftConsensusITest, MultiRaftBatchingLeaderStepDown) {
+void RaftConsensusITest::TestMultiRaftBatchingLeaderStepDown(bool streamed) {
   constexpr size_t kNumStepDowns = 3;
-  CreateCluster("raft_consensus-itest-cluster", {}, {});
-  ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
-  auto error_lines = WatchForBatchingErrorLines(cluster_.get());
+  auto error_lines = StartMultiRaftBatchingCluster(streamed);
+  ASSERT_FALSE(HasFatalFailure());
 
   TestYcqlWorkload workload(cluster_.get());
   ASSERT_NO_FATALS(StartBatchedWriteWorkload(&workload));
@@ -4527,6 +4594,9 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingLeaderStepDown) {
   workload.StopAndJoin();
 
   ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_update_deadline_responses"), 0);
+  if (streamed) {
+    ASSERT_NO_FATALS(AssertStreamedAndPaced(cluster_.get()));
+  }
   ASSERT_NO_FATALS(AssertNoBatchingErrorLines(error_lines.get()));
   ClusterVerifier cluster_verifier(cluster_.get());
   ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
@@ -4534,12 +4604,19 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingLeaderStepDown) {
       workload.table_name(), ClusterVerifier::AT_LEAST, workload.rows_inserted()));
 }
 
+TEST_F(RaftConsensusITest, MultiRaftBatchingLeaderStepDown) {
+  TestMultiRaftBatchingLeaderStepDown(/* streamed= */ false);
+}
+
+TEST_F(RaftConsensusITest, MultiRaftBatchingLeaderStepDownStreamed) {
+  TestMultiRaftBatchingLeaderStepDown(/* streamed= */ true);
+}
+
 // A table is deleted while writes to it, sent through the batchers, are in flight: its peers are
 // closed with batched rounds outstanding, and the writes to another table carry on.
-TEST_F(RaftConsensusITest, MultiRaftBatchingDeleteTableUnderLoad) {
-  CreateCluster("raft_consensus-itest-cluster", {}, {});
-  ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
-  auto error_lines = WatchForBatchingErrorLines(cluster_.get());
+void RaftConsensusITest::TestMultiRaftBatchingDeleteTableUnderLoad(bool streamed) {
+  auto error_lines = StartMultiRaftBatchingCluster(streamed);
+  ASSERT_FALSE(HasFatalFailure());
 
   TestYcqlWorkload kept(cluster_.get());
   ASSERT_NO_FATALS(StartBatchedWriteWorkload(&kept, 3));
@@ -4562,8 +4639,8 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingDeleteTableUnderLoad) {
 
   ASSERT_OK(WaitForMoreRows(kept, 500));
   kept.StopAndJoin();
-  // Closing a peer fails only its own slot of an envelope (the follower answers it with an error),
-  // never the envelope.
+  // Closing a peer fails only its own slot of an envelope (the follower answers it with an error,
+  // in a frame of its own when streamed), never the envelope.
   ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_envelopes_failed"), envelopes_failed);
   for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
     auto* ts = cluster_->tablet_server(i);
@@ -4572,6 +4649,9 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingDeleteTableUnderLoad) {
         << ts->uuid();
   }
 
+  if (streamed) {
+    ASSERT_NO_FATALS(AssertStreamedAndPaced(cluster_.get()));
+  }
   ASSERT_NO_FATALS(AssertNoBatchingErrorLines(error_lines.get()));
   ClusterVerifier cluster_verifier(cluster_.get());
   ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
@@ -4579,12 +4659,19 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingDeleteTableUnderLoad) {
       kept.table_name(), ClusterVerifier::AT_LEAST, kept.rows_inserted()));
 }
 
+TEST_F(RaftConsensusITest, MultiRaftBatchingDeleteTableUnderLoad) {
+  TestMultiRaftBatchingDeleteTableUnderLoad(/* streamed= */ false);
+}
+
+TEST_F(RaftConsensusITest, MultiRaftBatchingDeleteTableUnderLoadStreamed) {
+  TestMultiRaftBatchingDeleteTableUnderLoad(/* streamed= */ true);
+}
+
 // A follower replica of a loaded tablet is tombstoned: the leader learns that from a batched
 // sub-response (TABLET_NOT_FOUND), remote-bootstraps the replica, and the replica catches up.
-TEST_F(RaftConsensusITest, MultiRaftBatchingTombstonedFollowerUnderLoad) {
-  CreateCluster("raft_consensus-itest-cluster", {}, {});
-  ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
-  auto error_lines = WatchForBatchingErrorLines(cluster_.get());
+void RaftConsensusITest::TestMultiRaftBatchingTombstonedFollowerUnderLoad(bool streamed) {
+  auto error_lines = StartMultiRaftBatchingCluster(streamed);
+  ASSERT_FALSE(HasFatalFailure());
 
   TestYcqlWorkload workload(cluster_.get());
   ASSERT_NO_FATALS(StartBatchedWriteWorkload(&workload, 3));
@@ -4618,6 +4705,9 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingTombstonedFollowerUnderLoad) {
   workload.StopAndJoin();
 
   ASSERT_OK(WaitForServersToAgree(60s * kTimeMultiplier, tablet_servers_, tablet_id, 1));
+  if (streamed) {
+    ASSERT_NO_FATALS(AssertStreamedAndPaced(cluster_.get()));
+  }
   ASSERT_NO_FATALS(AssertNoBatchingErrorLines(error_lines.get()));
   ClusterVerifier cluster_verifier(cluster_.get());
   ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
@@ -4625,20 +4715,28 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingTombstonedFollowerUnderLoad) {
       workload.table_name(), ClusterVerifier::AT_LEAST, workload.rows_inserted()));
 }
 
+TEST_F(RaftConsensusITest, MultiRaftBatchingTombstonedFollowerUnderLoad) {
+  TestMultiRaftBatchingTombstonedFollowerUnderLoad(/* streamed= */ false);
+}
+
+TEST_F(RaftConsensusITest, MultiRaftBatchingTombstonedFollowerUnderLoadStreamed) {
+  TestMultiRaftBatchingTombstonedFollowerUnderLoad(/* streamed= */ true);
+}
+
 // The data-batching kill switch under load, flipped the way an operator would: one tablet server
 // at a time, at runtime, off and then back on. Between flips, leaders with the flag on send data
 // envelopes to followers with it off, which answer on the serial handler. With the flag off
 // everywhere, data goes direct and no follower uses the concurrent handler; with it back on, both
 // resume. Nothing stops or slows a follower, so no envelope fails and none is answered at its
-// deadline.
-TEST_F(RaftConsensusITest, MultiRaftBatchingKillSwitchUnderLoad) {
+// deadline. Streamed, the envelopes left with the flag off carry only heartbeats, which are never
+// streamed, and streaming resumes with the data.
+void RaftConsensusITest::TestMultiRaftBatchingKillSwitchUnderLoad(bool streamed) {
   constexpr auto kDataFlag = "enable_multi_raft_data_batching";
   constexpr int64_t kRowsBetweenFlips = 1000;
   // Long enough for envelopes in flight at the last flip to drain under the held update locks.
   const auto kSettle = 3s * kTimeMultiplier;
-  CreateCluster("raft_consensus-itest-cluster", {}, {});
-  ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
-  auto error_lines = WatchForBatchingErrorLines(cluster_.get());
+  auto error_lines = StartMultiRaftBatchingCluster(streamed);
+  ASSERT_FALSE(HasFatalFailure());
 
   TestYcqlWorkload workload(cluster_.get());
   // Tens of thousands of random int32 keys would likely repeat one, and the row count check below
@@ -4668,6 +4766,9 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingKillSwitchUnderLoad) {
         cluster_.get(), "handler_latency_yb_consensus_ConsensusService_UpdateConsensus",
         "total_count");
   };
+  auto frames_received = [this] {
+    return SumServerMetric(cluster_.get(), "multi_raft_frames_received");
+  };
   auto assert_no_failures = [this] {
     ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_envelopes_failed"), 0);
     ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_update_deadline_responses"), 0);
@@ -4676,11 +4777,16 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingKillSwitchUnderLoad) {
   // On: leaders batch data and followers process the envelopes concurrently.
   auto data_before = data_sub_requests();
   auto concurrent_before = concurrent_sub_requests();
+  auto frames_before = frames_received();
   ASSERT_OK(WaitForMoreRows(workload, 300));
   LOG(INFO) << "Batching on: data sub-requests +" << data_sub_requests() - data_before
-            << ", concurrent sub-requests +" << concurrent_sub_requests() - concurrent_before;
+            << ", concurrent sub-requests +" << concurrent_sub_requests() - concurrent_before
+            << ", frames received +" << frames_received() - frames_before;
   ASSERT_GT(data_sub_requests(), data_before);
   ASSERT_GT(concurrent_sub_requests(), concurrent_before);
+  if (streamed) {
+    ASSERT_GT(frames_received(), frames_before);
+  }
   ASSERT_NO_FATALS(assert_no_failures());
 
   // Off, one server at a time.
@@ -4691,6 +4797,7 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingKillSwitchUnderLoad) {
   SleepFor(kSettle);
   data_before = data_sub_requests();
   concurrent_before = concurrent_sub_requests();
+  frames_before = frames_received();
   const auto heartbeat_before = heartbeat_sub_requests();
   const auto direct_before = direct_updates();
   ASSERT_OK(WaitForMoreRows(workload, 300));
@@ -4698,12 +4805,15 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingKillSwitchUnderLoad) {
   LOG(INFO) << "Batching off: data sub-requests +" << data_sub_requests() - data_before
             << ", concurrent sub-requests +" << concurrent_sub_requests() - concurrent_before
             << ", heartbeat sub-requests +" << heartbeat_sub_requests() - heartbeat_before
-            << ", direct updates +" << direct_updates() - direct_before;
+            << ", direct updates +" << direct_updates() - direct_before
+            << ", frames received +" << frames_received() - frames_before;
   ASSERT_EQ(data_sub_requests(), data_before);
   ASSERT_GT(direct_updates(), direct_before);
   // Envelopes still arrive, with heartbeats only, and followers run them on the serial handler.
   ASSERT_GT(heartbeat_sub_requests(), heartbeat_before);
   ASSERT_EQ(concurrent_sub_requests(), concurrent_before);
+  // Heartbeat-only envelopes are never streamed.
+  ASSERT_EQ(frames_received(), frames_before);
   ASSERT_NO_FATALS(assert_no_failures());
 
   // On again, one server at a time.
@@ -4713,14 +4823,22 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingKillSwitchUnderLoad) {
   }
   data_before = data_sub_requests();
   concurrent_before = concurrent_sub_requests();
+  frames_before = frames_received();
   ASSERT_OK(WaitForMoreRows(workload, 300));
   LOG(INFO) << "Batching on again: data sub-requests +" << data_sub_requests() - data_before
-            << ", concurrent sub-requests +" << concurrent_sub_requests() - concurrent_before;
+            << ", concurrent sub-requests +" << concurrent_sub_requests() - concurrent_before
+            << ", frames received +" << frames_received() - frames_before;
   ASSERT_GT(data_sub_requests(), data_before);
   ASSERT_GT(concurrent_sub_requests(), concurrent_before);
+  if (streamed) {
+    ASSERT_GT(frames_received(), frames_before);
+  }
   workload.StopAndJoin();
 
   ASSERT_NO_FATALS(assert_no_failures());
+  if (streamed) {
+    ASSERT_NO_FATALS(AssertStreamedAndPaced(cluster_.get()));
+  }
   for (auto* ts : cluster_->tserver_daemons()) {
     ASSERT_TRUE(ts->IsProcessAlive()) << ts->uuid();
   }
@@ -4730,6 +4848,14 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingKillSwitchUnderLoad) {
   ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
   ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
       workload.table_name(), ClusterVerifier::AT_LEAST, workload.rows_inserted()));
+}
+
+TEST_F(RaftConsensusITest, MultiRaftBatchingKillSwitchUnderLoad) {
+  TestMultiRaftBatchingKillSwitchUnderLoad(/* streamed= */ false);
+}
+
+TEST_F(RaftConsensusITest, MultiRaftBatchingKillSwitchUnderLoadStreamed) {
+  TestMultiRaftBatchingKillSwitchUnderLoad(/* streamed= */ true);
 }
 
 }  // namespace tserver
