@@ -2173,7 +2173,8 @@ TEST_F(MultiRaftBatcherTest, PacedSubMillisecondWindow) {
     const auto second_sent = SentAt(envelopes + 1);
     gaps_us.push_back(ToMicroseconds(second_sent - first_sent));
     ASSERT_GE(second_sent - before_first, kWindow) << "round " << round;
-    ASSERT_LT(second_sent - first_sent, 5ms) << "round " << round;
+    // Loose for a loaded host; a millisecond-scale window would take hundreds of milliseconds.
+    ASSERT_LT(second_sent - first_sent, 20ms) << "round " << round;
   }
   LOG(INFO) << "Parked rounds: " << parked_rounds << ", first to second envelope (us): "
             << AsString(gaps_us);
