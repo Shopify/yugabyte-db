@@ -4221,6 +4221,14 @@ int64_t PacedFlushes(ExternalMiniCluster* cluster) {
          SumServerMetric(cluster, "multi_raft_flush_paced_timer");
 }
 
+// Data envelopes sent under the window-0 policy (response clocking): immediately, on a completion,
+// or at the delay.
+int64_t ResponseClockedPolicyFlushes(ExternalMiniCluster* cluster) {
+  return SumServerMetric(cluster, "multi_raft_flush_immediate") +
+         SumServerMetric(cluster, "multi_raft_flush_response_clocked") +
+         SumServerMetric(cluster, "multi_raft_flush_deadline");
+}
+
 // A test that turned streaming and pacing on must show that both ran, or it proves nothing about
 // them: leaders received response frames and paced data envelopes, and followers sent frames.
 // Followers count a frame after queueing it, hence the wait.
@@ -4291,13 +4299,17 @@ bool HasPrometheusMetric(
          (names.contains(metric + "_sum") && names.contains(metric + "_count"));
 }
 
-void StartBatchedWriteWorkload(TestYcqlWorkload* workload, int num_tablets = 6) {
+void SetUpBatchedWriteWorkload(TestYcqlWorkload* workload, int num_tablets = 6) {
   workload->set_num_tablets(num_tablets);
   workload->set_num_write_threads(4);
   workload->set_write_batch_size(1);
   workload->set_timeout_allowed(true);
   workload->set_write_timeout_millis(5000);
   workload->Setup(client::YBTableType::YQL_TABLE_TYPE);
+}
+
+void StartBatchedWriteWorkload(TestYcqlWorkload* workload, int num_tablets = 6) {
+  SetUpBatchedWriteWorkload(workload, num_tablets);
   workload->Start();
 }
 
@@ -4414,7 +4426,8 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingWorkloadStreamed) {
 }
 
 // Every multi-Raft batching metric, and the existing metrics that show how consensus RPCs behave,
-// are on the Prometheus page of a tablet server with batching on.
+// are on the Prometheus page of a tablet server with batching on. Streaming and pacing are off:
+// their metrics are registered whatever the flags.
 TEST_F(RaftConsensusITest, MultiRaftBatchingMetricsExported) {
   CreateCluster("raft_consensus-itest-cluster", {}, {});
   ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
@@ -4428,6 +4441,7 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingMetricsExported) {
   // Registered by each multi-Raft batcher, i.e. on a server that leads a tablet.
   const std::vector<std::string> kLeaderMetrics = {
     "multi_raft_batched_response_processing_us",
+    "multi_raft_data_add_to_send_us",
     "multi_raft_data_sends_direct",
     "multi_raft_data_sub_requests",
     "multi_raft_envelope_bytes",
@@ -4439,8 +4453,12 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingMetricsExported) {
     "multi_raft_flush_count_cap",
     "multi_raft_flush_deadline",
     "multi_raft_flush_immediate",
+    "multi_raft_flush_paced_inline",
+    "multi_raft_flush_paced_timer",
     "multi_raft_flush_response_clocked",
     "multi_raft_flush_timer",
+    "multi_raft_frame_slots",
+    "multi_raft_frames_received",
     "multi_raft_heartbeat_sub_requests",
   };
   // Registered by every tablet server.
@@ -4452,11 +4470,16 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingMetricsExported) {
     "handler_latency_yb_tserver_TabletServerService_Write",
     "log_group_commit_latency",
     "multi_raft_update_deadline_responses",
+    "multi_raft_update_frame_slots",
+    "multi_raft_update_frames_sent",
+    "multi_raft_update_inline_sub_requests",
     "multi_raft_update_pool_queue_time_us",
     "multi_raft_update_pool_run_time_us",
+    "multi_raft_update_slot_wait_us",
     "multi_raft_update_sub_requests_concurrent",
     "not_leader_rejections",
     "rpc_incoming_queue_time",
+    "rpc_outbound_calls_alive",
   };
 
   size_t num_servers_with_batcher = 0;
@@ -4856,6 +4879,218 @@ TEST_F(RaftConsensusITest, MultiRaftBatchingKillSwitchUnderLoad) {
 
 TEST_F(RaftConsensusITest, MultiRaftBatchingKillSwitchUnderLoadStreamed) {
   TestMultiRaftBatchingKillSwitchUnderLoad(/* streamed= */ true);
+}
+
+// Streaming and the pacing window flipped at runtime on every tablet server, once a second, under
+// a write workload. Each step flips one flag, so over eight steps each flag goes on and off with
+// the other both on and off. An envelope keeps the mode it was sent with, and a flush task fires
+// under the policy that armed it, so no envelope fails, none is answered at its deadline, the
+// replicas converge and no acknowledged write is lost.
+//
+// A streamed envelope kept alive past its RPC would keep that RPC's outbound call alive, so each
+// tablet server's `rpc_outbound_calls_alive` must return to about its idle level once the writes
+// stop. The gauge also counts master heartbeats and consensus calls in flight; the tolerance
+// covers those, and is far below the number of streamed envelopes.
+TEST_F(RaftConsensusITest, MultiRaftBatchingStreamingPacingToggleUnderLoad) {
+  constexpr auto kStreamingFlag = "enable_multi_raft_streaming_responses";
+  constexpr auto kWindowFlag = "multi_raft_data_flush_window_us";
+  constexpr int kNumSteps = 20;
+  constexpr int kNumTablets = 6;
+  constexpr int64_t kMinRowsPerStep = 20;
+  constexpr int64_t kOutboundCallsTolerance = 5;
+  struct Mode {
+    bool streamed;
+    bool paced;
+  };
+  // Starts after (streamed, paced); each step changes one flag.
+  constexpr std::array<Mode, 8> kModes = {{
+    {false, true}, {false, false}, {true, false}, {true, true},
+    {true, false}, {false, false}, {false, true}, {true, true},
+  }};
+  CreateCluster("raft_consensus-itest-cluster", {}, {});
+  ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
+  ASSERT_NO_FATALS(EnableStreamingAndPacing(cluster_.get()));
+  auto error_lines = WatchForBatchingErrorLines(cluster_.get());
+
+  TestYcqlWorkload workload(cluster_.get());
+  // Random keys could repeat over this many writes and fail the row count check.
+  workload.set_sequential_write(true);
+  ASSERT_NO_FATALS(SetUpBatchedWriteWorkload(&workload, kNumTablets));
+  // The idle level: the table exists and its tablets heartbeat through the batchers.
+  const auto heartbeats = SumServerMetric(cluster_.get(), "multi_raft_heartbeat_sub_requests");
+  ASSERT_OK(WaitFor(
+      [this, heartbeats] {
+        return SumServerMetric(cluster_.get(), "multi_raft_heartbeat_sub_requests") >
+               heartbeats + 100;
+      },
+      30s, "Batched heartbeats"));
+  std::vector<int64_t> idle_outbound_calls;
+  for (auto* ts : cluster_->tserver_daemons()) {
+    idle_outbound_calls.push_back(ServerMetric(ts, "rpc_outbound_calls_alive"));
+  }
+  LOG(INFO) << "Idle outbound calls: " << AsString(idle_outbound_calls);
+  workload.Start();
+  ASSERT_OK(WaitForMoreRows(workload, 300));
+
+  int64_t frames_while_streamed = 0;
+  int64_t paced_flushes_while_paced = 0;
+  int64_t clocked_flushes_while_not_paced = 0;
+  for (int step = 0; step != kNumSteps; ++step) {
+    const auto& mode = kModes[step % kModes.size()];
+    const auto& previous = kModes[(step + kModes.size() - 1) % kModes.size()];
+    if (mode.streamed != previous.streamed) {
+      ASSERT_OK(cluster_->SetFlagOnTServers(kStreamingFlag, mode.streamed ? "true" : "false"));
+    } else {
+      ASSERT_OK(cluster_->SetFlagOnTServers(kWindowFlag, mode.paced ? "100" : "0"));
+    }
+    const auto frames = SumServerMetric(cluster_.get(), "multi_raft_frames_received");
+    const auto paced = PacedFlushes(cluster_.get());
+    const auto clocked = ResponseClockedPolicyFlushes(cluster_.get());
+    const auto rows = workload.rows_inserted();
+    // The flip cadence is the scenario; there is no event to wait for.
+    SleepFor(1s);
+    // Writes ran in this mode.
+    ASSERT_OK(WaitFor(
+        [&workload, rows] { return workload.rows_inserted() >= rows + kMinRowsPerStep; },
+        30s * kTimeMultiplier, Format("Writes in step $0", step)));
+    if (mode.streamed) {
+      frames_while_streamed +=
+          SumServerMetric(cluster_.get(), "multi_raft_frames_received") - frames;
+    }
+    if (mode.paced) {
+      paced_flushes_while_paced += PacedFlushes(cluster_.get()) - paced;
+    } else {
+      clocked_flushes_while_not_paced += ResponseClockedPolicyFlushes(cluster_.get()) - clocked;
+    }
+  }
+  ASSERT_OK(WaitForMoreRows(workload, 300));
+  workload.StopAndJoin();
+
+  const auto envelopes_sent = SumServerMetric(cluster_.get(), "multi_raft_envelopes_sent");
+  LOG(INFO) << "Envelopes sent: " << envelopes_sent << ", frames received while streamed: "
+            << frames_while_streamed << ", paced flushes while paced: "
+            << paced_flushes_while_paced << ", response-clocked policy flushes while not paced: "
+            << clocked_flushes_while_not_paced;
+  // Both modes of each flag really ran.
+  ASSERT_GT(frames_while_streamed, 0);
+  ASSERT_GT(paced_flushes_while_paced, 0);
+  ASSERT_GT(clocked_flushes_while_not_paced, 0);
+  // A streamed envelope gets at most a frame per request and a final, and carries at most a
+  // heartbeat and a data request per tablet. So the streamed envelopes outnumber the tolerance at
+  // least a hundredfold, and a leak of one in a hundred of them would exceed it.
+  ASSERT_GT(frames_while_streamed, (2 * kNumTablets + 1) * 100 * kOutboundCallsTolerance);
+
+  ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_envelopes_failed"), 0);
+  ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_update_deadline_responses"), 0);
+
+  const auto tservers = cluster_->tserver_daemons();
+  std::vector<int64_t> outbound_calls(tservers.size());
+  const auto status = WaitFor([&] {
+    bool settled = true;
+    for (size_t i = 0; i != tservers.size(); ++i) {
+      outbound_calls[i] = ServerMetric(tservers[i], "rpc_outbound_calls_alive");
+      settled = settled && outbound_calls[i] <= idle_outbound_calls[i] + kOutboundCallsTolerance;
+    }
+    return settled;
+  }, 30s * kTimeMultiplier, "Outbound calls back to the idle level");
+  LOG(INFO) << "Outbound calls after the workload: " << AsString(outbound_calls);
+  ASSERT_OK(status);
+
+  ASSERT_NO_FATALS(AssertNoBatchingErrorLines(error_lines.get()));
+  LOG(INFO) << "Rows inserted: " << workload.rows_inserted();
+  ClusterVerifier cluster_verifier(cluster_.get());
+  ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
+  ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
+      workload.table_name(), ClusterVerifier::AT_LEAST, workload.rows_inserted()));
+}
+
+// Leaders that stream send envelopes to a follower with data batching off. That follower answers
+// on the serial handler, which ignores the streaming request and answers once, in request order and
+// without indices, as a server without streaming does. The leaders accept those answers: nothing
+// fails or breaks the frame protocol, and the replicas converge. The follower, as a leader, sends
+// its own data directly.
+TEST_F(RaftConsensusITest, MultiRaftBatchingStreamingToSerialFollower) {
+  constexpr auto kEnvelopeHandlerCalls =
+      "handler_latency_yb_consensus_ConsensusService_MultiRaftUpdateConsensus";
+  constexpr auto kDirectHandlerCalls =
+      "handler_latency_yb_consensus_ConsensusService_UpdateConsensus";
+  CreateCluster("raft_consensus-itest-cluster", {}, {});
+  ASSERT_NO_FATALS(EnableMultiRaftBatching(cluster_.get()));
+  ASSERT_NO_FATALS(EnableStreamingAndPacing(cluster_.get()));
+  // Not restarted, so the runtime flag is enough.
+  auto* serial = cluster_->tablet_server(2);
+  ASSERT_OK(cluster_->SetFlag(serial, "enable_multi_raft_data_batching", "false"));
+  auto error_lines = WatchForBatchingErrorLines(cluster_.get());
+
+  struct SerialMetrics {
+    int64_t frames_sent;
+    int64_t concurrent_sub_requests;
+    int64_t envelopes_handled;
+    int64_t direct_updates_handled;
+    int64_t data_sub_requests_sent;
+
+    std::string ToString() const {
+      return YB_STRUCT_TO_STRING(
+          frames_sent, concurrent_sub_requests, envelopes_handled, direct_updates_handled,
+          data_sub_requests_sent);
+    }
+  };
+  auto serial_metrics = [serial] {
+    return SerialMetrics{
+      .frames_sent = ServerMetric(serial, "multi_raft_update_frames_sent"),
+      .concurrent_sub_requests =
+          ServerMetric(serial, "multi_raft_update_sub_requests_concurrent"),
+      .envelopes_handled = ServerMetric(serial, kEnvelopeHandlerCalls, "total_count"),
+      .direct_updates_handled = ServerMetric(serial, kDirectHandlerCalls, "total_count"),
+      .data_sub_requests_sent = ServerMetric(serial, "multi_raft_data_sub_requests"),
+    };
+  };
+  const auto serial_before = serial_metrics();
+  const auto others_frames_before =
+      SumServerMetric(cluster_.get(), "multi_raft_update_frames_sent", "value", serial);
+  const auto others_concurrent_before = SumServerMetric(
+      cluster_.get(), "multi_raft_update_sub_requests_concurrent", "value", serial);
+  const auto frames_received_before = SumServerMetric(cluster_.get(), "multi_raft_frames_received");
+
+  TestYcqlWorkload workload(cluster_.get());
+  ASSERT_NO_FATALS(StartBatchedWriteWorkload(&workload));
+  ASSERT_OK(WaitForMoreRows(workload, 2000));
+  workload.StopAndJoin();
+
+  // The other followers streamed, so the leaders were streaming. Followers count frames after
+  // queueing them, hence the wait.
+  ASSERT_OK(WaitFor([this, serial, others_frames_before] {
+    return SumServerMetric(cluster_.get(), "multi_raft_update_frames_sent", "value", serial) >
+           others_frames_before;
+  }, 30s, "Other followers sent response frames"));
+  ASSERT_GT(SumServerMetric(
+      cluster_.get(), "multi_raft_update_sub_requests_concurrent", "value", serial),
+      others_concurrent_before);
+  ASSERT_GT(SumServerMetric(cluster_.get(), "multi_raft_frames_received"), frames_received_before);
+  ASSERT_GT(PacedFlushes(cluster_.get()), 0);
+
+  const auto serial_after = serial_metrics();
+  LOG(INFO) << "Serial follower before: " << serial_before.ToString()
+            << ", after: " << serial_after.ToString();
+  // The serial follower received envelopes, but never data directly: its replicas, which the
+  // verifier checks below, got their data through the envelopes it answered serially.
+  ASSERT_GT(serial_after.envelopes_handled, serial_before.envelopes_handled);
+  ASSERT_EQ(serial_after.direct_updates_handled, serial_before.direct_updates_handled);
+  // It neither streamed nor processed sub-requests concurrently.
+  ASSERT_EQ(serial_after.frames_sent, serial_before.frames_sent);
+  ASSERT_EQ(serial_after.concurrent_sub_requests, serial_before.concurrent_sub_requests);
+  // As a leader with data batching off it sent no data through its batcher.
+  ASSERT_EQ(serial_after.data_sub_requests_sent, serial_before.data_sub_requests_sent);
+
+  // Its unstreamed answers were accepted, and none answered the wrong number of requests (that
+  // would count a failure and log "responses for").
+  ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_envelopes_failed"), 0);
+  ASSERT_EQ(SumServerMetric(cluster_.get(), "multi_raft_update_deadline_responses"), 0);
+  ASSERT_NO_FATALS(AssertNoBatchingErrorLines(error_lines.get()));
+  ClusterVerifier cluster_verifier(cluster_.get());
+  ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
+  ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
+      workload.table_name(), ClusterVerifier::AT_LEAST, workload.rows_inserted()));
 }
 
 }  // namespace tserver
