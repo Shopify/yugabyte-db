@@ -1457,7 +1457,8 @@ void PgProductionProfileTest::CheckReadCommitted(PGConn* conn) {
   ASSERT_EQ(second_read, -1)
       << "Read committed: session A's second read of t.v for k = 1, in the same transaction, after "
       << "session B committed v = -1";
-  // An open transaction would stall the online CREATE INDEX below until statement_timeout.
+  // An open transaction would stall CheckIndexBackfill's online CREATE INDEX until
+  // statement_timeout.
   ASSERT_OK(session_a.Execute("COMMIT"));
 }
 
