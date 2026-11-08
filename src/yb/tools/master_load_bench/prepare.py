@@ -4,7 +4,7 @@
 The bench runs SQL files exactly as given; everything that has to be derived from or changed
 in a dump happens here, so the result can be inspected before a load.
 
-  prepare.py --out-dir DIR [--globaldb-repo DIR] [--build-dir build/latest]
+  prepare.py --out-dir DIR [--globaldb-repo DIR]
              [--drop-stats] [--scale-splits N:PROD] TABLESPACES.sql DUMP.sql ...
 
 Writes into DIR:
@@ -15,12 +15,11 @@ Writes into DIR:
                  guards take the production branch instead of skipping ownership
   <basename>     a copy of each input with the requested edits plus FUNCTION_SEARCH_PATHS, the
                  search_path the dump's empty one breaks for some SQL function bodies
+  <name>.rules   every rules file the dump's text search dictionaries name that sits next to
+                 the dump, where fetch_backup_ysql_dump.py puts the ones ansible installs on
+                 production nodes; the others are postgres's own
 
-Text search dictionaries in the dump name rules files that postgres opens from the build's
-postgres/share/tsearch_data; every one missing there is copied from --globaldb-repo's ansible
-node role files, and the tool fails if it cannot find one.
-
-Prints the --topology and --sql_file flags to pass to the bench.
+Prints the --topology, --sql_file and --tsearch_rules flags to pass to the bench.
 """
 
 import argparse
@@ -41,11 +40,8 @@ RULES_RE = re.compile(r"\brules\s*=\s*'([^']+)'", re.IGNORECASE)
 FUNCTION_SEARCH_PATHS = {
     "core.shopify_string_normalization(input text)": "'public', 'pg_catalog'",
 }
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
-# Inside a globaldb-yugabyte checkout: production tserver counts, and the files ansible installs
-# on every node.
+# Inside a globaldb-yugabyte checkout: production tserver counts per zone.
 GLOBALDB_CLUSTER_CONFIG = "tools/ansible/inventories/production/yugabyte.yml"
-GLOBALDB_NODE_FILES = "tools/ansible/collections/ansible_collections/shopify/yugabyte/roles/node/files"
 
 
 def read_lines(path):
@@ -209,30 +205,18 @@ def write_roles(paths, out_path):
     print(f"{len(roles)} roles -> {out_path}")
 
 
-def install_tsearch_rules(paths, build_dir, rules_dir):
-    tsearch = os.path.join(build_dir, "postgres", "share", "tsearch_data")
-    if not os.path.isdir(tsearch):
-        sys.exit(f"{tsearch} not found; build first or pass --build-dir")
-    needed = []
+def copy_tsearch_rules(paths, out_dir):
+    outputs = []
     for path in paths:
         for line in read_lines(path):
             for name in RULES_RE.findall(line):
-                if name not in needed:
-                    needed.append(name)
-    missing = []
-    for name in needed:
-        dest = os.path.join(tsearch, name + ".rules")
-        if os.path.exists(dest):
-            continue
-        src = os.path.join(rules_dir, name + ".rules") if rules_dir else None
-        if src and os.path.exists(src):
-            shutil.copyfile(src, dest)
-            print(f"{src} -> {dest}")
-        else:
-            missing.append(name + ".rules")
-    if missing:
-        sys.exit(f"rules files not in {tsearch}: {', '.join(missing)}; "
-                 "pass --globaldb-repo to copy them in")
+                src = os.path.join(os.path.dirname(os.path.abspath(path)), name + ".rules")
+                dest = os.path.join(out_dir, name + ".rules")
+                if dest not in outputs and os.path.exists(src):
+                    shutil.copyfile(src, dest)
+                    print(f"{src} -> {dest}")
+                    outputs.append(dest)
+    return outputs
 
 
 def rewrite_file(path, out_path, args):
@@ -283,10 +267,7 @@ def main():
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--globaldb-repo", metavar="DIR",
                         help="globaldb-yugabyte checkout: its production cluster config sets "
-                             "the zone percentages and its node files supply missing rules files")
-    parser.add_argument("--build-dir", default=os.path.join(REPO_ROOT, "build", "latest"),
-                        help="YugabyteDB build whose postgres/share/tsearch_data gets the rules "
-                             "files (default: %(default)s)")
+                             "the zone percentages")
     parser.add_argument("--drop-stats", action="store_true",
                         help="remove pg_restore_*_stats calls")
     parser.add_argument("--scale-splits", type=parse_ratio, metavar="N:PROD",
@@ -297,16 +278,14 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     topology = os.path.join(args.out_dir, "topology.txt")
     roles = os.path.join(args.out_dir, "roles.sql")
-    cluster_config = rules_dir = None
+    cluster_config = None
     if args.globaldb_repo:
         cluster_config = os.path.join(args.globaldb_repo, GLOBALDB_CLUSTER_CONFIG)
-        rules_dir = os.path.join(args.globaldb_repo, GLOBALDB_NODE_FILES)
-        for path in (cluster_config, rules_dir):
-            if not os.path.exists(path):
-                sys.exit(f"{path} not found; is --globaldb-repo a globaldb-yugabyte checkout?")
+        if not os.path.exists(cluster_config):
+            sys.exit(f"{cluster_config} not found; is --globaldb-repo a globaldb-yugabyte checkout?")
     write_topology(args.files, topology, cluster_config)
     write_roles(args.files, roles)
-    install_tsearch_rules(args.files, args.build_dir, rules_dir)
+    rules = copy_tsearch_rules(args.files, args.out_dir)
     outputs = [roles]
     for path in args.files:
         out_path = os.path.join(args.out_dir, os.path.basename(path))
@@ -317,7 +296,10 @@ def main():
         print(f"{path} -> {out_path}: dropped {counts['stats']} stats calls, scaled "
               f"{counts['splits']} SPLIT INTO, set {counts['search_paths']} function search_paths")
     print()
-    print(f"--topology={topology} --sql_file={','.join(outputs)}")
+    flags = f"--topology={topology} --sql_file={','.join(outputs)}"
+    if rules:
+        flags += f" --tsearch_rules={','.join(rules)}"
+    print(flags)
 
 
 if __name__ == "__main__":
