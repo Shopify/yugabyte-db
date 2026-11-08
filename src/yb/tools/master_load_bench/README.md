@@ -22,7 +22,7 @@ python3 ~/src/github.com/Shopify/globaldb-yugabyte/tools/scripts/fetch_backup_ys
 `--latest` takes the newest backup with a `success` marker; the second form takes a specific one.
 It downloads only the backup's `backup.md` object (about 125 MB, reused if already complete) and
 writes `extracted_YSQLDump_tablespaces` (CREATE TABLESPACE with placement JSON) and
-`extracted_YSQLDump` (database, roles, tables, indexes, statistics) into the out dir, plus every
+`extracted_YSQLDump` (database, roles, tables, indexes, statistics) into `--output-dir`, plus every
 text search rules file the dump names (`rules = '…'`) that ansible installs on production nodes,
 copied from the repo's node role files. Then it prints the step 2 command. The tablespaces file
 must load first: tables pick their tablespace with `SET default_tablespace`.
@@ -40,7 +40,7 @@ Writes into `/tmp/mlb-prep`:
 
 - `topology.txt`: one `cloud region zone percent` line per zone named by the tablespaces'
   `replica_placement` blocks. Percentages follow the per-zone tserver counts in the repo's
-  production `cluster_configs/gdb.yml`; without `--globaldb-repo` every zone gets an equal
+  production inventory `inventories/production/yugabyte.yml`; without `--globaldb-repo` every zone gets an equal
   share. `read_replica_placement` (observer) zones are not live-tserver zones and are skipped.
 - `roles.sql`: `CREATE ROLE` for every role the dump references, so the dump's own
   "role exists" guards take the production branch.
@@ -54,7 +54,7 @@ The last line printed is `--input-dir=/tmp/mlb-prep`, which the bench expands to
 `topology.txt`, then `roles.sql`, `extracted_YSQLDump_tablespaces` and `extracted_YSQLDump` in
 that order, and every `*.rules`.
 
-Neither file has to come from a dump. A topology is one `cloud region zone percent` line per
+Neither the topology nor the SQL has to come from a dump. A topology is one `cloud region zone percent` line per
 zone, `#` comments allowed, percentages adding up to 100; hollow tservers are spread over the
 zones by those percentages and register with these placements. Hand-made inputs go through
 `--topology`, `--sql_file` (any SQL files, run in order through ysqlsh) and `--tsearch_rules`
