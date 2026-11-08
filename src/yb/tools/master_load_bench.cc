@@ -94,6 +94,7 @@
 
 #include "yb/util/curl_util.h"
 #include "yb/util/env.h"
+#include "yb/util/env_util.h"
 #include "yb/util/faststring.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
@@ -122,6 +123,10 @@ DEFINE_NON_RUNTIME_int32(replication_factor, 7,
 DEFINE_NON_RUNTIME_string(sql_file, "",
     "Comma-separated SQL files to load in order through ysqlsh once the cluster is up, run "
     "exactly as given; e.g. roles, tablespaces dump, database dump.");
+DEFINE_NON_RUNTIME_string(tsearch_rules, "",
+    "Comma-separated text search rules files the SQL names (rules = '<name>'); each is copied "
+    "into the tserver build's postgres/share/tsearch_data before the tserver starts, as "
+    "production provisioning does on every node. prepare.py extracts them from the dump.");
 DEFINE_NON_RUNTIME_string(scenario, "",
     "Optional directive file run after --sql_file; one directive per line, key=value parameters "
     "before free text, '#' comments. sql [keys]: <stmt> | sql [keys]: << ... >> | "
@@ -2575,6 +2580,19 @@ class MasterLoadBench {
     return Status::OK();
   }
 
+  Status InstallTsearchRules(Env* env) {
+    const auto tsearch_dir =
+        JoinPathSegments(DirName(DirName(FLAGS_tserver_bin)), "postgres/share/tsearch_data");
+    const std::vector<string> rules =
+        strings::Split(FLAGS_tsearch_rules, ",", strings::SkipEmpty());
+    for (const auto& src : rules) {
+      const auto dest = JoinPathSegments(tsearch_dir, BaseName(src));
+      RETURN_NOT_OK_PREPEND(env_util::CopyFile(env, src, dest), Format("Copying $0", src));
+      LOG(INFO) << "Installed " << src << " -> " << dest;
+    }
+    return Status::OK();
+  }
+
   Status StartRealTserver() {
     const auto data_dir = JoinPathSegments(FLAGS_data_dir, kTServerDataDir);
     const auto log_dir = JoinPathSegments(FLAGS_data_dir, "ts-logs");
@@ -2584,6 +2602,7 @@ class MasterLoadBench {
     if (!restoring_) {
       RETURN_NOT_OK(ResetDir(data_dir));
     }
+    RETURN_NOT_OK(InstallTsearchRules(env));
     std::vector<string> argv = {
         FLAGS_tserver_bin,
         "--fs_data_dirs=" + data_dir,
