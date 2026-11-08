@@ -68,6 +68,7 @@
 #include "yb/gutil/casts.h"
 #include "yb/gutil/stringprintf.h"
 #include "yb/gutil/strings/escaping.h"
+#include "yb/gutil/strings/join.h"
 #include "yb/gutil/strings/split.h"
 
 #include "yb/master/master_cluster.proxy.h"
@@ -116,6 +117,10 @@
 
 DEFINE_NON_RUNTIME_int32(num_tservers, 100,
     "Number of hollow tservers to run, spread over the --topology zones by their percentages.");
+DEFINE_NON_RUNTIME_string(input_dir, "",
+    "Directory written by master_load_bench/prepare.py: topology.txt, roles.sql, "
+    "extracted_YSQLDump_tablespaces, extracted_YSQLDump and any *.rules. Fills --topology, "
+    "--sql_file and --tsearch_rules; each of those given explicitly wins.");
 DEFINE_NON_RUNTIME_string(topology, "",
     "Zone file (required): one 'cloud region zone percent' per line, '#' comments; percentages "
     "add up to 100 (or 1). Hollow tservers register with these placements so a dump's "
@@ -2402,7 +2407,38 @@ Status CopyTree(const string& from, const string& to) {
 
 class MasterLoadBench {
  public:
+  // The file names are prepare.py's; the SQL order is the one the dump needs.
+  Status ApplyInputDir() {
+    const auto& dir = FLAGS_input_dir;
+    auto* env = Env::Default();
+    SCHECK_FORMAT(env->DirExists(dir), NotFound, "--input-dir $0 is not a directory", dir);
+    if (FLAGS_topology.empty()) {
+      FLAGS_topology = JoinPathSegments(dir, "topology.txt");
+    }
+    if (FLAGS_sql_file.empty()) {
+      std::vector<string> files;
+      for (const auto* name : {"roles.sql", "extracted_YSQLDump_tablespaces", "extracted_YSQLDump"}) {
+        files.push_back(JoinPathSegments(dir, name));
+      }
+      FLAGS_sql_file = JoinStrings(files, ",");
+    }
+    if (FLAGS_tsearch_rules.empty()) {
+      std::vector<string> rules;
+      for (const auto& name : VERIFY_RESULT(env->GetChildren(dir, ExcludeDots::kTrue))) {
+        if (name.ends_with(".rules")) {
+          rules.push_back(JoinPathSegments(dir, name));
+        }
+      }
+      std::sort(rules.begin(), rules.end());
+      FLAGS_tsearch_rules = JoinStrings(rules, ",");
+    }
+    return Status::OK();
+  }
+
   Status Run() {
+    if (!FLAGS_input_dir.empty()) {
+      RETURN_NOT_OK(ApplyInputDir());
+    }
     SCHECK(!FLAGS_master_bin.empty(), InvalidArgument, "--master_bin is required");
     SCHECK(!FLAGS_tserver_bin.empty(), InvalidArgument, "--tserver_bin is required");
     SCHECK(!FLAGS_data_dir.empty(), InvalidArgument, "--data_dir is required");

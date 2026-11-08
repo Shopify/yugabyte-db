@@ -14,9 +14,9 @@ the globaldb-yugabyte repo, on its `fetch-backup-ysql-dump` branch until that me
 
 ```
 python3 ~/src/github.com/Shopify/globaldb-yugabyte/tools/scripts/fetch_backup_ysql_dump.py \
-    --out-dir /tmp/gdb-backup --latest
+    --output-dir /tmp/gdb-backup --latest
 python3 ~/src/github.com/Shopify/globaldb-yugabyte/tools/scripts/fetch_backup_ysql_dump.py \
-    --out-dir /tmp/gdb-backup gs://production-gdb-backups/globaldb/incremental/<TIMESTAMP>/
+    --output-dir /tmp/gdb-backup gs://production-gdb-backups/globaldb/incremental/<TIMESTAMP>/
 ```
 
 `--latest` takes the newest backup with a `success` marker; the second form takes a specific one.
@@ -32,9 +32,8 @@ must load first: tables pick their tablespace with `SET default_tablespace`.
 Needs a checkout of the globaldb-yugabyte repo and a built `master-load-bench` target:
 
 ```
-python3 src/yb/tools/master_load_bench/prepare.py --out-dir /tmp/mlb-prep \
-    --globaldb-repo ~/src/github.com/Shopify/globaldb-yugabyte \
-    /tmp/gdb-backup/extracted_YSQLDump_tablespaces /tmp/gdb-backup/extracted_YSQLDump
+python3 src/yb/tools/master_load_bench/prepare.py --input-dir /tmp/gdb-backup --output-dir /tmp/mlb-prep \
+    --globaldb-repo ~/src/github.com/Shopify/globaldb-yugabyte
 ```
 
 Writes into `/tmp/mlb-prep`:
@@ -51,13 +50,15 @@ Writes into `/tmp/mlb-prep`:
   build's directory when it starts the tserver (`--tsearch_rules`), as ansible does on a
   production node.
 
-The last line printed is the `--topology=… --sql_file=… --tsearch_rules=…` set to pass to the
-bench.
+The last line printed is `--input-dir=/tmp/mlb-prep`, which the bench expands to these files:
+`topology.txt`, then `roles.sql`, `extracted_YSQLDump_tablespaces` and `extracted_YSQLDump` in
+that order, and every `*.rules`.
 
 Neither file has to come from a dump. A topology is one `cloud region zone percent` line per
 zone, `#` comments allowed, percentages adding up to 100; hollow tservers are spread over the
-zones by those percentages and register with these placements. `--sql_file` takes any SQL
-files, run in order through ysqlsh.
+zones by those percentages and register with these placements. Hand-made inputs go through
+`--topology`, `--sql_file` (any SQL files, run in order through ysqlsh) and `--tsearch_rules`
+instead of `--input-dir`; prepare.py takes them as positional files in place of `--input-dir`.
 
 ```
 # cloud region zone percent
@@ -95,9 +96,7 @@ Options not used today, kept for when the load has to be cut down:
 ```
 build/latest/bin/master-load-bench --flagfile=src/yb/tools/master_load_bench/bench.flags \
     --num_tservers=100 \
-    --topology=/tmp/mlb-prep/topology.txt \
-    --sql_file=/tmp/mlb-prep/roles.sql,/tmp/mlb-prep/extracted_YSQLDump_tablespaces,/tmp/mlb-prep/extracted_YSQLDump \
-    --tsearch_rules=/tmp/mlb-prep/shopify_unaccent_2026_06_17.rules \
+    --input-dir=/tmp/mlb-prep \
     --csv_path=/tmp/mlb.csv
 ```
 
@@ -146,9 +145,7 @@ seed many later runs. Add `--snapshot_dir` to the load (or to a resume):
 
 ```
 build/latest/bin/master-load-bench --flagfile=src/yb/tools/master_load_bench/bench.flags \
-    --num_tservers=100 --topology=/tmp/mlb-prep/topology.txt \
-    --sql_file=/tmp/mlb-prep/roles.sql,/tmp/mlb-prep/extracted_YSQLDump_tablespaces,/tmp/mlb-prep/extracted_YSQLDump \
-    --tsearch_rules=/tmp/mlb-prep/shopify_unaccent_2026_06_17.rules \
+    --num_tservers=100 --input-dir=/tmp/mlb-prep \
     --snapshot_dir=/tmp/mlb-snapshot
 ```
 
