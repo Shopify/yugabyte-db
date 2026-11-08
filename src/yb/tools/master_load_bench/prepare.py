@@ -4,8 +4,11 @@
 The bench runs SQL files exactly as given; everything that has to be derived from or changed
 in a dump happens here, so the result can be inspected before a load.
 
-  prepare.py --out-dir DIR [--globaldb-repo DIR]
-             [--drop-stats] [--scale-splits N:PROD] TABLESPACES.sql DUMP.sql ...
+  prepare.py --input-dir DIR --output-dir DIR [--globaldb-repo DIR] [--drop-stats] [--scale-splits N:PROD]
+  prepare.py --output-dir DIR [...] TABLESPACES.sql DUMP.sql ...
+
+--input-dir is fetch_backup_ysql_dump.py's out dir: extracted_YSQLDump_tablespaces, then
+extracted_YSQLDump. Hand-made dumps are listed instead, tablespaces first.
 
 Writes into DIR:
   topology.txt   one 'cloud region zone percent' line per zone named by the replica_placement
@@ -19,7 +22,7 @@ Writes into DIR:
                  the dump, where fetch_backup_ysql_dump.py puts the ones ansible installs on
                  production nodes; the others are postgres's own
 
-Prints the --topology, --sql_file and --tsearch_rules flags to pass to the bench.
+Prints the --input-dir flag to pass to the bench.
 """
 
 import argparse
@@ -205,18 +208,17 @@ def write_roles(paths, out_path):
     print(f"{len(roles)} roles -> {out_path}")
 
 
-def copy_tsearch_rules(paths, out_dir):
-    outputs = []
+def copy_tsearch_rules(paths, output_dir):
+    copied = set()
     for path in paths:
         for line in read_lines(path):
             for name in RULES_RE.findall(line):
                 src = os.path.join(os.path.dirname(os.path.abspath(path)), name + ".rules")
-                dest = os.path.join(out_dir, name + ".rules")
-                if dest not in outputs and os.path.exists(src):
+                dest = os.path.join(output_dir, name + ".rules")
+                if dest not in copied and os.path.exists(src):
                     shutil.copyfile(src, dest)
                     print(f"{src} -> {dest}")
-                    outputs.append(dest)
-    return outputs
+                    copied.add(dest)
 
 
 def rewrite_file(path, out_path, args):
@@ -264,7 +266,9 @@ def parse_ratio(text):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--out-dir", required=True)
+    parser.add_argument("--input-dir", metavar="DIR",
+                        help="fetch_backup_ysql_dump.py's out dir, instead of listing the dumps")
+    parser.add_argument("--output-dir", required=True)
     parser.add_argument("--globaldb-repo", metavar="DIR",
                         help="globaldb-yugabyte checkout: its production cluster config sets "
                              "the zone percentages")
@@ -272,12 +276,20 @@ def main():
                         help="remove pg_restore_*_stats calls")
     parser.add_argument("--scale-splits", type=parse_ratio, metavar="N:PROD",
                         help="scale SPLIT INTO counts by N/PROD tservers (min 1)")
-    parser.add_argument("files", nargs="+", help="tablespaces dump, then database dumps")
+    parser.add_argument("files", nargs="*", help="tablespaces dump, then database dumps")
     args = parser.parse_args()
+    if bool(args.input_dir) == bool(args.files):
+        parser.error("give --input-dir or the dump files, not both")
+    if args.input_dir:
+        args.files = [os.path.join(args.input_dir, name)
+                      for name in ("extracted_YSQLDump_tablespaces", "extracted_YSQLDump")]
+        for path in args.files:
+            if not os.path.exists(path):
+                sys.exit(f"{path} not found; is --input-dir fetch_backup_ysql_dump.py's out dir?")
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    topology = os.path.join(args.out_dir, "topology.txt")
-    roles = os.path.join(args.out_dir, "roles.sql")
+    os.makedirs(args.output_dir, exist_ok=True)
+    topology = os.path.join(args.output_dir, "topology.txt")
+    roles = os.path.join(args.output_dir, "roles.sql")
     cluster_config = None
     if args.globaldb_repo:
         cluster_config = os.path.join(args.globaldb_repo, GLOBALDB_CLUSTER_CONFIG)
@@ -285,21 +297,16 @@ def main():
             sys.exit(f"{cluster_config} not found; is --globaldb-repo a globaldb-yugabyte checkout?")
     write_topology(args.files, topology, cluster_config)
     write_roles(args.files, roles)
-    rules = copy_tsearch_rules(args.files, args.out_dir)
-    outputs = [roles]
+    copy_tsearch_rules(args.files, args.output_dir)
     for path in args.files:
-        out_path = os.path.join(args.out_dir, os.path.basename(path))
+        out_path = os.path.join(args.output_dir, os.path.basename(path))
         if os.path.abspath(out_path) == os.path.abspath(path):
-            sys.exit(f"{path} would overwrite itself; use another --out-dir")
+            sys.exit(f"{path} would overwrite itself; use another --output-dir")
         counts = rewrite_file(path, out_path, args)
-        outputs.append(out_path)
         print(f"{path} -> {out_path}: dropped {counts['stats']} stats calls, scaled "
               f"{counts['splits']} SPLIT INTO, set {counts['search_paths']} function search_paths")
     print()
-    flags = f"--topology={topology} --sql_file={','.join(outputs)}"
-    if rules:
-        flags += f" --tsearch_rules={','.join(rules)}"
-    print(flags)
+    print(f"--input-dir={args.output_dir}")
 
 
 if __name__ == "__main__":
