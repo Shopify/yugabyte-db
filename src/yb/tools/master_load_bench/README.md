@@ -22,9 +22,10 @@ python3 ~/src/github.com/Shopify/globaldb-yugabyte/tools/scripts/fetch_backup_ys
 `--latest` takes the newest backup with a `success` marker; the second form takes a specific one.
 It downloads only the backup's `backup.md` object (about 125 MB, reused if already complete) and
 writes `extracted_YSQLDump_tablespaces` (CREATE TABLESPACE with placement JSON) and
-`extracted_YSQLDump` (database, roles, tables, indexes, statistics) into the out dir, then prints
-the step 2 command. The tablespaces file must load first: tables pick their tablespace with
-`SET default_tablespace`.
+`extracted_YSQLDump` (database, roles, tables, indexes, statistics) into the out dir, plus every
+text search rules file the dump names (`rules = '…'`) that ansible installs on production nodes,
+copied from the repo's node role files. Then it prints the step 2 command. The tablespaces file
+must load first: tables pick their tablespace with `SET default_tablespace`.
 
 ## 2. Prepare the inputs
 
@@ -45,14 +46,13 @@ Writes into `/tmp/mlb-prep`:
 - `roles.sql`: `CREATE ROLE` for every role the dump references, so the dump's own
   "role exists" guards take the production branch.
 - a copy of each input, byte-identical to the original unless one of the options below is given.
+- the rules files from step 1 that the dump's text search dictionaries name. Postgres opens
+  them only from its own `postgres/share/tsearch_data`, so the bench copies them into the
+  build's directory when it starts the tserver (`--tsearch_rules`), as ansible does on a
+  production node.
 
-It also installs into the build whatever the dump needs from outside the release. Today that
-is one file: the dump creates a text search dictionary on a Shopify-specific unaccent rules
-file that production ansible copies into every node's `postgres/share/tsearch_data`. prepare.py
-scans the dump for `rules = '…'`, and copies each missing file from the repo's ansible node
-files into the build (`build/latest`, or `--build-dir`). Postgres only looks in that directory.
-
-The last line printed is the `--topology=… --sql_file=…` pair to pass to the bench.
+The last line printed is the `--topology=… --sql_file=… --tsearch_rules=…` set to pass to the
+bench.
 
 Neither file has to come from a dump. A topology is one `cloud region zone percent` line per
 zone, `#` comments allowed, percentages adding up to 100; hollow tservers are spread over the
@@ -97,6 +97,7 @@ build/latest/bin/master-load-bench --flagfile=src/yb/tools/master_load_bench/ben
     --num_tservers=100 \
     --topology=/tmp/mlb-prep/topology.txt \
     --sql_file=/tmp/mlb-prep/roles.sql,/tmp/mlb-prep/extracted_YSQLDump_tablespaces,/tmp/mlb-prep/extracted_YSQLDump \
+    --tsearch_rules=/tmp/mlb-prep/shopify_unaccent_2026_06_17.rules \
     --csv_path=/tmp/mlb.csv
 ```
 
@@ -147,6 +148,7 @@ seed many later runs. Add `--snapshot_dir` to the load (or to a resume):
 build/latest/bin/master-load-bench --flagfile=src/yb/tools/master_load_bench/bench.flags \
     --num_tservers=100 --topology=/tmp/mlb-prep/topology.txt \
     --sql_file=/tmp/mlb-prep/roles.sql,/tmp/mlb-prep/extracted_YSQLDump_tablespaces,/tmp/mlb-prep/extracted_YSQLDump \
+    --tsearch_rules=/tmp/mlb-prep/shopify_unaccent_2026_06_17.rules \
     --snapshot_dir=/tmp/mlb-snapshot
 ```
 
