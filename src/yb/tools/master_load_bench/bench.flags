@@ -8,7 +8,5 @@
 --data_dir=/tmp/mlb
 # Periodic tserver->master RPCs at production cadence (tserver defaults).
 --heartbeat_interval_ms=1000
---send_lease_refreshes=true
---connectivity_check_interval_ms=60000
 --master_flags=--flagfile=src/yb/tools/master_load_bench/master.flags
 --tserver_flags=--flagfile=src/yb/tools/master_load_bench/tserver.flags
