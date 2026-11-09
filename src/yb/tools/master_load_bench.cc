@@ -60,6 +60,7 @@
 #include "yb/common/pg_catversions.h"
 #include "yb/common/transaction.h"
 #include "yb/common/wire_protocol.h"
+#include "yb/common/ysql_operation_lease.h"
 
 #include "yb/consensus/metadata.pb.h"
 
@@ -153,15 +154,13 @@ DEFINE_NON_RUNTIME_string(from_snapshot, "",
     "Copy a --snapshot_dir into --data_dir first, then behave like --resume.");
 DEFINE_NON_RUNTIME_int32(run_seconds, 0,
     "Stay up this long after loading, tservers heartbeating; 0 = until SIGINT/SIGTERM.");
-DEFINE_NON_RUNTIME_int32(heartbeat_interval_ms, 1000, "Hollow tserver heartbeat interval.");
-DEFINE_NON_RUNTIME_int32(full_metrics_beat_period, 5,
-    "Send the tablet metrics payload (storage_metadata + leader_info) every Nth heartbeat, "
-    "matching the real tserver's 5s metrics cadence.");
-DEFINE_NON_RUNTIME_bool(send_lease_refreshes, true,
-    "Send the per-second RefreshYsqlLease RPC from every hollow tserver.");
-DEFINE_NON_RUNTIME_int32(connectivity_check_interval_ms, 60000,
-    "ListTabletServers interval per hollow tserver, matching the real tserver's connectivity "
-    "poller.");
+// Tserver flags the hollow tservers follow; the spawned yb-tserver gets the same values.
+DECLARE_int32(heartbeat_interval_ms);
+DECLARE_int32(tserver_heartbeat_metrics_interval_ms);
+DECLARE_bool(enable_ysql_operation_lease);
+DECLARE_uint64(ysql_lease_refresher_interval_ms);
+DECLARE_uint64(connectivity_check_interval_ms);
+
 DEFINE_NON_RUNTIME_string(master_bin, "", "Path to the yb-master binary (required).");
 DEFINE_NON_RUNTIME_string(tserver_bin, "", "Path to the yb-tserver binary (required).");
 DEFINE_NON_RUNTIME_string(ysqlsh_bin, "",
@@ -374,15 +373,11 @@ class HollowTServer {
     }
   }
 
-  // mirror_tmpl, when set, is a captured real-tserver request used as the payload; the metrics
-  // shape then follows metrics_override instead of the hb_seq_ cadence.
+  // mirror_tmpl, when set, is a captured real-tserver request used as the payload.
   void FillHeartbeat(const string& universe_uuid, const master::TSHeartbeatRequestPB* mirror_tmpl,
-                     std::optional<bool> metrics_override, master::TSHeartbeatRequestPB* req) {
+                     bool metrics_beat, master::TSHeartbeatRequestPB* req) {
     req->Clear();
     std::lock_guard l(mutex_);
-    const bool metrics_beat = metrics_override.has_value()
-        ? *metrics_override
-        : hb_seq_ % FLAGS_full_metrics_beat_period == 0;
     ++hb_seq_;
     // Registration and full reports need synthetic state the template can't carry.
     if (mirror_tmpl != nullptr && !needs_registration_ && !full_report_active_) {
@@ -2496,6 +2491,7 @@ class MasterLoadBench {
     LOG(INFO) << "Idle" << (FLAGS_run_seconds > 0 ? Format(" for $0s", FLAGS_run_seconds) : "")
               << "; SIGINT/SIGTERM stops the run";
     while (!g_stop_requested.load(std::memory_order_acquire) && MonoTime::Now() < idle_deadline) {
+      RETURN_NOT_OK(CheckMasterAlive());
       SleepFor(500ms);
     }
     if (!FLAGS_snapshot_dir.empty()) {
@@ -2583,6 +2579,7 @@ class MasterLoadBench {
     const std::vector<string> extra_flags =
         strings::Split(FLAGS_master_flags, ",", strings::SkipEmpty());
     argv.insert(argv.end(), extra_flags.begin(), extra_flags.end());
+    argv.push_back(Format("--enable_ysql_operation_lease=$0", FLAGS_enable_ysql_operation_lease));
     string program = FLAGS_master_bin;
     if (!FLAGS_master_cpus.empty()) {
       argv.insert(argv.begin(), {"taskset", "-c", FLAGS_master_cpus});
@@ -2616,11 +2613,23 @@ class MasterLoadBench {
       if (status.ok() && !resp.has_error()) {
         break;
       }
+      RETURN_NOT_OK(CheckMasterAlive());
       SCHECK(MonoTime::Now() < deadline, TimedOut, "Master did not become ready");
       SleepFor(500ms);
     }
     LOG(INFO) << "Master is ready";
     return Status::OK();
+  }
+
+  // IsRunning() sees an unreaped child as alive; WaitNoBlock reaps it and reports the exit.
+  Status CheckMasterAlive() {
+    int exit_code = 0;
+    const auto status = master_process_->WaitNoBlock(&exit_code);
+    if (status.IsTimedOut()) {
+      return Status::OK();
+    }
+    RETURN_NOT_OK(status);
+    return STATUS_FORMAT(RuntimeError, "yb-master exited with status $0", exit_code);
   }
 
   Status InstallTsearchRules(Env* env) {
@@ -2667,6 +2676,13 @@ class MasterLoadBench {
     const std::vector<string> extra_flags =
         strings::Split(FLAGS_tserver_flags, ",", strings::SkipEmpty());
     argv.insert(argv.end(), extra_flags.begin(), extra_flags.end());
+    argv.push_back(Format("--enable_ysql_operation_lease=$0", FLAGS_enable_ysql_operation_lease));
+    argv.push_back(
+        Format("--ysql_lease_refresher_interval_ms=$0", FLAGS_ysql_lease_refresher_interval_ms));
+    argv.push_back(Format("--tserver_heartbeat_metrics_interval_ms=$0",
+                          FLAGS_tserver_heartbeat_metrics_interval_ms));
+    argv.push_back(
+        Format("--connectivity_check_interval_ms=$0", FLAGS_connectivity_check_interval_ms));
     tserver_process_ = std::make_unique<Subprocess>(FLAGS_tserver_bin, argv);
     RETURN_NOT_OK(tserver_process_->Start());
     LOG(INFO) << "Started yb-tserver pid " << tserver_process_->pid();
@@ -2742,7 +2758,8 @@ class MasterLoadBench {
           measured > 0 ? static_cast<int64_t>(measured) : FLAGS_heartbeat_interval_ms);
     }
     if (method == "RefreshYsqlLease") {
-      return FLAGS_send_lease_refreshes ? MonoDelta(1000ms) : MonoDelta();
+      return IsYsqlLeaseEnabled()
+          ? MonoDelta::FromMilliseconds(FLAGS_ysql_lease_refresher_interval_ms) : MonoDelta();
     }
     if (method == "ListTabletServers") {
       return MonoDelta::FromMilliseconds(FLAGS_connectivity_check_interval_ms);
@@ -2762,7 +2779,7 @@ class MasterLoadBench {
     const auto& tservers = registry_.tservers();
     auto now = MonoTime::Now();
     const auto metrics_period =
-        MonoDelta::FromMilliseconds(FLAGS_heartbeat_interval_ms) * FLAGS_full_metrics_beat_period;
+        MonoDelta::FromMilliseconds(FLAGS_tserver_heartbeat_metrics_interval_ms);
     for (size_t i = 0; i < tservers.size(); ++i) {
       auto& ts = *tservers[i];
       for (const char* method : kDefaultMethods) {
@@ -2893,27 +2910,22 @@ class MasterLoadBench {
       std::lock_guard l(universe_uuid_mutex_);
       universe_uuid = universe_uuid_;
     }
+    // Metrics go on the wall clock as in the real tserver; mirror mode follows its measured period.
+    const auto now = MonoTime::Now();
+    const auto measured = mirror_state_ ? mirror_state_->MeasuredMetricsPeriodMs() : 0;
+    const auto period = MonoDelta::FromMilliseconds(static_cast<int64_t>(
+        measured > 0 ? measured : FLAGS_tserver_heartbeat_metrics_interval_ms));
+    const bool want_metrics =
+        !ts->last_metrics_beat.Initialized() || now >= ts->last_metrics_beat + period;
+    if (want_metrics) {
+      ts->last_metrics_beat = now;
+    }
     std::shared_ptr<const master::TSHeartbeatRequestPB> tmpl;
-    std::optional<bool> metrics_override;
     if (mirror_state_) {
-      const auto now = MonoTime::Now();
-      const auto measured = mirror_state_->MeasuredMetricsPeriodMs();
-      const auto period = MonoDelta::FromMilliseconds(static_cast<int64_t>(
-          measured > 0
-              ? measured
-              : FLAGS_full_metrics_beat_period * FLAGS_heartbeat_interval_ms));
-      const bool want_metrics =
-          !ts->last_metrics_beat.Initialized() || now >= ts->last_metrics_beat + period;
       tmpl = mirror_state_->TemplateFor(want_metrics);
-      if (tmpl) {
-        metrics_override = want_metrics;
-        if (want_metrics) {
-          ts->last_metrics_beat = now;
-        }
-      }
     }
     ts->MarkRegistrationInFlight();
-    ts->FillHeartbeat(universe_uuid, tmpl.get(), metrics_override, &ts->hb_req);
+    ts->FillHeartbeat(universe_uuid, tmpl.get(), want_metrics, &ts->hb_req);
     ts->hb_controller.Reset();
     ts->hb_controller.set_timeout(15s);
     ts->heartbeat_sent_time = MonoTime::Now();
