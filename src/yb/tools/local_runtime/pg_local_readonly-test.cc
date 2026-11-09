@@ -872,6 +872,9 @@ void ReadonlyPgServerTest::CheckCommand(bool writable) {
     ASSERT_EQ(
         ASSERT_RESULT(connection.FetchRow<std::string>("SHOW yb_enable_alter_table_rewrite")),
         "on");
+    // Like a tablet server's PostgreSQL, with the connection limit initdb chose.
+    ASSERT_GE(
+        std::stoi(ASSERT_RESULT(connection.FetchRow<std::string>("SHOW max_connections"))), 100);
     ASSERT_OK(connection.Execute("ALTER TABLE cli_rows ADD COLUMN enabled boolean DEFAULT false"));
     ASSERT_FALSE(ASSERT_RESULT(connection.FetchRow<bool>("SELECT enabled FROM cli_rows")));
     ASSERT_OK(connection.Execute("BEGIN"));
@@ -1754,7 +1757,7 @@ TEST_F(ReadonlyPgServerTest, SharedMemoryExchange) {
   ASSERT_OK(other.Execute("COMMIT"));
   ASSERT_OK(c.Execute("ALTER TABLE wide_rows ADD COLUMN extra bigint"));
 
-  // More backends than max_connections come and go; new sessions retire exited ones.
+  // Backends come and go; new sessions retire exited ones and their exchanges.
   for (int i = 0; i != 30; ++i) {
     auto transient = ASSERT_RESULT(Connect(*server));
     ASSERT_OK(transient.Execute(Format("UPDATE wide_rows SET extra=$0 WHERE k=1", i)));
