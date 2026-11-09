@@ -201,6 +201,7 @@ class HollowTServer {
     info.config = config;
     info.leader_uuid = leader_uuid;
     dirty_.insert(tablet_id);
+    heartbeat_asap.store(true);
   }
 
   void RemoveTablet(const string& tablet_id) {
@@ -208,6 +209,7 @@ class HollowTServer {
     tablets_.erase(tablet_id);
     dirty_.erase(tablet_id);
     removed_.insert(tablet_id);
+    heartbeat_asap.store(true);
   }
 
   size_t NumTablets() {
@@ -391,6 +393,8 @@ class HollowTServer {
   MonoTime lease_sent_time;
   std::atomic<bool> heartbeat_in_flight{false};
   std::atomic<bool> lease_in_flight{false};
+  // Set on a tablet change; the scheduler sends the next heartbeat at once, like TriggerASAP.
+  std::atomic<bool> heartbeat_asap{false};
 
   // Reused across calls; safe because at most one of each RPC is in flight.
   master::TSHeartbeatRequestPB hb_req;
@@ -1531,7 +1535,9 @@ class HeartbeatBench {
         }
       }
       for (const auto& ts : tservers) {
-        if (now >= ts->next_heartbeat && !ts->heartbeat_in_flight.exchange(true)) {
+        if ((now >= ts->next_heartbeat || ts->heartbeat_asap.load()) &&
+            !ts->heartbeat_in_flight.exchange(true)) {
+          ts->heartbeat_asap.store(false);
           ts->next_heartbeat = now + interval;
           SendHeartbeat(ts.get());
         }
