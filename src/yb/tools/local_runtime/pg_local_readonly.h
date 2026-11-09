@@ -20,6 +20,14 @@ namespace yb::local_runtime {
 
 enum class CatalogMode { kFrozen, kSerializedTransactions };
 
+// Requests PostgreSQL backends sent through shared memory, and how many responses outgrew the
+// exchange: into a pooled segment, or kept for FetchData.
+struct SharedMemoryUse {
+  uint64_t requests = 0;
+  uint64_t segment_responses = 0;
+  uint64_t saved_responses = 0;
+};
+
 // Owns real YSQL over native catalogs and DocDB. Frozen by default; SQL transactions serialize.
 // No master, tserver, Tablet, TabletPeer, or Raft lifecycle.
 // Uses process-global PgWrapper flags; run each instance in its own process.
@@ -34,6 +42,7 @@ class ReadonlyPgServer {
 
   size_t CatalogTableCount() const;
   uint64_t ReadCount() const;
+  SharedMemoryUse SharedMemory() const;
   HostPort RpcAddress() const;
   uint16_t SqlPort() const;
   const std::string& PgDataDirectory() const;
