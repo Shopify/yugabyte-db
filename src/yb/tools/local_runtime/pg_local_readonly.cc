@@ -22,6 +22,7 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -29,6 +30,9 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include <google/protobuf/io/coded_stream.h>
+
+#include "yb/common/common.pb.h"
 #include "yb/common/pg_types.h"
 #include "yb/common/pgsql_error.h"
 #include "yb/common/transaction_error.h"
@@ -43,8 +47,10 @@
 #include "yb/docdb/ql_rocksdb_storage.h"
 #include "yb/rpc/inbound_call.h"
 #include "yb/rpc/messenger.h"
+#include "yb/rpc/rpc_header.pb.h"
 #include "yb/rpc/rpc_service.h"
 #include "yb/rpc/scheduler.h"
+#include "yb/rpc/serialization.h"
 #include "yb/rpc/sidecars.h"
 #include "yb/rpc/yb_rpc.h"
 #include "yb/server/rpc_server.h"
@@ -56,16 +62,21 @@
 #include "yb/tools/local_runtime/pg_local_request_sequence.h"
 #include "yb/dockv/partition.h"
 #include "yb/tools/local_runtime/pg_local_service_base.h"
+#include "yb/tserver/pg_shared_mem_pool.h"
 #include "yb/tserver/tserver_admin.pb.h"
 #include "yb/tserver/tserver_shared_mem.h"
+#include "yb/util/coding.h"
 #include "yb/util/env.h"
+#include "yb/util/mem_tracker.h"
 #include "yb/util/memory/arena.h"
 #include "yb/util/metrics.h"
 #include "yb/util/pb_util.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/sync_point.h"
+#include "yb/util/thread_pool.h"
 #include "yb/util/thread_restrictions.h"
 #include "yb/util/uuid.h"
+#include "yb/util/write_buffer.h"
 #include "yb/yql/pgwrapper/pg_wrapper.h"
 #include "yb/yql/pggate/util/pg_wire.h"
 
@@ -92,6 +103,17 @@ METRIC_DECLARE_event_stats(rpc_incoming_queue_time);
 
 DEFINE_NON_RUNTIME_bool(local_runtime_inline_rpc, true,
     "Handle local runtime RPCs on the reactor thread instead of a service thread pool.");
+
+#if defined(__APPLE__)
+// Interprocess semaphores there fall back to Boost's emulation, which measured slower than TCP.
+constexpr bool kSharedMemoryByDefault = false;
+#else
+constexpr bool kSharedMemoryByDefault = true;
+#endif
+
+DEFINE_NON_RUNTIME_bool(local_runtime_shared_memory, kSharedMemoryByDefault,
+    "Exchange Perform and object lock requests with PostgreSQL backends through per-session "
+    "shared memory, as the tablet server does, instead of only over TCP.");
 
 namespace yb::local_runtime {
 namespace {
@@ -919,14 +941,225 @@ class FrozenCatalog {
   HybridTime read_time_;
 };
 
+struct SharedMemoryCounters {
+  std::atomic<uint64_t> requests{0};
+  std::atomic<uint64_t> segment_responses{0};
+  std::atomic<uint64_t> saved_responses{0};
+
+  SharedMemoryUse Snapshot() const {
+    return {
+        .requests = requests.load(std::memory_order_relaxed),
+        .segment_responses = segment_responses.load(std::memory_order_relaxed),
+        .saved_responses = saved_responses.load(std::memory_order_relaxed),
+    };
+  }
+};
+
+// Where a Perform or object-lock response goes. PgGate sends a backend's request through its
+// shared-memory exchange when that is idle and over TCP otherwise, so a request on either
+// transport may be parked until its predecessor arrives on the other.
+class Responder {
+ public:
+  virtual ~Responder() = default;
+  virtual rpc::Sidecars& sidecars() = 0;
+  virtual CoarseTimePoint deadline() const = 0;
+  // Called once, after the response message is complete.
+  virtual void Send() = 0;
+};
+
+class RpcResponder : public Responder {
+ public:
+  explicit RpcResponder(rpc::RpcContext context) : context_(std::move(context)) {}
+
+  rpc::Sidecars& sidecars() override { return context_.sidecars(); }
+  CoarseTimePoint deadline() const override { return context_.GetClientDeadline(); }
+  void Send() override { context_.RespondSuccess(); }
+
+ private:
+  rpc::RpcContext context_;
+};
+
+std::byte* WriteVarint32ToArray(uint32_t value, std::byte* out) {
+  return pointer_cast<std::byte*>(google::protobuf::io::CodedOutputStream::WriteVarint32ToArray(
+      value, pointer_cast<uint8_t*>(out)));
+}
+
+std::atomic<bool>& InUseFlag(const tserver::SharedMemorySegmentHandle& handle) {
+  return *pointer_cast<std::atomic<bool>*>(handle.address() - sizeof(std::atomic<bool>));
+}
+
+// One backend's shared-memory exchange, polled by a dedicated thread as in the tablet server.
+// Responses that outgrow the exchange go to a pooled segment that PostgreSQL maps by id, and
+// larger ones wait for FetchData. Guarded by the service mutex, except for the thread itself.
+class SharedTransport {
+ public:
+  SharedTransport(
+      tserver::PgSessionSharedMemoryManager memory, tserver::PgSharedMemoryPool& segments,
+      SharedMemoryCounters& counters)
+      : memory_(std::move(memory)), segments_(segments), counters_(counters) {}
+
+  tserver::SharedExchange& exchange() { return memory_.exchange(); }
+  SharedMemoryCounters& counters() { return counters_; }
+
+  Status Start(YBThreadPool& threads, tserver::SharedExchangeListener listener) {
+    runnable_ = std::make_shared<tserver::SharedExchangeRunnable>(
+        memory_.exchange(), memory_.session_id(), std::move(listener));
+    return runnable_->Start(threads);
+  }
+
+  void StartShutdown() {
+    if (runnable_) runnable_->StartShutdown();
+  }
+
+  // Waits for the polling thread, which may need the service mutex to finish its request.
+  void CompleteShutdown() {
+    if (runnable_) runnable_->CompleteShutdown();
+  }
+
+  // PostgreSQL clears the flag once it has copied a segment response, before its next request.
+  // A request that finds it set follows an abandoned response, as after a timeout.
+  void ReleaseAbandonedSegment() {
+    if (segment_) InUseFlag(segment_).store(false, std::memory_order_release);
+  }
+
+  // Returns where to write a response of `size` bytes and the size word that tells PostgreSQL to
+  // read it from the segment, or nullptr when no segment is that large.
+  std::pair<std::byte*, size_t> ObtainSegment(size_t size) {
+    if (segment_ && segment_.size() >= size) {
+      InUseFlag(segment_).store(true, std::memory_order_release);
+    } else {
+      auto handle = segments_.Obtain(size + sizeof(std::atomic<bool>));
+      if (!handle) return {nullptr, 0};
+      new (handle.address()) std::atomic<bool>(true);
+      handle.TruncateLeft(sizeof(std::atomic<bool>));
+      segment_ = std::move(handle);
+    }
+    return {
+        segment_.address(), tserver::kTooBigResponseMark | tserver::kBigSharedMemoryMark | size |
+                                (segment_.id() << tserver::kBigSharedMemoryIdShift)};
+  }
+
+  size_t Save(const RefCntBuffer& buffer, WriteBuffer&& sidecars) {
+    auto slot = std::ranges::find_if(saved_, [](auto& data) { return data.empty(); });
+    if (slot == saved_.end()) slot = saved_.emplace(saved_.end(), 0);
+    slot->AddBlock(buffer, 0);
+    slot->Take(&sidecars);
+    return slot - saved_.begin();
+  }
+
+  Status Fetch(uint64_t id, WriteBuffer* out) {
+    SCHECK(
+        id < saved_.size() && !saved_[id].empty(), NotFound, "Saved local response not found");
+    out->Take(&saved_[id]);
+    return Status::OK();
+  }
+
+ private:
+  tserver::PgSessionSharedMemoryManager memory_;
+  tserver::PgSharedMemoryPool& segments_;
+  SharedMemoryCounters& counters_;
+  std::shared_ptr<tserver::SharedExchangeRunnable> runnable_;
+  tserver::SharedMemorySegmentHandle segment_;
+  std::vector<WriteBuffer> saved_;
+};
+
+// A request read from a backend's exchange. It keeps its own copy of the request because the
+// response is written over the exchange.
+template <class Request, class Response>
+class SharedCall : public Responder {
+ public:
+  explicit SharedCall(SharedTransport& transport)
+      : request(&arena_), response(&arena_), transport_(transport) {}
+
+  ~SharedCall() override { LOG_IF(DFATAL, !sent_) << "Shared memory request not answered"; }
+
+  // Layout written by PgClient::PrepareAndSend: timeout in milliseconds, ASH metadata, trace
+  // context, then the request.
+  Status Parse(const std::byte* data, size_t size) {
+    SCHECK_GE(size, sizeof(uint64_t), Corruption, "Truncated shared memory request");
+    auto* input = static_cast<uint8_t*>(arena_.AllocateBytes(size));
+    memcpy(input, data, size);
+    const auto* end = input + size;
+    deadline_ = CoarseMonoClock::Now() + std::chrono::milliseconds(LittleEndian::Load64(input));
+    input += sizeof(uint64_t);
+    AshMetadataPB ash;
+    RETURN_NOT_OK(
+        rpc::ParseMetadataFromSharedMemory(&input, end - input, rpc::AnyMessagePtr(&ash)));
+    uint32_t trace_size = 0;
+    input = const_cast<uint8_t*>(GetVarint32Ptr(input, end, &trace_size));
+    SCHECK(
+        input && trace_size <= static_cast<size_t>(end - input), Corruption,
+        "Unable to parse trace context size");
+    input += trace_size;
+    return request.ParseFromSlice(Slice(input, end));
+  }
+
+  rpc::Sidecars& sidecars() override { return sidecars_; }
+  CoarseTimePoint deadline() const override { return deadline_; }
+
+  // Same framing as an RPC response, which is how PgGate parses it.
+  void Send() override {
+    sent_ = true;
+    rpc::ResponseHeader header;
+    header.set_call_id(42);
+    const auto response_size = response.SerializedSize();
+    sidecars_.MoveOffsetsTo(response_size, header.mutable_sidecar_offsets());
+    const auto header_size = header.ByteSize();
+    const auto body_size = narrow_cast<uint32_t>(response_size + sidecars_.size());
+    using google::protobuf::io::CodedOutputStream;
+    const size_t full_size = CodedOutputStream::VarintSize32(header_size) + header_size +
+                             CodedOutputStream::VarintSize32(body_size) + body_size;
+    auto& exchange = transport_.exchange();
+    auto* start = exchange.Obtain(full_size);
+    size_t size_word = full_size;
+    RefCntBuffer buffer;
+    if (!start) {
+      std::tie(start, size_word) = transport_.ObtainSegment(full_size);
+      transport_.counters().segment_responses.fetch_add(start != nullptr);
+    }
+    if (!start) {
+      transport_.counters().saved_responses.fetch_add(1);
+      buffer = RefCntBuffer(full_size - sidecars_.size());
+      start = pointer_cast<std::byte*>(buffer.data());
+    }
+    auto* out = WriteVarint32ToArray(header_size, start);
+    out = pointer_cast<std::byte*>(
+        header.SerializeWithCachedSizesToArray(pointer_cast<uint8_t*>(out)));
+    out = WriteVarint32ToArray(body_size, out);
+    out = response.SerializeToArray(out);
+    if (buffer) {
+      size_word = tserver::kTooBigResponseMark |
+                  transport_.Save(buffer, std::move(sidecars_.buffer()));
+    } else {
+      sidecars_.CopyTo(out);
+    }
+    exchange.Respond(size_word);
+    exchange.ResetBusy();
+  }
+
+ private:
+  ThreadSafeArena arena_;
+
+ public:
+  Request request;
+  Response response;
+
+ private:
+  SharedTransport& transport_;
+  rpc::Sidecars sidecars_;
+  CoarseTimePoint deadline_;
+  bool sent_ = false;
+};
+
 class ReadonlyService : public UnsupportedPgClientService,
                         public std::enable_shared_from_this<ReadonlyService> {
  private:
-  // RpcContext owns the inbound call backing these pointers; drain before messenger shutdown.
+  // The responder owns what backs these pointers: the RpcContext's inbound call, or the shared
+  // memory call's copy. Drain before messenger shutdown.
   struct PendingPerform {
     const tserver::PgPerformRequestMsg* request;
     tserver::PgPerformResponseMsg* response;
-    rpc::RpcContext context;
+    std::unique_ptr<Responder> responder;
     CoarseTimePoint deadline;
     size_t bytes;
   };
@@ -965,16 +1198,34 @@ class ReadonlyService : public UnsupportedPgClientService,
     bool autonomous = false;
     bool transaction_failed = false;
     uint32_t failed_subtxn = 0;
+    std::shared_ptr<SharedTransport> transport;
   };
 
  public:
   ReadonlyService(
       const scoped_refptr<MetricEntity>& entity, FrozenCatalog& catalog, rpc::Scheduler& scheduler,
-      std::function<void()> publish_versions)
+      std::function<void()> publish_versions, std::string instance_id)
       : UnsupportedPgClientService(entity),
         catalog_(catalog),
         scheduler_(scheduler),
-        publish_versions_(std::move(publish_versions)) {}
+        publish_versions_(std::move(publish_versions)),
+        instance_id_(std::move(instance_id)) {
+    if (!FLAGS_local_runtime_shared_memory) return;
+    segments_ =
+        std::make_unique<tserver::PgSharedMemoryPool>(MemTracker::GetRootTracker(), instance_id_);
+    segments_->Start(scheduler_);
+    exchange_threads_ = std::make_unique<YBThreadPool>(ThreadPoolOptions{
+        .name = "local_shmem",
+        .max_workers = ThreadPoolOptions::kUnlimitedWorkersWithoutQueue,
+    });
+  }
+
+  template <class Response>
+  void Respond(const Status& status, Response* response, Responder& responder) {
+    const auto& result = status.ok() ? catalog_.failure_ : status;
+    if (!result.ok()) StatusToPB(result, response->mutable_status());
+    responder.Send();
+  }
 
   template <class Response>
   void Respond(const Status& status, Response* response, rpc::RpcContext& context) {
@@ -1003,7 +1254,24 @@ class ReadonlyService : public UnsupportedPgClientService,
   void RetireSession(Session& session) {
     WARN_NOT_OK(AbortOwnedTransaction(session), "Aborting exited local backend");
     CancelPending(session, STATUS(Aborted, "Local backend has exited"));
+    if (session.transport) {
+      session.transport->StartShutdown();
+      // Joined outside the mutex, which its polling thread may be waiting for.
+      retired_.push_back(std::move(session.transport));
+      exchange_threads_->EnqueueFunctor([weak = weak_from_this()] {
+        if (auto self = weak.lock()) self->JoinRetired();
+      });
+    }
     sessions_.erase(session.id);
+  }
+
+  void JoinRetired() {
+    decltype(retired_) retired;
+    {
+      std::lock_guard lock(mutex_);
+      retired.swap(retired_);
+    }
+    for (auto& transport : retired) transport->CompleteShutdown();
   }
 
   void Heartbeat(
@@ -1035,10 +1303,81 @@ class ReadonlyService : public UnsupportedPgClientService,
       return;
     }
     const auto id = ++next_session_;
-    sessions_.emplace(id, std::make_shared<Session>(id, static_cast<pid_t>(req->pid())));
+    auto session = std::make_shared<Session>(id, static_cast<pid_t>(req->pid()));
+    sessions_.emplace(id, session);
     resp->set_session_id(id);
-    // Empty instance_id selects the existing network transport in unmodified PgGate.
+    // An instance_id makes PgGate open the session's exchange; without one it uses TCP alone.
+    if (exchange_threads_) {
+      const auto status = StartTransport(*session);
+      if (status.ok()) {
+        resp->set_instance_id(instance_id_);
+      } else {
+        LOG(WARNING) << "Local session " << id << " uses TCP only: " << status;
+      }
+    }
     Respond(Status::OK(), resp, context);
+  }
+
+  Status StartTransport(Session& session) {
+    auto memory = VERIFY_RESULT(tserver::PgSessionSharedMemoryManager::Make(
+        instance_id_, session.id, tserver::Create::kTrue));
+    auto transport =
+        std::make_shared<SharedTransport>(std::move(memory), *segments_, shared_use_);
+    // The transport outlives its polling thread, so the listener may hold it by reference.
+    RETURN_NOT_OK(transport->Start(
+        *exchange_threads_,
+        [weak = weak_from_this(), id = session.id, &transport = *transport](size_t size) {
+          if (auto self = weak.lock()) self->HandleShared(id, transport, size);
+        }));
+    session.transport = std::move(transport);
+    return Status::OK();
+  }
+
+  // Runs on the session's polling thread. Every path answers the request exactly once.
+  void HandleShared(uint64_t id, SharedTransport& transport, size_t size) {
+    shared_use_.requests.fetch_add(1, std::memory_order_relaxed);
+    const auto* data = transport.exchange().Obtain(size);
+    const auto type = size && data ? static_cast<int>(*pointer_cast<const uint8_t*>(data)) : -1;
+    switch (type) {
+      case tserver::PgSharedExchangeReqType::PERFORM: {
+        auto call = std::make_unique<
+            SharedCall<tserver::LWPgPerformRequestPB, tserver::LWPgPerformResponsePB>>(transport);
+        auto status = call->Parse(data + 1, size - 1);
+        std::lock_guard lock(mutex_);
+        transport.ReleaseAbandonedSegment();
+        if (status.ok() && call->request.session_id() != id) {
+          status = STATUS(InvalidArgument, "Shared memory request for another local session");
+        }
+        if (!status.ok()) {
+          Respond(status, &call->response, *call);
+          return;
+        }
+        auto* req = &call->request;
+        auto* resp = &call->response;
+        DoPerform(req, resp, std::move(call));
+        return;
+      }
+      case tserver::PgSharedExchangeReqType::ACQUIRE_OBJECT_LOCK: {
+        using LockCall = SharedCall<
+            tserver::LWPgAcquireObjectLockRequestPB, tserver::LWPgAcquireObjectLockResponsePB>;
+        LockCall call(transport);
+        auto status = call.Parse(data + 1, size - 1);
+        std::lock_guard lock(mutex_);
+        transport.ReleaseAbandonedSegment();
+        if (status.ok() && call.request.session_id() != id) {
+          status = STATUS(InvalidArgument, "Shared memory request for another local session");
+        }
+        if (status.ok()) status = ObjectLockStatus(call.request);
+        Respond(status, &call.response, call);
+        return;
+      }
+      default:
+        break;
+    }
+    // PgGate sends no other types; an empty answer fails the backend's request.
+    LOG(DFATAL) << "Unexpected shared memory request type " << type << " for session " << id;
+    transport.exchange().Respond(0);
+    transport.exchange().ResetBusy();
   }
 
   Status CheckSession(uint64_t id) {
@@ -1128,7 +1467,7 @@ class ReadonlyService : public UnsupportedPgClientService,
   }
 
   void CancelPending(Session& session, const Status& status) {
-    for (auto& [serial, call] : session.pending) Respond(status, call.response, call.context);
+    for (auto& [serial, call] : session.pending) Respond(status, call.response, *call.responder);
     pending_calls_ -= session.pending.size();
     pending_bytes_ -= session.pending_bytes;
     session.pending.clear();
@@ -1143,11 +1482,25 @@ class ReadonlyService : public UnsupportedPgClientService,
   }
 
   void Shutdown() override {
-    std::lock_guard lock(mutex_);
-    shutting_down_ = true;
-    for (auto& [id, session] : sessions_) {
-      CancelPending(*session, STATUS(ServiceUnavailable, "Local runtime is shutting down"));
+    decltype(retired_) transports;
+    bool stop_threads = false;
+    {
+      std::lock_guard lock(mutex_);
+      shutting_down_ = true;
+      for (auto& [id, session] : sessions_) {
+        CancelPending(*session, STATUS(ServiceUnavailable, "Local runtime is shutting down"));
+        if (session->transport) {
+          session->transport->StartShutdown();
+          transports.push_back(std::move(session->transport));
+        }
+      }
+      std::ranges::move(retired_, std::back_inserter(transports));
+      retired_.clear();
+      stop_threads = exchange_threads_ && !std::exchange(exchange_threads_stopped_, true);
     }
+    for (auto& transport : transports) transport->CompleteShutdown();
+    transports.clear();
+    if (stop_threads) exchange_threads_->Shutdown();
   }
 
   Status CheckNoPending(Session& session) {
@@ -1197,9 +1550,9 @@ class ReadonlyService : public UnsupportedPgClientService,
 
   void ExecutePerform(
       Session& session, const tserver::PgPerformRequestMsg* req,
-      tserver::PgPerformResponseMsg* resp, rpc::RpcContext context) {
+      tserver::PgPerformResponseMsg* resp, std::unique_ptr<Responder> responder) {
     auto status = session.sequence.Register(req->sequence_num().serial_no(), Predecessor(*req));
-    if (status.ok()) status = PerformReads(session, *req, resp, context);
+    if (status.ok()) status = PerformReads(session, *req, resp, *responder);
     if (!status.ok()) {
       // PgGate skips a SKIP LOCKED row reported as kSkipLocking; its statement continues.
       const bool skipped =
@@ -1209,9 +1562,9 @@ class ReadonlyService : public UnsupportedPgClientService,
         session.failed_subtxn = std::max(1u, req->options().active_sub_transaction_id());
       }
       resp->Clear();
-      context.sidecars().Reset();
+      responder->sidecars().Reset();
     }
-    Respond(status, resp, context);
+    Respond(status, resp, *responder);
   }
 
   void DrainPending(Session& session) {
@@ -1230,11 +1583,11 @@ class ReadonlyService : public UnsupportedPgClientService,
       session.pending.erase(first);
       if (call.deadline <= CoarseMonoClock::Now()) {
         const auto status = STATUS(TimedOut, "Queued local request expired; reconnect required");
-        Respond(status, call.response, call.context);
+        Respond(status, call.response, *call.responder);
         FailSequence(session, status);
         return;
       }
-      ExecutePerform(session, call.request, call.response, std::move(call.context));
+      ExecutePerform(session, call.request, call.response, std::move(call.responder));
     }
   }
 
@@ -1242,15 +1595,22 @@ class ReadonlyService : public UnsupportedPgClientService,
       const tserver::PgPerformRequestMsg* req, tserver::PgPerformResponseMsg* resp,
       rpc::RpcContext context) override {
     std::lock_guard lock(mutex_);
+    DoPerform(req, resp, std::make_unique<RpcResponder>(std::move(context)));
+  }
+
+  void DoPerform(
+      const tserver::PgPerformRequestMsg* req, tserver::PgPerformResponseMsg* resp,
+      std::unique_ptr<Responder> responder) {
     const auto status = CheckSession(req->session_id());
     if (!status.ok()) {
-      Respond(status, resp, context);
+      Respond(status, resp, *responder);
       return;
     }
     auto session = sessions_.at(req->session_id());
     if (session->sequence_broken) {
       Respond(
-          STATUS(IllegalState, "Local request sequence failed; reconnect required"), resp, context);
+          STATUS(IllegalState, "Local request sequence failed; reconnect required"), resp,
+          *responder);
       return;
     }
     const auto serial = req->sequence_num().serial_no();
@@ -1258,7 +1618,7 @@ class ReadonlyService : public UnsupportedPgClientService,
     if (!ready.ok() || session->pending.contains(serial)) {
       const auto error =
           !ready.ok() ? ready.status() : STATUS(IllegalState, "Duplicate pending local request");
-      Respond(error, resp, context);
+      Respond(error, resp, *responder);
       FailSequence(*session, error);
       return;
     }
@@ -1267,14 +1627,14 @@ class ReadonlyService : public UnsupportedPgClientService,
       // Bounds apply to the whole service, not once per admitted backend.
       if (pending_calls_ >= 64 || bytes > 16ULL * 1024 * 1024 - pending_bytes_) {
         const auto error = STATUS(ServiceUnavailable, "Local request queue limit exceeded");
-        Respond(error, resp, context);
+        Respond(error, resp, *responder);
         FailSequence(*session, error);
         return;
       }
       const auto deadline =
-          std::min(context.GetClientDeadline(), CoarseMonoClock::Now() + std::chrono::seconds(5));
+          std::min(responder->deadline(), CoarseMonoClock::Now() + std::chrono::seconds(5));
       session->pending.emplace(
-          serial, PendingPerform{req, resp, std::move(context), deadline, bytes});
+          serial, PendingPerform{req, resp, std::move(responder), deadline, bytes});
       session->pending_bytes += bytes;
       pending_bytes_ += bytes;
       ++pending_calls_;
@@ -1282,7 +1642,7 @@ class ReadonlyService : public UnsupportedPgClientService,
       SchedulePendingCheck(*session);
       return;
     }
-    ExecutePerform(*session, req, resp, std::move(context));
+    ExecutePerform(*session, req, resp, std::move(responder));
     DrainPending(*session);
   }
 
@@ -1622,7 +1982,7 @@ class ReadonlyService : public UnsupportedPgClientService,
 
   Status PerformReads(
       Session& session, const tserver::PgPerformRequestMsg& req,
-      tserver::PgPerformResponseMsg* resp, rpc::RpcContext& context) {
+      tserver::PgPerformResponseMsg* resp, Responder& responder) {
     RETURN_NOT_OK(Status(catalog_.failure_));
     RETURN_NOT_OK(AcquireSqlTransaction(session, req.options()));
     SCHECK(
@@ -1692,11 +2052,11 @@ class ReadonlyService : public UnsupportedPgClientService,
             "Catalog mutations must be part of DDL");
         if (table.application) {
           RETURN_NOT_OK(catalog_.transaction_->NativeTransactions().WriteSql(
-              *session.native_txn, op.write(), resp->add_responses(), &context.sidecars(),
+              *session.native_txn, op.write(), resp->add_responses(), &responder.sidecars(),
               req.options().active_sub_transaction_id(), snapshot));
         } else {
           RETURN_NOT_OK(catalog_.Write(
-              op.write(), resp->add_responses(), &context.sidecars(),
+              op.write(), resp->add_responses(), &responder.sidecars(),
               req.options().active_sub_transaction_id()));
         }
         const auto& response = resp->responses().back();
@@ -1725,13 +2085,13 @@ class ReadonlyService : public UnsupportedPgClientService,
         const auto& table = VERIFY_RESULT_REF(catalog_.Find(op.read().table_id().ToBuffer()));
         if (catalog_.transaction_ && table.application) {
           RETURN_NOT_OK(catalog_.transaction_->NativeTransactions().ReadSql(
-              *session.native_txn, op.read(), resp->add_responses(), &context.sidecars(),
-              context.GetClientDeadline(), statement_time,
+              *session.native_txn, op.read(), resp->add_responses(), &responder.sidecars(),
+              responder.deadline(), statement_time,
               std::max(1u, req.options().active_sub_transaction_id()), snapshot));
           ++catalog_.reads_;
         } else {
           RETURN_NOT_OK(catalog_.Read(
-              op.read(), resp->add_responses(), &context.sidecars(), context.GetClientDeadline(),
+              op.read(), resp->add_responses(), &responder.sidecars(), responder.deadline(),
               statement_time));
         }
       }
@@ -1879,25 +2239,26 @@ class ReadonlyService : public UnsupportedPgClientService,
       const tserver::LWPgAcquireObjectLockRequestPB* req,
       tserver::LWPgAcquireObjectLockResponsePB* resp, rpc::RpcContext context) override {
     std::lock_guard lock(mutex_);
-    auto status = CheckSession(req->session_id());
-    if (status.ok() && (req->lock_type() < tserver::ACCESS_SHARE_LOCK ||
-                        req->lock_type() > (catalog_.transaction_ ? tserver::ACCESS_EXCLUSIVE_LOCK
-                                                                  : tserver::ROW_EXCLUSIVE_LOCK))) {
-      status =
-          STATUS_FORMAT(NotSupported, "Unsupported frozen catalog lock mode $0", req->lock_type());
+    Respond(ObjectLockStatus(*req), resp, context);
+  }
+
+  Status ObjectLockStatus(const tserver::LWPgAcquireObjectLockRequestPB& req) {
+    RETURN_NOT_OK(CheckSession(req.session_id()));
+    if (req.lock_type() < tserver::ACCESS_SHARE_LOCK ||
+        req.lock_type() > (catalog_.transaction_ ? tserver::ACCESS_EXCLUSIVE_LOCK
+                                                 : tserver::ROW_EXCLUSIVE_LOCK)) {
+      return STATUS_FORMAT(
+          NotSupported, "Unsupported frozen catalog lock mode $0", req.lock_type());
     }
-    if (status.ok() && req->is_session_lock()) {
-      status = STATUS(NotSupported, "Session object locks are not supported");
+    SCHECK(!req.is_session_lock(), NotSupported, "Session object locks are not supported");
+    auto& session = *sessions_.at(req.session_id());
+    RETURN_NOT_OK(AcquireSqlTransaction(session, req.options()));
+    // Data transactions only take weak locks, which never conflict with each other. Stronger
+    // modes stand in for catalog-level exclusion until the transaction finishes.
+    if (catalog_.transaction_ && req.lock_type() > tserver::ROW_EXCLUSIVE_LOCK) {
+      return AcquireExclusive(session);
     }
-    if (status.ok()) {
-      auto& session = *sessions_.at(req->session_id());
-      status = AcquireSqlTransaction(session, req->options());
-      // Data transactions only take weak locks, which never conflict with each other. Stronger
-      // modes stand in for catalog-level exclusion until the transaction finishes.
-      if (status.ok() && catalog_.transaction_ && req->lock_type() > tserver::ROW_EXCLUSIVE_LOCK)
-        status = AcquireExclusive(session);
-    }
-    Respond(status, resp, context);
+    return Status::OK();
   }
 
   void RollbackToSubTransaction(
@@ -2015,6 +2376,22 @@ class ReadonlyService : public UnsupportedPgClientService,
     Respond(CheckSession(req->session_id()), resp, context);
   }
 
+  // Collects a shared memory response too large for any segment.
+  void FetchData(
+      const tserver::PgFetchDataRequestPB* req, tserver::PgFetchDataResponsePB* resp,
+      rpc::RpcContext context) override {
+    std::lock_guard lock(mutex_);
+    auto status = CheckSession(req->session_id());
+    if (status.ok()) {
+      const auto& transport = sessions_.at(req->session_id())->transport;
+      status = transport ? transport->Fetch(req->data_id(), &context.sidecars().Start())
+                         : STATUS(NotFound, "Local session has no shared memory");
+    }
+    Respond(status, resp, context);
+  }
+
+  SharedMemoryUse shared_memory_use() const { return shared_use_.Snapshot(); }
+
  private:
   FrozenCatalog& catalog_;
   rpc::Scheduler& scheduler_;
@@ -2031,6 +2408,14 @@ class ReadonlyService : public UnsupportedPgClientService,
   uint64_t exclusive_owner_ = 0;
   uint64_t next_session_ = 0;
   std::unordered_map<uint64_t, std::shared_ptr<Session>> sessions_;
+  // Names this runtime's shared memory objects; PgGate opens them from the Heartbeat response.
+  const std::string instance_id_;
+  SharedMemoryCounters shared_use_;
+  std::unique_ptr<tserver::PgSharedMemoryPool> segments_;
+  std::unique_ptr<YBThreadPool> exchange_threads_;
+  bool exchange_threads_stopped_ = false;
+  // Transports of retired sessions whose polling threads have not been joined yet.
+  std::vector<std::shared_ptr<SharedTransport>> retired_;
 };
 
 }  // namespace
@@ -2038,7 +2423,13 @@ class ReadonlyService : public UnsupportedPgClientService,
 class ReadonlyPgServer::Impl : public pgwrapper::PgWrapperContext {
  public:
   ~Impl() {
-    if (service_) service_->Shutdown();
+    if (service_) {
+      service_->Shutdown();
+      const auto use = service_->shared_memory_use();
+      LOG(INFO) << "Local shared memory requests: " << use.requests
+                << ", segment responses: " << use.segment_responses
+                << ", fetched responses: " << use.saved_responses;
+    }
     if (postgres_ && postgres_->ProcessId()) {
       postgres_->Shutdown();
       WARN_NOT_OK(ResultToStatus(postgres_->Wait()), "Stopping local YSQL");
@@ -2048,6 +2439,11 @@ class ReadonlyPgServer::Impl : public pgwrapper::PgWrapperContext {
       messenger_->Shutdown();
     }
     WARN_NOT_OK(shared_memory_.ShutdownNegotiator(), "Stopping address negotiator");
+    if (FLAGS_local_runtime_shared_memory && !uuid_.empty()) {
+      WARN_NOT_OK(
+          tserver::PgSessionSharedMemoryManager::Cleanup(uuid_),
+          "Removing local session shared memory");
+    }
   }
 
   Status Start(
@@ -2078,7 +2474,7 @@ class ReadonlyPgServer::Impl : public pgwrapper::PgWrapperContext {
         rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>());
     RETURN_NOT_OK(rpc_server_->Init(messenger_.get()));
     service_ = std::make_shared<ReadonlyService>(
-        entity_, catalog_, messenger_->scheduler(), [this] { PublishVersions(); });
+        entity_, catalog_, messenger_->scheduler(), [this] { PublishVersions(); }, uuid_);
     if (FLAGS_local_runtime_inline_rpc) {
       RETURN_NOT_OK(messenger_->RegisterService(
           service_->service_name(), make_scoped_refptr<InlineService>(service_, entity_)));
@@ -2193,6 +2589,9 @@ Result<std::unique_ptr<ReadonlyPgServer>> ReadonlyPgServer::Start(
 
 size_t ReadonlyPgServer::CatalogTableCount() const { return impl_->catalog_.tables_.size(); }
 uint64_t ReadonlyPgServer::ReadCount() const { return impl_->catalog_.reads_.load(); }
+SharedMemoryUse ReadonlyPgServer::SharedMemory() const {
+  return impl_->service_->shared_memory_use();
+}
 HostPort ReadonlyPgServer::RpcAddress() const {
   return HostPort(impl_->rpc_server_->GetBoundAddresses().front());
 }

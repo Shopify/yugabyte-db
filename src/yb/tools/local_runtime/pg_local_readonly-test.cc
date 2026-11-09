@@ -60,6 +60,7 @@
 #include "yb/yql/pgwrapper/libpq_utils.h"
 
 DECLARE_int32(ysql_num_shards_per_tserver);
+DECLARE_bool(local_runtime_shared_memory);
 DECLARE_bool(yb_enable_read_committed_isolation);
 DECLARE_string(ysql_sequence_cache_method);
 
@@ -1715,6 +1716,52 @@ TEST_F(ReadonlyPgServerTest, ColumnRewriteReindexes) {
   ASSERT_OK(c.Execute("DROP TABLE typed_rows"));
 }
 
+// Backends send requests through their shared-memory exchange when it is idle. Responses that
+// outgrow it go to a pooled segment, and ones larger than any segment wait for FetchData.
+TEST_F(ReadonlyPgServerTest, SharedMemoryExchange) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_local_runtime_shared_memory) = true;
+  auto server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          GetTestPath("shared-memory"), Snapshot(), AllocateFreePort(),
+          CatalogMode::kSerializedTransactions));
+  auto c = ASSERT_RESULT(Connect(*server));
+  ASSERT_OK(c.Execute("CREATE TABLE wide_rows(k bigint PRIMARY KEY,v bigint NOT NULL,note text)"));
+  ASSERT_OK(c.Execute("CREATE UNIQUE INDEX wide_value ON wide_rows(v)"));
+  ASSERT_OK(c.Execute(
+      "INSERT INTO wide_rows SELECT g, g * 10, repeat('x', 4000) FROM generate_series(1, 600) g"));
+  const auto start = server->SharedMemory();
+  ASSERT_GT(start.requests, 0);
+
+  ASSERT_EQ(ASSERT_RESULT(c.FetchRow<int64_t>("SELECT v FROM wide_rows WHERE k=7")), 70);
+  ASSERT_EQ(
+      ASSERT_RESULT(c.FetchRows<std::string>("SELECT note FROM wide_rows LIMIT 20")).size(), 20);
+  const auto segment = server->SharedMemory();
+  ASSERT_GT(segment.segment_responses, start.segment_responses);
+  // One batch of all 600 rows is about 2.4 MB, over the largest segment.
+  const auto notes = ASSERT_RESULT(c.FetchRows<std::string>("SELECT note FROM wide_rows"));
+  ASSERT_EQ(notes.size(), 600);
+  ASSERT_TRUE(std::ranges::all_of(notes, [](const auto& note) { return note.size() == 4000; }));
+  ASSERT_GT(server->SharedMemory().saved_responses, segment.saved_responses);
+
+  const auto duplicate = c.Execute("INSERT INTO wide_rows VALUES(1000,70,'dup')");
+  ASSERT_NOK(duplicate);
+  ASSERT_STR_CONTAINS(duplicate.ToString(), "wide_value");
+  // A strong table lock waits for no one, and fails while another backend's transaction is open.
+  auto other = ASSERT_RESULT(Connect(*server));
+  ASSERT_OK(other.Execute("BEGIN"));
+  ASSERT_EQ(ASSERT_RESULT(other.FetchRow<int64_t>("SELECT count(*) FROM wide_rows")), 600);
+  ASSERT_NOK(c.Execute("ALTER TABLE wide_rows ADD COLUMN extra bigint"));
+  ASSERT_OK(other.Execute("COMMIT"));
+  ASSERT_OK(c.Execute("ALTER TABLE wide_rows ADD COLUMN extra bigint"));
+
+  // More backends than max_connections come and go; new sessions retire exited ones.
+  for (int i = 0; i != 30; ++i) {
+    auto transient = ASSERT_RESULT(Connect(*server));
+    ASSERT_OK(transient.Execute(Format("UPDATE wide_rows SET extra=$0 WHERE k=1", i)));
+  }
+  ASSERT_EQ(ASSERT_RESULT(c.FetchRow<int64_t>("SELECT extra FROM wide_rows WHERE k=1")), 29);
+}
+
 TEST_F(ReadonlyPgServerTest, SchemaLifecycle) {
   const auto path = GetTestPath("schema-lifecycle");
   auto server = ASSERT_RESULT(
@@ -2234,7 +2281,8 @@ TEST_F(ReadonlyPgServerTest, RejectsWritesAtRpcBoundary) {
   ASSERT_OK(proxy.Heartbeat(heartbeat, &heartbeat_response, &controller));
   ASSERT_FALSE(heartbeat_response.has_status());
   ASSERT_GT(heartbeat_response.session_id(), 0);
-  ASSERT_TRUE(heartbeat_response.instance_id().empty());
+  // An instance_id names the session's shared memory exchange.
+  ASSERT_EQ(heartbeat_response.instance_id().empty(), !FLAGS_local_runtime_shared_memory);
   ThreadSafeArena arena;
   tserver::LWPgPerformRequestPB request(&arena);
   tserver::LWPgPerformResponsePB response(&arena);
