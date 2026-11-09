@@ -2501,7 +2501,7 @@ class ReadonlyPgServer::Impl : public pgwrapper::PgWrapperContext {
     FLAGS_enable_ysql_conn_mgr_stats = false;
     FLAGS_ysql_pg_conf_csv = std::string("default_transaction_read_only=") +
                              (mode == CatalogMode::kFrozen ? "on" : "off") +
-                             ",autovacuum=off,max_connections=20,yb_enable_ash=off,"
+                             ",autovacuum=off,yb_enable_ash=off,"
                              "yb_enable_pg_stat_statements_docdb_metrics=off";
     if (mode != CatalogMode::kFrozen) {
       // There is no master to promote the prerequisites normally enabled in a new universe.
