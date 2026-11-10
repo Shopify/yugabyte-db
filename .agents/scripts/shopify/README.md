@@ -228,3 +228,23 @@ release in any series, so a series' first Shopify release reuses them from an
 earlier series and later ones reuse them from their own.
 
 `test_release.py` runs under the same `unittest discover` command as above.
+
+## PR title cases
+
+`pr_title_cases.py` checks `.github/workflows/pr-title.yml` against
+`.github/tests/pr-title-cases.json`: simulated pull request events, one per line,
+each with the expected outcome, exit code, and output of every step. It runs each
+step the way GitHub does (`bash -e`, a minimal environment, the step's `env:`
+expanded from the case) and reports, for each case that differs, its first differing
+step and that step's output. Exit codes: 0, 1 for a difference, 2 for invalid cases,
+workflow syntax it does not support, or a step that times out.
+
+```bash
+python3 -B .agents/scripts/shopify/pr_title_cases.py
+```
+
+Run it on Linux: the policy's regexes use `\S`, which macOS bash does not support.
+The "PR title cases" job in `shopify-contributions.yml` runs it whenever the workflow
+or the cases change, including a sync that replays the fork's patch to the workflow.
+Change the cases in the same PR as the policy. `test_pr_title_cases.py` runs under
+the same `unittest discover` command as above.
