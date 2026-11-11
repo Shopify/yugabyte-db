@@ -61,6 +61,7 @@
 
 DECLARE_int32(ysql_num_shards_per_tserver);
 DECLARE_bool(local_runtime_shared_memory);
+DECLARE_bool(local_runtime_wait_on_conflict);
 DECLARE_bool(yb_enable_read_committed_isolation);
 DECLARE_string(ysql_sequence_cache_method);
 
@@ -1155,6 +1156,8 @@ TEST_F(ReadonlyPgServerTest, CatalogCommitCrashRecovery) {
 TEST_F(ReadonlyPgServerTest, ConcurrentSqlSessions) {
   // Release builds default to native READ COMMITTED; pin it so every build checks one contract.
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_yb_enable_read_committed_isolation) = true;
+  // One thread drives both sessions, so conflicts must fail rather than wait.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_local_runtime_wait_on_conflict) = false;
   auto server = ASSERT_RESULT(
       ReadonlyPgServer::Start(
           GetTestPath("concurrent-sql"), Snapshot(), AllocateFreePort(),
@@ -1291,6 +1294,7 @@ TEST_F(ReadonlyPgServerTest, ConcurrentSqlSessions) {
 
 TEST_F(ReadonlyPgServerTest, RowLocks) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_yb_enable_read_committed_isolation) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_local_runtime_wait_on_conflict) = false;
   auto server = ASSERT_RESULT(
       ReadonlyPgServer::Start(
           GetTestPath("row-locks"), Snapshot(), AllocateFreePort(),
@@ -1378,6 +1382,178 @@ TEST_F(ReadonlyPgServerTest, RowLocks) {
   ASSERT_OK(other.Execute("UPDATE locked_rows SET v=13 WHERE k=1"));
   ASSERT_OK(other.Execute("COMMIT"));
   ASSERT_EQ(ASSERT_RESULT(locker.FetchRow<int64_t>("SELECT v FROM locked_rows WHERE k=1")), 13);
+}
+
+// Conflicts with pending transactions wait as in tablet wait queues, and lock status reports the
+// wait to a probe that joins yb_lock_status with pg_stat_activity.yb_backend_xid.
+TEST_F(ReadonlyPgServerTest, WaitsOnConflicts) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_yb_enable_read_committed_isolation) = true;
+  auto server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          GetTestPath("wait-on-conflict"), Snapshot(), AllocateFreePort(),
+          CatalogMode::kSerializedTransactions));
+  auto holder = ASSERT_RESULT(Connect(*server));
+  auto waiter = ASSERT_RESULT(Connect(*server));
+  auto observer = ASSERT_RESULT(Connect(*server));
+  ASSERT_OK(holder.Execute("CREATE TABLE waits(k bigint PRIMARY KEY, v bigint)"));
+  ASSERT_OK(holder.Execute("INSERT INTO waits VALUES(1,10),(2,20),(3,30)"));
+  ASSERT_OK(observer.Execute("SET yb_locks_min_txn_age = 0"));
+  const auto holder_pid = ASSERT_RESULT(holder.FetchRow<int32_t>("SELECT pg_backend_pid()"));
+  const auto waiter_pid = ASSERT_RESULT(waiter.FetchRow<int32_t>("SELECT pg_backend_pid()"));
+  const auto value = [&observer](int key) {
+    return observer.FetchRow<int64_t>(Format("SELECT v FROM waits WHERE k=$0", key));
+  };
+  const auto xid = [](int pid) {
+    return Format("(SELECT yb_backend_xid FROM pg_stat_activity WHERE pid = $0)", pid);
+  };
+  const auto await_wait = [&](int waiting, int blocking,
+                              const std::future<Status>& statement) -> Status {
+    RETURN_NOT_OK(WaitFor(
+        [&]() -> Result<bool> {
+          return observer.FetchRow<bool>(Format(
+              "SELECT EXISTS (SELECT 1 FROM yb_lock_status('waits'::regclass, NULL) AS l "
+              "WHERE NOT l.granted AND l.database = (SELECT oid FROM pg_database WHERE "
+              "datname = current_database()) AND l.transaction_id = $0 AND $1 = ANY(l.blocked_by))",
+              xid(waiting), xid(blocking)));
+        },
+        30s, "lock wait in yb_lock_status"));
+    SCHECK(
+        statement.wait_for(0s) == std::future_status::timeout, IllegalState,
+        "The statement did not wait");
+    return Status::OK();
+  };
+  const auto start = [](pgwrapper::PGConn& connection, std::string statement) {
+    return std::async(std::launch::async, [&connection, statement] {
+      return statement.starts_with("SELECT") ? ResultToStatus(connection.Fetch(statement))
+                                              : connection.Execute(statement);
+    });
+  };
+
+  // A READ COMMITTED update waits for the holder's commit, then updates the committed row. The
+  // holder's granted locks are reported too.
+  ASSERT_OK(holder.Execute("BEGIN"));
+  ASSERT_OK(holder.Execute("UPDATE waits SET v=11 WHERE k=1"));
+  ASSERT_OK(waiter.Execute("BEGIN"));
+  auto statement = start(waiter, "UPDATE waits SET v=v+1 WHERE k=1");
+  ASSERT_OK(await_wait(waiter_pid, holder_pid, statement));
+  ASSERT_GT(
+      ASSERT_RESULT(observer.FetchRow<int64_t>(Format(
+          "SELECT count(*) FROM pg_locks WHERE granted AND relation = 'waits'::regclass "
+          "AND (ybdetails->>'transactionid')::uuid = $0",
+          xid(holder_pid)))),
+      0);
+  ASSERT_OK(holder.Execute("COMMIT"));
+  ASSERT_OK(statement.get());
+  ASSERT_OK(waiter.Execute("COMMIT"));
+  ASSERT_EQ(ASSERT_RESULT(value(1)), 12);
+
+  // A rollback releases the waiter without a conflict, even under REPEATABLE READ.
+  ASSERT_OK(holder.Execute("BEGIN"));
+  ASSERT_OK(holder.Execute("UPDATE waits SET v=0 WHERE k=2"));
+  ASSERT_OK(waiter.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
+  ASSERT_OK(waiter.Fetch("SELECT count(*) FROM waits"));
+  statement = start(waiter, "UPDATE waits SET v=v+1 WHERE k=2");
+  ASSERT_OK(await_wait(waiter_pid, holder_pid, statement));
+  ASSERT_OK(holder.Execute("ROLLBACK"));
+  ASSERT_OK(statement.get());
+  ASSERT_OK(waiter.Execute("COMMIT"));
+  ASSERT_EQ(ASSERT_RESULT(value(2)), 21);
+
+  // A commit after a REPEATABLE READ snapshot fails the waiter with a serialization error.
+  ASSERT_OK(holder.Execute("BEGIN"));
+  ASSERT_OK(holder.Execute("UPDATE waits SET v=22 WHERE k=2"));
+  ASSERT_OK(waiter.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
+  ASSERT_OK(waiter.Fetch("SELECT count(*) FROM waits"));
+  statement = start(waiter, "UPDATE waits SET v=v+1 WHERE k=2");
+  ASSERT_OK(await_wait(waiter_pid, holder_pid, statement));
+  ASSERT_OK(holder.Execute("COMMIT"));
+  const auto serialization = statement.get();
+  ASSERT_NOK(serialization);
+  ASSERT_EQ(PgsqlError(serialization), YBPgErrorCode::YB_PG_T_R_SERIALIZATION_FAILURE)
+      << serialization;
+  ASSERT_OK(waiter.Execute("ROLLBACK"));
+
+  // Rolling back the savepoint that took the lock releases the waiter.
+  ASSERT_OK(holder.Execute("BEGIN"));
+  ASSERT_OK(holder.Execute("SAVEPOINT held"));
+  ASSERT_OK(holder.Execute("UPDATE waits SET v=0 WHERE k=3"));
+  ASSERT_OK(waiter.Execute("BEGIN"));
+  statement = start(waiter, "UPDATE waits SET v=v+1 WHERE k=3");
+  ASSERT_OK(await_wait(waiter_pid, holder_pid, statement));
+  ASSERT_OK(holder.Execute("ROLLBACK TO held"));
+  ASSERT_OK(statement.get());
+  ASSERT_OK(waiter.Execute("COMMIT"));
+  ASSERT_OK(holder.Execute("COMMIT"));
+  ASSERT_EQ(ASSERT_RESULT(value(3)), 31);
+
+  // FOR UPDATE waits; NOWAIT still fails at once and SKIP LOCKED still skips.
+  ASSERT_OK(holder.Execute("BEGIN"));
+  ASSERT_OK(holder.Fetch("SELECT v FROM waits WHERE k=1 FOR UPDATE"));
+  ASSERT_NOK(observer.Fetch("SELECT v FROM waits WHERE k=1 FOR UPDATE NOWAIT"));
+  ASSERT_EQ(
+      ASSERT_RESULT(observer.FetchAllAsString(
+          "SELECT k FROM waits ORDER BY k FOR UPDATE SKIP LOCKED")),
+      "2; 3");
+  ASSERT_OK(waiter.Execute("BEGIN"));
+  statement = start(waiter, "SELECT v FROM waits WHERE k=1 FOR UPDATE");
+  ASSERT_OK(await_wait(waiter_pid, holder_pid, statement));
+  ASSERT_OK(holder.Execute("COMMIT"));
+  ASSERT_OK(statement.get());
+  ASSERT_OK(waiter.Execute("COMMIT"));
+
+  // A deadlock aborts the newest transaction in the cycle, whichever request closed it.
+  for (const bool newest_closes : {true, false}) {
+    auto& older = newest_closes ? holder : waiter;
+    auto& newer = newest_closes ? waiter : holder;
+    const auto older_pid = newest_closes ? holder_pid : waiter_pid;
+    const auto newer_pid = newest_closes ? waiter_pid : holder_pid;
+    ASSERT_OK(older.Execute("BEGIN"));
+    ASSERT_OK(older.Execute("UPDATE waits SET v=v+1 WHERE k=1"));
+    ASSERT_OK(newer.Execute("BEGIN"));
+    ASSERT_OK(newer.Execute("UPDATE waits SET v=v+1 WHERE k=2"));
+    auto& first = newest_closes ? older : newer;
+    const auto first_pid = newest_closes ? older_pid : newer_pid;
+    const auto second_pid = newest_closes ? newer_pid : older_pid;
+    auto blocked = start(first, Format("UPDATE waits SET v=v+1 WHERE k=$0", newest_closes ? 2 : 1));
+    ASSERT_OK(await_wait(first_pid, second_pid, blocked));
+    auto& second = newest_closes ? newer : older;
+    const auto closing =
+        second.Execute(Format("UPDATE waits SET v=v+1 WHERE k=$0", newest_closes ? 1 : 2));
+    const auto& failure = newest_closes ? closing : blocked.get();
+    ASSERT_NOK(failure);
+    ASSERT_STR_CONTAINS(failure.ToString(), "deadlock");
+    ASSERT_OK(newest_closes ? blocked.get() : closing);
+    ASSERT_OK(newer.Execute("ROLLBACK"));
+    ASSERT_OK(older.Execute("COMMIT"));
+  }
+  ASSERT_EQ(ASSERT_RESULT(value(1)), 14);
+  ASSERT_EQ(ASSERT_RESULT(value(2)), 24);
+
+  // A waiter fails at its statement deadline, and its session continues.
+  ASSERT_OK(holder.Execute("BEGIN"));
+  ASSERT_OK(holder.Execute("UPDATE waits SET v=v+1 WHERE k=3"));
+  ASSERT_OK(waiter.Execute("SET statement_timeout = 1000"));
+  ASSERT_OK(waiter.Execute("BEGIN"));
+  ASSERT_NOK(waiter.Execute("UPDATE waits SET v=v+1 WHERE k=3"));
+  ASSERT_OK(waiter.Execute("ROLLBACK"));
+  ASSERT_OK(waiter.Execute("RESET statement_timeout"));
+  ASSERT_OK(holder.Execute("COMMIT"));
+  ASSERT_OK(waiter.Execute("UPDATE waits SET v=v+1 WHERE k=3"));
+  ASSERT_EQ(ASSERT_RESULT(value(3)), 33);
+
+  // A blocker whose backend exits is aborted, releasing the waiter.
+  {
+    auto exiting = ASSERT_RESULT(Connect(*server));
+    const auto exiting_pid = ASSERT_RESULT(exiting.FetchRow<int32_t>("SELECT pg_backend_pid()"));
+    ASSERT_OK(exiting.Execute("BEGIN"));
+    ASSERT_OK(exiting.Execute("UPDATE waits SET v=0 WHERE k=3"));
+    ASSERT_OK(waiter.Execute("BEGIN"));
+    statement = start(waiter, "UPDATE waits SET v=v+1 WHERE k=3");
+    ASSERT_OK(await_wait(waiter_pid, exiting_pid, statement));
+  }
+  ASSERT_OK(statement.get());
+  ASSERT_OK(waiter.Execute("COMMIT"));
+  ASSERT_EQ(ASSERT_RESULT(value(3)), 34);
 }
 
 TEST_F(ReadonlyPgServerTest, CatalogSavepointsAndSessionFence) {
