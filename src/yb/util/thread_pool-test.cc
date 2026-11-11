@@ -1017,8 +1017,6 @@ TEST_F(ThreadPoolTest, UnlanedPoolWorkerGetsServiceMask) {
   pool.Shutdown();
 }
 
-// With lane mode off a worker keeps the mask of the thread it was created on, as without lanes,
-// and nothing calls sched_setaffinity.
 // A worker started while lane mode was off, as the tablet server's early pools are, is confined
 // from its next task once the topology is installed.
 TEST_F(ThreadPoolTest, WorkerStartedBeforeInstallIsConfined) {
@@ -1077,6 +1075,8 @@ TEST_F(ThreadPoolTest, WorkerStartedBeforeInstallIsConfined) {
   unlaned_pool.Shutdown();
 }
 
+// With lane mode off a worker keeps the mask of the thread it was created on, as without lanes,
+// and nothing calls sched_setaffinity.
 TEST_F(ThreadPoolTest, LanesOffWorkerKeepsCreatorMask) {
   const auto process_cpuset = ThisThreadMask();
   if (process_cpuset.Count() < 2) {
