@@ -13,11 +13,14 @@
 
 #include "yb/tserver/tserver_lanes.h"
 
+#include "yb/gutil/bind.h"
+
 #include "yb/util/cpu_topology.h"
 #include "yb/util/flag_validators.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
+#include "yb/util/metrics.h"
 
 static_assert(yb::kMaxLanes == 254, "Keep the tserver_lanes validator in sync with kMaxLanes");
 
@@ -48,6 +51,31 @@ DEFINE_validator(tserver_service_lane_cpus,
     FLAG_OK_VALIDATOR(::yb::CpuSet::Parse(_value)));
 TAG_FLAG(tserver_service_lane_cpus, advanced);
 
+METRIC_DEFINE_gauge_uint64(server, lane_crossings_reactor,
+    "Lane Crossings Into Reactors", yb::MetricUnit::kOperations,
+    "Tasks and outbound calls handed to a reactor of one CPU lane by a thread of another lane.",
+    yb::EXPOSE_AS_COUNTER);
+METRIC_DEFINE_gauge_uint64(server, lane_crossings_rpc_handler,
+    "Lane Crossings Into RPC Handlers", yb::MetricUnit::kOperations,
+    "Tasks handed to an RPC handler thread of one CPU lane by a thread of another lane.",
+    yb::EXPOSE_AS_COUNTER);
+METRIC_DEFINE_gauge_uint64(server, lane_crossings_tablet_pipeline,
+    "Lane Crossings Into Tablet Pipelines", yb::MetricUnit::kOperations,
+    "Tasks handed to a tablet pipeline thread of one CPU lane by a thread of another lane.",
+    yb::EXPOSE_AS_COUNTER);
+METRIC_DEFINE_gauge_uint64(server, lane_crossings_callback,
+    "Lane Crossings Into Callbacks", yb::MetricUnit::kOperations,
+    "Callbacks handed to a callback thread of one CPU lane by a thread of another lane.",
+    yb::EXPOSE_AS_COUNTER);
+METRIC_DEFINE_gauge_uint64(server, lane_crossings_other,
+    "Other Lane Crossings", yb::MetricUnit::kOperations,
+    "Tasks handed to any other laned thread by a thread of another CPU lane.",
+    yb::EXPOSE_AS_COUNTER);
+METRIC_DEFINE_gauge_uint64(server, lane_entries_from_unlaned,
+    "Lane Entries From Unlaned Threads", yb::MetricUnit::kOperations,
+    "Tasks handed to a thread of a CPU lane by a thread that belongs to no lane.",
+    yb::EXPOSE_AS_COUNTER);
+
 namespace yb::tserver {
 
 Result<LaneTopology> ComputeTserverLaneTopology(std::string* description) {
@@ -62,8 +90,13 @@ Result<LaneTopology> ComputeTserverLaneTopology(std::string* description) {
     .domain_kind = FLAGS_tserver_lane_domain == "socket" ? CpuDomainKind::kSocket
                                                          : CpuDomainKind::kL3,
   };
-  // Pin the cpuset so discovery, service CPUs and the topology all use the same snapshot.
-  options.cpuset = VERIFY_RESULT(GetProcessCpuSet(options));
+  // Pin the cpuset so discovery, service CPUs and the topology all use the same snapshot. Threads
+  // are only confined while a topology is active, so before that the calling thread's mask is the
+  // process cpuset, and after that the installed topology holds it: a tablet server restarted in
+  // the same process then computes an equal topology even from a confined thread.
+  const auto& installed = GetLaneTopology();
+  options.cpuset = installed.active() ? installed.full_process_cpuset()
+                                      : VERIFY_RESULT(GetProcessCpuSet(options));
   std::string source;
   auto domains = VERIFY_RESULT(DiscoverCpuDomains(options, &source));
 
@@ -110,6 +143,24 @@ void InitTserverLaneTopology() {
   }
   LOG(INFO) << "Lane topology: " << description;
   SetLaneTopology(*topology);
+}
+
+void RegisterTserverLaneMetrics(const scoped_refptr<MetricEntity>& entity) {
+  if (!GetLaneTopology().active()) {
+    return;
+  }
+  for (auto [prototype, category] : {
+           std::pair(&METRIC_lane_crossings_reactor, LaneCrossingCategory::kReactor),
+           std::pair(&METRIC_lane_crossings_rpc_handler, LaneCrossingCategory::kRpcHandler),
+           std::pair(&METRIC_lane_crossings_tablet_pipeline,
+                     LaneCrossingCategory::kTabletPipeline),
+           std::pair(&METRIC_lane_crossings_callback, LaneCrossingCategory::kCallback),
+           std::pair(&METRIC_lane_crossings_other, LaneCrossingCategory::kOther)}) {
+    entity->NeverRetire(prototype->InstantiateFunctionGauge(
+        entity, Bind(&LaneCrossingCount, category)));
+  }
+  entity->NeverRetire(METRIC_lane_entries_from_unlaned.InstantiateFunctionGauge(
+      entity, Bind(&LaneEntriesFromUnlanedCount)));
 }
 
 } // namespace yb::tserver

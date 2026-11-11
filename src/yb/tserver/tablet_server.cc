@@ -666,6 +666,7 @@ Status TabletServer::Init() {
   // (TSTabletManager::Init). Not in the constructor: TSTabletManager is constructed in its
   // initializer list and must not see a topology there.
   InitTserverLaneTopology();
+  RegisterTserverLaneMetrics(metric_entity());
 
 #ifdef __linux__
   if (cgroup_manager_) {

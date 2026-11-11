@@ -34,6 +34,34 @@ std::mutex& TopologyMutex() {
 // nullptr means never set. Points into RetainedTopologies(), so readers never see a freed object.
 std::atomic<const LaneTopology*> current_topology{nullptr};
 
+// Changes whenever current_topology does, so a thread's cached lane is reapplied after a change.
+std::atomic<uint64_t> topology_generation{1};
+
+struct ThreadLaneState {
+  LaneId lane = kNoLane;
+  // topology_generation when lane was applied; 0 if it was not applied by ApplyLane.
+  uint64_t applied_generation = 0;
+};
+
+thread_local ThreadLaneState thread_lane_state;
+
+// Crossings per LaneCrossingCategory, then entries from unlaned threads.
+constexpr size_t kNumCrossingCounters = kLaneCrossingCategoryMapSize + 1;
+constexpr size_t kEntriesFromUnlanedCounter = kLaneCrossingCategoryMapSize;
+
+LaneShardedCounters<kNumCrossingCounters>& CrossingCounters() {
+  static auto* counters = new LaneShardedCounters<kNumCrossingCounters>();
+  return *counters;
+}
+
+// Requires TopologyMutex.
+void PublishTopology(const LaneTopology* topology) {
+  current_topology.store(topology, std::memory_order_release);
+  topology_generation.fetch_add(1, std::memory_order_acq_rel);
+  lanes_internal::lane_mode_active.store(
+      topology && topology->active(), std::memory_order_release);
+}
+
 const LaneTopology& InactiveTopology() {
   static const LaneTopology* topology = new LaneTopology();
   return *topology;
@@ -197,22 +225,133 @@ void SetLaneTopology(const LaneTopology& topology) {
                 << ", ignoring different topology " << topology.ToString();
     return;
   }
-  current_topology.store(RetainTopology(topology), std::memory_order_release);
+  PublishTopology(RetainTopology(topology));
 }
 
 TEST_SetLaneTopology::TEST_SetLaneTopology() {
   std::lock_guard lock(TopologyMutex());
-  previous_ = current_topology.exchange(nullptr, std::memory_order_acq_rel);
+  previous_ = current_topology.load(std::memory_order_acquire);
+  PublishTopology(nullptr);
 }
 
 TEST_SetLaneTopology::TEST_SetLaneTopology(const LaneTopology& topology) {
   std::lock_guard lock(TopologyMutex());
-  previous_ = current_topology.exchange(RetainTopology(topology), std::memory_order_acq_rel);
+  previous_ = current_topology.load(std::memory_order_acquire);
+  PublishTopology(RetainTopology(topology));
 }
 
 TEST_SetLaneTopology::~TEST_SetLaneTopology() {
   std::lock_guard lock(TopologyMutex());
-  current_topology.store(previous_, std::memory_order_release);
+  PublishTopology(previous_);
+}
+
+std::string LaneToString(LaneId lane) {
+  return lane == kNoLane ? "none" : std::to_string(lane);
+}
+
+namespace lanes_internal {
+
+std::atomic<bool> lane_mode_active{false};
+
+void ApplyLane(LaneId lane) {
+  // Generation first: if the topology changes after this load, the cached state below does not
+  // match the new generation and the next call applies again.
+  const auto generation = topology_generation.load(std::memory_order_acquire);
+  const auto& topology = GetLaneTopology();
+  if (!topology.active()) {
+    return;
+  }
+  lane = NormalizeLane(topology, lane);
+  auto& state = thread_lane_state;
+  if (state.applied_generation == generation && state.lane == lane) {
+    return;
+  }
+  state.lane = lane;
+  state.applied_generation = generation;
+  if (!topology.affinity_enabled()) {
+    return;
+  }
+  const auto& mask = lane == kNoLane ? topology.service_mask() : topology.lane_mask(lane);
+  auto status = SetCurrentThreadCpuAffinity(mask);
+  if (!status.ok()) {
+    YB_LOG_EVERY_N_SECS(WARNING, 10)
+        << "Failed to confine thread to lane " << LaneToString(lane) << " CPUs "
+        << mask.ToString() << ", running unpinned: " << status;
+  }
+}
+
+void CountHandoff(LaneId submitter, LaneId executor, LaneId slot, size_t counter) {
+  if (executor == kNoLane) {
+    return;
+  }
+  if (submitter == kNoLane) {
+    CrossingCounters().Increment(slot, kEntriesFromUnlanedCounter);
+  } else if (submitter != executor) {
+    CrossingCounters().Increment(slot, counter);
+  }
+}
+
+} // namespace lanes_internal
+
+LaneId NormalizeLane(const LaneTopology& topology, LaneId lane) {
+  if (lane == kNoLane || !topology.active()) {
+    return kNoLane;
+  }
+  const auto num_lanes = topology.num_lanes();
+  return lane < num_lanes ? lane : static_cast<LaneId>(lane % num_lanes);
+}
+
+LaneId ThisThreadLane() {
+  return thread_lane_state.lane;
+}
+
+void SetThisThreadLane(LaneId lane) {
+  thread_lane_state = ThreadLaneState { .lane = lane, .applied_generation = 0 };
+}
+
+ScopedThreadAffinity::ScopedThreadAffinity(const CpuSet& mask) {
+  if (!LaneModeActive()) {
+    return;
+  }
+  const auto& topology = GetLaneTopology();
+  if (!topology.active() || !topology.affinity_enabled() || mask.empty()) {
+    return;
+  }
+  auto saved = GetCurrentThreadCpuAffinity();
+  if (!saved.ok()) {
+    YB_LOG_EVERY_N_SECS(WARNING, 10)
+        << "Failed to read thread CPU mask, not changing it to " << mask.ToString() << ": "
+        << saved.status();
+    return;
+  }
+  if (*saved == mask) {
+    return;
+  }
+  auto status = SetCurrentThreadCpuAffinity(mask);
+  if (!status.ok()) {
+    YB_LOG_EVERY_N_SECS(WARNING, 10)
+        << "Failed to set thread CPU mask " << mask.ToString() << ": " << status;
+    return;
+  }
+  saved_ = *saved;
+}
+
+ScopedThreadAffinity::~ScopedThreadAffinity() {
+  if (saved_) {
+    auto status = SetCurrentThreadCpuAffinity(*saved_);
+    if (!status.ok()) {
+      YB_LOG_EVERY_N_SECS(WARNING, 10)
+          << "Failed to restore thread CPU mask " << saved_->ToString() << ": " << status;
+    }
+  }
+}
+
+uint64_t LaneCrossingCount(LaneCrossingCategory category) {
+  return CrossingCounters().Sum(static_cast<size_t>(category));
+}
+
+uint64_t LaneEntriesFromUnlanedCount() {
+  return CrossingCounters().Sum(kEntriesFromUnlanedCounter);
 }
 
 } // namespace yb

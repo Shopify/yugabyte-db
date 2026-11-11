@@ -15,7 +15,10 @@
 
 #include <string>
 
+#include "yb/gutil/ref_counted.h"
+
 #include "yb/util/lanes.h"
+#include "yb/util/metrics_fwd.h"
 #include "yb/util/result.h"
 
 namespace yb::tserver {
@@ -23,10 +26,17 @@ namespace yb::tserver {
 // Computes the lane topology from the tserver_lane* flags, sysfs and the process cpuset, without
 // touching the process-global topology. With --tserver_lanes=1 it reads nothing and returns the
 // inactive topology. If description is not null it receives a one-line summary for the log.
+//
+// Once an active topology is installed, the process cpuset is taken from it rather than from
+// the calling thread's mask, which may be confined by then.
 Result<LaneTopology> ComputeTserverLaneTopology(std::string* description = nullptr);
 
 // Computes the topology, installs it with SetLaneTopology and logs it. Never fails: a discovery
 // error is logged as a WARNING and the tserver runs with lanes off.
 void InitTserverLaneTopology();
+
+// Registers the lane crossing metrics (lane_crossings_<category>, lane_entries_from_unlaned) on
+// entity when lane mode is active; does nothing otherwise. The counts are process-wide.
+void RegisterTserverLaneMetrics(const scoped_refptr<MetricEntity>& entity);
 
 } // namespace yb::tserver

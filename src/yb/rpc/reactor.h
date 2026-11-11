@@ -67,6 +67,7 @@
 #include "yb/util/async_util.h"
 #include "yb/util/condition_variable.h"
 #include "yb/util/countdown_latch.h"
+#include "yb/util/lanes.h"
 #include "yb/util/locks.h"
 #include "yb/util/mem_tracker.h"
 #include "yb/util/monotime.h"
@@ -136,6 +137,9 @@ class Reactor {
   const std::string& LogPrefix() { return log_prefix_; }
 
   Messenger& messenger() const { return messenger_; }
+
+  // Lane the reactor thread runs in; kNoLane unless the messenger assigned one in lane mode.
+  LaneId lane() const { return lane_; }
 
   // Returns the latest current time updated by this reactor's thread.
   CoarseTimePoint cur_time() const { return cur_time_.load(std::memory_order_acquire); }
@@ -251,6 +255,9 @@ class Reactor {
   // Can be called on any thread, including the reactor thread.
   Status ScheduleReactorTask(ReactorTaskPtr task, bool even_if_not_running);
 
+  // ScheduleReactorTask without counting a lane handoff, for callers that counted it already.
+  Status DoScheduleReactorTask(ReactorTaskPtr task, bool even_if_not_running);
+
   // Find or create a new connection to the given remote.
   // If such a connection already exists, returns that, otherwise creates a new one.
   // May return a bad Status if the connect() call fails.
@@ -325,6 +332,8 @@ class Reactor {
 
   // Number of outbound connections to create per each destination server address.
   const int num_connections_to_server_;
+
+  const LaneId lane_;
 
   const std::shared_ptr<CompletedCallQueue> completed_call_queue_;
 

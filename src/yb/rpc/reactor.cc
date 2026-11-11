@@ -242,6 +242,14 @@ CoarseTimePoint ExpirationEnforcementTime(CoarseTimePoint expires_at) {
       : expires_at + 1ms * FLAGS_reactor_based_outbound_call_expiration_delay_ms;
 }
 
+LaneId ReactorLane(const MessengerBuilder& bld, int index) {
+  const auto& lanes = bld.reactor_lanes();
+  if (index < 0 || static_cast<size_t>(index) >= lanes.size()) {
+    return kNoLane;
+  }
+  return NormalizeLane(GetLaneTopology(), lanes[index]);
+}
+
 } // anonymous namespace
 
 // ------------------------------------------------------------------------------------------------
@@ -261,6 +269,7 @@ Reactor::Reactor(Messenger* messenger,
           MakeFunctorReactorTask(std::bind(&Reactor::ProcessOutboundQueue, this),
                                  SOURCE_LOCATION())),
       num_connections_to_server_(bld.num_connections_to_server()),
+      lane_(ReactorLane(bld, index)),
       completed_call_queue_(std::make_shared<CompletedCallQueue>()),
       cur_time_(CoarseMonoClock::Now()),
       cgroup_(bld.system_high_cgroup()) {
@@ -737,6 +746,7 @@ void Reactor::RunThread() {
                 LogPrefix() + "Failed to move reactor thread to cgroup");
   }
 #endif
+  ApplyLaneToCurrentThread(lane_);
   ThreadRestrictions::SetWaitAllowed(false);
   ThreadRestrictions::SetIOAllowed(false);
   DVLOG_WITH_PREFIX(6) << "Calling Reactor::RunThread()...";
@@ -963,8 +973,10 @@ void Reactor::QueueOutboundCall(OutboundCallPtr call) {
     call->Transferred(AbortedError(), nullptr /* conn */);
     return;
   }
+  CountLaneHandoffFromThisThread(lane_, LaneCrossingCategory::kReactor);
   if (was_empty) {
-    auto scheduling_status = ScheduleReactorTask(process_outbound_queue_task_);
+    auto scheduling_status = DoScheduleReactorTask(
+        process_outbound_queue_task_, /* even_if_not_running= */ false);
     // We should not call call->Transferred(scheduling_status, ...) here, because the call has
     // already been added to the outbound queue. ShutdownInternal will abort it.
     LOG_IF_WITH_PREFIX(WARNING, !scheduling_status.ok())
@@ -1010,6 +1022,11 @@ void Reactor::RegisterInboundSocket(
 }
 
 Status Reactor::ScheduleReactorTask(ReactorTaskPtr task, bool even_if_not_running) {
+  CountLaneHandoffFromThisThread(lane_, LaneCrossingCategory::kReactor);
+  return DoScheduleReactorTask(std::move(task), even_if_not_running);
+}
+
+Status Reactor::DoScheduleReactorTask(ReactorTaskPtr task, bool even_if_not_running) {
   // task should never be null, so not using an SCHECK here.
   CHECK_NOTNULL(task);
   bool was_empty;

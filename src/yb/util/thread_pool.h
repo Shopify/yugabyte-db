@@ -24,6 +24,7 @@
 #include "yb/util/debug/leakcheck_disabler.h"
 #include "yb/util/dist_trace.h"
 #include "yb/util/enums.h"
+#include "yb/util/lanes.h"
 #include "yb/util/metrics.h"
 #include "yb/util/lockfree.h"
 #include "yb/util/scope_exit.h"
@@ -78,6 +79,8 @@ class ThreadPoolTask {
   void set_cgroup(Cgroup* cgroup) { task_cgroup_ = cgroup; }
   Cgroup* cgroup() const { return task_cgroup_; }
 
+  LaneHandoff& lane_handoff() { return lane_handoff_; }
+
  protected:
   virtual ~ThreadPoolTask() {}
 
@@ -96,6 +99,7 @@ class ThreadPoolTask {
   std::optional<dist_trace::trace::SpanContext> trace_parent_;
   MonoTime submit_time_;
   [[maybe_unused]] Cgroup* task_cgroup_ = nullptr;
+  LaneHandoff lane_handoff_;
 };
 
 template <typename T>
@@ -167,10 +171,19 @@ struct ThreadPoolOptions {
 
   Cgroup* cgroup = nullptr;
 
+  // In lane mode, workers run confined to this lane's CPUs; kNoLane workers run on the service
+  // mask. No effect when lane mode is off.
+  LaneId lane = kNoLane;
+
+  // Counter that cross-lane handoffs into this pool (and its strands and task streams) count to.
+  LaneCrossingCategory crossing_category = LaneCrossingCategory::kOther;
+
   ThreadPoolMetrics metrics = {};
 
   std::string ToString() const {
-    return YB_STRUCT_TO_STRING(name, max_workers, min_workers, idle_timeout, wake_order);
+    return YB_STRUCT_TO_STRING(
+        name, max_workers, min_workers, idle_timeout, wake_order, (lane, LaneToString(lane)),
+        crossing_category);
   }
 
   static constexpr auto kUnlimitedWorkers = std::numeric_limits<decltype(max_workers)>::max();

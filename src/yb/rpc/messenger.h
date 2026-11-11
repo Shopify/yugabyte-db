@@ -53,6 +53,7 @@
 
 #include "yb/util/async_util.h"
 #include "yb/util/atomic.h"
+#include "yb/util/lanes.h"
 #include "yb/util/locks.h"
 #include "yb/util/metrics_fwd.h"
 #include "yb/util/monotime.h"
@@ -93,6 +94,15 @@ class MessengerBuilder {
 
   // Set the number of reactor threads that will be used for sending and receiving.
   MessengerBuilder &set_num_reactors(int num_reactors);
+
+  // Lane of each reactor, by reactor index; empty (default) leaves every reactor unlaned. When
+  // not empty its size must equal the number of reactors. Lanes are reduced modulo the lane
+  // count of the process topology, and ignored while lane mode is off.
+  MessengerBuilder &set_reactor_lanes(std::vector<LaneId> lanes);
+
+  const std::vector<LaneId>& reactor_lanes() const {
+    return reactor_lanes_;
+  }
 
   // Set the granularity with which connections are checked for keepalive.
   MessengerBuilder &set_coarse_timer_granularity(CoarseMonoClock::Duration granularity);
@@ -197,6 +207,7 @@ class MessengerBuilder {
   const std::string name_;
   CoarseMonoClock::Duration connection_keepalive_time_;
   int num_reactors_ = 4;
+  std::vector<LaneId> reactor_lanes_;
   CoarseMonoClock::Duration coarse_timer_granularity_ = std::chrono::milliseconds(100);
   scoped_refptr<MetricEntity> metric_entity_;
   ConnectionContextFactoryPtr connection_context_factory_;
@@ -339,6 +350,10 @@ class Messenger : public ProxyContext {
 
   size_t num_reactors() const {
     return reactors_.size();
+  }
+
+  Reactor* TEST_reactor(size_t index) const {
+    return reactors_[index].get();
   }
 
   // Use specified IP address as base address for outbound connections from messenger.

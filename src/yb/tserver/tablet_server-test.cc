@@ -76,6 +76,8 @@
 #include "yb/util/crc.h"
 #include "yb/util/curl_util.h"
 #include "yb/util/format.h"
+#include "yb/util/lanes.h"
+#include "yb/util/lanes_test_util.h"
 #include "yb/util/metrics.h"
 #include "yb/util/monotime.h"
 #include "yb/util/prometheus_metric_filter.h"
@@ -187,6 +189,28 @@ TEST_F(TabletServerTest, TestPingServer) {
   server::PingResponsePB resp;
   RpcController controller;
   ASSERT_OK(generic_proxy_->Ping(req, &resp, &controller));
+}
+
+// With default flags (lanes off) a started tablet server serving a write never touches a thread
+// mask or a lane counter, and registers no lane metrics.
+TEST_F(TabletServerTest, NoLaneActivityWithLanesOff) {
+  WriteRequestPB req;
+  req.set_tablet_id(kTabletId);
+  AddTestRowInsert(1, 2, "lanes off", &req);
+  WriteResponsePB resp;
+  RpcController controller;
+  ASSERT_OK(proxy_->Write(req, &resp, &controller));
+  ASSERT_FALSE(resp.has_error()) << resp.ShortDebugString();
+
+  ASSERT_FALSE(LaneModeActive());
+  ASSERT_EQ(TEST_CpuAffinityCallCount(), 0);
+  auto counts = LaneHandoffCounts::Now();
+  ASSERT_EQ(counts.total_crossings(), 0) << counts.ToString();
+  ASSERT_EQ(counts.entries_from_unlaned, 0);
+  for (const auto& [prototype, metric] :
+       mini_server_->server()->metric_entity()->TEST_UsageMetricsMap()) {
+    ASSERT_FALSE(std::string_view(prototype->name()).starts_with("lane_")) << prototype->name();
+  }
 }
 
 // The active-table list applies only to YSQL tables, so this test uses one.

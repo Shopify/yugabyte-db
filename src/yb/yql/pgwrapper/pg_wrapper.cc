@@ -50,6 +50,7 @@
 #include "yb/util/flags.h"
 #include "yb/util/flags/flags_callback.h"
 #include "yb/util/flag_validators.h"
+#include "yb/util/lanes.h"
 #include "yb/util/logging.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/path_util.h"
@@ -1186,7 +1187,13 @@ Status PgWrapper::Start() {
     proc_->SetEnv("YB_PG_CGROUP_MANAGEMENT", "1");
   }
 #endif
-  RETURN_NOT_OK(proc_->Start());
+  {
+    // The postmaster and its backends must float over every CPU even when this thread is
+    // confined to the service CPUs. posix_spawn, which Subprocess::Start uses on Linux, has no
+    // affinity attribute or pre-exec hook, and the child inherits the spawning thread's mask.
+    ScopedThreadAffinity full_cpuset(GetLaneTopology().full_process_cpuset());
+    RETURN_NOT_OK(proc_->Start());
+  }
   LOG(INFO) << "PostgreSQL server running as pid " << proc_->pid();
   return Status::OK();
 }

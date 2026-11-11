@@ -118,4 +118,15 @@ Result<CpuSet> GetProcessCpuSet(const CpuTopologyOptions& options);
 Result<std::vector<CpuSet>> DiscoverCpuDomains(
     const CpuTopologyOptions& options, std::string* source = nullptr);
 
+// The calling thread's CPU affinity mask (sched_getaffinity).
+Result<CpuSet> GetCurrentThreadCpuAffinity();
+
+// Sets the calling thread's CPU affinity mask (sched_setaffinity). An empty mask is rejected
+// without a system call. Every affinity change made for CPU lanes goes through this function, so
+// TEST_CpuAffinityCallCount shows whether any was attempted.
+Status SetCurrentThreadCpuAffinity(const CpuSet& mask);
+
+// Number of sched_setaffinity calls made by SetCurrentThreadCpuAffinity in this process.
+uint64_t TEST_CpuAffinityCallCount();
+
 } // namespace yb

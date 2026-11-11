@@ -12,6 +12,7 @@
 //
 
 #include <algorithm>
+#include <map>
 
 #include <gtest/gtest.h>
 
@@ -22,7 +23,9 @@
 #include "yb/util/cpu_topology_test_util.h"
 #include "yb/util/env.h"
 #include "yb/util/flags.h"
+#include "yb/util/lanes_test_util.h"
 #include "yb/util/logging_test_util.h"
+#include "yb/util/metrics.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 
@@ -184,6 +187,98 @@ TEST_F(TserverLanesTest, DiscoveryErrorRunsInactive) {
   InitTserverLaneTopology();
   ASSERT_EQ(GetLaneTopology(), LaneTopology());
   ASSERT_EQ(CountContaining(sink, "CPU topology discovery failed, running with lanes off"), 1);
+}
+
+// A tablet server restarted in the same process runs Init again, possibly on a thread already
+// confined to the service CPUs. It must compute the installed topology again, not one built from
+// that thread's mask. The cpuset comes from the real thread mask here (no TEST cpuset).
+TEST_F(TserverLanesTest, RepeatInitFromConfinedThreadIsNoOp) {
+  const auto process_cpuset = ThisThreadMask();
+  const auto cpus = process_cpuset.ToVector();
+  if (cpus.size() < 2) {
+    GTEST_SKIP() << "Needs at least 2 CPUs";
+  }
+  // Two sockets over the real CPUs, no cache info.
+  std::vector<FakeCpu> fake_cpus;
+  for (size_t i = 0; i != cpus.size(); ++i) {
+    fake_cpus.push_back(FakeCpu { .cpu = cpus[i], .package = i < cpus.size() / 2 ? 0 : 1 });
+  }
+  auto root = GetTestPath("sys_cpu");
+  ASSERT_OK(WriteFakeSysfsCpuTree(root, fake_cpus));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_cpu_topology_sysfs_root) = root;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_lanes) = 2;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_service_lane_cpus) = std::to_string(cpus.back());
+
+  TEST_SetLaneTopology scope;
+  InitTserverLaneTopology();
+  const auto* installed = &GetLaneTopology();
+  ASSERT_TRUE(installed->active());
+  ASSERT_EQ(installed->full_process_cpuset(), process_cpuset);
+  ASSERT_NE(installed->service_mask(), process_cpuset);
+
+  StringVectorSink sink;
+  ScopedRegisterSink registration(&sink);
+  RunOnStdThread([installed] {
+    ApplyServiceMaskToCurrentThread();
+    ASSERT_EQ(ThisThreadMask(), installed->service_mask());
+    auto recomputed = ASSERT_RESULT(ComputeTserverLaneTopology());
+    ASSERT_EQ(recomputed.ToString(), installed->ToString());
+    ASSERT_EQ(recomputed, *installed);
+    InitTserverLaneTopology();
+  });
+  ASSERT_EQ(&GetLaneTopology(), installed);
+  ASSERT_EQ(CountContaining(sink, "already set"), 0);
+}
+
+TEST_F(TserverLanesTest, LaneMetricsRegisteredOnlyWhenActive) {
+  MetricRegistry registry;
+  auto entity = METRIC_ENTITY_server.Instantiate(&registry, "lanes-test");
+  auto lane_metrics = [&entity] {
+    std::map<std::string, uint64_t> result;
+    for (const auto& [prototype, metric] : entity->TEST_UsageMetricsMap()) {
+      std::string name = prototype->name();
+      if (name.starts_with("lane_")) {
+        EXPECT_EQ(prototype->type(), MetricType::kCounter) << name;
+        result[name] = down_cast<FunctionGauge<uint64_t>*>(metric.get())->value();
+      }
+    }
+    return result;
+  };
+
+  {
+    TEST_SetLaneTopology scope{LaneTopology()};
+    RegisterTserverLaneMetrics(entity);
+    ASSERT_TRUE(lane_metrics().empty());
+  }
+
+  // The fake topology's CPUs need not exist here, so keep masks off; lanes are still assigned.
+  ASSERT_NO_FATALS(UseTwoDomainTree());
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_lanes) = 0;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_lane_cpu_affinity) = false;
+  TEST_SetLaneTopology scope;
+  InitTserverLaneTopology();
+  ASSERT_TRUE(GetLaneTopology().active());
+  RegisterTserverLaneMetrics(entity);
+  RegisterTserverLaneMetrics(entity);
+  auto before = lane_metrics();
+  std::vector<std::string> names;
+  for (const auto& [name, value] : before) {
+    names.push_back(name);
+  }
+  ASSERT_EQ(names, (std::vector<std::string>{
+      "lane_crossings_callback", "lane_crossings_other", "lane_crossings_reactor",
+      "lane_crossings_rpc_handler", "lane_crossings_tablet_pipeline",
+      "lane_entries_from_unlaned"}));
+
+  RunOnStdThread([] {
+    ApplyLaneToCurrentThread(0);
+    CountLaneHandoffToThisThread(1, LaneCrossingCategory::kRpcHandler);
+    CountLaneHandoffToThisThread(kNoLane, LaneCrossingCategory::kRpcHandler);
+  });
+  auto after = lane_metrics();
+  ASSERT_EQ(after["lane_crossings_rpc_handler"], before["lane_crossings_rpc_handler"] + 1);
+  ASSERT_EQ(after["lane_entries_from_unlaned"], before["lane_entries_from_unlaned"] + 1);
+  ASSERT_EQ(after["lane_crossings_other"], before["lane_crossings_other"]);
 }
 
 } // namespace yb::tserver

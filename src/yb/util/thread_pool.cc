@@ -246,6 +246,12 @@ class Worker : public boost::intrusive::list_base_hook<> {
         MoveToPoolCgroup();
       }
 #endif
+      // Workers are created lazily on whichever thread submits, so a worker applies the pool's
+      // lane itself rather than keep its creator's mask. Checked per task, which costs no system
+      // call unless the topology changed, so that workers started before the topology was
+      // installed are confined too.
+      ApplyLaneToCurrentThread(share_.options.lane);
+      task->lane_handoff().RecordExecution(share_.options.crossing_category);
       auto start = MonoTime::NowIf(has_run_metrics);
       dist_trace::ScopedAdoptSpan parent_scope(task->trace_parent());
       if (!task->run_token()) {
@@ -797,6 +803,7 @@ YBThreadPool::~YBThreadPool() {
 
 bool YBThreadPool::Enqueue(ThreadPoolTask* task) {
   task->set_trace_parent(dist_trace::GetActiveSpanContext());
+  task->lane_handoff().RecordSubmitter();
   return impl_->Enqueue(task);
 }
 

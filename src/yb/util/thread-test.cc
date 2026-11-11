@@ -39,6 +39,8 @@
 #include "yb/gutil/bind.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/util/env.h"
+#include "yb/util/lanes.h"
+#include "yb/util/lanes_test_util.h"
 #include "yb/util/status_log.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
@@ -182,5 +184,61 @@ TEST_F(ThreadTest, TestThreadRestrictions_Waiting) {
     "Waiting is not allowed to be used on this thread");
 }
 #endif // NDEBUG
+
+namespace {
+
+struct StartState {
+  CpuSet mask;
+  LaneId lane = kNoLane;
+};
+
+// Starts a yb::Thread from a std::thread set up by confine_creator and returns the mask and lane
+// the new thread started with.
+StartState StartThreadFrom(const std::function<void()>& confine_creator) {
+  StartState result;
+  RunOnStdThread([&confine_creator, &result] {
+    confine_creator();
+    auto thread = CHECK_RESULT(Thread::Make("test", "lane-start", [&result] {
+      result = StartState { .mask = ThisThreadMask(), .lane = ThisThreadLane() };
+    }));
+    thread->Join();
+  });
+  return result;
+}
+
+} // namespace
+
+TEST_F(ThreadTest, StartsOnServiceMaskInLaneMode) {
+  auto topology = MakeTwoLaneTestTopology(/* affinity_enabled= */ true, /* service_cpu= */ true);
+  if (!topology) {
+    topology = MakeTwoLaneTestTopology();
+  }
+  if (!topology) {
+    GTEST_SKIP() << "Needs at least 2 CPUs";
+  }
+  TEST_SetLaneTopology scope(*topology);
+  auto state = StartThreadFrom([] { ApplyLaneToCurrentThread(1); });
+  ASSERT_NE(state.mask, topology->lane_mask(1));
+  ASSERT_EQ(state.mask, topology->service_mask());
+  ASSERT_EQ(state.lane, kNoLane);
+}
+
+TEST_F(ThreadTest, KeepsCreatorMaskWithLanesOff) {
+  const auto process_cpuset = ThisThreadMask();
+  if (process_cpuset.Count() < 2) {
+    GTEST_SKIP() << "Needs at least 2 CPUs";
+  }
+  CpuSet creator_mask;
+  creator_mask.Set(*process_cpuset.Lowest());
+  TEST_SetLaneTopology scope{LaneTopology()};
+  const auto calls = TEST_CpuAffinityCallCount();
+  auto state = StartThreadFrom([&creator_mask] {
+    CHECK_OK(SetCurrentThreadCpuAffinity(creator_mask));
+  });
+  ASSERT_EQ(state.mask, creator_mask);
+  ASSERT_EQ(state.lane, kNoLane);
+  // Only the test's own call above.
+  ASSERT_EQ(TEST_CpuAffinityCallCount(), calls + 1);
+}
 
 } // namespace yb

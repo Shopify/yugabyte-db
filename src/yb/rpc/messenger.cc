@@ -145,6 +145,11 @@ MessengerBuilder& MessengerBuilder::set_num_reactors(int num_reactors) {
   return *this;
 }
 
+MessengerBuilder& MessengerBuilder::set_reactor_lanes(std::vector<LaneId> lanes) {
+  reactor_lanes_ = std::move(lanes);
+  return *this;
+}
+
 MessengerBuilder& MessengerBuilder::set_coarse_timer_granularity(
     CoarseMonoClock::Duration granularity) {
   coarse_timer_granularity_ = granularity;
@@ -659,6 +664,11 @@ Reactor* Messenger::RemoteToReactor(const Endpoint& remote, uint32_t idx) {
 
 Status Messenger::Init(const MessengerBuilder &bld) {
   default_normal_thread_pool_ = VERIFY_RESULT(normal_thread_pools_->Pool(/*tag=*/0));
+  if (!bld.reactor_lanes_.empty() && std::ssize(bld.reactor_lanes_) != bld.num_reactors_) {
+    return STATUS_FORMAT(
+        InvalidArgument, "$0 reactor lanes given for $1 reactors", bld.reactor_lanes_.size(),
+        bld.num_reactors_);
+  }
 
   reactors_.reserve(bld.num_reactors_);
   ReactorMonitor* reactor_monitor = nullptr;

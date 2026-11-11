@@ -14,6 +14,7 @@
 #include "yb/util/cpu_topology.h"
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 
 #include "yb/gutil/sysinfo.h"
@@ -398,7 +399,22 @@ Result<CpuSet> GetProcessCpuSet(const CpuTopologyOptions& options) {
     return CpuSet::Parse(FLAGS_TEST_cpu_topology_cpuset);
   }
 #ifdef __linux__
-  // The calling thread's mask; topology is computed during startup, before any thread is pinned.
+  // The calling thread's mask. Once threads are confined to lanes this is no longer the process
+  // cpuset; callers that may run on a confined thread pass options.cpuset instead.
+  return GetCurrentThreadCpuAffinity();
+#else
+  return CpuSet::FirstN(static_cast<size_t>(std::max(base::NumCPUs(), 1)));
+#endif
+}
+
+namespace {
+
+std::atomic<uint64_t> cpu_affinity_call_count{0};
+
+} // namespace
+
+Result<CpuSet> GetCurrentThreadCpuAffinity() {
+#ifdef __linux__
   cpu_set_t set;
   CPU_ZERO(&set);
   if (sched_getaffinity(0, sizeof(set), &set) != 0) {
@@ -406,8 +422,30 @@ Result<CpuSet> GetProcessCpuSet(const CpuTopologyOptions& options) {
   }
   return CpuSet::FromCpuSetT(set);
 #else
-  return CpuSet::FirstN(static_cast<size_t>(std::max(base::NumCPUs(), 1)));
+  return STATUS(NotSupported, "Thread CPU affinity is only supported on Linux");
 #endif
+}
+
+Status SetCurrentThreadCpuAffinity(const CpuSet& mask) {
+  if (mask.empty()) {
+    return STATUS(InvalidArgument, "Empty CPU affinity mask");
+  }
+#ifdef __linux__
+  cpu_affinity_call_count.fetch_add(1, std::memory_order_relaxed);
+  cpu_set_t set;
+  mask.ToCpuSetT(&set);
+  if (sched_setaffinity(0, sizeof(set), &set) != 0) {
+    const int err = errno;
+    return STATUS_FROM_ERRNO(Format("sched_setaffinity($0)", mask.ToString()), err);
+  }
+  return Status::OK();
+#else
+  return STATUS(NotSupported, "Thread CPU affinity is only supported on Linux");
+#endif
+}
+
+uint64_t TEST_CpuAffinityCallCount() {
+  return cpu_affinity_call_count.load(std::memory_order_relaxed);
 }
 
 Result<std::vector<CpuSet>> DiscoverCpuDomains(

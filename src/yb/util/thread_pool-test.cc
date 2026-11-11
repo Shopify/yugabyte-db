@@ -27,6 +27,9 @@
 #include "yb/util/dist_trace.h"
 #include "yb/util/dist_trace_test_util.h"
 #include "yb/util/flags.h"
+#include "yb/util/lanes.h"
+#include "yb/util/lanes_test_util.h"
+#include "yb/util/logging_test_util.h"
 #include "yb/util/random_util.h"
 #include "yb/util/test_thread_holder.h"
 #include "yb/util/test_util.h"
@@ -944,6 +947,240 @@ TEST_F(ThreadPoolTest, ReclaimSpeedLargePool) {
 // FIFO rotates through every parked worker, so none idles out. Logged for comparison only.
 TEST_F(ThreadPoolTest, IdleReclaimFifo) {
   idle_reclaim::LiveWorkersAfterTrickle(WorkerWakeOrder::kFifo);
+}
+
+namespace lanes {
+
+struct WorkerView {
+  CpuSet mask;
+  LaneId lane = kNoLane;
+};
+
+// Submits one task to recipient from a new thread set up by confine_submitter and waits for it.
+// On a fresh pool the worker running it is created on that thread. Returns what the task saw.
+template <class Recipient>
+WorkerView RunTaskFrom(Recipient& recipient, const std::function<void()>& confine_submitter) {
+  WorkerView result;
+  RunOnStdThread([&recipient, &confine_submitter, &result] {
+    confine_submitter();
+    CountDownLatch latch(1);
+    CHECK(recipient.EnqueueFunctor([&result, &latch] {
+      result = WorkerView { .mask = ThisThreadMask(), .lane = ThisThreadLane() };
+      latch.CountDown();
+    }));
+    latch.Wait();
+  });
+  return result;
+}
+
+void ConfineToLane(LaneId lane) {
+  ApplyLaneToCurrentThread(lane);
+}
+
+auto InLane(LaneId lane) {
+  return [lane] { ConfineToLane(lane); };
+}
+
+auto Unlaned() {
+  return [] { ApplyServiceMaskToCurrentThread(); };
+}
+
+} // namespace lanes
+
+TEST_F(ThreadPoolTest, LanePoolWorkerAppliesLaneMask) {
+  auto topology = MakeTwoLaneTestTopology();
+  if (!topology) {
+    GTEST_SKIP() << "Needs at least 2 CPUs";
+  }
+  TEST_SetLaneTopology scope(*topology);
+  ThreadPool pool(ThreadPoolOptions { .name = "lane0", .max_workers = 1, .lane = 0 });
+  ASSERT_STR_CONTAINS(pool.options().ToString(), "lane: 0 crossing_category: kOther");
+  // The worker is created on a thread confined to lane 1, and must not keep that mask.
+  auto view = lanes::RunTaskFrom(pool, lanes::InLane(1));
+  ASSERT_EQ(view.mask, topology->lane_mask(0));
+  ASSERT_EQ(view.lane, 0);
+  pool.Shutdown();
+}
+
+TEST_F(ThreadPoolTest, UnlanedPoolWorkerGetsServiceMask) {
+  auto topology = MakeTwoLaneTestTopology();
+  if (!topology) {
+    GTEST_SKIP() << "Needs at least 2 CPUs";
+  }
+  TEST_SetLaneTopology scope(*topology);
+  ThreadPool pool(ThreadPoolOptions { .name = "unlaned", .max_workers = 1 });
+  ASSERT_STR_CONTAINS(pool.options().ToString(), "lane: none");
+  auto view = lanes::RunTaskFrom(pool, lanes::InLane(1));
+  ASSERT_NE(view.mask, topology->lane_mask(1));
+  ASSERT_EQ(view.mask, topology->service_mask());
+  ASSERT_EQ(view.lane, kNoLane);
+  pool.Shutdown();
+}
+
+// With lane mode off a worker keeps the mask of the thread it was created on, as without lanes,
+// and nothing calls sched_setaffinity.
+TEST_F(ThreadPoolTest, LanesOffWorkerKeepsCreatorMask) {
+  const auto process_cpuset = ThisThreadMask();
+  if (process_cpuset.Count() < 2) {
+    GTEST_SKIP() << "Needs at least 2 CPUs";
+  }
+  CpuSet creator_mask;
+  creator_mask.Set(*process_cpuset.Lowest());
+  TEST_SetLaneTopology scope{LaneTopology()};
+  ThreadPool pool(ThreadPoolOptions { .name = "lane0", .max_workers = 1, .lane = 0 });
+  const auto calls = TEST_CpuAffinityCallCount();
+  auto view = lanes::RunTaskFrom(pool, [&creator_mask] {
+    ASSERT_OK(SetCurrentThreadCpuAffinity(creator_mask));
+  });
+  ASSERT_EQ(view.mask, creator_mask);
+  ASSERT_EQ(view.lane, kNoLane);
+  // Only the test's own call above.
+  ASSERT_EQ(TEST_CpuAffinityCallCount(), calls + 1);
+  pool.Shutdown();
+}
+
+// A pool's cgroup and lane options are applied independently. The sandbox has no cgroup
+// management, so the cgroup move fails (as on any host without it) and is logged; the lane is
+// applied regardless.
+TEST_F(ThreadPoolTest, LaneAndCgroupOptionsTogether) {
+  auto topology = MakeTwoLaneTestTopology();
+  if (!topology) {
+    GTEST_SKIP() << "Needs at least 2 CPUs";
+  }
+  TEST_SetLaneTopology scope(*topology);
+  Cgroup root(nullptr, "");
+  Cgroup unmanaged(&root, "lanes-test-unmanaged-cgroup");
+  StringVectorSink sink;
+  ScopedRegisterSink registration(&sink);
+  ThreadPool pool(ThreadPoolOptions {
+    .name = "lane1", .max_workers = 1, .cgroup = &unmanaged, .lane = 1 });
+  auto view = lanes::RunTaskFrom(pool, lanes::InLane(0));
+  ASSERT_EQ(view.mask, topology->lane_mask(1));
+  ASSERT_EQ(view.lane, 1);
+  pool.Shutdown();
+  auto cgroup_attempts = std::count_if(
+      sink.logged_msgs().begin(), sink.logged_msgs().end(), [](const std::string& msg) {
+        return msg.find("Failed to move thread to cgroup") != std::string::npos;
+      });
+  ASSERT_GE(cgroup_attempts, 1);
+}
+
+TEST_F(ThreadPoolTest, PoolCountsLaneHandoffs) {
+  auto topology = MakeTwoLaneTestTopology();
+  if (!topology) {
+    GTEST_SKIP() << "Needs at least 2 CPUs";
+  }
+  TEST_SetLaneTopology scope(*topology);
+  ThreadPool pool(ThreadPoolOptions {
+    .name = "lane0", .max_workers = 2, .lane = 0,
+    .crossing_category = LaneCrossingCategory::kRpcHandler });
+  ThreadSubPool sub_pool(&pool);
+
+  auto counts = LaneHandoffCounts::Now();
+  lanes::RunTaskFrom(pool, lanes::InLane(0));
+  auto delta = LaneHandoffCounts::Now() - counts;
+  ASSERT_EQ(delta.total_crossings(), 0) << delta.ToString();
+  ASSERT_EQ(delta.entries_from_unlaned, 0);
+
+  lanes::RunTaskFrom(pool, lanes::InLane(1));
+  delta = LaneHandoffCounts::Now() - counts;
+  ASSERT_EQ(delta.crossing(LaneCrossingCategory::kRpcHandler), 1) << delta.ToString();
+  ASSERT_EQ(delta.total_crossings(), 1);
+  ASSERT_EQ(delta.entries_from_unlaned, 0);
+
+  lanes::RunTaskFrom(pool, lanes::Unlaned());
+  delta = LaneHandoffCounts::Now() - counts;
+  ASSERT_EQ(delta.total_crossings(), 1) << delta.ToString();
+  ASSERT_EQ(delta.entries_from_unlaned, 1);
+
+  // A concurrent sub-pool task is a plain pool task, counted once.
+  lanes::RunTaskFrom(sub_pool, lanes::InLane(1));
+  delta = LaneHandoffCounts::Now() - counts;
+  ASSERT_EQ(delta.crossing(LaneCrossingCategory::kRpcHandler), 2) << delta.ToString();
+  ASSERT_EQ(delta.total_crossings(), 2);
+  ASSERT_EQ(delta.entries_from_unlaned, 1);
+
+  sub_pool.Shutdown();
+  pool.Shutdown();
+}
+
+TEST_F(ThreadPoolTest, PoolCountsNothingWithLanesOff) {
+  TEST_SetLaneTopology scope{LaneTopology()};
+  ThreadPool pool(ThreadPoolOptions { .name = "lane0", .max_workers = 1, .lane = 0 });
+  Strand strand(&pool);
+  const auto calls = TEST_CpuAffinityCallCount();
+  auto counts = LaneHandoffCounts::Now();
+  // Even a submitter carrying a lane counts nothing while lane mode is off.
+  auto view = lanes::RunTaskFrom(pool, [] { SetThisThreadLane(1); });
+  ASSERT_EQ(view.lane, kNoLane);
+  lanes::RunTaskFrom(strand, [] { SetThisThreadLane(1); });
+  auto delta = LaneHandoffCounts::Now() - counts;
+  ASSERT_EQ(delta.total_crossings(), 0) << delta.ToString();
+  ASSERT_EQ(delta.entries_from_unlaned, 0);
+  ASSERT_EQ(TEST_CpuAffinityCallCount(), calls);
+  strand.Shutdown();
+  pool.Shutdown();
+}
+
+// Each strand item counts its own handoff, once, including items queued while the strand is
+// already draining; the strand's wrapper task is not counted.
+TEST_F(ThreadPoolTest, StrandCountsLaneHandoffs) {
+  auto topology = MakeTwoLaneTestTopology();
+  if (!topology) {
+    GTEST_SKIP() << "Needs at least 2 CPUs";
+  }
+  TEST_SetLaneTopology scope(*topology);
+  ThreadPool pool(ThreadPoolOptions {
+    .name = "lane0", .max_workers = 2, .lane = 0,
+    .crossing_category = LaneCrossingCategory::kTabletPipeline });
+  Strand strand(&pool);
+
+  auto counts = LaneHandoffCounts::Now();
+  lanes::RunTaskFrom(strand, lanes::InLane(0));
+  auto delta = LaneHandoffCounts::Now() - counts;
+  ASSERT_EQ(delta.total_crossings(), 0) << delta.ToString();
+  ASSERT_EQ(delta.entries_from_unlaned, 0);
+
+  auto view = lanes::RunTaskFrom(strand, lanes::InLane(1));
+  ASSERT_EQ(view.lane, 0);
+  ASSERT_EQ(view.mask, topology->lane_mask(0));
+  delta = LaneHandoffCounts::Now() - counts;
+  ASSERT_EQ(delta.crossing(LaneCrossingCategory::kTabletPipeline), 1) << delta.ToString();
+  ASSERT_EQ(delta.total_crossings(), 1);
+  ASSERT_EQ(delta.entries_from_unlaned, 0);
+
+  lanes::RunTaskFrom(strand, lanes::Unlaned());
+  delta = LaneHandoffCounts::Now() - counts;
+  ASSERT_EQ(delta.total_crossings(), 1) << delta.ToString();
+  ASSERT_EQ(delta.entries_from_unlaned, 1);
+
+  // Hold the strand busy, then queue items from both lanes behind the running one.
+  counts = LaneHandoffCounts::Now();
+  CountDownLatch started(1), release(1), done(4);
+  RunOnStdThread([&] {
+    lanes::ConfineToLane(1);
+    ASSERT_TRUE(strand.EnqueueFunctor([&] {
+      started.CountDown();
+      release.Wait();
+      done.CountDown();
+    }));
+    started.Wait();
+    ASSERT_TRUE(strand.EnqueueFunctor([&done] { done.CountDown(); }));
+    ASSERT_TRUE(strand.EnqueueFunctor([&done] { done.CountDown(); }));
+  });
+  RunOnStdThread([&] {
+    lanes::ConfineToLane(0);
+    ASSERT_TRUE(strand.EnqueueFunctor([&done] { done.CountDown(); }));
+  });
+  release.CountDown();
+  done.Wait();
+  delta = LaneHandoffCounts::Now() - counts;
+  ASSERT_EQ(delta.crossing(LaneCrossingCategory::kTabletPipeline), 3) << delta.ToString();
+  ASSERT_EQ(delta.total_crossings(), 3);
+  ASSERT_EQ(delta.entries_from_unlaned, 0);
+
+  strand.Shutdown();
+  pool.Shutdown();
 }
 
 } // namespace yb::rpc

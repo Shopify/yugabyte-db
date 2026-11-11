@@ -20,6 +20,7 @@
 
 #include "yb/util/format.h"
 #include "yb/util/lanes.h"
+#include "yb/util/lanes_test_util.h"
 #include "yb/util/logging_test_util.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
@@ -278,6 +279,225 @@ TEST_F(LanesTest, ScopedOverrideRestoresPrevious) {
     ASSERT_EQ(GetLaneTopology(), inner_topology);
   }
   ASSERT_EQ(GetLaneTopology(), outer_topology);
+}
+
+TEST_F(LanesTest, NormalizeLane) {
+  const LaneTopology inactive;
+  ASSERT_EQ(NormalizeLane(inactive, 0), kNoLane);
+  ASSERT_EQ(NormalizeLane(inactive, kNoLane), kNoLane);
+  auto topology = LaneTopology::Build({
+      .domains = PairDomains(3), .process_cpuset = Cpus("0-5"), .requested_lanes = 3});
+  ASSERT_EQ(NormalizeLane(topology, 2), 2);
+  ASSERT_EQ(NormalizeLane(topology, 7), 1);
+  ASSERT_EQ(NormalizeLane(topology, kMaxLanes - 1), (kMaxLanes - 1) % 3);
+  ASSERT_EQ(NormalizeLane(topology, kNoLane), kNoLane);
+  ASSERT_EQ(LaneToString(kNoLane), "none");
+  ASSERT_EQ(LaneToString(7), "7");
+}
+
+TEST_F(LanesTest, ApplyLaneSetsMaskAndLane) {
+  auto topology = MakeTwoLaneTestTopology();
+  if (!topology) {
+    GTEST_SKIP() << "Needs at least 2 CPUs";
+  }
+  TEST_SetLaneTopology scope(*topology);
+  ASSERT_TRUE(LaneModeActive());
+  RunOnStdThread([&topology] {
+    ASSERT_EQ(ThisThreadLane(), kNoLane);
+    auto calls = TEST_CpuAffinityCallCount();
+    ApplyLaneToCurrentThread(0);
+    ASSERT_EQ(ThisThreadLane(), 0);
+    ASSERT_EQ(ThisThreadMask(), topology->lane_mask(0));
+    ASSERT_EQ(TEST_CpuAffinityCallCount(), calls + 1);
+
+    // The current lane again: no system call.
+    ApplyLaneToCurrentThread(0);
+    ASSERT_EQ(TEST_CpuAffinityCallCount(), calls + 1);
+
+    ApplyLaneToCurrentThread(1);
+    ASSERT_EQ(ThisThreadLane(), 1);
+    ASSERT_EQ(ThisThreadMask(), topology->lane_mask(1));
+
+    ApplyServiceMaskToCurrentThread();
+    ASSERT_EQ(ThisThreadLane(), kNoLane);
+    ASSERT_EQ(ThisThreadMask(), topology->service_mask());
+
+    // Out of range lanes are reduced modulo the lane count.
+    ApplyLaneToCurrentThread(5);
+    ASSERT_EQ(ThisThreadLane(), 1);
+    ASSERT_EQ(ThisThreadMask(), topology->lane_mask(1));
+    ASSERT_EQ(TEST_CpuAffinityCallCount(), calls + 4);
+  });
+}
+
+// With lane mode off nothing changes a mask, a lane or a counter, and the inactive topology's
+// empty process cpuset is never passed to the kernel.
+TEST_F(LanesTest, LanesOffChangesNothing) {
+  TEST_SetLaneTopology scope{LaneTopology()};
+  ASSERT_FALSE(LaneModeActive());
+  ASSERT_TRUE(GetLaneTopology().full_process_cpuset().empty());
+  RunOnStdThread([] {
+    const auto mask = ThisThreadMask();
+    const auto calls = TEST_CpuAffinityCallCount();
+    const auto counts = LaneHandoffCounts::Now();
+    ApplyLaneToCurrentThread(0);
+    ApplyServiceMaskToCurrentThread();
+    {
+      ScopedThreadAffinity full_cpuset(GetLaneTopology().full_process_cpuset());
+      ScopedThreadAffinity other(CpuSet::FirstN(1));
+      ASSERT_EQ(ThisThreadMask(), mask);
+    }
+    LaneHandoff handoff;
+    handoff.RecordSubmitter();
+    ASSERT_EQ(handoff.submitter(), kNoLane);
+    handoff.RecordExecution(LaneCrossingCategory::kOther);
+    CountLaneHandoffToThisThread(1, LaneCrossingCategory::kOther);
+    CountLaneHandoffFromThisThread(1, LaneCrossingCategory::kReactor);
+    ASSERT_EQ(ThisThreadLane(), kNoLane);
+    ASSERT_EQ(ThisThreadMask(), mask);
+    ASSERT_EQ(TEST_CpuAffinityCallCount(), calls);
+    auto delta = LaneHandoffCounts::Now() - counts;
+    ASSERT_EQ(delta.total_crossings(), 0) << delta.ToString();
+    ASSERT_EQ(delta.entries_from_unlaned, 0);
+  });
+}
+
+// --tserver_lane_cpu_affinity=false: lanes are assigned and handoffs counted, but no mask changes.
+TEST_F(LanesTest, AffinityDisabledSetsLaneOnly) {
+  auto topology = MakeTwoLaneTestTopology(/* affinity_enabled= */ false);
+  if (!topology) {
+    GTEST_SKIP() << "Needs at least 2 CPUs";
+  }
+  TEST_SetLaneTopology scope(*topology);
+  LaneHandoff handoff;
+  RunOnStdThread([&handoff] {
+    ApplyLaneToCurrentThread(1);
+    handoff.RecordSubmitter();
+  });
+  ASSERT_EQ(handoff.submitter(), 1);
+  RunOnStdThread([&topology, &handoff] {
+    const auto mask = ThisThreadMask();
+    const auto calls = TEST_CpuAffinityCallCount();
+    const auto counts = LaneHandoffCounts::Now();
+    ApplyLaneToCurrentThread(0);
+    ASSERT_EQ(ThisThreadLane(), 0);
+    {
+      ScopedThreadAffinity scoped(topology->lane_mask(1));
+      ASSERT_EQ(ThisThreadMask(), mask);
+    }
+    handoff.RecordExecution(LaneCrossingCategory::kTabletPipeline);
+    ASSERT_EQ(ThisThreadMask(), mask);
+    ASSERT_EQ(TEST_CpuAffinityCallCount(), calls);
+    auto delta = LaneHandoffCounts::Now() - counts;
+    ASSERT_EQ(delta.crossing(LaneCrossingCategory::kTabletPipeline), 1) << delta.ToString();
+    ASSERT_EQ(delta.total_crossings(), 1);
+  });
+}
+
+TEST_F(LanesTest, ScopedThreadAffinitySetsAndRestores) {
+  auto topology = MakeTwoLaneTestTopology(/* affinity_enabled= */ true, /* service_cpu= */ true);
+  if (!topology) {
+    GTEST_SKIP() << "Needs at least 3 CPUs";
+  }
+  ASSERT_NE(topology->service_mask(), topology->full_process_cpuset());
+  TEST_SetLaneTopology scope(*topology);
+  RunOnStdThread([&topology] {
+    ApplyServiceMaskToCurrentThread();
+    ASSERT_EQ(ThisThreadMask(), topology->service_mask());
+    const auto calls = TEST_CpuAffinityCallCount();
+    {
+      ScopedThreadAffinity full_cpuset(topology->full_process_cpuset());
+      ASSERT_EQ(ThisThreadMask(), topology->full_process_cpuset());
+    }
+    ASSERT_EQ(ThisThreadMask(), topology->service_mask());
+    ASSERT_EQ(ThisThreadLane(), kNoLane);
+    ASSERT_EQ(TEST_CpuAffinityCallCount(), calls + 2);
+
+    // An empty mask, or the mask the thread already has, makes no system call.
+    {
+      ScopedThreadAffinity empty{CpuSet()};
+      ScopedThreadAffinity same(topology->service_mask());
+      ASSERT_EQ(ThisThreadMask(), topology->service_mask());
+    }
+    ASSERT_EQ(TEST_CpuAffinityCallCount(), calls + 2);
+  });
+}
+
+TEST_F(LanesTest, HandoffCounting) {
+  auto topology = MakeTwoLaneTestTopology();
+  if (!topology) {
+    GTEST_SKIP() << "Needs at least 2 CPUs";
+  }
+  TEST_SetLaneTopology scope(*topology);
+  LaneHandoff from_lane_0, from_lane_1, from_unlaned, uncounted;
+  uncounted.DisableCounting();
+  RunOnStdThread([&] {
+    ApplyLaneToCurrentThread(0);
+    from_lane_0.RecordSubmitter();
+    uncounted.RecordSubmitter();
+  });
+  RunOnStdThread([&] {
+    ApplyLaneToCurrentThread(1);
+    from_lane_1.RecordSubmitter();
+  });
+  RunOnStdThread([&] {
+    ApplyServiceMaskToCurrentThread();
+    from_unlaned.RecordSubmitter();
+  });
+  ASSERT_EQ(from_lane_0.submitter(), 0);
+  ASSERT_EQ(from_lane_1.submitter(), 1);
+  ASSERT_EQ(from_unlaned.submitter(), kNoLane);
+
+  RunOnStdThread([&] {
+    ApplyLaneToCurrentThread(0);
+    auto counts = LaneHandoffCounts::Now();
+    from_lane_0.RecordExecution(LaneCrossingCategory::kRpcHandler);
+    uncounted.RecordExecution(LaneCrossingCategory::kRpcHandler);
+    auto delta = LaneHandoffCounts::Now() - counts;
+    ASSERT_EQ(delta.total_crossings(), 0) << delta.ToString();
+    ASSERT_EQ(delta.entries_from_unlaned, 0);
+
+    from_lane_1.RecordExecution(LaneCrossingCategory::kRpcHandler);
+    delta = LaneHandoffCounts::Now() - counts;
+    ASSERT_EQ(delta.crossing(LaneCrossingCategory::kRpcHandler), 1) << delta.ToString();
+    ASSERT_EQ(delta.total_crossings(), 1);
+
+    from_unlaned.RecordExecution(LaneCrossingCategory::kRpcHandler);
+    delta = LaneHandoffCounts::Now() - counts;
+    ASSERT_EQ(delta.total_crossings(), 1) << delta.ToString();
+    ASSERT_EQ(delta.entries_from_unlaned, 1);
+
+    // A reactor-style handoff counted by the submitter: lane 0 into a lane 1 executor.
+    CountLaneHandoffFromThisThread(1, LaneCrossingCategory::kReactor);
+    CountLaneHandoffFromThisThread(0, LaneCrossingCategory::kReactor);
+    CountLaneHandoffFromThisThread(kNoLane, LaneCrossingCategory::kReactor);
+    delta = LaneHandoffCounts::Now() - counts;
+    ASSERT_EQ(delta.crossing(LaneCrossingCategory::kReactor), 1) << delta.ToString();
+    ASSERT_EQ(delta.total_crossings(), 2);
+  });
+
+  // Unlaned executors count nothing.
+  RunOnStdThread([&] {
+    ApplyServiceMaskToCurrentThread();
+    auto counts = LaneHandoffCounts::Now();
+    from_lane_1.RecordExecution(LaneCrossingCategory::kOther);
+    from_unlaned.RecordExecution(LaneCrossingCategory::kOther);
+    auto delta = LaneHandoffCounts::Now() - counts;
+    ASSERT_EQ(delta.total_crossings(), 0) << delta.ToString();
+    ASSERT_EQ(delta.entries_from_unlaned, 0);
+  });
+}
+
+TEST_F(LanesTest, LaneShardedCounters) {
+  auto counters = std::make_unique<LaneShardedCounters<2>>();
+  counters->Increment(0, 0);
+  counters->Increment(kMaxLanes - 1, 0);
+  // kNoLane has its own slot.
+  counters->Increment(kNoLane, 0);
+  counters->Increment(kNoLane, 1);
+  ASSERT_EQ(counters->Sum(0), 3);
+  ASSERT_EQ(counters->Sum(1), 1);
+  ASSERT_EQ(counters->Sum(2), 0);
 }
 
 } // namespace yb

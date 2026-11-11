@@ -32,10 +32,14 @@
 
 #include <thread>
 
+#include "yb/rpc/reactor.h"
 #include "yb/rpc/rpc-test-base.h"
 
 #include "yb/util/countdown_latch.h"
+#include "yb/util/lanes.h"
+#include "yb/util/lanes_test_util.h"
 #include "yb/util/logging.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/thread.h"
 
@@ -188,6 +192,105 @@ TEST_F(ReactorTest, Monitor) {
   }, 0s, SOURCE_LOCATION()));
   latch_.Wait();
   ASSERT_EQ(logger->num_writes(), 1);
+}
+
+namespace {
+
+struct ReactorView {
+  CpuSet mask;
+  LaneId lane = kNoLane;
+};
+
+// Runs a task on reactor, scheduled from a new thread set up by confine_submitter, and returns
+// what the reactor thread saw.
+ReactorView RunOnReactorFrom(Reactor* reactor, const std::function<void()>& confine_submitter) {
+  ReactorView result;
+  RunOnStdThread([reactor, &confine_submitter, &result] {
+    confine_submitter();
+    CountDownLatch latch(1);
+    CHECK_OK(reactor->ScheduleReactorFunctor([&result, &latch](Reactor*) {
+      result = ReactorView { .mask = ThisThreadMask(), .lane = ThisThreadLane() };
+      latch.CountDown();
+    }, SOURCE_LOCATION()));
+    latch.Wait();
+  });
+  return result;
+}
+
+auto InLane(LaneId lane) {
+  return [lane] { ApplyLaneToCurrentThread(lane); };
+}
+
+} // namespace
+
+TEST_F_EX(ReactorTest, LanedReactors, YBTest) {
+  auto topology = MakeTwoLaneTestTopology();
+  if (!topology) {
+    GTEST_SKIP() << "Needs at least 2 CPUs";
+  }
+  TEST_SetLaneTopology scope(*topology);
+  MessengerBuilder builder("laned");
+  // 5 is reduced modulo the 2 lanes.
+  builder.set_num_reactors(3).set_reactor_lanes({0, 5, kNoLane});
+  auto messenger = ASSERT_RESULT(builder.Build());
+  auto se = ScopeExit([&messenger] { messenger->Shutdown(); });
+  std::vector<LaneId> expected_lanes = {0, 1, kNoLane};
+  for (size_t i = 0; i != expected_lanes.size(); ++i) {
+    auto* reactor = messenger->TEST_reactor(i);
+    ASSERT_EQ(reactor->lane(), expected_lanes[i]);
+    auto view = RunOnReactorFrom(reactor, [] {});
+    ASSERT_EQ(view.lane, expected_lanes[i]);
+    ASSERT_EQ(view.mask, expected_lanes[i] == kNoLane ? topology->service_mask()
+                                                      : topology->lane_mask(expected_lanes[i]));
+  }
+
+  // Tasks scheduled from another lane count as reactor crossings, by the submitting thread.
+  auto* lane0_reactor = messenger->TEST_reactor(0);
+  auto counts = LaneHandoffCounts::Now();
+  RunOnReactorFrom(lane0_reactor, InLane(0));
+  auto delta = LaneHandoffCounts::Now() - counts;
+  ASSERT_EQ(delta.total_crossings(), 0) << delta.ToString();
+  RunOnReactorFrom(lane0_reactor, InLane(1));
+  delta = LaneHandoffCounts::Now() - counts;
+  ASSERT_EQ(delta.crossing(LaneCrossingCategory::kReactor), 1) << delta.ToString();
+  ASSERT_EQ(delta.total_crossings(), 1);
+  auto unlaned_before = delta.entries_from_unlaned;
+  RunOnReactorFrom(lane0_reactor, [] { ApplyServiceMaskToCurrentThread(); });
+  delta = LaneHandoffCounts::Now() - counts;
+  ASSERT_EQ(delta.total_crossings(), 1) << delta.ToString();
+  ASSERT_GE(delta.entries_from_unlaned, unlaned_before + 1);
+  // An unlaned reactor counts nothing.
+  RunOnReactorFrom(messenger->TEST_reactor(2), InLane(1));
+  delta = LaneHandoffCounts::Now() - counts;
+  ASSERT_EQ(delta.total_crossings(), 1) << delta.ToString();
+}
+
+TEST_F_EX(ReactorTest, ReactorLanesMustMatchReactorCount, YBTest) {
+  MessengerBuilder builder("laned");
+  builder.set_num_reactors(3).set_reactor_lanes({0, 1});
+  auto result = builder.Build();
+  ASSERT_NOK(result);
+  ASSERT_TRUE(result.status().IsInvalidArgument()) << result.status();
+  ASSERT_STR_CONTAINS(result.status().ToString(), "2 reactor lanes given for 3 reactors");
+}
+
+// Reactor lanes are ignored while lane mode is off: no lane, no mask change.
+TEST_F_EX(ReactorTest, ReactorLanesWithLanesOff, YBTest) {
+  TEST_SetLaneTopology scope{LaneTopology()};
+  const auto mask = ThisThreadMask();
+  const auto calls = TEST_CpuAffinityCallCount();
+  MessengerBuilder builder("laned");
+  builder.set_num_reactors(2).set_reactor_lanes({0, 1});
+  auto messenger = ASSERT_RESULT(builder.Build());
+  auto se = ScopeExit([&messenger] { messenger->Shutdown(); });
+  for (size_t i = 0; i != 2; ++i) {
+    auto* reactor = messenger->TEST_reactor(i);
+    ASSERT_EQ(reactor->lane(), kNoLane);
+    auto view = RunOnReactorFrom(reactor, [] {});
+    ASSERT_EQ(view.lane, kNoLane);
+    ASSERT_EQ(view.mask, mask);
+  }
+  ASSERT_EQ(TEST_CpuAffinityCallCount(), calls);
 }
 
 } // namespace yb::rpc

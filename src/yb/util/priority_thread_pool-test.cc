@@ -15,6 +15,9 @@
 
 #include <gtest/gtest.h>
 
+#include "yb/util/countdown_latch.h"
+#include "yb/util/lanes.h"
+#include "yb/util/lanes_test_util.h"
 #include "yb/util/metrics.h"
 #include "yb/util/priority_thread_pool.h"
 #include "yb/util/random_util.h"
@@ -606,6 +609,122 @@ TEST(PriorityThreadPoolTest, FailureToCreateThread) {
   SubmitTask(10, &share, &thread_pool);
   share.FillRunningTaskPriorities(&running);
   ASSERT_EQ(running, std::vector<int>({8, 9, 10}));
+}
+
+namespace {
+
+struct LaneObservation {
+  CpuSet mask;
+  LaneId lane = kNoLane;
+  int64_t thread_id = 0;
+};
+
+class LaneObservingTask : public PriorityThreadPoolTask {
+ public:
+  LaneObservingTask(LaneObservation* observation, CountDownLatch* latch)
+      : observation_(observation), latch_(latch) {}
+
+  void Run(const Status& status, PriorityThreadPoolSuspender* suspender) override {
+    if (status.ok()) {
+      *observation_ = LaneObservation {
+        .mask = ThisThreadMask(),
+        .lane = ThisThreadLane(),
+        .thread_id = Thread::CurrentThreadId(),
+      };
+    }
+    latch_->CountDown();
+  }
+
+  bool ShouldRemoveWithKey(void* key) override { return false; }
+
+  std::string ToString() const override { return "LaneObservingTask"; }
+
+  int CalculateGroupNoPriority(int active_tasks) const override { return 0; }
+
+ private:
+  LaneObservation* const observation_;
+  CountDownLatch* const latch_;
+};
+
+// Runs one task with the given lane on pool and waits for it.
+LaneObservation RunWithLane(PriorityThreadPool* pool, LaneId lane) {
+  LaneObservation observation;
+  CountDownLatch latch(1);
+  auto task = std::make_unique<LaneObservingTask>(&observation, &latch);
+  task->SetTaskLane(lane);
+  CHECK_OK(pool->Submit(kTopDiskCompactionPriority, &task));
+  latch.Wait();
+  return observation;
+}
+
+} // namespace
+
+TEST(PriorityThreadPoolTest, PerTaskLane) {
+  auto topology = MakeTwoLaneTestTopology();
+  if (!topology) {
+    GTEST_SKIP() << "Needs at least 2 CPUs";
+  }
+  TEST_SetLaneTopology scope(*topology);
+  PriorityThreadPool pool(1);
+  auto se = ScopeExit([&pool] {
+    pool.StartShutdown();
+    pool.CompleteShutdown();
+  });
+
+  // Starts the worker; a new thread starts on the service mask.
+  auto first = RunWithLane(&pool, kNoLane);
+  ASSERT_EQ(first.mask, topology->service_mask());
+  ASSERT_EQ(first.lane, kNoLane);
+
+  const auto calls = TEST_CpuAffinityCallCount();
+  auto lane0 = RunWithLane(&pool, 0);
+  ASSERT_EQ(lane0.mask, topology->lane_mask(0));
+  ASSERT_EQ(lane0.lane, 0);
+  ASSERT_EQ(TEST_CpuAffinityCallCount(), calls + 1);
+
+  // Consecutive tasks of one lane switch once.
+  auto lane0_again = RunWithLane(&pool, 0);
+  ASSERT_EQ(lane0_again.mask, topology->lane_mask(0));
+  ASSERT_EQ(TEST_CpuAffinityCallCount(), calls + 1);
+
+  auto lane1 = RunWithLane(&pool, 1);
+  ASSERT_EQ(lane1.mask, topology->lane_mask(1));
+  ASSERT_EQ(lane1.lane, 1);
+  ASSERT_EQ(TEST_CpuAffinityCallCount(), calls + 2);
+
+  // An unlaned task goes back to the service mask.
+  auto unlaned = RunWithLane(&pool, kNoLane);
+  ASSERT_EQ(unlaned.mask, topology->service_mask());
+  ASSERT_EQ(unlaned.lane, kNoLane);
+  ASSERT_EQ(TEST_CpuAffinityCallCount(), calls + 3);
+
+  // Out of range lanes are reduced modulo the lane count.
+  auto reduced = RunWithLane(&pool, 3);
+  ASSERT_EQ(reduced.lane, 1);
+  ASSERT_EQ(reduced.mask, topology->lane_mask(1));
+  ASSERT_EQ(TEST_CpuAffinityCallCount(), calls + 4);
+
+  // All on the one worker.
+  for (const auto* observation : {&lane0, &lane0_again, &lane1, &unlaned, &reduced}) {
+    ASSERT_EQ(observation->thread_id, first.thread_id);
+  }
+}
+
+TEST(PriorityThreadPoolTest, PerTaskLaneWithLanesOff) {
+  TEST_SetLaneTopology scope{LaneTopology()};
+  const auto mask = ThisThreadMask();
+  const auto calls = TEST_CpuAffinityCallCount();
+  PriorityThreadPool pool(1);
+  auto se = ScopeExit([&pool] {
+    pool.StartShutdown();
+    pool.CompleteShutdown();
+  });
+  for (LaneId lane : {LaneId{0}, LaneId{1}, kNoLane}) {
+    auto observation = RunWithLane(&pool, lane);
+    ASSERT_EQ(observation.mask, mask);
+    ASSERT_EQ(observation.lane, kNoLane);
+  }
+  ASSERT_EQ(TEST_CpuAffinityCallCount(), calls);
 }
 
 } // namespace yb

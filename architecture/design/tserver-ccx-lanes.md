@@ -6,9 +6,12 @@ costs several times the CPU of one between threads sharing an L3. Lanes partitio
 threads and tablets by L3 domain so that a tablet's request path stays within one domain. Lanes
 are off by default (`--tserver_lanes=1`).
 
-What is implemented: topology discovery, the lane model and its flags. The topology is computed,
-logged and exposed through `GetLaneTopology()`; no thread, pool or RPC path reads it yet, so the
-rules below for those are the contract they must follow.
+What is implemented: topology discovery, the lane model and its flags, and the confinement and
+accounting mechanisms that consume the topology: new threads, thread pools, priority-pool tasks,
+reactors given a lane, the postmaster spawn, and the crossing counters. Nothing assigns lanes in
+production yet: there are no per-lane pools or laned messengers, so with lanes on every tserver
+thread runs in the service set. The tablet-to-lane rule below is a contract for code that routes
+by lane.
 
 ## Definitions
 
@@ -37,8 +40,10 @@ A lane value received from elsewhere is reduced modulo the local `L`, never used
 
 ## Topology discovery
 
-`DiscoverCpuDomains` (`util/cpu_topology.h`) groups the process cpuset (`sched_getaffinity`, so a
-cgroup cpuset is respected) into domains:
+`DiscoverCpuDomains` (`util/cpu_topology.h`) groups the process cpuset into domains. The cpuset is
+the starting thread's `sched_getaffinity`, so a cgroup cpuset is respected; once an active
+topology is installed, a repeated `InitTserverLaneTopology` takes it from that topology instead,
+because the calling thread may be confined by then:
 
 - `--tserver_lane_domain=l3`: CPUs sharing the highest cache level present under
   `/sys/devices/system/cpu/cpu*/cache/index*` (`level`, `shared_cpu_list`). If that level is
@@ -103,7 +108,90 @@ constructor because `TSTabletManager` is constructed in its initializer list.
 The topology is process-wide and immutable once an active one is set. MiniCluster and
 `PgMiniTestBase` run several tservers in one process and restart them, so setting an equal
 topology again is a no-op; setting a different one is a DFATAL. Consequently all tservers in a
-process share one `L`, and masters in the same process see it too: their threads are treated as
-service set and their messengers are never laned. Tests that need tservers with different `L` use
-ExternalMiniCluster. Unit tests install their own topology with the scoped
-`TEST_SetLaneTopology`.
+process share one `L`, and masters in the same process see it too: their threads start on the
+service mask like every other `yb::Thread`, and their messengers are never given reactor lanes.
+Tests that need tservers with different `L` use ExternalMiniCluster. Unit tests install their own
+topology with the scoped `TEST_SetLaneTopology`.
+
+## Thread confinement
+
+Lane state lives on the thread: `ThisThreadLane()` is the lane a thread runs in, `kNoLane` for
+the service set. `ApplyLaneToCurrentThread(lane)` sets it and confines the thread to the lane's
+whole-domain mask (the service mask for `kNoLane`); repeating the current lane makes no system
+call. Lane values from configuration go through `NormalizeLane` (modulo `L`, `kNoLane` when
+inactive) and are never used as raw indexes. With `--tserver_lane_cpu_affinity=false` lanes are
+assigned and crossings counted, but no mask changes. A failed `sched_setaffinity` logs a
+rate-limited WARNING and the thread runs unpinned. Every affinity change goes through
+`SetCurrentThreadCpuAffinity`, whose call counter tests use to show that lanes off makes none.
+
+No thread keeps its creator's mask:
+
+- A new `yb::Thread` applies the service mask before running its body (`Thread::SuperviseThread`),
+  since it inherits the mask of whatever thread created it, which may be a lane's.
+- `YBThreadPool` creates workers lazily on whichever thread submits, so lanes are a pool option
+  (`ThreadPoolOptions::lane`, `ThreadPoolBuilder::set_lane`) that each worker applies itself in
+  `Worker::Execute`. The check runs per task and costs no system call unless the lane or the
+  topology changed, so workers started before the topology was installed are confined from their
+  next task.
+- `PriorityThreadPool` workers serve every lane: a task's lane (`SetTaskLane`) is applied before it
+  runs, switching the mask only when it differs from the worker's current lane; unlaned tasks go
+  back to the service mask.
+- A reactor applies its lane at the start of `Reactor::RunThread`. Reactor lanes come from
+  `MessengerBuilder::set_reactor_lanes`, one per reactor (empty leaves all unlaned; a size other
+  than the reactor count fails `Messenger::Init`).
+
+Service CPUs confine threads started after the topology is installed. A `yb::Thread` created
+earlier (in the `TabletServer` constructor or by a process-wide singleton, such as the maintenance
+manager) that is not a pool worker keeps the full mask, as do threads not created through
+`yb::Thread` and the process's main thread.
+
+## Service set and the postmaster
+
+The service mask is `--tserver_service_lane_cpus` if set, otherwise the full process cpuset. The
+postmaster and its backends must float over every CPU even when service CPUs are set, but Linux
+`Subprocess::Start` uses `posix_spawn`, which has no affinity attribute or pre-exec hook, and the
+child inherits the spawning thread's mask. `PgWrapper::Start` therefore spawns inside
+`ScopedThreadAffinity(full_process_cpuset())`, which restores the thread's mask afterwards. The
+first start and supervisor restarts (`ProcessSupervisor::StartProcessUnlocked`) both go through
+it. initdb and odyssey keep the spawning thread's mask, the service set.
+`ScopedThreadAffinity` is a no-op with lanes off, with affinity disabled, or with an empty mask.
+
+## Relation to QoS cgroups
+
+Lanes and QoS are independent. QoS moves threads between cgroup-v2 cpu-controller groups without
+a cpuset (`util/cgroups.cc`); lanes set per-thread masks with `sched_setaffinity`. A pool's
+`cgroup` and `lane` options are applied side by side in `Worker::Execute`, and per-task cgroups
+are unchanged. A cpuset imposed on the process from outside is honoured through discovery.
+
+## Crossing accounting
+
+A handoff records the submitting thread's lane in one byte when it is queued and compares it with
+the executing thread's lane when it runs. If both are laned and differ it counts a crossing for
+the executor's category; if only the executor is laned it counts an entry from unlaned. Categories
+are reactor, rpc handler, tablet pipeline, callback and other, set per pool with
+`ThreadPoolOptions::crossing_category` (default other). Counted handoffs:
+
+| Primitive | Counted when | Category |
+| --- | --- | --- |
+| `YBThreadPool` task (also `ThreadSubPool`, CONCURRENT tokens) | the worker starts it | the pool's |
+| `Strand` item (SERIAL tokens, the raft-notifications strand) | the drain loop runs it | the strand's pool's |
+| `TaskStream` item, including items taken by a running stream | it is processed | the stream's pool's |
+| `Reactor::ScheduleReactorTask`, `Reactor::QueueOutboundCall` | it is scheduled | reactor |
+
+Wrapper tasks that only drain items (`Strand`'s pool task, the task that starts a `TaskStream`
+draining) are not counted, so each handoff counts once; nor is the end-of-group call with no
+item. A reactor's lane is fixed, so its handoffs are counted on the submitting side.
+
+Not counted: `PriorityThreadPool` tasks (flush and compaction), `rpc::Scheduler` and other
+io-service timers, `CompletedCallQueue`, futures, promises and `Synchronizer` wakeups, raw
+`std::condition_variable` or `BlockingQueue` handoffs outside `TaskStream`, and lock wait
+queues. Crossings through these do not show in the metrics.
+
+Counters are sharded per lane, one cache line per lane plus one for unlaned threads, each written
+only by threads of its lane (the executing thread, or the submitter for reactors), and summed on
+read (`LaneShardedCounters` in `util/lanes.h`). With lanes on the tserver exposes them as
+counters `lane_crossings_reactor`, `lane_crossings_rpc_handler`, `lane_crossings_tablet_pipeline`,
+`lane_crossings_callback`, `lane_crossings_other` and `lane_entries_from_unlaned`; with lanes off
+they are not registered and nothing is counted. The values are process-wide, so tservers sharing a
+process report the same totals. A crossing counter's rate divided by the operation rate is the
+number of crossings per operation on that path.
