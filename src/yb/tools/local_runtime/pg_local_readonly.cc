@@ -12,6 +12,7 @@
 
 #include <fcntl.h>
 #include <openssl/sha.h>
+#include <locale.h>
 #include <signal.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -44,6 +45,7 @@
 #include "yb/gutil/endian.h"
 #include "yb/gutil/walltime.h"
 #include "yb/docdb/doc_read_context.h"
+#include "yb/docdb/docdb_pgapi.h"
 #include "yb/docdb/docdb_rocksdb_util.h"
 #include "yb/docdb/pgsql_operation.h"
 #include "yb/docdb/ql_rocksdb_storage.h"
@@ -2919,6 +2921,13 @@ class ReadonlyPgServer::Impl : public pgwrapper::PgWrapperContext {
     auto conf = VERIFY_RESULT(
         pgwrapper::PgProcessConf::CreateValidateAndRunInitDb(
             Format("127.0.0.1:$0", sql_port), directory + "/pg_data"));
+    // As in the tablet server, pushed-down expressions run in this process: they need the UTF-8
+    // database encoding, not PostgreSQL's SQL_ASCII default, and initdb's locale (C collation)
+    // for case mapping and character classes.
+    RETURN_NOT_OK(docdb::DocPgInit(pgwrapper::PgWrapper::GetPostgresExecutablePath()));
+    LOG_IF(WARNING, !setlocale(LC_ALL, "en_US.UTF-8"))
+        << "Locale en_US.UTF-8 is unavailable; pushed-down case mapping uses the C locale";
+    setlocale(LC_COLLATE, "C");
     conf.force_disable_log_file = true;
     conf.cleanup_previous_postgres = false;
     pg_directory_ = conf.data_dir;
