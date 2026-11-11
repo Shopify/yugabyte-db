@@ -71,6 +71,7 @@
 #include "yb/util/env_util.h"
 #include "yb/util/fault_injection.h"
 #include "yb/util/flag_validators.h"
+#include "yb/util/lanes.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
@@ -197,6 +198,14 @@ DEFINE_UNKNOWN_int32(taskstream_queue_max_size, 100000,
 DEFINE_UNKNOWN_int32(taskstream_queue_max_wait_ms, 1000,
              "Maximum time in ms to wait for items in the taskstream queue to arrive.");
 
+DEFINE_NON_RUNTIME_int32(log_appender_lane_mode_max_wait_ms, 1,
+    "When CPU lanes are enabled, maximum time in ms a tablet's log appender waits for more "
+    "entries after its queue empties before releasing its append thread; replaces "
+    "taskstream_queue_max_wait_ms for the log appender. 0 releases the thread as soon as the "
+    "queue is empty. No effect when lanes are disabled.");
+DEFINE_validator(log_appender_lane_mode_max_wait_ms, FLAG_GE_VALUE_VALIDATOR(0));
+TAG_FLAG(log_appender_lane_mode_max_wait_ms, advanced);
+
 DEFINE_UNKNOWN_int32(wait_for_safe_op_id_to_apply_default_timeout_ms, 15000 * yb::kTimeMultiplier,
              "Timeout used by WaitForSafeOpIdToApply when it was not specified by caller.");
 
@@ -274,6 +283,13 @@ using std::unique_ptr;
 using std::string;
 
 namespace {
+
+// A parked appender holds an append worker, so with the long default every tablet written in the
+// last park interval holds one; a lane hosts many tablets, so lane mode parks briefly instead.
+int32_t AppenderMaxWaitMs() {
+  return LaneModeActive() ? FLAGS_log_appender_lane_mode_max_wait_ms
+                          : FLAGS_taskstream_queue_max_wait_ms;
+}
 
 bool IsRolloverMarkerType(LogEntryTypePB type) {
   return type == LogEntryTypePB::SYNC_ROLLOVER_MARKER ||
@@ -504,7 +520,7 @@ Log::Appender::Appender(Log* log, ThreadPool* append_thread_pool)
       task_stream_(new TaskStream<LogEntryBatch>(
           std::bind(&Log::Appender::ProcessBatch, this, _1), append_thread_pool,
           FLAGS_taskstream_queue_max_size,
-          MonoDelta::FromMilliseconds(FLAGS_taskstream_queue_max_wait_ms))),
+          MonoDelta::FromMilliseconds(AppenderMaxWaitMs()))),
       wait_state_(ash::WaitStateInfo::CreateIfAshIsEnabled<ash::WaitStateInfo>()) {
   if (wait_state_) {
     wait_state_->set_root_request_id(yb::Uuid::Generate());
@@ -2703,6 +2719,16 @@ uint64_t Log::active_segment_sequence_number() const {
 
 Status Log::TEST_SubmitFuncToAppendToken(const std::function<void()>& func) {
   return appender_->TEST_SubmitFunc(func);
+}
+
+Status Log::TEST_SubmitFuncToAllocationToken(const std::function<void()>& func) {
+  return allocation_token_->SubmitFunc(func);
+}
+
+Status Log::TEST_SubmitFuncToBackgroundSyncToken(const std::function<void()>& func) {
+  SharedLock lock(background_sync_token_mutex_);
+  SCHECK(background_sync_threadpool_token_, IllegalState, "Log is closed");
+  return background_sync_threadpool_token_->SubmitFunc(func);
 }
 
 Status Log::ResetLastSyncedEntryOpId(const OpId& op_id) {

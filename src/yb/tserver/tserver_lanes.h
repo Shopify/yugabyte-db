@@ -46,6 +46,14 @@ void InitTserverLaneTopology();
 // otherwise. Only the tablet server's own messenger is laned.
 void SetupTserverLaneMessenger(rpc::MessengerBuilder* builder);
 
+// Lane of a tablet hosted by this tablet server: LaneOf(tablet_id) when lane mode is active,
+// kNoLane otherwise, so that lanes off selects the unlaned pools and sends no lane hints.
+LaneId TserverTabletLane(Slice tablet_id);
+
+// Lane of the RocksDB flush and compaction tasks of a tablet in tablet_lane: tablet_lane, or
+// kNoLane (the service mask) with --tserver_lane_background=service.
+LaneId TserverBackgroundTaskLane(LaneId tablet_lane);
+
 // Registers the lane crossing metrics (lane_crossings_<category>, lane_entries_from_unlaned) on
 // entity when lane mode is active; does nothing otherwise. The counts are process-wide.
 void RegisterTserverLaneMetrics(const scoped_refptr<MetricEntity>& entity);

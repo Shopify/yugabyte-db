@@ -146,6 +146,40 @@ TEST_F(TestTaskStream, TestTwoTaskStreams) {
   taskStream1.Stop();
   thread_pool->Shutdown();
 }
+
+// A zero wait releases the worker as soon as the queue is empty, without spinning: each burst of
+// items is processed, and the stream then leaves the pool idle.
+TEST_F(TestTaskStream, ZeroWaitGoesIdle) {
+  std::unique_ptr<ThreadPool> thread_pool;
+  ASSERT_OK(BuildMinMaxTestPool(1, 1, &thread_pool));
+  std::atomic<int32_t> counter(0);
+  std::atomic<int32_t> groups(0);
+  TaskStream<int> stream(
+      [&counter, &groups](int* item) {
+        if (item) {
+          counter += *item;
+        } else {
+          ++groups;
+        }
+      },
+      thread_pool.get(), kTaskstreamQueueMaxSize, MonoDelta::kZero);
+  ASSERT_OK(stream.Start());
+  int items[3] = {1, 2, 3};
+  for (int round = 1; round <= 5; ++round) {
+    for (auto& item : items) {
+      ASSERT_OK(stream.Submit(&item));
+    }
+    ASSERT_OK(WaitFor([&counter, round] { return counter.load() == 6 * round; }, 5s,
+                      "Items processed"));
+    ASSERT_OK(WaitFor([&thread_pool] { return thread_pool->Idle(); }, 500ms, "Pool idle"));
+    const auto groups_before = groups.load();
+    std::this_thread::sleep_for(50ms);
+    ASSERT_TRUE(thread_pool->Idle());
+    ASSERT_EQ(groups.load(), groups_before);
+  }
+  stream.Stop();
+  thread_pool->Shutdown();
+}
 namespace {
 
 // Process function for lane tests: counts items and the lane they ran in, and blocks on items

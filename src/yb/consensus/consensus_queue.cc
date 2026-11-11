@@ -2148,4 +2148,8 @@ void PeerMessageQueue::TEST_WaitForNotificationToFinish() {
   notifications_strand_->TEST_BusyWait();
 }
 
+void PeerMessageQueue::TEST_EnqueueNotification(std::function<void()> func) {
+  notifications_strand_->Enqueue(MakeFunctorStrandTask(std::move(func)));
+}
+
 } // namespace yb::consensus

@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <map>
+#include <set>
 
 #include <gtest/gtest.h>
 
@@ -33,6 +34,8 @@
 
 DECLARE_string(TEST_cpu_topology_cpuset);
 DECLARE_string(TEST_cpu_topology_sysfs_root);
+DECLARE_int32(log_appender_lane_mode_max_wait_ms);
+DECLARE_string(tserver_lane_background);
 DECLARE_int32(tserver_lane_connections_per_remote);
 DECLARE_bool(tserver_lane_cpu_affinity);
 DECLARE_string(tserver_lane_domain);
@@ -332,6 +335,71 @@ TEST_F(TserverLanesTest, LaneMetricsRegisteredOnlyWhenActive) {
             "Tasks handed to a laned thread pool, strand or task stream by a thread that belongs "
             "to no lane. Work handed to reactors by threads that belong to no lane is not "
             "counted.");
+}
+
+// The tablet pipeline flags accept only their documented values and describe them.
+TEST_F(TserverLanesTest, PipelineFlagValidation) {
+  ASSERT_OK(flags_internal::ValidateFlagValue("tserver_lane_background", "lane"));
+  ASSERT_OK(flags_internal::ValidateFlagValue("tserver_lane_background", "service"));
+  for (auto value : {"", "Lane", "none"}) {
+    ASSERT_NOK(flags_internal::ValidateFlagValue("tserver_lane_background", value));
+  }
+  for (auto value : {"0", "1", "1000"}) {
+    ASSERT_OK(flags_internal::ValidateFlagValue("log_appender_lane_mode_max_wait_ms", value));
+  }
+  ASSERT_NOK(flags_internal::ValidateFlagValue("log_appender_lane_mode_max_wait_ms", "-1"));
+
+  gflags::CommandLineFlagInfo info;
+  ASSERT_TRUE(gflags::GetCommandLineFlagInfo("tserver_lane_background", &info));
+  ASSERT_EQ(info.default_value, "lane");
+  ASSERT_EQ(info.description,
+            "Where a tablet's RocksDB flushes and compactions run when lanes are enabled: 'lane' "
+            "(default) runs each task on the CPUs of the tablet's lane, 'service' on the CPUs of "
+            "threads that belong to no lane. No effect when lanes are disabled (tserver_lanes=1).");
+  ASSERT_TRUE(gflags::GetCommandLineFlagInfo("log_appender_lane_mode_max_wait_ms", &info));
+  ASSERT_EQ(info.default_value, "1");
+  ASSERT_EQ(info.description,
+            "When CPU lanes are enabled, maximum time in ms a tablet's log appender waits for "
+            "more entries after its queue empties before releasing its append thread; replaces "
+            "taskstream_queue_max_wait_ms for the log appender. 0 releases the thread as soon as "
+            "the queue is empty. No effect when lanes are disabled.");
+}
+
+// A tablet's lane is LaneOf(tablet_id) in lane mode and kNoLane otherwise; its background tasks
+// follow it unless tserver_lane_background=service.
+TEST_F(TserverLanesTest, TabletAndBackgroundLanes) {
+  const std::vector<std::string> tablet_ids = {"t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7"};
+  {
+    TEST_SetLaneTopology scope{LaneTopology()};
+    for (const auto& tablet_id : tablet_ids) {
+      ASSERT_EQ(TserverTabletLane(tablet_id), kNoLane);
+    }
+  }
+  CpuSet cpus;
+  std::vector<CpuSet> domains(4);
+  for (size_t cpu = 0; cpu != 8; ++cpu) {
+    cpus.Set(cpu);
+    domains[cpu / 2].Set(cpu);
+  }
+  TEST_SetLaneTopology scope(LaneTopology::Build(LaneTopologyOptions {
+    .domains = domains,
+    .process_cpuset = cpus,
+    .requested_lanes = 4,
+    .affinity_enabled = false,
+  }));
+  ASSERT_TRUE(LaneModeActive());
+  std::set<LaneId> seen;
+  for (const auto& tablet_id : tablet_ids) {
+    const auto lane = TserverTabletLane(tablet_id);
+    ASSERT_EQ(lane, LaneOf(tablet_id, 4));
+    seen.insert(lane);
+    ASSERT_EQ(TserverBackgroundTaskLane(lane), lane);
+  }
+  ASSERT_GT(seen.size(), 1);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_lane_background) = "service";
+  for (LaneId lane = 0; lane != 4; ++lane) {
+    ASSERT_EQ(TserverBackgroundTaskLane(lane), kNoLane);
+  }
 }
 
 } // namespace yb::tserver

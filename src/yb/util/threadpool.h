@@ -149,6 +149,10 @@ class ThreadPool {
     return underlying_->NumWorkers();
   }
 
+  size_t TEST_NumWorkersCreated() const {
+    return underlying_->TEST_NumWorkersCreated();
+  }
+
   bool Idle() const {
     return underlying_->Idle();
   }
@@ -223,6 +227,12 @@ class ThreadPoolBuilder {
 
   ThreadPoolBuilder& set_crossing_category(LaneCrossingCategory category) {
     options_.crossing_category = category;
+    return *this;
+  }
+
+  // See ThreadPoolOptions::worker_name_prefix.
+  ThreadPoolBuilder& set_worker_name_prefix(std::string prefix) {
+    options_.worker_name_prefix = std::move(prefix);
     return *this;
   }
 

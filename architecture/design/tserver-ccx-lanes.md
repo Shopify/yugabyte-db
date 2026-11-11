@@ -8,12 +8,13 @@ are off by default (`--tserver_lanes=1`).
 
 What is implemented: topology discovery, the lane model and its flags, the confinement and
 accounting mechanisms that consume the topology (new threads, thread pools, priority-pool tasks,
-reactors, the postmaster spawn, the crossing counters), and the laned tablet server messenger.
-With lanes on, the tserver messenger runs a group of reactors and handler pools per lane, and an
-inbound call is handled in the lane of the reactor that read it; calls with a lane hint go on
-lane-keyed connections, but no caller sets a hint yet, and tablet pipelines, sessions and all
-other tserver threads still run in the service set. The tablet-to-lane rule below is a contract
-for code that routes by lane.
+reactors, the postmaster spawn, the crossing counters), the laned tablet server messenger, and
+laned tablet pipelines. With lanes on, the tserver messenger runs a group of reactors and handler
+pools per lane, and an inbound call is handled in the lane of the reactor that read it. Each
+tablet's Raft, log, preparer, apply and service-strand work and its RocksDB background jobs run
+in its lane, and consensus peers send their RPCs with the tablet's lane hint. PG sessions and the
+tserver's embedded client are not laned and send no hints, and inbound connections are not yet
+bound to lanes, so inbound tablet calls cross into the tablet's lane once.
 
 ## Definitions
 
@@ -77,6 +78,8 @@ All are startup-only and tagged `advanced`.
 | `tserver_service_lane_cpus` | empty | Cpu-list reserved for the service set and removed from every domain. |
 | `tserver_lane_reactors` | `0` | Reactors per lane of the tserver messenger, replacing `--num_reactor_threads`. `0`: see [Messenger lanes](#messenger-lanes). |
 | `tserver_lane_connections_per_remote` | `2` | Connections per (remote, lane) for calls with a lane hint (`k` below). |
+| `tserver_lane_background` | `lane` | `lane` runs a tablet's RocksDB flushes and compactions in its lane, `service` on the service mask. See [Tablet pipelines](#tablet-pipelines). |
+| `log_appender_lane_mode_max_wait_ms` | `1` | In lane mode, how long a tablet's log appender keeps its append thread after its queue empties; `0` releases it at once. Replaces `taskstream_queue_max_wait_ms` for the appender. |
 
 Mapping `N` lanes onto `D` domains keeps masks whole and contiguous blocks within a socket:
 
@@ -101,6 +104,13 @@ tablet without coordination, so a leader and its followers replicate within one 
 ends. This is a cross-host, cross-version contract: the hash and seed are golden-tested in
 `util/lanes-test.cc` and must not change (and `std::hash` must never be used). Hosts with
 different `L` disagree, which costs locality only.
+
+A tablet server stores the lane on the peer (`TabletPeer::lane()`) when it creates the peer in
+`TSTabletManager::CreateAndRegisterTabletPeer`, the one path for tablets opened at startup, new
+tablets, split children and remote-bootstrapped replicas, so a split child gets the lane of its own
+id, not its parent's. `TserverTabletLane` gives `LaneOf(tablet_id)` in lane mode and `kNoLane`
+otherwise (not `LaneOf`'s 0), so with lanes off every peer selects the unlaned pools and sends no
+hints. Masters never set a peer lane.
 
 ## Process-global topology
 
@@ -141,7 +151,7 @@ No thread keeps its creator's mask:
   next task.
 - `PriorityThreadPool` workers serve every lane: a task's lane (`SetTaskLane`) is applied before it
   runs, switching the mask only when it differs from the worker's current lane; unlaned tasks go
-  back to the service mask.
+  back to the service mask. RocksDB `Env` pool threads apply their DB's lane per job the same way.
 - A reactor applies its lane at the start of `Reactor::RunThread`. A laned messenger assigns its
   reactors' lanes itself (see below); tests can also give an unlaned messenger reactor lanes with
   `MessengerBuilder::set_reactor_lanes`, one per reactor (empty leaves all unlaned; a size other
@@ -229,6 +239,63 @@ worker of the pool the provider returns (`ServicePool::Process`'s `OwnsThisThrea
 a thread of another lane never is; otherwise it is queued to that pool. Shared-memory PG sessions
 run on threads no handler pool owns, so their local calls always queue.
 
+## Tablet pipelines
+
+**Pools.** The `TSTabletManager` constructor builds one unlaned set of pipeline pools (`prepare`,
+`append`, `consensus`, `raft_notifications`, `log-sync`, `log-alloc`) as without lanes; it runs in
+the `TabletServer` constructor, before the topology is installed. In lane mode
+`TSTabletManager::Init` builds one more set per lane, before the cgroup setup, with the same limits
+(min 1, unlimited, since their tasks block on IO), the lane, and the `tablet_pipeline` crossing
+category. Lane pools are named `<pool>_L007` (the `/threadz` category) and their workers
+`L007_prepare_<n>_worker`, `L007_append_...`, `L007_raft_...`, `L007_notif_...`,
+`L007_logsync_...` and `L007_logalloc_...`. `TSTabletManager::pipeline_pools(lane)` selects a set
+(`lane % L`; the unlaned set for `kNoLane` or with lanes off), and `ForEachPipelinePools` visits the
+unlaned set and every lane's, so the `@system-high` cgroup assignment (consensus system mode) and
+shutdown cover all of them. In per-DB cgroup mode per-task cgroups are set on each tablet's tokens,
+which come from its lane's pools.
+
+`OpenTablet` gives a tablet its lane's append, allocation and log-sync pools for the log, its Raft,
+notification and prepare pools for consensus and the preparer, its Raft pool for intent cleanup,
+and `Messenger::TaggedThreadPool(PoolTagForTablet(tablet), lane)` for the service strand. Op apply
+runs on the Raft notification strand, so it follows the tablet without a pool of its own. The
+other tablet-manager pools (`apply` for split and clone, `snapshot-cleanup`, `tablet-bootstrap`,
+`flush-retryable-requests`, `read-parallel`, `admin-compaction`, `full-compaction`, `wait-queue`,
+vector index pools) stay in the service set. With lanes on the unlaned pipeline set serves only
+work that belongs to no tablet, such as `StepDownLocalLeaders` on the Raft pool; it runs on the
+service mask, and its pools hold only their one idle persistent worker each.
+
+**Log appender park.** A tablet's log appender drains its `TaskStream` on an append worker and,
+once the queue is empty, keeps that worker waiting for more entries for up to
+`taskstream_queue_max_wait_ms` (1000 ms). Every tablet written to within that time thus holds an
+append thread, which a lane hosting many tablets cannot afford, so in lane mode the appender waits
+`log_appender_lane_mode_max_wait_ms` (1 ms) instead; 0 releases the worker as soon as the queue is
+empty. Released workers stay idle in the pool until `default_idle_timeout_ms`. The value is to be
+set by measurement at production tablet density. Masters in a process with an active topology
+(tests) also use it.
+
+**Background jobs.** Flushes and compactions keep their shared pools so that priority ordering
+across tablets is kept: compactions, and flushes with `use_priority_thread_pool_for_flushes`, run on
+the global `PriorityThreadPool`, other flushes on the RocksDB `Env` high-priority pool. A tablet
+sets its lane on its regular and intents `DBImpl` (`SetTaskLane`) right after each open, including
+re-opens, from `TabletInitData::rocksdb_task_lane`: priority pool tasks carry it and `Env` pool
+threads apply it per job, so a job runs in its tablet's lane and an unlaned one on the service mask,
+with an affinity call only when consecutive jobs differ. `TSTabletManager` sets the field to the
+tablet's lane, or to `kNoLane` with `--tserver_lane_background=service`; `tablet` reads no tserver
+flag, and masters leave it `kNoLane`. Jobs scheduled while a DB is opening run on the service mask.
+Whether compaction volume overloads lanes, and so which mode suits a workload, is to be measured;
+`lane` is the default.
+
+**Consensus hints.** A replica's `RpcPeerProxyFactory` takes the peer's lane
+(`ConsensusOptions::lane`) when the server's messenger is laned, and `RpcPeerProxy` sets it as the
+controller's hint on every `UpdateConsensus`, `RequestConsensusVote`, `RunLeaderElection`,
+`LeaderElectionLost` and `StartRemoteBootstrap` call, since `RpcController::Reset()` clears it. Raft
+calls thus go on `(follower, lane(T))` connections owned by lane(T)'s reactors on the sender, and
+since they are sent from lane(T)'s threads their callbacks run in lane(T)'s pools. Masters
+replicate their sys catalog with the same code but never send a hint: their peers have no lane and
+their messengers are unlaned. Multi-tablet heartbeats (`enable_multi_raft_heartbeat_batcher`,
+default off) span tablets of many lanes, so they carry no hint and use unlaned connections; this
+costs locality only.
+
 ## Service set and the postmaster
 
 The service mask is `--tserver_service_lane_cpus` if set, otherwise the full process cpuset. The
@@ -246,7 +313,9 @@ Lanes and QoS are independent. QoS moves threads between cgroup-v2 cpu-controlle
 a cpuset (`util/cgroups.cc`); lanes set per-thread masks with `sched_setaffinity`. QoS tagged
 handler pools are per (lane, tag), see [Messenger lanes](#messenger-lanes). A pool's
 `cgroup` and `lane` options are applied side by side in `Worker::Execute`, and per-task cgroups
-are unchanged. A cpuset imposed on the process from outside is honoured through discovery.
+are unchanged. Lane pipeline pools get the cgroups of the unlaned pipeline pools, see
+[Tablet pipelines](#tablet-pipelines). A cpuset imposed on the process from outside is honoured
+through discovery.
 
 ## Crossing accounting
 
@@ -263,6 +332,7 @@ they share the handler pools. Counted handoffs:
 | `YBThreadPool` task (also `ThreadSubPool`, CONCURRENT tokens) | the worker starts it | the pool's |
 | `Strand` item (SERIAL tokens, the raft-notifications strand) | the drain loop runs it | the strand's pool's |
 | `TaskStream` item, including items taken by a running stream | it is processed | the stream's pool's |
+| Leader-side operation queued on a tablet's preparer (`PreparerImpl::Submit`) | the drain loop takes it | the prepare pool's |
 | Reactor task (`Reactor::ScheduleReactorTask`) | it is scheduled | reactor |
 | Outbound call (`Reactor::QueueOutboundCall`), response or other outbound data from another thread (`Connection::QueueOutboundData`), Redis reply (`ConnectionContextWithQueue::QueueResponse`) | it is queued | reactor |
 | Inbound or local call queued to a lane's handler pool (`ServicePool::Process`) | a handler starts it | rpc handler |
@@ -278,9 +348,16 @@ counted on the submitting side, and only by laned submitters: an unlaned thread'
 slot is the spare one all unlaned threads share, and every call it hands to a laned reactor (all
 client calls from PG sessions, which are not laned yet) would write it.
 
-Not counted: work handed to a reactor by an unlaned thread (see above), operations queued on a
-tablet's preparer (its drain task is submitted uncounted, so leader-side prepare handoffs show
-nowhere), `PriorityThreadPool` tasks (flush and compaction), `rpc::Scheduler` and other io-service
+Within a tablet's pipeline work stays in the tablet's lane, and Raft callbacks run in the lane
+that sent the call, which is also the lane of the reactor that reads the response, so neither
+crosses. Until inbound connections are bound to lanes, an inbound write is handled in the lane of
+the reactor that read it and crosses into the tablet's pipeline once, at the preparer. A
+follower's `UpdateConsensus` handler prepares and applies follower-side operations inline, in the
+lane of the reactor that read the call, and crosses into the tablet's pipeline for the log append
+and the other tasks it submits to the tablet's pools.
+
+Not counted: work handed to a reactor by an unlaned thread (see above), `PriorityThreadPool` tasks
+and `Env` pool jobs (flush and compaction), `rpc::Scheduler` and other io-service
 timers, `CompletedCallQueue`, futures, promises and `Synchronizer` wakeups, raw
 `std::condition_variable` or `BlockingQueue` handoffs outside `TaskStream`, and lock wait queues.
 Wakeups that coalesce signals rather than carry items count one handoff per task, not per signal:

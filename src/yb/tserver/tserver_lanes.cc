@@ -67,6 +67,13 @@ DEFINE_NON_RUNTIME_int32(tserver_lane_connections_per_remote, 2,
 DEFINE_validator(tserver_lane_connections_per_remote, FLAG_RANGE_VALIDATOR(1, 256));
 TAG_FLAG(tserver_lane_connections_per_remote, advanced);
 
+DEFINE_NON_RUNTIME_string(tserver_lane_background, "lane",
+    "Where a tablet's RocksDB flushes and compactions run when lanes are enabled: 'lane' (default) "
+    "runs each task on the CPUs of the tablet's lane, 'service' on the CPUs of threads that belong "
+    "to no lane. No effect when lanes are disabled (tserver_lanes=1).");
+DEFINE_validator(tserver_lane_background, FLAG_IN_SET_VALIDATOR("lane", "service"));
+TAG_FLAG(tserver_lane_background, advanced);
+
 METRIC_DEFINE_gauge_uint64(server, lane_crossings_reactor,
     "Lane Crossings Into Reactors", yb::MetricUnit::kOperations,
     "Tasks and outbound calls handed to a reactor of one CPU lane by a thread of another lane.",
@@ -170,6 +177,14 @@ void SetupTserverLaneMessenger(rpc::MessengerBuilder* builder) {
   builder->set_lane_topology(&topology)
       .set_reactors_per_lane(FLAGS_tserver_lane_reactors)
       .set_connections_per_lane_remote(FLAGS_tserver_lane_connections_per_remote);
+}
+
+LaneId TserverTabletLane(Slice tablet_id) {
+  return LaneModeActive() ? LaneOf(tablet_id) : kNoLane;
+}
+
+LaneId TserverBackgroundTaskLane(LaneId tablet_lane) {
+  return FLAGS_tserver_lane_background == "service" ? kNoLane : tablet_lane;
 }
 
 void RegisterTserverLaneMetrics(const scoped_refptr<MetricEntity>& entity) {

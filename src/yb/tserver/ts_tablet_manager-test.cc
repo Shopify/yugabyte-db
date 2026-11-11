@@ -30,6 +30,11 @@
 // under the License.
 //
 
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -44,6 +49,7 @@
 
 #include "yb/consensus/consensus.messages.h"
 #include "yb/consensus/consensus_round.h"
+#include "yb/consensus/log.h"
 #include "yb/consensus/metadata.pb.h"
 #include "yb/consensus/raft_consensus.h"
 
@@ -57,9 +63,11 @@
 
 #include "yb/rocksdb/cache.h"
 #include "yb/rocksdb/db.h"
+#include "yb/rocksdb/listener.h"
 #include "yb/rocksdb/rate_limiter.h"
 
 #include "yb/tablet/operations/operation.h"
+#include "yb/tablet/preparer.h"
 #include "yb/tablet/tablet-test-harness.h"
 #include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_metadata.h"
@@ -77,11 +85,17 @@
 
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/countdown_latch.h"
+#include "yb/util/cpu_topology.h"
+#include "yb/util/cpu_topology_test_util.h"
 #include "yb/util/format.h"
+#include "yb/util/lanes.h"
+#include "yb/util/lanes_test_util.h"
 #include "yb/util/memory/arena.h"
 #include "yb/util/random_util.h"
 #include "yb/util/status_format.h"
+#include "yb/util/strand.h"
 #include "yb/util/test_util.h"
+#include "yb/util/tsan_util.h"
 
 using std::string;
 
@@ -109,6 +123,12 @@ DECLARE_int32(timestamp_history_retention_interval_sec);
 DECLARE_int32(db_history_retention_pin_max_txn_age_sec);
 DECLARE_int32(history_retention_pins_persist_interval_sec);
 DECLARE_int32(tier_migration_reconcile_interval_sec);
+
+DECLARE_string(TEST_cpu_topology_cpuset);
+DECLARE_string(TEST_cpu_topology_sysfs_root);
+DECLARE_string(tserver_lane_background);
+DECLARE_int32(tserver_lanes);
+DECLARE_bool(use_priority_thread_pool_for_flushes);
 
 namespace yb::tserver {
 
@@ -158,6 +178,7 @@ class TsTabletManagerTest : public YBTest {
     // There is no master to grant the xCluster-guarded information lease.
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_enforce_xcluster_guarded_lease) = false;
 
+    options_result->listeners = listeners_;
     mini_server_ = std::make_unique<MiniTabletServer>(paths, paths, 0, *options_result, 0);
   }
 
@@ -248,6 +269,8 @@ class TsTabletManagerTest : public YBTest {
   std::unique_ptr<MiniTabletServer> mini_server_;
   FsManager* fs_manager_;
   TSTabletManager* tablet_manager_;
+  // RocksDB listeners of the tablets the mini server opens.
+  std::vector<std::shared_ptr<rocksdb::EventListener>> listeners_;
 
   Schema schema_;
   RaftConfigPB config_;
@@ -1908,6 +1931,474 @@ TEST_F(PersistedDbHistoryRetentionPinsTest, HeartbeatAfterRestartReplacesPersist
   const auto fresh = persisted.AddSeconds(50);
   SetClusterPin(fresh);
   EXPECT_EQ(ClusterPin(), fresh);
+}
+
+namespace {
+
+// The thread a probe task ran on, as seen from inside it.
+struct ProbedThread {
+  LaneId lane = kNoLane;
+  std::string os_name;
+  CpuSet mask;
+};
+
+// Linux keeps the first 15 characters of a thread name.
+std::string OsThreadName() {
+#ifdef __linux__
+  char name[16] = {};
+  CHECK_EQ(prctl(PR_GET_NAME, name), 0);
+  return name;
+#else
+  return Thread::current_thread() ? Thread::current_thread()->name() : std::string();
+#endif
+}
+
+ProbedThread ProbeThisThread() {
+  return ProbedThread {
+    .lane = ThisThreadLane(),
+    .os_name = OsThreadName(),
+    .mask = ThisThreadMask(),
+  };
+}
+
+using Submitter = std::function<Status(std::function<void()>)>;
+
+Result<ProbedThread> RunProbe(const Submitter& submit) {
+  CountDownLatch latch(1);
+  ProbedThread result;
+  RETURN_NOT_OK(submit([&result, &latch] {
+    result = ProbeThisThread();
+    latch.CountDown();
+  }));
+  SCHECK(latch.WaitFor(10s * kTimeMultiplier), TimedOut, "Probe did not run");
+  return result;
+}
+
+// Runs a probe on each pool and strand of the peer's pipeline: the stages that run its
+// operations (prepare, Raft, notifications and op apply, log append, segment allocation and
+// sync) and its service strand.
+Result<std::map<std::string, ProbedThread>> ProbePipeline(tablet::TabletPeer* peer) {
+  auto consensus = VERIFY_RESULT(peer->GetRaftConsensus());
+  auto* log = peer->log();
+  SCHECK_NOTNULL(log);
+  std::map<std::string, Submitter> stages = {
+    {"prepare", [peer](auto f) { return peer->DEBUG_GetPreparer()->PoolToken()->SubmitFunc(f); }},
+    {"raft", [consensus](auto f) { return consensus->TEST_SubmitToRaftPool(f); }},
+    {"notif", [consensus](auto f) {
+      consensus->TEST_EnqueueNotification(f);
+      return Status::OK();
+    }},
+    {"append", [log](auto f) { return log->TEST_SubmitFuncToAppendToken(f); }},
+    {"logalloc", [log](auto f) { return log->TEST_SubmitFuncToAllocationToken(f); }},
+    {"logsync", [log](auto f) { return log->TEST_SubmitFuncToBackgroundSyncToken(f); }},
+    {"service", [peer](auto f) {
+      peer->StrandEnqueue(MakeFunctorStrandTask(std::move(f)));
+      return Status::OK();
+    }},
+  };
+  std::map<std::string, ProbedThread> result;
+  for (const auto& [stage, submit] : stages) {
+    result[stage] = VERIFY_RESULT_PREPEND(RunProbe(submit), stage);
+  }
+  return result;
+}
+
+std::string LaneName(LaneId lane) {
+  return Format("L$0", ZeroPadded(lane, 3));
+}
+
+// Records the lane and mask of the threads that run RocksDB flushes and compactions, by DB path.
+class FlushLaneListener : public rocksdb::EventListener {
+ public:
+  void OnFlushCompleted(rocksdb::DB* db, const rocksdb::FlushJobInfo&) override {
+    Record(db, &flushes_);
+  }
+
+  void OnCompactionCompleted(rocksdb::DB* db, const rocksdb::CompactionJobInfo&) override {
+    Record(db, &compactions_);
+  }
+
+  // Threads of the flushes or compactions of the DBs whose path contains path_part.
+  std::vector<ProbedThread> Flushes(const std::string& path_part) {
+    return Find(flushes_, path_part);
+  }
+
+  std::vector<ProbedThread> Compactions(const std::string& path_part) {
+    return Find(compactions_, path_part);
+  }
+
+ private:
+  using Jobs = std::vector<std::pair<std::string, ProbedThread>>;
+
+  void Record(rocksdb::DB* db, Jobs* jobs) {
+    auto thread = ProbeThisThread();
+    std::lock_guard lock(mutex_);
+    jobs->emplace_back(db->GetName() + "/", std::move(thread));
+  }
+
+  std::vector<ProbedThread> Find(const Jobs& jobs, const std::string& path_part) {
+    std::vector<ProbedThread> result;
+    std::lock_guard lock(mutex_);
+    for (const auto& [path, thread] : jobs) {
+      if (path.find(path_part) != std::string::npos) {
+        result.push_back(thread);
+      }
+    }
+    return result;
+  }
+
+  std::mutex mutex_;
+  Jobs flushes_;
+  Jobs compactions_;
+};
+
+} // namespace
+
+// Writes through the peer (preparer, Raft, log, apply) and flushes.
+class TsTabletManagerPipelineTest : public TsTabletManagerTest {
+ protected:
+  void SetUp() override {
+    listeners_.push_back(flush_listener_);
+    TsTabletManagerTest::SetUp();
+  }
+
+  Result<tablet::TabletPeerPtr> CreateLeader(const TabletId& tablet_id) {
+    std::shared_ptr<TabletPeer> peer;
+    RETURN_NOT_OK(CreateNewTablet(kTableId, tablet_id, GetSimpleTestSchema(), &peer));
+    RETURN_NOT_OK(VERIFY_RESULT(peer->GetConsensus())->WaitUntilLeaderForTests(10s));
+    return peer;
+  }
+
+  static Status WriteRow(tablet::TabletPeer* peer, int32_t key) {
+    auto tablet = VERIFY_RESULT(peer->shared_tablet());
+    WriteRequestPB req;
+    req.set_tablet_id(peer->tablet_id());
+    AddTestRowInsert(key, key, &req);
+    auto arena = SharedThreadSafeArena();
+    auto* resp = arena->NewArenaObject<LWWriteResponsePB>();
+    CountDownLatch latch(1);
+    auto query = std::make_unique<tablet::WriteQuery>(
+        VERIFY_RESULT(peer->GetConsensus())->LeaderTerm(), CoarseTimePoint::max(), peer, tablet,
+        /* rpc_context= */ nullptr, resp);
+    query->set_client_request(*arena->NewArenaObject<LWWriteRequestPB>(req));
+    query->set_callback(tablet::MakeLatchOperationCompletionCallback(&latch, resp));
+    peer->WriteAsync(std::move(query));
+    latch.Wait();
+    SCHECK(!resp->has_error(), IllegalState,
+           Format("Write of key $0 failed: $1", key, resp->error().ShortDebugString()));
+    return Status::OK();
+  }
+
+  static Status WriteAndFlush(tablet::TabletPeer* peer, int32_t key) {
+    RETURN_NOT_OK(WriteRow(peer, key));
+    return VERIFY_RESULT(peer->shared_tablet())->Flush(
+        tablet::FlushMode::kSync, rocksdb::FlushReason::kTestOnly);
+  }
+
+  std::shared_ptr<FlushLaneListener> flush_listener_ = std::make_shared<FlushLaneListener>();
+};
+
+// Lanes off: one pipeline pool set, built by the constructor; tablets have no lane and run on
+// it, and nothing lane-related happens.
+TEST_F(TsTabletManagerPipelineTest, LanesOffKeepsOneUnlanedSet) {
+  ASSERT_FALSE(LaneModeActive());
+  ASSERT_EQ(tablet_manager_->num_lane_pipeline_pools(), 0);
+  std::vector<TSTabletManager::PipelinePools> sets;
+  tablet_manager_->ForEachPipelinePools([&sets](const auto& pools) { sets.push_back(pools); });
+  ASSERT_EQ(sets.size(), 1);
+  ASSERT_EQ(sets[0].prepare, tablet_manager_->tablet_prepare_pool());
+  ASSERT_EQ(sets[0].append, tablet_manager_->append_pool());
+  ASSERT_EQ(sets[0].raft, tablet_manager_->raft_pool());
+  ASSERT_EQ(sets[0].raft_notifications, tablet_manager_->raft_notifications_pool());
+  ASSERT_EQ(sets[0].log_sync, tablet_manager_->log_sync_pool());
+  ASSERT_EQ(sets[0].log_alloc, tablet_manager_->allocation_pool());
+  for (LaneId lane : {LaneId(0), LaneId(3), kNoLane}) {
+    ASSERT_EQ(tablet_manager_->pipeline_pools(lane).prepare, sets[0].prepare);
+  }
+  ASSERT_EQ(sets[0].prepare->options().name, "prepare");
+  ASSERT_EQ(sets[0].raft->options().name, "consensus");
+  ASSERT_EQ(sets[0].raft_notifications->options().name, "raft_notifications");
+  ASSERT_EQ(sets[0].log_alloc->options().name, "log-alloc");
+
+  auto peer = ASSERT_RESULT(CreateLeader("lanes-off"));
+  ASSERT_EQ(peer->lane(), kNoLane);
+  const std::map<std::string, std::string> expected_names = {
+    {"prepare", "prepare_"}, {"raft", "consensus_"}, {"notif", "raft_notifica"},
+    {"append", "append_"}, {"logalloc", "log-alloc_"}, {"logsync", "log-sync_"},
+  };
+  for (const auto& [stage, thread] : ASSERT_RESULT(ProbePipeline(peer.get()))) {
+    SCOPED_TRACE(stage);
+    ASSERT_EQ(thread.lane, kNoLane);
+    auto it = expected_names.find(stage);
+    if (it != expected_names.end()) {
+      ASSERT_TRUE(thread.os_name.starts_with(it->second)) << thread.os_name;
+    }
+  }
+  ASSERT_OK(WriteAndFlush(peer.get(), 1));
+  auto flushes = flush_listener_->Flushes(Format("/tablet-$0/", peer->tablet_id()));
+  ASSERT_FALSE(flushes.empty());
+  for (const auto& thread : flushes) {
+    ASSERT_EQ(thread.lane, kNoLane);
+  }
+  ASSERT_EQ(TEST_CpuAffinityCallCount(), 0);
+  auto counts = LaneHandoffCounts::Now();
+  ASSERT_EQ(counts.total_crossings(), 0) << counts.ToString();
+  ASSERT_EQ(counts.entries_from_unlaned, 0);
+}
+
+// Lanes off, a log appender keeps its append worker for taskstream_queue_max_wait_ms after its
+// queue empties.
+TEST_F(TsTabletManagerPipelineTest, AppendWorkersParkForTaskStreamWait) {
+  std::vector<tablet::TabletPeerPtr> peers;
+  for (int i = 0; i != 4; ++i) {
+    peers.push_back(ASSERT_RESULT(CreateLeader(Format("tablet-$0", i))));
+  }
+  auto* append_pool = tablet_manager_->append_pool();
+  ASSERT_OK(WaitFor([append_pool] { return append_pool->Idle(); }, 10s, "Append pool idle"));
+  const auto start = MonoTime::Now();
+  for (auto& peer : peers) {
+    ASSERT_OK(WriteRow(peer.get(), 1));
+  }
+  ASSERT_FALSE(append_pool->Idle());
+  ASSERT_OK(WaitFor([append_pool] { return append_pool->Idle(); }, 10s, "Append pool idle"));
+  ASSERT_GE(MonoTime::Now() - start, 500ms);
+}
+
+// Forced 4 lanes over a fake topology of two 2-CPU L3 domains laid over CPUs 0-3: lanes 0 and 1
+// share CPUs 0-1, lanes 2 and 3 share CPUs 2-3.
+class TsTabletManagerLanesTest : public TsTabletManagerPipelineTest {
+ protected:
+  void SetUp() override {
+    auto mask = ThisThreadMask();
+    for (size_t cpu = 0; cpu != 4; ++cpu) {
+      if (!mask.Test(cpu)) {
+        GTEST_SKIP() << "Needs CPUs 0-3, have " << mask.ToString();
+      }
+    }
+    auto root = GetTestPath("sys_cpu");
+    ASSERT_OK(WriteFakeSysfsCpuTree(
+        root, MakeFakeCpus({.sockets = 1, .l3_per_socket = 2, .cores_per_l3 = 2, .smt = 1})));
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_cpu_topology_sysfs_root) = root;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_cpu_topology_cpuset) = "0-3";
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_lanes) = 4;
+    // Unset, so that the tablet server installs its topology; restored after the server stops.
+    lane_scope_.emplace();
+    TsTabletManagerPipelineTest::SetUp();
+    ASSERT_TRUE(LaneModeActive());
+    ASSERT_EQ(GetLaneTopology().num_lanes(), 4);
+  }
+
+  void TearDown() override {
+    TsTabletManagerPipelineTest::TearDown();
+    lane_scope_.reset();
+  }
+
+  // Creates leaders until every lane has one, trying tablet ids from tablet-<first>.
+  Result<std::vector<tablet::TabletPeerPtr>> CreateLeaderPerLane(int first = 0) {
+    std::vector<tablet::TabletPeerPtr> result(4);
+    size_t found = 0;
+    for (int i = first; found != result.size(); ++i) {
+      SCHECK_LT(i, first + 100, IllegalState, "Tablet ids do not cover every lane");
+      auto tablet_id = Format("tablet-$0", i);
+      auto lane = LaneOf(tablet_id);
+      if (!result[lane]) {
+        result[lane] = VERIFY_RESULT(CreateLeader(tablet_id));
+        ++found;
+      }
+    }
+    return result;
+  }
+
+ private:
+  std::optional<TEST_SetLaneTopology> lane_scope_;
+};
+
+// Init builds one pipeline pool set per lane next to the constructor's; each lane's workers run
+// in the lane and carry it in their names.
+TEST_F(TsTabletManagerLanesTest, LanePipelinePools) {
+  const auto& topology = GetLaneTopology();
+  ASSERT_EQ(tablet_manager_->num_lane_pipeline_pools(), 4);
+  std::vector<TSTabletManager::PipelinePools> sets;
+  tablet_manager_->ForEachPipelinePools([&sets](const auto& pools) { sets.push_back(pools); });
+  ASSERT_EQ(sets.size(), 5);
+  ASSERT_EQ(sets[0].prepare, tablet_manager_->tablet_prepare_pool());
+  ASSERT_EQ(sets[0].raft_notifications, tablet_manager_->raft_notifications_pool());
+  ASSERT_EQ(tablet_manager_->pipeline_pools(kNoLane).append, tablet_manager_->append_pool());
+
+  for (LaneId lane = 0; lane != 4; ++lane) {
+    SCOPED_TRACE(Format("lane $0", lane));
+    const auto& pools = sets[lane + 1];
+    ASSERT_EQ(tablet_manager_->pipeline_pools(lane).log_sync, pools.log_sync);
+    ASSERT_EQ(tablet_manager_->pipeline_pools(lane + 4).log_sync, pools.log_sync);
+    ASSERT_NE(pools.prepare, sets[0].prepare);
+    const auto lane_name = LaneName(lane);
+    std::vector<std::tuple<std::string, std::string, ThreadPool*>> stages = {
+      {"prepare", "prepare", pools.prepare},
+      {"append", "append", pools.append},
+      {"consensus", "raft", pools.raft},
+      {"log-sync", "logsync", pools.log_sync},
+      {"log-alloc", "logalloc", pools.log_alloc},
+    };
+    for (const auto& [name, short_name, pool] : stages) {
+      SCOPED_TRACE(name);
+      ASSERT_EQ(pool->options().name, Format("$0_$1", name, lane_name));
+      ASSERT_EQ(pool->options().worker_name_prefix, Format("$0_$1", lane_name, short_name));
+      ASSERT_EQ(pool->options().max_workers, ThreadPoolOptions::kUnlimitedWorkers);
+      ASSERT_EQ(pool->options().min_workers, 1U);
+      ASSERT_STR_CONTAINS(
+          pool->options().ToString(),
+          Format("lane: $0 crossing_category: kTabletPipeline }", lane));
+      auto thread = ASSERT_RESULT(RunProbe([pool](auto f) { return pool->SubmitFunc(f); }));
+      ASSERT_EQ(thread.lane, lane);
+      ASSERT_EQ(thread.mask, topology.lane_mask(lane));
+      ASSERT_TRUE(thread.os_name.starts_with(Format("$0_$1_", lane_name, short_name)))
+          << thread.os_name;
+    }
+    ASSERT_EQ(pools.raft_notifications->options().name, Format("raft_notifications_$0", lane_name));
+    ASSERT_STR_CONTAINS(
+        pools.raft_notifications->options().ToString(),
+        Format("lane: $0 crossing_category: kTabletPipeline }", lane));
+    auto thread = ASSERT_RESULT(RunProbe([&pools](auto f) {
+      return pools.raft_notifications->Submit(f);
+    }));
+    ASSERT_EQ(thread.lane, lane);
+    ASSERT_TRUE(thread.os_name.starts_with(lane_name + "_notif_")) << thread.os_name;
+  }
+}
+
+// Each tablet's pipeline, service strand and flushes run in LaneOf(tablet_id); the constructor's
+// set runs none of it.
+TEST_F(TsTabletManagerLanesTest, TabletPipelineRunsInItsLane) {
+  const auto& topology = GetLaneTopology();
+  auto peers = ASSERT_RESULT(CreateLeaderPerLane());
+  for (LaneId lane = 0; lane != 4; ++lane) {
+    auto& peer = peers[lane];
+    SCOPED_TRACE(peer->tablet_id());
+    ASSERT_EQ(peer->lane(), lane);
+    for (const auto& [stage, thread] : ASSERT_RESULT(ProbePipeline(peer.get()))) {
+      SCOPED_TRACE(stage);
+      ASSERT_EQ(thread.lane, lane);
+      ASSERT_EQ(thread.mask, topology.lane_mask(lane));
+      ASSERT_TRUE(thread.os_name.starts_with(
+          Format("$0_$1_", LaneName(lane), stage == "service" ? "rpc" : stage)))
+          << thread.os_name;
+    }
+    for (int key = 0; key != 3; ++key) {
+      ASSERT_OK(WriteAndFlush(peer.get(), key));
+    }
+    auto flushes = flush_listener_->Flushes(Format("/tablet-$0/", peer->tablet_id()));
+    ASSERT_FALSE(flushes.empty());
+    for (const auto& thread : flushes) {
+      ASSERT_EQ(thread.lane, lane);
+      ASSERT_EQ(thread.mask, topology.lane_mask(lane));
+    }
+  }
+  // Only the persistent worker of each min-1 pool was ever created.
+  auto unlaned = tablet_manager_->pipeline_pools(kNoLane);
+  for (auto* pool : {unlaned.prepare, unlaned.append, unlaned.raft, unlaned.log_sync,
+                     unlaned.log_alloc}) {
+    ASSERT_EQ(pool->TEST_NumWorkersCreated(), 1) << pool->options().name;
+  }
+  ASSERT_EQ(unlaned.raft_notifications->TEST_NumWorkersCreated(), 0);
+}
+
+// Flushes on the priority pool and compactions run in the tablet's lane too, also on a worker
+// that last ran a task of another lane.
+TEST_F(TsTabletManagerLanesTest, PriorityPoolTasksRunInTabletLane) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_use_priority_thread_pool_for_flushes) = true;
+  const auto& topology = GetLaneTopology();
+  auto peers = ASSERT_RESULT(CreateLeaderPerLane());
+  for (auto lane : {LaneId(0), LaneId(2), LaneId(1), LaneId(3)}) {
+    auto& peer = peers[lane];
+    SCOPED_TRACE(peer->tablet_id());
+    const auto db_path = Format("/tablet-$0/", peer->tablet_id());
+    for (int key = 0; key != 2; ++key) {
+      ASSERT_OK(WriteAndFlush(peer.get(), key));
+    }
+    ASSERT_OK(ASSERT_RESULT(peer->shared_tablet())->ForceManualRocksDBCompact());
+    auto flushes = flush_listener_->Flushes(db_path);
+    auto compactions = flush_listener_->Compactions(db_path);
+    ASSERT_EQ(flushes.size(), 2);
+    ASSERT_FALSE(compactions.empty());
+    flushes.insert(flushes.end(), compactions.begin(), compactions.end());
+    for (const auto& thread : flushes) {
+      ASSERT_EQ(thread.lane, lane);
+      ASSERT_EQ(thread.mask, topology.lane_mask(lane));
+      ASSERT_TRUE(thread.os_name.starts_with("priority-work")) << thread.os_name;
+    }
+  }
+}
+
+// In lane mode a log appender releases its append worker after
+// log_appender_lane_mode_max_wait_ms, so idle tablets hold no busy append workers.
+TEST_F(TsTabletManagerLanesTest, AppendWorkersParkBriefly) {
+  std::vector<tablet::TabletPeerPtr> peers;
+  for (int round = 0; round != 2; ++round) {
+    for (auto& peer : ASSERT_RESULT(CreateLeaderPerLane(round * 100))) {
+      peers.push_back(peer);
+    }
+  }
+  auto all_idle = [this] {
+    for (LaneId lane = 0; lane != 4; ++lane) {
+      if (!tablet_manager_->pipeline_pools(lane).append->Idle()) {
+        return false;
+      }
+    }
+    return true;
+  };
+  ASSERT_OK(WaitFor(all_idle, 10s, "Append pools idle"));
+  for (int key = 0; key != 3; ++key) {
+    for (auto& peer : peers) {
+      ASSERT_OK(WriteRow(peer.get(), key));
+    }
+    ASSERT_OK(WaitFor(all_idle, 200ms, "Append pools idle after the lane mode park"));
+  }
+}
+
+// With tserver_lane_background=service a tablet's flushes run on the service mask.
+TEST_F(TsTabletManagerLanesTest, ServiceBackgroundFlushesOnServiceMask) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_lane_background) = "service";
+  auto peer = ASSERT_RESULT(CreateLeader("service-background"));
+  ASSERT_NE(peer->lane(), kNoLane);
+  ASSERT_OK(WriteAndFlush(peer.get(), 1));
+  auto flushes = flush_listener_->Flushes(Format("/tablet-$0/", peer->tablet_id()));
+  ASSERT_FALSE(flushes.empty());
+  for (const auto& thread : flushes) {
+    ASSERT_EQ(thread.lane, kNoLane);
+    ASSERT_EQ(thread.mask, GetLaneTopology().service_mask());
+  }
+}
+
+// Leader-side operations queued on a tablet's preparer count one tablet-pipeline handoff each,
+// and none when submitted from the tablet's own lane.
+TEST_F(TsTabletManagerLanesTest, PreparerCountsEachOperationOnce) {
+  auto peers = ASSERT_RESULT(CreateLeaderPerLane());
+  auto& peer = peers[0];
+  constexpr int kWrites = 20;
+  auto write_from_lane = [&peer](LaneId lane, int first_key) {
+    Status status;
+    RunOnStdThread([&] {
+      ApplyLaneToCurrentThread(lane);
+      for (int key = first_key; key != first_key + kWrites && status.ok(); ++key) {
+        status = WriteRow(peer.get(), key);
+      }
+    });
+    return status;
+  };
+  // Warm up, so lazily started log and Raft work is not counted below.
+  ASSERT_OK(write_from_lane(0, 0));
+
+  auto before = LaneHandoffCounts::Now();
+  ASSERT_OK(write_from_lane(0, 100));
+  auto same_lane = LaneHandoffCounts::Now() - before;
+  ASSERT_EQ(same_lane.crossing(LaneCrossingCategory::kTabletPipeline), 0)
+      << same_lane.ToString();
+
+  before = LaneHandoffCounts::Now();
+  ASSERT_OK(write_from_lane(2, 200));
+  auto other_lane = LaneHandoffCounts::Now() - before;
+  ASSERT_EQ(other_lane.crossing(LaneCrossingCategory::kTabletPipeline), kWrites)
+      << other_lane.ToString();
 }
 
 } // namespace yb::tserver

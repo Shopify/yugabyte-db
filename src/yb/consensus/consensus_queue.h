@@ -476,6 +476,9 @@ class PeerMessageQueue {
 
   void SetNotificationStrandCgroup(Cgroup* cgroup);
 
+  // Runs func on the strand that runs observer notifications (and so op apply).
+  void TEST_EnqueueNotification(std::function<void()> func);
+
  private:
   FRIEND_TEST(ConsensusQueueTest, TestQueueAdvancesCommittedIndex);
   FRIEND_TEST(ConsensusQueueTest, TestReadReplicatedMessagesForCDC);

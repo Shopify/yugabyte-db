@@ -844,6 +844,7 @@ Tablet::Tablet(const TabletInitData& data)
       retention_policy_(std::make_shared<TabletRetentionPolicy>(
           clock_, [this](const auto&) { return AllowedHistoryCutoff(); }, metadata_.get())),
       full_compaction_pool_(data.full_compaction_pool),
+      rocksdb_task_lane_(data.rocksdb_task_lane),
       tier_migration_hooks_(std::move(data.tier_migration_hooks)),
       admin_triggered_compaction_pool_(data.admin_triggered_compaction_pool),
       ts_post_split_compaction_added_(std::move(data.post_split_compaction_added)),
@@ -1510,6 +1511,7 @@ Status Tablet::OpenRegularDB(const rocksdb::Options& common_options) {
     return rocksdb_open_status;
   }
   regular_db_.reset(db);
+  down_cast<rocksdb::DBImpl*>(regular_db_.get())->SetTaskLane(rocksdb_task_lane_);
   regular_db_->ListenFilesChanged([this] { RegularDbFilesChanged(); });
 
   return Status::OK();
@@ -1578,6 +1580,7 @@ Status Tablet::OpenIntentsDB(const rocksdb::Options& common_options) {
   rocksdb::DB* intents_db = nullptr;
   RETURN_NOT_OK(rocksdb::DB::Open(intents_rocksdb_options, intents_dir, &intents_db));
   intents_db_.reset(intents_db);
+  down_cast<rocksdb::DBImpl*>(intents_db_.get())->SetTaskLane(rocksdb_task_lane_);
   intents_db_->ListenFilesChanged([this] { CleanupIntentFiles(); });
 
   // We need to set the "cdc_sdk_min_checkpoint_op_id" so that intents don't get

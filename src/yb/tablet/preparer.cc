@@ -131,6 +131,7 @@ class PreparerImpl {
   const size_t leader_side_single_op_size_limit_;
 
   std::unique_ptr<ThreadPoolToken> tablet_prepare_pool_token_;
+  const LaneCrossingCategory crossing_category_;
 
   // A temporary buffer of rounds to replicate, used to reduce reallocation.
   consensus::ConsensusRounds rounds_to_replicate_;
@@ -160,7 +161,8 @@ PreparerImpl::PreparerImpl(consensus::Consensus* consensus, ThreadPool* tablet_p
       leader_side_single_op_size_limit_(
           FLAGS_rpc_max_message_size * FLAGS_estimated_replicate_msg_size_percentage),
       tablet_prepare_pool_token_(tablet_prepare_pool
-                                     ->NewToken(ThreadPool::ExecutionMode::SERIAL)) {
+                                     ->NewToken(ThreadPool::ExecutionMode::SERIAL)),
+      crossing_category_(tablet_prepare_pool->options().crossing_category) {
 }
 
 PreparerImpl::~PreparerImpl() {
@@ -202,6 +204,7 @@ Status PreparerImpl::Submit(OperationDriver* operation_driver) {
     // Prepare leader-side operations on the "preparer thread" so we can only acquire the
     // ReplicaState lock once and append multiple operations.
     active_tasks_.fetch_add(1, std::memory_order_release);
+    operation_driver->prepare_lane_handoff().RecordSubmitter();
     queue_.Push(operation_driver);
   } else {
     // For follower-side operations, there would be no benefit in preparing them on the preparer
@@ -222,7 +225,7 @@ Status PreparerImpl::Submit(OperationDriver* operation_driver) {
   // such thread will be running, the other will be in the queue.
   //
   // Run drains operations queued by many submitters, so it is not counted as a lane handoff of
-  // whichever submitter woke it.
+  // whichever submitter woke it; each queued operation counts its own.
   return tablet_prepare_pool_token_->SubmitDrainFunc(std::bind(&PreparerImpl::Run, this));
 }
 
@@ -234,6 +237,7 @@ void PreparerImpl::Run() {
   for (;;) {
     while (OperationDriver *item = queue_.Pop()) {
       active_tasks_.fetch_sub(1, std::memory_order_release);
+      item->prepare_lane_handoff().RecordExecution(crossing_category_);
       ProcessItem(item);
     }
     ProcessAndClearLeaderSideBatch();
