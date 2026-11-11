@@ -240,12 +240,13 @@ class LaneShardedCounters {
 // Cross-lane handoffs counted in lane mode, by the category of the executing thread.
 uint64_t LaneCrossingCount(LaneCrossingCategory category);
 
-// Handoffs from a thread with no lane to a laned thread.
+// Handoffs from a thread with no lane to a laned pool, strand or task stream thread. Handoffs from
+// such a thread into a reactor are not counted (see CountLaneHandoffFromThisThread).
 uint64_t LaneEntriesFromUnlanedCount();
 
 // Counts a handoff that the calling thread executes and that was submitted from submitter: a
 // crossing when both are laned and differ, an entry from unlaned when only the calling thread is
-// laned.
+// laned. This is the only path that counts entries from unlaned threads.
 inline void CountLaneHandoffToThisThread(LaneId submitter, LaneCrossingCategory category) {
   if (LaneModeActive()) {
     const auto executor = ThisThreadLane();

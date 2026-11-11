@@ -252,10 +252,11 @@ are unchanged. A cpuset imposed on the process from outside is honoured through 
 
 A handoff records the submitting thread's lane in one byte when it is queued and compares it with
 the executing thread's lane when it runs. If both are laned and differ it counts a crossing for
-the executor's category; if only the executor is laned it counts an entry from unlaned. Categories
-are reactor, rpc handler, tablet pipeline, callback and other, set per pool with
-`ThreadPoolOptions::crossing_category` (default other); an item can override its pool's category
-(`LaneHandoff::SetCategory`), as RPC callbacks do, since they share the handler pools. Counted handoffs:
+the executor's category; if only the executor is laned it counts an entry from unlaned, except
+for handoffs into reactors (see below). Categories are reactor, rpc handler, tablet pipeline,
+callback and other, set per pool with `ThreadPoolOptions::crossing_category` (default other); an
+item can override its pool's category (`LaneHandoff::SetCategory`), as RPC callbacks do, since
+they share the handler pools. Counted handoffs:
 
 | Primitive | Counted when | Category |
 | --- | --- | --- |
@@ -278,20 +279,21 @@ slot is the spare one all unlaned threads share, and every call it hands to a la
 client calls from PG sessions, which are not laned yet) would write it.
 
 Not counted: work handed to a reactor by an unlaned thread (see above), operations queued on a
-tablet's preparer (its drain task is submitted uncounted, so
-leader-side prepare handoffs show nowhere), `PriorityThreadPool` tasks (flush and compaction),
-`rpc::Scheduler` and other io-service timers, `CompletedCallQueue`, futures, promises and
-`Synchronizer` wakeups, raw `std::condition_variable` or `BlockingQueue` handoffs outside
-`TaskStream`, and lock wait queues. Wakeups that coalesce signals rather than carry items count
-one handoff per task, not per signal: Raft peer request signals (`Peer::SignalRequest`), the
-log's background sync task, and a PG session's deferred processing of pending requests.
-Crossings through these do not show, or show once per batch, in the metrics.
+tablet's preparer (its drain task is submitted uncounted, so leader-side prepare handoffs show
+nowhere), `PriorityThreadPool` tasks (flush and compaction), `rpc::Scheduler` and other io-service
+timers, `CompletedCallQueue`, futures, promises and `Synchronizer` wakeups, raw
+`std::condition_variable` or `BlockingQueue` handoffs outside `TaskStream`, and lock wait queues.
+Wakeups that coalesce signals rather than carry items count one handoff per task, not per signal:
+Raft peer request signals (`Peer::SignalRequest`), the log's background sync task, and a PG
+session's deferred processing of pending requests. Crossings through these do not show, or show once
+per batch, in the metrics.
 
 Counters are sharded per lane, one cache line per lane plus one for unlaned threads, each written
 only by threads of its lane (the executing thread, or the submitter for reactors), and summed on
-read (`LaneShardedCounters` in `util/lanes.h`). With lanes on the tserver exposes them as
-counters `lane_crossings_reactor`, `lane_crossings_rpc_handler`, `lane_crossings_tablet_pipeline`,
+read (`LaneShardedCounters` in `util/lanes.h`). With lanes on the tserver exposes them as counters
+`lane_crossings_reactor`, `lane_crossings_rpc_handler`, `lane_crossings_tablet_pipeline`,
 `lane_crossings_callback`, `lane_crossings_other` and `lane_entries_from_unlaned`; with lanes off
-they are not registered and nothing is counted. The values are process-wide, so tservers sharing a
-process report the same totals. A crossing counter's rate divided by the operation rate is the
-number of crossings per operation on that path.
+they are not registered and nothing is counted. `lane_entries_from_unlaned` covers laned pools,
+strands and task streams only, not work unlaned threads hand to reactors. The values are
+process-wide, so tservers sharing a process report the same totals. A crossing counter's rate
+divided by the operation rate is the number of crossings per operation on that path.

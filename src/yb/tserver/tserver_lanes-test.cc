@@ -273,13 +273,15 @@ TEST_F(TserverLanesTest, RepeatInitFromConfinedThreadIsNoOp) {
 TEST_F(TserverLanesTest, LaneMetricsRegisteredOnlyWhenActive) {
   MetricRegistry registry;
   auto entity = METRIC_ENTITY_server.Instantiate(&registry, "lanes-test");
-  auto lane_metrics = [&entity] {
+  std::map<std::string, std::string> descriptions;
+  auto lane_metrics = [&entity, &descriptions] {
     std::map<std::string, uint64_t> result;
     for (const auto& [prototype, metric] : entity->TEST_UsageMetricsMap()) {
       std::string name = prototype->name();
       if (name.starts_with("lane_")) {
         EXPECT_EQ(prototype->type(), MetricType::kCounter) << name;
         result[name] = down_cast<FunctionGauge<uint64_t>*>(metric.get())->value();
+        descriptions[name] = prototype->description();
       }
     }
     return result;
@@ -319,6 +321,17 @@ TEST_F(TserverLanesTest, LaneMetricsRegisteredOnlyWhenActive) {
   ASSERT_EQ(after["lane_crossings_rpc_handler"], before["lane_crossings_rpc_handler"] + 1);
   ASSERT_EQ(after["lane_entries_from_unlaned"], before["lane_entries_from_unlaned"] + 1);
   ASSERT_EQ(after["lane_crossings_other"], before["lane_crossings_other"]);
+
+  // Work an unlaned thread hands to a laned reactor is not counted, as the help text says.
+  RunOnStdThread([] {
+    ApplyServiceMaskToCurrentThread();
+    CountLaneHandoffFromThisThread(1, LaneCrossingCategory::kReactor);
+  });
+  ASSERT_EQ(lane_metrics(), after);
+  ASSERT_EQ(descriptions["lane_entries_from_unlaned"],
+            "Tasks handed to a laned thread pool, strand or task stream by a thread that belongs "
+            "to no lane. Work handed to reactors by threads that belong to no lane is not "
+            "counted.");
 }
 
 } // namespace yb::tserver

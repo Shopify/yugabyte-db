@@ -89,7 +89,8 @@ METRIC_DEFINE_gauge_uint64(server, lane_crossings_other,
     yb::EXPOSE_AS_COUNTER);
 METRIC_DEFINE_gauge_uint64(server, lane_entries_from_unlaned,
     "Lane Entries From Unlaned Threads", yb::MetricUnit::kOperations,
-    "Tasks handed to a thread of a CPU lane by a thread that belongs to no lane.",
+    "Tasks handed to a laned thread pool, strand or task stream by a thread that belongs to no "
+    "lane. Work handed to reactors by threads that belong to no lane is not counted.",
     yb::EXPOSE_AS_COUNTER);
 
 namespace yb::tserver {
