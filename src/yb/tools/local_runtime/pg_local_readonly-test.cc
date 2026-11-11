@@ -1556,6 +1556,29 @@ TEST_F(ReadonlyPgServerTest, WaitsOnConflicts) {
   ASSERT_EQ(ASSERT_RESULT(value(3)), 34);
 }
 
+// Expressions pushed down to DocDB run in the runtime's process, which must use the database's
+// UTF-8 encoding and case mapping as PostgreSQL does.
+TEST_F(ReadonlyPgServerTest, PushdownUsesDatabaseEncoding) {
+  auto server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          GetTestPath("pushdown-encoding"), Snapshot(), AllocateFreePort(),
+          CatalogMode::kSerializedTransactions));
+  auto connection = ASSERT_RESULT(Connect(*server));
+  ASSERT_OK(connection.Execute("CREATE TABLE texts(k int PRIMARY KEY, v varchar(255), w text)"));
+  ASSERT_OK(connection.Execute(
+      "INSERT INTO texts VALUES (1, repeat('\u00e9', 200), '\u00c9COLE'), (2, 'abc', 'Istanbul')"));
+  const auto filter = "SELECT k FROM texts WHERE lower(w) = '\u00e9cole' AND char_length(w) = 5";
+  ASSERT_STR_CONTAINS(
+      ASSERT_RESULT(connection.FetchAllAsString(std::string("EXPLAIN ") + filter)),
+      "Storage Filter");
+  ASSERT_EQ(ASSERT_RESULT(connection.FetchRow<int32_t>(filter)), 1);
+  // A 200-character, 400-byte value still fits varchar(255) when the update runs in DocDB.
+  ASSERT_OK(connection.Execute("UPDATE texts SET v = v || '' WHERE k = 1"));
+  ASSERT_EQ(
+      ASSERT_RESULT(connection.FetchRow<int32_t>("SELECT char_length(v) FROM texts WHERE k = 1")),
+      200);
+}
+
 TEST_F(ReadonlyPgServerTest, CatalogSavepointsAndSessionFence) {
   auto server = ASSERT_RESULT(
       ReadonlyPgServer::Start(
