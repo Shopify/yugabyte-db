@@ -1019,6 +1019,64 @@ TEST_F(ThreadPoolTest, UnlanedPoolWorkerGetsServiceMask) {
 
 // With lane mode off a worker keeps the mask of the thread it was created on, as without lanes,
 // and nothing calls sched_setaffinity.
+// A worker started while lane mode was off, as the tablet server's early pools are, is confined
+// from its next task once the topology is installed.
+TEST_F(ThreadPoolTest, WorkerStartedBeforeInstallIsConfined) {
+  auto topology = MakeTwoLaneTestTopology(/* affinity_enabled= */ true, /* service_cpu= */ true);
+  if (!topology) {
+    GTEST_SKIP() << "Needs at least 3 CPUs";
+  }
+  // The service mask differs from the mask the worker starts with, so the unlaned pool shows
+  // whether its worker reapplies a lane it already has (kNoLane) after the install.
+  const auto process_cpuset = ThisThreadMask();
+  ASSERT_NE(topology->service_mask(), process_cpuset);
+  TEST_SetLaneTopology lanes_off{LaneTopology()};
+  const auto idle_timeout = MonoDelta::FromSeconds(600);
+  ThreadPool lane0_pool(ThreadPoolOptions {
+      .name = "lane0", .max_workers = 1, .idle_timeout = idle_timeout, .lane = 0 });
+  ThreadPool unlaned_pool(ThreadPoolOptions {
+      .name = "unlaned", .max_workers = 1, .idle_timeout = idle_timeout });
+  struct View {
+    CpuSet mask;
+    LaneId lane;
+    int64_t thread_id;
+  };
+  auto run = [](ThreadPool& pool) {
+    View result;
+    CountDownLatch latch(1);
+    CHECK(pool.EnqueueFunctor([&result, &latch] {
+      result = View {
+          .mask = ThisThreadMask(), .lane = ThisThreadLane(),
+          .thread_id = Thread::CurrentThreadId() };
+      latch.CountDown();
+    }));
+    latch.Wait();
+    return result;
+  };
+
+  auto lane0_before = run(lane0_pool);
+  auto unlaned_before = run(unlaned_pool);
+  for (const auto& view : {lane0_before, unlaned_before}) {
+    ASSERT_EQ(view.mask, process_cpuset);
+    ASSERT_EQ(view.lane, kNoLane);
+  }
+
+  {
+    TEST_SetLaneTopology lanes_on(*topology);
+    auto lane0_after = run(lane0_pool);
+    ASSERT_EQ(lane0_after.thread_id, lane0_before.thread_id);
+    ASSERT_EQ(lane0_after.mask, topology->lane_mask(0));
+    ASSERT_EQ(lane0_after.lane, 0);
+
+    auto unlaned_after = run(unlaned_pool);
+    ASSERT_EQ(unlaned_after.thread_id, unlaned_before.thread_id);
+    ASSERT_EQ(unlaned_after.mask, topology->service_mask());
+    ASSERT_EQ(unlaned_after.lane, kNoLane);
+  }
+  lane0_pool.Shutdown();
+  unlaned_pool.Shutdown();
+}
+
 TEST_F(ThreadPoolTest, LanesOffWorkerKeepsCreatorMask) {
   const auto process_cpuset = ThisThreadMask();
   if (process_cpuset.Count() < 2) {

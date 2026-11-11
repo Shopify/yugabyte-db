@@ -100,12 +100,15 @@ struct CpuTopologyOptions {
   // --TEST_cpu_topology_sysfs_root if set, else the real tree on Linux and none elsewhere.
   std::string sysfs_root = {};
 
-  // CPUs this process may run on. Unset means --TEST_cpu_topology_cpuset if set, else
-  // sched_getaffinity on Linux and every CPU elsewhere.
+  // CPUs this process may run on. Unset means --TEST_cpu_topology_cpuset if set, else the calling
+  // thread's sched_getaffinity on Linux and every CPU elsewhere. The calling thread's mask is the
+  // process cpuset only while no thread is confined to a lane or the service CPUs; callers that
+  // may run on a confined thread set this explicitly.
   std::optional<CpuSet> cpuset = {};
 };
 
-// The CPUs the process may run on, resolved as described for CpuTopologyOptions::cpuset.
+// The CPUs the process may run on, resolved as described for CpuTopologyOptions::cpuset
+// (including that the unset case reads the calling thread's mask).
 Result<CpuSet> GetProcessCpuSet(const CpuTopologyOptions& options);
 
 // Groups the process cpuset into CPU domains: disjoint, non-empty, ordered by lowest CPU.

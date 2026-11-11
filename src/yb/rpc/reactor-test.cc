@@ -32,9 +32,12 @@
 
 #include <thread>
 
+#include "yb/rpc/proxy.h"
 #include "yb/rpc/reactor.h"
 #include "yb/rpc/rpc-test-base.h"
+#include "yb/rpc/rpc_controller.h"
 
+#include "yb/util/backoff_waiter.h"
 #include "yb/util/countdown_latch.h"
 #include "yb/util/lanes.h"
 #include "yb/util/lanes_test_util.h"
@@ -291,6 +294,94 @@ TEST_F_EX(ReactorTest, ReactorLanesWithLanesOff, YBTest) {
     ASSERT_EQ(view.mask, mask);
   }
   ASSERT_EQ(TEST_CpuAffinityCallCount(), calls);
+}
+
+// Outbound calls and responses go on queues that a reactor drains in batches; each one counts as a
+// handoff. Calls are sent from a lane 0 thread through a lane 1 client reactor to a server whose
+// reactor is in lane 0 and whose handlers are in lane 1, so per call the outbound call and the
+// response are reactor crossings and the inbound call is a handler pool crossing.
+TEST_F_EX(ReactorTest, OutboundItemsCountedEach, RpcTestBase) {
+  auto topology = MakeTwoLaneTestTopology();
+  if (!topology) {
+    GTEST_SKIP() << "Needs at least 2 CPUs";
+  }
+  TEST_SetLaneTopology scope(*topology);
+  constexpr int kCalls = 5;
+
+  auto server_builder = CreateMessengerBuilder("Server", kDefaultClientMessengerOptions);
+  server_builder.set_reactor_lanes({0});
+  TestServerOptions server_options;
+  server_options.n_worker_threads = kCalls;
+  server_options.handler_lane = 1;
+  auto server = StartTestServer(server_options, "", ASSERT_RESULT(server_builder.Build()));
+  auto* server_reactor = server.messenger()->TEST_reactor(0);
+  ASSERT_EQ(server_reactor->lane(), 0);
+
+  // One connection, so that the responses share one queue on the server.
+  auto client_options = kDefaultClientMessengerOptions;
+  client_options.num_connections_to_server = 1;
+  auto client_builder = CreateMessengerBuilder("Client", client_options);
+  client_builder.set_reactor_lanes({1});
+  auto client_messenger =
+      rpc::CreateAutoShutdownMessengerHolder(ASSERT_RESULT(client_builder.Build()));
+  Proxy proxy(client_messenger.get(), HostPort::FromBoundEndpoint(server.bound_endpoint()));
+
+  rpc_test::SleepRequestPB req;
+  // Long enough for the handlers to respond only after the server reactor is blocked below.
+  req.set_sleep_micros(1'000'000);
+  // Sets up the connection outside the counted window.
+  RunOnStdThread([&proxy, &req] {
+    ApplyLaneToCurrentThread(0);
+    rpc_test::SleepResponsePB resp;
+    RpcController controller;
+    ASSERT_OK(proxy.SyncRequest(
+        CalculatorServiceMethods::SleepMethod(), /* method_metrics= */ nullptr, req, &resp,
+        &controller));
+  });
+
+  const auto counts = LaneHandoffCounts::Now();
+  auto delta = [&counts] { return LaneHandoffCounts::Now() - counts; };
+  std::vector<rpc_test::SleepResponsePB> responses(kCalls);
+  std::vector<RpcController> controllers(kCalls);
+  CountDownLatch done(kCalls);
+  RunOnStdThread([&] {
+    ApplyLaneToCurrentThread(0);
+    for (int i = 0; i != kCalls; ++i) {
+      proxy.AsyncRequest(
+          CalculatorServiceMethods::SleepMethod(), /* method_metrics= */ nullptr, req,
+          &responses[i], &controllers[i], [&done] { done.CountDown(); });
+    }
+  });
+  ASSERT_OK(WaitFor(
+      [&delta] { return delta().crossing(LaneCrossingCategory::kOther) == kCalls; },
+      MonoDelta::FromSeconds(30), "All calls handed to the handlers"));
+
+  // Hold the server reactor while the handlers respond, so that the responses queue up behind one
+  // drain task.
+  std::atomic<bool> blocked{false}, release{false};
+  ASSERT_OK(server_reactor->ScheduleReactorFunctor([&blocked, &release](Reactor*) {
+    blocked = true;
+    while (!release) {
+      std::this_thread::sleep_for(1ms);
+    }
+  }, SOURCE_LOCATION()));
+  ASSERT_OK(WaitFor([&blocked] { return blocked.load(); }, MonoDelta::FromSeconds(30),
+                    "Server reactor blocked"));
+  auto status = WaitFor(
+      [&delta] { return delta().crossing(LaneCrossingCategory::kReactor) == 2 * kCalls; },
+      MonoDelta::FromSeconds(15), "Responses handed to the server reactor");
+  release = true;
+  ASSERT_TRUE(status.ok()) << status << ": " << delta().ToString();
+  done.Wait();
+  for (auto& controller : controllers) {
+    ASSERT_OK(controller.status());
+  }
+  auto final_delta = delta();
+  ASSERT_EQ(final_delta.crossing(LaneCrossingCategory::kReactor), 2 * kCalls)
+      << final_delta.ToString();
+  ASSERT_EQ(final_delta.crossing(LaneCrossingCategory::kOther), kCalls);
+  ASSERT_EQ(final_delta.total_crossings(), 3 * kCalls);
+  server.Shutdown();
 }
 
 } // namespace yb::rpc

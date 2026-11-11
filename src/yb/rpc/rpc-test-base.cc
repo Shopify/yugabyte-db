@@ -529,6 +529,7 @@ TestServer::TestServer(std::unique_ptr<Messenger>&& messenger,
       thread_pool_(std::make_shared<ThreadPool>(ThreadPoolOptions {
         .name = "rpc-test",
         .max_workers = options.n_worker_threads,
+        .lane = options.handler_lane,
       })) {
 
   EXPECT_OK(messenger_->ListenAddress(

@@ -155,6 +155,8 @@ struct TestServerOptions {
   MessengerOptions messenger_options = kDefaultServerMessengerOptions;
   size_t n_worker_threads = 3;
   Endpoint endpoint;
+  // Lane of the handler pool's workers.
+  LaneId handler_lane = kNoLane;
 };
 
 class TestServer {

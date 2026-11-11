@@ -157,6 +157,17 @@ class Reactor {
     return ScheduleReactorTask(MakeFunctorReactorTask(f, source_location));
   }
 
+  // For callers that put items on their own queue and schedule one task to drain a batch:
+  // CountLaneHandoff counts one item handed to this reactor by the calling thread, and
+  // ScheduleDrainTask schedules the drain task without counting it, so each item counts once.
+  void CountLaneHandoff() const {
+    CountLaneHandoffFromThisThread(lane_, LaneCrossingCategory::kReactor);
+  }
+
+  Status ScheduleDrainTask(ReactorTaskPtr task) {
+    return DoScheduleReactorTask(std::move(task), /* even_if_not_running= */ false);
+  }
+
   // This should not be called on reactor thread, as the reactor thread should not even be running
   // yet.
   Status Init() EXCLUDES_REACTOR_THREAD;
@@ -255,7 +266,7 @@ class Reactor {
   // Can be called on any thread, including the reactor thread.
   Status ScheduleReactorTask(ReactorTaskPtr task, bool even_if_not_running);
 
-  // ScheduleReactorTask without counting a lane handoff, for callers that counted it already.
+  // ScheduleReactorTask without counting a lane handoff.
   Status DoScheduleReactorTask(ReactorTaskPtr task, bool even_if_not_running);
 
   // Find or create a new connection to the given remote.

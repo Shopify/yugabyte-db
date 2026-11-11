@@ -176,16 +176,25 @@ are reactor, rpc handler, tablet pipeline, callback and other, set per pool with
 | `YBThreadPool` task (also `ThreadSubPool`, CONCURRENT tokens) | the worker starts it | the pool's |
 | `Strand` item (SERIAL tokens, the raft-notifications strand) | the drain loop runs it | the strand's pool's |
 | `TaskStream` item, including items taken by a running stream | it is processed | the stream's pool's |
-| `Reactor::ScheduleReactorTask`, `Reactor::QueueOutboundCall` | it is scheduled | reactor |
+| Reactor task (`Reactor::ScheduleReactorTask`) | it is scheduled | reactor |
+| Outbound call (`Reactor::QueueOutboundCall`), response or other outbound data from another thread (`Connection::QueueOutboundData`), Redis reply (`ConnectionContextWithQueue::QueueResponse`) | it is queued | reactor |
 
-Wrapper tasks that only drain items (`Strand`'s pool task, the task that starts a `TaskStream`
-draining) are not counted, so each handoff counts once; nor is the end-of-group call with no
-item. A reactor's lane is fixed, so its handoffs are counted on the submitting side.
+Many primitives queue items privately and wake their executor once per batch. Their items are
+counted, and the wrapper task that only drains them is not, so each handoff counts once whether or
+not the executor was already running: `Strand`'s pool task and the task that starts a `TaskStream`
+draining are submitted uncounted (`ThreadPoolToken::SubmitDrainFunc`), and reactor queues count
+each item with `Reactor::CountLaneHandoff` and schedule the drain with `ScheduleDrainTask`. The
+end-of-group call with no item is not counted. A reactor's lane is fixed, so its handoffs are
+counted on the submitting side.
 
-Not counted: `PriorityThreadPool` tasks (flush and compaction), `rpc::Scheduler` and other
-io-service timers, `CompletedCallQueue`, futures, promises and `Synchronizer` wakeups, raw
-`std::condition_variable` or `BlockingQueue` handoffs outside `TaskStream`, and lock wait
-queues. Crossings through these do not show in the metrics.
+Not counted: operations queued on a tablet's preparer (its drain task is submitted uncounted, so
+leader-side prepare handoffs show nowhere), `PriorityThreadPool` tasks (flush and compaction),
+`rpc::Scheduler` and other io-service timers, `CompletedCallQueue`, futures, promises and
+`Synchronizer` wakeups, raw `std::condition_variable` or `BlockingQueue` handoffs outside
+`TaskStream`, and lock wait queues. Wakeups that coalesce signals rather than carry items count
+one handoff per task, not per signal: Raft peer request signals (`Peer::SignalRequest`), the
+log's background sync task, and a PG session's deferred processing of pending requests.
+Crossings through these do not show, or show once per batch, in the metrics.
 
 Counters are sharded per lane, one cache line per lane plus one for unlaned threads, each written
 only by threads of its lane (the executing thread, or the submitter for reactors), and summed on

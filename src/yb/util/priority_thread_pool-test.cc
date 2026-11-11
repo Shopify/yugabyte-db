@@ -710,6 +710,32 @@ TEST(PriorityThreadPoolTest, PerTaskLane) {
   }
 }
 
+// A worker started while lane mode was off moves to the service mask for its next unlaned task
+// once the topology is installed, although its lane (kNoLane) is unchanged.
+TEST(PriorityThreadPoolTest, WorkerStartedBeforeInstallIsConfined) {
+  auto topology = MakeTwoLaneTestTopology(/* affinity_enabled= */ true, /* service_cpu= */ true);
+  if (!topology) {
+    GTEST_SKIP() << "Needs at least 3 CPUs";
+  }
+  const auto process_cpuset = ThisThreadMask();
+  ASSERT_NE(topology->service_mask(), process_cpuset);
+  TEST_SetLaneTopology lanes_off{LaneTopology()};
+  PriorityThreadPool pool(1);
+  auto se = ScopeExit([&pool] {
+    pool.StartShutdown();
+    pool.CompleteShutdown();
+  });
+  auto before = RunWithLane(&pool, kNoLane);
+  ASSERT_EQ(before.mask, process_cpuset);
+  ASSERT_EQ(before.lane, kNoLane);
+
+  TEST_SetLaneTopology lanes_on(*topology);
+  auto after = RunWithLane(&pool, kNoLane);
+  ASSERT_EQ(after.thread_id, before.thread_id);
+  ASSERT_EQ(after.mask, topology->service_mask());
+  ASSERT_EQ(after.lane, kNoLane);
+}
+
 TEST(PriorityThreadPoolTest, PerTaskLaneWithLanesOff) {
   TEST_SetLaneTopology scope{LaneTopology()};
   const auto mask = ThisThreadMask();

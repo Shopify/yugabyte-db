@@ -220,7 +220,10 @@ Status PreparerImpl::Submit(OperationDriver* operation_driver) {
   // We flipped running_ from 0 to 1. The previously running thread could go back to doing another
   // iteration, but in that case since we are submitting to a token of a thread pool, only one
   // such thread will be running, the other will be in the queue.
-  return tablet_prepare_pool_token_->SubmitFunc(std::bind(&PreparerImpl::Run, this));
+  //
+  // Run drains operations queued by many submitters, so it is not counted as a lane handoff of
+  // whichever submitter woke it.
+  return tablet_prepare_pool_token_->SubmitDrainFunc(std::bind(&PreparerImpl::Run, this));
 }
 
 void PreparerImpl::Run() {

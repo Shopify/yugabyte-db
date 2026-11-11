@@ -603,8 +603,9 @@ Status Connection::QueueOutboundData(OutboundDataPtr outbound_data) {
     process_response_queue_task = process_response_queue_task_;
   }
 
+  reactor_->CountLaneHandoff();
   if (was_empty) {
-    return reactor_->ScheduleReactorTask(process_response_queue_task);
+    return reactor_->ScheduleDrainTask(process_response_queue_task);
   }
   return Status::OK();
 }

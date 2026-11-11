@@ -162,8 +162,9 @@ inline bool LaneModeActive() {
 // go through this before they are used.
 LaneId NormalizeLane(const LaneTopology& topology, LaneId lane);
 
-// Lane of the calling thread as set by ApplyLaneToCurrentThread; kNoLane for threads that belong
-// to no lane and for every thread while lane mode is off.
+// Lane of the calling thread as set by ApplyLaneToCurrentThread or SetThisThreadLane; kNoLane
+// unless a lane was set. A thread keeps its lane if lane mode is turned off afterwards (only tests
+// do that), so callers that count or route by lane also check LaneModeActive().
 LaneId ThisThreadLane();
 
 // Sets the calling thread's lane without changing its CPU mask.

@@ -973,10 +973,9 @@ void Reactor::QueueOutboundCall(OutboundCallPtr call) {
     call->Transferred(AbortedError(), nullptr /* conn */);
     return;
   }
-  CountLaneHandoffFromThisThread(lane_, LaneCrossingCategory::kReactor);
+  CountLaneHandoff();
   if (was_empty) {
-    auto scheduling_status = DoScheduleReactorTask(
-        process_outbound_queue_task_, /* even_if_not_running= */ false);
+    auto scheduling_status = ScheduleDrainTask(process_outbound_queue_task_);
     // We should not call call->Transferred(scheduling_status, ...) here, because the call has
     // already been added to the outbound queue. ShutdownInternal will abort it.
     LOG_IF_WITH_PREFIX(WARNING, !scheduling_status.ok())
@@ -1022,7 +1021,7 @@ void Reactor::RegisterInboundSocket(
 }
 
 Status Reactor::ScheduleReactorTask(ReactorTaskPtr task, bool even_if_not_running) {
-  CountLaneHandoffFromThisThread(lane_, LaneCrossingCategory::kReactor);
+  CountLaneHandoff();
   return DoScheduleReactorTask(std::move(task), even_if_not_running);
 }
 
