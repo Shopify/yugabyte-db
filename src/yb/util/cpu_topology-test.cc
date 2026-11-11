@@ -92,6 +92,13 @@ TEST_F(CpuTopologyTest, CpuSetOperations) {
   ASSERT_EQ(cpus, (std::vector<size_t>{0, 1, 2, 3, 4, 5, 6, 7, 100}));
   ASSERT_EQ(cpus, a.ToVector());
   ASSERT_EQ(CpuSet::FirstN(4).ToString(), "0-3");
+  ASSERT_EQ(CpuSet::FirstN(5000).Count(), CpuSet::kMaxCpus);
+
+  // Out-of-range ids never touch memory past the set.
+  auto before = a;
+  ASSERT_DEBUG_DEATH(a.Set(CpuSet::kMaxCpus), "is not below");
+  ASSERT_DEBUG_DEATH(a.Set(CpuSet::kMaxCpus * 64), "is not below");
+  ASSERT_EQ(a, before);
 #ifdef __linux__
   cpu_set_t native;
   a.ToCpuSetT(&native);

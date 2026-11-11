@@ -23,6 +23,7 @@
 #include "yb/util/faststring.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
+#include "yb/util/logging.h"
 #include "yb/util/status_format.h"
 #include "yb/util/stol_utils.h"
 
@@ -308,7 +309,10 @@ void CpuSet::ToCpuSetT(cpu_set_t* out) const {
 #endif
 
 void CpuSet::Set(size_t cpu) {
-  DCHECK_LT(cpu, kMaxCpus);
+  if (cpu >= kMaxCpus) {
+    LOG(DFATAL) << "CPU id " << cpu << " is not below " << kMaxCpus << ", ignoring it";
+    return;
+  }
   words_[cpu / kBitsPerWord] |= uint64_t{1} << (cpu % kBitsPerWord);
 }
 

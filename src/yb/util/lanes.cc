@@ -171,8 +171,10 @@ LaneId LaneOf(Slice tablet_id, size_t num_lanes) {
     return 0;
   }
   DCHECK_LE(num_lanes, kMaxLanes);
+  // Clamped so the result always fits a LaneId other than kNoLane.
   return static_cast<LaneId>(
-      HashUtil::MurmurHash2_64(tablet_id.AsStringView(), /* seed= */ 0) % num_lanes);
+      HashUtil::MurmurHash2_64(tablet_id.AsStringView(), /* seed= */ 0) %
+      std::min(num_lanes, kMaxLanes));
 }
 
 LaneId LaneOf(Slice tablet_id) {

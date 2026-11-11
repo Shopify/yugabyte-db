@@ -86,7 +86,9 @@ TEST_F(LanesTest, FewerLanesThanDomains) {
   ASSERT_EQ(topology.service_mask().ToString(), "0-47");
   ASSERT_EQ(topology.full_process_cpuset().ToString(), "0-47");
   ASSERT_TRUE(topology.affinity_enabled());
-  LOG(INFO) << topology.ToString();
+  ASSERT_STR_CONTAINS(
+      topology.ToString(),
+      "map: lanes 0 -> domains 0-3 (4 each), lanes 1-4 -> domains 4-23 (5 each) service_mask:");
 }
 
 TEST_F(LanesTest, LanesEqualDomains) {
@@ -95,6 +97,10 @@ TEST_F(LanesTest, LanesEqualDomains) {
   auto automatic = BuildPairs(4, 0);
   ASSERT_EQ(automatic, forced);
   ASSERT_EQ(automatic.domains().size(), 4);
+  ASSERT_EQ(automatic.ToString(),
+            "{ lanes: 4 affinity: 1 domains: [0-1] [2-3] [4-5] [6-7] "
+            "map: lanes 0-3 -> domains 0-3 (1 each) service_mask: 0-7 process_cpuset: 0-7 }");
+  ASSERT_STR_CONTAINS(BuildPairs(24, 0).ToString(), "map: lanes 0-23 -> domains 0-23 (1 each) ");
 }
 
 // N > D: lane i uses domain floor(i * D / N); lanes share whole-domain masks.
@@ -197,6 +203,8 @@ TEST_F(LanesTest, LaneOfGolden) {
   ASSERT_EQ(LaneOf(std::string_view(kIds[1]), 24), LaneOf(kIds[1], 24));
   ASSERT_EQ(LaneOf(kIds[1], 1), 0);
   ASSERT_EQ(LaneOf(kIds[1], 0), 0);
+  ASSERT_DEBUG_DEATH(
+      ASSERT_EQ(LaneOf(kIds[1], 1000), LaneOf(kIds[1], kMaxLanes)), "num_lanes <= kMaxLanes");
 }
 
 TEST_F(LanesTest, LaneOfDistribution) {

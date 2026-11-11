@@ -49,6 +49,7 @@ class CpuSet {
   void ToCpuSetT(cpu_set_t* out) const;
 #endif
 
+  // Ids >= kMaxCpus are a DFATAL and are not added.
   void Set(size_t cpu);
   bool Test(size_t cpu) const;
   size_t Count() const;
