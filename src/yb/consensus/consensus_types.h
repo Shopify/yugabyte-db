@@ -27,8 +27,8 @@ struct ConsensusOptions {
   std::string tablet_id;
 
   // Lane hint for the RPCs this replica sends to its peers, so they go on connections owned by
-  // that lane's reactors and their callbacks run in that lane. kNoLane sends no hint; the hint is
-  // also dropped when the messenger is not laned.
+  // that lane's reactors. kNoLane sends no hint; the hint is also dropped when the messenger is
+  // not laned.
   LaneId lane = kNoLane;
 };
 

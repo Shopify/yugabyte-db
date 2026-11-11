@@ -1975,8 +1975,8 @@ Result<ProbedThread> RunProbe(const Submitter& submit) {
 }
 
 // Runs a probe on each pool and strand of the peer's pipeline: the stages that run its
-// operations (prepare, Raft, notifications and op apply, log append, segment allocation and
-// sync) and its service strand.
+// operations (prepare, Raft, notifications and leader-side op apply, log append, segment
+// allocation and sync) and its service strand.
 Result<std::map<std::string, ProbedThread>> ProbePipeline(tablet::TabletPeer* peer) {
   auto consensus = VERIFY_RESULT(peer->GetRaftConsensus());
   auto* log = peer->log();

@@ -11,10 +11,12 @@ accounting mechanisms that consume the topology (new threads, thread pools, prio
 reactors, the postmaster spawn, the crossing counters), the laned tablet server messenger, and
 laned tablet pipelines. With lanes on, the tserver messenger runs a group of reactors and handler
 pools per lane, and an inbound call is handled in the lane of the reactor that read it. Each
-tablet's Raft, log, preparer, apply and service-strand work and its RocksDB background jobs run
-in its lane, and consensus peers send their RPCs with the tablet's lane hint. PG sessions and the
-tserver's embedded client are not laned and send no hints, and inbound connections are not yet
-bound to lanes, so inbound tablet calls cross into the tablet's lane once.
+tablet's Raft, log, preparer, leader-side apply and service-strand work and its RocksDB
+background jobs run in its lane, and consensus peers send their RPCs with the tablet's lane hint.
+Inbound connections are not yet bound to lanes: an inbound write crosses into the tablet's lane
+once, at the preparer, and a follower prepares and applies follower-side operations inline in its
+`UpdateConsensus` handler, in the lane of the reactor that read the call. PG sessions and the
+tserver's embedded client are not laned and send no hints.
 
 ## Definitions
 
@@ -256,13 +258,16 @@ which come from its lane's pools.
 
 `OpenTablet` gives a tablet its lane's append, allocation and log-sync pools for the log, its Raft,
 notification and prepare pools for consensus and the preparer, its Raft pool for intent cleanup,
-and `Messenger::TaggedThreadPool(PoolTagForTablet(tablet), lane)` for the service strand. Op apply
-runs on the Raft notification strand, so it follows the tablet without a pool of its own. The
-other tablet-manager pools (`apply` for split and clone, `snapshot-cleanup`, `tablet-bootstrap`,
-`flush-retryable-requests`, `read-parallel`, `admin-compaction`, `full-compaction`, `wait-queue`,
-vector index pools) stay in the service set. With lanes on the unlaned pipeline set serves only
-work that belongs to no tablet, such as `StepDownLocalLeaders` on the Raft pool; it runs on the
-service mask, and its pools hold only their one idle persistent worker each.
+and `Messenger::TaggedThreadPool(PoolTagForTablet(tablet), lane)` for the service strand. On the
+leader, op apply runs on the Raft notification strand, so it follows the tablet without a pool of
+its own. A follower prepares and applies follower-side operations inline in its `UpdateConsensus`
+handler, so that work runs in the handler's lane, which is lane(T) only once inbound connections
+are bound to lanes. The other tablet-manager pools (`apply` for split and clone,
+`snapshot-cleanup`, `tablet-bootstrap`, `flush-retryable-requests`, `read-parallel`,
+`admin-compaction`, `full-compaction`, `wait-queue`, vector index pools) stay in the service set.
+With lanes on the unlaned pipeline set serves only work that belongs to no tablet, such as
+`StepDownLocalLeaders` on the Raft pool; it runs on the service mask, and its pools hold only their
+one idle persistent worker each.
 
 **Log appender park.** A tablet's log appender drains its `TaskStream` on an append worker and,
 once the queue is empty, keeps that worker waiting for more entries for up to
@@ -289,8 +294,12 @@ Whether compaction volume overloads lanes, and so which mode suits a workload, i
 (`ConsensusOptions::lane`) when the server's messenger is laned, and `RpcPeerProxy` sets it as the
 controller's hint on every `UpdateConsensus`, `RequestConsensusVote`, `RunLeaderElection`,
 `LeaderElectionLost` and `StartRemoteBootstrap` call, since `RpcController::Reset()` clears it. Raft
-calls thus go on `(follower, lane(T))` connections owned by lane(T)'s reactors on the sender, and
-since they are sent from lane(T)'s threads their callbacks run in lane(T)'s pools. Masters
+calls thus go on `(follower, lane(T))` connections owned by lane(T)'s reactors on the sender. A
+callback runs in the pool of the lane that sent the call. A leader sends `UpdateConsensus` and
+remote bootstrap requests only from lane(T)'s threads (its Raft pool token, and the callback that
+sends the next request), so those callbacks run in lane(T). Vote and election calls are sent from
+the thread that starts the election (the Raft pool token after a failure detection, or the handler
+of a requested election or step-down) and call back in that thread's lane. Masters
 replicate their sys catalog with the same code but never send a hint: their peers have no lane and
 their messengers are unlaned. Multi-tablet heartbeats (`enable_multi_raft_heartbeat_batcher`,
 default off) span tablets of many lanes, so they carry no hint and use unlaned connections; this

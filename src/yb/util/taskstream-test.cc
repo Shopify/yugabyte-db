@@ -180,6 +180,7 @@ TEST_F(TestTaskStream, ZeroWaitGoesIdle) {
   stream.Stop();
   thread_pool->Shutdown();
 }
+
 namespace {
 
 // Process function for lane tests: counts items and the lane they ran in, and blocks on items

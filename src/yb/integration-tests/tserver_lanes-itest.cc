@@ -81,8 +81,8 @@ Result<LaneId> LaneOfTask(const Submitter& submit) {
   return lane;
 }
 
-// Lanes of the threads that run the peer's prepare, Raft, notification (and apply) and log append
-// work.
+// Lanes of the threads that run the peer's prepare, Raft, notification (and leader-side apply) and
+// log append work.
 Result<std::map<std::string, LaneId>> PipelineLanes(tablet::TabletPeer* peer) {
   auto consensus = VERIFY_RESULT(peer->GetRaftConsensus());
   auto* log = peer->log();
@@ -196,8 +196,9 @@ class TserverLanesITest : public TabletSplitITest {
 };
 
 // RF3 writes replicate; each replica runs in its tablet's lane; leaders send Raft calls on
-// connections of that lane owned by that lane's reactors, and their callbacks run in it; the
-// in-process master, whose messenger is unlaned, keys no connection by lane.
+// connections of that lane owned by that lane's reactors, and the reactors that read the responses
+// are in the lane that issued the calls, so no callback crosses; the in-process master, whose
+// messenger is unlaned, keys no connection by lane.
 TEST_F(TserverLanesITest, RaftStaysInTabletLane) {
   SetNumTablets(4);
   CreateTable();
@@ -214,8 +215,11 @@ TEST_F(TserverLanesITest, RaftStaysInTabletLane) {
   }
   auto delta = LaneHandoffCounts::Now() - before;
   LOG(INFO) << "Lane handoffs during " << kWrites << " writes: " << delta.ToString();
-  // A Raft callback runs in the pool of the lane that sent the call, which is the lane of the
-  // reactor that reads the response.
+  // A Raft callback runs in the pool of the lane that sent the call. A leader sends
+  // UpdateConsensus only from lane(T) threads (the Raft pool token, whose lane is probed above,
+  // and the callback that sends the next request), so that lane is lane(T), as is the reactor that
+  // reads the response, and no callback crosses. Without the hint the response reactor is in a
+  // random lane and callbacks cross.
   ASSERT_EQ(delta.crossing(LaneCrossingCategory::kCallback), 0) << delta.ToString();
   // Inbound calls are handled in the lane of whichever reactor read them, so each write crosses
   // into its tablet's pipeline at most once on the leader (the preparer) and at most twice on each

@@ -299,7 +299,8 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
 
   RetryableRequestsCounts TEST_CountRetryableRequests();
 
-  // Run func on the Raft pool token, or on the notification strand that also runs op apply.
+  // Run func on the Raft pool token, or on the notification strand that also runs leader-side op
+  // apply.
   Status TEST_SubmitToRaftPool(const std::function<void()>& func);
   void TEST_EnqueueNotification(std::function<void()> func);
 
