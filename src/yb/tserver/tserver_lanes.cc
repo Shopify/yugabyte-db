@@ -15,6 +15,8 @@
 
 #include "yb/gutil/bind.h"
 
+#include "yb/rpc/messenger.h"
+
 #include "yb/util/cpu_topology.h"
 #include "yb/util/flag_validators.h"
 #include "yb/util/flags.h"
@@ -50,6 +52,20 @@ DEFINE_NON_RUNTIME_string(tserver_service_lane_cpus, "",
 DEFINE_validator(tserver_service_lane_cpus,
     FLAG_OK_VALIDATOR(::yb::CpuSet::Parse(_value)));
 TAG_FLAG(tserver_service_lane_cpus, advanced);
+
+DEFINE_NON_RUNTIME_int32(tserver_lane_reactors, 0,
+    "Reactor threads per CPU lane when lanes are enabled; these replace num_reactor_threads. 0 "
+    "(default): max(1, CPUs in the lane / 4 / number of lanes sharing the lane's CPU domains). No "
+    "effect when lanes are disabled (tserver_lanes=1).");
+DEFINE_validator(tserver_lane_reactors, FLAG_RANGE_VALIDATOR(0, 256));
+TAG_FLAG(tserver_lane_reactors, advanced);
+
+DEFINE_NON_RUNTIME_int32(tserver_lane_connections_per_remote, 2,
+    "Outbound connections per remote server and CPU lane for calls routed to a lane when lanes "
+    "are enabled. Other calls keep using num_connections_to_server connections per remote. No "
+    "effect when lanes are disabled (tserver_lanes=1).");
+DEFINE_validator(tserver_lane_connections_per_remote, FLAG_RANGE_VALIDATOR(1, 256));
+TAG_FLAG(tserver_lane_connections_per_remote, advanced);
 
 METRIC_DEFINE_gauge_uint64(server, lane_crossings_reactor,
     "Lane Crossings Into Reactors", yb::MetricUnit::kOperations,
@@ -143,6 +159,16 @@ void InitTserverLaneTopology() {
   }
   LOG(INFO) << "Lane topology: " << description;
   SetLaneTopology(*topology);
+}
+
+void SetupTserverLaneMessenger(rpc::MessengerBuilder* builder) {
+  const auto& topology = GetLaneTopology();
+  if (!topology.active()) {
+    return;
+  }
+  builder->set_lane_topology(&topology)
+      .set_reactors_per_lane(FLAGS_tserver_lane_reactors)
+      .set_connections_per_lane_remote(FLAGS_tserver_lane_connections_per_remote);
 }
 
 void RegisterTserverLaneMetrics(const scoped_refptr<MetricEntity>& entity) {

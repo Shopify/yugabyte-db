@@ -429,8 +429,9 @@ TEST_F(LanesTest, HandoffCounting) {
     GTEST_SKIP() << "Needs at least 2 CPUs";
   }
   TEST_SetLaneTopology scope(*topology);
-  LaneHandoff from_lane_0, from_lane_1, from_unlaned, uncounted;
+  LaneHandoff from_lane_0, from_lane_1, from_unlaned, uncounted, callback_from_lane_1;
   uncounted.DisableCounting();
+  callback_from_lane_1.SetCategory(LaneCrossingCategory::kCallback);
   RunOnStdThread([&] {
     ApplyLaneToCurrentThread(0);
     from_lane_0.RecordSubmitter();
@@ -439,6 +440,7 @@ TEST_F(LanesTest, HandoffCounting) {
   RunOnStdThread([&] {
     ApplyLaneToCurrentThread(1);
     from_lane_1.RecordSubmitter();
+    callback_from_lane_1.RecordSubmitter();
   });
   RunOnStdThread([&] {
     ApplyServiceMaskToCurrentThread();
@@ -462,9 +464,16 @@ TEST_F(LanesTest, HandoffCounting) {
     ASSERT_EQ(delta.crossing(LaneCrossingCategory::kRpcHandler), 1) << delta.ToString();
     ASSERT_EQ(delta.total_crossings(), 1);
 
+    // An item's own category wins over the executing pool's.
+    callback_from_lane_1.RecordExecution(LaneCrossingCategory::kRpcHandler);
+    delta = LaneHandoffCounts::Now() - counts;
+    ASSERT_EQ(delta.crossing(LaneCrossingCategory::kCallback), 1) << delta.ToString();
+    ASSERT_EQ(delta.crossing(LaneCrossingCategory::kRpcHandler), 1);
+    ASSERT_EQ(delta.total_crossings(), 2);
+
     from_unlaned.RecordExecution(LaneCrossingCategory::kRpcHandler);
     delta = LaneHandoffCounts::Now() - counts;
-    ASSERT_EQ(delta.total_crossings(), 1) << delta.ToString();
+    ASSERT_EQ(delta.total_crossings(), 2) << delta.ToString();
     ASSERT_EQ(delta.entries_from_unlaned, 1);
 
     // A reactor-style handoff counted by the submitter: lane 0 into a lane 1 executor.
@@ -473,7 +482,17 @@ TEST_F(LanesTest, HandoffCounting) {
     CountLaneHandoffFromThisThread(kNoLane, LaneCrossingCategory::kReactor);
     delta = LaneHandoffCounts::Now() - counts;
     ASSERT_EQ(delta.crossing(LaneCrossingCategory::kReactor), 1) << delta.ToString();
-    ASSERT_EQ(delta.total_crossings(), 2);
+    ASSERT_EQ(delta.total_crossings(), 3);
+  });
+
+  // An unlaned submitter counts nothing into a reactor.
+  RunOnStdThread([&] {
+    ApplyServiceMaskToCurrentThread();
+    auto counts = LaneHandoffCounts::Now();
+    CountLaneHandoffFromThisThread(1, LaneCrossingCategory::kReactor);
+    auto delta = LaneHandoffCounts::Now() - counts;
+    ASSERT_EQ(delta.total_crossings(), 0) << delta.ToString();
+    ASSERT_EQ(delta.entries_from_unlaned, 0);
   });
 
   // Unlaned executors count nothing.

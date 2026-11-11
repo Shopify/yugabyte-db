@@ -34,6 +34,7 @@
 
 #include "yb/rpc/connection.h"
 #include "yb/rpc/connection_context.h"
+#include "yb/rpc/reactor.h"
 #include "yb/rpc/rpc_metrics.h"
 #include "yb/rpc/service_if.h"
 
@@ -151,6 +152,10 @@ const Endpoint& InboundCall::local_address() const {
 
 ConnectionPtr InboundCall::connection() const {
   return conn_;
+}
+
+LaneId InboundCall::connection_lane() const {
+  return conn_ ? conn_->reactor()->lane() : kNoLane;
 }
 
 ConnectionContext& InboundCall::connection_context() const {

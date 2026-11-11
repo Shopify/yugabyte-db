@@ -21,6 +21,12 @@
 #include "yb/util/metrics_fwd.h"
 #include "yb/util/result.h"
 
+namespace yb::rpc {
+
+class MessengerBuilder;
+
+} // namespace yb::rpc
+
 namespace yb::tserver {
 
 // Computes the lane topology from the tserver_lane* flags, sysfs and the process cpuset, without
@@ -34,6 +40,11 @@ Result<LaneTopology> ComputeTserverLaneTopology(std::string* description = nullp
 // Computes the topology, installs it with SetLaneTopology and logs it. Never fails: a discovery
 // error is logged as a WARNING and the tserver runs with lanes off.
 void InitTserverLaneTopology();
+
+// Makes builder build a laned messenger when the installed topology is active, with the
+// tserver_lane_reactors and tserver_lane_connections_per_remote settings; does nothing
+// otherwise. Only the tablet server's own messenger is laned.
+void SetupTserverLaneMessenger(rpc::MessengerBuilder* builder);
 
 // Registers the lane crossing metrics (lane_crossings_<category>, lane_entries_from_unlaned) on
 // entity when lane mode is active; does nothing otherwise. The counts are process-wide.

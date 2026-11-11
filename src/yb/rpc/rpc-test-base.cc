@@ -25,12 +25,14 @@
 
 #include "yb/util/debug-util.h"
 #include "yb/util/flags.h"
+#include "yb/util/lanes.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/random_util.h"
 #include "yb/util/result.h"
 #include "yb/util/status_format.h"
 #include "yb/util/status_log.h"
 #include "yb/util/test_macros.h"
+#include "yb/util/thread.h"
 
 using std::string;
 
@@ -304,6 +306,11 @@ class CalculatorService: public CalculatorServiceIf {
   void WhoAmI(const WhoAmIRequestPB* req, WhoAmIResponsePB* resp, RpcContext context) override {
     LOG(INFO) << "Remote address: " << context.remote_address();
     resp->set_address(yb::ToString(context.remote_address()));
+    resp->set_handler_lane(ThisThreadLane());
+    if (auto* thread = Thread::current_thread()) {
+      resp->set_handler_thread_name(thread->name());
+    }
+    resp->set_handler_thread_id(Thread::UniqueThreadId());
     context.RespondSuccess();
   }
 
@@ -530,7 +537,8 @@ TestServer::TestServer(std::unique_ptr<Messenger>&& messenger,
         .name = "rpc-test",
         .max_workers = options.n_worker_threads,
         .lane = options.handler_lane,
-      })) {
+      })),
+      messenger_pools_(options.messenger_pools) {
 
   EXPECT_OK(messenger_->ListenAddress(
       rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>(),
@@ -544,9 +552,16 @@ Status TestServer::Start() {
 Status TestServer::RegisterService(std::unique_ptr<ServiceIf> service) {
   const std::string& service_name = service->service_name();
 
+  ThreadPoolProvider provider = [pool = thread_pool_](auto, auto) { return pool; };
+  if (messenger_pools_) {
+    provider = [messenger = messenger_.get(), priority = *messenger_pools_](
+        ThreadPoolTag tag, LaneId lane) {
+      return messenger->HandlerThreadPool(priority, tag, lane);
+    };
+  }
   auto service_pool = make_scoped_refptr<ServicePool>(
-      kQueueLength, [pool = thread_pool_](auto) { return pool; },
-      &messenger_->scheduler(), std::move(service), messenger_->metric_entity());
+      kQueueLength, std::move(provider), &messenger_->scheduler(), std::move(service),
+      messenger_->metric_entity());
   if (!service_pool_) {
     service_pool_ = service_pool;
   }

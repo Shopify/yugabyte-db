@@ -123,6 +123,9 @@ class InboundCall : public RpcCall, public MPSCQueueEntry<InboundCall> {
   ConnectionPtr connection() const;
   ConnectionContext& connection_context() const;
 
+  // Lane of the reactor owning the call's connection; kNoLane without a connection.
+  LaneId connection_lane() const;
+
   inline Trace* trace() const EXCLUDES(mutex_) {
     return trace_.load(std::memory_order_acquire);
   }
@@ -172,6 +175,11 @@ class InboundCall : public RpcCall, public MPSCQueueEntry<InboundCall> {
 
   virtual ThreadPoolTag pool_tag() const {
     return 0;
+  }
+
+  // Lane whose handler pool handles the call (ThreadPoolProvider); kNoLane for the unlaned pools.
+  virtual LaneId lane() const {
+    return kNoLane;
   }
 
   virtual Slice serialized_remote_method() const = 0;

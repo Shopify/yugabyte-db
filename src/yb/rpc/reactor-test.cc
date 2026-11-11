@@ -257,11 +257,12 @@ TEST_F_EX(ReactorTest, LanedReactors, YBTest) {
   delta = LaneHandoffCounts::Now() - counts;
   ASSERT_EQ(delta.crossing(LaneCrossingCategory::kReactor), 1) << delta.ToString();
   ASSERT_EQ(delta.total_crossings(), 1);
+  // Unlaned submitters count nothing, so that they never write the counter slot they all share.
   auto unlaned_before = delta.entries_from_unlaned;
   RunOnReactorFrom(lane0_reactor, [] { ApplyServiceMaskToCurrentThread(); });
   delta = LaneHandoffCounts::Now() - counts;
   ASSERT_EQ(delta.total_crossings(), 1) << delta.ToString();
-  ASSERT_GE(delta.entries_from_unlaned, unlaned_before + 1);
+  ASSERT_EQ(delta.entries_from_unlaned, unlaned_before);
   // An unlaned reactor counts nothing.
   RunOnReactorFrom(messenger->TEST_reactor(2), InLane(1));
   delta = LaneHandoffCounts::Now() - counts;

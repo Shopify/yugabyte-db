@@ -932,7 +932,10 @@ void OutboundCall::QueueDumpConnectionState() const {
 ///
 
 string ConnectionId::ToString() const {
-  return Format("{ remote: $0 idx: $1 protocol: $2 }", remote_, idx_, protocol_);
+  if (lane_ == kNoLane) {
+    return Format("{ remote: $0 idx: $1 protocol: $2 }", remote_, idx_, protocol_);
+  }
+  return Format("{ remote: $0 idx: $1 protocol: $2 lane: $3 }", remote_, idx_, protocol_, lane_);
 }
 
 size_t ConnectionId::HashCode() const {
@@ -940,6 +943,9 @@ size_t ConnectionId::HashCode() const {
   boost::hash_combine(seed, hash_value(remote_));
   boost::hash_combine(seed, idx_);
   boost::hash_combine(seed, protocol_);
+  if (lane_ != kNoLane) {
+    boost::hash_combine(seed, lane_);
+  }
   return seed;
 }
 

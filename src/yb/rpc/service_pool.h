@@ -45,6 +45,7 @@
 #include "yb/rpc/rpc_fwd.h"
 #include "yb/rpc/rpc_service.h"
 
+#include "yb/util/lanes.h"
 #include "yb/util/status_fwd.h"
 #include "yb/util/blocking_queue.h"
 #include "yb/util/mutex.h"
@@ -61,7 +62,9 @@ class Socket;
 
 namespace rpc {
 
-using ThreadPoolProvider = std::function<ThreadPoolPtr(ThreadPoolTag)>;
+// Returns the pool that handles a call with the given tag and lane (InboundCall::lane(): the
+// receiving reactor's lane, or the caller's lane for a local call; kNoLane for none).
+using ThreadPoolProvider = std::function<ThreadPoolPtr(ThreadPoolTag, LaneId)>;
 
 // A pool of threads that handle new incoming RPC calls.
 // Also includes a queue that calls get pushed onto for handling by the pool.

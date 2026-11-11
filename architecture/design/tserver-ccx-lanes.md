@@ -6,12 +6,14 @@ costs several times the CPU of one between threads sharing an L3. Lanes partitio
 threads and tablets by L3 domain so that a tablet's request path stays within one domain. Lanes
 are off by default (`--tserver_lanes=1`).
 
-What is implemented: topology discovery, the lane model and its flags, and the confinement and
-accounting mechanisms that consume the topology: new threads, thread pools, priority-pool tasks,
-reactors given a lane, the postmaster spawn, and the crossing counters. Nothing assigns lanes in
-production yet: there are no per-lane pools or laned messengers, so with lanes on every tserver
-thread runs in the service set. The tablet-to-lane rule below is a contract for code that routes
-by lane.
+What is implemented: topology discovery, the lane model and its flags, the confinement and
+accounting mechanisms that consume the topology (new threads, thread pools, priority-pool tasks,
+reactors, the postmaster spawn, the crossing counters), and the laned tablet server messenger.
+With lanes on, the tserver messenger runs a group of reactors and handler pools per lane, and an
+inbound call is handled in the lane of the reactor that read it; calls with a lane hint go on
+lane-keyed connections, but no caller sets a hint yet, and tablet pipelines, sessions and all
+other tserver threads still run in the service set. The tablet-to-lane rule below is a contract
+for code that routes by lane.
 
 ## Definitions
 
@@ -73,6 +75,8 @@ All are startup-only and tagged `advanced`.
 | `tserver_lane_domain` | `l3` | `l3` or `socket`, as above. |
 | `tserver_lane_cpu_affinity` | `true` | `false` keeps the lane structure without pinning threads. |
 | `tserver_service_lane_cpus` | empty | Cpu-list reserved for the service set and removed from every domain. |
+| `tserver_lane_reactors` | `0` | Reactors per lane of the tserver messenger, replacing `--num_reactor_threads`. `0`: see [Messenger lanes](#messenger-lanes). |
+| `tserver_lane_connections_per_remote` | `2` | Connections per (remote, lane) for calls with a lane hint (`k` below). |
 
 Mapping `N` lanes onto `D` domains keeps masks whole and contiguous blocks within a socket:
 
@@ -109,7 +113,9 @@ The topology is process-wide and immutable once an active one is set. MiniCluste
 `PgMiniTestBase` run several tservers in one process and restart them, so setting an equal
 topology again is a no-op; setting a different one is a DFATAL. Consequently all tservers in a
 process share one `L`, and masters in the same process see it too: their threads start on the
-service mask like every other `yb::Thread`, and their messengers are never given reactor lanes.
+service mask like every other `yb::Thread`, and their messengers stay unlaned. Only
+`TabletServer::SetupMessengerBuilder` lanes a messenger (`SetupTserverLaneMessenger`); the CQL
+server, masters, and the xCluster and other clients that build their own messengers never do.
 Tests that need tservers with different `L` use ExternalMiniCluster. Unit tests install their own
 topology with the scoped `TEST_SetLaneTopology`.
 
@@ -136,7 +142,8 @@ No thread keeps its creator's mask:
 - `PriorityThreadPool` workers serve every lane: a task's lane (`SetTaskLane`) is applied before it
   runs, switching the mask only when it differs from the worker's current lane; unlaned tasks go
   back to the service mask.
-- A reactor applies its lane at the start of `Reactor::RunThread`. Reactor lanes come from
+- A reactor applies its lane at the start of `Reactor::RunThread`. A laned messenger assigns its
+  reactors' lanes itself (see below); tests can also give an unlaned messenger reactor lanes with
   `MessengerBuilder::set_reactor_lanes`, one per reactor (empty leaves all unlaned; a size other
   than the reactor count fails `Messenger::Init`).
 
@@ -144,6 +151,83 @@ Service CPUs confine threads started after the topology is installed. A `yb::Thr
 earlier (in the `TabletServer` constructor or by a process-wide singleton, such as the maintenance
 manager) that is not a pool worker keeps the full mask, as do threads not created through
 `yb::Thread` and the process's main thread.
+
+## Messenger lanes
+
+`MessengerBuilder::set_lane_topology` with an active topology makes a messenger laned
+(`Messenger::laned()`, `num_lanes()`). The topology must be the installed process topology,
+because reactor and pool threads take their masks and `ThisThreadLane()` from it; a different one
+fails `Messenger::Init` with `InvalidArgument`. The messenger copies it and sizes every per-lane
+array by its `L`. Lane values from a controller hint or a thread are reduced modulo `L` before
+indexing, and `kNoLane` always selects the unlaned state. Rpc reads no tserver flags: the tserver
+passes `tserver_lane_reactors` and `tserver_lane_connections_per_remote` through the builder.
+
+**Reactors.** A laned messenger builds `r` reactors per lane, lane by lane
+(`Messenger::ReactorsOfLane`), and ignores the reactor count from `--num_reactor_threads`, logging
+one INFO line ("Lane mode: L lanes, N reactors (per lane: ...); the configured reactor count ...
+is ignored"). With `tserver_lane_reactors=0`, `r = max(1, CPUs in the lane / 4 / lanes sharing
+the lane's domains)`, so forcing more lanes than domains splits a domain's reactors rather than
+multiplying them. Lanes whose domains lost service CPUs can get fewer reactors, so groups differ in
+size. This default is provisional; the final value is to be set by measurement on multi-L3
+hardware.
+
+**Thread names.** Linux keeps the first 15 characters of a thread name, so lane threads start
+with the lane as `L` and three digits: reactors `L007_reactor_<i>` (i within the lane), normal
+handler workers `L007_rpc_<n>_worker`, high-priority workers `L007_high_<n>_worker`, and tagged
+workers `L007_t<tag>_<n>_worker`. Thread categories keep the messenger name
+(`TabletServer_reactor`, `TabletServer_L007`, `TabletServer_L007-high-pri`,
+`TabletServer_L007_pool_<tag>`). Unlaned messengers and the unlaned pools keep their names.
+
+**Handler pools.** Each lane has a normal pool, a high-priority pool created on first use, and a
+`TaggedThreadPools` instance of its own for QoS tags (tag 0 is the lane's normal pool, held by the
+messenger and returned without a lookup). Their workers run in the lane and count handoffs as
+`rpc_handler`. Limits and cgroups are those of the unlaned pools: `rpc_workers_limit` (the
+builder's `workers_limit`) for normal and tagged pools, `rpc_high_priority_workers_limit` for
+high-priority ones, the system-medium, system-high and per-tag cgroups. The unlaned pools stay
+and serve `kNoLane`: `Messenger::ThreadPool(priority, lane)` and `TaggedThreadPool(tag, lane)`
+give a lane's pool and today's pool for `kNoLane`; the signatures without a lane are `kNoLane`.
+Looking up a tagged pool takes only that lane's lock, and the process-wide instance is unchanged.
+
+`ServicePool` asks its provider for the pool of `(call->pool_tag(), call->lane())`, and
+`RpcServer` maps that through `Messenger::HandlerThreadPool` to the lane's tagged pool for normal
+services and the lane's high-priority pool for high-priority ones. `InboundCall::lane()` is the
+receiving reactor's lane for calls read from a connection (no `RequestHeader` field), so an
+inbound call is handled in the lane that read it; inbound sockets are still assigned to reactors
+by a hash over all reactors.
+
+QoS thread count: at most `L x (1 normal + 1 high + T tagged)` handler pools for `T` active tags,
+next to the unlaned set, each up to the unlaned limit. Idle workers exit after
+`default_idle_timeout_ms`, and an idle tagged pool is reclaimed the next time its lane creates a
+tagged pool, so idle lanes cost no threads. Thread counts with QoS on and the real database count
+are to be measured on a cgroup-v2 host.
+
+**Outbound connections.** A call whose controller has a lane hint (`RpcController::set_lane`)
+through a laned messenger goes on a connection keyed by `(remote, lane, idx)` (`ConnectionId`
+has a separate lane field) and owned by a reactor of that lane, picked by a hash of the remote and
+`idx` over the lane's group. `idx` rotates over `k = tserver_lane_connections_per_remote`, so a
+tserver opens up to `L x remotes x k` lane-keyed connections next to the unlaned ones. The
+rotation counter is per `Proxy` and per submitting thread's lane, one cache line each plus a
+spare for unlaned threads, allocated only in a laned messenger, so threads of many lanes calling
+into one lane through one cached `Proxy` share no counter. Calls without a hint, and every call
+through an unlaned messenger, keep today's ids (`kNoLane`, `idx < num_connections_to_server`) and
+reactors. A reactor erases a closed client connection by the key it was registered under.
+
+**Callbacks.** In thread-pool callback modes a call's callback runs in the normal or high-priority
+pool of the controller's issuing lane, and in today's pools when that is `kNoLane` or the
+messenger is unlaned. The controller records the issuing lane when a call is sent: a send from a
+reactor thread keeps the lane an earlier send recorded, so a retry rescheduled by `RpcRetrier` or
+`Messenger::ScheduleOnReactor` on any reactor calls back in the original lane; a first send, or a
+send from any other thread, records the sending thread's lane, so a controller reused by another
+lane follows it. `Reset()` keeps the issuing lane and clears the hint, which callers set per send.
+`ScheduleOnReactor` from a lane thread picks a reactor of that lane.
+
+**Local calls.** A local call is handled by the pool of its lane: the controller's hint, or the
+issuing lane without one, so un-hinted local calls stay in the caller's lane as they stay on the
+caller's thread today. It runs inline iff `allow_local_calls_in_curr_thread` is set, the calling
+thread is in the call's lane (always true in an unlaned messenger), and the calling thread is a
+worker of the pool the provider returns (`ServicePool::Process`'s `OwnsThisThread` check), which
+a thread of another lane never is; otherwise it is queued to that pool. Shared-memory PG sessions
+run on threads no handler pool owns, so their local calls always queue.
 
 ## Service set and the postmaster
 
@@ -159,7 +243,8 @@ it. initdb and odyssey keep the spawning thread's mask, the service set.
 ## Relation to QoS cgroups
 
 Lanes and QoS are independent. QoS moves threads between cgroup-v2 cpu-controller groups without
-a cpuset (`util/cgroups.cc`); lanes set per-thread masks with `sched_setaffinity`. A pool's
+a cpuset (`util/cgroups.cc`); lanes set per-thread masks with `sched_setaffinity`. QoS tagged
+handler pools are per (lane, tag), see [Messenger lanes](#messenger-lanes). A pool's
 `cgroup` and `lane` options are applied side by side in `Worker::Execute`, and per-task cgroups
 are unchanged. A cpuset imposed on the process from outside is honoured through discovery.
 
@@ -169,7 +254,8 @@ A handoff records the submitting thread's lane in one byte when it is queued and
 the executing thread's lane when it runs. If both are laned and differ it counts a crossing for
 the executor's category; if only the executor is laned it counts an entry from unlaned. Categories
 are reactor, rpc handler, tablet pipeline, callback and other, set per pool with
-`ThreadPoolOptions::crossing_category` (default other). Counted handoffs:
+`ThreadPoolOptions::crossing_category` (default other); an item can override its pool's category
+(`LaneHandoff::SetCategory`), as RPC callbacks do, since they share the handler pools. Counted handoffs:
 
 | Primitive | Counted when | Category |
 | --- | --- | --- |
@@ -178,6 +264,8 @@ are reactor, rpc handler, tablet pipeline, callback and other, set per pool with
 | `TaskStream` item, including items taken by a running stream | it is processed | the stream's pool's |
 | Reactor task (`Reactor::ScheduleReactorTask`) | it is scheduled | reactor |
 | Outbound call (`Reactor::QueueOutboundCall`), response or other outbound data from another thread (`Connection::QueueOutboundData`), Redis reply (`ConnectionContextWithQueue::QueueResponse`) | it is queued | reactor |
+| Inbound or local call queued to a lane's handler pool (`ServicePool::Process`) | a handler starts it | rpc handler |
+| RPC callback queued to the issuing lane's pool (`OutboundCall::InvokeCallback`) | the callback starts | callback |
 
 Many primitives queue items privately and wake their executor once per batch. Their items are
 counted, and the wrapper task that only drains them is not, so each handoff counts once whether or
@@ -185,9 +273,12 @@ not the executor was already running: `Strand`'s pool task and the task that sta
 draining are submitted uncounted (`ThreadPoolToken::SubmitDrainFunc`), and reactor queues count
 each item with `Reactor::CountLaneHandoff` and schedule the drain with `ScheduleDrainTask`. The
 end-of-group call with no item is not counted. A reactor's lane is fixed, so its handoffs are
-counted on the submitting side.
+counted on the submitting side, and only by laned submitters: an unlaned thread's only counter
+slot is the spare one all unlaned threads share, and every call it hands to a laned reactor (all
+client calls from PG sessions, which are not laned yet) would write it.
 
-Not counted: operations queued on a tablet's preparer (its drain task is submitted uncounted, so
+Not counted: work handed to a reactor by an unlaned thread (see above), operations queued on a
+tablet's preparer (its drain task is submitted uncounted, so
 leader-side prepare handoffs show nowhere), `PriorityThreadPool` tasks (flush and compaction),
 `rpc::Scheduler` and other io-service timers, `CompletedCallQueue`, futures, promises and
 `Synchronizer` wakeups, raw `std::condition_variable` or `BlockingQueue` handoffs outside

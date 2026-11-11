@@ -2582,6 +2582,7 @@ void TabletServer::InvalidatePgTableCache(
 }
 Status TabletServer::SetupMessengerBuilder(rpc::MessengerBuilder* builder) {
   RETURN_NOT_OK(DbServerBase::SetupMessengerBuilder(builder));
+  SetupTserverLaneMessenger(builder);
 
 #ifdef __linux__
   builder->SetThreadPoolCgroupProvider([this](auto tag) { return PerDbCgroupProvider(tag); });

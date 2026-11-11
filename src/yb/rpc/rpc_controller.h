@@ -39,6 +39,7 @@
 
 #include "yb/rpc/rpc_fwd.h"
 
+#include "yb/util/lanes.h"
 #include "yb/util/locks.h"
 #include "yb/util/monotime.h"
 #include "yb/util/status_fwd.h"
@@ -72,7 +73,8 @@ class RpcController {
   void Swap(RpcController* other);
 
   // Reset this controller so it may be used with another call.
-  // Note that reset doesn't reset controller's properties except the call itself.
+  // Note that reset doesn't reset controller's properties except the call itself and the lane
+  // hint (set_lane).
   void Reset();
 
   // Return true if the call has finished.
@@ -137,7 +139,7 @@ class RpcController {
     invoke_callback_mode_ = invoke_callback_mode;
   }
 
-  InvokeCallbackMode invoke_callback_mode() { return invoke_callback_mode_; }
+  InvokeCallbackMode invoke_callback_mode() const { return invoke_callback_mode_; }
 
   // Return the configured timeout.
   MonoDelta timeout() const;
@@ -173,6 +175,24 @@ class RpcController {
 
   ThreadPoolTag pool_tag() const { return pool_tag_; }
 
+  // Lane hint for the next call through a laned messenger, reduced modulo its lane count: a remote
+  // call goes on a connection keyed by (remote, lane) and owned by that lane's reactors, and a
+  // local call is handled by that lane's handler pool. kNoLane (default) sends the call as an
+  // unlaned messenger does. Correctness never depends on it; a wrong lane costs locality only.
+  // Reset() clears it, so a caller that resends through the same controller (a retry) sets it
+  // for every send.
+  void set_lane(LaneId lane) { lane_ = lane; }
+
+  LaneId lane() const { return lane_; }
+
+  // Lane whose handler pool runs this controller's callbacks in thread-pool callback modes,
+  // kNoLane for the unlaned pools. Recorded when a call is sent through a laned messenger: a send
+  // from a reactor thread keeps the lane recorded by an earlier send, so that a retry rescheduled
+  // on any reactor (RpcRetrier, Messenger::ScheduleOnReactor) calls back in the lane that issued
+  // the call; a first send, or a send from any other thread, records the sending thread's lane.
+  // Kept across Reset().
+  LaneId issuing_lane() const { return issuing_lane_; }
+
   // Lets the next local call time out at its deadline instead of waiting for the handler.
   // The handler could still use the request and response after that, so holder must keep them
   // alive. The call releases holder when the handler responds.
@@ -200,6 +220,13 @@ class RpcController {
   bool TEST_disable_outbound_call_response_processing = false;
 
   ThreadPoolTag pool_tag_ = 0;
+
+  // Called by Proxy when it sends a call through a laned messenger.
+  void RecordIssuingLane();
+
+  LaneId lane_ = kNoLane;
+  LaneId issuing_lane_ = kNoLane;
+  bool issuing_lane_recorded_ = false;
 
   // Taken by the next call, so it does not stay referenced from the controller.
   std::shared_ptr<void> local_call_buffers_holder_;

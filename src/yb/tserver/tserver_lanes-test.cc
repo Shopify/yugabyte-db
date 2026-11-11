@@ -18,6 +18,8 @@
 
 #include "yb/gutil/casts.h"
 
+#include "yb/rpc/messenger.h"
+
 #include "yb/tserver/tserver_lanes.h"
 
 #include "yb/util/cpu_topology_test_util.h"
@@ -31,8 +33,10 @@
 
 DECLARE_string(TEST_cpu_topology_cpuset);
 DECLARE_string(TEST_cpu_topology_sysfs_root);
+DECLARE_int32(tserver_lane_connections_per_remote);
 DECLARE_bool(tserver_lane_cpu_affinity);
 DECLARE_string(tserver_lane_domain);
+DECLARE_int32(tserver_lane_reactors);
 DECLARE_int32(tserver_lanes);
 DECLARE_string(tserver_service_lane_cpus);
 
@@ -79,6 +83,42 @@ TEST_F(TserverLanesTest, FlagValidation) {
   ASSERT_OK(flags_internal::ValidateFlagValue("tserver_service_lane_cpus", "0-3,192-195"));
   ASSERT_NOK(flags_internal::ValidateFlagValue("tserver_service_lane_cpus", "0-"));
   ASSERT_NOK(flags_internal::ValidateFlagValue("tserver_service_lane_cpus", "2048"));
+  for (auto value : {"0", "1", "256"}) {
+    ASSERT_OK(flags_internal::ValidateFlagValue("tserver_lane_reactors", value));
+  }
+  for (auto value : {"-1", "257"}) {
+    ASSERT_NOK(flags_internal::ValidateFlagValue("tserver_lane_reactors", value));
+  }
+  for (auto value : {"1", "2", "256"}) {
+    ASSERT_OK(flags_internal::ValidateFlagValue("tserver_lane_connections_per_remote", value));
+  }
+  for (auto value : {"0", "257"}) {
+    ASSERT_NOK(flags_internal::ValidateFlagValue("tserver_lane_connections_per_remote", value));
+  }
+}
+
+// Only an active topology makes the tablet server's messenger laned, with the lane flags.
+TEST_F(TserverLanesTest, MessengerLaneSettings) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_lane_reactors) = 3;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_lane_connections_per_remote) = 4;
+  {
+    TEST_SetLaneTopology scope{LaneTopology()};
+    rpc::MessengerBuilder builder("TabletServer");
+    SetupTserverLaneMessenger(&builder);
+    ASSERT_EQ(builder.lane_topology(), nullptr);
+    ASSERT_EQ(builder.reactors_per_lane(), 0);
+    ASSERT_EQ(builder.connections_per_lane_remote(), 2);
+  }
+  auto topology = MakeTwoLaneTestTopology(/* affinity_enabled= */ false);
+  if (!topology) {
+    GTEST_SKIP() << "Needs at least 2 CPUs";
+  }
+  TEST_SetLaneTopology scope(*topology);
+  rpc::MessengerBuilder builder("TabletServer");
+  SetupTserverLaneMessenger(&builder);
+  ASSERT_EQ(builder.lane_topology(), &GetLaneTopology());
+  ASSERT_EQ(builder.reactors_per_lane(), 3);
+  ASSERT_EQ(builder.connections_per_lane_remote(), 4);
 }
 
 TEST_F(TserverLanesTest, AutoLanes) {

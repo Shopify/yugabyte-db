@@ -147,7 +147,9 @@ class Worker : public boost::intrusive::list_base_hook<> {
   Status Start(size_t index, ThreadPoolTask* task) EXCLUDES(mutex_) {
     UniqueLock lock(mutex_);
     SCHECK_EQ(state_, WorkerState::kRunning, IllegalState, "Worker already stopped");
-    auto name = Format("$0_$1_worker", share_.options.name, index);
+    const auto& prefix = share_.options.worker_name_prefix.empty()
+        ? share_.options.name : share_.options.worker_name_prefix;
+    auto name = Format("$0_$1_worker", prefix, index);
     return Thread::Create(share_.options.name, name, &Worker::Execute, this, task, &thread_);
   }
 

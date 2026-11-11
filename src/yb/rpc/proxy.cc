@@ -40,6 +40,8 @@
 
 #include "yb/util/logging.h"
 
+#include "yb/gutil/casts.h"
+
 #include "yb/rpc/local_call.h"
 #include "yb/rpc/lightweight_message.h"
 #include "yb/rpc/proxy_context.h"
@@ -89,9 +91,14 @@ Proxy::Proxy(ProxyContext* context,
       latency_stats_(ScopedDnsTracker::active_metric()),
       // Use the context->num_connections_to_server() here as opposed to directly reading the
       // FLAGS_num_connections_to_server, because the flag value could have changed since then.
-      num_connections_to_server_(context_->num_connections_to_server()) {
+      num_connections_to_server_(context_->num_connections_to_server()),
+      num_lanes_(context_->num_lanes()),
+      connections_per_lane_remote_(context_->connections_per_lane_remote()) {
   VLOG(1) << "Create proxy to " << remote << " with num_connections_to_server="
           << num_connections_to_server_;
+  if (num_lanes_ != 0) {
+    lane_call_counters_.reset(new LaneCallCounter[num_lanes_ + 1]);
+  }
   if (context_->parent_mem_tracker()) {
     mem_tracker_ = MemTracker::FindOrCreateTracker(
         "Queueing", context_->parent_mem_tracker());
@@ -140,20 +147,29 @@ void Proxy::AsyncRequest(const RemoteMethod* method,
 }
 
 ThreadPool* Proxy::GetCallbackThreadPool(
-    bool force_run_callback_on_reactor, InvokeCallbackMode invoke_callback_mode) {
+    bool force_run_callback_on_reactor, const RpcController& controller) {
   if (force_run_callback_on_reactor) {
     return nullptr;
   }
+  const auto invoke_callback_mode = controller.invoke_callback_mode();
   switch (invoke_callback_mode) {
     case InvokeCallbackMode::kReactorThread:
       return nullptr;
       break;
     case InvokeCallbackMode::kThreadPoolNormal:
-      return &context_->CallbackThreadPool(ServicePriority::kNormal);
+      return &context_->CallbackThreadPool(ServicePriority::kNormal, controller.issuing_lane());
     case InvokeCallbackMode::kThreadPoolHigh:
-      return &context_->CallbackThreadPool(ServicePriority::kHigh);
+      return &context_->CallbackThreadPool(ServicePriority::kHigh, controller.issuing_lane());
   }
   FATAL_INVALID_ENUM_VALUE(InvokeCallbackMode, invoke_callback_mode);
+}
+
+size_t Proxy::TEST_LaneCallCount(LaneId submitter) const {
+  if (!lane_call_counters_) {
+    return 0;
+  }
+  return lane_call_counters_[LaneCallCounterIndex(submitter)].value.load(
+      std::memory_order_relaxed);
 }
 
 bool Proxy::PrepareCall(AnyMessageConstPtr req, RpcController* controller) {
@@ -187,7 +203,7 @@ void Proxy::AsyncLocalCall(
   controller->call_ = std::make_shared<LocalOutboundCall>(
       *method, outbound_call_metrics_, resp, controller, context_->rpc_metrics(),
       std::move(callback),
-      GetCallbackThreadPool(force_run_callback_on_reactor, controller->invoke_callback_mode()));
+      GetCallbackThreadPool(force_run_callback_on_reactor, *controller));
   if (!PrepareCall(req, controller)) {
     return;
   }
@@ -206,8 +222,14 @@ void Proxy::AsyncLocalCall(
   const shared_ptr<LocalYBInboundCall>& local_call =
       static_cast<LocalOutboundCall*>(call)->CreateLocalInboundCall(
           send_metadata ? context_->call_state_listener_factory() : nullptr,
-          std::move(buffers_holder));
-  Queue queue(!controller->allow_local_calls_in_curr_thread());
+          std::move(buffers_holder),
+          context_->ToLocalLane(controller->lane() != kNoLane ? controller->lane()
+                                                              : controller->issuing_lane()));
+  // Inline only on a thread of the call's lane. The service pool also requires the thread to be
+  // owned by the pool it picks for the call's lane, which a thread of another lane never is, so
+  // the lane check states the rule rather than changing the outcome.
+  const bool same_lane = num_lanes_ == 0 || ThisThreadLane() == local_call->lane();
+  Queue queue(!controller->allow_local_calls_in_curr_thread() || !same_lane);
   context_->HandleLocal(local_call, queue);
 }
 
@@ -220,7 +242,7 @@ void Proxy::AsyncRemoteCall(
   controller->call_ = std::shared_ptr<OutboundCall>(new OutboundCall(
       *method, outbound_call_metrics_, std::move(method_metrics), resp, controller,
       context_->rpc_metrics(), std::move(callback),
-      GetCallbackThreadPool(force_run_callback_on_reactor, controller->invoke_callback_mode()),
+      GetCallbackThreadPool(force_run_callback_on_reactor, *controller),
       send_metadata ? context_->metadata_serializer_factory() : nullptr));
   if (!PrepareCall(req, controller)) {
     return;
@@ -243,6 +265,9 @@ void Proxy::DoAsyncRequest(const RemoteMethod* method,
                            const bool force_run_callback_on_reactor,
                            bool send_metadata) {
   CHECK(controller->call_.get() == nullptr) << "Controller should be reset";
+  if (num_lanes_ != 0) {
+    controller->RecordIssuingLane();
+  }
 
   auto buffers_holder = std::move(controller->local_call_buffers_holder_);
   if (call_local_service_) {
@@ -336,8 +361,19 @@ void Proxy::ResolveDone(const Result<IpAddress>& result) {
 }
 
 void Proxy::QueueCall(RpcController* controller, const Endpoint& endpoint) {
-  uint8_t idx = num_calls_.fetch_add(1) % num_connections_to_server_;
-  ConnectionId conn_id(endpoint, idx, protocol_);
+  uint8_t idx;
+  LaneId lane = kNoLane;
+  if (lane_call_counters_ && controller->lane() != kNoLane) {
+    lane = narrow_cast<LaneId>(controller->lane() % num_lanes_);
+    // Indexed by the calling thread's lane, not the hint, so that threads of many lanes calling
+    // into one lane don't share a counter.
+    auto& counter = lane_call_counters_[LaneCallCounterIndex(ThisThreadLane())].value;
+    idx = narrow_cast<uint8_t>(
+        counter.fetch_add(1, std::memory_order_relaxed) % connections_per_lane_remote_);
+  } else {
+    idx = num_calls_.fetch_add(1) % num_connections_to_server_;
+  }
+  ConnectionId conn_id(endpoint, idx, protocol_, lane);
   controller->call_->SetConnectionId(conn_id, &remote_.host());
   context_->QueueOutboundCall(controller->call_);
 }

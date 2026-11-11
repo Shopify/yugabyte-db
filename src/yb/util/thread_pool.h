@@ -162,6 +162,7 @@ YB_DEFINE_ENUM(WorkerWakeOrder, (kLifo)(kFifo)(kMixed));
 WorkerWakeOrder DefaultWorkerWakeOrder();
 
 struct ThreadPoolOptions {
+  // Thread category of the workers, and the start of their names unless worker_name_prefix is set.
   std::string name;
 
   size_t max_workers;
@@ -179,6 +180,11 @@ struct ThreadPoolOptions {
   LaneCrossingCategory crossing_category = LaneCrossingCategory::kOther;
 
   ThreadPoolMetrics metrics = {};
+
+  // Start of the worker thread names, when it must differ from name: Linux keeps only the first 15
+  // characters of a thread name, so a pool whose distinguishing part would come after them sets a
+  // short prefix here.
+  std::string worker_name_prefix = {};
 
   std::string ToString() const {
     return YB_STRUCT_TO_STRING(

@@ -37,6 +37,7 @@
 #include "yb/util/logging.h"
 
 #include "yb/rpc/outbound_call.h"
+#include "yb/rpc/reactor.h"
 #include "yb/rpc/sidecars.h"
 
 #include "yb/util/result.h"
@@ -73,6 +74,9 @@ void RpcController::Swap(RpcController* other) {
   std::swap(allow_local_calls_in_curr_thread_, other->allow_local_calls_in_curr_thread_);
   std::swap(call_, other->call_);
   std::swap(invoke_callback_mode_, other->invoke_callback_mode_);
+  std::swap(lane_, other->lane_);
+  std::swap(issuing_lane_, other->issuing_lane_);
+  std::swap(issuing_lane_recorded_, other->issuing_lane_recorded_);
 }
 
 void RpcController::Reset() {
@@ -81,6 +85,14 @@ void RpcController::Reset() {
     CHECK(FinishedUnlocked());
   }
   call_.reset();
+  lane_ = kNoLane;
+}
+
+void RpcController::RecordIssuingLane() {
+  if (!issuing_lane_recorded_ || !Reactor::IsReactorThread()) {
+    issuing_lane_ = ThisThreadLane();
+    issuing_lane_recorded_ = true;
+  }
 }
 
 bool RpcController::finished() const {

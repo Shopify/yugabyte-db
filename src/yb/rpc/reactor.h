@@ -128,8 +128,15 @@ class DelayedTask;
 
 class Reactor {
  public:
-  Reactor(Messenger* messenger, int index, const MessengerBuilder &bld);
+  // lane is the reactor's lane (kNoLane for none), already reduced to the process topology, and
+  // index_in_lane its position among the messenger's reactors of that lane, used in the thread
+  // name.
+  Reactor(Messenger* messenger, int index, const MessengerBuilder &bld,
+          LaneId lane = kNoLane, int index_in_lane = 0);
   ~Reactor();
+
+  // Whether the calling thread is a reactor thread of any messenger.
+  static bool IsReactorThread();
 
   // This may be called from another thread.
   const std::string &name() const { return name_; }
@@ -213,6 +220,9 @@ class Reactor {
 
   // Collect metrics. Works by scheduling a task on reactor thread and waiting for it.
   Status GetMetrics(ReactorMetrics *metrics) EXCLUDES_REACTOR_THREAD;
+
+  // Keys of this reactor's client connections.
+  Result<std::vector<ConnectionId>> TEST_ClientConnectionIds() EXCLUDES_REACTOR_THREAD;
 
   // Waits up to 30 seconds to join the reactor thread. If that fails, logs a warning and returns
   // in debug mode, but falls back to unlimited join in release mode after logging the warning.
@@ -341,10 +351,10 @@ class Reactor {
 
   const ReactorTaskPtr process_outbound_queue_task_;
 
-  // Number of outbound connections to create per each destination server address.
-  const int num_connections_to_server_;
-
   const LaneId lane_;
+
+  // OS-visible thread name: carries the lane within the first 15 characters for a laned reactor.
+  const std::string thread_name_;
 
   const std::shared_ptr<CompletedCallQueue> completed_call_queue_;
 

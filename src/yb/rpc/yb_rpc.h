@@ -158,6 +158,11 @@ class YBInboundCall : public InboundCall {
     return header_.pool_tag;
   }
 
+  // The receiving reactor's lane, so the handler runs in the lane that read the call.
+  LaneId lane() const override {
+    return LaneModeActive() ? connection_lane() : kNoLane;
+  }
+
   // Serializes 'response' into the InboundCall's internal buffer, and marks
   // the call as a success. Enqueues the response back to the connection
   // that made the call.

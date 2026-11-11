@@ -255,12 +255,16 @@ inline void CountLaneHandoffToThisThread(LaneId submitter, LaneCrossingCategory 
 }
 
 // Same for a handoff the calling thread submits to an executor with a fixed lane (a reactor). The
-// count goes to the calling thread's slot, which is the one written from this lane.
+// count goes to the calling thread's slot, which is the one written from this lane. A calling
+// thread with no lane counts nothing: its only slot is the spare one shared by every unlaned
+// thread, and writing it on each call would be a shared write on the request path.
 inline void CountLaneHandoffFromThisThread(LaneId executor, LaneCrossingCategory category) {
   if (executor != kNoLane && LaneModeActive()) {
     const auto submitter = ThisThreadLane();
-    lanes_internal::CountHandoff(
-        submitter, executor, submitter, static_cast<size_t>(category));
+    if (submitter != kNoLane) {
+      lanes_internal::CountHandoff(
+          submitter, executor, submitter, static_cast<size_t>(category));
+    }
   }
 }
 
@@ -275,19 +279,29 @@ class LaneHandoff {
     }
   }
 
-  void RecordExecution(LaneCrossingCategory category) const {
+  // Counts the handoff under the category set with SetCategory, else under pool_category.
+  void RecordExecution(LaneCrossingCategory pool_category) const {
     if (counted_) {
-      CountLaneHandoffToThisThread(submitter_, category);
+      CountLaneHandoffToThisThread(
+          submitter_, category_ == kPoolCategory ? pool_category
+                                                 : static_cast<LaneCrossingCategory>(category_));
     }
   }
 
   void DisableCounting() { counted_ = false; }
 
+  // For items whose category differs from the pool's: pools shared by several kinds of work (the
+  // messenger's handler pools also run RPC callbacks) count each item under its own category.
+  void SetCategory(LaneCrossingCategory category) { category_ = static_cast<uint8_t>(category); }
+
   LaneId submitter() const { return submitter_; }
 
  private:
+  static constexpr uint8_t kPoolCategory = 0xFF;
+
   LaneId submitter_ = kNoLane;
   bool counted_ = true;
+  uint8_t category_ = kPoolCategory;
 };
 
 } // namespace yb

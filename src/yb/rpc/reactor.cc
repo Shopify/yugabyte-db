@@ -242,15 +242,20 @@ CoarseTimePoint ExpirationEnforcementTime(CoarseTimePoint expires_at) {
       : expires_at + 1ms * FLAGS_reactor_based_outbound_call_expiration_delay_ms;
 }
 
-LaneId ReactorLane(const MessengerBuilder& bld, int index) {
-  const auto& lanes = bld.reactor_lanes();
-  if (index < 0 || static_cast<size_t>(index) >= lanes.size()) {
-    return kNoLane;
+thread_local bool is_reactor_thread = false;
+
+std::string ReactorThreadName(const std::string& messenger_name, LaneId lane, int index_in_lane) {
+  if (lane == kNoLane) {
+    return messenger_name + "_reactor";
   }
-  return NormalizeLane(GetLaneTopology(), lanes[index]);
+  return Format("L$0_reactor_$1", ZeroPadded(lane, 3), index_in_lane);
 }
 
 } // anonymous namespace
+
+bool Reactor::IsReactorThread() {
+  return is_reactor_thread;
+}
 
 // ------------------------------------------------------------------------------------------------
 // Public methods of Reactor
@@ -258,9 +263,13 @@ LaneId ReactorLane(const MessengerBuilder& bld, int index) {
 
 Reactor::Reactor(Messenger* messenger,
                  int index,
-                 const MessengerBuilder &bld)
+                 const MessengerBuilder &bld,
+                 LaneId lane,
+                 int index_in_lane)
     : messenger_(*messenger),
-      name_(Format("$0_R$1", messenger->name(), ZeroPadded(index, 3))),
+      name_(lane == kNoLane
+          ? Format("$0_R$1", messenger->name(), ZeroPadded(index, 3))
+          : Format("$0_L$1_R$2", messenger->name(), ZeroPadded(lane, 3), ZeroPadded(index, 3))),
       log_prefix_(name_ + ": "),
       loop_(kDefaultLibEvFlags),
       connection_keepalive_time_(bld.connection_keepalive_time()),
@@ -268,8 +277,8 @@ Reactor::Reactor(Messenger* messenger,
       process_outbound_queue_task_(
           MakeFunctorReactorTask(std::bind(&Reactor::ProcessOutboundQueue, this),
                                  SOURCE_LOCATION())),
-      num_connections_to_server_(bld.num_connections_to_server()),
-      lane_(ReactorLane(bld, index)),
+      lane_(lane),
+      thread_name_(ReactorThreadName(messenger->name(), lane, index_in_lane)),
       completed_call_queue_(std::make_shared<CompletedCallQueue>()),
       cur_time_(CoarseMonoClock::Now()),
       cgroup_(bld.system_high_cgroup()) {
@@ -319,7 +328,7 @@ Status Reactor::Init() {
 
   // Create Reactor thread.
   const std::string group_name = messenger_.name() + "_reactor";
-  return Thread::Create(group_name, group_name, &Reactor::RunThread, this, &thread_);
+  return Thread::Create(group_name, thread_name_, &Reactor::RunThread, this, &thread_);
 }
 
 void Reactor::StartShutdown() {
@@ -413,6 +422,18 @@ void Reactor::ShutdownInternal() {
   processing_outbound_queue_.clear();
 
   completed_call_queue_->Shutdown();
+}
+
+Result<std::vector<ConnectionId>> Reactor::TEST_ClientConnectionIds() {
+  std::vector<ConnectionId> result;
+  RETURN_NOT_OK(RunOnReactorThread([&result](Reactor* reactor) {
+    ReactorThreadRoleGuard guard;
+    for (const auto& [id, conn] : reactor->client_conns_) {
+      result.push_back(id);
+    }
+    return Status::OK();
+  }, SOURCE_LOCATION()));
+  return result;
 }
 
 Status Reactor::GetMetrics(ReactorMetrics *metrics) {
@@ -746,6 +767,7 @@ void Reactor::RunThread() {
                 LogPrefix() + "Failed to move reactor thread to cgroup");
   }
 #endif
+  is_reactor_thread = true;
   ApplyLaneToCurrentThread(lane_);
   ThreadRestrictions::SetWaitAllowed(false);
   ThreadRestrictions::SetIOAllowed(false);
@@ -848,6 +870,7 @@ Status Reactor::FindOrStartConnection(const ConnectionId &conn_id,
   RETURN_NOT_OK(connection->Start(&loop_));
 
   // Insert into the client connection map to avoid duplicate connection requests.
+  connection->set_client_id(conn_id);
   CHECK(client_conns_.emplace(conn_id, connection).second);
 
   conn->swap(connection);
@@ -885,22 +908,20 @@ void Reactor::DestroyConnection(Connection *conn, const Status &conn_status) {
 
   // Unlink connection from lists.
   if (conn->direction() == ConnectionDirection::CLIENT) {
-    bool erased = false;
-    for (int idx = 0; idx < num_connections_to_server_; idx++) {
-      auto it = client_conns_.find(ConnectionId(conn->remote(), idx, conn->protocol()));
-      if (it != client_conns_.end() && it->second.get() == conn) {
-        client_conns_.erase(it);
-        erased = true;
-      }
-    }
-    if (!erased) {
+    // Erase by the key the connection was registered under: keys of laned connections can't be
+    // rebuilt from the connection's remote and protocol.
+    auto it = client_conns_.find(conn->client_id());
+    if (it != client_conns_.end() && it->second.get() == conn) {
+      client_conns_.erase(it);
+    } else {
       LOG_WITH_PREFIX(WARNING) << "Looking for " << conn->ToString();
       for (auto &p : client_conns_) {
         LOG_WITH_PREFIX(WARNING) << "  Client connection: " << p.first.ToString() << ", "
                                  << p.second->ToString();
       }
       LOG_WITH_PREFIX(FATAL)
-          << "Couldn't find connection for any index to " << conn->ToString()
+          << "Couldn't find client connection " << conn->ToString() << " registered as "
+          << conn->client_id().ToString()
           << ", destroy reason: " << conn_status;
     }
   } else if (conn->direction() == ConnectionDirection::SERVER) {

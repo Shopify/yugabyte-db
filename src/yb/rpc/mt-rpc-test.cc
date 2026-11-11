@@ -202,7 +202,7 @@ TEST_F(MultiThreadedRpcTest, TestBlowOutServiceQueue) {
         .max_workers = 0
       });
   scoped_refptr<ServicePool> service_pool(new ServicePool(
-      kMaxConcurrency, [thread_pool](auto) { return thread_pool; },
+      kMaxConcurrency, [thread_pool](auto, auto) { return thread_pool; },
       &server_messenger->scheduler(), std::move(service), metric_entity()));
   ASSERT_OK(server_messenger->RegisterService(service_name, service_pool));
   ASSERT_OK(server_messenger->StartAcceptor());
