@@ -69,6 +69,8 @@
 #include "yb/tserver/tserver_shared_mem.h"
 #include "yb/util/coding.h"
 #include "yb/util/env.h"
+#include "yb/util/flags/auto_flags.h"
+#include "yb/util/flags/flag_tags.h"
 #include "yb/util/mem_tracker.h"
 #include "yb/util/memory/arena.h"
 #include "yb/util/metrics.h"
@@ -122,6 +124,9 @@ DEFINE_NON_RUNTIME_bool(local_runtime_shared_memory, kSharedMemoryByDefault,
 DEFINE_NON_RUNTIME_bool(local_runtime_wait_on_conflict, true,
     "Wait for conflicting transactions to finish, as tablet wait queues do, instead of failing "
     "the request.");
+
+DEFINE_NON_RUNTIME_bool(local_runtime_promote_ysql_auto_flags, true,
+    "Promote the YSQL AutoFlags at startup, as a new universe's master does.");
 
 namespace yb::local_runtime {
 namespace {
@@ -2874,6 +2879,19 @@ class ReadonlyPgServer::Impl : public pgwrapper::PgWrapperContext {
                              ",autovacuum=off,yb_enable_ash=off,"
                              "yb_enable_pg_stat_statements_docdb_metrics=off";
     if (mode != CatalogMode::kFrozen) {
+      // A new universe's master promotes every AutoFlag. Without one, promote the YSQL flags,
+      // which PostgreSQL reads as GUCs; command-line values and the assignments below still win.
+      std::vector<std::string> promoted;
+      for (const auto* flag : GetAllAutoFlagsDescription()) {
+        if (!FLAGS_local_runtime_promote_ysql_auto_flags) break;
+        std::unordered_set<FlagTag> tags;
+        GetFlagTags(flag->name, &tags);
+        if (!tags.contains(FlagTag::kPg) || flag->initial_val == flag->target_val) continue;
+        PromoteAutoFlag(*flag);
+        promoted.push_back(flag->name);
+      }
+      std::ranges::sort(promoted);
+      LOG(INFO) << "Promoted YSQL AutoFlags: " << AsString(promoted);
       // There is no master to promote the prerequisites normally enabled in a new universe.
       FLAGS_ysql_yb_enable_add_column_missing_default = true;
       FLAGS_ysql_yb_enable_alter_table_rewrite = true;
