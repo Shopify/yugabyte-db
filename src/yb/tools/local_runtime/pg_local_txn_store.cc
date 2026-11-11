@@ -14,6 +14,7 @@
 #include <charconv>
 #include <deque>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 #include <tuple>
@@ -31,16 +32,21 @@
 #include "yb/docdb/docdb.h"
 #include "yb/docdb/docdb_compaction_context.h"
 #include "yb/docdb/docdb_rocksdb_util.h"
+#include "yb/docdb/intent_format.h"
+#include "yb/docdb/lock_util.h"
 #include "yb/docdb/pgsql_operation.h"
 #include "yb/docdb/ql_rocksdb_storage.h"
 #include "yb/docdb/rocksdb_writer.h"
 #include "yb/docdb/shared_lock_manager.h"
 #include "yb/docdb/storage_set.h"
 #include "yb/dockv/doc_key.h"
+#include "yb/dockv/intent.h"
 #include "yb/dockv/partition.h"
+#include "yb/dockv/value_type.h"
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/iterator.h"
 #include "yb/rpc/sidecars.h"
+#include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_metrics.h"
 #include "yb/tablet/tablet_options.h"
 #include "yb/tools/local_runtime/column_family_view.h"
@@ -49,6 +55,7 @@
 #include "yb/tools/local_runtime/pg_local_storage.h"
 #include "yb/util/env.h"
 #include "yb/util/flags.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/sync_point.h"
 
 DEFINE_NON_RUNTIME_bool(local_runtime_cache_bindings, true,
@@ -67,6 +74,22 @@ constexpr size_t kMaxResidentBytes = 16 * 1024 * 1024;
 constexpr size_t kMaxStandaloneIntentBytes = 16 * 1024 * 1024;
 constexpr size_t kMaxAttachedIntentBytes = 512 * 1024 * 1024;
 const TabletId kStatusLocation = "local-native-intents";
+
+// Native lock-status decoding looks tables up by colocation ID; local tables are never
+// colocated, so every key belongs to the one table.
+class SingleTableInfo : public docdb::TableInfoProvider {
+ public:
+  explicit SingleTableInfo(tablet::TableInfoPtr info) : info_(std::move(info)) {}
+
+  Result<tablet::TableInfoPtr> GetTableInfo(ColocationId colocation_id) const override {
+    SCHECK_EQ(
+        colocation_id, kColocationIdNotSet, NotSupported, "Colocated local tables are unsupported");
+    return info_;
+  }
+
+ private:
+  tablet::TableInfoPtr info_;
+};
 
 std::string MetaKey(const std::string& name) {
   return dockv::DocKey(dockv::KeyEntryValues{dockv::KeyEntryValue(name)})
@@ -684,15 +707,18 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
 
   Status WriteSql(
       const TransactionId& id, const PgsqlWriteRequestMsg& request, PgsqlResponseMsg* response,
-      rpc::Sidecars* sidecars, uint32_t subtransaction, HybridTime snapshot) {
+      rpc::Sidecars* sidecars, uint32_t subtransaction, HybridTime snapshot, LockWait* wait) {
     std::lock_guard lock(mutex_);
     SCHECK(response && sidecars, InvalidArgument, "Missing SQL response or sidecars");
     response->Clear();
+    if (wait) wait->blockers.clear();
     auto* txn = VERIFY_RESULT(Active(id));
     SCHECK(owner_, NotSupported, "SQL execution requires authoritative catalog descriptors");
     RETURN_NOT_OK(StartWrite(txn, subtransaction));
-    return FinishStatement(
-        txn, DoWriteSql(txn, request, response, sidecars, snapshot), *response);
+    auto status = DoWriteSql(txn, request, response, sidecars, snapshot, wait);
+    // A waiting statement has not failed; the caller repeats this request.
+    if (wait && !wait->blockers.empty()) return status;
+    return FinishStatement(txn, std::move(status), *response);
   }
 
   Status DoWrite(Txn* txn, const PgsqlWriteRequestPB& request, PgsqlResponsePB* response) {
@@ -742,7 +768,7 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
 
   Status DoWriteSql(
       Txn* txn, const PgsqlWriteRequestMsg& request, PgsqlResponseMsg* response,
-      rpc::Sidecars* sidecars, HybridTime snapshot) {
+      rpc::Sidecars* sidecars, HybridTime snapshot, LockWait* wait) {
     SCHECK_EQ(request.client(), YQL_CLIENT_PGSQL, InvalidArgument, "Expected a YSQL request");
     SCHECK(
         request.stmt_type() == PgsqlWriteRequestPB::PGSQL_INSERT ||
@@ -770,12 +796,12 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
       RETURN_NOT_OK(
           dockv::InitPartitionKey(table->context->schema(), table->partition_schema, &normalized));
     }
-    return ExecuteWrite(txn, table, normalized, response, sidecars, snapshot);
+    return ExecuteWrite(txn, table, normalized, response, sidecars, snapshot, wait);
   }
 
   Status ExecuteWrite(
       Txn* txn, Table* table, const PgsqlWriteRequestMsg& request, PgsqlResponseMsg* response,
-      rpc::Sidecars* sidecars, HybridTime snapshot) {
+      rpc::Sidecars* sidecars, HybridTime snapshot, LockWait* wait = nullptr) {
     ThreadSafeArena arena;
     auto sub = txn->subtransaction;
     sub.subtransaction_id = txn->current_subtransaction;
@@ -796,20 +822,10 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
             operations, pairs.read_pairs(), metrics_holder_, IsolationLevel::SNAPSHOT_ISOLATION,
             ROW_MARK_ABSENT, true, false, CoarseTimePoint::max(),
             dockv::PartialRangeKeyIntents::kTrue, &locks_));
-    RequestScope scope;
-    std::optional<Result<HybridTime>> resolution;
-    RETURN_NOT_OK(
-        docdb::ResolveTransactionConflicts(
-            operations, docdb::FAIL_ON_CONFLICT, pairs, scope, write_time,
-            ReadTime(*txn, write_time, snapshot).read, txn->metadata.pg_txn_start_us,
-            Env::Default()->NowMicros(), request_id_, table->DB(),
-            dockv::PartialRangeKeyIntents::kTrue, this, metrics_holder_, &locks.lock_batch, nullptr,
-            false, CoarseTimePoint::max(),
-            [&resolution](const Result<HybridTime>& result) { resolution.emplace(result); },
-            dockv::SkipPrefixLocks::kFalse));
-    // FAIL_ON_CONFLICT plus this manager's inline callbacks cannot leave a resolver in flight.
-    CHECK(resolution.has_value());
-    RETURN_NOT_OK(ResultToStatus(*resolution));
+    RETURN_NOT_OK(Resolve(
+        operations, docdb::FAIL_ON_CONFLICT, pairs, write_time,
+        ReadTime(*txn, write_time, snapshot).read, *txn, *table, request.table_id().ToBuffer(),
+        &locks.lock_batch, wait));
     ScopedRWOperation pending(&operations_, CoarseTimePoint::max());
     RETURN_NOT_OK(pending);
     docdb::DocWriteBatch doc_batch(table->DB(), docdb::InitMarkerBehavior::kOptional, pending);
@@ -826,6 +842,101 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     if (response->status() != PgsqlResponsePB::PGSQL_STATUS_OK) return Status::OK();
     doc_batch.MoveToWriteBatchPB(&pairs);
     return WriteIntents(txn, table, pairs, write_time, request.table_id().ToBuffer());
+  }
+
+  // The manager's callbacks are inline, so FAIL_ON_CONFLICT never leaves a resolver in flight.
+  // With a wait, FillPriorities records the pending blockers and ranks them above this request,
+  // so the resolver fails it instead of aborting them, and the failure becomes the wait.
+  Status Resolve(
+      const docdb::DocOperations& operations, docdb::ConflictManagementPolicy policy,
+      const docdb::LWKeyValueWriteBatchPB& pairs, HybridTime write_time, HybridTime read_time,
+      const Txn& txn, const Table& table, const TableId& table_id, docdb::LockBatch* lock_batch,
+      LockWait* wait) {
+    RequestScope scope;
+    std::optional<Result<HybridTime>> resolution;
+    std::vector<TransactionId> blockers;
+    blockers_ = wait ? &blockers : nullptr;
+    const auto reset = ScopeExit([this] { blockers_ = nullptr; });
+    RETURN_NOT_OK(docdb::ResolveTransactionConflicts(
+        operations, policy, pairs, scope, write_time, read_time, txn.metadata.pg_txn_start_us,
+        Env::Default()->NowMicros(), request_id_, table.DB(), dockv::PartialRangeKeyIntents::kTrue,
+        this, metrics_holder_, lock_batch, nullptr, false, CoarseTimePoint::max(),
+        [&resolution](const Result<HybridTime>& result) { resolution.emplace(result); },
+        dockv::SkipPrefixLocks::kFalse));
+    CHECK(resolution.has_value());
+    if (resolution->ok() || blockers.empty() ||
+        TransactionError::ValueFromStatus(resolution->status()) !=
+            TransactionErrorCode::kConflict) {
+      return ResultToStatus(*resolution);
+    }
+    wait->blockers = std::move(blockers);
+    wait->table_id = table_id;
+    wait->subtransaction = txn.current_subtransaction;
+    RETURN_NOT_OK(RequestedIntents(operations, pairs, wait));
+    return resolution->status();
+  }
+
+  // A waiter's locks as the conflict resolver lists them for lock status: weak on each ancestor,
+  // the request's own intent types on each key it writes or locks. Lock batch keys are bare
+  // prefixes, not decodable doc keys.
+  static Status RequestedIntents(
+      const docdb::DocOperations& operations, const docdb::LWKeyValueWriteBatchPB& pairs,
+      LockWait* wait) {
+    std::map<std::string, dockv::IntentTypeSet> intents;
+    const auto add = [&intents](
+                         dockv::AncestorDocKey ancestor, dockv::IsTopLevelKey top_level,
+                         boost::tribool pk_is_known, const dockv::KeyBytes* key,
+                         dockv::IntentTypeSet types) -> Status {
+      const auto weak = VERIFY_RESULT(docdb::ShouldTakeWeakLockForPrefix(
+          ancestor, top_level, dockv::SkipPrefixLocks::kFalse,
+          IsolationLevel::SNAPSHOT_ISOLATION, pk_is_known, key));
+      intents[key->ToStringBuffer()] |= weak ? dockv::MakeWeak(types) : types;
+      return Status::OK();
+    };
+    dockv::KeyBytes buffer;
+    boost::container::small_vector<RefCntPrefix, 8> paths;
+    for (const auto& operation : operations) {
+      const boost::tribool pk_is_known =
+          operation->OpType() == docdb::DocOperation::Type::PGSQL_WRITE_OPERATION
+              ? boost::tribool(
+                    down_cast<const docdb::PgsqlWriteOperation&>(*operation).pk_is_known())
+              : boost::indeterminate;
+      for (const auto& [mode, types] :
+           {std::pair(
+                docdb::GetDocPathsMode::kIntents,
+                dockv::GetIntentTypesForWrite(IsolationLevel::SNAPSHOT_ISOLATION)),
+            std::pair(
+                docdb::GetDocPathsMode::kStrongReadIntents,
+                dockv::IntentTypeSet{dockv::IntentType::kStrongRead})}) {
+        paths.clear();
+        IsolationLevel level;
+        RETURN_NOT_OK(operation->GetDocPaths(mode, &paths, &level));
+        for (const auto& path : paths) {
+          RETURN_NOT_OK(dockv::EnumerateIntents(
+              path.as_slice(), Slice(),
+              [&](auto ancestor, auto, auto, auto* key, auto, auto, auto top_level, auto) {
+                return add(ancestor, top_level, pk_is_known, key, types);
+              },
+              &buffer, dockv::PartialRangeKeyIntents::kTrue));
+        }
+      }
+    }
+    if (!pairs.read_pairs().empty()) {
+      const auto read_intents = dockv::GetIntentTypesForRead(
+          IsolationLevel::SNAPSHOT_ISOLATION,
+          pairs.has_row_mark_type() ? pairs.row_mark_type() : ROW_MARK_ABSENT);
+      RETURN_NOT_OK(docdb::EnumerateIntents(
+          pairs.read_pairs(),
+          [&](auto ancestor, auto, auto, auto* key, auto, auto row_lock, auto top_level,
+              auto pk_is_known) {
+            return add(
+                ancestor, top_level, pk_is_known, key,
+                dockv::GetIntentTypes(read_intents, row_lock));
+          },
+          dockv::PartialRangeKeyIntents::kTrue));
+    }
+    wait->intents.assign(intents.begin(), intents.end());
+    return Status::OK();
   }
 
   // Persists data or row-lock intents, prepared and conflict-checked by the caller.
@@ -901,10 +1012,10 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
   // Mirrors a tserver row-marked read: lock intents come from docdb::GetIntents, are resolved like
   // writes, then persisted before the read executes. Committed lock-only intents stay in the
   // intents family, but conflict resolution treats a committed transaction's locks as released
-  // and readers skip them. There is no wait queue, so WAIT_BLOCK fails like WAIT_ERROR.
+  // and readers skip them. Only WAIT_BLOCK waits: NOWAIT fails and SKIP LOCKED skips.
   Status LockRows(
       Txn* txn, Table* table, const PgsqlReadRequestMsg& request, RowMarkType row_mark,
-      HybridTime read_time) {
+      HybridTime read_time, LockWait* wait) {
     ThreadSafeArena arena;
     docdb::LWKeyValueWriteBatchPB pairs(&arena);
     RETURN_NOT_OK(docdb::GetIntents(
@@ -922,22 +1033,12 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
             no_operations, pairs.read_pairs(), metrics_holder_,
             IsolationLevel::SNAPSHOT_ISOLATION, row_mark, true, false, CoarseTimePoint::max(),
             dockv::PartialRangeKeyIntents::kTrue, &locks_));
-    const auto policy = pairs.has_wait_policy() && pairs.wait_policy() == WAIT_SKIP
-                            ? docdb::SKIP_ON_CONFLICT
-                            : docdb::FAIL_ON_CONFLICT;
-    RequestScope scope;
-    std::optional<Result<HybridTime>> resolution;
-    RETURN_NOT_OK(
-        docdb::ResolveTransactionConflicts(
-            no_operations, policy, pairs, scope, write_time, read_time,
-            txn->metadata.pg_txn_start_us, Env::Default()->NowMicros(), request_id_, table->DB(),
-            dockv::PartialRangeKeyIntents::kTrue, this, metrics_holder_, &locks.lock_batch, nullptr,
-            false, CoarseTimePoint::max(),
-            [&resolution](const Result<HybridTime>& result) { resolution.emplace(result); },
-            dockv::SkipPrefixLocks::kFalse));
-    // Without a wait queue, this manager's inline callbacks cannot leave a resolver in flight.
-    CHECK(resolution.has_value());
-    RETURN_NOT_OK(ResultToStatus(*resolution));
+    const auto wait_policy = pairs.has_wait_policy() ? pairs.wait_policy() : WAIT_BLOCK;
+    RETURN_NOT_OK(Resolve(
+        no_operations,
+        wait_policy == WAIT_SKIP ? docdb::SKIP_ON_CONFLICT : docdb::FAIL_ON_CONFLICT, pairs,
+        write_time, read_time, *txn, *table, request.table_id().ToBuffer(), &locks.lock_batch,
+        wait_policy == WAIT_BLOCK ? wait : nullptr));
     return WriteIntents(txn, table, pairs, write_time, request.table_id().ToBuffer());
   }
 
@@ -1050,22 +1151,23 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
   Status ReadSql(
       const TransactionId& id, const PgsqlReadRequestMsg& request, PgsqlResponseMsg* response,
       rpc::Sidecars* sidecars, CoarseTimePoint deadline, HybridTime own_limit,
-      uint32_t subtransaction, HybridTime snapshot) {
+      uint32_t subtransaction, HybridTime snapshot, LockWait* wait) {
     std::lock_guard lock(mutex_);
     SCHECK(response && sidecars, InvalidArgument, "Missing SQL response or sidecars");
     response->Clear();
+    if (wait) wait->blockers.clear();
     auto* txn = VERIFY_RESULT(Active(id));
     SCHECK(owner_, NotSupported, "SQL execution requires authoritative catalog descriptors");
     RETURN_NOT_OK(StartWrite(txn, subtransaction));
-    return FinishStatement(
-        txn, DoReadSql(txn, request, response, sidecars, deadline, own_limit, snapshot),
-        *response);
+    auto status = DoReadSql(txn, request, response, sidecars, deadline, own_limit, snapshot, wait);
+    if (wait && !wait->blockers.empty()) return status;
+    return FinishStatement(txn, std::move(status), *response);
   }
 
   Status DoReadSql(
       Txn* txn, const PgsqlReadRequestMsg& request, PgsqlResponseMsg* response,
       rpc::Sidecars* sidecars, CoarseTimePoint deadline, HybridTime own_limit,
-      HybridTime snapshot) {
+      HybridTime snapshot, LockWait* wait) {
     SCHECK_EQ(request.client(), YQL_CLIENT_PGSQL, InvalidArgument, "Expected a YSQL request");
     SCHECK(
         !request.has_sampling_state() && request.sample_blocks().empty() &&
@@ -1172,7 +1274,7 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     db.key_bounds = &bounds;
     const auto row_mark = request.has_row_mark_type() ? request.row_mark_type() : ROW_MARK_ABSENT;
     if (IsValidRowMarkType(row_mark)) {
-      RETURN_NOT_OK(LockRows(txn, table, normalized, row_mark, time.read));
+      RETURN_NOT_OK(LockRows(txn, table, normalized, row_mark, time.read, wait));
     }
     docdb::QLRocksDBStorage storage(
         "native-sql", db, {.start_key = KeyBuffer(lower), .end_key = KeyBuffer(upper)});
@@ -1382,6 +1484,13 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
 
   Status RollbackTo(const TransactionId& id, uint32_t subtransaction, bool catalog_owned = false) {
     std::lock_guard lock(mutex_);
+    RETURN_NOT_OK(Status(failure_));
+    // As on a tablet server, a savepoint rollback of a transaction that deadlock detection or
+    // conflict arbitration already aborted succeeds; its owner's abort follows.
+    if (const auto it = txns_.find(id); it != txns_.end() && !catalog_owned &&
+        it->second.pb.status() == TransactionStatus::ABORTED) {
+      return Status::OK();
+    }
     auto* txn = VERIFY_RESULT(Active(id, true));
     SCHECK(
         !txn->catalog_owned || catalog_owned, NotSupported,
@@ -1478,7 +1587,13 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     for (auto& [id, priority] : *values) {
       auto it = txns_.find(id);
       SCHECK(it != txns_.end(), Corruption, "Unknown conflicting transaction");
-      priority = it->second.metadata.priority;
+      // A waiting request ranks its pending blockers above itself, so it aborts none of them.
+      if (blockers_) {
+        blockers_->push_back(id);
+        priority = std::numeric_limits<uint64_t>::max();
+      } else {
+        priority = it->second.metadata.priority;
+      }
     }
     return Status::OK();
   }
@@ -1512,6 +1627,120 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     --active_requests_;
   }
 
+  std::vector<std::pair<TransactionId, int64_t>> PendingTransactions() {
+    std::lock_guard lock(mutex_);
+    std::vector<std::pair<TransactionId, int64_t>> result;
+    for (const auto& [id, txn] : txns_) {
+      if (txn.pb.status() == TransactionStatus::PENDING)
+        result.emplace_back(id, txn.metadata.pg_txn_start_us);
+    }
+    return result;
+  }
+
+  // One table's lock status. Each table is one logical tablet, named by its table ID.
+  struct LockedTable {
+    TabletLockInfoPB info;
+    SingleTableInfo provider;
+    rocksdb::ColumnFamilyHandle* intents;
+    std::unordered_map<TransactionId, int, TransactionIdHash> index = {};
+
+    TabletLockInfoPB::TransactionLockInfoPB& Transaction(const TransactionId& id) {
+      const auto [it, added] = index.emplace(id, info.transaction_locks_size());
+      if (added) info.add_transaction_locks()->set_id(id.data(), id.size());
+      return *info.mutable_transaction_locks(it->second);
+    }
+  };
+
+  Result<LockedTable*> FindLockedTable(
+      const TableId& id, std::map<TableId, LockedTable>* tables) {
+    const auto found = tables->find(id);
+    if (found != tables->end()) return &found->second;
+    auto* table = VERIFY_RESULT(Find(id));
+    const auto metadata = VERIFY_RESULT(lookup_(id));
+    auto info = VERIFY_RESULT(tablet::TableInfo::LoadFromPB("", id, metadata));
+    auto& locked = tables->emplace(
+        id, LockedTable{
+                .info = {},
+                .provider = SingleTableInfo(std::move(info)),
+                .intents = table->intents}).first->second;
+    locked.info.set_pg_table_id(metadata.pg_table_id().empty() ? id : metadata.pg_table_id());
+    locked.info.set_tablet_id(id);
+    return &locked;
+  }
+
+  // Reads a transaction's intents through its reverse index, as Tablet::GetLockStatus does.
+  Status AddGrantedLocks(const Txn& txn, LockedTable& locked, uint32_t max_locks) {
+    const auto& id = txn.metadata.transaction_id;
+    std::string reverse(1, dockv::KeyEntryTypeAsChar::kTransactionId);
+    reverse.append(id.AsSlice().cdata(), id.size());
+    std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(rocksdb::ReadOptions(), locked.intents));
+    std::vector<std::string> keys;
+    for (it->Seek(reverse); it->Valid() && it->key().starts_with(reverse); it->Next()) {
+      // The first entry under the prefix is the transaction's metadata, not an intent.
+      if (it->key().size() != reverse.size()) keys.push_back(it->value().ToBuffer());
+    }
+    RETURN_NOT_OK(it->status());
+    std::sort(keys.begin(), keys.end());
+    auto& entry = locked.Transaction(id);
+    for (const auto& key : keys) {
+      it->Seek(key);
+      RETURN_NOT_OK(it->status());
+      if (!it->Valid() || it->key() != Slice(key)) continue;
+      const auto parsed = VERIFY_RESULT(dockv::ParseIntentKey(it->key(), it->value()));
+      const auto value = VERIFY_RESULT(
+          dockv::DecodeIntentValue(it->value(), nullptr, dockv::HasStrong(parsed.types)));
+      if (txn.subtransaction.aborted.Test(value.subtransaction_id)) continue;
+      if (max_locks && static_cast<uint32_t>(entry.granted_locks_size()) >= max_locks) {
+        entry.set_has_additional_granted_locks(true);
+        break;
+      }
+      RETURN_NOT_OK(docdb::PopulateLockInfoFromParsedIntent(
+          parsed, value, locked.provider, entry.add_granted_locks()));
+    }
+    return Status::OK();
+  }
+
+  Result<std::vector<TabletLockInfoPB>> LockStatus(
+      const std::vector<TransactionId>& transactions, const std::vector<WaitingLocks>& waiting,
+      uint32_t max_locks) {
+    std::lock_guard lock(mutex_);
+    RETURN_NOT_OK(Status(failure_));
+    SCHECK(owner_, NotSupported, "Lock status requires catalog descriptors");
+    std::map<TableId, LockedTable> tables;
+    for (const auto& id : transactions) {
+      const auto it = txns_.find(id);
+      if (it == txns_.end() || it->second.pb.status() != TransactionStatus::PENDING) continue;
+      for (const auto& table_id : it->second.touched) {
+        RETURN_NOT_OK(AddGrantedLocks(
+            it->second, *VERIFY_RESULT(FindLockedTable(table_id, &tables)), max_locks));
+      }
+    }
+    // Waiting locks are the requested intents, described as the wait queue describes them.
+    for (const auto& waiter : waiting) {
+      auto& locked = *VERIFY_RESULT(FindLockedTable(waiter.wait->table_id, &tables));
+      auto& entry = locked.Transaction(waiter.id);
+      auto& info = *entry.mutable_waiting_locks();
+      info.set_wait_start_ht(waiter.wait_start.ToUint64());
+      for (const auto& blocker : waiter.wait->blockers)
+        info.add_blocking_txn_ids(blocker.data(), blocker.size());
+      for (const auto& [key, types] : waiter.wait->intents) {
+        if (max_locks &&
+            static_cast<uint32_t>(info.locks_size() + entry.granted_locks_size()) >= max_locks) {
+          info.set_has_additional_waiting_locks(true);
+          break;
+        }
+        const dockv::ParsedIntent parsed{.doc_path = key, .types = types, .doc_ht = Slice()};
+        auto* lock_info = info.add_locks();
+        RETURN_NOT_OK(docdb::PopulateLockInfoFromParsedIntent(
+            parsed, dockv::DecodedIntentValue{}, locked.provider, lock_info, false));
+        lock_info->set_subtransaction_id(waiter.wait->subtransaction);
+      }
+    }
+    std::vector<TabletLockInfoPB> result;
+    for (auto& [id, locked] : tables) result.push_back(std::move(locked.info));
+    return result;
+  }
+
   std::shared_ptr<PgLocalStorage> storage_;
   std::recursive_mutex& mutex_;
   rocksdb::DB* db_;
@@ -1528,6 +1757,8 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
   HybridTime& clock_;
   Status& failure_;
   int64_t request_id_ = 0;
+  // Set while a waiting request resolves conflicts; FillPriorities collects its blockers here.
+  std::vector<TransactionId>* blockers_ = nullptr;
   int64_t active_requests_ = 0;
   RWOperationCounter operations_{"native-intent-store"};
   dockv::SchemaPackingRegistryPtr packings_ =
@@ -1578,15 +1809,15 @@ Result<TransactionReadResult> PgLocalTxnStore::Read(
 }
 Status PgLocalTxnStore::WriteSql(
     const TransactionId& id, const PgsqlWriteRequestMsg& request, PgsqlResponseMsg* response,
-    rpc::Sidecars* sidecars, uint32_t subtransaction, HybridTime snapshot) {
-  return impl_->WriteSql(id, request, response, sidecars, subtransaction, snapshot);
+    rpc::Sidecars* sidecars, uint32_t subtransaction, HybridTime snapshot, LockWait* wait) {
+  return impl_->WriteSql(id, request, response, sidecars, subtransaction, snapshot, wait);
 }
 Status PgLocalTxnStore::ReadSql(
     const TransactionId& id, const PgsqlReadRequestMsg& request, PgsqlResponseMsg* response,
     rpc::Sidecars* sidecars, CoarseTimePoint deadline, HybridTime own_limit,
-    uint32_t subtransaction, HybridTime snapshot) {
+    uint32_t subtransaction, HybridTime snapshot, LockWait* wait) {
   return impl_->ReadSql(
-      id, request, response, sidecars, deadline, own_limit, subtransaction, snapshot);
+      id, request, response, sidecars, deadline, own_limit, subtransaction, snapshot, wait);
 }
 Status PgLocalTxnStore::Commit(const TransactionId& id) { return impl_->Commit(id); }
 Status PgLocalTxnStore::Abort(const TransactionId& id) {
@@ -1595,6 +1826,18 @@ Status PgLocalTxnStore::Abort(const TransactionId& id) {
 }
 Status PgLocalTxnStore::RollbackTo(const TransactionId& id, uint32_t subtransaction) {
   return impl_->RollbackTo(id, subtransaction);
+}
+Status PgLocalTxnStore::AbortVictim(const TransactionId& id) {
+  std::lock_guard lock(impl_->mutex_);
+  return impl_->AbortTxn(id, false, false);
+}
+std::vector<std::pair<TransactionId, int64_t>> PgLocalTxnStore::PendingTransactions() {
+  return impl_->PendingTransactions();
+}
+Result<std::vector<TabletLockInfoPB>> PgLocalTxnStore::LockStatus(
+    const std::vector<TransactionId>& transactions, const std::vector<WaitingLocks>& waiting,
+    uint32_t max_locks) {
+  return impl_->LockStatus(transactions, waiting, max_locks);
 }
 
 Result<std::unique_ptr<PgLocalTxnStore>> PgLocalTxnStore::Attach(

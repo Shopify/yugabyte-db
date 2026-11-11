@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -41,6 +42,7 @@
 #include "yb/common/wire_protocol.h"
 #include "yb/common/version_info.h"
 #include "yb/gutil/endian.h"
+#include "yb/gutil/walltime.h"
 #include "yb/docdb/doc_read_context.h"
 #include "yb/docdb/docdb_rocksdb_util.h"
 #include "yb/docdb/pgsql_operation.h"
@@ -98,6 +100,8 @@ DECLARE_bool(ysql_yb_enable_add_column_missing_default);
 DECLARE_bool(ysql_yb_enable_alter_table_rewrite);
 DECLARE_bool(ysql_yb_enable_ddl_atomicity_infra);
 DECLARE_bool(ysql_yb_enable_ddl_savepoint_infra);
+DECLARE_bool(ysql_yb_enable_pg_locks);
+DECLARE_bool(ysql_yb_pg_locks_integrate_advisory_locks);
 
 METRIC_DECLARE_event_stats(rpc_incoming_queue_time);
 
@@ -114,6 +118,10 @@ constexpr bool kSharedMemoryByDefault = true;
 DEFINE_NON_RUNTIME_bool(local_runtime_shared_memory, kSharedMemoryByDefault,
     "Exchange Perform and object lock requests with PostgreSQL backends through per-session "
     "shared memory, as the tablet server does, instead of only over TCP.");
+
+DEFINE_NON_RUNTIME_bool(local_runtime_wait_on_conflict, true,
+    "Wait for conflicting transactions to finish, as tablet wait queues do, instead of failing "
+    "the request.");
 
 namespace yb::local_runtime {
 namespace {
@@ -1163,6 +1171,28 @@ class ReadonlyService : public UnsupportedPgClientService,
     CoarseTimePoint deadline;
     size_t bytes;
   };
+  // Where a Perform resumes after waiting: ops before op_index have their responses, and the
+  // statement limit and snapshot are the ones chosen when it first ran.
+  struct PerformState {
+    bool started = false;
+    HybridTime statement_time;
+    HybridTime snapshot;
+    size_t op_index = 0;
+    // The op at op_index already has a response slot from its first attempt.
+    bool resume = false;
+    LockWait wait;
+  };
+  // A Perform waiting for conflicting transactions to finish, as in a tablet's wait queue.
+  struct ConflictWait {
+    const tserver::PgPerformRequestMsg* request;
+    tserver::PgPerformResponseMsg* response;
+    std::unique_ptr<Responder> responder;
+    PerformState state;
+    TransactionId txn;
+    HybridTime wait_start;
+    CoarseTimePoint deadline;
+    uint64_t timer = 0;
+  };
   struct Session {
     Session(uint64_t id_, pid_t pid_) : id(id_), pid(pid_) {}
 
@@ -1199,6 +1229,9 @@ class ReadonlyService : public UnsupportedPgClientService,
     bool transaction_failed = false;
     uint32_t failed_subtxn = 0;
     std::shared_ptr<SharedTransport> transport;
+    // Later Performs of the session queue behind it in pending. A tablet server would start them,
+    // but they hold no locks yet, so holding them back cannot extend another backend's wait.
+    std::unique_ptr<ConflictWait> waiter;
   };
 
  public:
@@ -1236,22 +1269,27 @@ class ReadonlyService : public UnsupportedPgClientService,
 
   Status AbortOwnedTransaction(Session& session) {
     if (exclusive_owner_ == session.id) exclusive_owner_ = 0;
+    if (transaction_owner_ != session.id && !session.native_txn) return Status::OK();
+    const auto txn = session.native_txn;
+    Status status;
     if (transaction_owner_ != session.id) {
-      if (!session.native_txn) return Status::OK();
-      const auto id = *session.native_txn;
       session.native_txn.reset();
-      // Conflict arbitration may already have aborted it; finished write-less ones are gone.
-      const auto status = catalog_.transaction_->NativeTransactions().Abort(id);
-      return status.IsNotFound() ? Status::OK() : status;
+      // A deadlock or conflict abort may already have ended it; finished write-less ones are gone.
+      status = catalog_.transaction_->NativeTransactions().Abort(*txn);
+      if (status.IsNotFound()) status = Status::OK();
+    } else {
+      CHECK(catalog_.transaction_);
+      catalog_.transaction_->Abort();
+      transaction_owner_ = 0;
+      catalog_.failure_ = catalog_.ReloadTables();
+      status = catalog_.failure_;
     }
-    CHECK(catalog_.transaction_);
-    catalog_.transaction_->Abort();
-    transaction_owner_ = 0;
-    catalog_.failure_ = catalog_.ReloadTables();
-    return catalog_.failure_;
+    if (txn) Wake(*txn);
+    return status;
   }
 
   void RetireSession(Session& session) {
+    CancelWaiter(session, STATUS(Aborted, "Local backend has exited"));
     WARN_NOT_OK(AbortOwnedTransaction(session), "Aborting exited local backend");
     CancelPending(session, STATUS(Aborted, "Local backend has exited"));
     if (session.transport) {
@@ -1388,7 +1426,10 @@ class ReadonlyService : public UnsupportedPgClientService,
     auto session = it->second;
     // A call on the session's own connection shows its backend is alive. Exited backends are
     // retired when a session is created or another session needs exclusive ownership.
-    if (!catalog_.failure_.ok()) CancelPending(*session, catalog_.failure_);
+    if (!catalog_.failure_.ok()) {
+      CancelWaiter(*session, catalog_.failure_);
+      CancelPending(*session, catalog_.failure_);
+    }
     return catalog_.failure_;
   }
 
@@ -1477,6 +1518,7 @@ class ReadonlyService : public UnsupportedPgClientService,
   void FailSequence(Session& session, const Status& status) {
     session.sequence_broken = true;
     session.transaction_failed = true;
+    CancelWaiter(session, status);
     CancelPending(session, status);
     WARN_NOT_OK(AbortOwnedTransaction(session), "Aborting failed local request sequence");
   }
@@ -1488,6 +1530,7 @@ class ReadonlyService : public UnsupportedPgClientService,
       std::lock_guard lock(mutex_);
       shutting_down_ = true;
       for (auto& [id, session] : sessions_) {
+        CancelWaiter(*session, STATUS(ServiceUnavailable, "Local runtime is shutting down"));
         CancelPending(*session, STATUS(ServiceUnavailable, "Local runtime is shutting down"));
         if (session->transport) {
           session->transport->StartShutdown();
@@ -1552,23 +1595,236 @@ class ReadonlyService : public UnsupportedPgClientService,
       Session& session, const tserver::PgPerformRequestMsg* req,
       tserver::PgPerformResponseMsg* resp, std::unique_ptr<Responder> responder) {
     auto status = session.sequence.Register(req->sequence_num().serial_no(), Predecessor(*req));
-    if (status.ok()) status = PerformReads(session, *req, resp, *responder);
+    PerformState state;
+    if (status.ok()) status = PerformReads(session, *req, resp, *responder, state);
+    if (status.ok() && !state.wait.blockers.empty()) {
+      const auto deadline = responder->deadline();
+      WaitForBlockers(
+          session, std::make_unique<ConflictWait>(ConflictWait{
+                       .request = req,
+                       .response = resp,
+                       .responder = std::move(responder),
+                       .state = std::move(state),
+                       .txn = *session.native_txn,
+                       .wait_start = HybridTime::FromMicros(GetCurrentTimeMicros()),
+                       .deadline = deadline}));
+      return;
+    }
+    FinishPerform(session, *req, resp, *responder, status);
+  }
+
+  void FinishPerform(
+      Session& session, const tserver::PgPerformRequestMsg& req,
+      tserver::PgPerformResponseMsg* resp, Responder& responder, const Status& status) {
     if (!status.ok()) {
       // PgGate skips a SKIP LOCKED row reported as kSkipLocking; its statement continues.
       const bool skipped =
           TransactionError::ValueFromStatus(status) == TransactionErrorCode::kSkipLocking;
       if (catalog_.transaction_ && !skipped) {
         session.transaction_failed = true;
-        session.failed_subtxn = std::max(1u, req->options().active_sub_transaction_id());
+        session.failed_subtxn = std::max(1u, req.options().active_sub_transaction_id());
       }
       resp->Clear();
-      responder->sidecars().Reset();
+      responder.sidecars().Reset();
     }
-    Respond(status, resp, *responder);
+    Respond(status, resp, responder);
+  }
+
+  // Parks a Perform until its blockers finish, like a tablet's wait queue. It fails at its
+  // deadline, or as the deadlock detector would fail it when its wait closes a cycle.
+  void WaitForBlockers(Session& session, std::unique_ptr<ConflictWait> wait) {
+    if (CoarseMonoClock::Now() >= wait->deadline) {
+      FinishWait(
+          session, std::move(wait),
+          STATUS(TimedOut, "Failed to resume waiter transaction from queue within deadline"));
+      return;
+    }
+    const auto cycle = FindCycle(wait->txn, wait->state.wait.blockers);
+    std::optional<TransactionId> victim;
+    if (!cycle.empty()) victim = DeadlockVictim(cycle);
+    if (victim == wait->txn) {
+      AbortVictim(*victim);
+      FinishWait(session, std::move(wait), DeadlockStatus(*victim, cycle));
+      Wake(*victim);
+      return;
+    }
+    waiting_txns_.emplace(wait->txn, session.id);
+    session.waiter = std::move(wait);
+    ArmWaitTimer(session);
+    if (!victim) return;
+    // Every other transaction in the cycle is itself waiting.
+    const auto other = sessions_.at(waiting_txns_.at(*victim));
+    AbortVictim(*victim);
+    CancelWaiter(*other, DeadlockStatus(*victim, cycle));
+    DrainPending(*other);
+    Wake(*victim);
+  }
+
+  // Edges run from each waiting transaction to its blockers, so a new wait closes a cycle exactly
+  // when one of its blockers reaches the waiter. Returns the cycle, starting at the waiter.
+  std::vector<TransactionId> FindCycle(
+      const TransactionId& waiter, const std::vector<TransactionId>& blockers) {
+    std::unordered_map<TransactionId, TransactionId, TransactionIdHash> parent;
+    std::vector<TransactionId> stack;
+    for (const auto& blocker : blockers)
+      if (parent.emplace(blocker, waiter).second) stack.push_back(blocker);
+    while (!stack.empty()) {
+      const auto id = stack.back();
+      stack.pop_back();
+      if (id == waiter) {
+        std::vector<TransactionId> cycle;
+        for (auto at = parent.at(waiter); at != waiter; at = parent.at(at)) cycle.push_back(at);
+        cycle.push_back(waiter);
+        std::ranges::reverse(cycle);
+        return cycle;
+      }
+      const auto it = waiting_txns_.find(id);
+      if (it == waiting_txns_.end()) continue;
+      for (const auto& blocker : sessions_.at(it->second)->waiter->state.wait.blockers)
+        if (parent.emplace(blocker, id).second) stack.push_back(blocker);
+    }
+    return {};
+  }
+
+  // The deadlock detector aborts the newest transaction in the cycle.
+  TransactionId DeadlockVictim(const std::vector<TransactionId>& cycle) {
+    std::unordered_map<TransactionId, int64_t, TransactionIdHash> starts;
+    for (const auto& [id, start] :
+         catalog_.transaction_->NativeTransactions().PendingTransactions()) {
+      starts.emplace(id, start);
+    }
+    auto victim = TransactionId::Nil();
+    int64_t newest = 0;
+    for (const auto& id : cycle) {
+      const auto it = starts.find(id);
+      const auto start = it == starts.end() ? 0 : it->second;
+      if (start > newest || (start == newest && id > victim)) {
+        newest = start;
+        victim = id;
+      }
+    }
+    return victim;
+  }
+
+  static Status DeadlockStatus(
+      const TransactionId& victim, const std::vector<TransactionId>& cycle) {
+    return STATUS_EC_FORMAT(
+               Expired, TransactionError(TransactionErrorCode::kDeadlock),
+               "Transaction $0 aborted due to a deadlock: $1", victim, cycle)
+        .CloneAndAddErrorCode(PgsqlError(YBPgErrorCode::YB_PG_YB_DEADLOCK));
+  }
+
+  // A catalog-owned victim cannot be aborted here; its request still fails, and PostgreSQL
+  // aborts the transaction.
+  void AbortVictim(const TransactionId& victim) {
+    const auto status = catalog_.transaction_->NativeTransactions().AbortVictim(victim);
+    if (!status.ok() && !status.IsNotSupported())
+      WARN_NOT_OK(status, "Aborting local deadlock victim");
+  }
+
+  // Wakes cover every way a blocker finishes. The periodic retry also notices an exited backend,
+  // and repeats conflict resolution as a tablet's wait queue refreshes its waiters.
+  void ArmWaitTimer(Session& session) {
+    auto& wait = *session.waiter;
+    wait.timer = ++wait_timers_;
+    const auto now = CoarseMonoClock::Now();
+    scheduler_.Schedule(
+        [weak = weak_from_this(), id = session.id, timer = wait.timer](const Status& status) {
+          if (!status.ok()) return;
+          if (auto self = weak.lock()) self->CheckWaiter(id, timer);
+        },
+        std::min(wait.deadline, now + std::chrono::seconds(1)) - now);
+  }
+
+  void CheckWaiter(uint64_t id, uint64_t timer) {
+    std::lock_guard lock(mutex_);
+    const auto it = sessions_.find(id);
+    if (it == sessions_.end() || !it->second->waiter || it->second->waiter->timer != timer) return;
+    const auto session = it->second;
+    if (kill(session->pid, 0) != 0 && errno == ESRCH) {
+      RetireSession(*session);
+      return;
+    }
+    // An exited blocker's transaction is aborted, as its coordinator does once heartbeats stop.
+    const auto& blockers = session->waiter->state.wait.blockers;
+    std::vector<std::shared_ptr<Session>> exited;
+    for (const auto& [other_id, other] : sessions_) {
+      if (other->native_txn && std::ranges::find(blockers, *other->native_txn) != blockers.end() &&
+          kill(other->pid, 0) != 0 && errno == ESRCH) {
+        exited.push_back(other);
+      }
+    }
+    for (const auto& other : exited) {
+      if (sessions_.contains(other->id)) RetireSession(*other);
+    }
+    if (session->waiter) Resume(*session);
+  }
+
+  void Resume(Session& session) {
+    auto wait = std::move(session.waiter);
+    waiting_txns_.erase(wait->txn);
+    const auto status =
+        PerformReads(session, *wait->request, wait->response, *wait->responder, wait->state);
+    if (status.ok() && !wait->state.wait.blockers.empty()) {
+      WaitForBlockers(session, std::move(wait));
+      return;
+    }
+    FinishWait(session, std::move(wait), status);
+  }
+
+  void FinishWait(Session& session, std::unique_ptr<ConflictWait> wait, const Status& status) {
+    FinishPerform(session, *wait->request, wait->response, *wait->responder, status);
+    wait.reset();
+    DrainPending(session);
+  }
+
+  void CancelWaiter(Session& session, const Status& status) {
+    if (!session.waiter) return;
+    auto wait = std::move(session.waiter);
+    waiting_txns_.erase(wait->txn);
+    FinishPerform(session, *wait->request, wait->response, *wait->responder, status);
+  }
+
+  // A waiting backend sends transaction control only after it stopped waiting for the response.
+  static Status OvertakenWait() {
+    return STATUS(Aborted, "Transaction control overtook a waiting Perform");
+  }
+
+  // Resumes requests waiting on a transaction that finished or rolled back a savepoint, oldest
+  // first. Resumption runs as its own task: callers may be retiring sessions or iterating them,
+  // and a resumed request may finish or abort more transactions.
+  void Wake(const TransactionId& txn) {
+    std::vector<std::pair<HybridTime, uint64_t>> ready;
+    for (const auto& [id, session_id] : waiting_txns_) {
+      const auto& wait = *sessions_.at(session_id)->waiter;
+      if (std::ranges::find(wait.state.wait.blockers, txn) != wait.state.wait.blockers.end())
+        ready.emplace_back(wait.wait_start, session_id);
+    }
+    std::ranges::sort(ready);
+    for (const auto& [start, id] : ready) wakes_.push_back(id);
+    if (wakes_.empty() || shutting_down_ || std::exchange(wake_scheduled_, true)) return;
+    scheduler_.Schedule(
+        [weak = weak_from_this()](const Status& status) {
+          if (!status.ok()) return;
+          if (auto self = weak.lock()) self->ProcessWakes();
+        },
+        std::chrono::steady_clock::duration::zero());
+  }
+
+  void ProcessWakes() {
+    std::lock_guard lock(mutex_);
+    while (!wakes_.empty()) {
+      const auto it = sessions_.find(wakes_.front());
+      wakes_.pop_front();
+      if (it == sessions_.end() || !it->second->waiter) continue;
+      const auto session = it->second;
+      Resume(*session);
+    }
+    wake_scheduled_ = false;
   }
 
   void DrainPending(Session& session) {
-    while (!session.pending.empty()) {
+    while (!session.waiter && !session.pending.empty()) {
       auto first = session.pending.begin();
       auto ready = session.sequence.Ready(first->first, Predecessor(*first->second.request));
       if (!ready.ok()) {
@@ -1622,7 +1878,7 @@ class ReadonlyService : public UnsupportedPgClientService,
       FailSequence(*session, error);
       return;
     }
-    if (!*ready) {
+    if (!*ready || session->waiter) {
       const auto bytes = req->SerializedSize();
       // Bounds apply to the whole service, not once per admitted backend.
       if (pending_calls_ >= 64 || bytes > 16ULL * 1024 * 1024 - pending_bytes_) {
@@ -1631,8 +1887,11 @@ class ReadonlyService : public UnsupportedPgClientService,
         FailSequence(*session, error);
         return;
       }
-      const auto deadline =
-          std::min(responder->deadline(), CoarseMonoClock::Now() + std::chrono::seconds(5));
+      // A missing predecessor must arrive soon; a waiting one may take its whole deadline.
+      const auto deadline = session->waiter ? responder->deadline()
+                                            : std::min(
+                                                  responder->deadline(),
+                                                  CoarseMonoClock::Now() + std::chrono::seconds(5));
       session->pending.emplace(
           serial, PendingPerform{req, resp, std::move(responder), deadline, bytes});
       session->pending_bytes += bytes;
@@ -1980,70 +2239,30 @@ class ReadonlyService : public UnsupportedPgClientService,
     Respond(status, resp, context);
   }
 
+  // Runs a Perform's ops from state.op_index. An op that conflicts with pending transactions
+  // stops the run with state.wait filled, and the caller resumes the same state once they finish.
   Status PerformReads(
       Session& session, const tserver::PgPerformRequestMsg& req,
-      tserver::PgPerformResponseMsg* resp, Responder& responder) {
+      tserver::PgPerformResponseMsg* resp, Responder& responder, PerformState& state) {
     RETURN_NOT_OK(Status(catalog_.failure_));
-    RETURN_NOT_OK(AcquireSqlTransaction(session, req.options()));
-    SCHECK(
-        !req.options().use_historical_read_session(), NotSupported,
-        "Historical reads are not available on a frozen catalog");
-    // Start before selecting the statement limit, including read-only SQL transactions.
-    // The native table-lock path guarantees a FinishTransaction even without data writes.
     // Catalog mutations must be DDL, so DDL mode alone selects the catalog transaction.
     const bool catalog = req.options().ddl_mode();
-    for (const auto& op : req.ops()) {
-      if (op.has_write()) {
-        RETURN_NOT_OK(EnsureTransaction(session, req.options(), false, catalog));
-      } else if (op.has_read() && catalog_.transaction_) {
-        if (VERIFY_RESULT_REF(catalog_.Find(op.read().table_id().ToBuffer())).application) {
-          RETURN_NOT_OK(EnsureTransaction(session, req.options(), true, catalog));
-        } else if (
-            op.read().has_row_mark_type() && op.read().row_mark_type() != ROW_MARK_ABSENT) {
-          // Catalog row locks are not resolved against other backends; exclude them instead.
-          RETURN_NOT_OK(AcquireExclusive(session));
-        }
-      }
-    }
-    // One shared clock orders every backend. Own-write limits stay distinct from the snapshot.
-    auto statement_time =
-        catalog_.transaction_ ? catalog_.transaction_->Clock() : catalog_.ReadTime();
-    if (catalog_.transaction_ && req.options().has_in_txn_limit_ht()) {
-      const auto limit = HybridTime(req.options().in_txn_limit_ht().value());
-      if (limit.is_valid() && !limit.is_special()) statement_time = limit;
-      RETURN_NOT_OK(catalog_.transaction_->ValidateReadTime(statement_time));
-      resp->set_used_in_txn_limit_ht(statement_time.ToUint64());
-    }
-    const auto& read_options = req.options().read_time_options();
-    if (read_options.has_read_time()) {
-      const auto time = ReadHybridTime::FromPB(read_options.read_time()).read;
-      if (catalog_.transaction_)
-        RETURN_NOT_OK(catalog_.transaction_->ValidateReadTime(time));
-      else
-        SCHECK(time == catalog_.ReadTime(), NotSupported, "Historical reads are not supported");
-    }
-    if (catalog_.transaction_) {
-      // Mirrors PgClientSession: an explicit read time wins, otherwise a changed serial (zero
-      // keeps the current point) selects the current clock.
-      const auto serial = read_options.read_time_serial_no();
-      if (read_options.has_read_time() && read_options.read_time().has_read_ht()) {
-        session.read_point = ReadHybridTime::FromPB(read_options.read_time()).read;
-      } else if (!session.read_point.is_valid() || (serial && serial != session.read_serial)) {
-        session.read_point = catalog_.transaction_->Clock();
-      }
-      if (serial) session.read_serial = serial;
-    }
-    // The catalog transaction excludes every other writer, so its begin time is its snapshot.
-    const auto snapshot =
-        transaction_owner_ == session.id ? HybridTime::kInvalid : session.read_point;
-    if (catalog_.transaction_) {
-      SCHECK(
-          !req.options().read_time_options().restart_transaction() &&
-              req.options().read_time_options().read_time_manipulation() != tserver::RESTART,
-          NotSupported, "Catalog transaction restarts are not supported");
-    }
+    if (!std::exchange(state.started, true)) RETURN_NOT_OK(StartPerform(session, req, resp, state));
+    auto* const wait = FLAGS_local_runtime_wait_on_conflict ? &state.wait : nullptr;
+    const auto waiting = [&state, wait](const Status& status, size_t op_index) {
+      if (status.ok() || !wait || wait->blockers.empty()) return false;
+      state.op_index = op_index;
+      state.resume = true;
+      return true;
+    };
     size_t op_index = 0;
     for (const auto& op : req.ops()) {
+      if (op_index < state.op_index) {
+        ++op_index;
+        continue;
+      }
+      auto* slot = std::exchange(state.resume, false) ? &resp->mutable_responses()->back()
+                                                      : resp->add_responses();
       if (op.has_write()) {
         RETURN_NOT_OK(EnsureTransaction(session, req.options(), false, catalog));
         const auto& table = VERIFY_RESULT_REF(catalog_.Find(op.write().table_id().ToBuffer()));
@@ -2051,15 +2270,16 @@ class ReadonlyService : public UnsupportedPgClientService,
             table.application || req.options().ddl_mode(), NotSupported,
             "Catalog mutations must be part of DDL");
         if (table.application) {
-          RETURN_NOT_OK(catalog_.transaction_->NativeTransactions().WriteSql(
-              *session.native_txn, op.write(), resp->add_responses(), &responder.sidecars(),
-              req.options().active_sub_transaction_id(), snapshot));
+          const auto status = catalog_.transaction_->NativeTransactions().WriteSql(
+              *session.native_txn, op.write(), slot, &responder.sidecars(),
+              req.options().active_sub_transaction_id(), state.snapshot, wait);
+          if (waiting(status, op_index)) return Status::OK();
+          RETURN_NOT_OK(status);
         } else {
           RETURN_NOT_OK(catalog_.Write(
-              op.write(), resp->add_responses(), &responder.sidecars(),
-              req.options().active_sub_transaction_id()));
+              op.write(), slot, &responder.sidecars(), req.options().active_sub_transaction_id()));
         }
-        const auto& response = resp->responses().back();
+        const auto& response = *slot;
         if (response.status() != PgsqlResponsePB::PGSQL_STATUS_OK) {
           // Mirror PgClientSession's error envelope so PgGate aborts instead of committing a batch.
           auto error = response.error_status().empty()
@@ -2084,18 +2304,84 @@ class ReadonlyService : public UnsupportedPgClientService,
             IllegalState, "Application reads require rollback");
         const auto& table = VERIFY_RESULT_REF(catalog_.Find(op.read().table_id().ToBuffer()));
         if (catalog_.transaction_ && table.application) {
-          RETURN_NOT_OK(catalog_.transaction_->NativeTransactions().ReadSql(
-              *session.native_txn, op.read(), resp->add_responses(), &responder.sidecars(),
-              responder.deadline(), statement_time,
-              std::max(1u, req.options().active_sub_transaction_id()), snapshot));
+          const auto status = catalog_.transaction_->NativeTransactions().ReadSql(
+              *session.native_txn, op.read(), slot, &responder.sidecars(), responder.deadline(),
+              state.statement_time, std::max(1u, req.options().active_sub_transaction_id()),
+              state.snapshot, wait);
+          if (waiting(status, op_index)) return Status::OK();
+          RETURN_NOT_OK(status);
           ++catalog_.reads_;
         } else {
           RETURN_NOT_OK(catalog_.Read(
-              op.read(), resp->add_responses(), &responder.sidecars(), responder.deadline(),
-              statement_time));
+              op.read(), slot, &responder.sidecars(), responder.deadline(),
+              state.statement_time));
         }
       }
       ++op_index;
+    }
+    return Status::OK();
+  }
+
+  // Joins the backend's SQL transaction and picks the statement limit and snapshot.
+  Status StartPerform(
+      Session& session, const tserver::PgPerformRequestMsg& req,
+      tserver::PgPerformResponseMsg* resp, PerformState& state) {
+    RETURN_NOT_OK(AcquireSqlTransaction(session, req.options()));
+    SCHECK(
+        !req.options().use_historical_read_session(), NotSupported,
+        "Historical reads are not available on a frozen catalog");
+    // Start before selecting the statement limit, including read-only SQL transactions.
+    // The native table-lock path guarantees a FinishTransaction even without data writes.
+    const bool catalog = req.options().ddl_mode();
+    for (const auto& op : req.ops()) {
+      if (op.has_write()) {
+        RETURN_NOT_OK(EnsureTransaction(session, req.options(), false, catalog));
+      } else if (op.has_read() && catalog_.transaction_) {
+        if (VERIFY_RESULT_REF(catalog_.Find(op.read().table_id().ToBuffer())).application) {
+          RETURN_NOT_OK(EnsureTransaction(session, req.options(), true, catalog));
+        } else if (
+            op.read().has_row_mark_type() && op.read().row_mark_type() != ROW_MARK_ABSENT) {
+          // Catalog row locks are not resolved against other backends; exclude them instead.
+          RETURN_NOT_OK(AcquireExclusive(session));
+        }
+      }
+    }
+    // One shared clock orders every backend. Own-write limits stay distinct from the snapshot.
+    state.statement_time =
+        catalog_.transaction_ ? catalog_.transaction_->Clock() : catalog_.ReadTime();
+    if (catalog_.transaction_ && req.options().has_in_txn_limit_ht()) {
+      const auto limit = HybridTime(req.options().in_txn_limit_ht().value());
+      if (limit.is_valid() && !limit.is_special()) state.statement_time = limit;
+      RETURN_NOT_OK(catalog_.transaction_->ValidateReadTime(state.statement_time));
+      resp->set_used_in_txn_limit_ht(state.statement_time.ToUint64());
+    }
+    const auto& read_options = req.options().read_time_options();
+    if (read_options.has_read_time()) {
+      const auto time = ReadHybridTime::FromPB(read_options.read_time()).read;
+      if (catalog_.transaction_)
+        RETURN_NOT_OK(catalog_.transaction_->ValidateReadTime(time));
+      else
+        SCHECK(time == catalog_.ReadTime(), NotSupported, "Historical reads are not supported");
+    }
+    if (catalog_.transaction_) {
+      // Mirrors PgClientSession: an explicit read time wins, otherwise a changed serial (zero
+      // keeps the current point) selects the current clock.
+      const auto serial = read_options.read_time_serial_no();
+      if (read_options.has_read_time() && read_options.read_time().has_read_ht()) {
+        session.read_point = ReadHybridTime::FromPB(read_options.read_time()).read;
+      } else if (!session.read_point.is_valid() || (serial && serial != session.read_serial)) {
+        session.read_point = catalog_.transaction_->Clock();
+      }
+      if (serial) session.read_serial = serial;
+    }
+    // The catalog transaction excludes every other writer, so its begin time is its snapshot.
+    state.snapshot =
+        transaction_owner_ == session.id ? HybridTime::kInvalid : session.read_point;
+    if (catalog_.transaction_) {
+      SCHECK(
+          !req.options().read_time_options().restart_transaction() &&
+              req.options().read_time_options().read_time_manipulation() != tserver::RESTART,
+          NotSupported, "Catalog transaction restarts are not supported");
     }
     return Status::OK();
   }
@@ -2266,9 +2552,15 @@ class ReadonlyService : public UnsupportedPgClientService,
       tserver::PgRollbackToSubTransactionResponsePB* resp, rpc::RpcContext context) override {
     std::lock_guard lock(mutex_);
     auto status = CheckSession(req->session_id());
-    if (status.ok()) status = CheckNoPending(*sessions_.at(req->session_id()));
+    std::optional<TransactionId> rolled_back;
     if (status.ok()) {
       auto& session = *sessions_.at(req->session_id());
+      CancelWaiter(session, OvertakenWait());
+      status = CheckNoPending(session);
+    }
+    if (status.ok()) {
+      auto& session = *sessions_.at(req->session_id());
+      rolled_back = session.native_txn;
       if (catalog_.transaction_ && transaction_owner_ != session.id && session.native_txn) {
         if (req->sub_transaction_id() == 0) {
           status = STATUS(InvalidArgument, "Invalid subtransaction");
@@ -2298,6 +2590,8 @@ class ReadonlyService : public UnsupportedPgClientService,
       }
     }
     Respond(status, resp, context);
+    // The savepoint's locks are released, which may unblock a waiter.
+    if (status.ok() && rolled_back) Wake(*rolled_back);
   }
 
   void FinishTransaction(
@@ -2305,7 +2599,13 @@ class ReadonlyService : public UnsupportedPgClientService,
       tserver::PgFinishTransactionResponsePB* resp, rpc::RpcContext context) override {
     std::lock_guard lock(mutex_);
     auto status = CheckSession(req->session_id());
-    if (status.ok()) status = CheckNoPending(*sessions_.at(req->session_id()));
+    std::optional<TransactionId> finished;
+    if (status.ok()) {
+      auto& session = *sessions_.at(req->session_id());
+      finished = session.native_txn;
+      CancelWaiter(session, OvertakenWait());
+      status = CheckNoPending(session);
+    }
     if (status.ok() && catalog_.transaction_ && transaction_owner_ == req->session_id()) {
       auto& session = *sessions_.at(req->session_id());
       auto& txn = *catalog_.transaction_;
@@ -2367,6 +2667,8 @@ class ReadonlyService : public UnsupportedPgClientService,
       sessions_.at(req->session_id())->ResetTransaction();
     }
     Respond(status, resp, context);
+    // Waiters resume whichever way their blocker finished.
+    if (finished) Wake(*finished);
   }
 
   void ReleaseSessionObjectLock(
@@ -2388,6 +2690,69 @@ class ReadonlyService : public UnsupportedPgClientService,
                          : STATUS(NotFound, "Local session has no shared memory");
     }
     Respond(status, resp, context);
+  }
+
+  // Mirrors the tablet server: one requested transaction regardless of age, otherwise the oldest
+  // max_num_txns transactions at least min_txn_age_ms old. Like it, ignores the relation.
+  void GetLockStatus(
+      const tserver::PgGetLockStatusRequestPB* req, tserver::PgGetLockStatusResponsePB* resp,
+      rpc::RpcContext context) override {
+    std::lock_guard lock(mutex_);
+    Respond(LockStatus(*req, resp), resp, context);
+  }
+
+  Status LockStatus(
+      const tserver::PgGetLockStatusRequestPB& req, tserver::PgGetLockStatusResponsePB* resp) {
+    RETURN_NOT_OK(Status(catalog_.failure_));
+    SCHECK(catalog_.transaction_, NotSupported, "A read-only local runtime has no locks");
+    auto& store = catalog_.transaction_->NativeTransactions();
+    std::vector<TransactionId> transactions;
+    if (!req.transaction_id().empty()) {
+      transactions.push_back(VERIFY_RESULT(FullyDecodeTransactionId(req.transaction_id())));
+    } else {
+      SCHECK_GT(req.max_num_txns(), 0U, InvalidArgument, "Request must contain max_num_txns > 0");
+      auto pending = store.PendingTransactions();
+      const int64_t newest = GetCurrentTimeMicros() - int64_t{req.min_txn_age_ms()} * 1000;
+      std::erase_if(pending, [newest](const auto& txn) { return txn.second > newest; });
+      std::ranges::sort(pending, [](const auto& lhs, const auto& rhs) {
+        return std::tie(lhs.second, lhs.first) < std::tie(rhs.second, rhs.first);
+      });
+      if (pending.size() > req.max_num_txns()) pending.resize(req.max_num_txns());
+      auto& node = (*resp->mutable_transactions_by_node())[instance_id_];
+      for (const auto& [id, start] : pending) {
+        transactions.push_back(id);
+        node.add_transaction_ids(id.data(), id.size());
+      }
+    }
+    std::vector<WaitingLocks> waiting;
+    for (const auto& id : transactions) {
+      if (const auto it = waiting_txns_.find(id); it != waiting_txns_.end()) {
+        const auto& wait = *sessions_.at(it->second)->waiter;
+        waiting.push_back({.id = id, .wait_start = wait.wait_start, .wait = &wait.state.wait});
+      }
+    }
+    auto* node = resp->add_node_locks();
+    node->set_permanent_uuid(instance_id_);
+    for (auto& tablet : VERIFY_RESULT(
+             store.LockStatus(transactions, waiting, req.max_txn_locks_per_tablet()))) {
+      node->add_tablet_lock_infos()->Swap(&tablet);
+    }
+    return Status::OK();
+  }
+
+  // Each backend's current transaction, which pg_stat_activity shows as yb_backend_xid.
+  void GetActiveTransactionList(
+      const tserver::PgGetActiveTransactionListRequestPB* req,
+      tserver::PgGetActiveTransactionListResponsePB* resp, rpc::RpcContext context) override {
+    std::lock_guard lock(mutex_);
+    for (const auto& [id, session] : sessions_) {
+      if ((req->has_session_id() && req->session_id().value() != id) || !session->native_txn)
+        continue;
+      auto& entry = *resp->add_entries();
+      entry.set_session_id(id);
+      entry.set_txn_id(session->native_txn->data(), session->native_txn->size());
+    }
+    Respond(Status::OK(), resp, context);
   }
 
   SharedMemoryUse shared_memory_use() const { return shared_use_.Snapshot(); }
@@ -2416,6 +2781,11 @@ class ReadonlyService : public UnsupportedPgClientService,
   bool exchange_threads_stopped_ = false;
   // Transports of retired sessions whose polling threads have not been joined yet.
   std::vector<std::shared_ptr<SharedTransport>> retired_;
+  // Transactions with a waiting Perform, by session.
+  std::unordered_map<TransactionId, uint64_t, TransactionIdHash> waiting_txns_;
+  std::deque<uint64_t> wakes_;
+  bool wake_scheduled_ = false;
+  uint64_t wait_timers_ = 0;
 };
 
 }  // namespace
@@ -2509,6 +2879,10 @@ class ReadonlyPgServer::Impl : public pgwrapper::PgWrapperContext {
       FLAGS_ysql_yb_enable_alter_table_rewrite = true;
       FLAGS_ysql_yb_enable_ddl_atomicity_infra = true;
       FLAGS_ysql_yb_enable_ddl_savepoint_infra = true;
+      FLAGS_ysql_yb_enable_pg_locks = true;
+      // The catalog declares yb_lock_status with the advisory-lock columns; without them the
+      // function returns rows PostgreSQL rejects.
+      FLAGS_ysql_yb_pg_locks_integrate_advisory_locks = true;
       FLAGS_ysql_enable_object_locking_infra = true;
       FLAGS_enable_object_lock_fastpath = false;
       FLAGS_enable_object_locking_for_table_locks = true;

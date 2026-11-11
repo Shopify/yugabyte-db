@@ -13,6 +13,8 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "yb/common/doc_hybrid_time.h"
 #include "yb/common/pgsql_protocol.fwd.h"
@@ -20,6 +22,8 @@
 #include "yb/common/read_hybrid_time.h"
 #include "yb/common/schema.h"
 #include "yb/common/transaction.h"
+#include "yb/common/transaction.pb.h"
+#include "yb/dockv/intent.h"
 #include "yb/rocksdb/rocksdb_fwd.h"
 #include "yb/rpc/rpc_fwd.h"
 #include "yb/tablet/metadata.pb.h"
@@ -37,18 +41,35 @@ struct TransactionReadResult {
   ReadHybridTime read_time;
 };
 
-// Native shared-intent engine with snapshot isolation and fail-on-conflict arbitration.
-// Attached SQL access uses authoritative catalog descriptors; the standalone PB API remains
-// restricted to immutable HASH schemas (INT64/INT32/STRING). Operations serialize; transactions
-// overlap. Catalog-owned transactions finish through the single-WAL catalog coordinator.
-// Independent SQL transactions read and resolve conflicts at the backend's read point (statement
-// or transaction snapshot, as PgGate selects); others use their begin time. SQL row locks write
-// native lock intents. No serializable execution, waiting, retries, or history GC. Finished
-// transactions are reclaimed as on a tablet: committed intents are applied to regular rows, then
-// intents and the status record are removed. Bounds: 65536 unfinished transactions, 64 active,
-// 1024 rollbacks per txn. Cumulative encoded intents: 512 MiB per attached SQL txn, 16 MiB per
-// standalone txn. Each encoded intent batch plus resident catalog pending bytes is limited to
-// 16 MiB; the catalog coordinator also limits its final WAL batch to 16 MiB.
+// A request's conflict with pending transactions, which the caller waits out as a tablet's wait
+// queue does. The intents are the locks it requested, reported by lock status while it waits.
+struct LockWait {
+  std::vector<TransactionId> blockers;
+  TableId table_id;
+  uint32_t subtransaction = 0;
+  std::vector<std::pair<std::string, dockv::IntentTypeSet>> intents;
+};
+
+struct WaitingLocks {
+  TransactionId id;
+  HybridTime wait_start;
+  const LockWait* wait;
+};
+
+// Native shared-intent engine with snapshot isolation. A conflict with a pending transaction
+// fails the request, or is reported to the caller to wait out when it passes a LockWait; a
+// committed conflict always fails. Attached SQL access uses authoritative catalog descriptors;
+// the standalone PB API remains restricted to immutable HASH schemas (INT64/INT32/STRING).
+// Operations serialize; transactions overlap. Catalog-owned transactions finish through the
+// single-WAL catalog coordinator. Independent SQL transactions read and resolve conflicts at the
+// backend's read point (statement or transaction snapshot, as PgGate selects); others use their
+// begin time. SQL row locks write native lock intents. No serializable execution, retries, or
+// history GC. Finished transactions are reclaimed as on a tablet: committed intents are applied
+// to regular rows, then intents and the status record are removed. Bounds: 65536 unfinished
+// transactions, 64 active, 1024 rollbacks per txn. Cumulative encoded intents: 512 MiB per
+// attached SQL txn, 16 MiB per standalone txn. Each encoded intent batch plus resident catalog
+// pending bytes is limited to 16 MiB; the catalog coordinator also limits its final WAL batch to
+// 16 MiB.
 class PgLocalTxnStore {
  public:
   static Result<std::unique_ptr<PgLocalTxnStore>> Open(const std::string& directory);
@@ -65,18 +86,34 @@ class PgLocalTxnStore {
   Result<TransactionReadResult> Read(
       const TransactionId& id, const PgsqlReadRequestPB& request, size_t tablet,
       HybridTime own_write_limit = HybridTime::kInvalid);
-  // snapshot, when valid, replaces the begin time as the read point for others' commits.
+  // snapshot, when valid, replaces the begin time as the read point for others' commits. With a
+  // wait, a conflict with pending transactions fills it and returns a kConflict status that
+  // leaves the statement unfailed, so the caller may repeat the request once they finish.
   Status WriteSql(
       const TransactionId& id, const PgsqlWriteRequestMsg& request, PgsqlResponseMsg* response,
       rpc::Sidecars* sidecars, uint32_t subtransaction,
-      HybridTime snapshot = HybridTime::kInvalid);
+      HybridTime snapshot = HybridTime::kInvalid, LockWait* wait = nullptr);
+  // Row-marked reads wait like writes, except NOWAIT and SKIP LOCKED.
   Status ReadSql(
       const TransactionId& id, const PgsqlReadRequestMsg& request, PgsqlResponseMsg* response,
       rpc::Sidecars* sidecars, CoarseTimePoint deadline, HybridTime own_limit,
-      uint32_t subtransaction = 1, HybridTime snapshot = HybridTime::kInvalid);
+      uint32_t subtransaction = 1, HybridTime snapshot = HybridTime::kInvalid,
+      LockWait* wait = nullptr);
   Status Commit(const TransactionId& id);
   Status Abort(const TransactionId& id);
   Status RollbackTo(const TransactionId& id, uint32_t subtransaction);
+
+  // Marks a pending transaction aborted, as the deadlock detector does. Its owner's requests fail
+  // from then on, and its own abort removes it.
+  Status AbortVictim(const TransactionId& id);
+  // Begin time in microseconds of each pending transaction, the age lock status filters on.
+  std::vector<std::pair<TransactionId, int64_t>> PendingTransactions();
+  // One entry per table: granted locks of the listed transactions, read from their intents, and
+  // the given waiting locks. max_locks bounds each transaction's locks per table; zero is
+  // unbounded.
+  Result<std::vector<TabletLockInfoPB>> LockStatus(
+      const std::vector<TransactionId>& transactions, const std::vector<WaitingLocks>& waiting,
+      uint32_t max_locks);
 
  private:
   friend class PgCatalogTransaction;
