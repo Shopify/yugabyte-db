@@ -539,11 +539,8 @@ class DBImpl : public DB {
   void SetTaskCgroup(yb::Cgroup* cgroup) { task_cgroup_ = cgroup; }
   yb::Cgroup* task_cgroup() const { return task_cgroup_; }
 
-  // CPU lane that flush and compaction jobs run in: priority pool tasks created after this call
-  // carry it (PriorityThreadPoolTask::SetTaskLane), and Env pool threads apply it per job. Tasks
-  // already created keep their lane.
-  void SetTaskLane(yb::LaneId lane) { task_lane_.store(lane, std::memory_order_relaxed); }
-  yb::LaneId task_lane() const { return task_lane_.load(std::memory_order_relaxed); }
+  // CPU lane that flush and compaction jobs run in (DBOptions::task_lane).
+  yb::LaneId task_lane() const { return db_options_.task_lane; }
 
  protected:
   Env* const env_;
@@ -1146,7 +1143,6 @@ class DBImpl : public DB {
   bool MCOverlap(ManualCompaction* m, ManualCompaction* m1);
 
   [[maybe_unused]] yb::Cgroup* task_cgroup_ = nullptr;
-  std::atomic<yb::LaneId> task_lane_{yb::kNoLane};
 };
 
 // Sanitize db options.  The caller should delete result.info_log if

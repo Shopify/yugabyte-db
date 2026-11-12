@@ -63,6 +63,7 @@
 
 #include "yb/rocksdb/cache.h"
 #include "yb/rocksdb/db.h"
+#include "yb/rocksdb/db/db_impl.h"
 #include "yb/rocksdb/listener.h"
 #include "yb/rocksdb/rate_limiter.h"
 
@@ -2245,6 +2246,9 @@ TEST_F(TsTabletManagerLanesTest, LanePipelinePools) {
       ASSERT_EQ(pool->options().worker_name_prefix, Format("$0_$1", lane_name, short_name));
       ASSERT_EQ(pool->options().max_workers, ThreadPoolOptions::kUnlimitedWorkers);
       ASSERT_EQ(pool->options().min_workers, 1U);
+      // Before any task, the lane's pool holds only its persistent worker, which keeps a pool whose
+      // other workers exited from having to start its first worker under thread pressure.
+      ASSERT_EQ(pool->NumWorkers(), 1);
       ASSERT_STR_CONTAINS(
           pool->options().ToString(),
           Format("lane: $0 crossing_category: kTabletPipeline }", lane));
@@ -2254,6 +2258,7 @@ TEST_F(TsTabletManagerLanesTest, LanePipelinePools) {
       ASSERT_TRUE(thread.os_name.starts_with(Format("$0_$1_", lane_name, short_name)))
           << thread.os_name;
     }
+    ASSERT_EQ(pools.raft_notifications->NumWorkers(), 0);
     ASSERT_EQ(pools.raft_notifications->options().name, Format("raft_notifications_$0", lane_name));
     ASSERT_STR_CONTAINS(
         pools.raft_notifications->options().ToString(),
@@ -2327,6 +2332,46 @@ TEST_F(TsTabletManagerLanesTest, PriorityPoolTasksRunInTabletLane) {
       ASSERT_TRUE(thread.os_name.starts_with("priority-work")) << thread.os_name;
     }
   }
+}
+
+// A RocksDB opened with a task lane runs the jobs it schedules while opening in that lane: here the
+// compaction that the level-0 files left by the previous open trigger at the end of DB::Open,
+// before the caller has the DB. Tablets pass their lane this way
+// (TabletInitData::rocksdb_task_lane).
+TEST_F(TsTabletManagerLanesTest, JobsScheduledAtDbOpenRunInTaskLane) {
+  constexpr LaneId kLane = 2;
+  const auto db_path = GetTestPath("lane_db");
+  rocksdb::Options options;
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.level0_file_num_compaction_trigger = 2;
+  options.listeners.push_back(flush_listener_);
+  std::unique_ptr<rocksdb::DB> db;
+  auto open = [&db, &options, &db_path]() -> Status {
+    rocksdb::DB* raw_db = nullptr;
+    RETURN_NOT_OK(rocksdb::DB::Open(options, db_path, &raw_db));
+    db.reset(raw_db);
+    return Status::OK();
+  };
+  ASSERT_OK(open());
+  for (int i = 0; i != 2; ++i) {
+    ASSERT_OK(db->Put(rocksdb::WriteOptions(), Format("key$0", i), "value"));
+    ASSERT_OK(db->Flush(rocksdb::FlushOptions()));
+  }
+  ASSERT_TRUE(flush_listener_->Compactions(db_path + "/").empty());
+  db.reset();
+
+  options.disable_auto_compactions = false;
+  options.task_lane = kLane;
+  ASSERT_OK(open());
+  ASSERT_OK(WaitFor([this, &db_path] {
+    return !flush_listener_->Compactions(db_path + "/").empty();
+  }, 30s, "Compaction scheduled at open"));
+  for (const auto& thread : flush_listener_->Compactions(db_path + "/")) {
+    ASSERT_EQ(thread.lane, kLane);
+    ASSERT_EQ(thread.mask, GetLaneTopology().lane_mask(kLane));
+  }
+  ASSERT_EQ(down_cast<rocksdb::DBImpl*>(db.get())->task_lane(), kLane);
 }
 
 // In lane mode a log appender releases its append worker after

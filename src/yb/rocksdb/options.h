@@ -39,6 +39,7 @@
 #include "yb/rocksdb/metadata.h"
 #include "yb/rocksdb/universal_compaction.h"
 
+#include "yb/util/lanes.h"
 #include "yb/util/slice.h"
 #include "yb/util/strongly_typed_bool.h"
 
@@ -901,6 +902,11 @@ struct DBOptions {
   Env* checkpoint_env;
 
   yb::PriorityThreadPool* priority_thread_pool_for_compactions_and_flushes = nullptr;
+
+  // CPU lane of the DB's flush and compaction jobs, from the first job scheduled while the DB
+  // opens: priority pool tasks carry it (PriorityThreadPoolTask::SetTaskLane) and Env pool threads
+  // apply it per job. kNoLane runs them on the service mask in lane mode; no effect with lanes off.
+  yb::LaneId task_lane = yb::kNoLane;
 
   // Use to control write rate of flush and compaction. Flush has higher
   // priority than compaction. Rate limiting is disabled if nullptr.

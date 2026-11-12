@@ -1376,6 +1376,7 @@ Result<rocksdb::Options> Tablet::CommonRocksDBOptions() {
     }
   );
 
+  rocksdb_options.task_lane = rocksdb_task_lane_;
   rocksdb_options.disable_auto_compactions = true;
   rocksdb_options.level0_slowdown_writes_trigger = std::numeric_limits<int>::max();
   rocksdb_options.level0_stop_writes_trigger = std::numeric_limits<int>::max();
@@ -1511,7 +1512,6 @@ Status Tablet::OpenRegularDB(const rocksdb::Options& common_options) {
     return rocksdb_open_status;
   }
   regular_db_.reset(db);
-  down_cast<rocksdb::DBImpl*>(regular_db_.get())->SetTaskLane(rocksdb_task_lane_);
   regular_db_->ListenFilesChanged([this] { RegularDbFilesChanged(); });
 
   return Status::OK();
@@ -1580,7 +1580,6 @@ Status Tablet::OpenIntentsDB(const rocksdb::Options& common_options) {
   rocksdb::DB* intents_db = nullptr;
   RETURN_NOT_OK(rocksdb::DB::Open(intents_rocksdb_options, intents_dir, &intents_db));
   intents_db_.reset(intents_db);
-  down_cast<rocksdb::DBImpl*>(intents_db_.get())->SetTaskLane(rocksdb_task_lane_);
   intents_db_->ListenFilesChanged([this] { CleanupIntentFiles(); });
 
   // We need to set the "cdc_sdk_min_checkpoint_op_id" so that intents don't get

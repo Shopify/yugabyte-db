@@ -365,10 +365,14 @@ changes.
 `append`, `consensus`, `raft_notifications`, `log-sync`, `log-alloc`) as without lanes; it runs in
 the `TabletServer` constructor, before the topology is installed. In lane mode
 `TSTabletManager::Init` builds one more set per lane, before the cgroup setup, with the same limits
-(min 1, unlimited, since their tasks block on IO), the lane, and the `tablet_pipeline` crossing
-category. Lane pools are named `<pool>_L007` (the `/threadz` category) and their workers
-`L007_prepare_<n>_worker`, `L007_append_...`, `L007_raft_...`, `L007_notif_...`,
-`L007_logsync_...` and `L007_logalloc_...`. `TSTabletManager::pipeline_pools(lane)` selects a set
+(unlimited, since their tasks block on IO; min 1), the lane, and the `tablet_pipeline` crossing
+category. The persistent worker is kept in lane pools too: a pool with no live worker whose first
+worker fails to start (thread exhaustion) terminates the process, while one with a persistent worker
+queues the task, so an idle lane holds five idle pipeline threads (`raft_notifications` has none).
+They wait on the service mask until their first task. Lane pools are named `<pool>_L007` (the
+`/threadz` category) and their workers `L007_prepare_<n>_worker`, `L007_append_...`,
+`L007_raft_...`, `L007_notif_...`, `L007_logsync_...` and `L007_logalloc_...`.
+`TSTabletManager::pipeline_pools(lane)` selects a set
 (`lane % L`; the unlaned set for `kNoLane` or with lanes off), and `ForEachPipelinePools` visits the
 unlaned set and every lane's, so the `@system-high` cgroup assignment (consensus system mode) and
 shutdown cover all of them. In per-DB cgroup mode per-task cgroups are set on each tablet's tokens,
@@ -400,14 +404,14 @@ set by measurement at production tablet density. Masters in a process with an ac
 **Background jobs.** Flushes and compactions keep their shared pools so that priority ordering
 across tablets is kept: compactions, and flushes with `use_priority_thread_pool_for_flushes`, run on
 the global `PriorityThreadPool`, other flushes on the RocksDB `Env` high-priority pool. A tablet
-sets its lane on its regular and intents `DBImpl` (`SetTaskLane`) right after each open, including
-re-opens, from `TabletInitData::rocksdb_task_lane`: priority pool tasks carry it and `Env` pool
-threads apply it per job, so a job runs in its tablet's lane and an unlaned one on the service mask,
-with an affinity call only when consecutive jobs differ. `TSTabletManager` sets the field to the
-tablet's lane, or to `kNoLane` with `--tserver_lane_background=service`; `tablet` reads no tserver
-flag, and masters leave it `kNoLane`. Jobs scheduled while a DB is opening run on the service mask.
-Whether compaction volume overloads lanes, and so which mode suits a workload, is to be measured;
-`lane` is the default.
+passes its lane to every open of its regular and intents DBs, including re-opens
+(`rocksdb::DBOptions::task_lane`, from `TabletInitData::rocksdb_task_lane`), so jobs scheduled while
+a DB opens already have it: priority pool tasks carry it and `Env` pool threads apply it per job, so
+a job runs in its tablet's lane and an unlaned one on the service mask, with an affinity call only
+when consecutive jobs differ. `TSTabletManager` sets the field to the tablet's lane, or to `kNoLane`
+with `--tserver_lane_background=service`; `tablet` reads no tserver flag, and masters leave it
+`kNoLane`. `lane` is the default; `service` is for workloads whose compaction volume would crowd a
+lane's CPUs.
 
 **Consensus hints.** A replica's `RpcPeerProxyFactory` takes the peer's lane
 (`ConsensusOptions::lane`) when the server's messenger is laned, and `RpcPeerProxy` sets it as the
