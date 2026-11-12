@@ -651,8 +651,6 @@ Status CatalogManager::ListSnapshotsInternal(
 
 Status CatalogManager::RepackSnapshotsForBackup(
     ListSnapshotsResponsePB* resp, bool include_ddl_in_progress_tables, bool skip_missing_tables) {
-  SharedLock lock(mutex_);
-  TRACE("Acquired catalog manager lock");
   // Repack & extend the backup row entries.
   for (SnapshotInfoPB& snapshot : *resp->mutable_snapshots()) {
     auto format_version = FLAGS_enable_export_snapshot_using_relfilenode &&
@@ -681,7 +679,8 @@ Status CatalogManager::RepackSnapshotsForBackup(
           continue;
         }
         TRACE("Looking up table");
-        scoped_refptr<TableInfo> table_info = tables_->FindTableOrNull(entry.id());
+        // Hold the catalog manager lock only for the lookup.
+        scoped_refptr<TableInfo> table_info = GetTableInfo(entry.id());
         if (table_info == nullptr) {
           if (skip_missing_tables) {
             LOG(INFO) << Format(
@@ -694,6 +693,8 @@ Status CatalogManager::RepackSnapshotsForBackup(
               InvalidArgument, "Table not found by ID", entry.id(),
               MasterError(MasterErrorPB::OBJECT_NOT_FOUND));
         }
+        TEST_SYNC_POINT("YBBackupTestWithColocationParam::RepackTableLookedUp");
+        TEST_SYNC_POINT("YBBackupTestWithColocationParam::ContinueRepack");
 
         TRACE("Locking table");
         auto l = table_info->LockForRead();

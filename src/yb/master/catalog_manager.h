@@ -3142,7 +3142,7 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
 
   Status RepackSnapshotsForBackup(
       ListSnapshotsResponsePB* resp, bool include_ddl_in_progress_tables,
-      bool skip_missing_tables = false);
+      bool skip_missing_tables = false) EXCLUDES(mutex_);
 
   // Helper function for ImportTableEntry.
   Result<bool> CheckTableForImport(
