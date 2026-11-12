@@ -30,8 +30,11 @@ which performs shopify-upstream-pr's steps under their own identity. Until `subm
 exists, developers do these steps by hand following the skills. To submit a
 merged contribution upstream, including its upstream issue, stack placement, and the
 `Upstream:` record, use
-[shopify-upstream-pr](.claude/skills/shopify-upstream-pr/SKILL.md); the
-`shopify-create-pr` and `shopify-backport` skills are being added in following changes.
+[shopify-upstream-pr](.claude/skills/shopify-upstream-pr/SKILL.md). To open a PR in
+`Shopify/yugabyte-db`, use
+[shopify-create-pr](.claude/skills/shopify-create-pr/SKILL.md), not the inherited
+`create-pr`, which opens PRs in `yugabyte/yugabyte-db`; the `shopify-backport` skill is
+being added in a following change.
 
 Upstream PRs are opened in `yugabyte/yugabyte-db` from branches under
 `feature-stack/Shopify/<slug>`, where Shopify developers have push access.

@@ -147,8 +147,9 @@ commits, so the copy found there is adapted to current upstream; the PR's `merge
 stays reachable but older. Until a sync has done so, and for a PR merged another way,
 the commit is the `mergeCommit` from
 `gh pr view <n> --repo Shopify/yugabyte-db --json mergeCommit,commits`, and its shape
-decides the pick. Fork PRs are squash-merged (the `shopify-create-pr` skill), but the
-fork also allows merge and rebase merges:
+decides the pick. Fork PRs are squash-merged
+([shopify-create-pr](../shopify-create-pr/SKILL.md)), but the fork also allows merge
+and rebase merges:
 
 - `mergeCommit` has two parents (merge commit): `git cherry-pick -n <c1> <c2>` with
   every `commits[].oid`, oldest first, skipping any merge commit among them.
