@@ -30,6 +30,7 @@ on:
 
 jobs:
   bld-none:
+    if: github.repository == 'yugabyte/yugabyte-db'
     # Runs on jenkins, but very light-weight, so no approval required.
     # environment: jenkins
     runs-on: ybdbghr
