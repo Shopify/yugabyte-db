@@ -17,6 +17,7 @@
 
 #include "yb/rpc/rpc_fwd.h"
 
+#include "yb/util/lanes.h"
 #include "yb/util/metrics_fwd.h"
 #include "yb/util/net/net_fwd.h"
 
@@ -39,7 +40,10 @@ class ProxyContext {
   virtual const Protocol& DefaultProtocol() = 0;
   virtual const Protocol& UncompressedProtocol() = 0;
 
-  virtual ThreadPool& CallbackThreadPool(ServicePriority priority = ServicePriority::kNormal) = 0;
+  // Pool that runs callbacks of calls issued in lane, at the given priority: that lane's handler
+  // pool in a laned context, the unlaned pool for kNoLane or an unlaned context.
+  virtual ThreadPool& CallbackThreadPool(
+      ServicePriority priority = ServicePriority::kNormal, LaneId lane = kNoLane) = 0;
 
   virtual IoService& io_service() = 0;
 
@@ -51,6 +55,19 @@ class ProxyContext {
 
   // Number of connections to create per destination address.
   virtual int num_connections_to_server() const = 0;
+
+  // Number of lanes of a laned context, 0 for an unlaned one. In a laned context a call whose
+  // controller has a lane hint goes on a connection keyed by (remote, hint modulo num_lanes())
+  // and owned by that lane's reactors, one of connections_per_lane_remote() per (remote, lane).
+  virtual size_t num_lanes() const = 0;
+
+  virtual int connections_per_lane_remote() const = 0;
+
+  // lane reduced modulo num_lanes(); kNoLane for kNoLane or in an unlaned context.
+  LaneId ToLocalLane(LaneId lane) const {
+    const auto lanes = num_lanes();
+    return lane == kNoLane || lanes == 0 ? kNoLane : static_cast<LaneId>(lane % lanes);
+  }
 
   virtual MetadataSerializerFactory* metadata_serializer_factory() = 0;
 

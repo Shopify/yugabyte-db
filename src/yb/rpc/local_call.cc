@@ -61,7 +61,7 @@ void LocalOutboundCall::Serialize(ByteBlocks* output) {
 
 const std::shared_ptr<LocalYBInboundCall>& LocalOutboundCall::CreateLocalInboundCall(
     CallStateListenerFactory* call_state_listener_factory,
-    std::shared_ptr<void> buffers_holder) {
+    std::shared_ptr<void> buffers_holder, LaneId lane) {
   DCHECK(inbound_call_.get() == nullptr);
   const MonoDelta timeout = controller()->timeout();
   const CoarseTimePoint deadline =
@@ -70,7 +70,7 @@ const std::shared_ptr<LocalYBInboundCall>& LocalOutboundCall::CreateLocalInbound
   auto outbound_call = std::static_pointer_cast<LocalOutboundCall>(shared_from(this));
   inbound_call_ = InboundCall::Create<LocalYBInboundCall>(
       &rpc_metrics(), remote_method(), outbound_call, req_, response_, controller_->pool_tag(),
-      deadline, std::move(buffers_holder), call_state_listener_factory);
+      deadline, std::move(buffers_holder), call_state_listener_factory, lane);
   return inbound_call_;
 }
 
@@ -97,13 +97,15 @@ LocalYBInboundCall::LocalYBInboundCall(
     ThreadPoolTag pool_tag,
     CoarseTimePoint deadline,
     std::shared_ptr<void> buffers_holder,
-    CallStateListenerFactory* call_state_listener_factory)
+    CallStateListenerFactory* call_state_listener_factory,
+    LaneId lane)
     : YBInboundCall(rpc_metrics, remote_method, call_state_listener_factory),
       outbound_call_(outbound_call),
       request_(request),
       response_(response),
       pool_tag_(pool_tag),
       deadline_(deadline),
+      lane_(lane),
       buffers_holder_(std::move(buffers_holder)),
       can_time_out_(buffers_holder_ && deadline != CoarseTimePoint::max()) {
   UpdateWaitStateInfo();

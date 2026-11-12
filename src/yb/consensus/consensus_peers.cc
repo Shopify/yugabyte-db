@@ -47,6 +47,7 @@
 #include "yb/consensus/replicate_msgs_holder.h"
 #include "yb/consensus/multi_raft_batcher.h"
 
+#include "yb/rpc/messenger.h"
 #include "yb/rpc/periodic.h"
 #include "yb/rpc/rpc_controller.h"
 
@@ -681,8 +682,9 @@ Peer::~Peer() {
   CHECK_EQ(state_, kPeerClosed) << "Peer cannot be implicitly closed";
 }
 
-RpcPeerProxy::RpcPeerProxy(HostPort hostport, ConsensusServiceProxyPtr consensus_proxy)
-    : hostport_(std::move(hostport)), consensus_proxy_(std::move(consensus_proxy)) {
+RpcPeerProxy::RpcPeerProxy(
+    HostPort hostport, ConsensusServiceProxyPtr consensus_proxy, LaneId lane)
+    : hostport_(std::move(hostport)), consensus_proxy_(std::move(consensus_proxy)), lane_(lane) {
 }
 
 void RpcPeerProxy::UpdateAsync(const LWConsensusRequestPB* request,
@@ -691,12 +693,14 @@ void RpcPeerProxy::UpdateAsync(const LWConsensusRequestPB* request,
                                rpc::RpcController* controller,
                                const rpc::ResponseCallback& callback) {
   controller->set_timeout(MonoDelta::FromMilliseconds(FLAGS_consensus_rpc_timeout_ms));
+  SetLane(controller);
   consensus_proxy_->UpdateConsensusAsync(*request, response, controller, callback);
 }
 
 void RpcPeerProxy::RequestConsensusVoteAsync(
     const VoteRequestPB* request, VoteResponsePB* response, rpc::RpcController* controller,
     const rpc::ResponseCallback& callback) {
+  SetLane(controller);
   consensus_proxy_->RequestConsensusVoteAsync(*request, response, controller, callback);
 }
 
@@ -705,31 +709,35 @@ void RpcPeerProxy::RunLeaderElectionAsync(const RunLeaderElectionRequestPB* requ
                                           rpc::RpcController* controller,
                                           const rpc::ResponseCallback& callback) {
   controller->set_timeout(MonoDelta::FromMilliseconds(FLAGS_consensus_rpc_timeout_ms));
+  SetLane(controller);
   consensus_proxy_->RunLeaderElectionAsync(*request, response, controller, callback);
 }
 
 void RpcPeerProxy::LeaderElectionLostAsync(
     const LeaderElectionLostRequestPB* request, LeaderElectionLostResponsePB* response,
     rpc::RpcController* controller, const rpc::ResponseCallback& callback) {
+  SetLane(controller);
   consensus_proxy_->LeaderElectionLostAsync(*request, response, controller, callback);
 }
 
 void RpcPeerProxy::StartRemoteBootstrap(
     const StartRemoteBootstrapRequestPB* request, StartRemoteBootstrapResponsePB* response,
     rpc::RpcController* controller, const rpc::ResponseCallback& callback) {
+  SetLane(controller);
   consensus_proxy_->StartRemoteBootstrapAsync(*request, response, controller, callback);
 }
 
 RpcPeerProxy::~RpcPeerProxy() {}
 
 RpcPeerProxyFactory::RpcPeerProxyFactory(
-    Messenger* messenger, rpc::ProxyCache* proxy_cache, CloudInfoPB from)
-    : messenger_(messenger), proxy_cache_(proxy_cache), from_(std::move(from)) {}
+    Messenger* messenger, rpc::ProxyCache* proxy_cache, CloudInfoPB from, LaneId lane)
+    : messenger_(messenger), proxy_cache_(proxy_cache), from_(std::move(from)),
+      lane_(messenger && messenger->laned() ? lane : kNoLane) {}
 
 PeerProxyPtr RpcPeerProxyFactory::NewProxy(const RaftPeerPB& peer_pb) {
   auto hostport = HostPortFromPB(DesiredHostPort(peer_pb, from_));
   auto proxy = std::make_unique<ConsensusServiceProxy>(proxy_cache_, hostport);
-  return std::make_unique<RpcPeerProxy>(std::move(hostport), std::move(proxy));
+  return std::make_unique<RpcPeerProxy>(std::move(hostport), std::move(proxy), lane_);
 }
 
 RpcPeerProxyFactory::~RpcPeerProxyFactory() {}

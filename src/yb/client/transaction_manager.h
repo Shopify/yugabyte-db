@@ -55,6 +55,8 @@ class TransactionManager {
   void PickStatusTablet(
       PickStatusTabletCallback callback, TransactionFullLocality locality);
 
+  // The registry of the calling thread's lane (see rpc::LaneShardedRpcs). A caller keeps the
+  // registry it got for every handle it registers there.
   rpc::Rpcs& rpcs();
   YBClient* client() const;
 

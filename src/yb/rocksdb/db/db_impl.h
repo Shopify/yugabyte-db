@@ -61,6 +61,8 @@
 #include "yb/rocksdb/util/stop_watch.h"
 #include "yb/rocksdb/util/thread_local.h"
 
+#include "yb/util/lanes.h"
+
 namespace yb {
 class Cgroup;
 class PriorityThreadPoolSuspender;
@@ -536,6 +538,9 @@ class DBImpl : public DB {
 
   void SetTaskCgroup(yb::Cgroup* cgroup) { task_cgroup_ = cgroup; }
   yb::Cgroup* task_cgroup() const { return task_cgroup_; }
+
+  // CPU lane that flush and compaction jobs run in (DBOptions::task_lane).
+  yb::LaneId task_lane() const { return db_options_.task_lane; }
 
  protected:
   Env* const env_;

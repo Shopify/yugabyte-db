@@ -845,6 +845,7 @@ Tablet::Tablet(const TabletInitData& data)
       retention_policy_(std::make_shared<TabletRetentionPolicy>(
           clock_, [this](const auto&) { return AllowedHistoryCutoff(); }, metadata_.get())),
       full_compaction_pool_(data.full_compaction_pool),
+      rocksdb_task_lane_(data.rocksdb_task_lane),
       tier_migration_hooks_(std::move(data.tier_migration_hooks)),
       admin_triggered_compaction_pool_(data.admin_triggered_compaction_pool),
       ts_post_split_compaction_added_(std::move(data.post_split_compaction_added)),
@@ -1376,6 +1377,7 @@ Result<rocksdb::Options> Tablet::CommonRocksDBOptions() {
     }
   );
 
+  rocksdb_options.task_lane = rocksdb_task_lane_;
   rocksdb_options.disable_auto_compactions = true;
   rocksdb_options.level0_slowdown_writes_trigger = std::numeric_limits<int>::max();
   rocksdb_options.level0_stop_writes_trigger = std::numeric_limits<int>::max();

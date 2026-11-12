@@ -27,6 +27,7 @@ Below you can find a table of high level and non-trivial features, relevant desi
 |[RocksDB: Advanced delta-encoding](advanced-delta-encoding.md)|Timur|
 |Tablet local bootstrap|TBD|
 |Tablet remote bootstrap|Amit|
+|[Tablet server CPU lanes](tserver-ccx-lanes.md)|TBD|
 |Tablet server heartbeat|Nicolas|
 |TLS|Sergei|
 |YCQL server component|TBD|

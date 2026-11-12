@@ -50,6 +50,7 @@
 #include "yb/gutil/ref_counted.h"
 
 #include "yb/util/async_util.h"
+#include "yb/util/lanes.h"
 #include "yb/util/status_fwd.h"
 #include "yb/util/threadpool.h"
 
@@ -228,6 +229,13 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
     return deadline_;
   }
 
+  // Lane of the thread that flushed the batcher. Its tablet RPCs call back in this lane even when
+  // they are created and sent from the thread that completed a tablet lookup or made the
+  // transaction ready.
+  LaneId issuing_lane() const {
+    return issuing_lane_;
+  }
+
   rpc::Messenger* messenger() const;
 
   rpc::ProxyCache& proxy_cache() const;
@@ -398,6 +406,8 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
   CoarseTimePoint deadline_;
 
   rpc::ThreadPoolTag pool_tag_ = 0;
+
+  LaneId issuing_lane_ = kNoLane;
 
   // Number of outstanding lookups across all in-flight ops.
   std::atomic<size_t> outstanding_lookups_{0};

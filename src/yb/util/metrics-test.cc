@@ -50,6 +50,8 @@
 #include "yb/util/histogram.pb.h"
 #include "yb/util/json_document.h"
 #include "yb/util/jsonwriter.h"
+#include "yb/util/lanes.h"
+#include "yb/util/lanes_test_util.h"
 #include "yb/util/metrics.h"
 #include "yb/util/metrics_aggregator.h"
 #include "yb/util/sync_point.h"
@@ -1091,6 +1093,182 @@ TEST_F(MetricsTest, FlushStalePreAggregatedAttribute) {
   TEST_SYNC_POINT("tablet_holder_ready");
 
   flush_thread.join();
+}
+
+METRIC_DEFINE_gauge_int64(server, test_lane_gauge, "Lane gauge", MetricUnit::kRequests,
+                          "Gauge with lane cells");
+METRIC_DEFINE_histogram(server, test_lane_histogram, "Lane histogram", MetricUnit::kMicroseconds,
+                        "Histogram with lane cells", 60000000LU, 2);
+METRIC_DEFINE_event_stats(server, test_lane_event_stats, "Lane stats", MetricUnit::kMicroseconds,
+                          "Event stats with lane cells");
+METRIC_DEFINE_gauge_int64(test_entity, test_lane_non_server_gauge, "Non-server gauge",
+                          MetricUnit::kRequests, "Gauge of another entity type");
+
+namespace {
+
+LaneTopology MetricTestLanes(size_t num_lanes) {
+  std::vector<CpuSet> domains(num_lanes);
+  for (size_t i = 0; i != num_lanes; ++i) {
+    domains[i].Set(i);
+  }
+  return LaneTopology::Build(LaneTopologyOptions{
+      .domains = domains,
+      .process_cpuset = CpuSet::FirstN(num_lanes),
+      .requested_lanes = num_lanes,
+      .affinity_enabled = false,
+  });
+}
+
+struct LaneTestMetrics {
+  explicit LaneTestMetrics(MetricRegistry* registry)
+      : entity(METRIC_ENTITY_server.Instantiate(registry, "lane-metrics")),
+        gauge(METRIC_test_lane_gauge.Instantiate(entity, 0)),
+        histogram(METRIC_test_lane_histogram.Instantiate(entity)),
+        stats(METRIC_test_lane_event_stats.Instantiate(entity)) {}
+
+  void EnableLaneCells() {
+    gauge->EnableLaneCells();
+    histogram->EnableLaneCells();
+    stats->EnableLaneCells();
+  }
+
+  void Record(int64_t value) {
+    gauge->IncrementBy(value % 7 == 0 ? -1 : 1);
+    histogram->Increment(value);
+    stats->Increment(value);
+  }
+
+  std::string Json(bool reset) {
+    std::stringstream out;
+    JsonWriter writer(&out, JsonWriter::PRETTY);
+    MetricJsonOptions opts;
+    opts.include_raw_histograms = true;
+    opts.include_schema_info = true;
+    opts.reset_histograms = reset;
+    CHECK_OK(entity->WriteAsJson(&writer, opts));
+    return out.str();
+  }
+
+  std::string Prometheus(MetricRegistry* registry) {
+    std::stringstream out;
+    MetricPrometheusOptions opts;
+    PrometheusWriter writer(&out, opts);
+    CHECK_OK(registry->WriteForPrometheus(&writer, opts));
+    // Drops each sample's timestamp, the last field of its line.
+    std::string result;
+    std::string line;
+    while (std::getline(out, line)) {
+      if (!line.starts_with("#")) {
+        line.erase(line.rfind(' '));
+      }
+      result += line + "\n";
+    }
+    return result;
+  }
+
+  scoped_refptr<MetricEntity> entity;
+  scoped_refptr<AtomicGauge<int64_t>> gauge;
+  scoped_refptr<Histogram> histogram;
+  scoped_refptr<EventStats> stats;
+};
+
+} // namespace
+
+// Server-level gauges, histograms and event stats with lane cells: writes from lane threads leave
+// the shared value untouched, and every reader, the JSON output and the Prometheus output give
+// what the same metrics without cells give for the same recorded values, before and after reset.
+TEST_F(MetricsTest, LaneCellsMatchUnshardedOutput) {
+  constexpr size_t kLanes = 3;
+  TEST_SetLaneTopology scope(MetricTestLanes(kLanes));
+  MetricRegistry sharded_registry;
+  MetricRegistry plain_registry;
+  LaneTestMetrics sharded(&sharded_registry);
+  LaneTestMetrics plain(&plain_registry);
+  sharded.EnableLaneCells();
+  ASSERT_TRUE(sharded.gauge->lane_cells_enabled());
+  ASSERT_TRUE(sharded.histogram->lane_cells_enabled());
+  ASSERT_TRUE(sharded.stats->lane_cells_enabled());
+
+  auto record_round = [&](int64_t base) {
+    for (LaneId lane = 0; lane != kLanes; ++lane) {
+      RunOnStdThread([&, lane] {
+        SetThisThreadLane(lane);
+        for (int64_t i = 0; i != 50; ++i) {
+          sharded.Record(base + lane * 1000 + i * 37);
+        }
+      });
+    }
+    for (LaneId lane = 0; lane != kLanes; ++lane) {
+      for (int64_t i = 0; i != 50; ++i) {
+        plain.Record(base + lane * 1000 + i * 37);
+      }
+    }
+  };
+  record_round(100);
+  // Lane threads wrote only their cells.
+  ASSERT_EQ(sharded.gauge->TEST_shared_value(), 0);
+  ASSERT_EQ(sharded.histogram->underlying()->TotalCount(), 0);
+  ASSERT_EQ(sharded.stats->underlying()->TotalCount(), 0);
+  // An unlaned thread writes the shared value.
+  sharded.Record(5);
+  plain.Record(5);
+  ASSERT_EQ(sharded.gauge->TEST_shared_value(), 1);
+  ASSERT_EQ(sharded.histogram->underlying()->TotalCount(), 1);
+  ASSERT_EQ(sharded.stats->underlying()->TotalCount(), 1);
+
+  ASSERT_EQ(sharded.gauge->value(), plain.gauge->value());
+  ASSERT_EQ(sharded.histogram->TotalCount(), 151);
+  ASSERT_EQ(sharded.histogram->TotalCount(), plain.histogram->TotalCount());
+  ASSERT_EQ(sharded.histogram->TotalSum(), plain.histogram->TotalSum());
+  ASSERT_EQ(sharded.histogram->MinValue(), plain.histogram->MinValue());
+  ASSERT_EQ(sharded.histogram->MaxValue(), plain.histogram->MaxValue());
+  ASSERT_EQ(sharded.histogram->MeanValue(), plain.histogram->MeanValue());
+  ASSERT_EQ(sharded.histogram->CountInBucketForValueForTests(100),
+            plain.histogram->CountInBucketForValueForTests(100));
+  ASSERT_EQ(sharded.stats->TotalSum(), plain.stats->TotalSum());
+  ASSERT_EQ(sharded.stats->MinValue(), plain.stats->MinValue());
+  ASSERT_EQ(sharded.stats->MaxValue(), plain.stats->MaxValue());
+
+  ASSERT_EQ(sharded.Json(/* reset= */ false), plain.Json(/* reset= */ false));
+  auto prometheus = sharded.Prometheus(&sharded_registry);
+  ASSERT_STR_CONTAINS(prometheus, "test_lane_histogram{");
+  ASSERT_STR_CONTAINS(prometheus, "quantile=\"p99\"");
+  ASSERT_EQ(prometheus, plain.Prometheus(&plain_registry));
+  // Prometheus output resets the histograms' current values (default options): both again agree.
+  ASSERT_EQ(sharded.Json(/* reset= */ true), plain.Json(/* reset= */ true));
+  ASSERT_EQ(sharded.histogram->MinValue(), 0);
+  ASSERT_EQ(sharded.stats->MaxValue(), 0);
+  record_round(7);
+  ASSERT_EQ(sharded.Json(/* reset= */ false), plain.Json(/* reset= */ false));
+
+  // set_value replaces the cells' deltas too.
+  sharded.gauge->set_value(42);
+  ASSERT_EQ(sharded.gauge->value(), 42);
+}
+
+// With lanes off, or for a metric of another entity type, EnableLaneCells does nothing, and every
+// thread writes the shared value.
+TEST_F(MetricsTest, LaneCellsOffOrNotServer) {
+  MetricRegistry registry;
+  LaneTestMetrics metrics(&registry);
+  metrics.EnableLaneCells();
+  ASSERT_FALSE(metrics.gauge->lane_cells_enabled());
+  ASSERT_FALSE(metrics.histogram->lane_cells_enabled());
+  ASSERT_FALSE(metrics.stats->lane_cells_enabled());
+  RunOnStdThread([&] {
+    SetThisThreadLane(1);
+    metrics.Record(10);
+  });
+  ASSERT_EQ(metrics.gauge->TEST_shared_value(), 1);
+  ASSERT_EQ(metrics.histogram->underlying()->TotalCount(), 1);
+  ASSERT_EQ(metrics.stats->underlying()->TotalCount(), 1);
+
+  TEST_SetLaneTopology scope(MetricTestLanes(2));
+  auto gauge = METRIC_test_lane_non_server_gauge.Instantiate(entity_, 0);
+  gauge->EnableLaneCells();
+  ASSERT_FALSE(gauge->lane_cells_enabled());
+  metrics.EnableLaneCells();
+  ASSERT_TRUE(metrics.gauge->lane_cells_enabled());
 }
 
 } // namespace yb

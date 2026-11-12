@@ -1817,6 +1817,8 @@ class Tablet : public AbstractTablet,
   // Pointer to shared thread pool in TsTabletManager. Managed by the FullCompactionManager.
   ThreadPool* full_compaction_pool_ = nullptr;
 
+  const LaneId rocksdb_task_lane_;
+
   // Tiered storage: guards tier_migration_status_, written from SetTierMigrationTarget,
   // RunTierMigrationPass and the ScheduleDBPathMove callbacks, read from GetTierInfo.
   mutable std::mutex tier_migration_mutex_;

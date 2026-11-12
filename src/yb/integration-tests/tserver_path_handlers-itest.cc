@@ -12,6 +12,7 @@
 //
 
 #include <regex>
+#include <set>
 #include <string>
 
 #include "yb/integration-tests/mini_cluster.h"
@@ -103,6 +104,7 @@ TEST_F(TServerPathHandlersItest, TestMasterPathHandlers) {
   ASSERT_OK(FetchURL("/intentsdb"));
 #endif
   ASSERT_OK(FetchURL("/maintenance-manager"));
+  ASSERT_OK(FetchURL("/lanes"));
 
   // Default paths.
   ASSERT_OK(FetchURL("/logs"));
@@ -119,6 +121,29 @@ TEST_F(TServerPathHandlersItest, TestMasterPathHandlers) {
   ASSERT_OK(FetchURL("/api/v1/version"));
   ASSERT_OK(FetchURL("/api/v1/masters"));
   ASSERT_OK(FetchURL("/api/v1/tablets"));
+  ASSERT_OK(FetchURL("/api/v1/lanes"));
+}
+
+// With lanes off the lanes page says lane mode is inactive and why, and shows no preamble counter,
+// since a tablet server with lanes off instantiates none until it drops a lane preamble.
+TEST_F(TServerPathHandlersItest, LanesPageWithLanesOff) {
+  auto json = ASSERT_RESULT(FetchURL("/api/v1/lanes"));
+  JsonDocument doc;
+  auto root = ASSERT_RESULT(doc.Parse(json));
+  std::set<std::string> keys;
+  for (const auto& [key, _] : ASSERT_RESULT(root.GetObject())) {
+    keys.emplace(key);
+  }
+  ASSERT_EQ(keys, (std::set<std::string>{"lanes_active", "topology", "preamble"})) << json;
+  ASSERT_FALSE(ASSERT_RESULT(root["lanes_active"].GetBool()));
+  ASSERT_EQ(ASSERT_RESULT(root["topology"].GetString()), "lanes disabled (tserver_lanes=1)");
+  ASSERT_EQ(ASSERT_RESULT(root["preamble"].size()), 0);
+
+  auto html = ASSERT_RESULT(FetchURL("/lanes"));
+  ASSERT_STR_CONTAINS(html, "<h2>CPU lanes</h2>");
+  ASSERT_STR_CONTAINS(html, "Lane mode is inactive: lanes disabled (tserver_lanes=1)");
+  ASSERT_STR_CONTAINS(html, "No lane preamble counters");
+  ASSERT_STR_NOT_CONTAINS(html, "<h3>Lanes</h3>");
 }
 
 TEST_F(TServerPathHandlersItest, TestVarzAutoFlag) {

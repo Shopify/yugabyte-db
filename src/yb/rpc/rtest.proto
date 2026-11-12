@@ -106,6 +106,10 @@ message WhoAmIRequestPB {
 
 message WhoAmIResponsePB {
   required string address = 2;
+  // State of the thread that ran the handler.
+  optional uint32 handler_lane = 3;
+  optional string handler_thread_name = 4;
+  optional int64 handler_thread_id = 5;
 }
 
 message CalculatorError {

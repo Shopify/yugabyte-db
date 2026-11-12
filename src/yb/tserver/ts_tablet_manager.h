@@ -33,6 +33,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -198,6 +199,28 @@ class TSTabletManager : public tserver::TabletPeerLookupIf, public tablet::Table
 
   rpc::ThreadPoolTag PoolTagForTablet(const tablet::TabletPtr& tablet);
 
+  // The pools a tablet's Raft, log and preparer stages run on.
+  struct PipelinePools {
+    ThreadPool* prepare;
+    ThreadPool* append;
+    ThreadPool* raft;
+    rpc::ThreadPool* raft_notifications;
+    ThreadPool* log_sync;
+    ThreadPool* log_alloc;
+  };
+
+  // The constructor builds one unlaned set of pipeline pools (the no-argument accessors). In lane
+  // mode Init() also builds one set per lane, and tablets run on their lane's set (see
+  // TabletPeer::lane()), so the unlaned set then serves only work that belongs to no tablet, such
+  // as StepDownLocalLeaders. Returns the set of lane % (number of lane sets), or the unlaned set
+  // for kNoLane or when there are no lane sets.
+  PipelinePools pipeline_pools(LaneId lane) const;
+
+  // Calls f for the unlaned set and then for every lane's set, in lane order.
+  void ForEachPipelinePools(const std::function<void(const PipelinePools&)>& f) const;
+
+  size_t num_lane_pipeline_pools() const { return lane_pipeline_pools_.size(); }
+
   ThreadPool* tablet_prepare_pool() const { return tablet_prepare_pool_.get(); }
   ThreadPool* raft_pool() const { return raft_pool_.get(); }
   ThreadPool* snapshot_cleanup_pool() const { return snapshot_cleanup_pool_.get(); }
@@ -208,6 +231,7 @@ class TSTabletManager : public tserver::TabletPeerLookupIf, public tablet::Table
   ThreadPool* read_pool() const { return read_pool_.get(); }
   ThreadPool* append_pool() const { return append_pool_.get(); }
   ThreadPool* log_sync_pool() const { return log_sync_pool_.get(); }
+  ThreadPool* allocation_pool() const { return allocation_pool_.get(); }
   ThreadPool* full_compaction_pool() const { return full_compaction_pool_.get(); }
   ThreadPool* admin_triggered_compaction_pool() const {
     return admin_triggered_compaction_pool_.get();
@@ -531,6 +555,9 @@ class TSTabletManager : public tserver::TabletPeerLookupIf, public tablet::Table
   FRIEND_TEST(TsTabletManagerTest, TestTombstonedTabletsAreUnregistered);
   friend class ComputeDbHistoryRetentionPinCutoffTest;
   friend class ::yb::XClusterSafeTimeTest;
+
+  // Builds lane_pipeline_pools_ for the installed lane topology; nothing when lane mode is off.
+  Status BuildLanePipelinePools();
 
   // Flag specified when registering a TabletPeer.
   enum RegisterTabletPeerMode {
@@ -905,6 +932,10 @@ class TSTabletManager : public tserver::TabletPeerLookupIf, public tablet::Table
   // Lock-free mirror of state_ transitioning to MANAGER_QUIESCING. See IsShutdownStarted.
   std::atomic<bool> shutdown_started_{false};
 
+  // log_sync_pool_, tablet_prepare_pool_, raft_pool_, raft_notifications_pool_, append_pool_ and
+  // allocation_pool_ form the unlaned pipeline pool set; in lane mode tablets run on
+  // lane_pipeline_pools_ instead, see pipeline_pools().
+
   // Thread pool used to perform fsync operations corresponding to log::Log of each tablet_peer
   std::unique_ptr<ThreadPool> log_sync_pool_;
 
@@ -938,6 +969,19 @@ class TSTabletManager : public tserver::TabletPeerLookupIf, public tablet::Table
 
   // Thread pool for flushing retryable requests.
   std::unique_ptr<ThreadPool> flush_bootstrap_state_pool_;
+
+  struct LanePipelinePools {
+    std::unique_ptr<ThreadPool> prepare;
+    std::unique_ptr<ThreadPool> append;
+    std::unique_ptr<ThreadPool> raft;
+    std::unique_ptr<rpc::ThreadPool> raft_notifications;
+    std::unique_ptr<ThreadPool> log_sync;
+    std::unique_ptr<ThreadPool> log_alloc;
+  };
+
+  // One pipeline pool set per lane, indexed by lane, built by Init() in lane mode and never
+  // resized afterwards; empty when lane mode is off.
+  std::vector<LanePipelinePools> lane_pipeline_pools_;
 
   // Thread pool for manually triggering full compactions for tablets, either via schedule
   // of tablets created from a split.

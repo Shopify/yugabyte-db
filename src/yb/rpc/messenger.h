@@ -36,6 +36,8 @@
 #include <atomic>
 #include <list>
 #include <memory>
+#include <mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -53,6 +55,7 @@
 
 #include "yb/util/async_util.h"
 #include "yb/util/atomic.h"
+#include "yb/util/lanes.h"
 #include "yb/util/locks.h"
 #include "yb/util/metrics_fwd.h"
 #include "yb/util/monotime.h"
@@ -93,6 +96,36 @@ class MessengerBuilder {
 
   // Set the number of reactor threads that will be used for sending and receiving.
   MessengerBuilder &set_num_reactors(int num_reactors);
+
+  // Lane of each reactor, by reactor index; empty (default) leaves every reactor unlaned. When
+  // not empty its size must equal the number of reactors. Lanes are reduced modulo the lane
+  // count of the process topology, and ignored while lane mode is off. Reactor lanes alone don't
+  // make the messenger laned (see set_lane_topology); not used with a lane topology.
+  MessengerBuilder &set_reactor_lanes(std::vector<LaneId> lanes);
+
+  const std::vector<LaneId>& reactor_lanes() const {
+    return reactor_lanes_;
+  }
+
+  // Makes the messenger laned when topology is active: it then builds reactors_per_lane reactors
+  // for each lane (the reactor count set with set_num_reactors is ignored), a normal,
+  // high-priority and tagged handler pool set per lane next to the unlaned ones, and keys
+  // outbound connections of calls with a lane hint by (remote, lane). An active topology must be
+  // the installed process topology (GetLaneTopology()), or Messenger::Init fails, because reactor
+  // and pool threads take their masks from it. An inactive or null topology leaves the messenger
+  // unlaned.
+  MessengerBuilder &set_lane_topology(const LaneTopology* topology);
+
+  // Reactors per lane of a laned messenger; 0 (default) means
+  // max(1, CPUs in the lane / 4 / number of lanes sharing the lane's domains).
+  MessengerBuilder &set_reactors_per_lane(int value);
+
+  // Connections per (remote, lane) for calls with a lane hint in a laned messenger, in [1, 256].
+  MessengerBuilder &set_connections_per_lane_remote(int value);
+
+  const LaneTopology* lane_topology() const { return lane_topology_; }
+  int reactors_per_lane() const { return reactors_per_lane_; }
+  int connections_per_lane_remote() const { return connections_per_lane_remote_; }
 
   // Set the granularity with which connections are checked for keepalive.
   MessengerBuilder &set_coarse_timer_granularity(CoarseMonoClock::Duration granularity);
@@ -197,6 +230,10 @@ class MessengerBuilder {
   const std::string name_;
   CoarseMonoClock::Duration connection_keepalive_time_;
   int num_reactors_ = 4;
+  std::vector<LaneId> reactor_lanes_;
+  const LaneTopology* lane_topology_ = nullptr;
+  int reactors_per_lane_ = 0;
+  int connections_per_lane_remote_ = 2;
   CoarseMonoClock::Duration coarse_timer_granularity_ = std::chrono::milliseconds(100);
   scoped_refptr<MetricEntity> metric_entity_;
   ConnectionContextFactoryPtr connection_context_factory_;
@@ -261,8 +298,8 @@ class Messenger : public ProxyContext {
   const Protocol& DefaultProtocol() override { return listen_protocol_; }
   const Protocol& UncompressedProtocol() override { return uncompressed_protocol_; }
 
-  rpc::ThreadPool& CallbackThreadPool(ServicePriority priority) override {
-    return ThreadPool(priority);
+  rpc::ThreadPool& CallbackThreadPool(ServicePriority priority, LaneId lane) override {
+    return ThreadPool(priority, lane);
   }
 
   Status QueueEventOnAllReactors(
@@ -321,11 +358,57 @@ class Messenger : public ProxyContext {
     return *resolver_;
   }
 
-  rpc::ThreadPool& ThreadPool(ServicePriority priority = ServicePriority::kNormal);
+  // Handler pools. kNoLane, and any lane in an unlaned messenger, give the messenger's unlaned
+  // pools; another lane, reduced modulo num_lanes(), gives that lane's pool, whose workers run in
+  // the lane. Each lane's pools have the limits and cgroups of the unlaned ones. High-priority
+  // pools are created on first use; tagged pools on first use and reclaimed when idle the next
+  // time the same lane creates a tagged pool.
+  rpc::ThreadPool& ThreadPool(
+      ServicePriority priority = ServicePriority::kNormal, LaneId lane = kNoLane);
 
-  const rpc::ThreadPoolPtr& ThreadPoolPtr(ServicePriority priority = ServicePriority::kNormal);
+  const rpc::ThreadPoolPtr& ThreadPoolPtr(
+      ServicePriority priority = ServicePriority::kNormal, LaneId lane = kNoLane);
 
-  Result<rpc::ThreadPoolPtr> TaggedThreadPool(TaggedThreadPools::Tag pool_tag = 0);
+  // Tag 0 is the normal pool of the lane.
+  Result<rpc::ThreadPoolPtr> TaggedThreadPool(
+      TaggedThreadPools::Tag pool_tag = 0, LaneId lane = kNoLane);
+
+  // Pool for an inbound call to a service of the given priority: the tagged pool of the call's
+  // tag and lane for normal priority (the normal pool if that fails, e.g. during shutdown), the
+  // high-priority pool of the lane for high priority.
+  rpc::ThreadPoolPtr HandlerThreadPool(
+      ServicePriority priority, ThreadPoolTag tag, LaneId lane);
+
+  // Calls f on each existing handler pool of lane, reduced modulo num_lanes(), or on the unlaned
+  // pools for kNoLane or in an unlaned messenger: the normal and tagged pools, and the
+  // high-priority pool if it was created. Unlike ThreadPool and TaggedThreadPool it never creates a
+  // pool, so readers such as status pages change nothing.
+  void ForEachHandlerPool(LaneId lane, const std::function<void(const rpc::ThreadPool&)>& f);
+
+  // Calls f on each registered service, unless services are being shut down.
+  void ForEachService(const std::function<void(const RpcService&)>& f) const;
+
+  // Number of tagged pools of lane (unlaned for kNoLane), including the normal pool.
+  size_t TEST_ActiveTaggedPools(LaneId lane = kNoLane);
+
+  // The operation counters Handle takes per call: the one for threads without a lane first, then
+  // each lane's in a laned messenger.
+  std::vector<const RWOperationCounter*> TEST_RpcServicesCounters() const;
+  // The one Handle takes on the calling thread.
+  const RWOperationCounter* TEST_RpcServicesCounterOfThisThread() const;
+
+  // Whether the messenger was built with an active lane topology.
+  bool laned() const { return num_lanes_ != 0; }
+
+  size_t num_lanes() const override { return num_lanes_; }
+
+  // Topology of a laned messenger; the inactive topology otherwise.
+  const LaneTopology& lane_topology() const { return lane_topology_; }
+
+  int connections_per_lane_remote() const override { return connections_per_lane_remote_; }
+
+  // Reactors of lane, reduced modulo num_lanes(); empty for kNoLane or an unlaned messenger.
+  std::span<const std::unique_ptr<Reactor>> ReactorsOfLane(LaneId lane) const;
 
   const std::shared_ptr<RpcMetrics>& rpc_metrics() override {
     return rpc_metrics_;
@@ -339,6 +422,10 @@ class Messenger : public ProxyContext {
 
   size_t num_reactors() const {
     return reactors_.size();
+  }
+
+  Reactor* TEST_reactor(size_t index) const {
+    return reactors_[index].get();
   }
 
   // Use specified IP address as base address for outbound connections from messenger.
@@ -376,17 +463,23 @@ class Messenger : public ProxyContext {
 
   explicit Messenger(const MessengerBuilder &bld);
 
-  Reactor* RemoteToReactor(const Endpoint& remote, uint32_t idx = 0);
+  // Reactor for an outbound connection, or an inbound one not bound to a lane: among the lane's
+  // reactors for a laned connection of a laned messenger, among all reactors otherwise.
+  Reactor* RemoteToReactor(const Endpoint& remote, uint32_t idx = 0, LaneId lane = kNoLane);
   Status Init(const MessengerBuilder &bld);
+  Status InitLaned(const MessengerBuilder &bld);
 
   void ShutdownThreadPools();
 
   void BreakConnectivity(const IpAddress& address, bool incoming, bool outgoing);
   void RestoreConnectivity(const IpAddress& address, bool incoming, bool outgoing);
 
-  // Take ownership of the socket via Socket::Release
+  // Takes ownership of the socket. Called by the acceptor with the lane of the socket's lane
+  // preamble: a lane's connections take its reactors in turn. Without one (kNoLane, or on an
+  // unlaned messenger) the reactor is RemoteToReactor's over all reactors.
   void RegisterInboundSocket(
-      const ConnectionContextFactoryPtr& factory, Socket *new_socket, const Endpoint& remote);
+      const ConnectionContextFactoryPtr& factory, Socket *new_socket, const Endpoint& remote,
+      LaneId lane);
 
   bool TEST_ShouldArtificiallyRejectOutgoingCallsTo(const IpAddress &remote);
 
@@ -395,6 +488,31 @@ class Messenger : public ProxyContext {
   }
 
   ThreadPoolOptions MakeNormalThreadPoolOptions(TaggedThreadPools::Tag tag) const;
+  ThreadPoolOptions MakeLaneThreadPoolOptions(
+      LaneId lane, ServicePriority priority, TaggedThreadPools::Tag tag) const;
+
+  // Handler pools of one lane; tagged pools are a separate instance per lane, so looking one up
+  // takes only that lane's lock.
+  struct LanePools {
+    std::unique_ptr<TaggedThreadPools> tagged;
+    rpc::ThreadPoolPtr normal;
+    std::mutex high_mutex;
+    rpc::ThreadPoolPtr high;
+    std::atomic<bool> high_ready{false};
+  };
+
+  // The counter Handle takes for a call: the calling thread's lane's in a laned messenger, else
+  // rpc_services_counter_. Shutdown disables and drains all of them (ForEachRpcServicesCounter).
+  RWOperationCounter& RpcServicesCounter() const;
+  template <class F>
+  void ForEachRpcServicesCounter(const F& f) const;
+
+  // Tracker of a local call of lane: the lane's in a laned messenger, else local_call_tracker_.
+  LocalYBInboundCallTracker& LocalCallTracker(LaneId lane);
+
+  LanePools* LanePoolsOf(LaneId lane) const {
+    return lane == kNoLane || num_lanes_ == 0 ? nullptr : lane_pools_[lane % num_lanes_].get();
+  }
 
   const std::string name_;
 
@@ -411,7 +529,8 @@ class Messenger : public ProxyContext {
 
   std::atomic_bool closing_ = false;
 
-  // RPC services that handle inbound requests.
+  // Taken per call by Handle; with lanes, by threads without a lane only (see
+  // RpcServicesCounter).
   mutable RWOperationCounter rpc_services_counter_;
   OneTimeBool rpc_services_stopped_;
   std::unordered_multimap<std::string, RpcServicePtr> rpc_services_;
@@ -448,7 +567,20 @@ class Messenger : public ProxyContext {
 
   IoThreadPool io_thread_pool_;
   Scheduler scheduler_;
+  // Tracks local calls; with lanes, those without a lane only (see LocalCallTracker).
   LocalYBInboundCallTracker local_call_tracker_;
+
+  // Per-call state of a laned messenger, one per lane, so that calls of different lanes write
+  // different cache lines: the operation counter Handle takes for each call from a thread of the
+  // lane, and the tracker of the lane's local calls.
+  struct alignas(CACHELINE_SIZE) LaneCallState {
+    LaneCallState(const std::string& name, Scheduler& scheduler)
+        : rpc_services_counter(name), local_call_tracker(scheduler) {}
+
+    RWOperationCounter rpc_services_counter;
+    LocalYBInboundCallTracker local_call_tracker;
+  };
+  std::vector<std::unique_ptr<LaneCallState>> lane_call_states_;
 
   size_t thread_pool_workers_limit_;
 
@@ -473,6 +605,16 @@ class Messenger : public ProxyContext {
 
   // Number of outbound connections to create per each destination server address.
   int num_connections_to_server_;
+
+  // Lane state; num_lanes_ is 0 for an unlaned messenger.
+  size_t num_lanes_ = 0;
+  LaneTopology lane_topology_;
+  int connections_per_lane_remote_ = 0;
+  // Reactors of lane l are reactors_[lane_reactor_begin_[l], lane_reactor_begin_[l + 1]).
+  std::vector<size_t> lane_reactor_begin_;
+  // Inbound connections bound to each lane so far; used only by the acceptor thread.
+  std::vector<size_t> inbound_lane_connections_;
+  std::vector<std::unique_ptr<LanePools>> lane_pools_;
 
   std::unique_ptr<ReactorMonitor> reactor_monitor_ GUARDED_BY(lock_);
 

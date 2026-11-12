@@ -99,6 +99,11 @@ class ThreadPoolToken {
   virtual ~ThreadPoolToken() = default;
 
   virtual Status SubmitFunc(std::function<void()> f) = 0;
+
+  // Like SubmitFunc, for a task that only drains items which count their own lane handoffs
+  // (LaneHandoff): the task itself is not counted, so each handoff is counted once.
+  virtual Status SubmitDrainFunc(std::function<void()> f) = 0;
+
   virtual void Shutdown() = 0;
 
   // Set a per-task cgroup. All tasks submitted via this token will have their executing
@@ -124,6 +129,10 @@ class ThreadPool {
   Status SubmitClosure(const Closure& task);
   Status Submit(const std::shared_ptr<Runnable>& r);
 
+  const ThreadPoolOptions& options() const {
+    return underlying_->options();
+  }
+
   bool WaitFor(MonoDelta delta) {
     return WaitUntil(MonoTime::NowPlus(delta));
   }
@@ -138,6 +147,10 @@ class ThreadPool {
 
   size_t NumWorkers() const {
     return underlying_->NumWorkers();
+  }
+
+  size_t TEST_NumWorkersCreated() const {
+    return underlying_->TEST_NumWorkersCreated();
   }
 
   bool Idle() const {
@@ -204,6 +217,22 @@ class ThreadPoolBuilder {
 
   ThreadPoolBuilder& set_cgroup(Cgroup* cgroup) {
     options_.cgroup = cgroup;
+    return *this;
+  }
+
+  ThreadPoolBuilder& set_lane(LaneId lane) {
+    options_.lane = lane;
+    return *this;
+  }
+
+  ThreadPoolBuilder& set_crossing_category(LaneCrossingCategory category) {
+    options_.crossing_category = category;
+    return *this;
+  }
+
+  // See ThreadPoolOptions::worker_name_prefix.
+  ThreadPoolBuilder& set_worker_name_prefix(std::string prefix) {
+    options_.worker_name_prefix = std::move(prefix);
     return *this;
   }
 

@@ -34,6 +34,7 @@
 
 #include <stdint.h>
 
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -45,6 +46,7 @@
 #include "yb/rpc/rpc_fwd.h"
 #include "yb/rpc/rpc_service.h"
 
+#include "yb/util/lanes.h"
 #include "yb/util/status_fwd.h"
 #include "yb/util/blocking_queue.h"
 #include "yb/util/mutex.h"
@@ -61,17 +63,27 @@ class Socket;
 
 namespace rpc {
 
-using ThreadPoolProvider = std::function<ThreadPoolPtr(ThreadPoolTag)>;
+// Returns the pool that handles a call with the given tag and lane (InboundCall::lane(): the
+// receiving reactor's lane, or the caller's lane for a local call; kNoLane for none).
+using ThreadPoolProvider = std::function<ThreadPoolPtr(ThreadPoolTag, LaneId)>;
 
 // A pool of threads that handle new incoming RPC calls.
 // Also includes a queue that calls get pushed onto for handling by the pool.
 class ServicePool : public RpcService {
  public:
+  // num_lanes (L): the lane count of a laned messenger, 0 for an unlaned one. A laned pool keeps
+  // its queued-call count and timeout pre-check queue per lane (plus one for calls without a lane),
+  // and, with limit = max_tasks and share = ceil(limit / L), admits a call without a shared write
+  // while its lane slot is below share and no slot is above its share; otherwise it sums the slots.
+  // The spare slot's share is 0, so calls without a lane always sum. The queue never holds more
+  // than max(limit, L x share) <= limit + L - 1 calls; see ServicePoolImpl::LaneCallQueued. An
+  // unlaned pool keeps one count and one queue.
   ServicePool(size_t max_tasks,
               ThreadPoolProvider thread_pool_provider,
               Scheduler* scheduler,
               ServiceIfPtr service,
-              const scoped_refptr<MetricEntity>& metric_entity);
+              const scoped_refptr<MetricEntity>& metric_entity,
+              size_t num_lanes = 0);
   virtual ~ServicePool();
 
   void StartShutdown() override;
@@ -84,6 +96,23 @@ class ServicePool : public RpcService {
   std::string service_name() const;
 
   ServiceIfPtr TEST_get_service() const;
+
+  // Calls counted as queued (for a laned pool, the sum over its lanes).
+  int64_t QueuedCalls() const;
+
+  // Per-lane queued-call counts of a laned pool, the spare slot (calls without a lane) last; empty
+  // for an unlaned pool. Relaxed reads of the slots, for display.
+  std::vector<int64_t> LaneQueuedCalls() const;
+  // Number of slots of a laned pool currently above their share of the queue limit: lane slots
+  // above ceil(limit / lanes), plus the slot of calls without a lane while it holds any (its share
+  // is 0). 0 for an unlaned pool.
+  int64_t LanesOverShare() const;
+  // The count an unlaned pool uses; stays 0 in a laned pool.
+  int64_t TEST_SharedQueuedCalls() const;
+  // Admission and release as for a call of lane, without a call.
+  std::optional<int64_t> TEST_CallQueued(LaneId lane);
+  void TEST_CallDequeued(LaneId lane);
+
  private:
   std::unique_ptr<ServicePoolImpl> impl_;
 };

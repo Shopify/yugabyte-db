@@ -118,6 +118,33 @@ void HdrHistogram::Reset() {
   NoBarrier_Store(&max_value_, 0);
 }
 
+void HdrHistogram::MergeFrom(const HdrHistogram& other) {
+  CHECK_EQ(highest_trackable_value_, other.highest_trackable_value_);
+  CHECK_EQ(num_significant_digits_, other.num_significant_digits_);
+  NoBarrier_AtomicIncrement(&total_sum_, NoBarrier_Load(&other.total_sum_));
+  NoBarrier_AtomicIncrement(&current_sum_, NoBarrier_Load(&other.current_sum_));
+  const auto other_min = NoBarrier_Load(&other.min_value_);
+  Atomic64 merged_count = 0;
+  for (int i = 0; i < counts_array_length_; i++) {
+    const auto count = NoBarrier_Load(&other.counts_[i]);
+    if (count) {
+      NoBarrier_AtomicIncrement(&counts_[i], count);
+      merged_count += count;
+    }
+  }
+  const auto other_max = NoBarrier_Load(&other.max_value_);
+  NoBarrier_AtomicIncrement(&total_count_, NoBarrier_Load(&other.total_count_));
+  NoBarrier_AtomicIncrement(&current_count_, merged_count);
+  if (merged_count != 0) {
+    if (other_min < NoBarrier_Load(&min_value_)) {
+      NoBarrier_Store(&min_value_, other_min);
+    }
+    if (other_max > NoBarrier_Load(&max_value_)) {
+      NoBarrier_Store(&max_value_, other_max);
+    }
+  }
+}
+
 bool HdrHistogram::IsValidHighestTrackableValue(uint64_t highest_trackable_value) {
   return highest_trackable_value >= kMinHighestTrackableValue;
 }

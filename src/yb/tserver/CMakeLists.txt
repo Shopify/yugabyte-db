@@ -305,6 +305,7 @@ set(TSERVER_SRCS
   ts_tablet_manager.cc
   tserver-path-handlers.cc
   tserver_auto_flags_manager.cc
+  tserver_lanes.cc
   tserver_metrics_heartbeat_data_provider.cc
   server_main_util.cc
   stateful_services/pg_auto_analyze_service.cc
@@ -467,6 +468,7 @@ if (NOT APPLE)
   # We disable this test when running on Apple platform as it does not support cgroups.
   ADD_YB_TEST(tserver_cgroup_manager-test)
 endif()
+ADD_YB_TEST(tserver_lanes-test)
 ADD_YB_TEST(header_manager_impl-test)
 ADD_YB_TEST(backup_service-test)
 ADD_YB_TEST(clone_operation-test)

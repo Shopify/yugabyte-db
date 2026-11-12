@@ -109,6 +109,12 @@ class ConnectionContextFactory {
     return buffer_tracker_;
   }
 
+  // Whether inbound connections of this factory accept a lane preamble (rpc/lane_preamble.h):
+  // the acceptor of a laned messenger peeks for it, and the stream drops one the acceptor did not
+  // consume. True for the YB RPC protocol only, whose senders may write one; other protocols, such
+  // as CQL and Redis, see every byte their clients send.
+  virtual bool AcceptsLanePreamble() const { return false; }
+
  protected:
   ~ConnectionContextFactory();
 
@@ -130,8 +136,23 @@ class ConnectionContextFactoryImpl : public ConnectionContextFactory {
     return std::make_unique<ContextType>(receive_buffer_size, buffer_tracker_, call_tracker_);
   }
 
+  bool AcceptsLanePreamble() const override {
+    if constexpr (requires { ContextType::kAcceptsLanePreamble; }) {
+      return ContextType::kAcceptsLanePreamble;
+    } else {
+      return false;
+    }
+  }
+
   virtual ~ConnectionContextFactoryImpl() {}
 };
+
+// Lane-batches (MemTracker::EnableLaneBatching) the read buffer and call memory trackers of the
+// messengers whose connection context factories use parent, with their subtrees (per-messenger
+// trackers and the buffer, parser, sending and outbound queueing trackers below them, including
+// those created later): every lane's reactors and handlers update them per call. No-op while lane
+// mode is off.
+void EnableLaneBatchingForRpcMemTrackers(const std::shared_ptr<MemTracker>& parent);
 
 template <class ContextType, class... Args>
 std::shared_ptr<ConnectionContextFactory> CreateConnectionContextFactory(Args&&... args) {

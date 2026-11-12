@@ -113,6 +113,7 @@
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/tier_migration_reconciler.h"
 #include "yb/tserver/tserver_cgroup_manager.h"
+#include "yb/tserver/tserver_lanes.h"
 #include "yb/tserver/tablet_validator.h"
 #include "yb/tserver/tserver.pb.h"
 #include "yb/tserver/tserver_admin.pb.h"
@@ -733,6 +734,74 @@ TSTabletManager::TSTabletManager(FsManager* fs_manager,
 TSTabletManager::~TSTabletManager() {
 }
 
+Status TSTabletManager::BuildLanePipelinePools() {
+  const auto& topology = GetLaneTopology();
+  if (!topology.active()) {
+    return Status::OK();
+  }
+  lane_pipeline_pools_.resize(topology.num_lanes());
+  for (size_t index = 0; index != lane_pipeline_pools_.size(); ++index) {
+    const auto lane = static_cast<LaneId>(index);
+    auto& pools = lane_pipeline_pools_[index];
+    // Linux shows the first 15 characters of a thread name, so worker names start with the lane.
+    const auto lane_name = Format("L$0", ZeroPadded(lane, 3));
+    // Same limits as the unlaned set: these tasks block on IO.
+    auto build = [lane, &lane_name](
+        const char* name, const char* short_name, std::unique_ptr<ThreadPool>* pool) {
+      return ThreadPoolBuilder(Format("$0_$1", name, lane_name))
+          .set_min_threads(1)
+          .unlimited_threads()
+          .set_lane(lane)
+          .set_crossing_category(LaneCrossingCategory::kTabletPipeline)
+          .set_worker_name_prefix(Format("$0_$1", lane_name, short_name))
+          .Build(pool);
+    };
+    RETURN_NOT_OK(build("consensus", "raft", &pools.raft));
+    RETURN_NOT_OK(build("log-sync", "logsync", &pools.log_sync));
+    RETURN_NOT_OK(build("prepare", "prepare", &pools.prepare));
+    RETURN_NOT_OK(build("append", "append", &pools.append));
+    RETURN_NOT_OK(build("log-alloc", "logalloc", &pools.log_alloc));
+    pools.raft_notifications = std::make_unique<rpc::ThreadPool>(rpc::ThreadPoolOptions {
+      .name = Format("raft_notifications_$0", lane_name),
+      .max_workers = rpc::ThreadPoolOptions::kUnlimitedWorkers,
+      .lane = lane,
+      .crossing_category = LaneCrossingCategory::kTabletPipeline,
+      .worker_name_prefix = lane_name + "_notif",
+    });
+  }
+  return Status::OK();
+}
+
+TSTabletManager::PipelinePools TSTabletManager::pipeline_pools(LaneId lane) const {
+  if (lane == kNoLane || lane_pipeline_pools_.empty()) {
+    return PipelinePools {
+      .prepare = tablet_prepare_pool_.get(),
+      .append = append_pool_.get(),
+      .raft = raft_pool_.get(),
+      .raft_notifications = raft_notifications_pool_.get(),
+      .log_sync = log_sync_pool_.get(),
+      .log_alloc = allocation_pool_.get(),
+    };
+  }
+  const auto& pools = lane_pipeline_pools_[lane % lane_pipeline_pools_.size()];
+  return PipelinePools {
+    .prepare = pools.prepare.get(),
+    .append = pools.append.get(),
+    .raft = pools.raft.get(),
+    .raft_notifications = pools.raft_notifications.get(),
+    .log_sync = pools.log_sync.get(),
+    .log_alloc = pools.log_alloc.get(),
+  };
+}
+
+void TSTabletManager::ForEachPipelinePools(
+    const std::function<void(const PipelinePools&)>& f) const {
+  f(pipeline_pools(kNoLane));
+  for (size_t lane = 0; lane != lane_pipeline_pools_.size(); ++lane) {
+    f(pipeline_pools(static_cast<LaneId>(lane)));
+  }
+}
+
 Status TSTabletManager::Init() {
   CHECK_EQ(state(), MANAGER_INITIALIZING);
 
@@ -805,6 +874,9 @@ Status TSTabletManager::Init() {
                     .set_metrics(std::move(bootstrap_metrics))
                     .Build(&open_tablet_pool_));
 
+  // The constructor runs before the lane topology is installed, so lane pools are built here.
+  RETURN_NOT_OK(BuildLanePipelinePools());
+
 #ifdef __linux__
   if (auto* cm = server_->cgroup_manager()) {
     auto* sys_high = cm->SystemHighCgroup();
@@ -815,12 +887,14 @@ Status TSTabletManager::Init() {
 
     if (consensus_system_mode) {
       // system-high: consensus, WAL, Raft coordination.
-      raft_pool_->SetCgroup(sys_high);
-      raft_notifications_pool_->SetCgroup(sys_high);
-      log_sync_pool_->SetCgroup(sys_high);
-      append_pool_->SetCgroup(sys_high);
-      allocation_pool_->SetCgroup(sys_high);
-      tablet_prepare_pool_->SetCgroup(sys_high);
+      ForEachPipelinePools([sys_high](const PipelinePools& pools) {
+        pools.raft->SetCgroup(sys_high);
+        pools.raft_notifications->SetCgroup(sys_high);
+        pools.log_sync->SetCgroup(sys_high);
+        pools.append->SetCgroup(sys_high);
+        pools.log_alloc->SetCgroup(sys_high);
+        pools.prepare->SetCgroup(sys_high);
+      });
       apply_pool_->SetCgroup(sys_high);
     }
     // In per_db mode, pool-level cgroups are not set; per-task cgroup switching
@@ -2280,6 +2354,8 @@ Result<TabletPeerPtr> TSTabletManager::CreateAndRegisterTabletPeer(
       this,
       persistence_gate_.get(),
       server_->client_future()));
+  // Every open path (startup, new and split tablets, remote bootstrap) creates its peer here.
+  tablet_peer->SetLane(TserverTabletLane(tablet_id));
   std::lock_guard lock(mutex_);
   RETURN_NOT_OK(RegisterTabletUnlocked(tablet_id, tablet_peer, mode));
   if (mark_dirty_after_register) {
@@ -2601,6 +2677,9 @@ void TSTabletManager::OpenTablet(
   LOG(INFO) << kLogPrefix << "Bootstrapping tablet";
   TRACE("Bootstrapping tablet");
 
+  const auto lane = tablet_peer->lane();
+  const auto pipeline = pipeline_pools(lane);
+
   std::unique_ptr<ConsensusMetadata> cmeta;
   auto s = ConsensusMetadata::Load(
       meta->fs_manager(), tablet_id, meta->fs_manager()->uuid(), &cmeta);
@@ -2736,7 +2815,8 @@ void TSTabletManager::OpenTablet(
         .wait_queue_cgroup = wait_queue_cgroup,
         .full_compaction_pool = full_compaction_pool(),
         .admin_triggered_compaction_pool = admin_triggered_compaction_pool(),
-        .intent_cleanup_pool = raft_pool(),
+        .intent_cleanup_pool = pipeline.raft,
+        .rocksdb_task_lane = TserverBackgroundTaskLane(lane),
         .post_split_compaction_added = ts_post_split_compaction_added_,
         .tier_migration_hooks = tier_migration_reconciler_->tablet_hooks(),
         .metadata_cache = metadata_cache,
@@ -2758,9 +2838,9 @@ void TSTabletManager::OpenTablet(
     tablet::BootstrapTabletData data = {
       .tablet_init_data = tablet_init_data,
       .listener = tablet_peer->status_listener(),
-      .append_pool = append_pool(),
-      .allocation_pool = allocation_pool_.get(),
-      .log_sync_pool = log_sync_pool(),
+      .append_pool = pipeline.append,
+      .allocation_pool = pipeline.log_alloc,
+      .log_sync_pool = pipeline.log_sync,
       .retryable_requests = &retryable_requests,
       .bootstrap_state_manager = bootstrap_state_manager.get(),
       .bootstrap_retryable_requests = bootstrap_retryable_requests,
@@ -2796,7 +2876,7 @@ void TSTabletManager::OpenTablet(
   DeleteStartupUnlistedVectorIndexStorages(*meta);
 
   auto pool_tag = PoolTagForTablet(tablet);
-  auto service_thread_pool = server_->messenger()->TaggedThreadPool(pool_tag);
+  auto service_thread_pool = server_->messenger()->TaggedThreadPool(pool_tag, lane);
   if (!service_thread_pool.ok()) {
     LOG(ERROR) << kLogPrefix << "Failed to get service thread pool for tag " << pool_tag
                << ": " << service_thread_pool.status();
@@ -2815,10 +2895,10 @@ void TSTabletManager::OpenTablet(
         log,
         tablet->GetTableMetricsEntity(),
         tablet->GetTabletMetricsEntity(),
-        raft_pool(),
+        pipeline.raft,
         snapshot_cleanup_pool(),
-        raft_notifications_pool(),
-        tablet_prepare_pool(),
+        pipeline.raft_notifications,
+        pipeline.prepare,
         &retryable_requests,
         bootstrap_state_manager,
         std::move(cmeta),
@@ -3094,21 +3174,19 @@ void TSTabletManager::CompleteShutdown() {
   if (sst_stats_resync_pool_) {
     sst_stats_resync_pool_->Shutdown();
   }
-  if (raft_pool_) {
-    raft_pool_->Shutdown();
-  }
-  if (log_sync_pool_) {
-    log_sync_pool_->Shutdown();
-  }
+  // Same order for the unlaned set and every lane's set. Notification and allocation pools are
+  // released by the destructor.
+  ForEachPipelinePools([](const PipelinePools& pools) {
+    pools.raft->Shutdown();
+    pools.log_sync->Shutdown();
+  });
   if (flush_bootstrap_state_pool_) {
     flush_bootstrap_state_pool_->Shutdown();
   }
-  if (tablet_prepare_pool_) {
-    tablet_prepare_pool_->Shutdown();
-  }
-  if (append_pool_) {
-    append_pool_->Shutdown();
-  }
+  ForEachPipelinePools([](const PipelinePools& pools) {
+    pools.prepare->Shutdown();
+    pools.append->Shutdown();
+  });
   if (admin_triggered_compaction_pool_) {
     admin_triggered_compaction_pool_->Shutdown();
   }

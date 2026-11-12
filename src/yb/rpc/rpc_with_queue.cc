@@ -111,8 +111,11 @@ void ConnectionContextWithQueue::CallProcessed(InboundCall* call) {
 Status ConnectionContextWithQueue::QueueResponse(const ConnectionPtr& conn, InboundCallPtr call) {
   QueueableInboundCall* queueable_call = down_cast<QueueableInboundCall*>(call.get());
   queueable_call->SetHasReply();
+  // Replies are flushed in batches; count each one as a handoff to the reactor.
+  auto* reactor = conn->reactor();
+  reactor->CountLaneHandoff();
   if (queueable_call == first_without_reply_.load(std::memory_order_acquire)) {
-    return conn->reactor()->ScheduleReactorTask(flush_outbound_queue_task_);
+    return reactor->ScheduleDrainTask(flush_outbound_queue_task_);
   }
   return Status::OK();
 }

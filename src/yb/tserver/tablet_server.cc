@@ -101,6 +101,7 @@
 #include "yb/tserver/tserver-path-handlers.h"
 #include "yb/tserver/tserver_auto_flags_manager.h"
 #include "yb/tserver/tserver_cgroup_manager.h"
+#include "yb/tserver/tserver_lanes.h"
 #include "yb/tserver/tserver_service.proxy.h"
 #include "yb/tserver/tserver_shared_mem.h"
 #include "yb/tserver/tserver_types.pb.h"
@@ -659,6 +660,14 @@ Status TabletServer::Init() {
   // be allowed to start the TS and the master in whichever order --
   // our heartbeat thread will loop until successfully connecting.
   RETURN_NOT_OK(ValidateMasterAddressResolution());
+
+  // The lane topology must exist before anything laid out per lane is built: the messenger
+  // (SetupMessengerBuilder runs inside DbServerBase::Init) and the tablet manager's pools
+  // (TSTabletManager::Init). Not in the constructor: TSTabletManager is constructed in its
+  // initializer list and must not see a topology there.
+  InitTserverLaneTopology();
+  RegisterTserverLaneMetrics(metric_entity());
+  EnableTserverLaneMemTrackerBatching(mem_tracker());
 
 #ifdef __linux__
   if (cgroup_manager_) {
@@ -2574,6 +2583,7 @@ void TabletServer::InvalidatePgTableCache(
 }
 Status TabletServer::SetupMessengerBuilder(rpc::MessengerBuilder* builder) {
   RETURN_NOT_OK(DbServerBase::SetupMessengerBuilder(builder));
+  SetupTserverLaneMessenger(builder);
 
 #ifdef __linux__
   builder->SetThreadPoolCgroupProvider([this](auto tag) { return PerDbCgroupProvider(tag); });
@@ -3185,6 +3195,13 @@ HybridTime TabletServer::GetClusterYsqlDbOldestPinnedReadTime(PgOid db_oid) cons
 
 Result<std::string> TabletServer::GetUniverseUuid() const {
   return fs_manager_->GetUniverseUuidFromTserverInstanceMetadata();
+}
+
+void TabletServer::VisitPgClientService(
+    const std::function<void(const PgClientServiceImpl&)>& f) {
+  if (auto holder = pg_client_service_.lock()) {
+    f(holder->impl);
+  }
 }
 
 PgClientServiceImpl* TabletServer::TEST_GetPgClientService() {

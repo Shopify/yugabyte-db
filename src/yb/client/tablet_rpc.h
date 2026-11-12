@@ -38,6 +38,7 @@
 
 #include "yb/util/atomic.h"
 #include "yb/util/flags.h"
+#include "yb/util/lanes.h"
 #include "yb/util/net/net_fwd.h"
 #include "yb/util/pb_util.h"
 #include "yb/util/status_fwd.h"
@@ -146,7 +147,16 @@ class TabletInvoker {
 
   virtual ~TabletInvoker();
 
+  // When the client's messenger is laned, every send carries the tablet's lane as the
+  // controller's lane hint (none for the master's sys catalog tablet) and pins the controller's
+  // issuing lane, so callbacks run in the lane that started the command even when the send
+  // follows an asynchronous lookup completed on another lane's thread.
   void Execute(TabletIdView tablet_id, bool leader_only = false);
+
+  // Lane that started the command; the lane of the constructing thread by default. Set by owners
+  // constructed off the thread that started the command (e.g. a Batcher's RPCs, created after its
+  // tablet lookups). No effect unless the client's messenger is laned.
+  void set_issuing_lane(LaneId lane) { issuing_lane_ = lane; }
 
   // Clear per-tablet state so the next Execute can target a different tablet.
   void Reset();
@@ -176,6 +186,8 @@ class TabletInvoker {
   FRIEND_TEST(TabletRpcTest, TabletInvokerSelectTabletServerRace);
 
   void SelectTabletServer();
+
+  void UpdateTabletLane();
 
   // This is an implementation of ReadRpc with consistency level as CONSISTENT_PREFIX. As a result,
   // there is no requirement that the read needs to hit the leader.
@@ -234,6 +246,14 @@ class TabletInvoker {
   RemoteTabletPtr tablet_;
 
   std::string tablet_id_;
+
+  // Whether client_'s messenger is laned; lane hints are sent only then.
+  const bool laned_;
+
+  // Lane hint for tablet_id_, kNoLane when not laned or for the sys catalog tablet.
+  LaneId tablet_lane_ = kNoLane;
+
+  LaneId issuing_lane_;
 
   const std::shared_ptr<const YBTable> table_;
 

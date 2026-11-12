@@ -502,7 +502,7 @@ class TransactionManager::Impl {
   }
 
   rpc::Rpcs& rpcs() {
-    return rpcs_;
+    return rpcs_.Local();
   }
 
   HybridTime Now() const {
@@ -591,7 +591,8 @@ class TransactionManager::Impl {
   yb::rpc::ThreadPool thread_pool_; // TODO async operations instead of pool
   yb::rpc::TasksPool<LoadStatusTabletsTask> tasks_pool_;
   yb::rpc::TasksPool<InvokeCallbackTask> invoke_callback_tasks_;
-  yb::rpc::Rpcs rpcs_;
+  // Heartbeat, commit and abort rpcs of every transaction, one registry per lane.
+  yb::rpc::LaneShardedRpcs rpcs_;
 
   // These are incremented by YBTransaction, but we keep them here so that the counters are not
   // deleted/recreated after a period of idleness.

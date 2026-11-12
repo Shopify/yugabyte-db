@@ -314,6 +314,7 @@ void Batcher::FlushAsync(
 
   CHECK_EQ(state_, BatcherState::kGatheringOps);
   state_ = BatcherState::kResolvingTablets;
+  issuing_lane_ = ThisThreadLane();
 
   const auto operations_count = ops_.size();
   outstanding_lookups_ = operations_count;

@@ -22,6 +22,9 @@
 
 #include "yb/common/wire_protocol.h"
 
+#include "yb/master/sys_catalog_constants.h"
+
+#include "yb/rpc/messenger.h"
 #include "yb/rpc/network_error.h"
 #include "yb/rpc/rpc_controller.h"
 #include "yb/rpc/rpc_header.pb.h"
@@ -89,6 +92,9 @@ TabletInvoker::TabletInvoker(const bool local_tserver_only,
         rpc_(rpc),
         tablet_(tablet),
         tablet_id_(tablet != nullptr ? tablet->tablet_id() : std::string()),
+        laned_(client != nullptr && client->messenger() != nullptr &&
+               client->messenger()->laned()),
+        issuing_lane_(laned_ ? ThisThreadLane() : kNoLane),
         table_(table),
         retrier_(retrier),
         trace_(trace),
@@ -96,9 +102,18 @@ TabletInvoker::TabletInvoker(const bool local_tserver_only,
         include_deleted_(include_deleted),
         local_tserver_only_(local_tserver_only),
         consistent_prefix_(consistent_prefix),
-        fail_on_not_found_(fail_on_not_found) {}
+        fail_on_not_found_(fail_on_not_found) {
+  UpdateTabletLane();
+}
 
 TabletInvoker::~TabletInvoker() {}
+
+void TabletInvoker::UpdateTabletLane() {
+  // Lane hints are for tablet servers of this universe; the sys catalog tablet is on the masters.
+  tablet_lane_ = laned_ && !tablet_id_.empty() && tablet_id_ != master::kSysCatalogTabletId
+      ? LaneOf(tablet_id_, client_->messenger()->num_lanes())
+      : kNoLane;
+}
 
 void TabletInvoker::SelectTabletServerWithConsistentPrefix() {
   TRACE_TO(trace_, "SelectTabletServerWithConsistentPrefix()");
@@ -197,6 +212,7 @@ void TabletInvoker::Execute(TabletIdView tablet_id, bool leader_only) {
     } else {
       tablet_id_ = CHECK_NOTNULL(tablet_.get())->tablet_id();
     }
+    UpdateTabletLane();
   }
 
   // Neither tablet lookups nor tablet RPCs can make progress once the client is shutting down, so
@@ -306,6 +322,13 @@ void TabletInvoker::Execute(TabletIdView tablet_id, bool leader_only) {
           << current_ts_->ToString();
   int64_t opid_index = client_->GetRaftConfigOpidIndex(tablet_id_);
   rpc_->SetRequestRaftConfigOpidIndex(opid_index);
+
+  if (laned_) {
+    // Set per send: RpcController::Reset() before a retry clears the hint.
+    auto* controller = retrier_->mutable_controller();
+    controller->set_lane(tablet_lane_);
+    controller->set_issuing_lane(issuing_lane_);
+  }
 
   // Keep a refon trace, since it is possible that we receive reply before returning from async rpc,
   // destroying us.

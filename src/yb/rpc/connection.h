@@ -58,6 +58,7 @@
 
 #include "yb/gutil/ref_counted.h"
 
+#include "yb/rpc/connection_id.h"
 #include "yb/rpc/rpc_fwd.h"
 #include "yb/rpc/stream.h"
 #include "yb/rpc/reactor_thread_role.h"
@@ -163,6 +164,11 @@ class Connection final : public StreamContext, public std::enable_shared_from_th
   void QueueDumpConnectionState(int32_t call_id, const void* call_ptr) const;
 
   Direction direction() const { return direction_; }
+
+  // Key under which a client connection is registered in its reactor; set once by the reactor
+  // before the connection is registered.
+  const ConnectionId& client_id() const ON_REACTOR_THREAD { return client_id_; }
+  void set_client_id(const ConnectionId& id) ON_REACTOR_THREAD { client_id_ = id; }
 
   // Queue a call response back to the client on the server side.
   //
@@ -272,6 +278,8 @@ class Connection final : public StreamContext, public std::enable_shared_from_th
 
   // Whether we are client or server.
   const Direction direction_;
+
+  ConnectionId client_id_ GUARDED_BY_REACTOR_THREAD;
 
   // RPC related metrics.
   RpcMetrics& rpc_metrics_;

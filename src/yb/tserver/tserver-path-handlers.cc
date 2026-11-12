@@ -33,6 +33,7 @@
 #include "yb/tserver/tserver-path-handlers.h"
 
 #include <algorithm>
+#include <array>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -64,6 +65,10 @@
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/util/options_parser.h"
 
+#include "yb/rpc/messenger.h"
+#include "yb/rpc/reactor.h"
+#include "yb/rpc/service_pool.h"
+
 #include "yb/server/webui_util.h"
 
 #include "yb/tablet/maintenance_manager.h"
@@ -74,11 +79,13 @@
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/transaction_participant.h"
 
+#include "yb/tserver/pg_client_service.h"
 #include "yb/tserver/service_util.h"
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/ts_local_lock_manager.h"
 #include "yb/tserver/ts_tablet_manager.h"
 #include "yb/tserver/tserver_cgroup_manager.h"
+#include "yb/tserver/tserver_lanes.h"
 #include "yb/tserver/xcluster_consumer_if.h"
 #include "yb/tserver/xcluster_poller_stats.h"
 
@@ -86,6 +93,8 @@
 #include "yb/util/format.h"
 #include "yb/util/html_print_helper.h"
 #include "yb/util/jsonwriter.h"
+#include "yb/util/lanes.h"
+#include "yb/util/metrics.h"
 #include "yb/util/monotime.h"
 #include "yb/util/prometheus_metric_filter.h"
 #include "yb/util/stol_utils.h"
@@ -117,6 +126,11 @@ DEFINE_UNKNOWN_bool(enable_intentsdb_page, false,
 
 DECLARE_bool(enable_xcluster_stat_collection);
 DECLARE_bool(enable_active_table_metrics_filtering);
+
+METRIC_DECLARE_counter(rpc_lane_preamble_absent);
+METRIC_DECLARE_counter(rpc_lane_preamble_bound);
+METRIC_DECLARE_counter(rpc_lane_preamble_peek_timeouts);
+METRIC_DECLARE_counter(rpc_lane_preamble_stripped_late);
 
 namespace {
 
@@ -875,6 +889,10 @@ Status TabletServerPathHandlers::Register(Webserver* server) {
       "/xcluster", "xCluster",
       std::bind(&TabletServerPathHandlers::HandleXClusterPage, this, _1, _2), true /* styled */,
       false /* is_on_nav_bar */);
+  server->RegisterPathHandler(
+      "/lanes", "CPU lanes",
+      std::bind(&TabletServerPathHandlers::HandleLanesPage, this, _1, _2), true /* styled */,
+      false /* is_on_nav_bar */);
 
   // APIS.
   server->RegisterPathHandler(
@@ -900,6 +918,10 @@ Status TabletServerPathHandlers::Register(Webserver* server) {
   server->RegisterPathHandler(
       "/api/v1/xcluster", "xcluster",
       std::bind(&TabletServerPathHandlers::HandleXClusterJSON, this, _1, _2), false /* styled */,
+      false /* is_on_nav_bar */);
+  server->RegisterPathHandler(
+      "/api/v1/lanes", "CPU lanes",
+      std::bind(&TabletServerPathHandlers::HandleLanesJSON, this, _1, _2), false /* styled */,
       false /* is_on_nav_bar */);
   return Status::OK();
 }
@@ -1868,6 +1890,368 @@ void TabletServerPathHandlers::HandleTabletMetaCacheJSON(
   std::stringstream* output = &resp->output;
   JsonWriter writer(output, JsonWriter::COMPACT);
   tserver_->WriteServerMetaCacheAsJson(&writer);
+}
+
+namespace {
+
+// JSON keys and column labels of the crossing categories: the lane_crossings_<key> metric suffixes.
+constexpr std::array<std::pair<LaneCrossingCategory, const char*>, kLaneCrossingCategoryMapSize>
+    kLaneCrossingKeys = {{
+  {LaneCrossingCategory::kReactor, "reactor"},
+  {LaneCrossingCategory::kRpcHandler, "rpc_handler"},
+  {LaneCrossingCategory::kTabletPipeline, "tablet_pipeline"},
+  {LaneCrossingCategory::kCallback, "callback"},
+  {LaneCrossingCategory::kOther, "other"},
+}};
+
+constexpr const char* kEntriesFromUnlanedKey = "entries_from_unlaned";
+
+struct LaneCrossingCounts {
+  std::array<uint64_t, kLaneCrossingCategoryMapSize> crossings = {};
+  uint64_t entries_from_unlaned = 0;
+};
+
+struct LaneStatusRow {
+  size_t tablet_replicas = 0;
+  size_t tablet_leaders = 0;
+  size_t pg_sessions = 0;
+  size_t reactors = 0;
+  size_t client_connections = 0;
+  size_t server_connections = 0;
+  size_t handler_threads = 0;
+  size_t pipeline_threads = 0;
+  size_t exchange_threads = 0;
+  int64_t queued_calls = 0;
+  LaneCrossingCounts crossings_counted;
+};
+
+struct LanesStatus {
+  bool active = false;
+  std::string topology;
+  // The rest, except preamble, only when active.
+  size_t num_lanes = 0;
+  bool cpu_affinity = false;
+  std::string service_cpus;
+  std::string process_cpus;
+  std::vector<std::string> domains;
+  std::vector<std::string> lane_cpus;
+  std::vector<LaneStatusRow> lanes;
+  // Tablets without a lane, the unlaned handler and pipeline pools, and calls queued without a
+  // lane.
+  LaneStatusRow unlaned;
+  LaneCrossingCounts crossings;
+  int64_t service_queue_lanes_over_share = 0;
+  // Lane preamble counters this server has instantiated, by key.
+  std::vector<std::pair<const char*, int64_t>> preamble;
+};
+
+// Reads lane state without creating anything: existing pools only, counters, and one task per
+// reactor for its connection counts.
+LanesStatus CollectLanesStatus(TabletServer* tserver) {
+  LanesStatus result;
+  const auto& topology = GetLaneTopology();
+  result.active = topology.active();
+  auto summary = GetTserverLaneTopologySummary();
+  if (summary.active == result.active && !summary.description.empty()) {
+    result.topology = std::move(summary.description);
+  } else {
+    result.topology = result.active ? Format("lanes active: $0", topology) : "lanes inactive";
+  }
+
+  for (auto [prototype, key] : {
+           std::pair(&METRIC_rpc_lane_preamble_bound, "bound"),
+           std::pair(&METRIC_rpc_lane_preamble_absent, "absent"),
+           std::pair(&METRIC_rpc_lane_preamble_peek_timeouts, "peek_timeouts"),
+           std::pair(&METRIC_rpc_lane_preamble_stripped_late, "stripped_late")}) {
+    if (auto counter = tserver->metric_entity()->FindOrNull<Counter>(*prototype)) {
+      result.preamble.emplace_back(key, counter->value());
+    }
+  }
+
+  if (!result.active) {
+    return result;
+  }
+
+  const auto num_lanes = topology.num_lanes();
+  result.num_lanes = num_lanes;
+  result.cpu_affinity = topology.affinity_enabled();
+  result.service_cpus = topology.service_mask().ToString();
+  result.process_cpus = topology.full_process_cpuset().ToString();
+  for (const auto& domain : topology.domains()) {
+    result.domains.push_back(domain.ToString());
+  }
+  result.lanes.resize(num_lanes);
+  for (size_t lane = 0; lane != num_lanes; ++lane) {
+    result.lane_cpus.push_back(topology.lane_mask(static_cast<LaneId>(lane)).ToString());
+  }
+  // Lane values from elsewhere are reduced modulo the lane count; kNoLane is the unlaned row.
+  auto row = [&result, num_lanes](LaneId lane) -> LaneStatusRow& {
+    return lane == kNoLane ? result.unlaned : result.lanes[lane % num_lanes];
+  };
+
+  for (const auto& peer : tserver->tablet_manager()->GetTabletPeers()) {
+    auto& counts = row(peer->lane());
+    ++counts.tablet_replicas;
+    counts.tablet_leaders += peer->IsLeaderAndReady();
+  }
+
+  tserver->VisitPgClientService([&result](const PgClientServiceImpl& service) {
+    auto counts = service.GetLaneCounts();
+    for (size_t lane = 0; lane != std::min(counts.sessions.size(), result.lanes.size()); ++lane) {
+      result.lanes[lane].pg_sessions = counts.sessions[lane];
+    }
+    for (size_t lane = 0; lane != std::min(counts.exchange_workers.size(), result.lanes.size());
+         ++lane) {
+      result.lanes[lane].exchange_threads = counts.exchange_workers[lane];
+    }
+  });
+
+  auto* messenger = tserver->messenger();
+  messenger->ForEachHandlerPool(kNoLane, [&result](const rpc::ThreadPool& pool) {
+    result.unlaned.handler_threads += pool.NumWorkers();
+  });
+  for (size_t lane = 0; lane != (messenger->laned() ? num_lanes : 0); ++lane) {
+    auto& counts = result.lanes[lane];
+    messenger->ForEachHandlerPool(
+        static_cast<LaneId>(lane), [&counts](const rpc::ThreadPool& pool) {
+          counts.handler_threads += pool.NumWorkers();
+        });
+    for (const auto& reactor : messenger->ReactorsOfLane(static_cast<LaneId>(lane))) {
+      ++counts.reactors;
+      rpc::ReactorMetrics metrics;
+      if (reactor->GetMetrics(&metrics).ok()) {
+        counts.client_connections += metrics.num_client_connections;
+        counts.server_connections += metrics.num_server_connections;
+      }
+    }
+  }
+
+  // The unlaned set first, then each lane's in lane order.
+  size_t pipeline_set = 0;
+  tserver->tablet_manager()->ForEachPipelinePools(
+      [&result, &row, &pipeline_set](const TSTabletManager::PipelinePools& pools) {
+    auto& counts = pipeline_set == 0 ? result.unlaned : row(static_cast<LaneId>(pipeline_set - 1));
+    ++pipeline_set;
+    for (auto* pool : {pools.prepare, pools.append, pools.raft, pools.log_sync, pools.log_alloc}) {
+      counts.pipeline_threads += pool->NumWorkers();
+    }
+    counts.pipeline_threads += pools.raft_notifications->NumWorkers();
+  });
+
+  messenger->ForEachService([&result](const rpc::RpcService& service) {
+    auto* pool = dynamic_cast<const rpc::ServicePool*>(&service);
+    if (!pool) {
+      return;
+    }
+    // A laned pool's slots are its messenger's lanes, then the slot of calls without a lane.
+    auto slots = pool->LaneQueuedCalls();
+    for (size_t slot = 0; slot < slots.size(); ++slot) {
+      auto& counts = slot + 1 == slots.size() || slot >= result.lanes.size()
+          ? result.unlaned : result.lanes[slot];
+      counts.queued_calls += slots[slot];
+    }
+    result.service_queue_lanes_over_share += pool->LanesOverShare();
+  });
+
+  for (size_t index = 0; index != kLaneCrossingKeys.size(); ++index) {
+    const auto category = kLaneCrossingKeys[index].first;
+    result.crossings.crossings[index] = LaneCrossingCount(category);
+    for (size_t lane = 0; lane != num_lanes; ++lane) {
+      result.lanes[lane].crossings_counted.crossings[index] =
+          LaneCrossingCountOfLane(category, static_cast<LaneId>(lane));
+    }
+  }
+  result.crossings.entries_from_unlaned = LaneEntriesFromUnlanedCount();
+  for (size_t lane = 0; lane != num_lanes; ++lane) {
+    result.lanes[lane].crossings_counted.entries_from_unlaned =
+        LaneEntriesFromUnlanedCountOfLane(static_cast<LaneId>(lane));
+  }
+  return result;
+}
+
+void WriteCrossingsJson(const LaneCrossingCounts& counts, JsonWriter* jw) {
+  jw->StartObject();
+  for (size_t index = 0; index != kLaneCrossingKeys.size(); ++index) {
+    jw->String(kLaneCrossingKeys[index].second);
+    jw->Uint64(counts.crossings[index]);
+  }
+  jw->String(kEntriesFromUnlanedKey);
+  jw->Uint64(counts.entries_from_unlaned);
+  jw->EndObject();
+}
+
+void WriteLaneRowJson(const LaneStatusRow& row, JsonWriter* jw) {
+  for (auto [key, value] : {
+           std::pair("tablet_replicas", row.tablet_replicas),
+           std::pair("tablet_leaders", row.tablet_leaders),
+           std::pair("pg_sessions", row.pg_sessions),
+           std::pair("reactors", row.reactors),
+           std::pair("client_connections", row.client_connections),
+           std::pair("server_connections", row.server_connections),
+           std::pair("handler_threads", row.handler_threads),
+           std::pair("pipeline_threads", row.pipeline_threads),
+           std::pair("exchange_threads", row.exchange_threads)}) {
+    jw->String(key);
+    jw->Uint64(value);
+  }
+  jw->String("queued_calls");
+  jw->Int64(row.queued_calls);
+}
+
+void LaneRowCells(const LaneStatusRow& row, std::stringstream* output) {
+  for (auto value : {row.tablet_replicas, row.tablet_leaders, row.pg_sessions, row.reactors,
+                     row.client_connections, row.server_connections, row.handler_threads,
+                     row.pipeline_threads, row.exchange_threads}) {
+    *output << "<td>" << value << "</td>";
+  }
+  *output << "<td>" << row.queued_calls << "</td>";
+}
+
+void CrossingCells(const LaneCrossingCounts& counts, std::stringstream* output) {
+  for (auto value : counts.crossings) {
+    *output << "<td>" << value << "</td>";
+  }
+  *output << "<td>" << counts.entries_from_unlaned << "</td>";
+}
+
+void PreambleHtml(const LanesStatus& status, std::stringstream* output) {
+  *output << "<h3>Lane preamble</h3>\n";
+  if (status.preamble.empty()) {
+    *output << "<p>No lane preamble counters: this server has neither peeked for nor dropped a "
+               "lane preamble.</p>\n";
+    return;
+  }
+  *output << "<table class='table table-striped'>\n<tr><th>Counter</th><th>Value</th></tr>\n";
+  for (const auto& [key, value] : status.preamble) {
+    *output << "<tr><td>rpc_lane_preamble_" << key << "</td><td>" << value << "</td></tr>\n";
+  }
+  *output << "</table>\n";
+}
+
+} // namespace
+
+void TabletServerPathHandlers::HandleLanesPage(
+    const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
+  auto* output = &resp->output;
+  const auto status = CollectLanesStatus(tserver_);
+  *output << "<h2>CPU lanes</h2>\n";
+  *output << "<p>Lane mode is " << (status.active ? "active" : "inactive") << ": "
+          << EscapeForHtmlToString(status.topology) << "</p>\n";
+  if (!status.active) {
+    PreambleHtml(status, output);
+    return;
+  }
+
+  *output << "<h3>Topology</h3>\n<table class='table table-striped'>\n";
+  std::string domains;
+  for (const auto& domain : status.domains) {
+    domains += Format("$0[$1]", domains.empty() ? "" : " ", domain);
+  }
+  for (auto [label, value] : {
+           std::pair("Lanes", std::to_string(status.num_lanes)),
+           std::pair("CPU affinity", std::string(status.cpu_affinity ? "on" : "off")),
+           std::pair("Service CPUs", status.service_cpus),
+           std::pair("Process CPUs", status.process_cpus),
+           std::pair("CPU domains", domains)}) {
+    *output << "<tr><td>" << label << "</td><td>" << value << "</td></tr>\n";
+  }
+  *output << "</table>\n";
+
+  *output << "<h3>Lanes</h3>\n<table class='table table-striped'>\n"
+             "<tr><th>Lane</th><th>CPUs</th><th>Tablet replicas</th><th>Leaders</th>"
+             "<th>PG sessions</th><th>Reactors</th><th>Client connections</th>"
+             "<th>Server connections</th><th>Handler threads</th><th>Pipeline threads</th>"
+             "<th>Exchange threads</th><th>Queued calls</th></tr>\n";
+  for (size_t lane = 0; lane != status.lanes.size(); ++lane) {
+    *output << "<tr><td>" << lane << "</td><td>" << status.lane_cpus[lane] << "</td>";
+    LaneRowCells(status.lanes[lane], output);
+    *output << "</tr>\n";
+  }
+  *output << "<tr><td>unlaned</td><td>" << status.service_cpus << "</td>";
+  LaneRowCells(status.unlaned, output);
+  *output << "</tr>\n</table>\n";
+  *output << "<p>Service queue slots above their share of the queue limit (lane slots above "
+             "ceil(limit / lanes), and the slot of calls without a lane while it holds any): "
+          << status.service_queue_lanes_over_share << "</p>\n";
+
+  *output << "<h3>Lane crossings</h3>\n"
+             "<p>Counts since the process started, for the whole process (tablet servers sharing "
+             "a process show the same counts). A lane's row holds the handoffs counted by its "
+             "threads: by the executing thread for thread pools, strands and task streams, by the "
+             "submitting thread for handoffs to reactors. It is not the number of crossings into "
+             "the lane. Divide the rate of a total by the operation rate to get crossings per "
+             "operation.</p>\n<table class='table table-striped'>\n<tr><th>Counted by</th>";
+  for (const auto& [_, key] : kLaneCrossingKeys) {
+    *output << "<th>" << key << "</th>";
+  }
+  *output << "<th>" << kEntriesFromUnlanedKey << "</th></tr>\n";
+  for (size_t lane = 0; lane != status.lanes.size(); ++lane) {
+    *output << "<tr><td>lane " << lane << "</td>";
+    CrossingCells(status.lanes[lane].crossings_counted, output);
+    *output << "</tr>\n";
+  }
+  *output << "<tr><td>total</td>";
+  CrossingCells(status.crossings, output);
+  *output << "</tr>\n</table>\n";
+
+  PreambleHtml(status, output);
+}
+
+void TabletServerPathHandlers::HandleLanesJSON(
+    const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
+  JsonWriter jw(&resp->output, JsonWriter::COMPACT);
+  const auto status = CollectLanesStatus(tserver_);
+  jw.StartObject();
+  jw.String("lanes_active");
+  jw.Bool(status.active);
+  jw.String("topology");
+  jw.String(status.topology);
+  if (status.active) {
+    jw.String("num_lanes");
+    jw.Uint64(status.num_lanes);
+    jw.String("cpu_affinity");
+    jw.Bool(status.cpu_affinity);
+    jw.String("service_cpus");
+    jw.String(status.service_cpus);
+    jw.String("process_cpus");
+    jw.String(status.process_cpus);
+    jw.String("domains");
+    jw.StartArray();
+    for (const auto& domain : status.domains) {
+      jw.String(domain);
+    }
+    jw.EndArray();
+    jw.String("lanes");
+    jw.StartArray();
+    for (size_t lane = 0; lane != status.lanes.size(); ++lane) {
+      jw.StartObject();
+      jw.String("lane");
+      jw.Uint64(lane);
+      jw.String("cpus");
+      jw.String(status.lane_cpus[lane]);
+      WriteLaneRowJson(status.lanes[lane], &jw);
+      jw.String("crossings_counted");
+      WriteCrossingsJson(status.lanes[lane].crossings_counted, &jw);
+      jw.EndObject();
+    }
+    jw.EndArray();
+    jw.String("unlaned");
+    jw.StartObject();
+    WriteLaneRowJson(status.unlaned, &jw);
+    jw.EndObject();
+    jw.String("crossings");
+    WriteCrossingsJson(status.crossings, &jw);
+    jw.String("service_queue_lanes_over_share");
+    jw.Int64(status.service_queue_lanes_over_share);
+  }
+  jw.String("preamble");
+  jw.StartObject();
+  for (const auto& [key, value] : status.preamble) {
+    jw.String(key);
+    jw.Int64(value);
+  }
+  jw.EndObject();
+  jw.EndObject();
 }
 
 }  // namespace tserver

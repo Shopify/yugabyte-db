@@ -62,6 +62,7 @@
 
 #include "yb/util/atomic.h"
 #include "yb/util/disk_space_checker.h"
+#include "yb/util/lanes.h"
 
 using yb::consensus::StateChangeContext;
 
@@ -427,6 +428,12 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
   // yet.
   const std::string& tablet_id() const override { return tablet_id_; }
 
+  // CPU lane whose pools run this tablet's pipeline, and the lane hint of its Raft RPCs. kNoLane
+  // (the default, and always when lane mode is off) uses the server's unlaned pools and sends no
+  // hint. Set before InitTabletPeer and never changed.
+  LaneId lane() const { return lane_; }
+  void SetLane(LaneId lane) { lane_ = lane; }
+
   // Convenience method to return the permanent_uuid of this peer.
   const std::string& permanent_uuid() const override {
     return permanent_uuid_;
@@ -607,6 +614,8 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
   const RaftGroupMetadataPtr meta_;
 
   const std::string tablet_id_;
+
+  LaneId lane_ = kNoLane;
 
   const consensus::RaftPeerPB local_peer_pb_;
 

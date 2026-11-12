@@ -35,12 +35,13 @@ namespace internal {
 ClientMasterRpcBase::ClientMasterRpcBase(YBClient::Data* client_data, CoarseTimePoint deadline)
     : Rpc(deadline, client_data->messenger_, client_data->proxy_cache_.get()),
       client_data_(DCHECK_NOTNULL(client_data)),
-      retained_self_(client_data->rpcs_.InvalidHandle()),
+      rpcs_(client_data->rpcs_.Local()),
+      retained_self_(rpcs_.InvalidHandle()),
       wait_state_(ash::WaitStateInfo::CurrentWaitState()) {
 }
 
 void ClientMasterRpcBase::SendRpc() {
-  DCHECK(retained_self_ != client_data_->rpcs_.InvalidHandle());
+  DCHECK(retained_self_ != rpcs_.InvalidHandle());
 
   auto deadline = retrier().deadline();
   auto now = CoarseMonoClock::Now();
@@ -96,7 +97,7 @@ void ClientMasterRpcBase::Finished(const Status& status) {
   }
 
   if (client_data_->Closing()) {
-    auto retained_self = client_data_->rpcs_.Unregister(&retained_self_);
+    auto retained_self = rpcs_.Unregister(&retained_self_);
     // Returning here skips the code further down that replaces an OK new_status with resp_status.
     // Make the same replacement now, so ProcessResponse sees what ResponseStatus() reports
     // instead of an OK status; a new_status that already failed is reported unchanged.
@@ -188,7 +189,7 @@ void ClientMasterRpcBase::Finished(const Status& status) {
     }
   }
 
-  auto retained_self = client_data_->rpcs_.Unregister(&retained_self_);
+  auto retained_self = rpcs_.Unregister(&retained_self_);
 
   ProcessResponse(new_status);
 }

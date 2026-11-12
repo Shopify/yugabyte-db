@@ -155,6 +155,11 @@ struct TestServerOptions {
   MessengerOptions messenger_options = kDefaultServerMessengerOptions;
   size_t n_worker_threads = 3;
   Endpoint endpoint;
+  // Lane of the handler pool's workers.
+  LaneId handler_lane = kNoLane;
+  // When set, calls are handled by the messenger's handler pools of this priority, picked by tag
+  // and lane as RpcServer does, instead of the test server's own pool.
+  std::optional<ServicePriority> messenger_pools;
 };
 
 class TestServer {
@@ -179,6 +184,7 @@ class TestServer {
  private:
   std::unique_ptr<Messenger> messenger_;
   ThreadPoolPtr thread_pool_;
+  std::optional<ServicePriority> messenger_pools_;
   scoped_refptr<ServicePool> service_pool_;
   Endpoint bound_endpoint_;
 };

@@ -3094,7 +3094,7 @@ Result<std::unique_ptr<FakeTserver>> StartFakeTserver(
   fake->service = service.get();
   const std::string service_name = service->service_name();
   fake->service_pool = make_scoped_refptr<rpc::ServicePool>(
-      /* max_tasks= */ 50, [pool = fake->thread_pool](auto) { return pool; },
+      /* max_tasks= */ 50, [pool = fake->thread_pool](auto, auto) { return pool; },
       &fake->messenger->scheduler(), std::move(service), fake->messenger->metric_entity());
   RETURN_NOT_OK(fake->messenger->RegisterService(service_name, fake->service_pool));
   RETURN_NOT_OK(fake->messenger->StartAcceptor());

@@ -49,6 +49,7 @@
 #include "yb/util/env.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
+#include "yb/util/lanes.h"
 #include "yb/util/memory/memory.h"
 #include "yb/util/metrics.h"
 #include "yb/util/mutex.h"
@@ -122,6 +123,13 @@ DEFINE_RUNTIME_int64(mem_tracker_tcmalloc_gc_release_bytes, -1,
     "page heap freelist. A higher value implies less aggressive GC, i.e. higher memory "
     "overhead, but more efficient in terms of runtime.");
 
+DEFINE_NON_RUNTIME_int64(mem_tracker_lane_batch_bytes, 64 * 1024,
+    "In lane mode, the delta a lane thread accumulates per lane-batched memory tracker (and in the "
+    "memory released since the last tcmalloc GC) before applying it to the shared value. Shared "
+    "consumption values, the limit checks that use them and the GC trigger can lag the tracked "
+    "total by up to the number of lanes times this value. 0 disables lane batching.");
+TAG_FLAG(mem_tracker_lane_batch_bytes, advanced);
+
 DECLARE_int64(server_tcmalloc_max_total_thread_cache_bytes);
 
 namespace yb {
@@ -140,6 +148,49 @@ namespace {
 // Total amount of memory from calls to Release() since the last GC. If this
 // is greater than mem_tracker_tcmalloc_gc_release_bytes, this will trigger a tcmalloc gc.
 Atomic64 released_memory_since_gc;
+
+// Lane batches of released_memory_since_gc, allocated when the root tracker is lane-batched, and
+// their batch size. A Release from a lane thread adds to its lane's slot and moves the slot to
+// released_memory_since_gc once it exceeds the batch, so the GC triggers no later than
+// mem_tracker_tcmalloc_gc_release_bytes + L x batch.
+LaneSharded<std::atomic<int64_t>> released_since_gc_lane_slots;
+std::atomic<int64_t> released_since_gc_lane_batch_bytes{0};
+
+// Serializes EnableLaneBatching.
+std::mutex lane_batching_mutex;
+
+constexpr int64_t kMaxLaneBatchBytes = 16 * 1024 * 1024;
+
+bool ValidateLaneBatchBytes(const char* flag_name, int64_t value) {
+  if (value < 0 || value > kMaxLaneBatchBytes) {
+    LOG_FLAG_VALIDATION_ERROR(flag_name, value)
+        << "Must be between 0 and " << kMaxLaneBatchBytes;
+    return false;
+  }
+  return true;
+}
+
+DEFINE_validator(mem_tracker_lane_batch_bytes, &ValidateLaneBatchBytes);
+
+// Adds amount to the calling thread's lane slot. Returns true when the slot absorbed it, false
+// with *amount set to what the caller must apply to the shared value: amount itself when there is
+// no lane slot or it exceeds the batch, else the slot's content once that exceeds the batch.
+bool AbsorbInLaneSlot(
+    const LaneSharded<std::atomic<int64_t>>& slots, int64_t batch_bytes, int64_t* amount) {
+  if (std::abs(*amount) > batch_bytes) {
+    return false;
+  }
+  auto* slot = slots.LaneLocal();
+  if (!slot) {
+    return false;
+  }
+  const auto value = slot->fetch_add(*amount, std::memory_order_relaxed) + *amount;
+  if (std::abs(value) <= batch_bytes) {
+    return true;
+  }
+  *amount = slot->exchange(0, std::memory_order_relaxed);
+  return *amount == 0;
+}
 
 DEFINE_validator(default_memory_limit_to_ram_ratio, &::yb::internal::ValidateMemoryLimitToRamRatio);
 
@@ -208,6 +259,32 @@ std::shared_ptr<MemTracker> CreateRootTracker() {
 }
 
 } // namespace
+
+class MemTracker::LaneBatches {
+ public:
+  LaneBatches(size_t num_lanes, int64_t batch_bytes) : batch_bytes_(batch_bytes) {
+    slots_.Allocate(num_lanes);
+  }
+
+  int64_t batch_bytes() const { return batch_bytes_; }
+
+  const LaneSharded<std::atomic<int64_t>>& slots() const { return slots_; }
+
+  // Calls f(delta) with the content of every non-empty slot, emptying it.
+  template <class F>
+  void Drain(const F& f) const {
+    slots_.ForEach([&f](std::atomic<int64_t>& slot) {
+      auto delta = slot.exchange(0, std::memory_order_relaxed);
+      if (delta != 0) {
+        f(delta);
+      }
+    });
+  }
+
+ private:
+  const int64_t batch_bytes_;
+  LaneSharded<std::atomic<int64_t>> slots_;
+};
 
 class MemTracker::TrackerMetrics {
  public:
@@ -296,6 +373,7 @@ shared_ptr<MemTracker> MemTracker::CreateChild(int64_t byte_limit,
         byte_limit, id, std::move(consumption_functor), shared_from_this(),
         add_to_parent, create_metrics, metric_name, IsRootTracker::kFalse);
   };
+  MemTrackerPtr result;
   if (!may_exist) {
     // Create mem-tracker before locking to avoid recursive mutex acquisition through the following
     // stack for untracked memory tracker creation:
@@ -304,14 +382,63 @@ shared_ptr<MemTracker> MemTracker::CreateChild(int64_t byte_limit,
     // MemTracker::GetTrackedMemory() -> GetRootTracker()->ListChildren()
     auto child = create_mem_tracker();
     std::lock_guard lock(child_trackers_mutex_);
-    return InsertChildUnlocked(id, std::move(child));
+    result = InsertChildUnlocked(id, std::move(child));
+  } else {
+    std::lock_guard lock(child_trackers_mutex_);
+    result = FindChildUnlocked(id);
+    if (result) {
+      return result;
+    }
+    result = InsertChildUnlocked(id, create_mem_tracker());
   }
-  std::lock_guard lock(child_trackers_mutex_);
-  auto existing = FindChildUnlocked(id);
-  if (existing) {
-    return existing;
+  // After the insertion: EnableLaneBatching sets the flags before it lists the children, so a
+  // child is either listed there or sees the flags here.
+  EnableLaneBatchingForChild(result);
+  return result;
+}
+
+void MemTracker::EnableLaneBatchingForChild(const MemTrackerPtr& child) {
+  if (lane_batch_children_.load(std::memory_order_acquire)) {
+    child->EnableLaneBatching(lane_batch_subtree_.load(std::memory_order_acquire)
+        ? MemTrackerLaneBatching::kSubtree : MemTrackerLaneBatching::kTracker);
   }
-  return InsertChildUnlocked(id, create_mem_tracker());
+}
+
+bool MemTracker::EnableLaneBatching(MemTrackerLaneBatching scope) {
+  if (!LaneModeActive() || FLAGS_mem_tracker_lane_batch_bytes <= 0) {
+    return false;
+  }
+  {
+    std::lock_guard lock(lane_batching_mutex);
+    if (!lane_batches_.load(std::memory_order_acquire)) {
+      const auto num_lanes = GetLaneTopology().num_lanes();
+      const auto batch_bytes = FLAGS_mem_tracker_lane_batch_bytes;
+      lane_batches_.store(new LaneBatches(num_lanes, batch_bytes), std::memory_order_release);
+      if (is_root_tracker_ && released_since_gc_lane_slots.Allocate(num_lanes)) {
+        released_since_gc_lane_batch_bytes.store(batch_bytes, std::memory_order_release);
+      }
+    }
+  }
+  if (scope != MemTrackerLaneBatching::kTracker) {
+    if (scope == MemTrackerLaneBatching::kSubtree) {
+      lane_batch_subtree_.store(true, std::memory_order_release);
+    }
+    lane_batch_children_.store(true, std::memory_order_release);
+    for (const auto& child : ListChildren()) {
+      EnableLaneBatchingForChild(child);
+    }
+  }
+  return true;
+}
+
+bool MemTracker::lane_batching_enabled() const {
+  return lane_batches_.load(std::memory_order_acquire) != nullptr;
+}
+
+void MemTracker::FlushLaneBatches() {
+  if (auto* batches = lane_batches_.load(std::memory_order_acquire)) {
+    batches->Drain([this](int64_t delta) { IncrementSharedBy(delta); });
+  }
 }
 
 MemTracker::MemTracker(int64_t byte_limit, const string& id,
@@ -358,9 +485,12 @@ MemTracker::~MemTracker() {
   VLOG(1) << "Destroying tracker " << ToString();
   if (parent_) {
     if (add_to_parent_) {
+      // Unflushed lane slots are part of what this tracker added to its ancestors.
+      FlushLaneBatches();
       parent_->Release(consumption());
     }
   }
+  delete lane_batches_.load(std::memory_order_acquire);
 }
 
 void MemTracker::UnregisterFromParent() {
@@ -483,6 +613,10 @@ void MemTracker::DoUpdateConsumption() {
   VLOG(1) << "Setting consumption of tracker " << id_ << " from " << consumption_.current_value()
           << " to " << value << " from consumption functor";
   consumption_.set_value(value);
+  // The functor's value includes the memory behind the deltas still in lane slots.
+  if (auto* batches = lane_batches_.load(std::memory_order_acquire)) {
+    batches->Drain([](int64_t) {});
+  }
   if (soft_limit_ > 0) {
     const int64_t accuracy_bytes =
         FLAGS_mem_tracker_external_consumption_accuracy_percentage / 100 * soft_limit_;
@@ -519,6 +653,15 @@ void MemTracker::IncrementMetricBy(int64_t amount) {
 }
 
 void MemTracker::IncrementBy(int64_t amount) {
+  if (auto* batches = lane_batches_.load(std::memory_order_acquire)) {
+    if (AbsorbInLaneSlot(batches->slots(), batches->batch_bytes(), &amount)) {
+      return;
+    }
+  }
+  IncrementSharedBy(amount);
+}
+
+void MemTracker::IncrementSharedBy(int64_t amount) {
   consumption_.IncrementBy(amount);
   if (consumption_functor_ && ShouldForceUpdateConsumption()) {
     DoUpdateConsumption();
@@ -528,6 +671,31 @@ void MemTracker::IncrementBy(int64_t amount) {
 }
 
 bool MemTracker::TryIncrementBy(int64_t amount) {
+  auto* batches = lane_batches_.load(std::memory_order_acquire);
+  if (batches && amount <= batches->batch_bytes()) {
+    if (auto* slot = batches->slots().LaneLocal()) {
+      auto old_value = slot->load(std::memory_order_relaxed);
+      for (;;) {
+        const auto new_value = old_value + amount;
+        if (new_value > batches->batch_bytes() ||
+            consumption_.current_value() + new_value > limit_) {
+          break;
+        }
+        if (slot->compare_exchange_weak(old_value, new_value, std::memory_order_relaxed)) {
+          return true;
+        }
+      }
+      // The slot holds bytes already admitted: apply them, then check bytes exactly.
+      auto pending = slot->exchange(0, std::memory_order_relaxed);
+      if (pending != 0) {
+        IncrementSharedBy(pending);
+      }
+    }
+  }
+  return TryIncrementSharedBy(amount);
+}
+
+bool MemTracker::TryIncrementSharedBy(int64_t amount) {
   if (!consumption_.TryIncrementBy(amount, limit_)) {
     return false;
   }
@@ -553,7 +721,10 @@ void MemTracker::Consume(int64_t bytes) {
   for (auto& tracker : all_trackers_) {
     if (!tracker->MaybeUpdateConsumption()) {
       tracker->IncrementBy(bytes);
-      DCHECK_GE(tracker->consumption_.current_value(), 0);
+      // A batched tracker's shared value can be below zero by up to L x batch: a lane may flush
+      // releases of memory whose consumption is still in another lane's slot.
+      DCHECK(tracker->lane_batching_enabled() || tracker->consumption_.current_value() >= 0)
+          << "Tracker: " << tracker->ToString();
     }
   }
 }
@@ -621,8 +792,13 @@ void MemTracker::Release(int64_t bytes) {
   }
 
   bool do_force_update_consumption = false;
-  if (PREDICT_FALSE(base::subtle::Barrier_AtomicIncrement(&released_memory_since_gc, bytes) >
-                    FLAGS_mem_tracker_tcmalloc_gc_release_bytes)) {
+  auto released_delta = bytes;
+  if (!AbsorbInLaneSlot(
+          released_since_gc_lane_slots,
+          released_since_gc_lane_batch_bytes.load(std::memory_order_relaxed), &released_delta) &&
+      PREDICT_FALSE(
+          base::subtle::Barrier_AtomicIncrement(&released_memory_since_gc, released_delta) >
+          FLAGS_mem_tracker_tcmalloc_gc_release_bytes)) {
     // Force updating consumption to reflect real consumption if GC happened.
     do_force_update_consumption = GcTcmallocIfNeeded();
   }
@@ -640,7 +816,8 @@ void MemTracker::Release(int64_t bytes) {
       // metric. Don't blow up in this case. (Note that this doesn't affect non-process
       // trackers since we can enforce that the reported memory usage is internally
       // consistent.)
-      DCHECK_GE(tracker->consumption_.current_value(), 0) << "Tracker: " << tracker->ToString();
+      DCHECK(tracker->lane_batching_enabled() || tracker->consumption_.current_value() >= 0)
+          << "Tracker: " << tracker->ToString();
     }
   }
 }
@@ -906,6 +1083,28 @@ void MemTracker::SetMetricEntity(const MetricEntityPtr& metric_entity) {
 
 void MemTracker::TEST_SetReleasedMemorySinceGC(int64_t value) {
   released_memory_since_gc = value;
+}
+
+int64_t MemTracker::TEST_ReleasedMemorySinceGC() {
+  return base::subtle::Acquire_Load(&released_memory_since_gc);
+}
+
+int64_t MemTracker::TEST_UnflushedReleasedMemorySinceGC() {
+  int64_t result = 0;
+  released_since_gc_lane_slots.ForEach([&result](std::atomic<int64_t>& slot) {
+    result += slot.load(std::memory_order_relaxed);
+  });
+  return result;
+}
+
+int64_t MemTracker::TEST_UnflushedLaneBatches() const {
+  int64_t result = 0;
+  if (auto* batches = lane_batches_.load(std::memory_order_acquire)) {
+    batches->slots().ForEach([&result](std::atomic<int64_t>& slot) {
+      result += slot.load(std::memory_order_relaxed);
+    });
+  }
+  return result;
 }
 
 scoped_refptr<MetricEntity> MemTracker::metric_entity() const {
