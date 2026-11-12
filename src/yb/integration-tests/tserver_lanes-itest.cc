@@ -681,6 +681,8 @@ TEST_F(TserverMixedLanesITest, WritesAndReadsWithMixedLaneCounts) {
   TestYcqlWorkload workload(cluster_.get());
   workload.set_num_tablets(3);
   workload.set_num_write_threads(2);
+  // Distinct keys, so the row count is at least the number of successful inserts.
+  workload.set_sequential_write(true);
   workload.Setup();
   workload.Start();
   workload.WaitInserted(500);
@@ -723,18 +725,34 @@ TEST_F(TserverMixedLanesITest, PreamblePromoteAndDemote) {
               i == 0 ? "1" : "4");
   }
 
-  int64_t rows_inserted = 0;
-  client::YBTableName table_name;
-  auto run_workload = [this, &rows_inserted, &table_name] {
-    TestYcqlWorkload workload(cluster_.get());
-    workload.set_num_tablets(6);
-    workload.set_num_write_threads(2);
-    workload.Setup();
-    workload.Start();
-    workload.WaitInserted(200);
-    workload.StopAndJoin();
-    rows_inserted += workload.rows_inserted();
-    table_name = workload.table_name();
+  // Each run writes distinct keys to a table of its own, so each table holds at least the rows its
+  // run inserted. The tables are created first, with the flag off, so that the lane-keyed
+  // connections their tablets need exist before the flag changes.
+  constexpr size_t kRuns = 5;
+  auto table_name = [](size_t run) {
+    const auto& name = TestWorkloadOptions::kDefaultTableName;
+    return client::YBTableName(
+        name.namespace_type(), name.namespace_name(), Format("$0-$1", name.table_name(), run));
+  };
+  auto make_workload = [this, &table_name](size_t run) {
+    auto workload = std::make_unique<TestYcqlWorkload>(cluster_.get());
+    workload->set_table_name(table_name(run));
+    workload->set_num_tablets(6);
+    workload->set_num_write_threads(2);
+    workload->set_sequential_write(true);
+    workload->Setup();
+    return workload;
+  };
+  for (size_t run = 0; run != kRuns; ++run) {
+    make_workload(run);
+  }
+  std::vector<int64_t> rows_inserted;
+  auto run_workload = [&make_workload, &rows_inserted] {
+    auto workload = make_workload(rows_inserted.size());
+    workload->Start();
+    workload->WaitInserted(200);
+    workload->StopAndJoin();
+    rows_inserted.push_back(workload->rows_inserted());
   };
   auto counter = [this](size_t ts_idx, const CounterPrototype& prototype) {
     return cluster_->tablet_server(ts_idx)->GetMetric<int64>(
@@ -792,7 +810,11 @@ TEST_F(TserverMixedLanesITest, PreamblePromoteAndDemote) {
 
   ClusterVerifier verifier(cluster_.get());
   ASSERT_NO_FATALS(verifier.CheckCluster());
-  ASSERT_NO_FATALS(verifier.CheckRowCount(table_name, ClusterVerifier::AT_LEAST, rows_inserted));
+  ASSERT_EQ(rows_inserted.size(), kRuns);
+  for (size_t run = 0; run != kRuns; ++run) {
+    ASSERT_NO_FATALS(verifier.CheckRowCount(
+        table_name(run), ClusterVerifier::AT_LEAST, rows_inserted[run]));
+  }
 }
 
 } // namespace yb
