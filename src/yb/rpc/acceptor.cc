@@ -96,8 +96,8 @@ METRIC_DEFINE_counter(server, rpc_lane_preamble_bound,
 METRIC_DEFINE_counter(server, rpc_lane_preamble_absent,
     "RPC Connections Without Lane Preamble", yb::MetricUnit::kConnections,
     "Number of inbound connections of a laned messenger whose first bytes were not a lane "
-    "preamble, or that closed or failed before sending one. They are assigned to a reactor as "
-    "without lanes.");
+    "preamble, that closed or failed before sending one, or whose preamble the acceptor could not "
+    "read in full. They are assigned to a reactor as without lanes.");
 METRIC_DEFINE_counter(server, rpc_lane_preamble_peek_timeouts,
     "RPC Lane Preamble Peek Timeouts", yb::MetricUnit::kConnections,
     "Number of inbound connections of a laned messenger whose first bytes had not shown whether "

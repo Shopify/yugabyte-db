@@ -49,9 +49,10 @@ METRIC_DEFINE_simple_counter(
 METRIC_DEFINE_counter(
     server, rpc_lane_preamble_stripped_late, "RPC Lane Preambles Stripped Late",
     yb::MetricUnit::kConnections,
-    "Number of inbound connections whose lane preamble was dropped by the reactor rather than "
-    "consumed by the acceptor: it arrived after the peek timeout, or the messenger does not peek. "
-    "Such connections are not bound to the preamble's lane.");
+    "Number of inbound connections whose lane preamble was dropped by the reactor because the "
+    "acceptor did not consume it: the messenger does not peek, or the acceptor gave up before the "
+    "preamble arrived (peek timeout, or too many connections already held). Such connections are "
+    "not bound to the preamble's lane.");
 
 namespace yb {
 namespace rpc {

@@ -42,6 +42,7 @@
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/countdown_latch.h"
 #include "yb/util/flags.h"
+#include "yb/util/flags/auto_flags.h"
 #include "yb/util/lanes.h"
 #include "yb/util/lanes_test_util.h"
 #include "yb/util/logging_test_util.h"
@@ -56,13 +57,13 @@
 
 using namespace std::literals;
 
-DECLARE_bool(enable_rpc_lane_preamble);
-DECLARE_bool(TEST_rpc_ignore_lane_preamble);
-DECLARE_int32(TEST_delay_connect_ms);
-DECLARE_int32(TEST_rpc_lane_preamble_max_pending_sockets);
 DECLARE_uint64(default_idle_timeout_ms);
+DECLARE_bool(enable_rpc_lane_preamble);
 DECLARE_uint32(rpc_lane_preamble_peek_timeout_ms);
 DECLARE_int32(stream_compression_algo);
+DECLARE_int32(TEST_delay_connect_ms);
+DECLARE_bool(TEST_rpc_ignore_lane_preamble);
+DECLARE_int32(TEST_rpc_lane_preamble_max_pending_sockets);
 
 METRIC_DECLARE_counter(rpc_lane_preamble_absent);
 METRIC_DECLARE_counter(rpc_lane_preamble_bound);
@@ -2089,6 +2090,74 @@ TEST_F(RpcLanePreambleTest, QueuedBeforeConnect) {
   }
   ASSERT_OK(WhoAmIWithTimeout(&proxy, 1));
   server.Shutdown();
+}
+
+// The flags and metrics operators see: names, defaults, AutoFlag class and values, tags and help.
+TEST_F(RpcLanePreambleTest, FlagAndMetricFormats) {
+  auto tags_of = [](const std::string& flag) {
+    std::unordered_set<FlagTag> tags;
+    GetFlagTags(flag, &tags);
+    return tags;
+  };
+  gflags::CommandLineFlagInfo info;
+  ASSERT_TRUE(gflags::GetCommandLineFlagInfo("rpc_lane_preamble_peek_timeout_ms", &info));
+  ASSERT_EQ(info.type, "uint32");
+  ASSERT_EQ(info.default_value, "500");
+  ASSERT_EQ(info.description,
+            "How long the acceptor of a laned messenger waits for the first bytes of an accepted "
+            "connection to show whether it starts with a lane preamble. A connection that has not "
+            "decided by then is assigned to a reactor as without lanes, and is not bound to a lane "
+            "for its lifetime.");
+  auto tags = tags_of("rpc_lane_preamble_peek_timeout_ms");
+  ASSERT_TRUE(tags.contains(FlagTag::kAdvanced));
+  ASSERT_TRUE(tags.contains(FlagTag::kRuntime));
+
+  const auto* auto_flag = GetAutoFlagDescription("enable_rpc_lane_preamble");
+  ASSERT_NE(auto_flag, nullptr);
+  ASSERT_EQ(auto_flag->flag_class, AutoFlagClass::kLocalVolatile);
+  ASSERT_EQ(auto_flag->initial_val, "false");
+  ASSERT_EQ(auto_flag->target_val, "true");
+  ASSERT_TRUE(gflags::GetCommandLineFlagInfo("enable_rpc_lane_preamble", &info));
+  ASSERT_EQ(info.type, "bool");
+  ASSERT_EQ(info.description,
+            "Laned tablet servers write a lane preamble at the start of each connection they key "
+            "by lane, so that a receiving tablet server with lanes on can bind it to a reactor of "
+            "that lane. Receivers that predate the preamble reject such connections, so enable it "
+            "only after every process in the universe runs a version that accepts it. Read when a "
+            "connection is created: a change affects only connections created afterwards.");
+  tags = tags_of("enable_rpc_lane_preamble");
+  ASSERT_TRUE(tags.contains(FlagTag::kAdvanced));
+  ASSERT_TRUE(tags.contains(FlagTag::kRuntime));
+  ASSERT_TRUE(tags.contains(FlagTag::kAuto));
+
+  const std::vector<std::pair<const CounterPrototype*, std::string>> counters = {
+    {&METRIC_rpc_lane_preamble_bound,
+     "Number of inbound connections that the acceptor of a laned messenger bound to a reactor of "
+     "the lane of their lane preamble."},
+    {&METRIC_rpc_lane_preamble_absent,
+     "Number of inbound connections of a laned messenger whose first bytes were not a lane "
+     "preamble, that closed or failed before sending one, or whose preamble the acceptor could "
+     "not read in full. They are assigned to a reactor as without lanes."},
+    {&METRIC_rpc_lane_preamble_peek_timeouts,
+     "Number of inbound connections of a laned messenger whose first bytes had not shown whether "
+     "they start with a lane preamble within --rpc_lane_preamble_peek_timeout_ms, or that could "
+     "not be held because the acceptor held the maximum number of such connections. They are "
+     "assigned to a reactor as without lanes."},
+    {&METRIC_rpc_lane_preamble_stripped_late,
+     "Number of inbound connections whose lane preamble was dropped by the reactor because the "
+     "acceptor did not consume it: the messenger does not peek, or the acceptor gave up before the "
+     "preamble arrived (peek timeout, or too many connections already held). Such connections are "
+     "not bound to the preamble's lane."},
+  };
+  std::vector<std::string> names;
+  for (const auto& [prototype, description] : counters) {
+    names.push_back(prototype->name());
+    ASSERT_EQ(prototype->description(), description) << prototype->name();
+    ASSERT_EQ(prototype->unit(), MetricUnit::kConnections) << prototype->name();
+  }
+  ASSERT_EQ(names, (std::vector<std::string>{
+      "rpc_lane_preamble_bound", "rpc_lane_preamble_absent", "rpc_lane_preamble_peek_timeouts",
+      "rpc_lane_preamble_stripped_late"}));
 }
 
 } // namespace yb::rpc

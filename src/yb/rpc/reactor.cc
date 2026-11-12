@@ -88,10 +88,11 @@ DEFINE_UNKNOWN_uint64(rpc_read_buffer_size, 0,
               "RPC connection read buffer size. 0 to auto detect.");
 DEFINE_RUNTIME_AUTO_bool(enable_rpc_lane_preamble, kLocalVolatile, false, true,
     "Laned tablet servers write a lane preamble at the start of each connection they key by lane, "
-    "so that the receiver can bind it to a reactor of that lane. Receivers that predate the "
-    "preamble reject such connections, so enable it only after every process in the universe runs "
-    "a version that accepts it. Read when a connection is created: a change affects only "
-    "connections created afterwards.");
+    "so that a receiving tablet server with lanes on can bind it to a reactor of that lane. "
+    "Receivers that predate the preamble reject such connections, so enable it only after every "
+    "process in the universe runs a version that accepts it. Read when a connection is created: a "
+    "change affects only connections created afterwards.");
+TAG_FLAG(enable_rpc_lane_preamble, advanced);
 
 DECLARE_string(local_ip_for_outbound_sockets);
 DECLARE_int32(num_connections_to_server);
