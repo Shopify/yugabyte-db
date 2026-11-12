@@ -417,6 +417,74 @@ TEST_P(YBBackupTestWithColocationParam, CreateConsistentMasterSnapshot) {
   LOG(INFO) << "Test finished: " << CURRENT_TEST_CASE_AND_TEST_NAME_STR();
 }
 
+// Test that repacking a snapshot for backup does not hold the catalog manager lock across its
+// per table work. The repack pauses after its first table lookup, and a CREATE TABLE, which takes
+// the catalog manager lock exclusively, must finish before the repack resumes.
+// Timeline of the test:
+//
+// Main Thread          Background Thread                 Master Leader
+//      |                       |                              |
+//      | 1. Create test_table  |                              |
+//      | 2. Create snapshot    |                              |
+//      | 3. Setup sync points  |                              |
+//      | 4. Start bg thread    |                              |
+//      |                       | 5. Wait until the repack     |
+//      |                       |    looked up a table         |
+//      | 6. ListSnapshots with |                              |
+//      |    prepare_for_backup |                              |
+//      |                       |                              | 7. Look up the first table
+//      |                       | 8. Create test_table2        |
+//      |                       | 9. Signal creation complete  |
+//      |                       |                              | 10. Finish the repack
+//      | 11. Verify both calls |                              |
+//      |     succeeded         |                              |
+// Sync Points:
+// - StartCreateTableDuringRepack: Blocks until the repack looked up a table
+// - ContinueRepack: Blocks until the table creation finished
+TEST_P(YBBackupTestWithColocationParam, CreateTableDuringSnapshotRepack) {
+  auto conn = ASSERT_RESULT(ConnectToDB(kBackupSourceDbName));
+  const std::string table_name = "test_table", table2_name = "test_table2";
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (k INT PRIMARY KEY, v TEXT)", table_name));
+
+  YBTableName namespace_info(YQL_DATABASE_PGSQL);
+  namespace_info.set_namespace_name(kBackupSourceDbName);
+  master::GetNamespaceInfoResponsePB namespace_resp;
+  ASSERT_OK(client_->GetNamespaceInfo(kBackupSourceDbName, YQL_DATABASE_PGSQL, &namespace_resp));
+  namespace_info.set_namespace_id(namespace_resp.namespace_().id());
+  TxnSnapshotId snapshot_id = ASSERT_RESULT(snapshot_util_->CreateSnapshot(namespace_info));
+
+  // The scope is declared after the thread holder, so it releases a waiting thread before the join.
+  TestThreadHolder thread_holder;
+  SyncPointScope sync_point;
+  std::vector<SyncPoint::Dependency> dependencies;
+  dependencies.push_back(
+      {"YBBackupTestWithColocationParam::RepackTableLookedUp",
+       "YBBackupTestWithColocationParam::StartCreateTableDuringRepack"});
+  dependencies.push_back(
+      {"YBBackupTestWithColocationParam::CreateTableDuringRepackFinished",
+       "YBBackupTestWithColocationParam::ContinueRepack"});
+  sync_point->LoadDependency(dependencies);
+  sync_point->EnableProcessing();
+
+  thread_holder.AddThreadFunctor([&] {
+    TEST_SYNC_POINT("YBBackupTestWithColocationParam::StartCreateTableDuringRepack");
+
+    LOG(INFO) << Format("Started creating table: $0", table2_name);
+    auto status = conn.ExecuteFormat("CREATE TABLE $0 (k INT PRIMARY KEY, v TEXT)", table2_name);
+
+    TEST_SYNC_POINT("YBBackupTestWithColocationParam::CreateTableDuringRepackFinished");
+    ASSERT_OK(status);
+  });
+
+  Snapshots snapshot_infos = ASSERT_RESULT(snapshot_util_->ListSnapshots(
+      snapshot_id, client::ListDeleted::kTrue, client::PrepareForBackup::kTrue,
+      client::IncludeDdlInProgressTables::kTrue));
+  ASSERT_EQ(snapshot_infos.size(), 1);
+  thread_holder.JoinAll();
+
+  LOG(INFO) << "Test finished: " << CURRENT_TEST_CASE_AND_TEST_NAME_STR();
+}
+
 // Test that we retain the deleted tables of a namespace if CreateSnapshot RPC is being executed.
 // Timeline of the test:
 // Main Thread                    Master Leader
