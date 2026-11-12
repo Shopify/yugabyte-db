@@ -971,8 +971,9 @@ class PgClientServiceImpl::Impl : public SessionProvider, public SessionRegistry
         lane == kNoLane ? 0 : lane % exchange_thread_pools_.size()];
   }
 
-  // Every reader outside the call_once that fills exchange_thread_pools_ goes through here, so it
-  // sees no pool until the creating thread has published all of them.
+  // Readers not ordered after the call_once that fills exchange_thread_pools_ go through here, so
+  // they see no pool until the creating thread has published all of them. ExchangeThreadPool(lane)
+  // is called only after that call_once returns, which orders it.
   void ForEachExchangeThreadPool(const std::function<void(YBThreadPool&)>& f) const {
     if (!exchange_thread_pools_created_.load(std::memory_order_acquire)) {
       return;
@@ -3296,7 +3297,8 @@ class PgClientServiceImpl::Impl : public SessionProvider, public SessionRegistry
   std::atomic<bool> exchange_thread_pools_created_{false};
 
   // Live sessions per lane, empty unless the messenger is laned. Written at session creation and
-  // expiry only.
+  // expiry only. A session that expires between registry Insert and the increment can make a count
+  // wrap briefly; it is only displayed.
   std::vector<std::atomic<size_t>> lane_session_counts_;
 
   PgSharedMemoryPool shared_mem_pool_;
