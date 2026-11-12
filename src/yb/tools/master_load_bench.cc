@@ -39,6 +39,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <set>
 #include <thread>
 
@@ -62,6 +63,7 @@
 #include "yb/common/wire_protocol.h"
 #include "yb/common/ysql_operation_lease.h"
 
+#include "yb/consensus/consensus.service.h"
 #include "yb/consensus/metadata.pb.h"
 
 #include "yb/gutil/casts.h"
@@ -295,46 +297,81 @@ class HollowTServer {
   void SetHostPort(const HostPort& host_port) { host_port_ = host_port; }
   const HostPort& host_port() const { return host_port_; }
 
+  // This tserver's replica of one tablet.
+  struct TabletInfo {
+    // As a real replica's update_lock_: its leader holds it for a whole election or config
+    // change, so these run one at a time.
+    std::mutex update_lock;
+    // Guards the fields below; never held while taking another lock.
+    mutable std::mutex mutex;
+    consensus::RaftConfigPB config;
+    string leader_uuid;
+    uint32_t schema_version = 0;
+    int64_t term = 1;
+  };
+  using TabletInfoPtr = std::shared_ptr<TabletInfo>;
+
+  TabletInfoPtr FindTablet(const string& tablet_id) {
+    std::shared_lock l(tablets_lock_);
+    auto it = tablets_.find(tablet_id);
+    return it == tablets_.end() ? nullptr : it->second;
+  }
+
   void AddTablet(
       const string& tablet_id, const consensus::RaftConfigPB& config,
-      uint32_t schema_version = 0) {
+      uint32_t schema_version = 0, int64_t term = 1) {
     // All replicas receive the same config, so hashing the tablet id picks the same
     // leader everywhere and the master sees a consistent consensus state.
     const auto& leader_uuid =
         config.peers(std::hash<string>()(tablet_id) % config.peers_size()).permanent_uuid();
+    SetConsensus(tablet_id, config, leader_uuid, term, schema_version);
+  }
+
+  // Consensus state decided elsewhere: by a real leader, an election or a config change.
+  void SetConsensus(
+      const string& tablet_id, const consensus::RaftConfigPB& config, const string& leader_uuid,
+      int64_t term, uint32_t schema_version) {
+    const auto info = FindOrAddTablet(tablet_id);
+    {
+      std::lock_guard l(info->mutex);
+      info->config = config;
+      info->leader_uuid = leader_uuid;
+      info->schema_version = schema_version;
+      info->term = term;
+    }
+    MarkChanged(tablet_id);
+  }
+
+  void MarkChanged(const string& tablet_id) {
     std::lock_guard l(mutex_);
-    auto& info = tablets_[tablet_id];
-    info.config = config;
-    info.leader_uuid = leader_uuid;
-    info.schema_version = schema_version;
     dirty_.insert(tablet_id);
+    in_flight_.erase(tablet_id);
     heartbeat_asap.store(true);
   }
 
   // The master re-sends AlterSchema while any replica reports an older version than the
   // table's, so the next heartbeat must carry the new one.
   void SetSchemaVersion(const string& tablet_id, uint32_t schema_version) {
-    std::lock_guard l(mutex_);
-    auto it = tablets_.find(tablet_id);
-    if (it == tablets_.end()) {
+    const auto info = FindTablet(tablet_id);
+    if (!info) {
       return;
     }
-    it->second.schema_version = std::max(it->second.schema_version, schema_version);
-    dirty_.insert(tablet_id);
-    heartbeat_asap.store(true);
+    {
+      std::lock_guard l(info->mutex);
+      info->schema_version = std::max(info->schema_version, schema_version);
+    }
+    MarkChanged(tablet_id);
   }
 
   bool HasTablet(const string& tablet_id) {
-    std::lock_guard l(mutex_);
-    return tablets_.contains(tablet_id);
+    return FindTablet(tablet_id) != nullptr;
   }
 
   std::vector<string> PeerUuids(const string& tablet_id) {
     std::vector<string> uuids;
-    std::lock_guard l(mutex_);
-    auto it = tablets_.find(tablet_id);
-    if (it != tablets_.end()) {
-      for (const auto& peer : it->second.config.peers()) {
+    if (const auto info = FindTablet(tablet_id)) {
+      std::lock_guard l(info->mutex);
+      for (const auto& peer : info->config.peers()) {
         uuids.push_back(peer.permanent_uuid());
       }
     }
@@ -342,16 +379,24 @@ class HollowTServer {
   }
 
   void RemoveTablet(const string& tablet_id) {
+    {
+      std::lock_guard l(tablets_lock_);
+      tablets_.erase(tablet_id);
+    }
     std::lock_guard l(mutex_);
-    tablets_.erase(tablet_id);
     dirty_.erase(tablet_id);
     removed_.insert(tablet_id);
     heartbeat_asap.store(true);
   }
 
   size_t NumTablets() {
-    std::lock_guard l(mutex_);
+    std::shared_lock l(tablets_lock_);
     return tablets_.size();
+  }
+
+  size_t NumLeaders() {
+    std::shared_lock l(tablets_lock_);
+    return std::ranges::count_if(tablets_, [this](const auto& t) { return IsLeader(*t.second); });
   }
 
   // Registered and no report in flight: the master's view of this tserver is current.
@@ -364,12 +409,30 @@ class HollowTServer {
   struct RegistryEntry {
     consensus::RaftConfigPB config;
     uint32_t schema_version;
+    int64_t term;
+    string leader_uuid;
   };
 
+  static RegistryEntry Read(const TabletInfo& info) {
+    std::lock_guard l(info.mutex);
+    return RegistryEntry{info.config, info.schema_version, info.term, info.leader_uuid};
+  }
+
+  std::optional<RegistryEntry> GetTablet(const string& tablet_id) {
+    const auto info = FindTablet(tablet_id);
+    if (!info) {
+      return std::nullopt;
+    }
+    return Read(*info);
+  }
+
   void CollectTablets(std::map<string, RegistryEntry>* out) {
-    std::lock_guard l(mutex_);
+    std::shared_lock l(tablets_lock_);
     for (const auto& [tablet_id, info] : tablets_) {
-      out->emplace(tablet_id, RegistryEntry{info.config, info.schema_version});
+      std::lock_guard info_lock(info->mutex);
+      out->emplace(
+          tablet_id,
+          RegistryEntry{info->config, info->schema_version, info->term, info->leader_uuid});
     }
   }
 
@@ -378,6 +441,7 @@ class HollowTServer {
                      bool metrics_beat, master::TSHeartbeatRequestPB* req) {
     req->Clear();
     std::lock_guard l(mutex_);
+    std::shared_lock tablets_lock(tablets_lock_);
     ++hb_seq_;
     // Registration and full reports need synthetic state the template can't carry.
     if (mirror_tmpl != nullptr && !needs_registration_ && !full_report_active_) {
@@ -416,7 +480,7 @@ class HollowTServer {
 
     int leader_count = 0;
     for (const auto& [_, info] : tablets_) {
-      if (info.leader_uuid == uuid_) {
+      if (IsLeader(*info)) {
         ++leader_count;
       }
     }
@@ -452,7 +516,7 @@ class HollowTServer {
         // followers report NO_MAJORITY_REPLICATED_LEASE without an expiration.
         auto* leader = req->add_leader_info();
         leader->set_tablet_id(tablet_id);
-        if (info.leader_uuid == uuid_) {
+        if (IsLeader(*info)) {
           leader->set_leader_lease_status(consensus::LeaderLeaseStatus::HAS_LEASE);
           leader->set_ht_lease_expiration((now_micros + 2 * 1000 * 1000) << 12);
         } else {
@@ -469,6 +533,7 @@ class HollowTServer {
 
   void HandleHeartbeatSuccess(const master::TSHeartbeatResponsePB& resp, int64_t rtt_us) {
     std::lock_guard l(mutex_);
+    std::shared_lock tablets_lock(tablets_lock_);
     last_rtt_us_ = rtt_us;
     if (registration_in_flight_) {
       needs_registration_ = false;
@@ -498,13 +563,17 @@ class HollowTServer {
     }
     if (resp.has_tablet_report()) {
       for (const auto& update : resp.tablet_report().tablets()) {
-        dirty_.erase(update.tablet_id());
+        // A tablet that changed after the report was built stays dirty.
+        if (in_flight_.erase(update.tablet_id())) {
+          dirty_.erase(update.tablet_id());
+        }
       }
     }
     if (resp.needs_full_tablet_report()) {
       full_report_queue_.clear();
       for (const auto& [tablet_id, _] : tablets_) {
         full_report_queue_.push_back(tablet_id);
+        dirty_.insert(tablet_id);
       }
       full_report_active_ = true;
       full_report_started_ = false;
@@ -513,6 +582,7 @@ class HollowTServer {
 
   void HandleHeartbeatFailure() {
     std::lock_guard l(mutex_);
+    std::shared_lock tablets_lock(tablets_lock_);
     registration_in_flight_ = false;
     // A lost chunk desyncs the master's report sequence; start the full report over and let
     // sequence-number checks on the master sort out duplicates.
@@ -520,6 +590,7 @@ class HollowTServer {
       full_report_queue_.clear();
       for (const auto& [tablet_id, _] : tablets_) {
         full_report_queue_.push_back(tablet_id);
+        dirty_.insert(tablet_id);
       }
       full_report_started_ = false;
     }
@@ -580,11 +651,22 @@ class HollowTServer {
   std::unique_ptr<master::MasterClusterProxy> cluster_proxy;
 
  private:
-  struct TabletInfo {
-    consensus::RaftConfigPB config;
-    string leader_uuid;
-    uint32_t schema_version = 0;
-  };
+  TabletInfoPtr FindOrAddTablet(const string& tablet_id) {
+    if (auto info = FindTablet(tablet_id)) {
+      return info;
+    }
+    std::lock_guard l(tablets_lock_);
+    auto& info = tablets_[tablet_id];
+    if (!info) {
+      info = std::make_shared<TabletInfo>();
+    }
+    return info;
+  }
+
+  bool IsLeader(const TabletInfo& info) const {
+    std::lock_guard l(info.mutex);
+    return info.leader_uuid == uuid_;
+  }
 
   // Rewrites a captured real-tserver heartbeat to carry this hollow tserver's identity, tablets
   // and report state; every other field stays byte-faithful to the real request.
@@ -635,7 +717,7 @@ class HollowTServer {
 
     int leader_count = 0;
     for (const auto& [_, info] : tablets_) {
-      if (info.leader_uuid == uuid_) {
+      if (IsLeader(*info)) {
         ++leader_count;
       }
     }
@@ -674,7 +756,7 @@ class HollowTServer {
       }
       if (!tmpl_leaders.empty()) {
         auto* leader = req->add_leader_info();
-        if (info.leader_uuid == uuid_ && leader_tmpl_idx >= 0) {
+        if (IsLeader(*info) && leader_tmpl_idx >= 0) {
           *leader = tmpl_leaders.Get(leader_tmpl_idx);
         } else {
           leader->set_leader_lease_status(
@@ -687,6 +769,7 @@ class HollowTServer {
   }
 
   void FillTabletReport(master::TSHeartbeatRequestPB* req) REQUIRES(mutex_) {
+    in_flight_.clear();
     const int32_t limit = tablet_report_limit_;
     if (full_report_active_) {
       auto* report = req->mutable_tablet_report();
@@ -705,15 +788,14 @@ class HollowTServer {
         if (it == tablets_.end()) {
           continue;
         }
-        AddReportedTablet(it->first, it->second, report);
+        AddReportedTablet(it->first, *it->second, report);
+        in_flight_.insert(it->first);
         ++added;
       }
       report->set_remaining_tablet_count(narrow_cast<int32_t>(full_report_queue_.size()));
       if (full_report_queue_.empty()) {
         full_report_active_ = false;
         full_report_started_ = false;
-        // The full report supersedes any pending incremental updates.
-        dirty_.clear();
         removed_.clear();
       }
       return;
@@ -733,7 +815,8 @@ class HollowTServer {
       if (it == tablets_.end()) {
         continue;
       }
-      AddReportedTablet(it->first, it->second, report);
+      AddReportedTablet(it->first, *it->second, report);
+      in_flight_.insert(tablet_id);
       ++added;
     }
     for (const auto& tablet_id : removed_) {
@@ -753,9 +836,10 @@ class HollowTServer {
     tablet->set_tablet_id(tablet_id);
     tablet->set_state(tablet::RUNNING);
     tablet->set_tablet_data_state(tablet::TABLET_DATA_READY);
+    std::lock_guard l(info.mutex);
     tablet->set_schema_version(info.schema_version);
     auto* cstate = tablet->mutable_committed_consensus_state();
-    cstate->set_current_term(1);
+    cstate->set_current_term(info.term);
     cstate->set_leader_uuid(info.leader_uuid);
     *cstate->mutable_config() = info.config;
   }
@@ -766,9 +850,13 @@ class HollowTServer {
   const CloudInfoPB cloud_info_;
   HostPort host_port_;
 
+  // Lock order: mutex_, tablets_lock_, a replica's TabletInfo::mutex. tablets_lock_ guards the
+  // map only: shared to find a replica, exclusive to add or remove one.
   std::mutex mutex_;
-  std::map<string, TabletInfo> tablets_ GUARDED_BY(mutex_);
+  std::shared_mutex tablets_lock_;
+  std::map<string, TabletInfoPtr> tablets_;
   std::set<string> dirty_ GUARDED_BY(mutex_);
+  std::set<string> in_flight_ GUARDED_BY(mutex_);
   std::set<string> removed_ GUARDED_BY(mutex_);
   std::deque<string> full_report_queue_ GUARDED_BY(mutex_);
   bool full_report_active_ GUARDED_BY(mutex_) = false;
@@ -812,6 +900,16 @@ class HollowTServerRegistry {
 
   const std::vector<std::unique_ptr<HollowTServer>>& tservers() const { return tservers_; }
 
+  // Load balancer requests received and applied by hollow tservers, for the idle-phase log.
+  struct RequestCount {
+    std::atomic<int64_t> received{0};
+    std::atomic<int64_t> applied{0};
+  };
+  RequestCount add_server;
+  RequestCount remove_server;
+  RequestCount leader_step_down;
+  RequestCount delete_tablet;
+
  private:
   std::vector<std::unique_ptr<HollowTServer>> tservers_;
   std::unordered_map<string, HollowTServer*> by_uuid_;
@@ -840,8 +938,10 @@ class HollowTSAdminService : public tserver::TabletServerAdminServiceIf {
       const tserver::DeleteTabletRequestPB* req, tserver::DeleteTabletResponsePB* resp,
       rpc::RpcContext context) override {
     auto* ts = registry_->Find(req->dest_uuid());
+    ++registry_->delete_tablet.received;
     if (ts) {
       ts->RemoveTablet(req->tablet_id());
+      ++registry_->delete_tablet.applied;
     }
     context.RespondSuccess();
   }
@@ -1140,6 +1240,258 @@ class HollowTSService : public tserver::TabletServerServiceIf {
 #undef HOLLOW_UNSUPPORTED_RESULT_METHOD
 
  private:
+  HollowTServerRegistry* registry_;
+};
+
+// Raft peer side of hollow tablets, shared by all hollow tservers and routed by dest_uuid. A
+// real leader gets every op acknowledged without a copy, so the load balancer can move a tablet
+// off the real tserver; hollow leaders apply elections and config changes in-process.
+class HollowConsensusService : public consensus::ConsensusServiceIf {
+ public:
+  HollowConsensusService(
+      const scoped_refptr<MetricEntity>& entity, HollowTServerRegistry* registry)
+      : consensus::ConsensusServiceIf(entity), registry_(registry) {}
+
+  void UpdateConsensus(
+      const consensus::LWConsensusRequestPB* req, consensus::LWConsensusResponsePB* resp,
+      rpc::RpcContext context) override {
+    auto* ts = registry_->Find(req->dest_uuid().ToBuffer());
+    if (!ts) {
+      context.RespondFailure(STATUS_FORMAT(NotFound, "Unknown dest_uuid $0", req->dest_uuid()));
+      return;
+    }
+    const auto tablet_id = req->tablet_id().ToBuffer();
+    const auto known = ts->GetTablet(tablet_id);
+    const auto last_received = req->ops().empty()
+        ? OpId::FromPB(req->preceding_id()) : OpId::FromPB(req->ops().rbegin()->id());
+    const auto committed = OpId::FromPB(req->committed_op_id());
+    resp->dup_responder_uuid(ts->uuid());
+    auto* status = resp->mutable_status();
+    last_received.ToPB(status->mutable_last_received());
+    last_received.ToPB(status->mutable_last_received_current_leader());
+    status->set_last_committed_idx(committed.index);
+    committed.ToPB(status->mutable_last_applied());
+    if (known && known->term > req->caller_term()) {
+      // A hollow replica was elected since; this makes the old leader step down.
+      resp->set_responder_term(known->term);
+      auto* error = status->mutable_error();
+      error->set_code(consensus::ConsensusErrorPB::INVALID_TERM);
+      StatusToPB(STATUS(IllegalState, "Hollow leader has a newer term"), error->mutable_status());
+      context.RespondSuccess();
+      return;
+    }
+    resp->set_responder_term(req->caller_term());
+    // The request does not carry the config; the only source is a config change op, and the
+    // leader sends at least the one that promotes this replica to voter.
+    std::optional<consensus::RaftConfigPB> config;
+    for (const auto& op : req->ops()) {
+      if (op.op_type() == consensus::CHANGE_CONFIG_OP) {
+        config = op.change_config_record().new_config().ToGoogleProtobuf();
+        config->set_committed_op_index(op.id().index());
+      }
+    }
+    if (config && IsMember(ts->uuid(), *config)) {
+      ts->SetConsensus(
+          tablet_id, *config, req->caller_uuid().ToBuffer(), req->caller_term(),
+          known ? known->schema_version : 0);
+    }
+    context.RespondSuccess();
+  }
+
+  // Sent by a real leader the master told to step down in favor of this replica. There is no
+  // vote to win: the hollow peers are all in this process and the real one already stepped down.
+  void RunLeaderElection(
+      const consensus::RunLeaderElectionRequestPB* req,
+      consensus::RunLeaderElectionResponsePB* resp, rpc::RpcContext context) override {
+    auto* ts = registry_->Find(req->dest_uuid());
+    const auto info = ts ? ts->FindTablet(req->tablet_id()) : nullptr;
+    if (!info) {
+      RespondError(tserver::TabletServerErrorPB::TABLET_NOT_FOUND, req->tablet_id(), resp,
+                   &context);
+      return;
+    }
+    std::lock_guard l(info->update_lock);
+    const auto tablet = HollowTServer::Read(*info);
+    SetOnHollowPeers(
+        req->tablet_id(), tablet.config, ts->uuid(), tablet.term + 1, tablet.schema_version);
+    context.RespondSuccess();
+  }
+
+  // Keeps a real replica that lost its leader from winning it back.
+  void RequestConsensusVote(
+      const consensus::VoteRequestPB* req, consensus::VoteResponsePB* resp,
+      rpc::RpcContext context) override {
+    auto* ts = registry_->Find(req->dest_uuid());
+    if (!ts) {
+      context.RespondFailure(STATUS_FORMAT(NotFound, "Unknown dest_uuid $0", req->dest_uuid()));
+      return;
+    }
+    const auto tablet = ts->GetTablet(req->tablet_id());
+    resp->set_responder_uuid(ts->uuid());
+    resp->set_responder_term(tablet ? tablet->term : req->candidate_term());
+    resp->set_preelection(req->preelection());
+    resp->set_vote_granted(false);
+    auto* error = resp->mutable_consensus_error();
+    error->set_code(consensus::ConsensusErrorPB::LEADER_IS_ALIVE);
+    StatusToPB(STATUS(IllegalState, "Hollow tservers do not vote"), error->mutable_status());
+    context.RespondSuccess();
+  }
+
+  // A hollow leader has no log: the new config is committed at once on every hollow peer.
+  // An added replica has nothing to copy, so it becomes a voter immediately.
+  void ChangeConfig(
+      const consensus::ChangeConfigRequestPB* req, consensus::ChangeConfigResponsePB* resp,
+      rpc::RpcContext context) override {
+    auto* count = req->type() == consensus::ADD_SERVER ? &registry_->add_server
+        : req->type() == consensus::REMOVE_SERVER ? &registry_->remove_server : nullptr;
+    if (count) {
+      ++count->received;
+    }
+    auto* ts = registry_->Find(req->dest_uuid());
+    const auto info = ts ? ts->FindTablet(req->tablet_id()) : nullptr;
+    if (!info) {
+      RespondError(tserver::TabletServerErrorPB::TABLET_NOT_FOUND, req->tablet_id(), resp,
+                   &context);
+      return;
+    }
+    std::lock_guard l(info->update_lock);
+    const auto tablet = HollowTServer::Read(*info);
+    if (tablet.leader_uuid != ts->uuid()) {
+      RespondError(tserver::TabletServerErrorPB::NOT_THE_LEADER, req->tablet_id(), resp,
+                   &context);
+      return;
+    }
+    if (req->has_cas_config_opid_index() &&
+        req->cas_config_opid_index() != tablet.config.committed_op_index()) {
+      RespondError(tserver::TabletServerErrorPB::CAS_FAILED, req->tablet_id(), resp, &context);
+      return;
+    }
+    const auto& server_uuid = req->server().permanent_uuid();
+    const auto is_member = IsMember(server_uuid, tablet.config);
+    auto config = tablet.config;
+    if (req->type() == consensus::ADD_SERVER && !is_member) {
+      auto* peer = config.add_peers();
+      *peer = req->server();
+      peer->set_member_type(consensus::PeerMemberType::VOTER);
+    } else if (req->type() == consensus::REMOVE_SERVER && is_member && server_uuid != ts->uuid()) {
+      auto* peers = config.mutable_peers();
+      for (int i = 0; i < peers->size(); ++i) {
+        if (peers->Get(i).permanent_uuid() == server_uuid) {
+          peers->DeleteSubrange(i, 1);
+          break;
+        }
+      }
+    } else {
+      context.RespondFailure(STATUS_FORMAT(
+          NotSupported, "Hollow leader cannot apply $0", req->ShortDebugString()));
+      return;
+    }
+    config.set_committed_op_index(tablet.config.committed_op_index() + 1);
+    SetOnHollowPeers(
+        req->tablet_id(), config, tablet.leader_uuid, tablet.term, tablet.schema_version);
+    ++count->applied;
+    context.RespondSuccess();
+  }
+
+  // The load balancer's leader moves. As with RunLeaderElection there is no vote: the named
+  // hollow peer leads from the next term on.
+  void LeaderStepDown(
+      const consensus::LeaderStepDownRequestPB* req, consensus::LeaderStepDownResponsePB* resp,
+      rpc::RpcContext context) override {
+    ++registry_->leader_step_down.received;
+    auto* ts = registry_->Find(req->dest_uuid());
+    const auto info = ts ? ts->FindTablet(req->tablet_id()) : nullptr;
+    if (!info) {
+      RespondError(tserver::TabletServerErrorPB::TABLET_NOT_FOUND, req->tablet_id(), resp,
+                   &context);
+      return;
+    }
+    std::lock_guard l(info->update_lock);
+    const auto tablet = HollowTServer::Read(*info);
+    if (tablet.leader_uuid != ts->uuid()) {
+      RespondError(tserver::TabletServerErrorPB::NOT_THE_LEADER, req->tablet_id(), resp,
+                   &context);
+      return;
+    }
+    string new_leader_uuid = req->new_leader_uuid();
+    if (new_leader_uuid.empty()) {
+      for (const auto& peer : tablet.config.peers()) {
+        if (peer.permanent_uuid() != ts->uuid() && registry_->Find(peer.permanent_uuid())) {
+          new_leader_uuid = peer.permanent_uuid();
+          break;
+        }
+      }
+    }
+    if (new_leader_uuid == ts->uuid() || !registry_->Find(new_leader_uuid) ||
+        !IsMember(new_leader_uuid, tablet.config)) {
+      context.RespondFailure(STATUS_FORMAT(
+          NotSupported, "Hollow leader cannot step down: $0", req->ShortDebugString()));
+      return;
+    }
+    SetOnHollowPeers(
+        req->tablet_id(), tablet.config, new_leader_uuid, tablet.term + 1,
+        tablet.schema_version);
+    ++registry_->leader_step_down.applied;
+    context.RespondSuccess();
+  }
+
+#define HOLLOW_UNSUPPORTED_METHOD(Method, ReqType, RespType) \
+  void Method(const ReqType*, RespType*, rpc::RpcContext context) override { \
+    context.RespondFailure(STATUS(NotSupported, #Method " not implemented by hollow tserver")); \
+  }
+
+  HOLLOW_UNSUPPORTED_METHOD(MultiRaftUpdateConsensus, consensus::MultiRaftConsensusRequestPB,
+                            consensus::MultiRaftConsensusResponsePB)
+  HOLLOW_UNSUPPORTED_METHOD(UnsafeChangeConfig, consensus::UnsafeChangeConfigRequestPB,
+                            consensus::UnsafeChangeConfigResponsePB)
+  HOLLOW_UNSUPPORTED_METHOD(GetNodeInstance, consensus::GetNodeInstanceRequestPB,
+                            consensus::GetNodeInstanceResponsePB)
+  HOLLOW_UNSUPPORTED_METHOD(LeaderElectionLost, consensus::LeaderElectionLostRequestPB,
+                            consensus::LeaderElectionLostResponsePB)
+  HOLLOW_UNSUPPORTED_METHOD(GetLastOpId, consensus::GetLastOpIdRequestPB,
+                            consensus::GetLastOpIdResponsePB)
+  HOLLOW_UNSUPPORTED_METHOD(GetConsensusState, consensus::GetConsensusStateRequestPB,
+                            consensus::GetConsensusStateResponsePB)
+  HOLLOW_UNSUPPORTED_METHOD(StartRemoteBootstrap, consensus::StartRemoteBootstrapRequestPB,
+                            consensus::StartRemoteBootstrapResponsePB)
+#undef HOLLOW_UNSUPPORTED_METHOD
+
+ private:
+  static bool IsMember(const string& uuid, const consensus::RaftConfigPB& config) {
+    return std::ranges::any_of(
+        config.peers(), [&uuid](const auto& peer) { return peer.permanent_uuid() == uuid; });
+  }
+
+  template <class Resp>
+  static void RespondError(
+      tserver::TabletServerErrorPB::Code code, const string& tablet_id, Resp* resp,
+      rpc::RpcContext* context) {
+    StatusToPB(
+        STATUS_FORMAT(IllegalState, "$0 for tablet $1",
+                      tserver::TabletServerErrorPB::Code_Name(code), tablet_id),
+        resp->mutable_error()->mutable_status());
+    resp->mutable_error()->set_code(code);
+    context->RespondSuccess();
+  }
+
+  // Stands in for the messages a real leader sends its peers. The leader's replica is written
+  // last, so it answers NOT_THE_LEADER until every other replica has the change.
+  void SetOnHollowPeers(
+      const string& tablet_id, const consensus::RaftConfigPB& config, const string& leader_uuid,
+      int64_t term, uint32_t schema_version) {
+    const auto set = [&](const string& uuid) {
+      if (auto* ts = registry_->Find(uuid)) {
+        ts->SetConsensus(tablet_id, config, leader_uuid, term, schema_version);
+      }
+    };
+    for (const auto& peer : config.peers()) {
+      if (peer.permanent_uuid() != leader_uuid) {
+        set(peer.permanent_uuid());
+      }
+    }
+    set(leader_uuid);
+  }
+
   HollowTServerRegistry* registry_;
 };
 
@@ -2415,6 +2767,7 @@ class MasterLoadBench {
       d.arg = path;
       scenario_.push_back(std::move(d));
     }
+    num_sql_files_ = scenario_.size();
     if (!FLAGS_scenario.empty()) {
       auto parsed = VERIFY_RESULT(ParseScenarioFile(FLAGS_scenario));
       scenario_.insert(scenario_.end(), std::make_move_iterator(parsed.begin()),
@@ -2435,6 +2788,10 @@ class MasterLoadBench {
     RETURN_NOT_OK(OpenCsv());
 
     RETURN_NOT_OK(StartMaster());
+    if (!restoring_ || num_sql_files_ > 0) {
+      RETURN_NOT_OK(SetLoadBalancerEnabled(false));
+      load_balancer_paused_ = true;
+    }
     if (!restoring_) {
       // Boot default: what is created before the switch, i.e. the transactions table, lands on
       // the real tserver.
@@ -2473,9 +2830,19 @@ class MasterLoadBench {
       RETURN_NOT_OK(WaitForYsql());
       recorder_thread_ = std::thread([this] { RecorderLoop(); });
     }
+    const auto load_end = scenario_.begin() + num_sql_files_;
     if (!scenario_.empty()) {
       SetPhase("load");
-      RETURN_NOT_OK(RunDirectives(scenario_, /* iter= */ 1));
+      RETURN_NOT_OK(RunDirectives(
+          std::vector<Directive>(scenario_.begin(), load_end), /* iter= */ 1));
+    }
+    // Off for the fresh-start setup and the SQL files; on for the scenario and the idle.
+    if (load_balancer_paused_) {
+      RETURN_NOT_OK(SetLoadBalancerEnabled(true));
+    }
+    if (!scenario_.empty()) {
+      RETURN_NOT_OK(RunDirectives(
+          std::vector<Directive>(load_end, scenario_.end()), /* iter= */ 1));
       LOG(INFO) << "Load complete " << (MonoTime::Now() - start_time_).ToSeconds()
                 << "s after start";
     }
@@ -2490,8 +2857,13 @@ class MasterLoadBench {
         ? MonoTime::Now() + MonoDelta::FromSeconds(FLAGS_run_seconds) : MonoTime::Max();
     LOG(INFO) << "Idle" << (FLAGS_run_seconds > 0 ? Format(" for $0s", FLAGS_run_seconds) : "")
               << "; SIGINT/SIGTERM stops the run";
+    auto next_zone_load = MonoTime::Now();
     while (!g_stop_requested.load(std::memory_order_acquire) && MonoTime::Now() < idle_deadline) {
       RETURN_NOT_OK(CheckMasterAlive());
+      if (MonoTime::Now() >= next_zone_load) {
+        LogZoneLoad();
+        next_zone_load = MonoTime::Now() + MonoDelta::FromSeconds(60);
+      }
       SleepFor(500ms);
     }
     if (!FLAGS_snapshot_dir.empty()) {
@@ -2511,6 +2883,88 @@ class MasterLoadBench {
   }
 
  private:
+  // Appends one row per call to two tables in the data dir: tablets/leaders per zone, and the
+  // load balancer's requests to hollow tservers since the previous row.
+  void LogZoneLoad() {
+    struct Zone {
+      string name;
+      size_t tablets = 0;
+      size_t leaders = 0;
+    };
+    std::vector<std::pair<string, std::vector<Zone>>> regions;
+    for (const auto& ts : registry_.tservers()) {
+      const auto& cloud = ts->cloud_info();
+      auto region = std::ranges::find_if(
+          regions, [&](const auto& r) { return r.first == cloud.placement_region(); });
+      if (region == regions.end()) {
+        region = regions.emplace(regions.end(), cloud.placement_region(), std::vector<Zone>());
+      }
+      auto zone = std::ranges::find_if(
+          region->second, [&](const auto& z) { return z.name == cloud.placement_zone(); });
+      if (zone == region->second.end()) {
+        zone = region->second.emplace(region->second.end(), Zone{cloud.placement_zone()});
+      }
+      zone->tablets += ts->NumTablets();
+      zone->leaders += ts->NumLeaders();
+    }
+    char now[8];
+    const time_t seconds = time(nullptr);
+    struct tm local;
+    localtime_r(&seconds, &local);
+    strftime(now, sizeof(now), "%H:%M", &local);
+
+    const auto first = zone_load_lines_++ == 0;
+    const auto mode = first ? std::ios::trunc : std::ios::app;
+    const auto zone_path = JoinPathSegments(FLAGS_data_dir, "zone-load.txt");
+    const auto request_path = JoinPathSegments(FLAGS_data_dir, "balancer-requests.txt");
+    std::ofstream zone_out(zone_path, mode);
+    std::ofstream request_out(request_path, mode);
+    if (first) {
+      LOG(INFO) << "Per-minute tables: " << zone_path << ", " << request_path;
+      auto region_header = StringPrintf("%-8s", "");
+      auto zone_header = StringPrintf("%-8s", "time");
+      for (const auto& [region, zones] : regions) {
+        region_header += StringPrintf(
+            "%-*s", narrow_cast<int>(kZoneColumn * zones.size()), region.c_str());
+        for (const auto& zone : zones) {
+          // us-east4-a is listed as a under us-east4.
+          const auto prefix = region + "-";
+          const auto name =
+              zone.name.starts_with(prefix) ? zone.name.substr(prefix.size()) : zone.name;
+          zone_header += StringPrintf("%-*s", kZoneColumn, name.c_str());
+        }
+      }
+      zone_out << region_header << "\n" << zone_header << "   (tablets/leaders)\n";
+      request_out << StringPrintf(
+          "%-8s%-16s%-16s%-16s%-16s(received/applied per minute)\n", "time", "AddServer",
+          "RemoveServer", "LeaderStepDown", "DeleteTablet");
+    }
+    zone_out << StringPrintf("%-8s", now);
+    for (const auto& [region, zones] : regions) {
+      for (const auto& zone : zones) {
+        zone_out << StringPrintf(
+            "%-*s", kZoneColumn, Format("$0/$1", zone.tablets, zone.leaders).c_str());
+      }
+    }
+    zone_out << "\n";
+
+    // Received minus applied is what the tablet's leader rejected.
+    const HollowTServerRegistry::RequestCount* counts[] = {
+        &registry_.add_server, &registry_.remove_server, &registry_.leader_step_down,
+        &registry_.delete_tablet};
+    request_out << StringPrintf("%-8s", now);
+    for (size_t i = 0; i < std::size(counts); ++i) {
+      const auto received = counts[i]->received.load();
+      const auto applied = counts[i]->applied.load();
+      request_out << StringPrintf(
+          "%-16s",
+          Format("$0/$1", received - last_requests_[i].first,
+                 applied - last_requests_[i].second).c_str());
+      last_requests_[i] = {received, applied};
+    }
+    request_out << "\n";
+  }
+
   string PidFilePath(const string& name) const {
     return JoinPathSegments(FLAGS_data_dir, name + ".pid");
   }
@@ -2567,7 +3021,7 @@ class MasterLoadBench {
         "--webserver_interface=127.0.0.1",
         Format("--webserver_port=$0", FLAGS_master_web_port),
         Format("--replication_factor=$0", FLAGS_replication_factor),
-        "--enable_load_balancing=false",
+        "--enable_load_balancing=true",
         "--enable_ysql=true",
         "--max_create_tablets_per_ts=1000000",
         "--callhome_enabled=false",
@@ -2739,6 +3193,13 @@ class MasterLoadBench {
         /* max_tasks= */ 10000, [pool = service_thread_pool_](auto) { return pool; },
         &messenger_->scheduler(), std::move(generic_service), messenger_->metric_entity());
     RETURN_NOT_OK(messenger_->RegisterService(generic_service_name, generic_service_pool_));
+
+    auto consensus_service = std::make_unique<HollowConsensusService>(metric_entity_, &registry_);
+    const auto consensus_service_name = consensus_service->service_name();
+    consensus_service_pool_ = make_scoped_refptr<rpc::ServicePool>(
+        /* max_tasks= */ 10000, [pool = service_thread_pool_](auto) { return pool; },
+        &messenger_->scheduler(), std::move(consensus_service), messenger_->metric_entity());
+    RETURN_NOT_OK(messenger_->RegisterService(consensus_service_name, consensus_service_pool_));
 
     RETURN_NOT_OK(messenger_->StartAcceptor());
     LOG(INFO) << "Started " << FLAGS_num_tservers << " hollow tservers";
@@ -3353,6 +3814,19 @@ class MasterLoadBench {
     return ri;
   }
 
+  Status SetLoadBalancerEnabled(bool enabled) {
+    master::ChangeLoadBalancerStateRequestPB req;
+    req.set_is_enabled(enabled);
+    master::ChangeLoadBalancerStateResponsePB resp;
+    rpc::RpcController controller;
+    controller.set_timeout(30s);
+    RETURN_NOT_OK(cluster_proxy_->ChangeLoadBalancerState(req, &resp, &controller));
+    SCHECK(!resp.has_error(), RuntimeError, "ChangeLoadBalancerState: $0",
+           resp.error().ShortDebugString());
+    LOG(INFO) << "Load balancer " << (enabled ? "enabled" : "disabled");
+    return Status::OK();
+  }
+
   Status SetClusterPlacement(const ReplicationInfoPB& replication) {
     master::GetMasterClusterConfigRequestPB get_req;
     master::GetMasterClusterConfigResponsePB get_resp;
@@ -3389,19 +3863,23 @@ class MasterLoadBench {
   // under the boot default it lands on the real tserver. The table-level override keeps it
   // there after the default switches to the hollow zones.
   Status WaitForTransactionsTableAndPin() {
-    const client::YBTableName table_name(
-        YQL_DATABASE_CQL, master::kSystemNamespaceName, kGlobalTransactionsTableName);
-    RETURN_NOT_OK(WaitForTableRunning(table_name));
-    LOG(INFO) << table_name.ToString() << " is running; pinning it to " << kRealTServerZone;
-    auto alterer = VERIFY_RESULT(Client())->NewTableAlterer(table_name);
-    return alterer->replication_info(RealTServerReplication())->Alter();
+    // The master creates the advisory lock and auto analyze tables in the same pass; the real
+    // tserver serves them too.
+    for (const string name :
+         {kGlobalTransactionsTableName, "pg_advisory_locks", "pg_auto_analyze_table"}) {
+      const client::YBTableName table_name(YQL_DATABASE_CQL, master::kSystemNamespaceName, name);
+      RETURN_NOT_OK(WaitForTableRunning(table_name));
+      LOG(INFO) << table_name.ToString() << " is running; pinning it to " << kRealTServerZone;
+      auto alterer = VERIFY_RESULT(Client())->NewTableAlterer(table_name);
+      RETURN_NOT_OK(alterer->replication_info(RealTServerReplication())->Alter());
+    }
+    return Status::OK();
   }
 
   // Sequence values are rows in system_postgres.sequences_data, a data table the tserver
   // creates on first use and then writes through the regular tablet service, which hollow
-  // tservers do not serve. Force the creation now so it also lands on the real tserver. The
-  // master rejects table-level placement for YSQL tables, so with the load balancer on this
-  // table would need another way to stay put.
+  // tservers do not serve. Force the creation now so it also lands on the real tserver, where
+  // the SQL files can write it; the load balancer moves it to hollow tservers afterwards.
   Status CreateSequencesDataTable() {
     RETURN_NOT_OK(WaitForYsql());
     const auto exit_code = VERIFY_RESULT(Ysqlsh(
@@ -3828,7 +4306,8 @@ class MasterLoadBench {
       SCHECK_FORMAT(out.good(), IOError, "Cannot write $0", tablets_path);
       for (const auto& [tablet_id, entry] : tablets) {
         out << tablet_id << "\t" << entry.schema_version << "\t"
-            << b2a_hex(entry.config.SerializeAsString()) << "\n";
+            << b2a_hex(entry.config.SerializeAsString()) << "\t" << entry.term << "\t"
+            << entry.leader_uuid << "\n";
       }
     }
     RETURN_NOT_OK(Env::Default()->RenameFile(tablets_path + ".tmp", tablets_path));
@@ -3849,6 +4328,8 @@ class MasterLoadBench {
     }
     RETURN_NOT_OK(StopProcess(&tserver_process_, "tserver"));
     RETURN_NOT_OK(StopProcess(&master_process_, "master"));
+    // The load balancer may have changed hollow tablets since the registry was written.
+    RETURN_NOT_OK(WriteRegistry());
 
     RETURN_NOT_OK(ResetDir(FLAGS_snapshot_dir));
     for (const auto* entry : {kMasterDataDir, kTServerDataDir, kSnapshotTablets, kSnapshotMeta}) {
@@ -3892,9 +4373,14 @@ class MasterLoadBench {
     size_t count = 0;
     for (string line; std::getline(in, line);) {
       const std::vector<string> fields = strings::Split(line, "\t");
-      SCHECK_FORMAT(fields.size() == 3, Corruption, "Bad registry line: $0", line);
+      SCHECK_FORMAT(fields.size() >= 3 && fields.size() <= 5, Corruption,
+                    "Bad registry line: $0", line);
       const auto& tablet_id = fields[0];
       const auto schema_version = VERIFY_RESULT(CheckedStoInt<uint32_t>(fields[1]));
+      int64_t term = 1;
+      if (fields.size() >= 4) {
+        term = VERIFY_RESULT(CheckedStoll(fields[3]));
+      }
       consensus::RaftConfigPB config;
       SCHECK(config.ParseFromString(a2b_hex(fields[2])), Corruption,
              "Bad config for tablet $0", tablet_id);
@@ -3902,7 +4388,11 @@ class MasterLoadBench {
         auto* ts = registry_.Find(peer.permanent_uuid());
         SCHECK(ts != nullptr, NotFound, "Tablet $0 names unknown tserver $1", tablet_id,
                peer.permanent_uuid());
-        ts->AddTablet(tablet_id, config, schema_version);
+        if (fields.size() == 5) {
+          ts->SetConsensus(tablet_id, config, fields[4], term, schema_version);
+        } else {
+          ts->AddTablet(tablet_id, config, schema_version, term);
+        }
       }
       ++count;
     }
@@ -4128,6 +4618,9 @@ class MasterLoadBench {
     if (generic_service_pool_) {
       generic_service_pool_->Shutdown();
     }
+    if (consensus_service_pool_) {
+      consensus_service_pool_->Shutdown();
+    }
     if (messenger_) {
       messenger_->Shutdown();
     }
@@ -4171,6 +4664,10 @@ class MasterLoadBench {
   scoped_refptr<rpc::ServicePool> service_pool_;
   scoped_refptr<rpc::ServicePool> ts_service_pool_;
   scoped_refptr<rpc::ServicePool> generic_service_pool_;
+  scoped_refptr<rpc::ServicePool> consensus_service_pool_;
+  static constexpr int kZoneColumn = 12;
+  int zone_load_lines_ = 0;
+  std::pair<int64_t, int64_t> last_requests_[4];
   HollowTServerRegistry registry_;
 
   std::mutex universe_uuid_mutex_;
@@ -4205,6 +4702,8 @@ class MasterLoadBench {
   std::vector<int> allocation_;
   std::vector<Directive> scenario_;
   bool restoring_ = false;
+  size_t num_sql_files_ = 0;
+  bool load_balancer_paused_ = false;
   std::mutex db_mutex_;
   string current_db_ GUARDED_BY(db_mutex_) = "yugabyte";
 
