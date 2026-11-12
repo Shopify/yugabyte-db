@@ -77,6 +77,7 @@ void RpcController::Swap(RpcController* other) {
   std::swap(lane_, other->lane_);
   std::swap(issuing_lane_, other->issuing_lane_);
   std::swap(issuing_lane_recorded_, other->issuing_lane_recorded_);
+  std::swap(issuing_lane_pinned_, other->issuing_lane_pinned_);
 }
 
 void RpcController::Reset() {
@@ -89,6 +90,9 @@ void RpcController::Reset() {
 }
 
 void RpcController::RecordIssuingLane() {
+  if (issuing_lane_pinned_) {
+    return;
+  }
   if (!issuing_lane_recorded_ || !Reactor::IsReactorThread()) {
     issuing_lane_ = ThisThreadLane();
     issuing_lane_recorded_ = true;

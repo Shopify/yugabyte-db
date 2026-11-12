@@ -182,6 +182,7 @@ AsyncRpc::AsyncRpc(
       wait_state_(ash::WaitStateInfo::CurrentWaitState()) {
   mutable_retrier()->mutable_controller()->set_allow_local_calls_in_curr_thread(
       data.allow_local_calls_in_curr_thread);
+  tablet_invoker_.set_issuing_lane(data.batcher->issuing_lane());
 }
 
 AsyncRpc::~AsyncRpc() {
@@ -1154,6 +1155,7 @@ WaitForAsyncWriteRpc::WaitForAsyncWriteRpc(
   }
 
   op_id_.ToPB(req_.mutable_op_id());
+  tablet_invoker_.set_issuing_lane(batcher->issuing_lane());
 }
 
 void WaitForAsyncWriteRpc::SendRpc() {

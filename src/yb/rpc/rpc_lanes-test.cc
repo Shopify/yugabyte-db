@@ -744,6 +744,55 @@ TEST_F(RpcLanesTest, CallbackRunsInIssuingLane) {
   server.Shutdown();
 }
 
+// A pinned issuing lane decides the callback pool for every later send, from any thread, and is
+// kept across Reset().
+TEST_F(RpcLanesTest, PinnedIssuingLane) {
+  SKIP_WITHOUT_TOPOLOGY();
+  TEST_SetLaneTopology scope(*topology_);
+  auto server = StartServer();
+  auto client = rpc::CreateAutoShutdownMessengerHolder(
+      ASSERT_RESULT(LanedBuilder("Client", *topology_).Build()));
+  Proxy proxy(client.get(), HostPort::FromBoundEndpoint(server.bound_endpoint()));
+
+  RpcController controller;
+  controller.set_issuing_lane(0);
+  ThreadView view;
+  RunInLane(1, [&] {
+    view = WhoAmIAsync(&proxy, &controller);
+  });
+  ASSERT_EQ(controller.issuing_lane(), 0);
+  ASSERT_EQ(view.lane, 0);
+  ASSERT_TRUE(view.os_name.starts_with("L000_rpc_")) << view.os_name;
+
+  controller.Reset();
+  rpc_test::WhoAmIRequestPB req;
+  rpc_test::WhoAmIResponsePB resp;
+  CountDownLatch done(1);
+  RunOnReactor(client->ReactorsOfLane(1)[0].get(), [&] {
+    proxy.AsyncRequest(
+        &WhoAmIMethod(), /* method_metrics= */ nullptr, req, &resp, &controller,
+        [&view, &done] {
+          view = ViewThisThread();
+          done.CountDown();
+        });
+  });
+  done.Wait();
+  ASSERT_OK(controller.status());
+  ASSERT_EQ(controller.issuing_lane(), 0);
+  ASSERT_EQ(view.lane, 0);
+
+  // Pinning kNoLane selects today's pools from a lane thread.
+  controller.Reset();
+  controller.set_issuing_lane(kNoLane);
+  RunInLane(1, [&] {
+    view = WhoAmIAsync(&proxy, &controller);
+  });
+  ASSERT_EQ(controller.issuing_lane(), kNoLane);
+  ASSERT_EQ(view.lane, kNoLane);
+  ASSERT_TRUE(view.os_name.starts_with("Client_")) << view.os_name;
+  server.Shutdown();
+}
+
 namespace {
 
 // Sends WhoAmI with lane hint 1 through an RpcRetrier, which retries the first attempt from a

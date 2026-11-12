@@ -19,6 +19,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "yb/client/client_fwd.h"
 
@@ -35,6 +36,7 @@
 #include "yb/tserver/pg_client.service.h"
 #include "yb/tserver/pg_txn_snapshot_manager.h"
 
+#include "yb/util/lanes.h"
 #include "yb/util/monotime.h"
 
 namespace yb {
@@ -180,9 +182,21 @@ class PgClientServiceImpl : public PgClientServiceIf {
   // session has recorded none yet, nullopt if no session belongs to that pid.
   std::optional<PgOid> TEST_SessionDatabaseOid(pid_t pid);
 
-  // Cumulative number of worker threads ever created by the shared memory exchange thread pool.
-  // Used to verify that the pool reuses threads across postgres connections.
+  // Number of live sessions in each lane of the server's messenger; empty unless it is laned.
+  std::vector<size_t> SessionsPerLane() const;
+
+  // Lane of the session of the backend with the given pid: kNoLane unless the messenger is laned,
+  // nullopt if no session belongs to that pid.
+  std::optional<LaneId> TEST_SessionLane(pid_t pid);
+
+  // Cumulative number of worker threads ever created by the shared memory exchange thread pools,
+  // summed over the pools. Used to verify that the pools reuse threads across postgres
+  // connections.
   size_t TEST_ExchangeThreadPoolWorkersCreated();
+
+  // Number of shared memory exchange thread pools created so far: 0 before the first shared
+  // memory session, then one per lane of a laned messenger, else one.
+  size_t TEST_NumExchangeThreadPools();
 
   // Allows shared-memory RPCs to consult the same mock registry as the network path.
   // Non-owning. The mock must outlive this service.

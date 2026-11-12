@@ -91,6 +91,8 @@
 
 #include "yb/util/debug-util.h"
 #include "yb/util/flags/flag_tags.h"
+#include "yb/util/format.h"
+#include "yb/util/lanes.h"
 #include "yb/util/logging.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/random_util.h"
@@ -241,12 +243,16 @@ class LockablePgClientSession {
   pid_t pid() const { return session_.pid(); }
   PgOid TEST_database_oid() const { return session_.TEST_database_oid(); }
 
+  // Lane the session's exchange and follow-up work run in; kNoLane unless the messenger is laned.
+  LaneId lane() const { return lane_; }
+
   template <class... Args>
   explicit LockablePgClientSession(
       CoarseDuration lifetime, SharedThisSource shared_this_source, rpc::Messenger& messenger,
-      Args&&... args)
+      LaneId lane, Args&&... args)
       : shared_this_{SharedField(shared_this_source, this)},
         messenger_(messenger),
+        lane_(lane),
         guard_state_{mutex_, [this](auto arg) { OnBeforeReleasingSessionLock(arg); }},
         session_(std::move(shared_this_source), messenger.scheduler(), std::forward<Args>(args)...),
         lifetime_(lifetime), expiration_(NewExpiration()),
@@ -423,7 +429,9 @@ class LockablePgClientSession {
       }
     };
 
-    if (!messenger_.ThreadPool().EnqueueFunctor(std::move(functor))) {
+    // In the session's lane: this can run once per operation.
+    if (!messenger_.ThreadPool(rpc::ServicePriority::kNormal, lane_).EnqueueFunctor(
+            std::move(functor))) {
       process_pending_requests_scheduled_.store(false, std::memory_order_release);
     }
   }
@@ -454,6 +462,7 @@ class LockablePgClientSession {
 
   const std::weak_ptr<LockablePgClientSession> shared_this_;
   rpc::Messenger& messenger_;
+  const LaneId lane_;
   std::mutex mutex_;
   PgSessionGuardState guard_state_;
   PgSessionSharedMemoryManager shared_mem_manager_;
@@ -498,12 +507,13 @@ class SessionInfo : public ClientSession {
   template <class... Args>
   static auto Make(
       rw_spinlock& txn_assignment_mutex, CoarseDuration lifetime, const TransactionBuilder& builder,
-      rpc::Messenger& messenger, Args&&... args) {
+      rpc::Messenger& messenger, LaneId lane, Args&&... args) {
     auto session_info = std::make_shared<SessionInfo>(txn_assignment_mutex, PrivateTag{});
     session_info->session_.emplace(
         lifetime,
         session_info,
         messenger,
+        lane,
         [&builder, txn_assignment = &session_info->txn_assignment_](auto&&... builder_args) {
           return builder(txn_assignment, std::forward<decltype(builder_args)>(builder_args)...);
         },
@@ -835,6 +845,9 @@ class PgClientServiceImpl::Impl : public SessionProvider, public SessionRegistry
                   "Cleanup shared memory failed");
     }
     shared_mem_pool_.Start(messenger->scheduler());
+    if (messenger_.laned()) {
+      lane_session_counts_ = std::vector<std::atomic<size_t>>(messenger_.num_lanes());
+    }
   }
 
   void Shutdown() {
@@ -851,9 +864,7 @@ class PgClientServiceImpl::Impl : public SessionProvider, public SessionRegistry
     for (auto& task : schedulers) {
       task.get().CompleteShutdown();
     }
-    if (exchange_thread_pool_) {
-      exchange_thread_pool_->Shutdown();
-    }
+    ForEachExchangeThreadPool([](YBThreadPool& pool) { pool.Shutdown(); });
   }
 
   ~Impl() override {
@@ -880,10 +891,11 @@ class PgClientServiceImpl::Impl : public SessionProvider, public SessionRegistry
     }
 
     auto session_id = session_registry_.NewSessionId();
+    const auto lane = SessionLane(session_id);
     auto session_info = SessionInfo::Make(
         txns_assignment_mutexes_[session_id % txns_assignment_mutexes_.size()],
-        FLAGS_pg_client_session_expiration_ms * 1ms, transaction_builder_, messenger_, client(),
-        session_context_, session_id, req.pid(), lease_epoch(),
+        FLAGS_pg_client_session_expiration_ms * 1ms, transaction_builder_, messenger_, lane,
+        client(), session_context_, session_id, req.pid(), lease_epoch(),
         tablet_server_.ts_local_lock_manager(), tablet_server_.AllocateObjectLockSharedState());
     resp->set_session_id(session_id);
     if (const auto v = tablet_server_.cluster_config_version(); req.cluster_config_version() < v) {
@@ -892,15 +904,8 @@ class PgClientServiceImpl::Impl : public SessionProvider, public SessionRegistry
       *cluster_config_pb.mutable_replication_info() = tablet_server_.GetClusterReplicationInfo();
     }
     if (FLAGS_pg_client_use_shared_memory) {
-      std::call_once(exchange_thread_pool_once_flag_, [this] {
-        exchange_thread_pool_ = std::make_unique<YBThreadPool>(ThreadPoolOptions {
-          .name = "shmem_exchange",
-          .max_workers = ThreadPoolOptions::kUnlimitedWorkersWithoutQueue,
-          .min_workers = 1,
-          .idle_timeout = MonoDelta::FromMilliseconds(FLAGS_shmem_exchange_idle_timeout_ms),
-        });
-      });
-      auto status = session_info->session().StartExchange(instance_id_, *exchange_thread_pool_);
+      std::call_once(exchange_thread_pools_once_flag_, [this] { CreateExchangeThreadPools(); });
+      auto status = session_info->session().StartExchange(instance_id_, ExchangeThreadPool(lane));
       if (status.ok()) {
         resp->set_instance_id(instance_id_);
       } else {
@@ -913,7 +918,59 @@ class PgClientServiceImpl::Impl : public SessionProvider, public SessionRegistry
       ScheduleCheckSessionShutdown(pid, session_id, CoarseMonoClock::Now() + kCheckTimeout);
     });
 
-    return session_registry_.Insert(std::move(session_info));
+    RETURN_NOT_OK(session_registry_.Insert(std::move(session_info)));
+    if (!lane_session_counts_.empty()) {
+      lane_session_counts_[lane % lane_session_counts_.size()].fetch_add(
+          1, std::memory_order_relaxed);
+    }
+    return Status::OK();
+  }
+
+  // Round-robin over the messenger's lanes, since session ids are sequential.
+  LaneId SessionLane(uint64_t session_id) const {
+    return messenger_.laned()
+        ? static_cast<LaneId>(session_id % messenger_.num_lanes()) : kNoLane;
+  }
+
+  // One pool per lane of a laned messenger, else a single unlaned pool. Each session's exchange
+  // is a long-running task, one worker per session.
+  void CreateExchangeThreadPools() {
+    const auto idle_timeout = MonoDelta::FromMilliseconds(FLAGS_shmem_exchange_idle_timeout_ms);
+    if (!messenger_.laned()) {
+      exchange_thread_pools_.push_back(std::make_unique<YBThreadPool>(ThreadPoolOptions {
+        .name = "shmem_exchange",
+        .max_workers = ThreadPoolOptions::kUnlimitedWorkersWithoutQueue,
+        .min_workers = 1,
+        .idle_timeout = idle_timeout,
+      }));
+      return;
+    }
+    exchange_thread_pools_.reserve(messenger_.num_lanes());
+    for (size_t index = 0; index != messenger_.num_lanes(); ++index) {
+      const auto lane = static_cast<LaneId>(index);
+      // Linux shows the first 15 characters of a thread name, so worker names start with the lane.
+      const auto lane_name = Format("L$0", ZeroPadded(lane, 3));
+      // No persistent worker: it would hold a thread per lane, and every worker hosts a session.
+      exchange_thread_pools_.push_back(std::make_unique<YBThreadPool>(ThreadPoolOptions {
+        .name = Format("shmem_exchange_$0", lane_name),
+        .max_workers = ThreadPoolOptions::kUnlimitedWorkersWithoutQueue,
+        .min_workers = 0,
+        .idle_timeout = idle_timeout,
+        .lane = lane,
+        .worker_name_prefix = lane_name + "_shmem",
+      }));
+    }
+  }
+
+  YBThreadPool& ExchangeThreadPool(LaneId lane) {
+    return *exchange_thread_pools_[
+        lane == kNoLane ? 0 : lane % exchange_thread_pools_.size()];
+  }
+
+  void ForEachExchangeThreadPool(const std::function<void(YBThreadPool&)>& f) {
+    for (auto& pool : exchange_thread_pools_) {
+      f(*pool);
+    }
   }
 
   void ScheduleCheckSessionShutdown(pid_t pid, int64_t session_id, CoarseTimePoint deadline) {
@@ -3029,7 +3086,35 @@ class PgClientServiceImpl::Impl : public SessionProvider, public SessionRegistry
   }
 
   size_t TEST_ExchangeThreadPoolWorkersCreated() {
-    return exchange_thread_pool_ ? exchange_thread_pool_->TEST_NumWorkersCreated() : 0;
+    size_t result = 0;
+    ForEachExchangeThreadPool([&result](YBThreadPool& pool) {
+      result += pool.TEST_NumWorkersCreated();
+    });
+    return result;
+  }
+
+  size_t TEST_NumExchangeThreadPools() {
+    size_t result = 0;
+    ForEachExchangeThreadPool([&result](YBThreadPool&) { ++result; });
+    return result;
+  }
+
+  std::optional<LaneId> TEST_SessionLane(pid_t pid) {
+    for (const auto& session_info : session_registry_.Snapshot()) {
+      if (session_info->session().pid() == pid) {
+        return session_info->session().lane();
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::vector<size_t> SessionsPerLane() const {
+    std::vector<size_t> result;
+    result.reserve(lane_session_counts_.size());
+    for (const auto& count : lane_session_counts_) {
+      result.push_back(count.load(std::memory_order_relaxed));
+    }
+    return result;
   }
 
   void TEST_SetMockService(PgClientServiceMockImpl* mock) {
@@ -3077,6 +3162,11 @@ class PgClientServiceImpl::Impl : public SessionProvider, public SessionRegistry
 
   void SessionShutdownStarted(const ClientSessionPtr& session) override {
     txn_snapshot_manager_.UnregisterAll(session->id());
+    if (!lane_session_counts_.empty()) {
+      const auto lane = std::static_pointer_cast<SessionInfo>(session)->session().lane();
+      lane_session_counts_[lane % lane_session_counts_.size()].fetch_sub(
+          1, std::memory_order_relaxed);
+    }
   }
 
   void SessionsRemoved(std::vector<uint64_t>&& session_ids) override {
@@ -3181,8 +3271,12 @@ class PgClientServiceImpl::Impl : public SessionProvider, public SessionRegistry
   PgSequenceCache sequence_cache_;
 
   const std::string instance_id_;
-  std::once_flag exchange_thread_pool_once_flag_;
-  std::unique_ptr<YBThreadPool> exchange_thread_pool_;
+  std::once_flag exchange_thread_pools_once_flag_;
+  std::vector<std::unique_ptr<YBThreadPool>> exchange_thread_pools_;
+
+  // Live sessions per lane, empty unless the messenger is laned. Written at session creation and
+  // expiry only.
+  std::vector<std::atomic<size_t>> lane_session_counts_;
 
   PgSharedMemoryPool shared_mem_pool_;
 
@@ -3251,6 +3345,18 @@ std::optional<PgOid> PgClientServiceImpl::TEST_SessionDatabaseOid(pid_t pid) {
 
 size_t PgClientServiceImpl::TEST_ExchangeThreadPoolWorkersCreated() {
   return impl_->TEST_ExchangeThreadPoolWorkersCreated();
+}
+
+size_t PgClientServiceImpl::TEST_NumExchangeThreadPools() {
+  return impl_->TEST_NumExchangeThreadPools();
+}
+
+std::optional<LaneId> PgClientServiceImpl::TEST_SessionLane(pid_t pid) {
+  return impl_->TEST_SessionLane(pid);
+}
+
+std::vector<size_t> PgClientServiceImpl::SessionsPerLane() const {
+  return impl_->SessionsPerLane();
 }
 
 void PgClientServiceImpl::TEST_SetMockService(PgClientServiceMockImpl* mock) {

@@ -11,19 +11,25 @@
 // under the License.
 //
 
-// Tablet pipelines and Raft traffic of tablet servers with CPU lanes.
+// Tablet pipelines, Raft traffic and embedded-client callbacks of tablet servers with CPU lanes.
 
+#include <array>
 #include <map>
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "yb/client/client.h"
+#include "yb/client/ql-dml-test-base.h"
 #include "yb/client/session.h"
 #include "yb/client/table_handle.h"
 #include "yb/client/yb_op.h"
+
+#include "yb/common/ql_protocol_util.h"
 
 #include "yb/consensus/log.h"
 #include "yb/consensus/raft_consensus.h"
@@ -58,6 +64,8 @@
 #include "yb/util/test_macros.h"
 #include "yb/util/tsan_util.h"
 
+DECLARE_int32(force_lookup_cache_refresh_secs);
+DECLARE_int32(master_inject_latency_on_tablet_lookups_ms);
 DECLARE_string(TEST_cpu_topology_cpuset);
 DECLARE_string(TEST_cpu_topology_sysfs_root);
 DECLARE_int32(tserver_lanes);
@@ -116,11 +124,35 @@ Result<std::vector<std::pair<rpc::ConnectionId, LaneId>>> ClientConnections(
   return result;
 }
 
+struct LaneFlush {
+  CountDownLatch done{1};
+  LaneId start_lane = kNoLane;
+  LaneId callback_lane = kNoLane;
+  Status status;
+};
+
+// Flushes session from a worker of lane's normal handler pool and records the lanes of the thread
+// that flushed and of the thread that ran the flush callback.
+Status StartFlushInLane(
+    rpc::Messenger* messenger, LaneId lane, const client::YBSessionPtr& session,
+    LaneFlush* result) {
+  SCHECK(messenger->ThreadPool(rpc::ServicePriority::kNormal, lane).EnqueueFunctor(
+      [session, result] {
+        result->start_lane = ThisThreadLane();
+        session->FlushAsync([result](client::FlushStatus* status) {
+          result->callback_lane = ThisThreadLane();
+          result->status = status->status;
+          result->done.CountDown();
+        });
+      }), IllegalState, "Failed to enqueue flush");
+  return Status::OK();
+}
+
 } // namespace
 
 // MiniCluster of three tablet servers with forced 4 lanes over a fake topology of two 2-CPU L3
-// domains laid over CPUs 0-3. Tables are not transactional, so the only outbound calls tablet
-// servers make from lane threads are Raft calls.
+// domains laid over CPUs 0-3. Tables are not transactional, so the test client's writes make
+// tablet servers send only Raft calls from lane threads.
 class TserverLanesITest : public TabletSplitITest {
  protected:
   void SetUp() override {
@@ -276,6 +308,71 @@ TEST_F(TserverLanesITest, RaftStaysInTabletLane) {
     }
   }
   ASSERT_GT(master_connections, 0);
+}
+
+// The server client's tablet RPCs call back in the lane that flushed them even when the tablet
+// lookup they waited for was started by, and completed in, another lane: the master delays lookups
+// so that lane 1's lookup joins the one lane 0 started, and lane 0's thread completes both. Without
+// the carried issuing lane, lane 1's RPC is sent from lane 0's thread and calls back in lane 0.
+TEST_F(TserverLanesITest, CallbackInIssuingLaneAfterSharedLookup) {
+  SetNumTablets(1);
+  CreateTable();
+  ASSERT_OK(WaitAllReplicasReady(cluster_.get(), table_->id(), 30s * kTimeMultiplier));
+  auto* server = cluster_->mini_tablet_server(0)->server();
+  auto* client = server->client();
+  ASSERT_TRUE(client->messenger()->laned());
+  client::TableHandle table;
+  ASSERT_OK(table.Open(table_->name(), client));
+  static constexpr int32_t kLookupLatencyMs = 1000;
+  static constexpr auto kSecondStartDelay = 200ms;
+
+  auto run_pair = [client, server](
+      const std::function<void(const client::YBSessionPtr&, int32_t)>& apply) -> Status {
+    std::array<LaneFlush, 2> flushes;
+    std::array<client::YBSessionPtr, 2> sessions;
+    for (LaneId lane = 0; lane != 2; ++lane) {
+      sessions[lane] = client->NewSession(60s * kTimeMultiplier);
+      apply(sessions[lane], static_cast<int32_t>(lane) + 1);
+    }
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_master_inject_latency_on_tablet_lookups_ms) =
+        kLookupLatencyMs;
+    RETURN_NOT_OK(StartFlushInLane(server->messenger(), 0, sessions[0], &flushes[0]));
+    std::this_thread::sleep_for(kSecondStartDelay);
+    RETURN_NOT_OK(StartFlushInLane(server->messenger(), 1, sessions[1], &flushes[1]));
+    for (auto& flush : flushes) {
+      SCHECK(flush.done.WaitFor(60s * kTimeMultiplier), TimedOut, "Flush did not finish");
+    }
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_master_inject_latency_on_tablet_lookups_ms) = 0;
+    for (LaneId lane = 0; lane != 2; ++lane) {
+      RETURN_NOT_OK(flushes[lane].status);
+      SCHECK_EQ(flushes[lane].start_lane, lane, IllegalState, "Flush started in another lane");
+      SCHECK_EQ(
+          flushes[lane].callback_lane, lane, IllegalState,
+          Format("Flush started in lane $0 called back in lane $1", lane,
+                 flushes[lane].callback_lane));
+    }
+    return Status::OK();
+  };
+
+  // Writes with a cold meta cache: lane 1's batcher waits for lane 0's lookup by key and creates
+  // its RPC on the thread that completes it.
+  ASSERT_OK(run_pair([&table](const client::YBSessionPtr& session, int32_t key) {
+    CHECK_OK(client::kv_table_test::WriteRow(
+        &table, session, key, key, client::WriteOpType::INSERT, client::Flush::kFalse));
+  }));
+
+  // Consistent-prefix reads that refresh the cached locations: lane 1's invoker waits for lane 0's
+  // lookup by id and resends from the thread that completes it.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_lookup_cache_refresh_secs) = 1;
+  std::this_thread::sleep_for(1500ms);
+  ASSERT_OK(run_pair([&table](const client::YBSessionPtr& session, int32_t key) {
+    auto op = table.NewReadOp(session->arena());
+    QLAddInt32HashValue(op->mutable_request(), key);
+    table.AddColumns({client::kv_table_test::kValueColumn}, op->mutable_request());
+    op->set_yb_consistency_level(YBConsistencyLevel::CONSISTENT_PREFIX);
+    session->Apply(op);
+  }));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_lookup_cache_refresh_secs) = 0;
 }
 
 // Split children and a remote-bootstrapped replica run in the lanes of their own tablet ids.

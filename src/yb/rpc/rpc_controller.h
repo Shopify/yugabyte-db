@@ -190,8 +190,17 @@ class RpcController {
   // from a reactor thread keeps the lane recorded by an earlier send, so that a retry rescheduled
   // on any reactor (RpcRetrier, Messenger::ScheduleOnReactor) calls back in the lane that issued
   // the call; a first send, or a send from any other thread, records the sending thread's lane.
-  // Kept across Reset().
+  // A lane set by set_issuing_lane overrides that rule for every later send. Kept across Reset().
   LaneId issuing_lane() const { return issuing_lane_; }
+
+  // Makes lane the issuing lane of every later send, whichever thread sends: for a caller whose
+  // command was started by a thread of that lane but may be resent from another lane's thread,
+  // such as the completion of a shared asynchronous lookup. kNoLane selects the unlaned pools.
+  // Kept across Reset().
+  void set_issuing_lane(LaneId lane) {
+    issuing_lane_ = lane;
+    issuing_lane_pinned_ = true;
+  }
 
   // Lets the next local call time out at its deadline instead of waiting for the handler.
   // The handler could still use the request and response after that, so holder must keep them
@@ -227,6 +236,7 @@ class RpcController {
   LaneId lane_ = kNoLane;
   LaneId issuing_lane_ = kNoLane;
   bool issuing_lane_recorded_ = false;
+  bool issuing_lane_pinned_ = false;
 
   // Taken by the next call, so it does not stay referenced from the controller.
   std::shared_ptr<void> local_call_buffers_holder_;
