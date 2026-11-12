@@ -44,8 +44,9 @@ namespace yb {
 // is updated rarely relative to how often it is read; a cold MetaCache filling under load takes
 // this path once per missed tablet.
 //
-// Readers and writers spin briefly, then yield (boost::detail::yield, as rw_semaphore). Critical sections are expected to be short (map
-// lookups and updates); the lock is not for holding across I/O.
+// Readers and writers spin briefly, then yield (boost::detail::yield, as rw_semaphore). Critical
+// sections are expected to be short (map lookups and updates); the lock is not for holding
+// across I/O.
 //
 // A thread must unlock_shared on the slot it lock_shared'ed: the slot is the calling thread's
 // lane, which ApplyLaneToCurrentThread sets once per thread and does not change while the thread
