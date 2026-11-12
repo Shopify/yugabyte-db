@@ -236,6 +236,11 @@ The previous Shopify release whose cherry-picks are reused is the highest lower
 release in any series, so a series' first Shopify release reuses them from an
 earlier series and later ones reuse them from their own.
 
+The candidate lands in its release branch through a release PR, which keeps every
+cherry-pick with a merge commit; [shopify-create-pr](../../../.claude/skills/shopify-create-pr/SKILL.md)
+§ Release PRs gives its title, when to create the release branch, and why the PR is
+never squashed.
+
 `test_release.py` runs under the same `unittest discover` command as above.
 
 ## Upstream submission (planned)

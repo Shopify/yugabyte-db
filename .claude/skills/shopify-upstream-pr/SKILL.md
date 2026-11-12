@@ -152,12 +152,13 @@ commits, so the copy found there is adapted to current upstream; the PR's `merge
 stays reachable but older. Until a sync has done so, the commit is the `mergeCommit`
 from `gh pr view <n> --repo Shopify/yugabyte-db --json mergeCommit`.
 
-Fork PRs squash-merge (the `shopify-create-pr` skill), so that commit holds the whole
-PR: `git cherry-pick -x <commit>`, then `git commit --amend` for the subject. A landing
-that is not a single squash commit is cherry-picked from its own commits with `-n` and
-recommitted with `git commit --author="<original author>" -F <message-file>` and a
-`Co-authored-by:` trailer per other author; `upstream.py submit` will refuse such a
-landing with a message. Confirm with `git diff <base>` against
+Fork PRs squash-merge ([shopify-create-pr](../shopify-create-pr/SKILL.md)), so that
+commit holds the whole PR: `git cherry-pick -x <commit>`, then `git commit --amend` for
+the subject. A landing that is not a single squash commit is cherry-picked from its own
+commits with `-n` and recommitted with
+`git commit --author="<original author>" -F <message-file>` and a `Co-authored-by:`
+trailer per other author; `upstream.py submit` will refuse such a landing with a
+message. Confirm with `git diff <base>` against
 `gh pr diff <n> --repo Shopify/yugabyte-db`. The subject is the Step 4 title, and any
 bare `#N` in copied text becomes a full fork URL without its closing keyword: a fork
 number pushed upstream links to an unrelated upstream issue, and upstream's squash
