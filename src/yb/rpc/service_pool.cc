@@ -452,7 +452,7 @@ class ServicePoolImpl final : public InboundCallHandler {
 
   void CallDequeued(LaneId lane) override {
     if (num_lanes_) {
-      LaneSlotDecrement(LaneQueueOf(lane));
+      LaneSlotDecrement(LaneIndex(lane));
     } else {
       queued_calls_.fetch_sub(1, std::memory_order_relaxed);
     }
@@ -462,17 +462,22 @@ class ServicePoolImpl final : public InboundCallHandler {
   struct LaneQueue;
 
   // Admission of a laned pool. A call is counted in its lane's slot and admitted while that slot
-  // is below its share of the limit and no lane is over its share; otherwise (near overload) the
-  // slots are summed and the call admitted while the sum stays within the limit. So on the
-  // normal path nothing shared is written, a hot lane can use the whole limit while the others
-  // are idle, and the queue never holds more than max(limit, L x share) <= limit + L - 1 calls,
-  // where share is ceil(limit / L). lanes_over_share_ counts slots above their share; it is
-  // written only when a slot crosses its share, which happens only near overload.
+  // is below its share of the limit and no slot is over its share; otherwise (near overload) the
+  // slots are summed and the call admitted while the sum stays within the limit. The share of a
+  // lane slot is ceil(limit / L); the spare slot, for calls without a lane, has a share of 0, so
+  // its calls always take the sum and, while it holds any, so does every lane. So on the normal
+  // path nothing shared is written, a hot lane can use the whole limit while the others are idle,
+  // and the queue never holds more than max(limit, L x share) <= limit + L - 1 calls: fast-path
+  // admits happen only while every lane slot is at most its share and the spare is empty.
+  // lanes_over_share_ counts slots above their share; it is written only when a slot crosses its
+  // share, which for a lane happens only near overload, and for the spare on each call without a
+  // lane queued to an empty spare slot (unlaned threads keep a shared path).
   std::optional<int64_t> LaneCallQueued(int64_t rpc_queue_limit, LaneId lane) {
-    auto& slot = LaneQueueOf(lane);
+    const auto index = LaneIndex(lane);
+    auto& slot = lane_queues_[index];
     const auto limit = static_cast<int64_t>(
         std::min(max_queued_calls_, implicit_cast<size_t>(rpc_queue_limit)));
-    const auto share = static_cast<int64_t>(lane_share_);
+    const auto share = SlotShare(index);
     const auto queued = slot.queued.fetch_add(1, std::memory_order_seq_cst);
     if (queued == share) {
       lanes_over_share_.fetch_add(1, std::memory_order_seq_cst);
@@ -483,7 +488,7 @@ class ServicePoolImpl final : public InboundCallHandler {
         lanes_over_share_.load(std::memory_order_seq_cst) > 0) {
       // Includes this call.
       if (QueuedCalls() > limit) {
-        LaneSlotDecrement(slot);
+        LaneSlotDecrement(index);
         return std::nullopt;
       }
     }
@@ -491,16 +496,25 @@ class ServicePoolImpl final : public InboundCallHandler {
     return queued;
   }
 
-  void LaneSlotDecrement(LaneQueue& slot) {
-    const auto queued = slot.queued.fetch_sub(1, std::memory_order_seq_cst);
-    if (queued == static_cast<int64_t>(lane_share_) + 1) {
+  void LaneSlotDecrement(size_t index) {
+    const auto queued = lane_queues_[index].queued.fetch_sub(1, std::memory_order_seq_cst);
+    if (queued == SlotShare(index) + 1) {
       lanes_over_share_.fetch_sub(1, std::memory_order_seq_cst);
     }
   }
 
-  // Slot of a call's lane; the spare slot for kNoLane (and any lane outside the pool's lanes).
+  // Index of a call's lane slot; the spare slot for kNoLane (and any lane outside the pool's
+  // lanes).
+  size_t LaneIndex(LaneId lane) const {
+    return lane < num_lanes_ ? lane : num_lanes_;
+  }
+
+  int64_t SlotShare(size_t index) const {
+    return index < num_lanes_ ? static_cast<int64_t>(lane_share_) : 0;
+  }
+
   LaneQueue& LaneQueueOf(LaneId lane) {
-    return lane_queues_[lane < num_lanes_ ? lane : num_lanes_];
+    return lane_queues_[LaneIndex(lane)];
   }
 
   // It is too expensive to update timeout priority queue when each call is received.

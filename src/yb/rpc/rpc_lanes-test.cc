@@ -1052,7 +1052,60 @@ TEST_F(RpcLanesTest, ServicePoolLaneAdmission) {
   unlaned->CompleteShutdown();
 }
 
-// Lanes admitting and releasing at once never have more than limit + L - 1 calls queued.
+// Calls without a lane share the spare slot, whose share is 0: they always take the sum, and while
+// any is queued so do the lanes. So filling every slot, the spare included, up to its lane share
+// queues no more than limit + L - 1 calls, in whichever order the slots fill.
+TEST_F(RpcLanesTest, ServicePoolSpareSlotBound) {
+  constexpr size_t kLanes = 4;
+  constexpr int64_t kLimit = 10;
+  constexpr int64_t kShare = 3;
+  auto messenger = CreateAutoShutdownMessengerHolder("Server");
+  auto pool = make_scoped_refptr<ServicePool>(
+      kLimit, [thread_pool = NoWorkersPool()](auto, auto) { return thread_pool; },
+      &messenger->scheduler(), std::make_unique<GenericCalculatorService>(), metric_entity(),
+      kLanes);
+  using Slots = std::vector<int64_t>;
+  auto fill_to_share = [&pool](LaneId lane) {
+    int64_t admitted = 0;
+    for (int64_t i = 0; i != kShare; ++i) {
+      admitted += pool->TEST_CallQueued(lane).has_value();
+    }
+    return admitted;
+  };
+  auto drain = [&pool](const Slots& slots) {
+    for (size_t i = 0; i != slots.size(); ++i) {
+      for (auto n = slots[i]; n; --n) {
+        pool->TEST_CallDequeued(i < kLanes ? narrow_cast<LaneId>(i) : kNoLane);
+      }
+    }
+  };
+
+  // Lanes first: they fill their shares on the fast path, then the spare is refused by the sum.
+  for (LaneId lane = 0; lane != kLanes; ++lane) {
+    ASSERT_EQ(fill_to_share(lane), kShare);
+  }
+  ASSERT_EQ(fill_to_share(kNoLane), 0);
+  ASSERT_LE(pool->QueuedCalls(), kLimit + static_cast<int64_t>(kLanes) - 1);
+  ASSERT_EQ(pool->TEST_LaneQueuedCalls(), (Slots{kShare, kShare, kShare, kShare, 0}));
+  drain(pool->TEST_LaneQueuedCalls());
+  ASSERT_EQ(pool->TEST_LanesOverShare(), 0);
+
+  // Spare first: while it holds calls the lanes take the sum, so the queue stops at the limit.
+  ASSERT_EQ(fill_to_share(kNoLane), kShare);
+  ASSERT_EQ(pool->TEST_LanesOverShare(), 1);
+  for (LaneId lane = 0; lane != kLanes; ++lane) {
+    fill_to_share(lane);
+  }
+  ASSERT_EQ(pool->QueuedCalls(), kLimit);
+  drain(pool->TEST_LaneQueuedCalls());
+  ASSERT_EQ(pool->QueuedCalls(), 0);
+  ASSERT_EQ(pool->TEST_LanesOverShare(), 0);
+  pool->StartShutdown();
+  pool->CompleteShutdown();
+}
+
+// Lanes, and a thread queuing calls without a lane, admitting and releasing at once never have more
+// than limit + L - 1 calls queued.
 TEST_F(RpcLanesTest, ServicePoolConcurrentAdmissionBound) {
   constexpr size_t kLanes = 4;
   constexpr int64_t kLimit = 20;
@@ -1067,7 +1120,12 @@ TEST_F(RpcLanesTest, ServicePoolConcurrentAdmissionBound) {
   std::atomic<int64_t> max_admitted{0};
   std::atomic<int64_t> rejected{0};
   TestThreadHolder threads;
+  std::vector<LaneId> lanes;
   for (LaneId lane = 0; lane != kLanes; ++lane) {
+    lanes.push_back(lane);
+  }
+  lanes.push_back(kNoLane);
+  for (auto lane : lanes) {
     threads.AddThreadFunctor([&, lane, &stop = threads.stop_flag()] {
       int64_t mine = 0;
       while (!stop.load()) {
@@ -1187,7 +1245,7 @@ TEST_F(RpcLanesTest, RpcServicesCounterPerLane) {
       ASSERT_EQ(messenger->TEST_RpcServicesCounterOfThisThread(), counters[lane + 1]);
     });
   }
-  // A call from each lane, handled while its lane's counter is taken.
+  // A call from each lane, and one without a lane, succeeds through the laned messenger's counters.
   for (LaneId lane : {LaneId{0}, LaneId{1}, kNoLane}) {
     RunWithLane(lane, [messenger] {
       Proxy local_proxy(messenger, HostPort());

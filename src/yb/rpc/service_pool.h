@@ -73,8 +73,9 @@ class ServicePool : public RpcService {
  public:
   // num_lanes: the lane count of a laned messenger, 0 for an unlaned one. A laned pool keeps its
   // queued-call count and timeout pre-check queue per lane (plus one for calls without a lane),
-  // and admits a call without a shared write while its lane is below its share of max_tasks; see
-  // ServicePoolImpl::LaneCallQueued. An unlaned pool keeps one count and one queue.
+  // and admits a call without a shared write while its lane is below its share of max_tasks
+  // (calls without a lane always sum the lanes); see ServicePoolImpl::LaneCallQueued. An unlaned
+  // pool keeps one count and one queue.
   ServicePool(size_t max_tasks,
               ThreadPoolProvider thread_pool_provider,
               Scheduler* scheduler,

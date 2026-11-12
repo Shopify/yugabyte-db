@@ -567,12 +567,16 @@ stored on the call (`InboundCall::queued_lane_`), so `CallQueued` on the queuing
 `CallDequeued` on the handler thread use one slot. A local call queued from another lane writes the
 slot of its own lane, along with the handoff into that lane's pool that it makes anyway. With
 `limit` the service's queue length and `share = ceil(limit / L)`, a call is admitted without a
-shared write while its slot is below `share` and no slot is above its share. Otherwise, which
+shared write while its lane slot is below `share` and no slot is above its share. Otherwise, which
 happens only near overload, the slots are summed (a read-only walk) and the call admitted while the
-sum, itself included, stays within `limit`. A hot lane can therefore fill the whole queue while the
-others are idle, an idle lane cannot add to a full queue, and the queue never holds more than
-`max(limit, L x share) <= limit + L - 1` calls. A shared count of slots above their share is written
-only when a slot crosses its share, near overload. The overflow log line reports the queue's total,
+sum, itself included, stays within `limit`. The spare slot's share is 0: a call without a lane (a
+local call from an unlaned thread without a hint) always takes the sum, and while the spare holds a
+call so does every lane. A hot lane can therefore fill the whole queue while the others are idle,
+an idle lane cannot add to a full queue, and the queue never holds more than
+`max(limit, L x share) <= limit + L - 1` calls, since calls are admitted without the sum only while
+every lane slot is at most its share and the spare is empty. A shared count of slots above their
+share is written only when a slot crosses its share: for a lane near overload, for the spare on
+each call without a lane that finds it empty. The overflow log line reports the queue's total,
 and `rpcs_queue_overflow` counts every refused call. `InboundCall::GetRpcQueuePosition` is the
 call's lane slot count (only CQL reads it, and its messenger is unlaned). `CheckTimeout` and
 shutdown drain all queues through one helper; the time of the next scheduled check stays shared,
@@ -650,6 +654,7 @@ calls) cost about 20 KiB x L each.
   local call trackers' key, and call ids must stay unique on a connection that carries calls of
   every lane; splitting either into per-lane ranges changes those ids and shortens their reuse
   period.
-- Writes made only near overload or per connection, not per operation: the service pool's over-share
-  count and its last backpressure time, the queue timeout and overflow counters,
+- Writes made only near overload, per connection, or by unlaned threads, not per lane operation: the
+  service pool's over-share count (also written by calls without a lane, which unlaned threads
+  queue) and its last backpressure time, the queue timeout and overflow counters,
   `rpc_connections_alive`, and `Available Big Shared Memory` (updated per large response).
