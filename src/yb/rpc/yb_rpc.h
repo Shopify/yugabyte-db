@@ -87,6 +87,11 @@ class YBInboundConnectionContext : public YBConnectionContext {
       : YBConnectionContext(receive_buffer_size, buffer_tracker, call_tracker) {}
 
   static std::string Name() { return "Inbound RPC"; }
+
+  // Laned tablet servers may start a connection with a lane preamble, see
+  // ConnectionContextFactory::AcceptsLanePreamble.
+  static constexpr bool kAcceptsLanePreamble = true;
+
  private:
   // Takes ownership of call_data content.
   Status HandleCall(const ConnectionPtr& connection, CallData* call_data)

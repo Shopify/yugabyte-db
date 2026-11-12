@@ -109,6 +109,12 @@ class ConnectionContextFactory {
     return buffer_tracker_;
   }
 
+  // Whether inbound connections of this factory accept a lane preamble (rpc/lane_preamble.h):
+  // the acceptor of a laned messenger peeks for it, and the stream drops one the acceptor did not
+  // consume. True for the YB RPC protocol only, whose senders may write one; other protocols, such
+  // as CQL and Redis, see every byte their clients send.
+  virtual bool AcceptsLanePreamble() const { return false; }
+
  protected:
   ~ConnectionContextFactory();
 
@@ -128,6 +134,14 @@ class ConnectionContextFactoryImpl : public ConnectionContextFactory {
 
   std::unique_ptr<ConnectionContext> Create(size_t receive_buffer_size) override {
     return std::make_unique<ContextType>(receive_buffer_size, buffer_tracker_, call_tracker_);
+  }
+
+  bool AcceptsLanePreamble() const override {
+    if constexpr (requires { ContextType::kAcceptsLanePreamble; }) {
+      return ContextType::kAcceptsLanePreamble;
+    } else {
+      return false;
+    }
   }
 
   virtual ~ConnectionContextFactoryImpl() {}

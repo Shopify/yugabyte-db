@@ -9,18 +9,20 @@ are off by default (`--tserver_lanes=1`).
 What is implemented: topology discovery, the lane model and its flags, the confinement and
 accounting mechanisms that consume the topology (new threads, thread pools, priority-pool tasks,
 reactors, the postmaster spawn, the crossing counters), the laned tablet server messenger, laned
-tablet pipelines, laned PG sessions, and per-lane sharding of the state the write path updates per
-operation. With lanes on, the tserver messenger runs a group of reactors and handler pools per lane,
-and an inbound call is handled in the lane of the reactor that read it. Each tablet's Raft, log,
-preparer, leader-side apply and service-strand work and its RocksDB background jobs run in its lane,
-and consensus peers send their RPCs with the tablet's lane hint. Each PG session has a lane, in
-which a shared-memory session's operations run, and clients built on the server messenger send their
-tablet RPCs with the tablet's lane hint and call back in the lane that issued them. Memory trackers,
-service queues, RPC counters, server metrics and client RPC registries that every lane updates per
-operation are sharded or batched by lane, see [Shared state](#shared-state). Inbound connections are
-not yet bound to lanes: an inbound write crosses into the tablet's lane once, at the preparer, and a
-follower prepares and applies follower-side operations inline in its `UpdateConsensus` handler, in
-the lane of the reactor that read the call.
+tablet pipelines, laned PG sessions, per-lane sharding of the state the write path updates per
+operation, and inbound binding by lane preamble. With lanes on, the tserver messenger runs a group
+of reactors and handler pools per lane, and an inbound call is handled in the lane of the reactor
+that read it. Each tablet's Raft, log, preparer, leader-side apply and service-strand work and its
+RocksDB background jobs run in its lane, and consensus peers send their RPCs with the tablet's lane
+hint. Each PG session has a lane, in which a shared-memory session's operations run, and clients
+built on the server messenger send their tablet RPCs with the tablet's lane hint and call back in
+the lane that issued them. Memory trackers, service queues, RPC counters, server metrics and client
+RPC registries that every lane updates per operation are sharded or batched by lane, see [Shared
+state](#shared-state). A laned tablet server starts each connection it keys by lane with a lane
+preamble, and the receiving tablet server binds the connection to a reactor of that lane, so a
+follower handles `UpdateConsensus`, with the follower-side prepare and apply, in the tablet's lane.
+A write on a connection that is not bound, such as one from a client whose messenger is unlaned,
+crosses into the tablet's lane once, at the preparer.
 
 ## Definitions
 
@@ -41,7 +43,9 @@ than it saves.
 Lane mode is active only when the effective `L > 1` (`LaneTopology::active()`). With
 `--tserver_lanes=1` nothing is discovered or logged and no topology is installed. When discovery
 yields one domain, or service CPUs leave none, the result is the same inactive topology. Every
-lane-related code path must be a no-op for an inactive topology.
+lane-related code path must be a no-op for an inactive topology. The one exception is that every YB
+RPC receiver drops a leading lane preamble (see [Inbound binding](#inbound-binding)), a check of a
+connection's first bytes that changes nothing for a stream without one.
 
 Correctness never depends on lanes: a tablet's pipeline runs on its lane's pools on every host,
 and everything else (connection choice, reactor binding, session placement) is a locality hint.
@@ -74,7 +78,8 @@ affinity.
 
 ## Flags
 
-All are startup-only and tagged `advanced`.
+All are tagged `advanced` and startup-only, except the last two: `enable_rpc_lane_preamble` is a
+runtime AutoFlag and `rpc_lane_preamble_peek_timeout_ms` a runtime flag, both read per connection.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -87,6 +92,8 @@ All are startup-only and tagged `advanced`.
 | `tserver_lane_background` | `lane` | `lane` runs a tablet's RocksDB flushes and compactions in its lane, `service` on the service mask. See [Tablet pipelines](#tablet-pipelines). |
 | `log_appender_lane_mode_max_wait_ms` | `1` | In lane mode, how long a tablet's log appender keeps its append thread after its queue empties; `0` releases it at once. Replaces `taskstream_queue_max_wait_ms` for the appender. |
 | `mem_tracker_lane_batch_bytes` | `65536` | In lane mode, the delta a lane accumulates per lane-batched memory tracker before applying it to the shared value, in [0, 16 MiB]; `0` disables batching. See [Shared state](#shared-state). |
+| `enable_rpc_lane_preamble` | AutoFlag `kLocalVolatile`, `false` -> `true` | Laned tablet servers start lane-keyed connections with a lane preamble. See [Inbound binding](#inbound-binding). |
+| `rpc_lane_preamble_peek_timeout_ms` | `500` | How long a laned messenger's acceptor waits for an accepted connection's first bytes to show whether they are a lane preamble. |
 
 Mapping `N` lanes onto `D` domains keeps masks whole and contiguous blocks within a socket:
 
@@ -209,8 +216,8 @@ Looking up a tagged pool takes only that lane's lock, and the process-wide insta
 `RpcServer` maps that through `Messenger::HandlerThreadPool` to the lane's tagged pool for normal
 services and the lane's high-priority pool for high-priority ones. `InboundCall::lane()` is the
 receiving reactor's lane for calls read from a connection (no `RequestHeader` field), so an
-inbound call is handled in the lane that read it; inbound sockets are still assigned to reactors
-by a hash over all reactors.
+inbound call is handled in the lane that read it; which reactor reads a connection is in
+[Inbound binding](#inbound-binding).
 
 QoS thread count: at most `L x (1 normal + 1 high + T tagged)` handler pools for `T` active tags,
 next to the unlaned set, each up to the unlaned limit. Idle workers exit after
@@ -253,6 +260,100 @@ local call inline: their `YBSession`s clear `allow_local_calls_in_curr_thread`, 
 shared memory alike, so every local call of a PG operation is queued to the call's lane's pool, a
 same-lane handoff when the session is in the tablet's lane.
 
+## Inbound binding
+
+Without binding, the acceptor assigns an inbound connection to a reactor by a hash over all
+reactors, so the lane that handles its calls is random relative to their tablets, and each inbound
+tablet RPC crosses into the tablet's pipeline and back. A laned tablet server therefore tells the
+receiver the lane of each connection it keys by lane, and the receiver binds the connection to a
+reactor of that lane.
+
+**Wire format.** A lane preamble is three plaintext bytes, `"YL"` and the lane
+(`rpc/lane_preamble.h`), before any other byte of the connection: before the TLS ClientHello, the
+compression header (`"YB"` and an algorithm id) and the YB connection header (`"YB\1"`). No YB RPC
+stream starts with `"YL"` otherwise. `TcpStream`, the bottom of every stream stack, queues the
+preamble as its first block when a client stream starts, ahead of whatever the upper layers send
+once connected or queue before the connect completes. The marker is outside TLS because the
+reactor has to be chosen before the handshake, after which every byte is encrypted; a wrong or
+spoofed lane costs locality only.
+
+**Who sends.** `Reactor::FindOrStartConnection` asks for a preamble iff the messenger is laned, the
+connection is keyed by a lane, and `enable_rpc_lane_preamble` is true when the connection is
+created; the lane is the connection's, lane(T) of the calls it carries. Only the laned tablet
+server messenger keys connections by lane, for calls with a hint (consensus peers and the clients
+built on it, never for the sys catalog tablet, see [Messenger lanes](#messenger-lanes) and
+[Sessions and the embedded client](#sessions-and-the-embedded-client)). Masters, unlaned calls,
+pggate and clients of other universes (xCluster's remote client, external clients) use unlaned
+messengers or send no hint, and never send a preamble.
+
+**Acceptor peek.** The acceptor peeks only for a laned messenger whose inbound protocol accepts a
+preamble, which in a server is a tablet server with lanes on. After `accept()` it holds the socket
+in its own event loop with a read watcher and a timer, never blocking, peeks (`MSG_PEEK`) at up to
+three bytes and decides as soon as they allow:
+
+- `"YL"` and a lane byte `b`: it consumes the three bytes and registers the socket on a reactor of
+  lane `b % L`. The lane's bound connections take its reactors in turn.
+- A first byte other than `'Y'`, or a second other than `'L'` (TLS starts with `0x16`, the other
+  headers with `"YB"`): it registers the socket as without lanes, with nothing consumed.
+- `"Y"` or `"YL"` alone: it keeps waiting, peeking again every millisecond, since a read watcher
+  would fire continuously on bytes left unread.
+- EOF, an error, or no decision within `--rpc_lane_preamble_peek_timeout_ms`: it registers the
+  socket as without lanes; the reactor then fails or closes it as it would have.
+
+YB senders speak first and write the preamble with the bytes after it, so only silent or very slow
+sockets wait. The 500 ms default is provisional, to be set by measurement. The acceptor holds at
+most 4096 sockets; one it cannot hold is registered at once, without lanes. Shutdown closes the held
+sockets without registering them. The unbound path, and every unlaned messenger's acceptor, is the
+assignment without lanes: a hash of the remote endpoint and the accept count over all reactors.
+
+**Reactor strip.** The server stream of every messenger whose inbound connection context is YB RPC
+(`YBInboundConnectionContext`: tablet servers with or without lanes, masters, and the RPC test
+servers) checks its first bytes once, before any upper layer sees them, and drops a preamble: one
+that arrived after the peek timeout, or at a receiver that does not peek. It waits while the bytes
+read are `"Y"` or `"YL"`. A connection whose preamble is dropped here is not bound. The context
+factory decides (`ConnectionContextFactory::AcceptsLanePreamble`), so a new YB RPC server gets the
+strip, and CQL and Redis messengers, whose clients never send a preamble, neither strip nor peek.
+
+**What is bound.** A connection is bound only if the sender keyed it by lane and the acceptor
+consumed its preamble; its calls are handled in that lane, so a follower handles `UpdateConsensus`,
+and the follower-side prepare and apply it runs inline, in lane(T). Calls on every other inbound
+connection are handled in the lane of the reactor that read them: connections from older senders,
+from unlaned clients (pggate over TCP, masters, external clients), for unhinted calls, created with
+the AutoFlag off, or whose preamble arrived late. Binding sets which lane handles a connection's
+calls on the receiver, not which lane runs the sender's callbacks.
+
+**Compatibility and rollback.** A receiver that predates the preamble rejects a connection that
+starts with one: neither its compression or TLS detection nor its YB header check accepts it.
+Sending is therefore gated by the AutoFlag `enable_rpc_lane_preamble` (`kLocalVolatile`, like
+`enable_rpc_pool_tags`), promoted once every process in the universe runs a version that accepts the
+preamble and demoted on rollback. Every receiver of this version accepts it whatever its own flags,
+so a promoted universe can mix tablet servers with lanes on and off. The flag is read when a
+connection is created: after demotion new connections carry no preamble and existing ones keep
+working, and after promotion existing connections stay unbound for their lifetime; nothing recycles
+them, and idle ones close by keepalive.
+
+**Different lane counts.** The receiver reduces the lane byte modulo its own `L`. With equal `L` on
+both ends that is lane(T) on the receiver too; with different `L` it is not, and binding only
+spreads connections over the receiver's lanes, which costs locality, not correctness.
+
+**Metrics.** `rpc_lane_preamble_bound`, `rpc_lane_preamble_absent` (other first bytes, EOF or an
+error) and `rpc_lane_preamble_peek_timeouts` (no decision within the timeout, or not held because of
+the cap) count each socket a laned messenger's acceptor accepts once;
+`rpc_lane_preamble_stripped_late` counts preambles dropped by a reactor. A laned messenger
+instantiates all four; another instantiates `rpc_lane_preamble_stripped_late` when it first drops a
+preamble, so the metric output of a server that never receives one is unchanged.
+
+**Tests.** Plain, compressed, TLS and TLS with compression streams are tested in `rpc_lanes-test`:
+binding, the first bytes on the wire, the path without a preamble, a late preamble, and the
+rejection by a receiver that ignores preambles.
+
+**Alternatives not taken.** A per-call lane field in `RequestHeader` would let the handler pick a
+lane but not the reactor, so it only moves the crossing from the reactor to the handler. SNI covers
+TLS only and needs ClientHello parsing. Moving a connection to another reactor after its first
+call is not possible without a large change: a connection's reactor is fixed for its life, and a
+live TLS session would have to move. A port per lane adds registration, firewall and monitoring
+changes.
+
 ## Tablet pipelines
 
 **Pools.** The `TSTabletManager` constructor builds one unlaned set of pipeline pools (`prepare`,
@@ -273,8 +374,9 @@ notification and prepare pools for consensus and the preparer, its Raft pool for
 and `Messenger::TaggedThreadPool(PoolTagForTablet(tablet), lane)` for the service strand. On the
 leader, op apply runs on the Raft notification strand, so it follows the tablet without a pool of
 its own. A follower prepares and applies follower-side operations inline in its `UpdateConsensus`
-handler, so that work runs in the handler's lane, which is lane(T) only once inbound connections
-are bound to lanes. The other tablet-manager pools (`apply` for split and clone,
+handler, so that work runs in the handler's lane: lane(T) when the leader's connection is bound by
+its lane preamble, the lane of whichever reactor read the call otherwise (see
+[Inbound binding](#inbound-binding)). The other tablet-manager pools (`apply` for split and clone,
 `snapshot-cleanup`, `tablet-bootstrap`, `flush-retryable-requests`, `read-parallel`,
 `admin-compaction`, `full-compaction`, `wait-queue`, vector index pools) stay in the service set.
 With lanes on the unlaned pipeline set serves only work that belongs to no tablet, such as
@@ -457,25 +559,26 @@ they share the handler pools. Counted handoffs:
 Many primitives queue items privately and wake their executor once per batch. Their items are
 counted, and the wrapper task that only drains them is not, so each handoff counts once whether or
 not the executor was already running: `Strand`'s pool task and the task that starts a `TaskStream`
-draining are submitted uncounted (`ThreadPoolToken::SubmitDrainFunc`), and reactor queues count
-each item with `Reactor::CountLaneHandoff` and schedule the drain with `ScheduleDrainTask`. The
+draining are submitted uncounted (`ThreadPoolToken::SubmitDrainFunc`), and reactor queues count each
+item with `Reactor::CountLaneHandoff` and schedule the drain with `ScheduleDrainTask`. The
 end-of-group call with no item is not counted. A reactor's lane is fixed, so its handoffs are
-counted on the submitting side, and only by laned submitters: an unlaned thread's only counter
-slot is the spare one all unlaned threads share, and every call it hands to a laned reactor would
-write it. No per-operation path hands work from an unlaned thread to a laned reactor: PG sessions,
-their follow-up work and the embedded client's completions run in lanes, and what remains
-(heartbeats, `rpc::Scheduler` timers, background tasks) is periodic. A handoff from an unlaned
-thread to a laned pool is counted in the executor's slot, as an entry from unlaned.
+counted on the submitting side, and only by laned submitters: an unlaned thread's only counter slot
+is the spare one all unlaned threads share, and every call it hands to a laned reactor would write
+it. No per-operation path hands work from an unlaned thread to a laned reactor: PG sessions, their
+follow-up work and the embedded client's completions run in lanes, and what remains (heartbeats,
+`rpc::Scheduler` timers, background tasks) is periodic, and the acceptor hands a reactor one task
+per accepted connection. A handoff from an unlaned thread to a laned pool is counted in the
+executor's slot, as an entry from unlaned.
 
-Within a tablet's pipeline work stays in the tablet's lane, and Raft callbacks run in the lane
-that sent the call, which is also the lane of the reactor that reads the response, so neither
-crosses. Until inbound connections are bound to lanes, an inbound write is handled in the lane of
-the reactor that read it and crosses into the tablet's pipeline once, at the preparer. A
-follower's `UpdateConsensus` handler prepares and applies follower-side operations inline, in the
-lane of the reactor that read the call, and crosses into the tablet's pipeline for the log append
-and the other tasks it submits to the tablet's pools. On the client side a PG operation crosses at
-most twice per tablet RPC, see
-[Sessions and the embedded client](#sessions-and-the-embedded-client).
+Within a tablet's pipeline work stays in the tablet's lane, and Raft callbacks run in the lane that
+sent the call, which is also the lane of the reactor that reads the response, so neither crosses. A
+follower's `UpdateConsensus` handler prepares and applies follower-side operations inline; on a
+connection bound to lane(T) (see [Inbound binding](#inbound-binding)) it runs in lane(T) and crosses
+nothing. A call on a connection that is not bound is handled in the lane of the reactor that read
+it: an inbound write crosses into the tablet's pipeline at most once, at the preparer, and such an
+`UpdateConsensus` handler crosses into the pipeline for the log append and the other tasks it
+submits to the tablet's pools. On the client side a PG operation crosses at most twice per tablet
+RPC, see [Sessions and the embedded client](#sessions-and-the-embedded-client).
 
 Not counted: work handed to a reactor by an unlaned thread (see above), `PriorityThreadPool` tasks
 and `Env` pool jobs (flush and compaction), `rpc::Scheduler` and other io-service
@@ -538,8 +641,8 @@ installs the topology) for:
 
 Per-tablet trackers (`tablet-<id>`, its RocksDB, operation tracker, participant and log cache
 trackers) are not batched: only their tablet's lane updates them, apart from follower-side
-operations handled in another lane until inbound connections are bound. Masters never enable
-batching.
+operations whose `UpdateConsensus` arrives on a connection not bound to the tablet's lane (see
+[Inbound binding](#inbound-binding)). Masters never enable batching.
 
 `consumption()`, `peak_consumption()`, the `mem_tracker_*` metrics, `/mem-trackers` and every limit
 check use the shared value, which differs from the tracked total by at most L x batch per tracker

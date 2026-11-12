@@ -15,6 +15,7 @@
 
 #include "yb/rpc/tcp_stream.h"
 
+#include "yb/rpc/lane_preamble.h"
 #include "yb/rpc/outbound_data.h"
 #include "yb/rpc/rpc_introspection.pb.h"
 #include "yb/rpc/rpc_util.h"
@@ -33,12 +34,24 @@ using namespace std::literals;
 DECLARE_uint64(rpc_connection_timeout_ms);
 DEFINE_test_flag(int32, delay_connect_ms, 0,
                  "Delay connect in tests for specified amount of milliseconds.");
+DEFINE_test_flag(bool, rpc_ignore_lane_preamble, false,
+                 "Inbound connections neither peek for nor strip a lane preamble, as a receiver "
+                 "that predates it does.");
 
 METRIC_DEFINE_simple_counter(
   server, tcp_bytes_sent, "Bytes sent over TCP connections", yb::MetricUnit::kBytes);
 
 METRIC_DEFINE_simple_counter(
   server, tcp_bytes_received, "Bytes received via TCP connections", yb::MetricUnit::kBytes);
+
+// Instantiated by a laned messenger's acceptor, and on first use elsewhere, so that the metric
+// output of a server that never receives a preamble is unchanged.
+METRIC_DEFINE_counter(
+    server, rpc_lane_preamble_stripped_late, "RPC Lane Preambles Stripped Late",
+    yb::MetricUnit::kConnections,
+    "Number of inbound connections whose lane preamble was dropped by the reactor rather than "
+    "consumed by the acceptor: it arrived after the peek timeout, or the messenger does not peek. "
+    "Such connections are not bound to the preamble's lane.");
 
 namespace yb {
 namespace rpc {
@@ -51,7 +64,12 @@ const size_t kMaxIov = 16;
 
 TcpStream::TcpStream(const StreamCreateData& data)
     : socket_(std::move(*data.socket)),
-      remote_(data.remote) {
+      remote_(data.remote),
+      lane_preamble_(data.lane_preamble),
+      strip_lane_preamble_(data.strip_lane_preamble && !FLAGS_TEST_rpc_ignore_lane_preamble) {
+  if (strip_lane_preamble_) {
+    metric_entity_ = data.metric_entity;
+  }
   if (data.mem_tracker) {
     mem_tracker_ = MemTracker::FindOrCreateTracker("Sending", data.mem_tracker);
   }
@@ -81,6 +99,11 @@ Status TcpStream::Start(bool connect, ev::loop_ref* loop, StreamContext* context
   RETURN_NOT_OK(socket_.SetSendTimeout(FLAGS_rpc_connection_timeout_ms * 1ms));
   RETURN_NOT_OK(socket_.SetRecvTimeout(FLAGS_rpc_connection_timeout_ms * 1ms));
 
+  if (connect) {
+    // Nothing is queued yet: upper layers send once connected, and calls are queued after Start.
+    QueueLanePreamble();
+  }
+
   if (connect && FLAGS_TEST_delay_connect_ms) {
     connect_delayer_.set(*loop);
     connect_delayer_.set<TcpStream, &TcpStream::DelayConnectHandler>(this);
@@ -89,7 +112,26 @@ Status TcpStream::Start(bool connect, ev::loop_ref* loop, StreamContext* context
     return Status::OK();
   }
 
-  return DoStart(loop, connect);
+  auto status = DoStart(loop, connect);
+  if (!status.ok()) {
+    // The caller drops a stream that failed to start without shutting it down.
+    ClearSending(status);
+  }
+  return status;
+}
+
+void TcpStream::QueueLanePreamble() {
+  if (lane_preamble_ == kNoLane) {
+    return;
+  }
+  RefCntBuffer preamble(kLanePreambleSize);
+  memcpy(preamble.data(), kLanePreambleMagic, sizeof(kLanePreambleMagic));
+  preamble.data()[sizeof(kLanePreambleMagic)] = static_cast<char>(lane_preamble_);
+  lane_preamble_ = kNoLane;
+  // Its handle is never returned, so Cancelled never sees it, and the handles of later blocks
+  // count it like any other block.
+  sending_.emplace_back(RefCntSlice(std::move(preamble)));
+  queued_bytes_to_send_ += kLanePreambleSize;
 }
 
 Status TcpStream::DoStart(ev::loop_ref* loop, bool connect) {
@@ -389,7 +431,39 @@ Result<bool> TcpStream::Receive() {
 
   IncrementCounterBy(bytes_received_counter_, *nread);
   ReadBuffer().DataAppended(*nread);
+  if (PREDICT_FALSE(strip_lane_preamble_) && *nread != 0 && !StripLanePreamble()) {
+    return false;
+  }
   return *nread != 0;
+}
+
+bool TcpStream::StripLanePreamble() {
+  // Nothing was consumed from the read buffer yet, so it starts with the first bytes received.
+  char first_bytes[kLanePreambleSize];
+  size_t size = 0;
+  for (const auto& iov : ReadBuffer().AppendedVecs()) {
+    auto len = std::min(iov.iov_len, kLanePreambleSize - size);
+    memcpy(first_bytes + size, iov.iov_base, len);
+    size += len;
+    if (size == kLanePreambleSize) {
+      break;
+    }
+  }
+  auto match = MatchLanePreamble(Slice(first_bytes, size));
+  if (match == LanePreambleMatch::kPrefix) {
+    return false;
+  }
+  strip_lane_preamble_ = false;
+  if (match == LanePreambleMatch::kPreamble) {
+    VLOG_WITH_PREFIX(2) << "Dropped lane preamble: "
+                        << Slice(first_bytes, kLanePreambleSize).ToDebugHexString();
+    ReadBuffer().Consume(kLanePreambleSize, Slice());
+    if (metric_entity_) {
+      METRIC_rpc_lane_preamble_stripped_late.Instantiate(metric_entity_)->Increment();
+    }
+  }
+  metric_entity_ = nullptr;
+  return true;
 }
 
 void TcpStream::ParseReceived() {
@@ -406,7 +480,7 @@ void TcpStream::ParseReceived() {
 
 Result<bool> TcpStream::TryProcessReceived() {
   auto& read_buffer = ReadBuffer();
-  if (!read_buffer.ReadyToRead()) {
+  if (!read_buffer.ReadyToRead() || strip_lane_preamble_) {
     return false;
   }
 
@@ -528,6 +602,10 @@ StreamFactoryPtr TcpStream::Factory() {
   };
 
   return std::make_shared<TcpStreamFactory>();
+}
+
+TcpStreamSendingData::TcpStreamSendingData(RefCntSlice bytes_) {
+  bytes.push_back(std::move(bytes_));
 }
 
 TcpStreamSendingData::TcpStreamSendingData(OutboundDataPtr data_, const MemTrackerPtr& mem_tracker)

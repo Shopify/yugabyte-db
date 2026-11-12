@@ -283,9 +283,12 @@ Status Messenger::ListenAddress(
   {
     std::lock_guard guard(lock_);
     if (!acceptor_) {
+      // Only a laned messenger, whose reactors are grouped by lane, peeks for a lane preamble, and
+      // only for a protocol that accepts one; the acceptor serves every later ListenAddress too.
       acceptor_.reset(new Acceptor(
-          metric_entity_, std::bind(&Messenger::RegisterInboundSocket, this, factory, _1, _2),
-          system_high_cgroup_));
+          metric_entity_,
+          std::bind(&Messenger::RegisterInboundSocket, this, factory, _1, _2, _3),
+          system_high_cgroup_, factory->AcceptsLanePreamble() ? num_lanes_ : 0));
     }
     auto accept_host = accept_endpoint.address();
     auto& outbound_address = accept_host.is_v6() ? outbound_address_v6_
@@ -699,7 +702,8 @@ const std::shared_ptr<MemTracker>& Messenger::parent_mem_tracker() {
 }
 
 void Messenger::RegisterInboundSocket(
-    const ConnectionContextFactoryPtr& factory, Socket *new_socket, const Endpoint& remote) {
+    const ConnectionContextFactoryPtr& factory, Socket *new_socket, const Endpoint& remote,
+    LaneId lane) {
   if (TEST_ShouldArtificiallyRejectIncomingCallsFrom(remote.address())) {
     auto status = new_socket->Close();
     VLOG_WITH_PREFIX(1) << "TEST: Rejected connection from " << remote
@@ -718,8 +722,17 @@ void Messenger::RegisterInboundSocket(
     return;
   }
 
-  int idx = num_connections_accepted_.fetch_add(1) % num_connections_to_server_;
-  Reactor *reactor = RemoteToReactor(remote, idx);
+  Reactor* reactor;
+  if (lane != kNoLane && num_lanes_ != 0) {
+    lane %= num_lanes_;
+    // Connections bound to a lane take its reactors in turn, so that a lane's few connections from
+    // each remote spread over all of them.
+    auto group = ReactorsOfLane(lane);
+    reactor = group[inbound_lane_connections_[lane]++ % group.size()].get();
+  } else {
+    int idx = num_connections_accepted_.fetch_add(1) % num_connections_to_server_;
+    reactor = RemoteToReactor(remote, idx);
+  }
   reactor->RegisterInboundSocket(new_socket, *receive_buffer_size, remote, factory);
 }
 
@@ -809,6 +822,7 @@ Status Messenger::InitLaned(const MessengerBuilder &bld) {
   const auto num_lanes = lane_topology_.num_lanes();
   lane_reactor_begin_.reserve(num_lanes + 1);
   lane_reactor_begin_.push_back(0);
+  inbound_lane_connections_.assign(num_lanes, 0);
   std::string per_lane;
   for (size_t lane = 0; lane != num_lanes; ++lane) {
     size_t reactors = bld.reactors_per_lane_;

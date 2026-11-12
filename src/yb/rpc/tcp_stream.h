@@ -34,6 +34,9 @@ struct TcpStreamSendingData {
 
   TcpStreamSendingData(OutboundDataPtr data_, const MemTrackerPtr& mem_tracker);
 
+  // Bytes of the stream itself, such as a lane preamble: no data, nothing to report as transferred.
+  explicit TcpStreamSendingData(RefCntSlice bytes_);
+
   size_t bytes_size() const {
     size_t result = 0;
     for (const auto& entry : bytes) {
@@ -47,12 +50,18 @@ struct TcpStreamSendingData {
     consumption = ScopedTrackedConsumption();
   }
 
+  // Null for bytes of the stream itself.
   OutboundDataPtr data;
   SendingBytes bytes;
   ScopedTrackedConsumption consumption;
   bool skipped = false;
 };
 
+// The bottom layer of every stream stack. A client stream with StreamCreateData::lane_preamble
+// queues the lane preamble as its first sending_ entry when it starts, ahead of whatever the upper
+// layers send once connected or queue before the connect completes. A server stream with
+// StreamCreateData::strip_lane_preamble checks the first bytes it reads, before any upper layer
+// sees them, and drops a lane preamble the acceptor did not consume.
 class TcpStream : public Stream {
  public:
   explicit TcpStream(const StreamCreateData& data);
@@ -120,6 +129,12 @@ class TcpStream : public Stream {
 
   void PopSending();
 
+  void QueueLanePreamble();
+
+  // Drops a lane preamble at the start of the read buffer. Returns false while the bytes read so
+  // far are a prefix of a preamble, so that no upper layer sees them yet.
+  bool StripLanePreamble();
+
   // The socket we're communicating on.
   Socket socket_;
 
@@ -144,6 +159,13 @@ class TcpStream : public Stream {
   bool connected_ = false;
 
   bool read_buffer_full_ = false;
+
+  // Lane to send in a preamble on start; kNoLane once queued, and for streams that send none.
+  LaneId lane_preamble_;
+  // Whether the start of the inbound stream is still to be checked for a lane preamble.
+  bool strip_lane_preamble_;
+  // Set only when strip_lane_preamble_ is, to count stripped preambles.
+  scoped_refptr<MetricEntity> metric_entity_;
 
   std::deque<TcpStreamSendingData> sending_;
   size_t data_blocks_sent_ = 0;

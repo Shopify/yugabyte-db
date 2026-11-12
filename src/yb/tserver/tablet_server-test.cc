@@ -110,6 +110,8 @@ DECLARE_uint32(max_active_table_metrics_table_count);
 DECLARE_string(metric_node_name);
 
 // Declare these metrics prototypes for simpler unit testing of their behavior.
+METRIC_DECLARE_counter(rpc_lane_preamble_absent);
+METRIC_DECLARE_counter(rpc_lane_preamble_bound);
 METRIC_DECLARE_counter(rows_inserted);
 METRIC_DECLARE_counter(rows_updated);
 METRIC_DECLARE_counter(rows_deleted);
@@ -210,7 +212,8 @@ TEST_F(TabletServerTest, NoLaneActivityWithLanesOff) {
   ASSERT_EQ(counts.entries_from_unlaned, 0);
   for (const auto& [prototype, metric] :
        mini_server_->server()->metric_entity()->TEST_UsageMetricsMap()) {
-    ASSERT_FALSE(std::string_view(prototype->name()).starts_with("lane_")) << prototype->name();
+    const std::string_view name(prototype->name());
+    ASSERT_FALSE(name.starts_with("lane_") || name.starts_with("rpc_lane_")) << name;
   }
 }
 
@@ -273,6 +276,10 @@ TEST_F(TabletServerLanesTest, LanedMessengerServesWrites) {
     lane_metrics = lane_metrics || std::string_view(prototype->name()) == "lane_crossings_reactor";
   }
   ASSERT_TRUE(lane_metrics);
+  // The test's proxy is on an unlaned messenger, so its connection carries no lane preamble.
+  const auto& entity = mini_server_->server()->metric_entity();
+  ASSERT_EQ(entity->FindOrNull<Counter>(METRIC_rpc_lane_preamble_bound)->value(), 0);
+  ASSERT_GE(entity->FindOrNull<Counter>(METRIC_rpc_lane_preamble_absent)->value(), 1);
 }
 
 // The active-table list applies only to YSQL tables, so this test uses one.

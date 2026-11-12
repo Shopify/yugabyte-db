@@ -54,6 +54,8 @@ class ConnectionId {
   Endpoint remote_;
   uint8_t idx_ = 0;  // Connection index, used to support multiple connections to the same server.
   const Protocol* protocol_ = nullptr;
+  // Set only for connections of a laned messenger keyed by lane; a new such connection sends it to
+  // the receiver in a lane preamble while enable_rpc_lane_preamble is set.
   LaneId lane_ = kNoLane;
 };
 

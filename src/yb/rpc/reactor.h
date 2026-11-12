@@ -241,6 +241,7 @@ class Reactor {
   // Queue a new incoming connection. Takes ownership of the underlying fd from
   // 'socket', but not the Socket object itself.
   // If the reactor is already shut down, takes care of closing the socket.
+  // The stream drops a lane preamble at its start when factory accepts one.
   void RegisterInboundSocket(
       Socket *socket, size_t receive_buffer_size, const Endpoint& remote,
       const ConnectionContextFactoryPtr& factory)
@@ -284,6 +285,8 @@ class Reactor {
   // May return a bad Status if the connect() call fails.
   // The resulting connection object is managed internally by the reactor thread.
   // Deadline specifies latest time allowed for initializing the connection.
+  // A new lane-keyed connection of a laned messenger starts with a lane preamble while
+  // enable_rpc_lane_preamble is set.
   Status FindOrStartConnection(
       const ConnectionId &conn_id,
       const std::string& hostname,

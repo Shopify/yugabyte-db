@@ -454,8 +454,8 @@ class Messenger : public ProxyContext {
 
   explicit Messenger(const MessengerBuilder &bld);
 
-  // Reactor for a connection: among the lane's reactors for a laned connection of a laned
-  // messenger, among all reactors otherwise.
+  // Reactor for an outbound connection, or an inbound one not bound to a lane: among the lane's
+  // reactors for a laned connection of a laned messenger, among all reactors otherwise.
   Reactor* RemoteToReactor(const Endpoint& remote, uint32_t idx = 0, LaneId lane = kNoLane);
   Status Init(const MessengerBuilder &bld);
   Status InitLaned(const MessengerBuilder &bld);
@@ -465,9 +465,12 @@ class Messenger : public ProxyContext {
   void BreakConnectivity(const IpAddress& address, bool incoming, bool outgoing);
   void RestoreConnectivity(const IpAddress& address, bool incoming, bool outgoing);
 
-  // Take ownership of the socket via Socket::Release
+  // Takes ownership of the socket. Called by the acceptor with the lane of the socket's lane
+  // preamble: a lane's connections take its reactors in turn. Without one (kNoLane, or on an
+  // unlaned messenger) the reactor is RemoteToReactor's over all reactors.
   void RegisterInboundSocket(
-      const ConnectionContextFactoryPtr& factory, Socket *new_socket, const Endpoint& remote);
+      const ConnectionContextFactoryPtr& factory, Socket *new_socket, const Endpoint& remote,
+      LaneId lane);
 
   bool TEST_ShouldArtificiallyRejectOutgoingCallsTo(const IpAddress &remote);
 
@@ -600,6 +603,8 @@ class Messenger : public ProxyContext {
   int connections_per_lane_remote_ = 0;
   // Reactors of lane l are reactors_[lane_reactor_begin_[l], lane_reactor_begin_[l + 1]).
   std::vector<size_t> lane_reactor_begin_;
+  // Inbound connections bound to each lane so far; used only by the acceptor thread.
+  std::vector<size_t> inbound_lane_connections_;
   std::vector<std::unique_ptr<LanePools>> lane_pools_;
 
   std::unique_ptr<ReactorMonitor> reactor_monitor_ GUARDED_BY(lock_);

@@ -86,6 +86,13 @@ using namespace std::literals;
 
 DEFINE_UNKNOWN_uint64(rpc_read_buffer_size, 0,
               "RPC connection read buffer size. 0 to auto detect.");
+DEFINE_RUNTIME_AUTO_bool(enable_rpc_lane_preamble, kLocalVolatile, false, true,
+    "Laned tablet servers write a lane preamble at the start of each connection they key by lane, "
+    "so that the receiver can bind it to a reactor of that lane. Receivers that predate the "
+    "preamble reject such connections, so enable it only after every process in the universe runs "
+    "a version that accepts it. Read when a connection is created: a change affects only "
+    "connections created afterwards.");
+
 DECLARE_string(local_ip_for_outbound_sockets);
 DECLARE_int32(num_connections_to_server);
 DECLARE_int32(socket_receive_buffer_size);
@@ -847,6 +854,14 @@ Status Reactor::FindOrStartConnection(const ConnectionId &conn_id,
 
   auto receive_buffer_size = PatchReceiveBufferSize(VERIFY_RESULT(sock.GetReceiveBufferSize()));
 
+  // Only a laned messenger keys connections by lane (Proxy::QueueCall), for calls with a lane hint:
+  // consensus peers and clients built on the laned tablet server messenger set hints, never for the
+  // master's sys catalog tablet. So masters, unlaned calls and clients of other universes, which
+  // build their own unlaned messengers, never send a preamble.
+  const auto lane_preamble =
+      messenger_.laned() && conn_id.lane() != kNoLane && FLAGS_enable_rpc_lane_preamble
+          ? conn_id.lane() : kNoLane;
+
   auto stream = VERIFY_RESULT(CreateStream(
       messenger_.stream_factories_, conn_id.protocol(),
       StreamCreateData {
@@ -856,6 +871,7 @@ Status Reactor::FindOrStartConnection(const ConnectionId &conn_id,
         .receive_buffer_size = receive_buffer_size,
         .mem_tracker = messenger_.connection_context_factory_->buffer_tracker(),
         .metric_entity = messenger_.metric_entity(),
+        .lane_preamble = lane_preamble,
       }));
   auto context = messenger_.connection_context_factory_->Create(receive_buffer_size);
 
@@ -1020,7 +1036,8 @@ void Reactor::RegisterInboundSocket(
         .socket = socket,
         .receive_buffer_size = receive_buffer_size,
         .mem_tracker = factory->buffer_tracker(),
-        .metric_entity = messenger_.metric_entity()
+        .metric_entity = messenger_.metric_entity(),
+        .strip_lane_preamble = factory->AcceptsLanePreamble(),
       });
   if (!stream.ok()) {
     LOG_WITH_PREFIX(DFATAL) << "Failed to create stream for " << remote << ": " << stream.status();

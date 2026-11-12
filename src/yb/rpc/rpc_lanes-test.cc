@@ -11,8 +11,10 @@
 // under the License.
 //
 
-// Laned messengers: reactor groups, per-lane handler pools, lane-keyed connections and the
-// callback and local-call lane rules.
+// Laned messengers: reactor groups, per-lane handler pools, lane-keyed connections, the callback
+// and local-call lane rules, and inbound binding by lane preamble.
+
+#include <poll.h>
 
 #ifdef __linux__
 #include <sys/prctl.h>
@@ -24,12 +26,18 @@
 #include <string>
 #include <vector>
 
+#include "yb/rpc/circular_read_buffer.h"
+#include "yb/rpc/compressed_stream.h"
+#include "yb/rpc/lane_preamble.h"
 #include "yb/rpc/proxy.h"
 #include "yb/rpc/reactor.h"
 #include "yb/rpc/rpc.h"
 #include "yb/rpc/rpc-test-base.h"
 #include "yb/rpc/rpc_controller.h"
+#include "yb/rpc/rpc_with_queue.h"
+#include "yb/rpc/secure_stream.h"
 #include "yb/rpc/service_pool.h"
+#include "yb/rpc/tcp_stream.h"
 
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/countdown_latch.h"
@@ -44,11 +52,22 @@
 #include "yb/util/test_macros.h"
 #include "yb/util/test_thread_holder.h"
 #include "yb/util/thread.h"
+#include "yb/util/tsan_util.h"
 
 using namespace std::literals;
 
+DECLARE_bool(enable_rpc_lane_preamble);
+DECLARE_bool(TEST_rpc_ignore_lane_preamble);
+DECLARE_int32(TEST_delay_connect_ms);
+DECLARE_int32(TEST_rpc_lane_preamble_max_pending_sockets);
 DECLARE_uint64(default_idle_timeout_ms);
+DECLARE_uint32(rpc_lane_preamble_peek_timeout_ms);
+DECLARE_int32(stream_compression_algo);
 
+METRIC_DECLARE_counter(rpc_lane_preamble_absent);
+METRIC_DECLARE_counter(rpc_lane_preamble_bound);
+METRIC_DECLARE_counter(rpc_lane_preamble_peek_timeouts);
+METRIC_DECLARE_counter(rpc_lane_preamble_stripped_late);
 METRIC_DECLARE_counter(rpcs_queue_overflow);
 
 namespace yb::rpc {
@@ -559,7 +578,8 @@ TEST_F(RpcLanesTest, CloseLanedConnections) {
 }
 
 // An inbound call is handled by the handler pool of the lane of the reactor that read it, for
-// normal and high-priority services.
+// normal and high-priority services. The client is unlaned, so its connection carries no lane
+// preamble and is not bound to a lane.
 TEST_F(RpcLanesTest, HandlerRunsInReactorLane) {
   SKIP_WITHOUT_TOPOLOGY();
   TEST_SetLaneTopology scope(*topology_);
@@ -1395,6 +1415,680 @@ TEST_F(RpcLanesTest, LaneShardedRpcs) {
     ASSERT_FALSE(late->Register(registry));
     ASSERT_TRUE(late->aborted());
   }
+}
+
+
+namespace {
+
+YB_DEFINE_ENUM(LaneStack, (kPlain)(kCompressed)(kSecure)(kSecureCompressed));
+
+const MessengerOptions kLanePreambleServerOptions = {
+  .n_reactors = 2,
+  // Long enough that no server connection closes as idle while a test inspects it.
+  .keep_alive_timeout = 60s,
+};
+
+std::string LanePreamble(uint8_t lane) {
+  return std::string(kLanePreambleMagic, sizeof(kLanePreambleMagic)) + static_cast<char>(lane);
+}
+
+Status WhoAmIWithTimeout(
+    Proxy* proxy, LaneId lane, rpc_test::WhoAmIResponsePB* resp = nullptr,
+    MonoDelta timeout = MonoDelta(10s) * kTimeMultiplier) {
+  rpc_test::WhoAmIResponsePB ignored;
+  RpcController controller;
+  controller.set_lane(lane);
+  controller.set_timeout(timeout);
+  return WhoAmI(proxy, &controller, resp ? resp : &ignored);
+}
+
+// Server connections of the messenger per reactor lane.
+Result<std::map<LaneId, size_t>> ServerConnectionsByLane(Messenger* messenger) {
+  std::map<LaneId, size_t> result;
+  for (size_t i = 0; i != messenger->num_reactors(); ++i) {
+    ReactorMetrics metrics;
+    RETURN_NOT_OK(messenger->TEST_GetReactorMetrics(i, &metrics));
+    result[messenger->TEST_reactor(i)->lane()] += metrics.num_server_connections;
+  }
+  return result;
+}
+
+Result<size_t> ServerConnections(Messenger* messenger) {
+  size_t result = 0;
+  for (const auto& [lane, count] : VERIFY_RESULT(ServerConnectionsByLane(messenger))) {
+    result += count;
+  }
+  return result;
+}
+
+Result<Socket> RawConnect(const Endpoint& endpoint) {
+  Socket socket;
+  RETURN_NOT_OK(socket.Init(0));
+  RETURN_NOT_OK(socket.SetNoDelay(true));
+  RETURN_NOT_OK(socket.Connect(endpoint));
+  return socket;
+}
+
+Status RawSend(Socket* socket, std::string_view bytes) {
+  return socket->BlockingWrite(
+      pointer_cast<const uint8_t*>(bytes.data()), bytes.size(), MonoTime::Now() + 10s);
+}
+
+// Forwards one connection from a client to a target server. Bytes from the client are held while
+// hold() returns true, and the lane byte of a preamble at their start can be replaced, so that a
+// real client's preamble reaches the server late or with another lane.
+class Relay {
+ public:
+  struct Options {
+    std::function<bool()> hold;
+    std::optional<uint8_t> lane_byte;
+  };
+
+  ~Relay() {
+    threads_.Stop();
+  }
+
+  Status Start(const Endpoint& target, Options options) {
+    RETURN_NOT_OK(listen_socket_.Init(0));
+    RETURN_NOT_OK(listen_socket_.BindAndListen(
+        Endpoint(IpAddress::from_string("127.0.0.1"), 0), /* listen_queue_size= */ 1));
+    RETURN_NOT_OK(listen_socket_.GetSocketAddress(&endpoint_));
+    RETURN_NOT_OK(listen_socket_.SetNonBlocking(true));
+    threads_.AddThreadFunctor([this, target, options = std::move(options)] {
+      auto status = Run(target, options);
+      LOG_IF(INFO, !status.ok()) << "Relay stopped: " << status;
+    });
+    return Status::OK();
+  }
+
+  HostPort host_port() const {
+    return HostPort::FromBoundEndpoint(endpoint_);
+  }
+
+ private:
+  Status Run(const Endpoint& target, const Options& options) {
+    auto& stop = threads_.stop_flag();
+    Socket client;
+    Endpoint remote;
+    for (;;) {
+      SCHECK(!stop.load(), Aborted, "Stopped before a client connected");
+      auto status = listen_socket_.Accept(&client, &remote, Socket::FLAG_NONBLOCKING);
+      if (status.ok()) {
+        break;
+      }
+      SCHECK(status.IsTryAgain(), IllegalState, status.ToString());
+      std::this_thread::sleep_for(1ms);
+    }
+    auto server = VERIFY_RESULT(RawConnect(target));
+    RETURN_NOT_OK(server.SetNonBlocking(true));
+    while (options.hold && options.hold()) {
+      SCHECK(!stop.load(), Aborted, "Stopped while holding");
+      std::this_thread::sleep_for(1ms);
+    }
+    size_t client_bytes = 0;
+    std::array<pollfd, 2> fds = {
+        pollfd{.fd = client.GetFd(), .events = POLLIN, .revents = 0},
+        pollfd{.fd = server.GetFd(), .events = POLLIN, .revents = 0}};
+    std::array<Socket*, 2> sockets = {&client, &server};
+    while (!stop.load()) {
+      if (::poll(fds.data(), fds.size(), 10) <= 0) {
+        continue;
+      }
+      for (size_t i = 0; i != fds.size(); ++i) {
+        if (!(fds[i].revents & (POLLIN | POLLHUP | POLLERR))) {
+          continue;
+        }
+        uint8_t buf[4096];
+        auto received = sockets[i]->Recv(buf, sizeof(buf));
+        if (!received.ok()) {
+          if (received.status().IsTryAgain()) {
+            continue;
+          }
+          return received.status();
+        }
+        if (i == 0) {
+          const auto lane_pos = sizeof(kLanePreambleMagic);
+          if (options.lane_byte && client_bytes <= lane_pos &&
+              client_bytes + *received > lane_pos) {
+            buf[lane_pos - client_bytes] = *options.lane_byte;
+          }
+          client_bytes += *received;
+        }
+        RETURN_NOT_OK(sockets[1 - i]->BlockingWrite(buf, *received, MonoTime::Now() + 10s));
+      }
+    }
+    return Status::OK();
+  }
+
+  Socket listen_socket_;
+  Endpoint endpoint_;
+  TestThreadHolder threads_;
+};
+
+// A connection context of a protocol other than YB RPC, as CQL and Redis have, recording the bytes
+// it receives.
+class RecordingConnectionContext : public ConnectionContextWithQueue {
+ public:
+  RecordingConnectionContext(
+      size_t receive_buffer_size, const MemTrackerPtr& buffer_tracker, const MemTrackerPtr&)
+      : ConnectionContextWithQueue(/* max_concurrent_calls= */ 1, /* max_queued_bytes= */ 1_MB),
+        read_buffer_(receive_buffer_size, buffer_tracker) {}
+
+  static std::string Name() { return "Recording"; }
+
+  static std::string Received() {
+    std::lock_guard lock(mutex_);
+    return received_;
+  }
+
+ private:
+  Result<ProcessCallsResult> ProcessCalls(
+      const ConnectionPtr& connection, const IoVecs& data, ReadBufferFull read_buffer_full)
+      ON_REACTOR_THREAD override {
+    size_t consumed = 0;
+    std::lock_guard lock(mutex_);
+    for (const auto& iov : data) {
+      received_.append(static_cast<const char*>(iov.iov_base), iov.iov_len);
+      consumed += iov.iov_len;
+    }
+    return ProcessCallsResult{.consumed = consumed, .buffer = Slice()};
+  }
+
+  Status Connected(const ConnectionPtr& connection) override { return Status::OK(); }
+  RpcConnectionPB::StateType State() override { return RpcConnectionPB::OPEN; }
+  StreamReadBuffer& ReadBuffer() override { return read_buffer_; }
+
+  CircularReadBuffer read_buffer_;
+
+  static std::mutex mutex_;
+  static std::string received_;
+};
+
+std::mutex RecordingConnectionContext::mutex_;
+std::string RecordingConnectionContext::received_;
+
+} // namespace
+
+class RpcLanePreambleTest : public RpcLanesTest {
+ protected:
+  void SetUp() override {
+    RpcLanesTest::SetUp();
+    secure_context_ = std::make_unique<SecureContext>(
+        RequireClientCertificate::kFalse, UseClientCertificate::kFalse);
+    ASSERT_OK(secure_context_->TEST_GenerateKeys(2048, "127.0.0.1", MatchingCertKeyPair::kTrue));
+  }
+
+  void ApplyStack(LaneStack stack, MessengerBuilder* builder) {
+    auto secure_factory = [this] {
+      return SecureStreamFactory(
+          TcpStream::Factory(), MemTracker::GetRootTracker(), secure_context_.get());
+    };
+    switch (stack) {
+      case LaneStack::kPlain:
+        return;
+      case LaneStack::kCompressed:
+        builder->SetListenProtocol(CompressedStreamProtocol());
+        builder->AddStreamFactory(
+            CompressedStreamProtocol(),
+            CompressedStreamFactory(TcpStream::Factory(), MemTracker::GetRootTracker()));
+        return;
+      case LaneStack::kSecure:
+        builder->SetListenProtocol(SecureStreamProtocol());
+        builder->SetUncompressedProtocol(SecureStreamProtocol());
+        builder->AddStreamFactory(SecureStreamProtocol(), secure_factory());
+        return;
+      case LaneStack::kSecureCompressed:
+        builder->SetListenProtocol(CompressedStreamProtocol());
+        builder->SetUncompressedProtocol(SecureStreamProtocol());
+        builder->AddStreamFactory(
+            CompressedStreamProtocol(),
+            CompressedStreamFactory(secure_factory(), MemTracker::GetRootTracker()));
+        return;
+    }
+    FATAL_INVALID_ENUM_VALUE(LaneStack, stack);
+  }
+
+  // A laned server messenger with reactors_per_lane reactors per lane, whose calls are handled by
+  // the handler pools of the lane of the reactor that read them.
+  TestServer StartLanedServer(LaneStack stack = LaneStack::kPlain, int reactors_per_lane = 1) {
+    auto builder = LanedBuilder("Server", *topology_, kLanePreambleServerOptions);
+    builder.set_reactors_per_lane(reactors_per_lane);
+    ApplyStack(stack, &builder);
+    return StartServer(EXPECT_RESULT(builder.Build()), ServicePriority::kNormal);
+  }
+
+  AutoShutdownMessengerHolder LanedClient(
+      LaneStack stack = LaneStack::kPlain, int connections_per_lane_remote = 1) {
+    auto builder = LanedBuilder("Client", *topology_);
+    builder.set_connections_per_lane_remote(connections_per_lane_remote);
+    ApplyStack(stack, &builder);
+    return rpc::CreateAutoShutdownMessengerHolder(EXPECT_RESULT(builder.Build()));
+  }
+
+  AutoShutdownMessengerHolder UnlanedClient(LaneStack stack = LaneStack::kPlain) {
+    auto builder = CreateMessengerBuilder("UnlanedClient");
+    ApplyStack(stack, &builder);
+    return rpc::CreateAutoShutdownMessengerHolder(EXPECT_RESULT(builder.Build()));
+  }
+
+  // Value of a preamble counter of the test metric entity, which servers and clients share; -1
+  // when it is not instantiated.
+  int64_t PreambleCounter(const CounterPrototype& prototype) {
+    auto metric = metric_entity()->FindOrNull<Counter>(prototype);
+    return metric ? metric->value() : -1;
+  }
+
+  struct PreambleCounts {
+    int64_t bound;
+    int64_t absent;
+    int64_t peek_timeouts;
+    int64_t stripped_late;
+
+    bool operator==(const PreambleCounts&) const = default;
+
+    std::string ToString() const {
+      return YB_STRUCT_TO_STRING(bound, absent, peek_timeouts, stripped_late);
+    }
+  };
+
+  PreambleCounts Counts() {
+    return PreambleCounts {
+      .bound = PreambleCounter(METRIC_rpc_lane_preamble_bound),
+      .absent = PreambleCounter(METRIC_rpc_lane_preamble_absent),
+      .peek_timeouts = PreambleCounter(METRIC_rpc_lane_preamble_peek_timeouts),
+      .stripped_late = PreambleCounter(METRIC_rpc_lane_preamble_stripped_late),
+    };
+  }
+
+  Status WaitCounts(
+      const PreambleCounts& expected, MonoDelta timeout = MonoDelta(10s) * kTimeMultiplier) {
+    return LoggedWaitFor([this, &expected] { return Counts() == expected; }, timeout,
+                         Format("Preamble counts $0", expected));
+  }
+
+  // The first size bytes that a call through messenger with the lane hint writes on a new
+  // connection, read by a listening socket.
+  Result<std::string> FirstBytesOnWire(Messenger* messenger, LaneId hint, size_t size) {
+    Socket listen_socket;
+    HostPort host_port;
+    RETURN_NOT_OK(StartFakeServer(&listen_socket, &host_port));
+    Proxy proxy(messenger, host_port);
+    RpcController controller;
+    controller.set_lane(hint);
+    controller.set_timeout(30s * kTimeMultiplier);
+    rpc_test::WhoAmIRequestPB req;
+    rpc_test::WhoAmIResponsePB resp;
+    CountDownLatch done(1);
+    proxy.AsyncRequest(
+        &WhoAmIMethod(), /* method_metrics= */ nullptr, req, &resp, &controller,
+        [&done] { done.CountDown(); });
+    auto result = [&listen_socket, size]() -> Result<std::string> {
+      Socket connection;
+      Endpoint remote;
+      RETURN_NOT_OK(listen_socket.Accept(&connection, &remote, 0));
+      std::string bytes(size, '\0');
+      RETURN_NOT_OK(connection.BlockingRecv(
+          pointer_cast<uint8_t*>(bytes.data()), size, MonoTime::Now() + 10s * kTimeMultiplier));
+      // Closing the connection fails the call.
+      return bytes;
+    }();
+    done.Wait();
+    return result;
+  }
+
+  std::unique_ptr<SecureContext> secure_context_;
+};
+
+class RpcLanePreambleStackTest : public RpcLanePreambleTest,
+                                 public testing::WithParamInterface<LaneStack> {
+ protected:
+  void SetUp() override {
+    if (GetParam() == LaneStack::kCompressed || GetParam() == LaneStack::kSecureCompressed) {
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_stream_compression_algo) = 1;
+    }
+    RpcLanePreambleTest::SetUp();
+  }
+
+  // The first two bytes of the stream's own header: the TLS ClientHello, or "YB" for a compressed
+  // stream's header and the YB connection header.
+  std::string StackHeader() {
+    return GetParam() == LaneStack::kSecure || GetParam() == LaneStack::kSecureCompressed
+        ? std::string("\x16\x03", 2) : std::string("YB");
+  }
+};
+
+// The preamble precedes the stream's own first bytes, whatever the upper layers are, only on
+// lane-keyed connections of a laned messenger, and only while the AutoFlag is set.
+TEST_P(RpcLanePreambleStackTest, FirstBytesOnWire) {
+  SKIP_WITHOUT_TOPOLOGY();
+  TEST_SetLaneTopology scope(*topology_);
+  auto laned = LanedClient(GetParam());
+  auto unlaned = UnlanedClient(GetParam());
+  const auto header = StackHeader();
+  ASSERT_EQ(ASSERT_RESULT(FirstBytesOnWire(laned.get(), 1, 5)), LanePreamble(1) + header);
+  ASSERT_EQ(ASSERT_RESULT(FirstBytesOnWire(laned.get(), 0, 5)), LanePreamble(0) + header);
+  // A hint above the lane count is reduced before it keys the connection.
+  ASSERT_EQ(ASSERT_RESULT(FirstBytesOnWire(laned.get(), 3, 5)), LanePreamble(1) + header);
+  ASSERT_EQ(ASSERT_RESULT(FirstBytesOnWire(laned.get(), kNoLane, 2)), header);
+  ASSERT_EQ(ASSERT_RESULT(FirstBytesOnWire(unlaned.get(), 1, 2)), header);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_rpc_lane_preamble) = false;
+  ASSERT_EQ(ASSERT_RESULT(FirstBytesOnWire(laned.get(), 1, 2)), header);
+}
+
+// A connection with a preamble is bound to a reactor of the preamble's lane, a lane's connections
+// take its reactors in turn, and calls are handled in that lane.
+TEST_P(RpcLanePreambleStackTest, BindsToPreambleLane) {
+  SKIP_WITHOUT_TOPOLOGY();
+  TEST_SetLaneTopology scope(*topology_);
+  auto server = StartLanedServer(GetParam(), /* reactors_per_lane= */ 2);
+  auto client = LanedClient(GetParam(), /* connections_per_lane_remote= */ 2);
+  Proxy proxy(client.get(), HostPort::FromBoundEndpoint(server.bound_endpoint()));
+  for (LaneId lane : {LaneId(0), LaneId(1)}) {
+    for (int i = 0; i != 4; ++i) {
+      rpc_test::WhoAmIResponsePB resp;
+      ASSERT_OK(WhoAmIWithTimeout(&proxy, lane, &resp));
+      ASSERT_EQ(resp.handler_lane(), lane);
+    }
+  }
+  ASSERT_EQ(Counts(), (PreambleCounts{
+      .bound = 4, .absent = 0, .peek_timeouts = 0, .stripped_late = 0}));
+  for (size_t i = 0; i != server.messenger()->num_reactors(); ++i) {
+    ReactorMetrics metrics;
+    ASSERT_OK(server.messenger()->TEST_GetReactorMetrics(i, &metrics));
+    ASSERT_EQ(metrics.num_server_connections, 1) << "reactor " << i;
+  }
+  server.Shutdown();
+}
+
+// Without a preamble (an older sender, or the AutoFlag off) a laned receiver consumes nothing and
+// assigns the connection as without lanes.
+TEST_P(RpcLanePreambleStackTest, NoPreamble) {
+  SKIP_WITHOUT_TOPOLOGY();
+  TEST_SetLaneTopology scope(*topology_);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_rpc_lane_preamble) = false;
+  auto server = StartLanedServer(GetParam());
+  auto client = LanedClient(GetParam());
+  Proxy proxy(client.get(), HostPort::FromBoundEndpoint(server.bound_endpoint()));
+  for (LaneId lane : {LaneId(0), LaneId(1), kNoLane}) {
+    ASSERT_OK(WhoAmIWithTimeout(&proxy, lane));
+  }
+  ASSERT_EQ(Counts(), (PreambleCounts{
+      .bound = 0, .absent = 3, .peek_timeouts = 0, .stripped_late = 0}));
+  ASSERT_EQ(ASSERT_RESULT(ServerConnections(server.messenger())), 3);
+  server.Shutdown();
+}
+
+// A receiver that neither peeks for nor strips the preamble, as one that predates it, rejects a
+// connection that starts with one, which is why sending it is gated by an AutoFlag.
+TEST_P(RpcLanePreambleStackTest, OldReceiverRejectsPreamble) {
+  SKIP_WITHOUT_TOPOLOGY();
+  TEST_SetLaneTopology scope(*topology_);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_rpc_ignore_lane_preamble) = true;
+  auto server = StartLanedServer(GetParam());
+  auto client = LanedClient(GetParam());
+  Proxy proxy(client.get(), HostPort::FromBoundEndpoint(server.bound_endpoint()));
+  auto status = WhoAmIWithTimeout(&proxy, 1);
+  ASSERT_NOK(status);
+  LOG(INFO) << "Call with a preamble to an old receiver: " << status;
+  ASSERT_OK(WhoAmIWithTimeout(&proxy, kNoLane));
+  server.Shutdown();
+}
+
+// A preamble that arrives after the peek timeout is dropped by the reactor, and the connection,
+// not bound to a lane, serves calls.
+TEST_P(RpcLanePreambleStackTest, LatePreambleStrippedByReactor) {
+  SKIP_WITHOUT_TOPOLOGY();
+  TEST_SetLaneTopology scope(*topology_);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_lane_preamble_peek_timeout_ms) = 100;
+  auto server = StartLanedServer(GetParam());
+  auto client = LanedClient(GetParam());
+  Relay relay;
+  ASSERT_OK(relay.Start(server.bound_endpoint(), Relay::Options{
+      .hold = [this] { return PreambleCounter(METRIC_rpc_lane_preamble_peek_timeouts) < 1; },
+      .lane_byte = std::nullopt,
+  }));
+  Proxy proxy(client.get(), relay.host_port());
+  ASSERT_OK(WhoAmIWithTimeout(&proxy, 1));
+  ASSERT_EQ(Counts(), (PreambleCounts{
+      .bound = 0, .absent = 0, .peek_timeouts = 1, .stripped_late = 1}));
+  server.Shutdown();
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    , RpcLanePreambleStackTest,
+    testing::Values(
+        LaneStack::kPlain, LaneStack::kCompressed, LaneStack::kSecure,
+        LaneStack::kSecureCompressed),
+    [](const testing::TestParamInfo<LaneStack>& info) {
+      return ToString(info.param).substr(1);
+    });
+
+// The lane byte comes from the network: any value, including kNoLane's, binds to its value modulo
+// the lane count.
+TEST_F(RpcLanePreambleTest, SpoofedLaneIsReduced) {
+  SKIP_WITHOUT_TOPOLOGY();
+  TEST_SetLaneTopology scope(*topology_);
+  auto server = StartLanedServer();
+  auto client = LanedClient();
+  int64_t bound = 0;
+  for (uint8_t lane_byte : {2, 3, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}) {
+    SCOPED_TRACE(Format("lane byte $0", static_cast<int>(lane_byte)));
+    Relay relay;
+    ASSERT_OK(relay.Start(server.bound_endpoint(), Relay::Options{
+        .hold = {}, .lane_byte = lane_byte}));
+    Proxy proxy(client.get(), relay.host_port());
+    rpc_test::WhoAmIResponsePB resp;
+    ASSERT_OK(WhoAmIWithTimeout(&proxy, 0, &resp));
+    ASSERT_EQ(resp.handler_lane(), lane_byte % 2);
+    ASSERT_EQ(PreambleCounter(METRIC_rpc_lane_preamble_bound), ++bound);
+  }
+  server.Shutdown();
+}
+
+// The acceptor decides on the first bytes as soon as they allow, waits for a preamble split over
+// several reads, and gives up at the timeout; a socket that closes falls back at once.
+TEST_F(RpcLanePreambleTest, PeekOutcomes) {
+  SKIP_WITHOUT_TOPOLOGY();
+  TEST_SetLaneTopology scope(*topology_);
+  // Long enough that every outcome but the timeout one shows the acceptor did not wait for it.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_lane_preamble_peek_timeout_ms) = 60000;
+  auto server = StartLanedServer();
+  const auto endpoint = server.bound_endpoint();
+  PreambleCounts expected{.bound = 0, .absent = 0, .peek_timeouts = 0, .stripped_late = 0};
+  ASSERT_EQ(Counts(), expected);
+
+  // Preamble split over three reads.
+  {
+    auto socket = ASSERT_RESULT(RawConnect(endpoint));
+    for (char c : LanePreamble(1)) {
+      ASSERT_OK(RawSend(&socket, std::string_view(&c, 1)));
+      std::this_thread::sleep_for(20ms);
+    }
+    ++expected.bound;
+    ASSERT_OK(WaitCounts(expected));
+    ASSERT_OK(LoggedWaitFor([&server]() -> Result<bool> {
+      return VERIFY_RESULT(ServerConnectionsByLane(server.messenger()))[1] == 1;
+    }, 10s, "Connection on lane 1's reactor"));
+    ASSERT_EQ(ASSERT_RESULT(ServerConnectionsByLane(server.messenger()))[0], 0);
+  }
+  ASSERT_OK(LoggedWaitFor([&server]() -> Result<bool> {
+    return VERIFY_RESULT(ServerConnections(server.messenger())) == 0;
+  }, 10s, "Connection closed"));
+
+  // Decided at the first byte, at the second, and on EOF.
+  for (std::string_view first_bytes : {"\x16"sv, "YB"sv, ""sv}) {
+    SCOPED_TRACE(Slice(first_bytes).ToDebugHexString());
+    auto socket = ASSERT_RESULT(RawConnect(endpoint));
+    if (first_bytes.empty()) {
+      ASSERT_OK(socket.Close());
+    } else {
+      ASSERT_OK(RawSend(&socket, first_bytes));
+    }
+    ++expected.absent;
+    ASSERT_OK(WaitCounts(expected));
+  }
+
+  // Part of a preamble when the timeout passes: the rest is stripped by the reactor.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_lane_preamble_peek_timeout_ms) = 100;
+  auto socket = ASSERT_RESULT(RawConnect(endpoint));
+  ASSERT_OK(RawSend(&socket, "Y"));
+  ++expected.peek_timeouts;
+  ASSERT_OK(WaitCounts(expected));
+  ASSERT_OK(RawSend(&socket, LanePreamble(1).substr(1)));
+  ++expected.stripped_late;
+  ASSERT_OK(WaitCounts(expected));
+  server.Shutdown();
+}
+
+// Past the cap on held sockets an undecided socket is passed on at once, not bound; shutdown closes
+// held sockets without passing them on.
+TEST_F(RpcLanePreambleTest, HeldSocketsCapAndShutdown) {
+  SKIP_WITHOUT_TOPOLOGY();
+  TEST_SetLaneTopology scope(*topology_);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_lane_preamble_peek_timeout_ms) = 60000;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_rpc_lane_preamble_max_pending_sockets) = 0;
+  auto server = StartLanedServer();
+  auto first = ASSERT_RESULT(RawConnect(server.bound_endpoint()));
+  PreambleCounts expected{.bound = 0, .absent = 0, .peek_timeouts = 1, .stripped_late = 0};
+  ASSERT_OK(WaitCounts(expected));
+  ASSERT_OK(LoggedWaitFor([&server]() -> Result<bool> {
+    return VERIFY_RESULT(ServerConnections(server.messenger())) == 1;
+  }, 10s, "Connection registered"));
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_rpc_lane_preamble_max_pending_sockets) = 1;
+  auto held = ASSERT_RESULT(RawConnect(server.bound_endpoint()));
+  std::this_thread::sleep_for(200ms);
+  ASSERT_EQ(Counts(), expected);
+  ASSERT_EQ(ASSERT_RESULT(ServerConnections(server.messenger())), 1);
+
+  server.messenger()->ShutdownAcceptor();
+  uint8_t byte;
+  ASSERT_OK(held.SetRecvTimeout(10s));
+  auto received = held.Recv(&byte, 1);
+  ASSERT_NOK(received);
+  ASSERT_EQ(Errno(received.status()), ESHUTDOWN) << received.status();
+  ASSERT_EQ(Counts(), expected);
+  ASSERT_EQ(ASSERT_RESULT(ServerConnections(server.messenger())), 1);
+  server.Shutdown();
+}
+
+// An unlaned YB RPC receiver, as a lanes=1 tablet server's, does not peek but drops a preamble on
+// the reactor; with no preamble received its metrics are those of a server without lanes.
+TEST_F(RpcLanePreambleTest, UnlanedReceiverStripsWithoutPeeking) {
+  SKIP_WITHOUT_TOPOLOGY();
+  TEST_SetLaneTopology scope(*topology_);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_lane_preamble_peek_timeout_ms) = 60000;
+  TestServerOptions options;
+  options.messenger_options = kLanePreambleServerOptions;
+  auto server = StartTestServer(options);
+  const PreambleCounts none{.bound = -1, .absent = -1, .peek_timeouts = -1, .stripped_late = -1};
+
+  {
+    auto silent = ASSERT_RESULT(RawConnect(server.bound_endpoint()));
+    ASSERT_OK(LoggedWaitFor([&server]() -> Result<bool> {
+      return VERIFY_RESULT(ServerConnections(server.messenger())) == 1;
+    }, 10s, "Silent connection registered without a peek"));
+  }
+  auto unlaned = UnlanedClient();
+  Proxy unlaned_proxy(unlaned.get(), HostPort::FromBoundEndpoint(server.bound_endpoint()));
+  ASSERT_OK(WhoAmIWithTimeout(&unlaned_proxy, 1));
+  ASSERT_EQ(Counts(), none);
+
+  auto laned = LanedClient();
+  Proxy laned_proxy(laned.get(), HostPort::FromBoundEndpoint(server.bound_endpoint()));
+  ASSERT_OK(WhoAmIWithTimeout(&laned_proxy, 1));
+  ASSERT_OK(WhoAmIWithTimeout(&laned_proxy, 0));
+  ASSERT_EQ(Counts(), (PreambleCounts{
+      .bound = -1, .absent = -1, .peek_timeouts = -1, .stripped_late = 2}));
+  server.Shutdown();
+}
+
+// A messenger whose inbound protocol is not YB RPC, as CQL's and Redis's, neither peeks nor strips:
+// its connection context receives the preamble.
+TEST_F(RpcLanePreambleTest, OtherProtocolsSeePreamble) {
+  SKIP_WITHOUT_TOPOLOGY();
+  TEST_SetLaneTopology scope(*topology_);
+  auto client = LanedClient();
+  for (bool laned_server : {false, true}) {
+    SCOPED_TRACE(Format("laned server: $0", laned_server));
+    auto builder = laned_server ? LanedBuilder("Server", *topology_, kLanePreambleServerOptions)
+                                : CreateMessengerBuilder("Server", kLanePreambleServerOptions);
+    auto server = rpc::CreateAutoShutdownMessengerHolder(ASSERT_RESULT(builder.Build()));
+    Endpoint endpoint;
+    ASSERT_OK(server->ListenAddress(
+        CreateConnectionContextFactory<RecordingConnectionContext>(), Endpoint(), &endpoint));
+    ASSERT_OK(server->StartAcceptor());
+    const auto received_before = RecordingConnectionContext::Received().size();
+    Proxy proxy(client.get(), HostPort::FromBoundEndpoint(endpoint));
+    ASSERT_NOK(WhoAmIWithTimeout(&proxy, 1, nullptr, 500ms));
+    auto received = RecordingConnectionContext::Received().substr(received_before);
+    ASSERT_TRUE(received.starts_with(LanePreamble(1) + "YB\x01"))
+        << Slice(received).ToDebugString();
+  }
+  ASSERT_EQ(Counts(), (PreambleCounts{
+      .bound = -1, .absent = -1, .peek_timeouts = -1, .stripped_late = -1}));
+}
+
+// Turning the AutoFlag off stops preambles on new connections while existing bound ones keep
+// serving calls; turning it on again leaves connections created meanwhile unbound.
+TEST_F(RpcLanePreambleTest, RuntimeDemotion) {
+  SKIP_WITHOUT_TOPOLOGY();
+  TEST_SetLaneTopology scope(*topology_);
+  auto server = StartLanedServer();
+  auto client = LanedClient();
+  Proxy proxy(client.get(), HostPort::FromBoundEndpoint(server.bound_endpoint()));
+  rpc_test::WhoAmIResponsePB resp;
+  ASSERT_OK(WhoAmIWithTimeout(&proxy, 1, &resp));
+  ASSERT_EQ(resp.handler_lane(), 1);
+  PreambleCounts expected{.bound = 1, .absent = 0, .peek_timeouts = 0, .stripped_late = 0};
+  ASSERT_EQ(Counts(), expected);
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_rpc_lane_preamble) = false;
+  ASSERT_OK(WhoAmIWithTimeout(&proxy, 0));
+  ++expected.absent;
+  ASSERT_EQ(Counts(), expected);
+  for (int i = 0; i != 3; ++i) {
+    ASSERT_OK(WhoAmIWithTimeout(&proxy, 1, &resp));
+    ASSERT_EQ(resp.handler_lane(), 1);
+  }
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_rpc_lane_preamble) = true;
+  ASSERT_OK(WhoAmIWithTimeout(&proxy, 0));
+  ASSERT_EQ(Counts(), expected);
+  ASSERT_EQ(ASSERT_RESULT(ServerConnections(server.messenger())), 2);
+  server.Shutdown();
+}
+
+// The preamble stays first when calls are queued before the connect completes, including one that
+// expires there, and a connect that fails tears down a stream with a queued preamble.
+TEST_F(RpcLanePreambleTest, QueuedBeforeConnect) {
+  SKIP_WITHOUT_TOPOLOGY();
+  TEST_SetLaneTopology scope(*topology_);
+  auto server = StartLanedServer();
+  auto client = LanedClient();
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_delay_connect_ms) = 2000;
+  Proxy proxy(client.get(), HostPort::FromBoundEndpoint(server.bound_endpoint()));
+  auto status = WhoAmIWithTimeout(&proxy, 1, nullptr, 100ms);
+  ASSERT_TRUE(status.IsTimedOut()) << status;
+  rpc_test::WhoAmIResponsePB resp;
+  ASSERT_OK(WhoAmIWithTimeout(&proxy, 1, &resp));
+  ASSERT_EQ(resp.handler_lane(), 1);
+  ASSERT_EQ(Counts(), (PreambleCounts{
+      .bound = 1, .absent = 0, .peek_timeouts = 0, .stripped_late = 0}));
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_delay_connect_ms) = 0;
+  // Bound but not listening, so a connect to it is refused.
+  Socket closed;
+  ASSERT_OK(closed.Init(0));
+  ASSERT_OK(closed.Bind(Endpoint(IpAddress::from_string("127.0.0.1"), 0)));
+  Endpoint closed_endpoint;
+  ASSERT_OK(closed.GetSocketAddress(&closed_endpoint));
+  Proxy refused(client.get(), HostPort::FromBoundEndpoint(closed_endpoint));
+  for (int i = 0; i != 3; ++i) {
+    ASSERT_NOK(WhoAmIWithTimeout(&refused, 1, nullptr, 5s));
+  }
+  ASSERT_OK(WhoAmIWithTimeout(&proxy, 1));
+  server.Shutdown();
 }
 
 } // namespace yb::rpc

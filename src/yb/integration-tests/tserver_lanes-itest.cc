@@ -61,14 +61,22 @@
 #include "yb/util/cpu_topology_test_util.h"
 #include "yb/util/lanes.h"
 #include "yb/util/lanes_test_util.h"
+#include "yb/util/metrics.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/tsan_util.h"
 
+DECLARE_bool(enable_rpc_lane_preamble);
 DECLARE_int32(force_lookup_cache_refresh_secs);
 DECLARE_int32(master_inject_latency_on_tablet_lookups_ms);
 DECLARE_string(TEST_cpu_topology_cpuset);
 DECLARE_string(TEST_cpu_topology_sysfs_root);
 DECLARE_int32(tserver_lanes);
+
+METRIC_DECLARE_entity(server);
+METRIC_DECLARE_counter(rpc_lane_preamble_absent);
+METRIC_DECLARE_counter(rpc_lane_preamble_bound);
+METRIC_DECLARE_counter(rpc_lane_preamble_peek_timeouts);
+METRIC_DECLARE_counter(rpc_lane_preamble_stripped_late);
 
 namespace yb {
 
@@ -223,15 +231,40 @@ class TserverLanesITest : public TabletSplitITest {
     }, 30s * kTimeMultiplier, "Replicas agree on the committed op id");
   }
 
+  // Sum of a preamble counter over the tablet servers; a server that did not instantiate it adds 0.
+  int64_t PreambleCounter(const CounterPrototype& prototype) {
+    int64_t result = 0;
+    for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
+      auto* entity = cluster_->mini_tablet_server(i)->server()->metric_entity().get();
+      auto counter = entity->FindOrNull<Counter>(prototype);
+      result += counter ? counter->value() : 0;
+    }
+    return result;
+  }
+
+  void TestRaftStaysInTabletLane(bool preamble);
+
  private:
   std::optional<TEST_SetLaneTopology> lane_scope_;
+};
+
+// The same cluster with the lane preamble AutoFlag off from the start, so that no inbound
+// connection is bound to a lane.
+class TserverLanesNoPreambleITest : public TserverLanesITest {
+ protected:
+  void SetUp() override {
+    // Set as an override, which AutoFlag promotion at cluster start leaves alone.
+    ASSERT_OK(SET_FLAG(enable_rpc_lane_preamble, false));
+    TserverLanesITest::SetUp();
+  }
 };
 
 // RF3 writes replicate; each replica runs in its tablet's lane; leaders send Raft calls on
 // connections of that lane owned by that lane's reactors, and the reactors that read the responses
 // are in the lane that issued the calls, so no callback crosses; the in-process master, whose
-// messenger is unlaned, keys no connection by lane.
-TEST_F(TserverLanesITest, RaftStaysInTabletLane) {
+// messenger is unlaned, keys no connection by lane. With the preamble, followers handle
+// UpdateConsensus in the tablet's lane.
+void TserverLanesITest::TestRaftStaysInTabletLane(bool preamble) {
   SetNumTablets(4);
   CreateTable();
   ASSERT_OK(WaitAllReplicasReady(cluster_.get(), table_->id(), 30s * kTimeMultiplier));
@@ -253,12 +286,35 @@ TEST_F(TserverLanesITest, RaftStaysInTabletLane) {
   // reads the response, and no callback crosses. Without the hint the response reactor is in a
   // random lane and callbacks cross.
   ASSERT_EQ(delta.crossing(LaneCrossingCategory::kCallback), 0) << delta.ToString();
-  // Inbound calls are handled in the lane of whichever reactor read them, so each write crosses
-  // into its tablet's pipeline at most once on the leader (the preparer) and at most twice on each
-  // follower (the log append and the other tasks its UpdateConsensus handler submits). Work within
-  // the pipeline crosses no lane.
-  ASSERT_LE(delta.crossing(LaneCrossingCategory::kTabletPipeline), kWrites * (1 + 2 * 2))
-      << delta.ToString();
+  // The test client's messenger is unlaned, so its writes arrive on connections not bound to a lane
+  // and are handled in the lane of whichever reactor read them: each write crosses into its
+  // tablet's pipeline at most once on the leader (the preparer). Work within the pipeline crosses
+  // no lane.
+  // With the preamble, the leader's UpdateConsensus connection to a follower, keyed by lane(T), is
+  // bound to a lane(T) reactor of the follower, so the follower's handler, and the follower-side
+  // prepare and apply it runs inline, are in lane(T) and cross nothing. The slack covers pipeline
+  // work started by calls of unbound connections other than the writes, such as the master's.
+  // Without the preamble the follower handles UpdateConsensus in the lane of whichever reactor read
+  // it, and crosses into the pipeline for the log append and the other tasks it submits, at most
+  // twice per write on each of two followers.
+  constexpr int kSlack = 5;
+  if (preamble) {
+    ASSERT_LE(delta.crossing(LaneCrossingCategory::kTabletPipeline), kWrites + kSlack)
+        << delta.ToString();
+    ASSERT_GT(PreambleCounter(METRIC_rpc_lane_preamble_bound), 0);
+  } else {
+    // A follower handles a call in lane(T) with probability 1/L, so the followers' crossings,
+    // about 2 x 50 x 3/4 at least, put the count well above the bound with the preamble.
+    ASSERT_GT(delta.crossing(LaneCrossingCategory::kTabletPipeline), kWrites + kSlack)
+        << delta.ToString();
+    ASSERT_LE(delta.crossing(LaneCrossingCategory::kTabletPipeline), kWrites * (1 + 2 * 2))
+        << delta.ToString();
+    ASSERT_EQ(PreambleCounter(METRIC_rpc_lane_preamble_bound), 0);
+  }
+  // Masters' and the test client's connections carry no preamble; none arrives late.
+  ASSERT_GT(PreambleCounter(METRIC_rpc_lane_preamble_absent), 0);
+  ASSERT_EQ(PreambleCounter(METRIC_rpc_lane_preamble_peek_timeouts), 0);
+  ASSERT_EQ(PreambleCounter(METRIC_rpc_lane_preamble_stripped_late), 0);
   ASSERT_OK(CheckRowsCount(100 + kWrites));
   ASSERT_OK(WaitReplicated());
 
@@ -308,6 +364,14 @@ TEST_F(TserverLanesITest, RaftStaysInTabletLane) {
     }
   }
   ASSERT_GT(master_connections, 0);
+}
+
+TEST_F(TserverLanesITest, RaftStaysInTabletLane) {
+  TestRaftStaysInTabletLane(/* preamble= */ true);
+}
+
+TEST_F(TserverLanesNoPreambleITest, RaftStaysInTabletLane) {
+  TestRaftStaysInTabletLane(/* preamble= */ false);
 }
 
 // The server client's tablet RPCs call back in the lane that flushed them even when the tablet
@@ -421,7 +485,9 @@ TEST_F(TserverLanesITest, SplitChildrenAndRemoteBootstrapUseTheirLanes) {
   ASSERT_OK(CheckRowsCount(kDefaultNumRows));
 }
 
-// Tablet servers with different lane counts replicate to each other: lanes cost locality only.
+// Tablet servers with different lane counts replicate to each other: lanes cost locality only. The
+// lanes=1 server does not peek for lane preambles but drops those of the laned servers' lane-keyed
+// connections on its reactors; the laned servers bind each other's.
 class TserverMixedLanesITest : public ExternalMiniClusterITestBase {};
 
 TEST_F(TserverMixedLanesITest, WritesAndReadsWithMixedLaneCounts) {
@@ -448,6 +514,15 @@ TEST_F(TserverMixedLanesITest, WritesAndReadsWithMixedLaneCounts) {
   ASSERT_NO_FATALS(verifier.CheckCluster());
   ASSERT_NO_FATALS(verifier.CheckRowCount(
       workload.table_name(), ClusterVerifier::AT_LEAST, workload.rows_inserted()));
+
+  auto preamble_counter = [this](size_t ts_idx, const CounterPrototype& prototype) {
+    return cluster_->tablet_server(ts_idx)->GetMetric<int64>(
+        &METRIC_ENTITY_server, "yb.tabletserver", &prototype, "value");
+  };
+  ASSERT_GT(ASSERT_RESULT(preamble_counter(0, METRIC_rpc_lane_preamble_stripped_late)), 0);
+  for (size_t i = 1; i != 3; ++i) {
+    ASSERT_GT(ASSERT_RESULT(preamble_counter(i, METRIC_rpc_lane_preamble_bound)), 0);
+  }
 }
 
 } // namespace yb
