@@ -260,6 +260,28 @@ TEST_F(CpuTopologyTest, MalformedFilesAreErrors) {
   ASSERT_NOK(GetProcessCpuSet(CpuTopologyOptions()));
 }
 
+// CpuSet holds ids below kMaxCpus (1024). A higher id in a sysfs list or in the cpuset fails
+// discovery rather than being left out of a domain.
+TEST_F(CpuTopologyTest, CpuIdsFrom1024AreErrors) {
+  const auto layout = FakeCpuLayout{.sockets = 1, .l3_per_socket = 2, .cores_per_l3 = 2};
+  ASSERT_NO_FATALS(UseFakeTree(MakeFakeCpus(layout), "0-3"));
+  ASSERT_EQ(ASSERT_RESULT(Discover(CpuDomainKind::kL3)), (std::vector<std::string>{"0-1", "2-3"}));
+
+  auto cpus = MakeFakeCpus(layout);
+  cpus[0].caches[3].shared_cpu_list = "0-1,1024";
+  ASSERT_NO_FATALS(UseFakeTree(cpus, "0-3"));
+  ASSERT_NOK(Discover(CpuDomainKind::kL3));
+
+  cpus = MakeFakeCpus(layout);
+  cpus[2].thread_siblings = "2,1024";
+  ASSERT_NO_FATALS(UseFakeTree(cpus, "0-3"));
+  ASSERT_NOK(Discover(CpuDomainKind::kL3));
+
+  ASSERT_NO_FATALS(UseFakeTree(MakeFakeCpus(layout), "0-3,1024"));
+  ASSERT_NOK(GetProcessCpuSet(CpuTopologyOptions()));
+  ASSERT_NOK(Discover(CpuDomainKind::kL3));
+}
+
 TEST_F(CpuTopologyTest, OverlappingGroupsAreErrors) {
   std::vector<FakeCpu> cpus;
   for (size_t cpu = 0; cpu != 3; ++cpu) {

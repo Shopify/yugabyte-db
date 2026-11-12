@@ -85,6 +85,8 @@ TEST_F(TserverLanesTest, FlagValidation) {
   ASSERT_OK(flags_internal::ValidateFlagValue("tserver_service_lane_cpus", ""));
   ASSERT_OK(flags_internal::ValidateFlagValue("tserver_service_lane_cpus", "0-3,192-195"));
   ASSERT_NOK(flags_internal::ValidateFlagValue("tserver_service_lane_cpus", "0-"));
+  ASSERT_OK(flags_internal::ValidateFlagValue("tserver_service_lane_cpus", "1023"));
+  ASSERT_NOK(flags_internal::ValidateFlagValue("tserver_service_lane_cpus", "1024"));
   ASSERT_NOK(flags_internal::ValidateFlagValue("tserver_service_lane_cpus", "2048"));
   for (auto value : {"0", "1", "256"}) {
     ASSERT_OK(flags_internal::ValidateFlagValue("tserver_lane_reactors", value));
@@ -241,6 +243,25 @@ TEST_F(TserverLanesTest, DiscoveryErrorRunsInactive) {
   ASSERT_FALSE(summary.active);
   ASSERT_TRUE(summary.description.starts_with(
       "CPU topology discovery failed, running with lanes off: ")) << summary.description;
+}
+
+// A CPU id of 1024 or more, which CpuSet cannot hold, in a sysfs list is a discovery error: the
+// tablet server runs with lanes off and a WARNING.
+TEST_F(TserverLanesTest, CpuIdFrom1024RunsInactive) {
+  ASSERT_NO_FATALS(UseTwoDomainTree());
+  ASSERT_OK(WriteStringToFile(
+      Env::Default(), "0-3,8-11,1024\n",
+      GetTestPath("sys_cpu") + "/cpu0/cache/index3/shared_cpu_list"));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_lanes) = 0;
+
+  TEST_SetLaneTopology scope;
+  StringVectorSink sink;
+  ScopedRegisterSink registration(&sink);
+  InitTserverLaneTopology();
+  ASSERT_EQ(GetLaneTopology(), LaneTopology());
+  ASSERT_EQ(CountContaining(sink, "CPU topology discovery failed, running with lanes off"), 1);
+  ASSERT_EQ(CountContaining(sink, "CPU id 1024 in cpu list '0-3,8-11,1024' is not below 1024"), 1);
+  ASSERT_FALSE(GetTserverLaneTopologySummary().active);
 }
 
 // A tablet server restarted in the same process runs Init again, possibly on a thread already

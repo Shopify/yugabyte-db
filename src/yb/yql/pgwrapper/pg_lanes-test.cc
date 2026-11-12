@@ -601,6 +601,8 @@ TEST_F(PgLanesOffTest, SessionsAndClientUnlaned) {
   ASSERT_EQ(service.TEST_SessionLane(pid), kNoLane);
   ASSERT_TRUE(service.SessionsPerLane().empty());
   ASSERT_EQ(service.TEST_NumExchangeThreadPools(), 1);
+  ASSERT_GE(service.TEST_ExchangeThreadPoolWorkersCreated(), 1);
+  ASSERT_TRUE(service.GetLaneCounts().exchange_workers.empty());
   size_t exchange_workers = 0;
   for (const auto& thread : ASSERT_RESULT(ProcessThreads())) {
     ASSERT_FALSE(thread.name.starts_with("L0")) << thread.name;

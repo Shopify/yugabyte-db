@@ -56,7 +56,10 @@ because the calling thread may be confined by then:
 Domains are intersected with the cpuset, empty ones dropped, and ordered by lowest CPU. Where a
 socket has one L3 (Intel), both modes agree. A sysfs file that exists but does not parse, or
 groups that overlap, are discovery errors; the tserver then logs a WARNING and runs with lanes
-off rather than failing to start. Non-Linux builds see one domain.
+off rather than failing to start. CPU ids must be below 1024 (`CpuSet::kMaxCpus`): a higher id in a
+sysfs list or the cpuset, or a `sched_getaffinity` that fails because the kernel supports more
+CPUs, is a discovery error too, and one in `--tserver_service_lane_cpus` fails flag validation.
+Non-Linux builds see one domain.
 
 Tests use `--TEST_cpu_topology_sysfs_root` (a fake sysfs tree) and `--TEST_cpu_topology_cpuset`
 (a fake cpuset) to describe hosts larger than the test machine without changing any real
