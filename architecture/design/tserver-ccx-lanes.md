@@ -210,29 +210,29 @@ next to the unlaned set, each up to the unlaned limit. Idle workers exit after
 tagged pool, so idle lanes cost no handler threads.
 
 **Outbound connections.** A call whose controller has a lane hint (`RpcController::set_lane`)
-through a laned messenger goes on a connection keyed by `(remote, lane, idx)` (`ConnectionId`
-has a separate lane field) and owned by a reactor of that lane, picked by a hash of the remote and
-`idx` over the lane's group. `idx` rotates over `k = tserver_lane_connections_per_remote`, so a
-tserver opens up to `L x remotes x k` lane-keyed connections next to the unlaned ones. The
-rotation counter is per `Proxy` and per submitting thread's lane, one cache line each plus a
-spare for unlaned threads, allocated only in a laned messenger, so threads of many lanes calling
-into one lane through one cached `Proxy` share no counter (see
-[Shared state](#shared-state)). Calls without a hint, and every call
-through an unlaned messenger, keep today's ids (`kNoLane`, `idx < num_connections_to_server`) and
-reactors. A reactor erases a closed client connection by the key it was registered under.
+through a laned messenger goes on a connection keyed by `(remote, lane, idx)` (`ConnectionId` has a
+separate lane field) and owned by a reactor of that lane, picked by a hash of the remote and `idx`
+over the lane's group. `idx` rotates over `k = tserver_lane_connections_per_remote`, so a tserver
+opens up to `L x remotes x k` lane-keyed connections next to the unlaned ones. The rotation counter
+is per `Proxy` and per submitting thread's lane, one cache line each plus a spare for unlaned
+threads, allocated only in a laned messenger, so threads of many lanes calling into one lane through
+one cached `Proxy` share no counter (see [Shared state](#shared-state)). Calls without a hint, and
+every call through an unlaned messenger, keep today's ids (`kNoLane`, `idx <
+num_connections_to_server`) and reactors. A reactor erases a closed client connection by the key it
+was registered under.
 
 **Callbacks.** In thread-pool callback modes a call's callback runs in the normal or high-priority
-pool of the controller's issuing lane, and in today's pools when that is `kNoLane` or the
-messenger is unlaned. The controller records the issuing lane when a call is sent: a send from a
-reactor thread keeps the lane an earlier send recorded, so a retry rescheduled by `RpcRetrier` or
+pool of the controller's issuing lane, and in today's pools when that is `kNoLane` or the messenger
+is unlaned. The controller records the issuing lane when a call is sent: a send from a reactor
+thread keeps the lane an earlier send recorded, so a retry rescheduled by `RpcRetrier` or
 `Messenger::ScheduleOnReactor` on any reactor calls back in the original lane; a first send, or a
 send from any other thread, records the sending thread's lane, so a controller reused by another
 lane follows it. A caller that knows which lane started its command pins it instead
 (`RpcController::set_issuing_lane`), and every later send keeps that lane whichever thread sends;
-the embedded client does so, see
-[Sessions and the embedded client](#sessions-and-the-embedded-client). `Reset()` keeps the
-issuing lane and the pin and clears the hint, which callers set per send.
-`ScheduleOnReactor` from a lane thread picks a reactor of that lane.
+the embedded client does so, see [Sessions and the embedded
+client](#sessions-and-the-embedded-client). `Reset()` keeps the issuing lane and the pin and clears
+the hint, which callers set per send. `ScheduleOnReactor` from a lane thread picks a reactor of that
+lane.
 
 **Local calls.** A local call is handled by the pool of its lane: the controller's hint, or the
 issuing lane without one, so un-hinted local calls stay in the caller's lane as they stay on the
@@ -285,10 +285,10 @@ three bytes and decides as soon as they allow:
   socket as without lanes; the reactor then fails or closes it as it would have.
 
 YB senders speak first and write the preamble with the bytes after it, so only silent or very slow
-sockets wait. The acceptor holds at
-most 4096 sockets; one it cannot hold is registered at once, without lanes. Shutdown closes the held
-sockets without registering them. The unbound path, and every unlaned messenger's acceptor, is the
-assignment without lanes: a hash of the remote endpoint and the accept count over all reactors.
+sockets wait. The acceptor holds at most 4096 sockets; one it cannot hold is registered at once,
+without lanes. Shutdown closes the held sockets without registering them. The unbound path, and
+every unlaned messenger's acceptor, is the assignment without lanes: a hash of the remote endpoint
+and the accept count over all reactors.
 
 **Reactor strip.** The server stream of every messenger whose inbound connection context is YB RPC
 (`YBInboundConnectionContext`: tablet servers with or without lanes, masters, and the RPC test
@@ -353,11 +353,10 @@ queues the task, so an idle lane holds five idle pipeline threads (`raft_notific
 They wait on the service mask until their first task. Lane pools are named `<pool>_L007` (the
 `/threadz` category) and their workers `L007_prepare_<n>_worker`, `L007_append_...`,
 `L007_raft_...`, `L007_notif_...`, `L007_logsync_...` and `L007_logalloc_...`.
-`TSTabletManager::pipeline_pools(lane)` selects a set
-(`lane % L`; the unlaned set for `kNoLane` or with lanes off), and `ForEachPipelinePools` visits the
-unlaned set and every lane's, so the `@system-high` cgroup assignment (consensus system mode) and
-shutdown cover all of them. In per-DB cgroup mode per-task cgroups are set on each tablet's tokens,
-which come from its lane's pools.
+`TSTabletManager::pipeline_pools(lane)` selects a set (`lane % L`; the unlaned set for `kNoLane` or
+with lanes off), and `ForEachPipelinePools` visits the unlaned set and every lane's, so the
+`@system-high` cgroup assignment (consensus system mode) and shutdown cover all of them. In per-DB
+cgroup mode per-task cgroups are set on each tablet's tokens, which come from its lane's pools.
 
 `OpenTablet` gives a tablet its lane's append, allocation and log-sync pools for the log, its Raft,
 notification and prepare pools for consensus and the preparer, its Raft pool for intent cleanup, and
@@ -404,11 +403,10 @@ sends the next request), so those callbacks run in lane(T). `RequestConsensusVot
 `RunLeaderElection` are sent from the thread that starts the election (the Raft pool token after a
 failure detection, or the handler of a requested election or step-down), and `LeaderElectionLost`
 from the election's completion (`DoElectionCallback`, on the Raft pool token); each calls back in
-the lane of the thread that sent it. Masters
-replicate their sys catalog with the same code but never send a hint: their peers have no lane and
-their messengers are unlaned. Multi-tablet heartbeats (`enable_multi_raft_heartbeat_batcher`,
-default off) span tablets of many lanes, so they carry no hint and use unlaned connections; this
-costs locality only.
+the lane of the thread that sent it. Masters replicate their sys catalog with the same code but
+never send a hint: their peers have no lane and their messengers are unlaned. Multi-tablet
+heartbeats (`enable_multi_raft_heartbeat_batcher`, default off) span tablets of many lanes, so they
+carry no hint and use unlaned connections; this costs locality only.
 
 ## Sessions and the embedded client
 
@@ -426,10 +424,12 @@ session, that polls the session's shared memory and processes each request on th
 unlaned messenger has one pool, `shmem_exchange`, as without lanes: at least one worker, no limit
 and no queue, idle timeout `shmem_exchange_idle_timeout_ms`. A laned messenger has one pool per
 lane, all created on the first shared-memory session: `shmem_exchange_L007` with workers
-`L007_shmem_<n>_worker`, the same limits and timeout, and no persistent worker, since every worker
-hosts a session and a persistent one per lane would only hold an idle thread. A session's exchange
-runs in its lane's pool. Starting it is one handoff from the `Heartbeat` handler, a crossing
-counted as `other` when that handler is in another lane.
+`L007_shmem_<n>_worker`, the same limits, timeout and persistent worker. The persistent worker keeps
+a lane whose sessions have all ended from needing a new thread for its next session: a pool with no
+live worker whose first worker fails to start (thread exhaustion) terminates the process, while with
+one a failed start makes the session fall back to RPCs, as with lanes off. It costs one idle thread
+per lane. A session's exchange runs in its lane's pool. Starting it is one handoff from the
+`Heartbeat` handler, a crossing counted as `other` when that handler is in another lane.
 
 **TCP calls.** PgClientService calls that arrive over TCP (`Perform` without shared memory,
 `Heartbeat`, `OpenTable`, ...) carry no lane: they are handled in the lane of the reactor that read
@@ -505,11 +505,11 @@ postmaster and its backends must float over every CPU even when service CPUs are
 `Subprocess::Start` uses `posix_spawn`, which has no affinity attribute or pre-exec hook, and the
 child inherits the spawning thread's mask. `PgWrapper::Start` therefore spawns inside
 `ScopedThreadAffinity(full_process_cpuset())`, which restores the thread's mask afterwards. The
-first start and supervisor restarts (`ProcessSupervisor::StartProcessUnlocked`) both go through
-it. The spawning threads are service-set threads: the supervisor's own `yb::Thread` runs restarts,
-and also the first start when it waits for the YSQL lease. initdb and odyssey keep the spawning
-thread's mask, the service set.
-`ScopedThreadAffinity` is a no-op with lanes off, with affinity disabled, or with an empty mask.
+first start and supervisor restarts (`ProcessSupervisor::StartProcessUnlocked`) both go through it.
+The spawning threads are service-set threads: the supervisor's own `yb::Thread` runs restarts, and
+also the first start when it waits for the YSQL lease. initdb and odyssey keep the spawning thread's
+mask, the service set. `ScopedThreadAffinity` is a no-op with lanes off, with affinity disabled, or
+with an empty mask.
 
 ## Relation to QoS cgroups
 
@@ -560,8 +560,9 @@ executor's slot, as an entry from unlaned.
 tablet server A, for a tablet `T` led by tablet server B (A itself for a local leader), with B's
 followers. The list comes from the counted primitives above, the session paths of [Sessions and the
 embedded client](#sessions-and-the-embedded-client) and the clients built on the server messenger.
-"Bound" means the connection from A to B, or from B to a follower, is bound to lane(T) by its lane
-preamble with equal lane counts on both servers (see [Inbound binding](#inbound-binding)).
+"Bound to lane(T)" means the connection from A to B, or from B to a follower, is bound by its lane
+preamble and both servers have the same lane count, so the preamble's lane is lane(T) on the
+receiver too (see [Inbound binding](#inbound-binding)).
 
 | Handoff | Primitive | Category | Crosses when | Why acceptable |
 | --- | --- | --- | --- | --- |
@@ -569,28 +570,31 @@ preamble with equal lane counts on both servers (see [Inbound binding](#inbound-
 | A: exchange worker to lane(T)'s reactor (remote leader) | outbound call | reactor | `s != lane(T)` | the client side's first crossing |
 | A: exchange worker to lane(T)'s handler pool (local leader) | local call | rpc handler | `s != lane(T)` | the client side's first crossing |
 | B: reactor to the write handler | inbound call | rpc handler | never: the pool is the reactor's lane | |
-| B: write handler to the tablet's preparer | preparer queue | tablet pipeline | not bound | |
+| B: write handler to the tablet's preparer | preparer queue | tablet pipeline | not bound to lane(T) | |
 | B: preparer to log append, log sync and the Raft pool | task stream, pool tasks | tablet pipeline | never: all are lane(T)'s pools | |
 | B: Raft pool to the follower's connection | outbound call | reactor | never: hinted lane(T), owned by a lane(T) reactor | |
 | Follower: reactor to the `UpdateConsensus` handler | inbound call | rpc handler | never: the pool is the reactor's lane | |
-| Follower: handler to log append (prepare and apply run inline) | task stream, pool tasks | tablet pipeline | not bound | |
+| Follower: handler to log append (prepare and apply run inline) | task stream, pool tasks | tablet pipeline | not bound to lane(T) | |
+| Follower: `UpdateConsensus` response to the connection's reactor | outbound data | reactor | never: the handler is in the reactor's lane | |
 | B: follower response to the Raft callback | RPC callback | callback | never: issued from lane(T) | |
 | B: commit to the notification strand, apply | strand | tablet pipeline | never | |
-| B: write response to the connection's reactor (remote leader) | outbound data | reactor | not bound | |
+| B: write response to the connection's reactor (remote leader) | outbound data | reactor | not bound to lane(T) | |
 | A: response, from lane(T)'s reactor or the local handler, to `s`'s callback pool | RPC callback | callback | `s != lane(T)` | the client side's second crossing |
 | A: response through shared memory to the backend | shared memory | not counted | backends float | |
 
-So with bound connections a write crosses twice on the client side when its session is in another
-lane than its tablet and not at all otherwise, `2(L-1)/L` on average with uniform tablets, plus the
-backend's two uncounted hops, and nothing on the leader's and the followers' receive paths.
-`PgLanesClusterTest.WriteCrossingBudget` and its TLS variant assert this per tablet server of an
-RF3 cluster. Exceptions:
+So with connections bound to lane(T) a write crosses twice on the client side when its session is in
+another lane than its tablet and not at all otherwise, `2(L-1)/L` on average with uniform tablets,
+plus the backend's two uncounted hops, and nothing on the leader's and the followers' receive
+paths. `PgLanesClusterTest.WriteCrossingBudget` and its TLS variant assert the bound on each tablet
+server of an RF3 cluster: about 0 on the receive paths and at most 2 per write on the client side.
+Exceptions:
 
 - A TCP session's calls are handled in the lane of the reactor that read them (pggate's connection
   is not bound), which plays the part of `s`.
-- On a connection that is not bound (sender with lanes off, AutoFlag off or an older version,
-  different lane counts, a preamble the acceptor did not consume, unlaned clients such as external
-  YCQL clients and xCluster), the call is handled in the reading reactor's lane: the leader's write
+- On a connection not bound to lane(T), the call is handled in the reading reactor's lane. That is
+  a connection that is not bound (sender with lanes off, AutoFlag off or an older version, a
+  preamble the acceptor did not consume, unlaned clients such as external YCQL clients and
+  xCluster), or one bound to the preamble's lane modulo a different lane count: the leader's write
   handler crosses into the pipeline at the preparer and the response crosses back to the reactor,
   and a follower's `UpdateConsensus` handler crosses into the pipeline for the log append and the
   other tasks it submits.
@@ -811,7 +815,8 @@ startup summary, domains, lane CPUs, service CPUs, whether affinity is on) and, 
 replicas and leaders, PG sessions, reactors and their client and server connections, live handler,
 pipeline and shared memory exchange threads, and calls queued in service queues, next to the same
 for the unlaned pools; then the crossing counters, the number of service queue lane slots above
-their share of the queue limit, and the lane preamble counters. With lanes off it says lane mode is
+their share of the queue limit (which includes the slot of calls without a lane while it holds any,
+since that slot's share is 0), and the lane preamble counters. With lanes off it says lane mode is
 inactive and why. Reading it creates no pool and runs one task per reactor for its connection
 counts. Tablet and session counts show lane balance; `rpc_lane_preamble_bound` against `_absent` and
 `_peek_timeouts` shows how many inbound connections were bound, and `_stripped_late` counts
@@ -820,8 +825,9 @@ counted, as the executor for pools, strands and task streams and as the submitte
 it is not the number of crossings into that lane. Crossings per operation are a crossing counter's
 rate divided by the operation rate: on a tablet server whose PG sessions write to tablets of other
 lanes, up to 2 per write (reactor or rpc handler, then callback), and close to 0 on a server that
-only serves leader and follower requests; `lane_crossings_tablet_pipeline` growing with the write
-rate means inbound calls on connections that are not bound.
+only serves leader and follower requests. `lane_crossings_tablet_pipeline` growing with the write
+rate means inbound calls on connections not bound to their tablets' lanes: connections that are not
+bound (see the preamble counters), or bound connections from servers with a different lane count.
 
 **Rollback.** In this order, each step only as far as needed:
 

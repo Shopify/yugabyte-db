@@ -150,8 +150,8 @@ void PgLanesClusterTest::TestCrossingBudget() {
   // Background work counted while the writes run, on any one server: Raft heartbeats and master
   // heartbeats start on unlaned threads and count no crossing, but a leader change and the retries
   // it causes, the ASH collector's session on every server and other periodic tasks can. Measured
-  // over 7 runs with and without TLS: 0 on tablet servers 1 and 2, 0 pipeline crossings on tablet
-  // server 0, and its outbound crossings equal to its callback crossings.
+  // with and without TLS: 0 on tablet servers 1 and 2, 0 pipeline crossings on tablet server 0, and
+  // its outbound crossings equal to its callback crossings.
   constexpr int64_t kSlack = 10;
 
   auto conn = ASSERT_RESULT(Connect());

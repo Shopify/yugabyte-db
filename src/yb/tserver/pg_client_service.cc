@@ -950,11 +950,13 @@ class PgClientServiceImpl::Impl : public SessionProvider, public SessionRegistry
       const auto lane = static_cast<LaneId>(index);
       // Linux shows the first 15 characters of a thread name, so worker names start with the lane.
       const auto lane_name = Format("L$0", ZeroPadded(lane, 3));
-      // No persistent worker: it would hold a thread per lane, and every worker hosts a session.
+      // One persistent worker, as in the unlaned pool: a pool with no live worker whose first
+      // worker fails to start terminates the process, while with one the failed start makes the
+      // session fall back to RPCs.
       exchange_thread_pools_.push_back(std::make_unique<YBThreadPool>(ThreadPoolOptions {
         .name = Format("shmem_exchange_$0", lane_name),
         .max_workers = ThreadPoolOptions::kUnlimitedWorkersWithoutQueue,
-        .min_workers = 0,
+        .min_workers = 1,
         .idle_timeout = idle_timeout,
         .lane = lane,
         .worker_name_prefix = lane_name + "_shmem",

@@ -15,6 +15,7 @@
 
 #include <signal.h>
 
+#include <algorithm>
 #include <fstream>
 #include <map>
 #include <numeric>
@@ -59,10 +60,17 @@
 
 DECLARE_bool(pg_client_use_shared_memory);
 DECLARE_int32(replication_factor);
+DECLARE_int64(shmem_exchange_idle_timeout_ms);
 DECLARE_string(TEST_cpu_topology_cpuset);
 DECLARE_string(TEST_cpu_topology_sysfs_root);
 DECLARE_int32(tserver_lanes);
 DECLARE_string(tserver_service_lane_cpus);
+
+namespace yb {
+
+extern bool TEST_fail_to_create_second_thread_in_thread_pool_without_queue;
+
+} // namespace yb
 
 namespace yb::pgwrapper {
 
@@ -442,6 +450,57 @@ TEST_F(PgLanesSingleServerTest, LocalCallCrossings) {
     ASSERT_EQ(delta.crossing(LaneCrossingCategory::kCallback), kOps) << delta.ToString();
     ASSERT_EQ(delta.total_crossings(), 2 * kOps) << delta.ToString();
     ASSERT_EQ(delta.entries_from_unlaned, 0) << delta.ToString();
+  }
+}
+
+// Each lane's exchange pool keeps a persistent worker. A lane whose sessions have all ended then
+// needs no new thread for its next session, and when a further worker cannot start, the session
+// falls back to RPCs, as with lanes off, instead of the pool's first-worker failure terminating the
+// process.
+class PgLanesExchangeThreadFailureTest : public PgLanesSingleServerTest {
+ protected:
+  void SetUp() override {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_shmem_exchange_idle_timeout_ms) = 100;
+    PgLanesSingleServerTest::SetUp();
+  }
+
+  void DoTearDown() override {
+    ANNOTATE_UNPROTECTED_WRITE(TEST_fail_to_create_second_thread_in_thread_pool_without_queue) =
+        false;
+    PgLanesSingleServerTest::DoTearDown();
+  }
+};
+
+TEST_F(PgLanesExchangeThreadFailureTest, ThreadStartFailureFallsBackToRpc) {
+  const size_t kLanes = NumLanes();
+  auto exchange_workers = [this] { return PgService().GetLaneCounts().exchange_workers; };
+  {
+    std::vector<PGConn> conns;
+    for (size_t i = 0; i != 2 * kLanes; ++i) {
+      conns.push_back(ASSERT_RESULT(Connect()));
+    }
+  }
+  // Once those sessions are gone, the workers above each lane's persistent one idle out. The
+  // persistent worker of one lane hosts the ASH collector's session.
+  ASSERT_OK(WaitFor([&exchange_workers, kLanes] {
+    auto workers = exchange_workers();
+    return workers.size() == kLanes &&
+           std::all_of(workers.begin(), workers.end(), [](size_t n) { return n <= 1; });
+  }, 30s * kTimeMultiplier, "Exchange workers idle out"));
+  ASSERT_EQ(exchange_workers(), std::vector<size_t>(kLanes, 1));
+
+  // From here no exchange pool can start a worker.
+  ANNOTATE_UNPROTECTED_WRITE(TEST_fail_to_create_second_thread_in_thread_pool_without_queue) = true;
+  std::vector<PGConn> conns;
+  for (size_t i = 0; i != 2 * kLanes; ++i) {
+    conns.push_back(ASSERT_RESULT(Connect()));
+    ASSERT_EQ(ASSERT_RESULT(conns.back().FetchRow<int32_t>("SELECT 1")), 1);
+  }
+  // Every lane got at least two new sessions but still has its one worker: at most one session per
+  // lane runs on it, the others use RPCs.
+  ASSERT_EQ(exchange_workers(), std::vector<size_t>(kLanes, 1));
+  for (auto& conn : conns) {
+    ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int32_t>("SELECT 2")), 2);
   }
 }
 

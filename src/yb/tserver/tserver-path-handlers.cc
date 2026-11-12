@@ -2170,7 +2170,8 @@ void TabletServerPathHandlers::HandleLanesPage(
   *output << "<tr><td>unlaned</td><td>" << status.service_cpus << "</td>";
   LaneRowCells(status.unlaned, output);
   *output << "</tr>\n</table>\n";
-  *output << "<p>Lane slots of service queues above their share of the queue limit: "
+  *output << "<p>Service queue slots above their share of the queue limit (lane slots above "
+             "ceil(limit / lanes), and the slot of calls without a lane while it holds any): "
           << status.service_queue_lanes_over_share << "</p>\n";
 
   *output << "<h3>Lane crossings</h3>\n"
