@@ -9,15 +9,18 @@ are off by default (`--tserver_lanes=1`).
 What is implemented: topology discovery, the lane model and its flags, the confinement and
 accounting mechanisms that consume the topology (new threads, thread pools, priority-pool tasks,
 reactors, the postmaster spawn, the crossing counters), the laned tablet server messenger, laned
-tablet pipelines, and laned PG sessions. With lanes on, the tserver messenger runs a group of
-reactors and handler pools per lane, and an inbound call is handled in the lane of the reactor that
-read it. Each tablet's Raft, log, preparer, leader-side apply and service-strand work and its
-RocksDB background jobs run in its lane, and consensus peers send their RPCs with the tablet's lane
-hint. Each PG session has a lane, in which a shared-memory session's operations run, and clients
-built on the server messenger send their tablet RPCs with the tablet's lane hint and call back in
-the lane that issued them. Inbound connections are not yet bound to lanes: an inbound write crosses
-into the tablet's lane once, at the preparer, and a follower prepares and applies follower-side
-operations inline in its `UpdateConsensus` handler, in the lane of the reactor that read the call.
+tablet pipelines, laned PG sessions, and per-lane sharding of the state the write path updates per
+operation. With lanes on, the tserver messenger runs a group of reactors and handler pools per lane,
+and an inbound call is handled in the lane of the reactor that read it. Each tablet's Raft, log,
+preparer, leader-side apply and service-strand work and its RocksDB background jobs run in its lane,
+and consensus peers send their RPCs with the tablet's lane hint. Each PG session has a lane, in
+which a shared-memory session's operations run, and clients built on the server messenger send their
+tablet RPCs with the tablet's lane hint and call back in the lane that issued them. Memory trackers,
+service queues, RPC counters, server metrics and client RPC registries that every lane updates per
+operation are sharded or batched by lane, see [Shared state](#shared-state). Inbound connections are
+not yet bound to lanes: an inbound write crosses into the tablet's lane once, at the preparer, and a
+follower prepares and applies follower-side operations inline in its `UpdateConsensus` handler, in
+the lane of the reactor that read the call.
 
 ## Definitions
 
@@ -83,6 +86,7 @@ All are startup-only and tagged `advanced`.
 | `tserver_lane_connections_per_remote` | `2` | Connections per (remote, lane) for calls with a lane hint (`k` below). |
 | `tserver_lane_background` | `lane` | `lane` runs a tablet's RocksDB flushes and compactions in its lane, `service` on the service mask. See [Tablet pipelines](#tablet-pipelines). |
 | `log_appender_lane_mode_max_wait_ms` | `1` | In lane mode, how long a tablet's log appender keeps its append thread after its queue empties; `0` releases it at once. Replaces `taskstream_queue_max_wait_ms` for the appender. |
+| `mem_tracker_lane_batch_bytes` | `65536` | In lane mode, the delta a lane accumulates per lane-batched memory tracker before applying it to the shared value, in [0, 16 MiB]; `0` disables batching. See [Shared state](#shared-state). |
 
 Mapping `N` lanes onto `D` domains keeps masks whole and contiguous blocks within a socket:
 
@@ -221,7 +225,8 @@ has a separate lane field) and owned by a reactor of that lane, picked by a hash
 tserver opens up to `L x remotes x k` lane-keyed connections next to the unlaned ones. The
 rotation counter is per `Proxy` and per submitting thread's lane, one cache line each plus a
 spare for unlaned threads, allocated only in a laned messenger, so threads of many lanes calling
-into one lane through one cached `Proxy` share no counter. Calls without a hint, and every call
+into one lane through one cached `Proxy` share no counter (see
+[Shared state](#shared-state)). Calls without a hint, and every call
 through an unlaned messenger, keep today's ids (`kNoLane`, `idx < num_connections_to_server`) and
 reactors. A reactor erases a closed client connection by the key it was registered under.
 
@@ -400,9 +405,10 @@ handled it), with the tablet `T` of each tablet RPC:
 | Deferred processing, to `s`'s handler pool | pool task | rpc handler | submitter's lane is not `s` |
 
 So a tablet RPC crosses twice on the client side when the session is in another lane than the
-tablet, and not at all in the tablet's lane. Per-operation state on this path is still shared by
-all lanes: the `exchange_response_size` metric, the client's request id allocator and `Rpcs`
-registry, the meta cache lock taken per lookup, and the session registry lock taken per TCP call.
+tablet, and not at all in the tablet's lane. Which per-operation state on this path is sharded by
+lane (the `exchange_response_size` metric, the client's `Rpcs` registries) and which is still
+shared (the request id allocator, the meta cache lock, the session registry lock) is listed in
+[Shared state](#shared-state).
 
 ## Service set and the postmaster
 
@@ -490,3 +496,160 @@ they are not registered and nothing is counted. `lane_entries_from_unlaned` cove
 strands and task streams only, not work unlaned threads hand to reactors. The values are
 process-wide, so tservers sharing a process report the same totals. A crossing counter's rate
 divided by the operation rate is the number of crossings per operation on that path.
+
+## Shared state
+
+An atomic or lock that threads of every lane write per operation moves a cache line between L3s on
+each write. With lanes on, the state the write path updates per operation is sharded by lane or
+batched, as below; the rest is listed with the reason, as the starting point for profiling on
+multi-L3 hardware. A new cross-lane write on the write path is a bug: shard it, or list it here with
+the reason. With lanes off none of this allocates anything: each sharded object checks one
+pointer, lane count or batch size and takes its unsharded path.
+
+**Mechanism.** `LaneSharded<T>` (`util/lanes.h`) holds one cache-line-aligned slot per lane plus a
+spare, sized by the lane count when its owner allocates it, which the owner does only in lane mode,
+possibly while the object is in use (the root memory tracker exists before the topology is
+installed). `LaneLocal()` gives a thread of lane `l < L` slot `l` and every other thread nothing, so
+state updated per operation keeps its unsharded path for unlaned threads (masters, the service set)
+rather than sharing the spare slot among all of them. A lane value never indexes past the array:
+`kNoLane` and a thread lane left over from an earlier topology select the spare slot or nothing.
+Where a count is raised and lowered on different threads, either the slot is chosen by the object
+that owns the count and stored with it (service queue counts by the call's lane), or slots hold
+signed deltas that are only ever summed (memory trackers, gauges).
+
+**Memory trackers.** A tracker is lane-batched (`MemTracker::EnableLaneBatching`) when threads of
+several lanes update it per operation. A lane thread adds its `Consume`, `Release` and `TryConsume`
+deltas to its lane's slot of each batched tracker on its path and applies the slot to the shared
+value, and to the tracker's metric, only when the slot's absolute value exceeds
+`--mem_tracker_lane_batch_bytes`; a delta larger than that goes to the shared value directly. The
+tablet server enables it in lane mode (`EnableTserverLaneMemTrackerBatching`, right after it
+installs the topology) for:
+
+- the root and the server tracker, which every tracker below adds to;
+- every child of the server tracker, existing or created later: the RPC `Read Buffer` and `Call`
+  trackers, `Tablets_overhead` (parent of all `tablet-<id>` trackers), the global log cache tracker
+  (parent of all per-tablet log caches), `BlockBasedTable`, `Log Reader Memory`, `PgResponseCache`,
+  `Allocated Big Shared Memory` and the others the server creates;
+- the `Read Buffer` and `Call` subtrees, existing or created later: each messenger's tracker below
+  them and the `Allocated`, `Used`, `Mandatory`, `Reading`, `Sending` and `Queueing` trackers below
+  those, which every lane's reactors and handlers update per call;
+- `Tablets_overhead`'s `Transactions` tracker, parent of every tablet's participant tracker, batched
+  because its parent is.
+
+Per-tablet trackers (`tablet-<id>`, its RocksDB, operation tracker, participant and log cache
+trackers) are not batched: only their tablet's lane updates them, apart from follower-side
+operations handled in another lane until inbound connections are bound. Masters never enable
+batching.
+
+`consumption()`, `peak_consumption()`, the `mem_tracker_*` metrics, `/mem-trackers` and every limit
+check use the shared value, which differs from the tracked total by at most L x batch per tracker
+(1.5 MiB at L = 24, about 16 MiB at L = 254, with the default batch) and can be below zero by as
+much when one lane releases memory another lane's slot still holds. Limits stay process-wide; no
+lane has a limit of its own. `TryConsume` on a batched limited tracker admits into the lane's slot
+only while the shared value plus that slot plus the bytes stays within the limit and the slot within
+the batch; otherwise it applies the slot and checks the shared value exactly, so the tracked total
+exceeds the limit by at most L x batch plus the bytes of calls racing with one check. The soft and
+hard limits (`AnySoftLimitExceeded` per write, `ShouldThrottleRpc` per call, the maintenance manager
+and the tablet memory manager) read the shared values; the limits they compare with are hundreds of
+megabytes or more, so the bound is small next to them. The memory released since the last tcmalloc
+GC is batched the same way once the root is, so a GC runs no later than
+`mem_tracker_tcmalloc_gc_release_bytes` + L x batch. The root tracker is tcmalloc-backed: each
+update from tcmalloc overwrites its shared value and drops its unflushed slots, since tcmalloc's
+figure already includes the memory they stand for; between updates the root follows its batched
+deltas as other trackers do, and the forced update when it drifts by more than
+`mem_tracker_external_consumption_accuracy_percentage` reacts up to L x batch late. A destroyed
+tracker applies its slots before releasing its consumption to its parent. When lane mode is turned
+off, which only tests do, slots keep their content until `FlushLaneBatches()`.
+
+**Service queues.** A `ServicePool` of a laned messenger keeps its queued-call count and its timeout
+pre-check queue per lane, plus a spare for calls without a lane, chosen by the call's lane and
+stored on the call (`InboundCall::queued_lane_`), so `CallQueued` on the queuing thread and
+`CallDequeued` on the handler thread use one slot. A local call queued from another lane writes the
+slot of its own lane, along with the handoff into that lane's pool that it makes anyway. With
+`limit` the service's queue length and `share = ceil(limit / L)`, a call is admitted without a
+shared write while its slot is below `share` and no slot is above its share. Otherwise, which
+happens only near overload, the slots are summed (a read-only walk) and the call admitted while the
+sum, itself included, stays within `limit`. A hot lane can therefore fill the whole queue while the
+others are idle, an idle lane cannot add to a full queue, and the queue never holds more than
+`max(limit, L x share) <= limit + L - 1` calls. A shared count of slots above their share is written
+only when a slot crosses its share, near overload. The overflow log line reports the queue's total,
+and `rpcs_queue_overflow` counts every refused call. `InboundCall::GetRpcQueuePosition` is the
+call's lane slot count (only CQL reads it, and its messenger is unlaned). `CheckTimeout` and
+shutdown drain all queues through one helper; the time of the next scheduled check stays shared,
+since it is written only when a call's deadline is earlier than the scheduled check, about once per
+check. Unlaned messengers, including CQL with its per-call queue limit, keep one count and one
+queue.
+
+**RPC calls.** A laned messenger takes the per-call operation counter of `Messenger::Handle` from
+the calling thread's lane (`RpcServicesCounter`), and tracks local calls in their lane's
+`LocalYBInboundCallTracker`; unlaned threads and calls keep the messenger's own. Shutdown disables
+and drains every counter before shutting services down, and `DumpRunningRpcs` lists the local calls
+of every tracker.
+
+**Client RPC registries.** `rpc::LaneShardedRpcs` gives the client (`YBClient::Data::rpcs_`: master
+RPCs and meta cache lookups) and the transaction manager (heartbeat, commit and abort RPCs) one
+`Rpcs` registry per lane plus one for unlaned threads. A caller registers in its lane's registry and
+keeps that registry for the handle, whichever thread later unregisters or aborts it: a
+`ClientMasterRpcBase` picks it when constructed, a `YBTransaction` for all its RPCs when it is
+created, and the leader master determination uses the unlaned one. Shutdown and abort walk every
+registry. Tablet-side registries (a tablet's transaction participant and coordinator) belong to one
+tablet and stay as they are; the single-shard write path registers in none.
+
+**Metrics.** Server-level metrics updated per operation on the write path get per-lane cells
+(`EnableLaneCells`) in lane mode; a thread with a lane writes its lane's cell and readers combine
+cells and the shared value, so names, types, JSON and Prometheus output are what one unsharded
+metric with the same values gives (histogram bucket counts add, minima and maxima combine). Only
+server-level metrics take cells; they are never pre-aggregated for Prometheus. Masters in a process
+with an active topology (tests) get cells for their per-method histograms and session metrics too;
+their threads have no lane and write the shared values. Instances:
+
+| Metric | Type | Written by | Cells |
+| --- | --- | --- | --- |
+| `handler_latency_<service>_<method>` | Histogram | handler, per call | one HdrHistogram per lane that calls the method, created on first use |
+| `handler_latency_outbound_transfer` | Histogram | reactor, per transfer | as above |
+| `rpc_incoming_queue_time` | EventStats | handler, per call | per lane |
+| `handler_latency_outbound_call_{queue_time,send_time,time_to_response}` | EventStats | caller and reactor, per call | per lane |
+| `pg_client_exchange_response_size` | EventStats | session, per exchange | per lane |
+| `rpcs_in_queue_<service>` | gauge | queuing and handler threads | per lane, signed deltas |
+| `rpc_inbound_calls_alive`, `rpc_outbound_calls_alive`, `rpc_busy_reactors` | gauge | reactor, handler, caller | per lane, signed deltas |
+
+**Memory.** Per sharded object: a batched tracker (L + 1) x 64 bytes; a laned `ServicePool` (L + 1)
+x 64 bytes; a gauge (L + 1) x 64 bytes; event stats (L + 1) x 128 bytes; a histogram 8 x L bytes for
+its cell pointers, plus one HdrHistogram per lane that records (about 20 KiB for the 60 s, two-digit
+handler latency histograms); a laned messenger one operation counter and local call tracker per
+lane; `LaneShardedRpcs` (L + 2) registries; a `Proxy` (L + 1) x 64 bytes. At L = 24 the per-object
+sizes are 1.6 KiB (3.2 KiB for event stats, 192 bytes of histogram pointers); at L = 254, 16 KiB (32
+KiB, 2 KiB). Batched trackers and laned pools number a few dozen per server. Histogram pointers
+exist for every RPC method of every service, but cells only for the methods lanes call: the
+per-operation ones (`Write`, `Read`, `UpdateConsensus`, `Perform`, transaction status and update
+calls) cost about 20 KiB x L each.
+
+**Not sharded.** Shared state still written per operation from every lane, for profiling:
+
+- `TSTabletManager::mutex_`, an `RWMutex` taken shared by every tablet lookup (`Write`, `Read`,
+  `UpdateConsensus`): each shared acquisition writes the lock's reader count. It is first on the
+  list because every remote and local tablet RPC takes it; sharding it means a per-lane tablet map
+  or a read-copy-update map, which changes tablet registration.
+- The hybrid clock: `Now()` and `Update()` advance one process-wide hybrid time, the monotonic
+  source every tablet's hybrid times come from, so a per-lane clock would break the order between
+  tablets.
+- The client request id allocator (`client/request_id_allocator.cc`): already sharded, NumCPUs/8
+  shards walked round robin per thread. A thread is deliberately not bound to a shard, because a
+  shard whose threads stop writing to a tablet would never advance its `min_running`; a lane-bound
+  shard has the same problem when a lane stops writing to a tablet.
+- The meta cache `mutex_`, a shared lock taken per lookup (reader count write); the meta cache is
+  read-mostly, as the design asks, and lookups are per tablet RPC on the client.
+- The PG session registry `rw_spinlock`, taken per TCP PgClientService call.
+- `Counter` metrics (`LongAdder`), such as the per-method request and response byte counters and
+  `rpc_inbound_calls_created`: a `LongAdder` writes one shared base until a CAS on it fails, then
+  per-thread hashed cells (a power of two at least the CPU count), and moves a thread to another
+  cell only after a failed CAS. So two threads of different lanes can share a cell, and move its
+  cache line on each write, until they collide; nothing keeps cells within lanes.
+- The inbound call instance id (`InboundCall::NextInstanceId`) and the outbound call id
+  (`NextCallId`), one `fetch_add` each per call: the instance id is ASH's RPC request id and the
+  local call trackers' key, and call ids must stay unique on a connection that carries calls of
+  every lane; splitting either into per-lane ranges changes those ids and shortens their reuse
+  period.
+- Writes made only near overload or per connection, not per operation: the service pool's over-share
+  count and its last backpressure time, the queue timeout and overflow counters,
+  `rpc_connections_alive`, and `Available Big Shared Memory` (updated per large response).

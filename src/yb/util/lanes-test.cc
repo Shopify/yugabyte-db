@@ -12,7 +12,10 @@
 //
 
 #include <algorithm>
+#include <atomic>
 #include <random>
+#include <set>
+#include <thread>
 
 #include <gtest/gtest.h>
 
@@ -23,7 +26,10 @@
 #include "yb/util/lanes_test_util.h"
 #include "yb/util/logging_test_util.h"
 #include "yb/util/test_macros.h"
+#include "yb/util/test_thread_holder.h"
 #include "yb/util/test_util.h"
+
+using namespace std::literals;
 
 namespace yb {
 
@@ -517,6 +523,109 @@ TEST_F(LanesTest, LaneShardedCounters) {
   ASSERT_EQ(counters->Sum(0), 3);
   ASSERT_EQ(counters->Sum(1), 1);
   ASSERT_EQ(counters->Sum(2), 0);
+}
+
+// LaneSharded is sized by the lane count given to Allocate, gives every lane its own cache line,
+// sends lanes without a slot of their own to the spare slot (Get, Local) or to the owner's
+// unsharded path (LaneLocal), and can be allocated while in use.
+TEST_F(LanesTest, LaneSharded) {
+  constexpr size_t kLanes = 3;
+  LaneSharded<std::atomic<int64_t>> sharded;
+  // Nothing before Allocate, whatever the lane mode.
+  ASSERT_FALSE(sharded.allocated());
+  ASSERT_EQ(sharded.num_lanes(), 0);
+  ASSERT_EQ(sharded.Get(0), nullptr);
+  ASSERT_EQ(sharded.Get(kNoLane), nullptr);
+  ASSERT_EQ(sharded.Local(), nullptr);
+  size_t visited = 0;
+  sharded.ForEach([&visited](auto&) { ++visited; });
+  ASSERT_EQ(visited, 0);
+
+  TEST_SetLaneTopology scope(BuildPairs(kLanes, kLanes));
+  RunOnStdThread([&sharded] {
+    SetThisThreadLane(1);
+    ASSERT_EQ(sharded.LaneLocal(), nullptr);
+  });
+
+  ASSERT_TRUE(sharded.Allocate(kLanes));
+  ASSERT_FALSE(sharded.Allocate(kLanes + 5));
+  ASSERT_EQ(sharded.num_lanes(), kLanes);
+  std::set<uintptr_t> addresses;
+  for (LaneId lane = 0; lane != kLanes; ++lane) {
+    auto address = reinterpret_cast<uintptr_t>(sharded.Get(lane));
+    ASSERT_EQ(address % CACHELINE_SIZE, 0);
+    addresses.insert(address);
+  }
+  auto* spare = sharded.Get(kNoLane);
+  ASSERT_EQ(reinterpret_cast<uintptr_t>(spare) % CACHELINE_SIZE, 0);
+  addresses.insert(reinterpret_cast<uintptr_t>(spare));
+  ASSERT_EQ(addresses.size(), kLanes + 1);
+  // A lane outside the array (left over from a larger topology) never indexes past it.
+  ASSERT_EQ(sharded.Get(kLanes), spare);
+  ASSERT_EQ(sharded.Get(kMaxLanes - 1), spare);
+
+  RunOnStdThread([&sharded, spare] {
+    SetThisThreadLane(2);
+    ASSERT_EQ(sharded.LaneLocal(), sharded.Get(2));
+    ASSERT_EQ(sharded.Local(), sharded.Get(2));
+    sharded.LaneLocal()->fetch_add(5);
+    SetThisThreadLane(kNoLane);
+    ASSERT_EQ(sharded.LaneLocal(), nullptr);
+    ASSERT_EQ(sharded.Local(), spare);
+    SetThisThreadLane(kLanes);
+    ASSERT_EQ(sharded.LaneLocal(), nullptr);
+    ASSERT_EQ(sharded.Local(), spare);
+  });
+  spare->fetch_add(7);
+  int64_t sum = 0;
+  visited = 0;
+  sharded.ForEach([&sum, &visited](std::atomic<int64_t>& slot) {
+    sum += slot.load();
+    ++visited;
+  });
+  ASSERT_EQ(visited, kLanes + 1);
+  ASSERT_EQ(sum, 12);
+
+  // A thread keeps its lane when lane mode is turned off, but no longer gets a lane slot.
+  RunOnStdThread([&sharded, spare] {
+    SetThisThreadLane(1);
+    TEST_SetLaneTopology off_scope{LaneTopology()};
+    ASSERT_EQ(sharded.LaneLocal(), nullptr);
+    ASSERT_EQ(sharded.Local(), spare);
+  });
+}
+
+// Allocate is safe while other threads use the accessors: each reader sees either no slots or all
+// of them.
+TEST_F(LanesTest, LaneShardedAllocateWhileInUse) {
+  constexpr size_t kLanes = 4;
+  TEST_SetLaneTopology scope(BuildPairs(kLanes, kLanes));
+  LaneSharded<std::atomic<int64_t>> sharded;
+  std::atomic<int64_t> unsharded{0};
+  std::atomic<int64_t> total{0};
+  TestThreadHolder threads;
+  for (LaneId lane = 0; lane != kLanes; ++lane) {
+    threads.AddThreadFunctor([&, lane, &stop = threads.stop_flag()] {
+      SetThisThreadLane(lane);
+      while (!stop.load()) {
+        if (auto* slot = sharded.LaneLocal()) {
+          slot->fetch_add(1);
+        } else {
+          unsharded.fetch_add(1);
+        }
+        total.fetch_add(1);
+      }
+    });
+  }
+  std::this_thread::sleep_for(20ms);
+  ASSERT_TRUE(sharded.Allocate(kLanes));
+  std::this_thread::sleep_for(20ms);
+  threads.Stop();
+  int64_t sum = unsharded.load();
+  sharded.ForEach([&sum](std::atomic<int64_t>& slot) { sum += slot.load(); });
+  ASSERT_EQ(sum, total.load());
+  ASSERT_GT(unsharded.load(), 0);
+  ASSERT_GT(sum, unsharded.load());
 }
 
 } // namespace yb

@@ -382,6 +382,12 @@ class Messenger : public ProxyContext {
   // Number of tagged pools of lane (unlaned for kNoLane), including the normal pool.
   size_t TEST_ActiveTaggedPools(LaneId lane = kNoLane);
 
+  // The operation counters Handle takes per call: the one for threads without a lane first, then
+  // each lane's in a laned messenger.
+  std::vector<const RWOperationCounter*> TEST_RpcServicesCounters() const;
+  // The one Handle takes on the calling thread.
+  const RWOperationCounter* TEST_RpcServicesCounterOfThisThread() const;
+
   // Whether the messenger was built with an active lane topology.
   bool laned() const { return num_lanes_ != 0; }
 
@@ -483,6 +489,15 @@ class Messenger : public ProxyContext {
     std::atomic<bool> high_ready{false};
   };
 
+  // The counter Handle takes for a call: the calling thread's lane's in a laned messenger, else
+  // rpc_services_counter_. Shutdown disables and drains all of them (ForEachRpcServicesCounter).
+  RWOperationCounter& RpcServicesCounter() const;
+  template <class F>
+  void ForEachRpcServicesCounter(const F& f) const;
+
+  // Tracker of a local call of lane: the lane's in a laned messenger, else local_call_tracker_.
+  LocalYBInboundCallTracker& LocalCallTracker(LaneId lane);
+
   LanePools* LanePoolsOf(LaneId lane) const {
     return lane == kNoLane || num_lanes_ == 0 ? nullptr : lane_pools_[lane % num_lanes_].get();
   }
@@ -502,7 +517,8 @@ class Messenger : public ProxyContext {
 
   std::atomic_bool closing_ = false;
 
-  // RPC services that handle inbound requests.
+  // Taken per call by Handle; with lanes, by threads without a lane only (see
+  // RpcServicesCounter).
   mutable RWOperationCounter rpc_services_counter_;
   OneTimeBool rpc_services_stopped_;
   std::unordered_multimap<std::string, RpcServicePtr> rpc_services_;
@@ -539,7 +555,20 @@ class Messenger : public ProxyContext {
 
   IoThreadPool io_thread_pool_;
   Scheduler scheduler_;
+  // Tracks local calls; with lanes, those without a lane only (see LocalCallTracker).
   LocalYBInboundCallTracker local_call_tracker_;
+
+  // Per-call state of a laned messenger, one per lane, so that calls of different lanes write
+  // different cache lines: the operation counter Handle takes for each call from a thread of the
+  // lane, and the tracker of the lane's local calls.
+  struct alignas(CACHELINE_SIZE) LaneCallState {
+    LaneCallState(const std::string& name, Scheduler& scheduler)
+        : rpc_services_counter(name), local_call_tracker(scheduler) {}
+
+    RWOperationCounter rpc_services_counter;
+    LocalYBInboundCallTracker local_call_tracker;
+  };
+  std::vector<std::unique_ptr<LaneCallState>> lane_call_states_;
 
   size_t thread_pool_workers_limit_;
 

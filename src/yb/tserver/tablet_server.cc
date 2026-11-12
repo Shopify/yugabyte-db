@@ -667,6 +667,7 @@ Status TabletServer::Init() {
   // initializer list and must not see a topology there.
   InitTserverLaneTopology();
   RegisterTserverLaneMetrics(metric_entity());
+  EnableTserverLaneMemTrackerBatching(mem_tracker());
 
 #ifdef __linux__
   if (cgroup_manager_) {

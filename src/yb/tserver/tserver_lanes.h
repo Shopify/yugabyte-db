@@ -21,6 +21,12 @@
 #include "yb/util/metrics_fwd.h"
 #include "yb/util/result.h"
 
+namespace yb {
+
+class MemTracker;
+
+} // namespace yb
+
 namespace yb::rpc {
 
 class MessengerBuilder;
@@ -57,5 +63,10 @@ LaneId TserverBackgroundTaskLane(LaneId tablet_lane);
 // Registers the lane crossing metrics (lane_crossings_<category>, lane_entries_from_unlaned) on
 // entity when lane mode is active; does nothing otherwise. The counts are process-wide.
 void RegisterTserverLaneMetrics(const scoped_refptr<MetricEntity>& entity);
+
+// In lane mode, lane-batches the memory trackers that threads of every lane update per operation:
+// the root, the server tracker and its children (existing and later), and the RPC read buffer and
+// call subtrees. No-op with lanes off.
+void EnableTserverLaneMemTrackerBatching(const std::shared_ptr<MemTracker>& server_tracker);
 
 } // namespace yb::tserver

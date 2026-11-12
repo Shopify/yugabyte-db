@@ -291,6 +291,11 @@ void CountHandoff(LaneId submitter, LaneId executor, LaneId slot, size_t counter
   }
 }
 
+std::mutex& LaneShardedAllocateMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
 } // namespace lanes_internal
 
 LaneId NormalizeLane(const LaneTopology& topology, LaneId lane) {

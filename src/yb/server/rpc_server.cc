@@ -136,7 +136,8 @@ Status RpcServer::RegisterService(size_t queue_limit,
       [this, priority](rpc::ThreadPoolTag tag, LaneId lane) {
         return messenger_->HandlerThreadPool(priority, tag, lane);
       },
-      &messenger_->scheduler(), std::move(service), metric_entity));
+      &messenger_->scheduler(), std::move(service), metric_entity,
+      messenger_->laned() ? messenger_->num_lanes() : 0));
   RETURN_NOT_OK(messenger_->RegisterService(service_name, service_pool));
   return Status::OK();
 }

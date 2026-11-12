@@ -199,7 +199,7 @@ Status YBClient::Data::SyncLeaderMasterRpc(
         (proxy->*func)(req, resp, controller, callback);
       });
   SCOPED_WAIT_STATUS(YBClient_WaitingOnMaster);
-  RETURN_NOT_OK(rpcs_.RegisterAndStartStatus(rpc, rpc->RpcHandle()));
+  RETURN_NOT_OK(rpc->rpcs().RegisterAndStartStatus(rpc, rpc->RpcHandle()));
   auto result = rpc->synchronizer().Wait();
   if (attempts) {
     *attempts = rpc->num_attempts();
@@ -390,7 +390,7 @@ Status CheckTabletLocations(
 }
 
 YBClient::Data::Data()
-    : leader_master_rpc_(rpcs_.InvalidHandle()),
+    : leader_master_rpc_(rpcs_.Unlaned().InvalidHandle()),
       latest_observed_hybrid_time_(YBClient::kNoHybridTime),
       request_id_allocator_(internal::CreateRequestIdAllocator()),
       log_prefix_(Format("Client $0: ", request_id_allocator_->client_id())) {
@@ -1458,7 +1458,7 @@ bool YBClient::Data::IsTabletServerLocal(const RemoteTabletServer& rts) const {
 template <class T, class... Args>
 rpc::RpcCommandPtr YBClient::Data::StartRpc(Args&&... args) {
   auto rpc = std::make_shared<T>(std::forward<Args>(args)...);
-  rpcs_.RegisterAndStart(rpc, rpc->RpcHandle());
+  rpc->rpcs().RegisterAndStart(rpc, rpc->RpcHandle());
   return rpc;
 }
 
@@ -2722,7 +2722,7 @@ void YBClient::Data::GetNamespaceInfo(
       client, namespace_id, std::move(resp), callback, deadline);
   // Registration fails once rpcs_ is shutting down, and an rpc rejected there is aborted before
   // it is sent, so its own callback never runs. Report that to the caller here.
-  auto status = rpcs_.RegisterAndStartStatus(rpc, rpc->RpcHandle());
+  auto status = rpc->rpcs().RegisterAndStartStatus(rpc, rpc->RpcHandle());
   if (!status.ok()) {
     callback(status);
   }
@@ -2866,7 +2866,7 @@ Status YBClient::Data::BootstrapProducer(
   auto rpc =
       std::make_shared<internal::BootstrapProducerRpc>(client, std::move(callback), deadline);
   RETURN_NOT_OK(rpc->Init(db_type, namespace_name, pg_schema_names, table_names));
-  rpcs_.RegisterAndStart(rpc, rpc->RpcHandle());
+  rpc->rpcs().RegisterAndStart(rpc, rpc->RpcHandle());
 
   return Status::OK();
 }
@@ -2977,7 +2977,7 @@ void YBClient::Data::LeaderMasterDetermined(const Status& status,
           proxy_cache_.get(), host_port);
     }
 
-    rpcs_.Unregister(&leader_master_rpc_);
+    rpcs_.Unlaned().Unregister(&leader_master_rpc_);
   }
 
   for (const auto& callback : callbacks) {
@@ -3067,14 +3067,15 @@ void YBClient::Data::DoSetMasterServerProxy(CoarseTimePoint deadline,
 
   ASH_ENABLE_CONCURRENT_UPDATES();
   SET_WAIT_STATUS(YBClient_WaitingOnMaster);
-  rpcs_.Register(
+  auto& rpcs = rpcs_.Unlaned();
+  rpcs.Register(
       std::make_shared<GetLeaderMasterRpc>(
           Bind(&YBClient::Data::LeaderMasterDetermined, Unretained(this)),
           *master_addrs,
           actual_deadline,
           messenger_,
           proxy_cache_.get(),
-          &rpcs_,
+          &rpcs,
           false /*should timeout to follower*/,
           wait_for_leader_election),
       &leader_master_rpc_);
@@ -3113,7 +3114,7 @@ Status YBClient::Data::CreateSnapshot(
     CreateSnapshotCallback callback) {
   auto rpc = std::make_shared<internal::CreateSnapshotRpc>(client, std::move(callback), deadline);
   RETURN_NOT_OK(rpc->Init(tables));
-  rpcs_.RegisterAndStart(rpc, rpc->RpcHandle());
+  rpc->rpcs().RegisterAndStart(rpc, rpc->RpcHandle());
 
   return Status::OK();
 }
@@ -3403,7 +3404,7 @@ Status YBClient::Data::GetXClusterStreams(
   auto rpc =
       std::make_shared<internal::GetXClusterStreamsRpc>(client, std::move(user_cb), deadline);
   RETURN_NOT_OK(rpc->Init(replication_group_id, namespace_id, table_names, pg_schema_names));
-  rpcs_.RegisterAndStart(rpc, rpc->RpcHandle());
+  rpc->rpcs().RegisterAndStart(rpc, rpc->RpcHandle());
 
   return Status::OK();
 }
@@ -3417,7 +3418,7 @@ Status YBClient::Data::GetXClusterStreams(
       std::make_shared<internal::GetXClusterStreamsRpc>(client, std::move(user_cb), deadline);
   RETURN_NOT_OK(
       rpc->Init(replication_group_id, namespace_id, source_table_ids, create_stream_if_missing));
-  rpcs_.RegisterAndStart(rpc, rpc->RpcHandle());
+  rpc->rpcs().RegisterAndStart(rpc, rpc->RpcHandle());
 
   return Status::OK();
 }
@@ -3429,7 +3430,7 @@ Status YBClient::Data::IsXClusterBootstrapRequired(
   auto rpc = std::make_shared<internal::IsXClusterBootstrapRequiredRpc>(
       client, std::move(user_cb), deadline);
   RETURN_NOT_OK(rpc->Init(replication_group_id, namespace_id));
-  rpcs_.RegisterAndStart(rpc, rpc->RpcHandle());
+  rpc->rpcs().RegisterAndStart(rpc, rpc->RpcHandle());
 
   return Status::OK();
 }
@@ -3509,7 +3510,7 @@ void YBClient::Data::Shutdown() {
     rpc::RpcCommandPtr rpc_to_abort = nullptr;
     {
       std::lock_guard l(leader_master_lock_);
-      if (leader_master_rpc_ != rpcs_.InvalidHandle()) {
+      if (leader_master_rpc_ != rpcs_.Unlaned().InvalidHandle()) {
         rpc_to_abort = *leader_master_rpc_;
       }
     }

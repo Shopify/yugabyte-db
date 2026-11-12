@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -150,6 +151,9 @@ extern std::atomic<bool> lane_mode_active;
 void ApplyLane(LaneId lane);
 void CountHandoff(LaneId submitter, LaneId executor, LaneId slot, size_t counter);
 
+// Serializes LaneSharded::Allocate calls.
+std::mutex& LaneShardedAllocateMutex();
+
 } // namespace lanes_internal
 
 // Whether the process-global topology is active.
@@ -235,6 +239,97 @@ class LaneShardedCounters {
   };
 
   std::array<Slot, kMaxLanes + 1> slots_;
+};
+
+// Per-object state sharded by lane: one cache-line-aligned slot per lane plus a spare slot, sized
+// by the lane count passed to Allocate, so an object costs (num_lanes + 1) x
+// max(sizeof(T), CACHELINE_SIZE) bytes. Nothing is allocated until Allocate, which an owner calls
+// only when lane mode is active; until then every accessor returns nullptr and the owner keeps
+// using its unsharded state. Allocate may run while the object is already in use (the root
+// MemTracker exists before any topology is installed), and the slots then live as long as the
+// object.
+//
+// Lane values never index past the array: a lane outside [0, num_lanes) (kNoLane, or a thread lane
+// left over from an earlier topology) selects the spare slot in Get and nullptr in LaneLocal.
+template <class T>
+class LaneSharded {
+ public:
+  LaneSharded() = default;
+
+  ~LaneSharded() {
+    delete[] slots_.load(std::memory_order_acquire);
+  }
+
+  LaneSharded(const LaneSharded&) = delete;
+  void operator=(const LaneSharded&) = delete;
+
+  // Allocates num_lanes + 1 default-constructed slots. Returns false and changes nothing if the
+  // slots already exist. Safe while other threads use the accessors.
+  bool Allocate(size_t num_lanes) {
+    std::lock_guard lock(lanes_internal::LaneShardedAllocateMutex());
+    if (slots_.load(std::memory_order_relaxed)) {
+      return false;
+    }
+    num_lanes_ = num_lanes;
+    slots_.store(new Slot[num_lanes + 1], std::memory_order_release);
+    return true;
+  }
+
+  bool allocated() const {
+    return slots_.load(std::memory_order_acquire) != nullptr;
+  }
+
+  // Lanes with a slot of their own; 0 before Allocate.
+  size_t num_lanes() const {
+    return allocated() ? num_lanes_ : 0;
+  }
+
+  // Slot of lane, the spare slot for a lane outside [0, num_lanes()). nullptr before Allocate.
+  T* Get(LaneId lane) const {
+    auto* slots = slots_.load(std::memory_order_acquire);
+    if (!slots) {
+      return nullptr;
+    }
+    return &slots[lane < num_lanes_ ? lane : num_lanes_].value;
+  }
+
+  // Get for the calling thread's lane, kNoLane when lane mode is off.
+  T* Local() const {
+    return Get(LaneModeActive() ? ThisThreadLane() : kNoLane);
+  }
+
+  // Slot of the calling thread's lane when lane mode is active and that lane has a slot of its own;
+  // nullptr otherwise. For state updated per operation: an unlaned thread takes its owner's
+  // unsharded path instead of the spare slot, which every unlaned thread would share.
+  T* LaneLocal() const {
+    auto* slots = slots_.load(std::memory_order_acquire);
+    if (!slots || !LaneModeActive()) {
+      return nullptr;
+    }
+    const auto lane = ThisThreadLane();
+    return lane < num_lanes_ ? &slots[lane].value : nullptr;
+  }
+
+  // Calls f(T&) on every slot, the spare slot last. Does nothing before Allocate.
+  template <class F>
+  void ForEach(const F& f) const {
+    auto* slots = slots_.load(std::memory_order_acquire);
+    if (!slots) {
+      return;
+    }
+    for (size_t i = 0; i <= num_lanes_; ++i) {
+      f(slots[i].value);
+    }
+  }
+
+ private:
+  struct alignas(CACHELINE_SIZE) Slot {
+    T value{};
+  };
+
+  std::atomic<Slot*> slots_{nullptr};
+  // Written once, before slots_ is published.
+  size_t num_lanes_ = 0;
 };
 
 // Cross-lane handoffs counted in lane mode, by the category of the executing thread.

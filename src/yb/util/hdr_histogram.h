@@ -184,6 +184,12 @@ class HdrHistogram {
   // Preserves the values for TotalSum and TotalCount.
   void Reset();
 
+  // Adds the counts, sums and min/max of other, which must have the same highest trackable value
+  // and number of significant digits. Like the copy constructor, it is not a consistent snapshot
+  // of other while other is being written, but keeps the current count equal to the sum of the
+  // bucket counts.
+  void MergeFrom(const HdrHistogram& other);
+
   // Get the percentile at a given value
   // TODO: implement
   // double PercentileAtOrBelowValue(uint64_t value) const;

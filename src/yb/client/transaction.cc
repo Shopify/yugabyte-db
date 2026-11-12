@@ -266,6 +266,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
       : trace_(Trace::MaybeGetNewTrace()),
         wait_state_(ash::WaitStateInfo::CurrentWaitState()),
         manager_(manager),
+        rpcs_(manager->rpcs()),
         transaction_(transaction),
         read_point_(manager->clock()),
         child_(Child::kFalse) {
@@ -301,6 +302,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
       : trace_(Trace::MaybeGetNewTrace()),
         wait_state_(ash::WaitStateInfo::CurrentWaitState()),
         manager_(manager),
+        rpcs_(manager->rpcs()),
         transaction_(transaction),
         metadata_(metadata),
         read_point_(manager->clock()),
@@ -313,6 +315,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
       : trace_(Trace::MaybeGetNewTrace()),
         wait_state_(ash::WaitStateInfo::CurrentWaitState()),
         manager_(manager),
+        rpcs_(manager->rpcs()),
         transaction_(transaction),
         read_point_(manager->clock()),
         child_(Child::kTrue),
@@ -342,7 +345,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
     for (auto& entry : transaction_status_move_handles_) {
       handles.push_back(&entry.second);
     }
-    manager_->rpcs().Abort(handles.begin(), handles.end());
+    rpcs_.Abort(handles.begin(), handles.end());
     LOG_IF_WITH_PREFIX(DFATAL, !waiters_.empty()) << "Non empty waiters";
     auto start_us = start_.load(std::memory_order_relaxed);
     const auto now_us = manager_->clock()->Now().GetPhysicalValueMicros();
@@ -904,7 +907,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
       const auto& participant_tablet = tablet_state.first;
       transaction_status_move_tablets_.emplace(participant_tablet);
       transaction_status_move_handles_.emplace(participant_tablet,
-                                               manager_->rpcs().InvalidHandle());
+                                               rpcs_.InvalidHandle());
     }
 
     return Status::OK();
@@ -1178,7 +1181,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
     // The response outlives this call, so it keeps the transaction alive until it arrives.
     auto transaction = transaction_->shared_from_this();
     return MakeFuture<Status>([&, handle, transaction = std::move(transaction)](auto callback) {
-      manager_->rpcs().RegisterAndStart(
+      rpcs_.RegisterAndStart(
           // Include no origination info on this heartbeat, unlike the normal PENDING heartbeats
           // sent by SendHeartbeat.
           //
@@ -1200,7 +1203,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
                       FLAGS_TEST_delay_rollback_heartbeat_response_ms * 1ms);
                 }
                 UpdateClock(resp, manager_);
-                manager_->rpcs().Unregister(handle);
+                rpcs_.Unregister(handle);
                 callback(status);
               },
               aborted_sub_txn_set), handle);
@@ -1543,13 +1546,13 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
   void CompleteConstruction() {
     LOG_IF(FATAL, !IsAcceptableAtomicImpl(log_prefix_.tag));
     log_prefix_.prefix = Format("$0$1", metadata_.transaction_id, child_ ? " (CHILD)" : "");
-    heartbeat_handle_ = manager_->rpcs().InvalidHandle();
-    new_heartbeat_handle_ = manager_->rpcs().InvalidHandle();
-    commit_handle_ = manager_->rpcs().InvalidHandle();
-    abort_handle_ = manager_->rpcs().InvalidHandle();
-    old_abort_handle_ = manager_->rpcs().InvalidHandle();
-    rollback_heartbeat_handle_ = manager_->rpcs().InvalidHandle();
-    old_rollback_heartbeat_handle_ = manager_->rpcs().InvalidHandle();
+    heartbeat_handle_ = rpcs_.InvalidHandle();
+    new_heartbeat_handle_ = rpcs_.InvalidHandle();
+    commit_handle_ = rpcs_.InvalidHandle();
+    abort_handle_ = rpcs_.InvalidHandle();
+    old_abort_handle_ = rpcs_.InvalidHandle();
+    rollback_heartbeat_handle_ = rpcs_.InvalidHandle();
+    old_rollback_heartbeat_handle_ = rpcs_.InvalidHandle();
   }
 
   void CompleteInit(IsolationLevel isolation) {
@@ -1604,7 +1607,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
         [this, deadline, seal_only, transaction](
             const auto& status, const auto& req, const auto& resp) {
           UpdateClock(resp, manager_);
-          manager_->rpcs().Unregister(&commit_handle_);
+          rpcs_.Unregister(&commit_handle_);
           last_old_heartbeat_failed_.store(!status.ok(), std::memory_order_release);
           DoCommit(deadline, seal_only, status, transaction);
         });
@@ -1706,7 +1709,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
     if (old_status_tablet_ && last_old_heartbeat_failed_.load(std::memory_order_acquire)) {
       auto rpc = PrepareOldStatusTabletFinalHeartbeat(deadline, seal_only, status, transaction);
       lock.unlock();
-      manager_->rpcs().RegisterAndStart(rpc, &commit_handle_);
+      rpcs_.RegisterAndStart(rpc, &commit_handle_);
       return;
     }
 
@@ -1754,7 +1757,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
     auto old_status_tablet = old_status_tablet_;
     lock.unlock();
 
-    manager_->rpcs().RegisterAndStart(
+    rpcs_.RegisterAndStart(
         UpdateTransaction(
             deadline,
             status_tablet,
@@ -1831,7 +1834,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
     req.set_propagated_hybrid_time(manager_->Now().ToUint64());
     req.set_transaction_id(metadata_.transaction_id.data(), metadata_.transaction_id.size());
 
-    manager_->rpcs().RegisterAndStart(
+    rpcs_.RegisterAndStart(
         AbortTransaction(
             deadline,
             old_status_tablet.get(),
@@ -1850,7 +1853,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
     req.set_propagated_hybrid_time(manager_->Now().ToUint64());
     req.set_transaction_id(metadata_.transaction_id.data(), metadata_.transaction_id.size());
 
-    manager_->rpcs().RegisterAndStart(
+    rpcs_.RegisterAndStart(
         AbortTransaction(
             deadline,
             status_tablet.get(),
@@ -1914,7 +1917,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
       VLOG_WITH_PREFIX(1) << "Committed: " << status;
 
       UpdateClock(response, manager_);
-      manager_->rpcs().Unregister(&commit_handle_);
+      rpcs_.Unregister(&commit_handle_);
 
       actual_status = status.IsAlreadyPresent() ? Status::OK() : status;
       if (state_.load(std::memory_order_acquire) != TransactionState::kCommitted &&
@@ -1956,7 +1959,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
     if (response.has_propagated_hybrid_time()) {
       manager_->UpdateClock(HybridTime(response.propagated_hybrid_time()));
     }
-    manager_->rpcs().Unregister(&abort_handle_);
+    rpcs_.Unregister(&abort_handle_);
   }
 
   void OldStatusAbortDone(const Status& status,
@@ -1968,7 +1971,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
     if (response.has_propagated_hybrid_time()) {
       manager_->UpdateClock(HybridTime(response.propagated_hybrid_time()));
     }
-    manager_->rpcs().Unregister(&old_abort_handle_);
+    rpcs_.Unregister(&old_abort_handle_);
 
     Waiter waiter;
     {
@@ -2312,7 +2315,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
     }
 
     auto& handle = send_to_new_tablet ? new_heartbeat_handle_ : heartbeat_handle_;
-    manager_->rpcs().RegisterAndStart(rpc, &handle);
+    rpcs_.RegisterAndStart(rpc, &handle);
   }
 
   static bool AllowHeartbeat(TransactionState current_state, TransactionStatus status) {
@@ -2368,7 +2371,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
     SCOPED_WAIT_STATUS(OnCpu_Active);
     UpdateClock(response, manager_);
     auto& handle = send_to_new_tablet ? new_heartbeat_handle_ : heartbeat_handle_;
-    manager_->rpcs().Unregister(&handle);
+    rpcs_.Unregister(&handle);
 
     if (status.ok() && transaction_status == TransactionStatus::CREATED) {
       auto decode_result = FullyDecodeTransactionId(request.state().transaction_id());
@@ -2695,7 +2698,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
         std::move(transaction), id, tablet_id, *result, request_template);
 
     lock.unlock();
-    manager_->rpcs().RegisterAndStart(rpc, handle);
+    rpcs_.RegisterAndStart(rpc, handle);
   }
 
   void UpdateTransactionPromotingDone(
@@ -2710,7 +2713,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
 
     UniqueLock lock(mutex_);
     auto handle = GetTransactionStatusMoveHandle(tablet_id);
-    manager_->rpcs().Unregister(handle);
+    rpcs_.Unregister(handle);
 
     auto status_tablet = status_tablet_;
     auto trigger_abort = false;
@@ -2839,6 +2842,9 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
 
   // Manager is created once per service.
   TransactionManager* const manager_;
+  // The manager's registry of the lane that created the transaction: every handle below belongs
+  // to it, whichever thread registers or unregisters it.
+  rpc::Rpcs& rpcs_;
 
   // Transaction related to this impl.
   YBTransaction* const transaction_;

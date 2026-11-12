@@ -29,6 +29,7 @@
 #include "yb/rpc/rpc.h"
 #include "yb/rpc/rpc-test-base.h"
 #include "yb/rpc/rpc_controller.h"
+#include "yb/rpc/service_pool.h"
 
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/countdown_latch.h"
@@ -36,13 +37,19 @@
 #include "yb/util/lanes.h"
 #include "yb/util/lanes_test_util.h"
 #include "yb/util/logging_test_util.h"
+#include "yb/util/metrics.h"
+#include "yb/util/operation_counter.h"
+#include "yb/util/random_util.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/test_macros.h"
+#include "yb/util/test_thread_holder.h"
 #include "yb/util/thread.h"
 
 using namespace std::literals;
 
 DECLARE_uint64(default_idle_timeout_ms);
+
+METRIC_DECLARE_counter(rpcs_queue_overflow);
 
 namespace yb::rpc {
 
@@ -946,6 +953,389 @@ TEST_F(RpcLanesTest, ScheduleOnReactorInCallerLane) {
       ASSERT_TRUE(view.on_reactor);
       ASSERT_EQ(view.lane, lane);
     }
+  }
+}
+
+namespace {
+
+// num_lanes lanes of one fake CPU each, without affinity, for tests that only set thread lanes.
+LaneTopology FakeLanes(size_t num_lanes) {
+  std::vector<CpuSet> domains(num_lanes);
+  for (size_t i = 0; i != num_lanes; ++i) {
+    domains[i].Set(i);
+  }
+  return LaneTopology::Build(LaneTopologyOptions{
+      .domains = domains,
+      .process_cpuset = CpuSet::FirstN(num_lanes),
+      .requested_lanes = num_lanes,
+      .affinity_enabled = false,
+  });
+}
+
+void RunWithLane(LaneId lane, const std::function<void()>& f) {
+  RunOnStdThread([lane, &f] {
+    SetThisThreadLane(lane);
+    f();
+  });
+}
+
+ThreadPoolPtr NoWorkersPool() {
+  return std::make_shared<ThreadPool>(ThreadPoolOptions {
+    .name = "no_workers",
+    .max_workers = 0
+  });
+}
+
+} // namespace
+
+// A laned ServicePool admits a call of a lane below its share (ceil(limit / L)) by writing only
+// that lane's slot; beyond the share it sums the slots, so a hot lane can use the whole limit but
+// an idle lane cannot add to a full queue. Calls without a lane use the spare slot.
+TEST_F(RpcLanesTest, ServicePoolLaneAdmission) {
+  constexpr size_t kLanes = 4;
+  constexpr size_t kLimit = 10;
+  constexpr int64_t kShare = 3;
+  auto messenger = CreateAutoShutdownMessengerHolder("Server");
+  auto pool = make_scoped_refptr<ServicePool>(
+      kLimit, [thread_pool = NoWorkersPool()](auto, auto) { return thread_pool; },
+      &messenger->scheduler(), std::make_unique<GenericCalculatorService>(), metric_entity(),
+      kLanes);
+  auto slots = [&pool] { return pool->TEST_LaneQueuedCalls(); };
+  using Slots = std::vector<int64_t>;
+
+  // Below the share: only the lane's slot is written; the position is that slot's count.
+  for (int64_t i = 0; i != kShare; ++i) {
+    ASSERT_EQ(pool->TEST_CallQueued(0), i);
+  }
+  ASSERT_EQ(slots(), (Slots{kShare, 0, 0, 0, 0}));
+  ASSERT_EQ(pool->TEST_SharedQueuedCalls(), 0);
+  ASSERT_EQ(pool->TEST_LanesOverShare(), 0);
+
+  // A hot lane fills the whole queue.
+  for (size_t i = kShare; i != kLimit; ++i) {
+    ASSERT_TRUE(pool->TEST_CallQueued(0));
+  }
+  ASSERT_FALSE(pool->TEST_CallQueued(0));
+  ASSERT_EQ(pool->TEST_LanesOverShare(), 1);
+  // An idle lane, below its share, is refused too: the queue is full.
+  ASSERT_FALSE(pool->TEST_CallQueued(1));
+  ASSERT_EQ(pool->QueuedCalls(), kLimit);
+  ASSERT_EQ(slots(), (Slots{kLimit, 0, 0, 0, 0}));
+
+  // Calls without a lane go to the spare slot, which counts in the sum.
+  pool->TEST_CallDequeued(0);
+  pool->TEST_CallDequeued(0);
+  ASSERT_TRUE(pool->TEST_CallQueued(kNoLane));
+  ASSERT_TRUE(pool->TEST_CallQueued(1));
+  ASSERT_FALSE(pool->TEST_CallQueued(2));
+  ASSERT_EQ(slots(), (Slots{kLimit - 2, 1, 0, 0, 1}));
+
+  pool->TEST_CallDequeued(kNoLane);
+  pool->TEST_CallDequeued(1);
+  for (size_t i = 0; i != kLimit - 2; ++i) {
+    pool->TEST_CallDequeued(0);
+  }
+  ASSERT_EQ(slots(), (Slots{0, 0, 0, 0, 0}));
+  ASSERT_EQ(pool->TEST_LanesOverShare(), 0);
+  pool->StartShutdown();
+  pool->CompleteShutdown();
+
+  // An unlaned pool keeps one shared count.
+  auto unlaned = make_scoped_refptr<ServicePool>(
+      kLimit, [thread_pool = NoWorkersPool()](auto, auto) { return thread_pool; },
+      &messenger->scheduler(), std::make_unique<GenericCalculatorService>(), metric_entity());
+  ASSERT_TRUE(unlaned->TEST_CallQueued(0));
+  ASSERT_TRUE(unlaned->TEST_LaneQueuedCalls().empty());
+  ASSERT_EQ(unlaned->TEST_SharedQueuedCalls(), 1);
+  unlaned->TEST_CallDequeued(0);
+  unlaned->StartShutdown();
+  unlaned->CompleteShutdown();
+}
+
+// Lanes admitting and releasing at once never have more than limit + L - 1 calls queued.
+TEST_F(RpcLanesTest, ServicePoolConcurrentAdmissionBound) {
+  constexpr size_t kLanes = 4;
+  constexpr int64_t kLimit = 20;
+  auto messenger = CreateAutoShutdownMessengerHolder("Server");
+  auto pool = make_scoped_refptr<ServicePool>(
+      kLimit, [thread_pool = NoWorkersPool()](auto, auto) { return thread_pool; },
+      &messenger->scheduler(), std::make_unique<GenericCalculatorService>(), metric_entity(),
+      kLanes);
+  // Never above the calls the pool counts as admitted: raised after an admit, lowered before the
+  // release.
+  std::atomic<int64_t> admitted{0};
+  std::atomic<int64_t> max_admitted{0};
+  std::atomic<int64_t> rejected{0};
+  TestThreadHolder threads;
+  for (LaneId lane = 0; lane != kLanes; ++lane) {
+    threads.AddThreadFunctor([&, lane, &stop = threads.stop_flag()] {
+      int64_t mine = 0;
+      while (!stop.load()) {
+        if (pool->TEST_CallQueued(lane)) {
+          ++mine;
+          auto now = ++admitted;
+          auto max = max_admitted.load();
+          while (now > max && !max_admitted.compare_exchange_weak(max, now)) {}
+          continue;
+        }
+        ++rejected;
+        for (auto n = RandomUniformInt<int64_t>(0, mine); n; --n, --mine) {
+          --admitted;
+          pool->TEST_CallDequeued(lane);
+        }
+      }
+      for (; mine; --mine) {
+        --admitted;
+        pool->TEST_CallDequeued(lane);
+      }
+    });
+  }
+  threads.WaitAndStop(1s);
+  LOG(INFO) << "Max admitted: " << max_admitted.load() << ", rejected: " << rejected.load();
+  ASSERT_LE(max_admitted.load(), kLimit + static_cast<int64_t>(kLanes) - 1);
+  ASSERT_GE(max_admitted.load(), kLimit - static_cast<int64_t>(kLanes));
+  ASSERT_GT(rejected.load(), 0);
+  ASSERT_EQ(pool->QueuedCalls(), 0);
+  ASSERT_EQ(pool->TEST_LanesOverShare(), 0);
+  pool->StartShutdown();
+  pool->CompleteShutdown();
+}
+
+// Calls read by one lane's reactor fill a laned pool's whole queue; the next is refused with the
+// queue's total in the message and counted in rpcs_queue_overflow.
+TEST_F(RpcLanesTest, LanedServiceQueueOverflow) {
+  SKIP_WITHOUT_TOPOLOGY();
+  constexpr size_t kLimit = 4;
+  TEST_SetLaneTopology scope(*topology_);
+  auto builder = LanedBuilder("Server", *topology_, kDefaultServerMessengerOptions);
+  builder.set_metric_entity(metric_entity());
+  auto server = rpc::CreateAutoShutdownMessengerHolder(ASSERT_RESULT(builder.Build()));
+  Endpoint endpoint;
+  ASSERT_OK(server->ListenAddress(
+      CreateConnectionContextFactory<YBInboundConnectionContext>(), Endpoint(), &endpoint));
+  auto service = std::make_unique<GenericCalculatorService>();
+  auto service_name = service->service_name();
+  auto thread_pool = NoWorkersPool();
+  auto pool = make_scoped_refptr<ServicePool>(
+      kLimit, [thread_pool](auto, auto) { return thread_pool; },
+      &server->scheduler(), std::move(service), metric_entity(), server->num_lanes());
+  ASSERT_OK(server->RegisterService(service_name, pool));
+  ASSERT_OK(server->StartAcceptor());
+  auto overflow = METRIC_rpcs_queue_overflow.Instantiate(metric_entity());
+  const auto overflow_before = overflow->value();
+
+  auto options = kDefaultClientMessengerOptions;
+  options.num_connections_to_server = 1;
+  auto client = CreateAutoShutdownMessengerHolder("Client", options);
+  Proxy proxy(client.get(), HostPort::FromBoundEndpoint(endpoint));
+  struct Call {
+    RpcController controller;
+    rpc_test::AddRequestPB req;
+    rpc_test::AddResponsePB resp;
+  };
+  constexpr size_t kCalls = kLimit + 1;
+  std::vector<Call> calls(kCalls);
+  CountDownLatch first_done(1);
+  for (auto& call : calls) {
+    call.req.set_x(1);
+    call.req.set_y(2);
+    call.controller.set_timeout(60s);
+    proxy.AsyncRequest(
+        CalculatorServiceMethods::AddMethod(), /* method_metrics= */ nullptr, call.req,
+        &call.resp, &call.controller, [&first_done] { first_done.CountDown(); });
+  }
+  first_done.Wait();
+  const auto& refused = calls.back().controller.status();
+  ASSERT_TRUE(refused.IsRemoteError()) << refused;
+  ASSERT_STR_CONTAINS(
+      refused.ToString(),
+      Format("dropped due to backpressure. The service queue is full, it has $0 items", kLimit));
+  ASSERT_EQ(overflow->value() - overflow_before, 1);
+  auto slots = pool->TEST_LaneQueuedCalls();
+  ASSERT_EQ(std::count(slots.begin(), slots.end(), kLimit), 1) << AsString(slots);
+  ASSERT_EQ(pool->QueuedCalls(), kLimit);
+
+  server->UnregisterAllServices();
+  pool->Shutdown();
+  thread_pool->Shutdown();
+  server->Shutdown();
+  client->Shutdown();
+}
+
+// A laned messenger takes a per-lane operation counter for each call handled from a lane thread,
+// and shutdown stops every one of them.
+TEST_F(RpcLanesTest, RpcServicesCounterPerLane) {
+  SKIP_WITHOUT_TOPOLOGY();
+  TEST_SetLaneTopology scope(*topology_);
+  auto unlaned_server = StartServer();
+  auto unlaned = unlaned_server.messenger();
+  ASSERT_EQ(unlaned->TEST_RpcServicesCounters().size(), 1);
+  RunWithLane(1, [unlaned] {
+    ASSERT_EQ(unlaned->TEST_RpcServicesCounterOfThisThread(),
+              unlaned->TEST_RpcServicesCounters()[0]);
+  });
+  unlaned_server.Shutdown();
+
+  auto server = StartServer(
+      ASSERT_RESULT(LanedBuilder("Server", *topology_).Build()), ServicePriority::kNormal);
+  auto* messenger = server.messenger();
+  auto counters = messenger->TEST_RpcServicesCounters();
+  ASSERT_EQ(counters.size(), 3);
+  ASSERT_EQ(messenger->TEST_RpcServicesCounterOfThisThread(), counters[0]);
+  for (LaneId lane = 0; lane != 2; ++lane) {
+    RunWithLane(lane, [messenger, &counters, lane] {
+      ASSERT_EQ(messenger->TEST_RpcServicesCounterOfThisThread(), counters[lane + 1]);
+    });
+  }
+  // A call from each lane, handled while its lane's counter is taken.
+  for (LaneId lane : {LaneId{0}, LaneId{1}, kNoLane}) {
+    RunWithLane(lane, [messenger] {
+      Proxy local_proxy(messenger, HostPort());
+      rpc_test::WhoAmIResponsePB resp;
+      RpcController controller;
+      ASSERT_OK(WhoAmI(&local_proxy, &controller, &resp));
+    });
+  }
+  messenger->UnregisterAllServices();
+  for (const auto* counter : counters) {
+    ASSERT_TRUE(counter->TEST_IsStopped());
+  }
+  server.Shutdown();
+}
+
+// Local calls of each lane are tracked by that lane's tracker, and DumpRunningRpcs lists all.
+TEST_F(RpcLanesTest, LocalCallTrackersPerLane) {
+  SKIP_WITHOUT_TOPOLOGY();
+  TEST_SetLaneTopology scope(*topology_);
+  auto server = StartServer(
+      ASSERT_RESULT(LanedBuilder("Server", *topology_).Build()), ServicePriority::kNormal);
+  auto* messenger = server.messenger();
+  Proxy local_proxy(messenger, HostPort());
+  struct Call {
+    RpcController controller;
+    rpc_test::SleepRequestPB req;
+    rpc_test::SleepResponsePB resp;
+  };
+  std::vector<Call> calls(3);
+  CountDownLatch latch(calls.size());
+  for (size_t i = 0; i != calls.size(); ++i) {
+    auto& call = calls[i];
+    call.req.set_sleep_micros(2 * 1000000);
+    call.req.set_deferred(true);
+    call.controller.set_lane(i < 2 ? narrow_cast<LaneId>(i) : kNoLane);
+    local_proxy.AsyncRequest(
+        CalculatorServiceMethods::SleepMethod(), /* method_metrics= */ nullptr, call.req,
+        &call.resp, &call.controller, latch.CountDownCallback());
+  }
+  DumpRunningRpcsRequestPB dump_req;
+  dump_req.set_get_local_calls(true);
+  DumpRunningRpcsResponsePB dump_resp;
+  ASSERT_OK(messenger->DumpRunningRpcs(dump_req, &dump_resp));
+  ASSERT_EQ(dump_resp.local_calls().calls_in_flight_size(), calls.size()) << AsString(dump_resp);
+  latch.Wait();
+  for (const auto& call : calls) {
+    ASSERT_OK(call.controller.status());
+  }
+  server.Shutdown();
+}
+
+namespace {
+
+// Registered in an Rpcs registry; Abort completes it, unregistering it as a finished call does.
+class AbortableCommand : public RpcCommand {
+ public:
+  void SendRpc() override {}
+  std::string ToString() const override { return "AbortableCommand"; }
+  void Finished(const Status& status) override {}
+  CoarseTimePoint deadline() const override { return CoarseMonoClock::Now() + 60s; }
+
+  void Abort() override {
+    aborted_ = true;
+    if (rpcs_ && handle_ != rpcs_->InvalidHandle()) {
+      rpcs_->Unregister(&handle_);
+    }
+  }
+
+  bool Register(Rpcs* rpcs) {
+    rpcs_ = rpcs;
+    handle_ = rpcs->InvalidHandle();
+    rpcs->Register(shared_from(this), &handle_);
+    return handle_ != rpcs->InvalidHandle();
+  }
+
+  bool aborted() const { return aborted_; }
+  Rpcs::Handle* handle() { return &handle_; }
+  Rpcs* rpcs() const { return rpcs_; }
+
+ private:
+  std::atomic<bool> aborted_{false};
+  Rpcs* rpcs_ = nullptr;
+  Rpcs::Handle handle_;
+};
+
+} // namespace
+
+// LaneShardedRpcs: a registry per lane and one for unlaned threads; a handle is unregistered
+// through its own registry from any thread, and abort and shutdown cover every registry.
+TEST_F(RpcLanesTest, LaneShardedRpcs) {
+  {
+    // Built without lanes: one registry for every thread.
+    rpc::LaneShardedRpcs rpcs;
+    ASSERT_EQ(rpcs.num_lanes(), 0);
+    RunWithLane(1, [&rpcs] {
+      ASSERT_EQ(&rpcs.Local(), &rpcs.Unlaned());
+    });
+  }
+
+  constexpr size_t kLanes = 2;
+  TEST_SetLaneTopology scope(FakeLanes(kLanes));
+  rpc::LaneShardedRpcs rpcs;
+  ASSERT_EQ(rpcs.num_lanes(), kLanes);
+  std::vector<Rpcs*> registries;
+  for (LaneId lane = 0; lane != kLanes; ++lane) {
+    RunWithLane(lane, [&rpcs, &registries] { registries.push_back(&rpcs.Local()); });
+  }
+  registries.push_back(&rpcs.Local());
+  ASSERT_EQ(registries.back(), &rpcs.Unlaned());
+  ASSERT_EQ(std::set<Rpcs*>(registries.begin(), registries.end()).size(), kLanes + 1);
+
+  // Registered from lane 0, unregistered from a lane 1 thread through the handle's registry.
+  auto command = std::make_shared<AbortableCommand>();
+  RunWithLane(0, [&rpcs, &command] { ASSERT_TRUE(command->Register(&rpcs.Local())); });
+  ASSERT_EQ(rpcs.TEST_NumActiveCalls(), 1);
+  ASSERT_EQ(registries[0]->TEST_NumActiveCalls(), 1);
+  RunWithLane(1, [&command] {
+    ASSERT_EQ(command->rpcs()->Unregister(command->handle()), command);
+    ASSERT_EQ(*command->handle(), command->rpcs()->InvalidHandle());
+  });
+  ASSERT_EQ(rpcs.TEST_NumActiveCalls(), 0);
+
+  auto register_everywhere = [&registries] {
+    std::vector<std::shared_ptr<AbortableCommand>> result;
+    for (auto* registry : registries) {
+      result.push_back(std::make_shared<AbortableCommand>());
+      CHECK(result.back()->Register(registry));
+    }
+    return result;
+  };
+  auto commands = register_everywhere();
+  ASSERT_EQ(rpcs.TEST_NumActiveCalls(), kLanes + 1);
+  rpcs.RequestAbortAll();
+  for (const auto& aborted : commands) {
+    ASSERT_TRUE(aborted->aborted());
+  }
+  ASSERT_EQ(rpcs.TEST_NumActiveCalls(), 0);
+
+  commands = register_everywhere();
+  rpcs.Shutdown();
+  for (const auto& aborted : commands) {
+    ASSERT_TRUE(aborted->aborted());
+  }
+  // Every registry refuses calls after shutdown.
+  for (auto* registry : registries) {
+    auto late = std::make_shared<AbortableCommand>();
+    ASSERT_FALSE(late->Register(registry));
+    ASSERT_TRUE(late->aborted());
   }
 }
 

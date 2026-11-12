@@ -117,6 +117,12 @@ OutboundCallMetrics::OutboundCallMetrics(const scoped_refptr<MetricEntity>& enti
       time_to_response(METRIC_handler_latency_outbound_call_time_to_response.Instantiate(entity)) {
 }
 
+void OutboundCallMetrics::EnableLaneCells() {
+  queue_time->EnableLaneCells();
+  send_time->EnableLaneCells();
+  time_to_response->EnableLaneCells();
+}
+
 namespace {
 
 std::atomic<int32_t> call_id_ = {0};

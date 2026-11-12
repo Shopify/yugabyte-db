@@ -34,6 +34,7 @@
 
 #include <stdint.h>
 
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -70,11 +71,16 @@ using ThreadPoolProvider = std::function<ThreadPoolPtr(ThreadPoolTag, LaneId)>;
 // Also includes a queue that calls get pushed onto for handling by the pool.
 class ServicePool : public RpcService {
  public:
+  // num_lanes: the lane count of a laned messenger, 0 for an unlaned one. A laned pool keeps its
+  // queued-call count and timeout pre-check queue per lane (plus one for calls without a lane),
+  // and admits a call without a shared write while its lane is below its share of max_tasks; see
+  // ServicePoolImpl::LaneCallQueued. An unlaned pool keeps one count and one queue.
   ServicePool(size_t max_tasks,
               ThreadPoolProvider thread_pool_provider,
               Scheduler* scheduler,
               ServiceIfPtr service,
-              const scoped_refptr<MetricEntity>& metric_entity);
+              const scoped_refptr<MetricEntity>& metric_entity,
+              size_t num_lanes = 0);
   virtual ~ServicePool();
 
   void StartShutdown() override;
@@ -87,6 +93,19 @@ class ServicePool : public RpcService {
   std::string service_name() const;
 
   ServiceIfPtr TEST_get_service() const;
+
+  // Calls counted as queued (for a laned pool, the sum over its lanes).
+  int64_t QueuedCalls() const;
+
+  // Per-lane counts of a laned pool, the spare slot last; empty for an unlaned pool.
+  std::vector<int64_t> TEST_LaneQueuedCalls() const;
+  // The count an unlaned pool uses; stays 0 in a laned pool.
+  int64_t TEST_SharedQueuedCalls() const;
+  int64_t TEST_LanesOverShare() const;
+  // Admission and release as for a call of lane, without a call.
+  std::optional<int64_t> TEST_CallQueued(LaneId lane);
+  void TEST_CallDequeued(LaneId lane);
+
  private:
   std::unique_ptr<ServicePoolImpl> impl_;
 };

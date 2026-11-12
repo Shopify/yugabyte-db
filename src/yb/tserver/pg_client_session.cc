@@ -5223,6 +5223,8 @@ PgClientSessionMetrics::PgClientSessionMetrics(MetricEntity* metric_entity)
       vector_index_reduce_us(METRIC_vector_index_reduce_us.Instantiate(metric_entity)),
       vector_index_partitions_queried(
           METRIC_vector_index_partitions_queried.Instantiate(metric_entity)) {
+  // Recorded per shared-memory exchange by every session lane. No-op with lanes off.
+  exchange_response_size->EnableLaneCells();
 }
 
 }  // namespace yb::tserver

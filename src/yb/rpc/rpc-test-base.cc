@@ -561,7 +561,7 @@ Status TestServer::RegisterService(std::unique_ptr<ServiceIf> service) {
   }
   auto service_pool = make_scoped_refptr<ServicePool>(
       kQueueLength, std::move(provider), &messenger_->scheduler(), std::move(service),
-      messenger_->metric_entity());
+      messenger_->metric_entity(), messenger_->laned() ? messenger_->num_lanes() : 0);
   if (!service_pool_) {
     service_pool_ = service_pool;
   }

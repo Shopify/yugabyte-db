@@ -98,6 +98,9 @@ struct OutboundCallMetrics {
   scoped_refptr<EventStats> queue_time;
   scoped_refptr<EventStats> send_time;
   scoped_refptr<EventStats> time_to_response;
+
+  // Per-lane cells for all three; see EventStats::EnableLaneCells.
+  void EnableLaneCells();
 };
 
 // A response to a call, on the client side.

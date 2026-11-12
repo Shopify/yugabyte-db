@@ -120,8 +120,12 @@ class ServicePoolImpl final : public InboundCallHandler {
       ThreadPoolProvider thread_pool_provider,
       Scheduler* scheduler,
       ServiceIfPtr service,
-      const scoped_refptr<MetricEntity>& entity)
+      const scoped_refptr<MetricEntity>& entity,
+      size_t num_lanes)
       : max_queued_calls_(max_tasks),
+        num_lanes_(num_lanes),
+        lane_share_(num_lanes ? max_tasks / num_lanes + (max_tasks % num_lanes != 0) : 0),
+        lane_queues_(num_lanes ? new LaneQueue[num_lanes + 1] : nullptr),
         thread_pool_provider_(std::move(thread_pool_provider)),
         scheduler_(*scheduler),
         service_(std::move(service)),
@@ -142,6 +146,10 @@ class ServicePoolImpl final : public InboundCallHandler {
                   entity->prototype().name(), std::move(id),
                   description, MetricUnit::kRequests, description, MetricLevel::kInfo)),
               static_cast<int64>(0) /* initial_value */);
+          if (num_lanes_) {
+            incoming_queue_time_->EnableLaneCells();
+            rpcs_in_queue_->EnableLaneCells();
+          }
 
           LOG_WITH_PREFIX(INFO) << "yb::rpc::ServicePoolImpl created at " << this;
   }
@@ -156,8 +164,10 @@ class ServicePoolImpl final : public InboundCallHandler {
     while (scheduled_tasks_.load(std::memory_order_acquire) != 0) {
       std::this_thread::sleep_for(10ms);
     }
-    LOG_IF(DFATAL, !pre_check_timeout_queue_.Empty())
-        << "Entries pushed to pre_check_timeout_queue_ after shutdown";
+    ForEachPreCheckTimeoutQueue([this](PreCheckTimeoutQueue& queue) {
+      LOG_IF_WITH_PREFIX(DFATAL, !queue.Empty())
+          << "Entries pushed to pre_check_timeout_queue_ after shutdown";
+    });
   }
 
   void StartShutdown() {
@@ -171,7 +181,7 @@ class ServicePoolImpl final : public InboundCallHandler {
       }
 
       check_timeout_strand_.dispatch([this] {
-        pre_check_timeout_queue_.Drain();
+        ForEachPreCheckTimeoutQueue([](PreCheckTimeoutQueue& queue) { queue.Drain(); });
         shutdown_complete_latch_.CountDown();
       });
     }
@@ -191,13 +201,13 @@ class ServicePoolImpl final : public InboundCallHandler {
 
     auto task = call->BindTask(this);
     if (!task) {
-      Overflow(call, "service", queued_calls_.load(std::memory_order_relaxed));
+      Overflow(call, "service", QueuedCalls());
       return;
     }
 
     auto call_deadline = call->GetClientDeadline();
     if (call_deadline != CoarseTimePoint::max()) {
-      pre_check_timeout_queue_.Push(new WeakInboundCall(std::move(call)));
+      PreCheckTimeoutQueueOf(call->lane()).Push(new WeakInboundCall(std::move(call)));
       ScheduleCheckTimeout(call_deadline);
     }
 
@@ -218,6 +228,35 @@ class ServicePoolImpl final : public InboundCallHandler {
 
   ServiceIfPtr TEST_get_service() const {
     return service_;
+  }
+
+  // Calls counted as queued: the shared count for an unlaned pool, the sum of the lane slots
+  // otherwise.
+  int64_t QueuedCalls() const {
+    if (!num_lanes_) {
+      return queued_calls_.load(std::memory_order_relaxed);
+    }
+    int64_t result = 0;
+    for (size_t i = 0; i <= num_lanes_; ++i) {
+      result += lane_queues_[i].queued.load(std::memory_order_seq_cst);
+    }
+    return result;
+  }
+
+  std::vector<int64_t> TEST_LaneQueuedCalls() const {
+    std::vector<int64_t> result;
+    for (size_t i = 0; num_lanes_ && i <= num_lanes_; ++i) {
+      result.push_back(lane_queues_[i].queued.load(std::memory_order_relaxed));
+    }
+    return result;
+  }
+
+  int64_t TEST_SharedQueuedCalls() const {
+    return queued_calls_.load(std::memory_order_relaxed);
+  }
+
+  int64_t TEST_LanesOverShare() const {
+    return lanes_over_share_.load(std::memory_order_relaxed);
   }
 
   void Overflow(const InboundCallPtr& call, const char* type, size_t limit) {
@@ -287,6 +326,8 @@ class ServicePoolImpl final : public InboundCallHandler {
   }
 
  private:
+  friend class ServicePool;
+
   void TimedOut(InboundCall* call, const char* error_message, Counter* metric) {
     if (call->RespondTimedOutIfPending(error_message)) {
       metric->Increment();
@@ -331,8 +372,8 @@ class ServicePoolImpl final : public InboundCallHandler {
     }
 
     auto now = CoarseMonoClock::now();
-    {
-      while (auto raw_call = pre_check_timeout_queue_.Pop()) {
+    ForEachPreCheckTimeoutQueue([this, now](PreCheckTimeoutQueue& queue) {
+      while (auto raw_call = queue.Pop()) {
         std::unique_ptr<WeakInboundCall> call(raw_call);
         auto inbound_call = call->call.lock();
         if (!inbound_call) {
@@ -344,7 +385,7 @@ class ServicePoolImpl final : public InboundCallHandler {
           check_timeout_queue_.emplace(inbound_call);
         }
       }
-    }
+    });
 
     while (!check_timeout_queue_.empty() && now > check_timeout_queue_.top().time) {
       auto call = check_timeout_queue_.top().call.lock();
@@ -390,7 +431,10 @@ class ServicePoolImpl final : public InboundCallHandler {
 
   const std::string& LogPrefix() const { return log_prefix_; }
 
-  std::optional<int64_t> CallQueued(int64_t rpc_queue_limit) override {
+  std::optional<int64_t> CallQueued(int64_t rpc_queue_limit, LaneId lane) override {
+    if (num_lanes_) {
+      return LaneCallQueued(rpc_queue_limit, lane);
+    }
     auto queued_calls = queued_calls_.fetch_add(1, std::memory_order_acq_rel);
     if (queued_calls < 0) {
       YB_LOG_EVERY_N_SECS(DFATAL, 5) << "Negative number of queued calls: " << queued_calls;
@@ -406,12 +450,97 @@ class ServicePoolImpl final : public InboundCallHandler {
     return queued_calls;
   }
 
-  void CallDequeued() override {
-    queued_calls_.fetch_sub(1, std::memory_order_relaxed);
+  void CallDequeued(LaneId lane) override {
+    if (num_lanes_) {
+      LaneSlotDecrement(LaneQueueOf(lane));
+    } else {
+      queued_calls_.fetch_sub(1, std::memory_order_relaxed);
+    }
     rpcs_in_queue_->Decrement();
   }
 
+  struct LaneQueue;
+
+  // Admission of a laned pool. A call is counted in its lane's slot and admitted while that slot
+  // is below its share of the limit and no lane is over its share; otherwise (near overload) the
+  // slots are summed and the call admitted while the sum stays within the limit. So on the
+  // normal path nothing shared is written, a hot lane can use the whole limit while the others
+  // are idle, and the queue never holds more than max(limit, L x share) <= limit + L - 1 calls,
+  // where share is ceil(limit / L). lanes_over_share_ counts slots above their share; it is
+  // written only when a slot crosses its share, which happens only near overload.
+  std::optional<int64_t> LaneCallQueued(int64_t rpc_queue_limit, LaneId lane) {
+    auto& slot = LaneQueueOf(lane);
+    const auto limit = static_cast<int64_t>(
+        std::min(max_queued_calls_, implicit_cast<size_t>(rpc_queue_limit)));
+    const auto share = static_cast<int64_t>(lane_share_);
+    const auto queued = slot.queued.fetch_add(1, std::memory_order_seq_cst);
+    if (queued == share) {
+      lanes_over_share_.fetch_add(1, std::memory_order_seq_cst);
+    }
+    // The per-call limit only lowers the limit (no laned messenger sets one); the share then no
+    // longer applies.
+    if (queued >= share || limit < static_cast<int64_t>(max_queued_calls_) ||
+        lanes_over_share_.load(std::memory_order_seq_cst) > 0) {
+      // Includes this call.
+      if (QueuedCalls() > limit) {
+        LaneSlotDecrement(slot);
+        return std::nullopt;
+      }
+    }
+    rpcs_in_queue_->Increment();
+    return queued;
+  }
+
+  void LaneSlotDecrement(LaneQueue& slot) {
+    const auto queued = slot.queued.fetch_sub(1, std::memory_order_seq_cst);
+    if (queued == static_cast<int64_t>(lane_share_) + 1) {
+      lanes_over_share_.fetch_sub(1, std::memory_order_seq_cst);
+    }
+  }
+
+  // Slot of a call's lane; the spare slot for kNoLane (and any lane outside the pool's lanes).
+  LaneQueue& LaneQueueOf(LaneId lane) {
+    return lane_queues_[lane < num_lanes_ ? lane : num_lanes_];
+  }
+
+  // It is too expensive to update timeout priority queue when each call is received.
+  // So we are doing the following trick.
+  // All calls are added to pre_check_timeout_queue_, w/o priority.
+  // Then before timeout check we move calls from this queue to priority queue.
+  struct WeakInboundCall : public MPSCQueueEntry<WeakInboundCall> {
+    explicit WeakInboundCall(std::weak_ptr<InboundCall>&& call_) : call(std::move(call_)) {
+    }
+
+    std::weak_ptr<InboundCall> call;
+  };
+  using PreCheckTimeoutQueue = MPSCQueue<WeakInboundCall>;
+
+  // A laned pool keeps a queue per lane, pushed to by the threads that queue the lane's calls.
+  PreCheckTimeoutQueue& PreCheckTimeoutQueueOf(LaneId lane) {
+    return num_lanes_ ? LaneQueueOf(lane).pre_check_timeout_queue : pre_check_timeout_queue_;
+  }
+
+  template <class F>
+  void ForEachPreCheckTimeoutQueue(const F& f) {
+    f(pre_check_timeout_queue_);
+    for (size_t i = 0; num_lanes_ && i <= num_lanes_; ++i) {
+      f(lane_queues_[i].pre_check_timeout_queue);
+    }
+  }
+
+  // State of one lane of a laned pool, plus a spare slot for calls without a lane. Written by the
+  // threads that queue and handle the lane's calls.
+  struct alignas(CACHELINE_SIZE) LaneQueue {
+    std::atomic<int64_t> queued{0};
+    PreCheckTimeoutQueue pre_check_timeout_queue;
+  };
+
   const size_t max_queued_calls_;
+  // 0 for an unlaned pool, which uses queued_calls_ and pre_check_timeout_queue_ only.
+  const size_t num_lanes_;
+  const size_t lane_share_;
+  const std::unique_ptr<LaneQueue[]> lane_queues_;
+  std::atomic<int64_t> lanes_over_share_{0};
   ThreadPoolProvider thread_pool_provider_;
   Scheduler& scheduler_;
   ServiceIfPtr service_;
@@ -424,19 +553,11 @@ class ServicePoolImpl final : public InboundCallHandler {
   std::atomic<CoarseDuration> last_backpressure_at_{CoarseTimePoint().time_since_epoch()};
   std::atomic<int64_t> queued_calls_{0};
 
-  // It is too expensive to update timeout priority queue when each call is received.
-  // So we are doing the following trick.
-  // All calls are added to pre_check_timeout_queue_, w/o priority.
-  // Then before timeout check we move calls from this queue to priority queue.
-  struct WeakInboundCall : public MPSCQueueEntry<WeakInboundCall> {
-    explicit WeakInboundCall(std::weak_ptr<InboundCall>&& call_) : call(std::move(call_)) {
-    }
+  PreCheckTimeoutQueue pre_check_timeout_queue_;
 
-    std::weak_ptr<InboundCall> call;
-  };
-  MPSCQueue<WeakInboundCall> pre_check_timeout_queue_;
-
-  // Used to track scheduled time, to avoid unnecessary rescheduling.
+  // Used to track scheduled time, to avoid unnecessary rescheduling. Shared by all lanes: written
+  // only when a call's deadline is earlier than the scheduled check, which in steady state happens
+  // about once per check, not per call.
   std::atomic<CoarseDuration> next_check_timeout_{CoarseTimePoint::max().time_since_epoch()};
 
   // Last scheduled task, required to abort scheduled task during reschedule.
@@ -474,9 +595,11 @@ ServicePool::ServicePool(
     ThreadPoolProvider thread_pool_provider,
     Scheduler* scheduler,
     ServiceIfPtr service,
-    const scoped_refptr<MetricEntity>& metric_entity)
+    const scoped_refptr<MetricEntity>& metric_entity,
+    size_t num_lanes)
     : impl_(new ServicePoolImpl(
-        max_tasks, std::move(thread_pool_provider), scheduler, std::move(service), metric_entity)) {
+        max_tasks, std::move(thread_pool_provider), scheduler, std::move(service), metric_entity,
+        num_lanes)) {
 }
 
 ServicePool::~ServicePool() {
@@ -512,6 +635,30 @@ std::string ServicePool::service_name() const {
 
 ServiceIfPtr ServicePool::TEST_get_service() const {
   return impl_->TEST_get_service();
+}
+
+int64_t ServicePool::QueuedCalls() const {
+  return impl_->QueuedCalls();
+}
+
+std::vector<int64_t> ServicePool::TEST_LaneQueuedCalls() const {
+  return impl_->TEST_LaneQueuedCalls();
+}
+
+int64_t ServicePool::TEST_SharedQueuedCalls() const {
+  return impl_->TEST_SharedQueuedCalls();
+}
+
+int64_t ServicePool::TEST_LanesOverShare() const {
+  return impl_->TEST_LanesOverShare();
+}
+
+std::optional<int64_t> ServicePool::TEST_CallQueued(LaneId lane) {
+  return impl_->CallQueued(std::numeric_limits<int64_t>::max(), lane);
+}
+
+void ServicePool::TEST_CallDequeued(LaneId lane) {
+  impl_->CallDequeued(lane);
 }
 
 } // namespace rpc

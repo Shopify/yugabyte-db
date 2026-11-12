@@ -44,6 +44,11 @@ class ClientMasterRpcBase : public rpc::Rpc {
     return &retained_self_;
   }
 
+  // The client's registry of the lane that created the rpc; register the handle there.
+  rpc::Rpcs& rpcs() {
+    return rpcs_;
+  }
+
   virtual bool ShouldRetry(const Status& status) {
     return false;
   }
@@ -143,6 +148,8 @@ class ClientMasterRpcBase : public rpc::Rpc {
 
  private:
   YBClient::Data* const client_data_;
+  // Picked once, since the handle belongs to it and the rpc may finish on another lane's thread.
+  rpc::Rpcs& rpcs_;
   rpc::Rpcs::Handle retained_self_;
   // This is a pointer to the wait state that was created while
   // processing the inbound call, we use this to update the

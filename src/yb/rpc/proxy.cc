@@ -98,6 +98,9 @@ Proxy::Proxy(ProxyContext* context,
           << num_connections_to_server_;
   if (num_lanes_ != 0) {
     lane_call_counters_.reset(new LaneCallCounter[num_lanes_ + 1]);
+    if (outbound_call_metrics_) {
+      outbound_call_metrics_->EnableLaneCells();
+    }
   }
   if (context_->parent_mem_tracker()) {
     mem_tracker_ = MemTracker::FindOrCreateTracker(

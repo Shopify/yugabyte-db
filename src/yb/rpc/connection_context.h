@@ -133,6 +133,13 @@ class ConnectionContextFactoryImpl : public ConnectionContextFactory {
   virtual ~ConnectionContextFactoryImpl() {}
 };
 
+// Lane-batches (MemTracker::EnableLaneBatching) the read buffer and call memory trackers of the
+// messengers whose connection context factories use parent, with their subtrees (per-messenger
+// trackers and the buffer, parser, sending and outbound queueing trackers below them, including
+// those created later): every lane's reactors and handlers update them per call. No-op while lane
+// mode is off.
+void EnableLaneBatchingForRpcMemTrackers(const std::shared_ptr<MemTracker>& parent);
+
 template <class ContextType, class... Args>
 std::shared_ptr<ConnectionContextFactory> CreateConnectionContextFactory(Args&&... args) {
   return std::make_shared<ConnectionContextFactoryImpl<ContextType>>(std::forward<Args>(args)...);

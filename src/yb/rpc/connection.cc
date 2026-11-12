@@ -130,6 +130,9 @@ Connection::Connection(Reactor* reactor,
   const auto metric_entity = reactor->messenger().metric_entity();
   handler_latency_outbound_transfer_ = metric_entity ?
       METRIC_handler_latency_outbound_transfer.Instantiate(metric_entity) : nullptr;
+  if (handler_latency_outbound_transfer_ && reactor->messenger().laned()) {
+    handler_latency_outbound_transfer_->EnableLaneCells();
+  }
   IncrementCounter(rpc_metrics_.connections_created);
   IncrementGauge(rpc_metrics_.connections_alive);
 }

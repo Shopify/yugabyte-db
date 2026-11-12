@@ -30,6 +30,10 @@ struct RpcMetrics {
   scoped_refptr<Counter> outbound_calls_created;
   scoped_refptr<Counter> outbound_calls_stuck;
   scoped_refptr<AtomicGauge<int64_t>> busy_reactors;
+
+  // Gives the gauges that every lane updates per call or reactor wakeup (inbound and outbound
+  // calls alive, busy reactors) per-lane cells; see AtomicGauge::EnableLaneCells.
+  void EnableLaneCells();
 };
 
 } // namespace yb::rpc

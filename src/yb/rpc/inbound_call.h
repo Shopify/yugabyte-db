@@ -77,9 +77,15 @@ class InboundCallHandler {
 
   virtual void Failure(const InboundCallPtr& call, const Status& status) = 0;
 
-  virtual std::optional<int64_t> CallQueued(int64_t rpc_queue_limit) = 0;
+  // Counts a call queued to the handler pool of lane (the call's lane(), kNoLane for the unlaned
+  // pools) and returns its queue position, or nullopt if the queue is full. A handler sharded by
+  // lane counts the call in lane's slot whichever thread queues it (the reading reactor, or the
+  // caller of a local call, which may run in another lane), so that CallDequeued, which runs on
+  // the handler thread, finds it there; the position is then that slot's count.
+  virtual std::optional<int64_t> CallQueued(int64_t rpc_queue_limit, LaneId lane) = 0;
 
-  virtual void CallDequeued() = 0;
+  // Called with the lane passed to CallQueued.
+  virtual void CallDequeued(LaneId lane) = 0;
 
  protected:
   ~InboundCallHandler() = default;
@@ -201,7 +207,7 @@ class InboundCall : public RpcCall, public MPSCQueueEntry<InboundCall> {
       return false;
     }
     if (tracker_) {
-      tracker_->CallDequeued();
+      tracker_->CallDequeued(queued_lane_);
     }
     return true;
   }
@@ -329,6 +335,9 @@ class InboundCall : public RpcCall, public MPSCQueueEntry<InboundCall> {
 
   size_t method_index_ = 0;
   int64_t rpc_queue_position_ = -1;
+
+  // Lane the call was counted in by CallQueued.
+  LaneId queued_lane_ = kNoLane;
 
   DISALLOW_COPY_AND_ASSIGN(InboundCall);
 };

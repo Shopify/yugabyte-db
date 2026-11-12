@@ -78,6 +78,11 @@ YB_STRONGLY_TYPED_BOOL(IsRootTracker);
 YB_STRONGLY_TYPED_BOOL(MayExist);
 YB_STRONGLY_TYPED_BOOL(OnlyChildren);
 
+// Which trackers MemTracker::EnableLaneBatching applies to: the tracker only, the tracker and each
+// of its children (existing ones and those created later, not their descendants), or the tracker
+// and all its descendants (existing and later).
+YB_DEFINE_ENUM(MemTrackerLaneBatching, (kTracker)(kChildren)(kSubtree));
+
 using ConsumptionFunctor = std::function<int64_t()>;
 using PollChildrenConsumptionFunctors = std::function<void()>;
 
@@ -343,6 +348,13 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
   // Returns true if the try succeeded.
   // In case of failure mem tracker that prevented consumption will be stored to
   // blocking_mem_tracker.
+  //
+  // On a lane-batched limited tracker, a lane thread admits bytes into its lane's batch while the
+  // shared consumption plus that batch plus bytes stays within the limit and the batch stays
+  // within --mem_tracker_lane_batch_bytes; otherwise it flushes its batch and checks the shared
+  // value as an unbatched tracker does. So the tracked total can exceed the limit by at most
+  // L x batch (the other lanes' unflushed batches), plus bytes admitted by calls racing with the
+  // same check.
   bool TryConsume(int64_t bytes, MemTracker** blocking_mem_tracker = nullptr);
 
   // Decreases consumption of this tracker and its ancestors by 'bytes'.
@@ -388,7 +400,32 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
   const std::string& id() const { return id_; }
   const std::string& metric_name() const { return metric_name_; }
 
-  // Returns the memory consumed in bytes.
+  // Lane batching for a tracker that threads of several lanes update per operation (see
+  // architecture/design/tserver-ccx-lanes.md). A lane thread then adds its
+  // Consume/Release/TryConsume deltas to its lane's slot of the tracker and moves the slot to the
+  // shared value (and the tracker's metric) only when the slot's absolute value exceeds
+  // --mem_tracker_lane_batch_bytes, so the shared value lags the tracked total by at most L x that
+  // batch. Threads without a lane, and every thread while lane mode is off, update the shared
+  // value directly. Limits stay process-wide: there is no per-lane limit.
+  //
+  // No-op unless lane mode is active and the batch size is positive; idempotent. May be called
+  // while the tracker is in use (the root tracker exists before the topology is installed). For
+  // a tracker with a consumption functor (the tcmalloc-backed root), each update from the functor
+  // also drops the unflushed slots, since the functor's value already includes the memory they
+  // stand for. Returns whether this tracker is batched.
+  bool EnableLaneBatching(MemTrackerLaneBatching scope = MemTrackerLaneBatching::kTracker);
+
+  bool lane_batching_enabled() const;
+
+  // Moves every lane slot of this tracker to its shared value, so consumption() includes all
+  // deltas applied so far. Called on destruction; for readers that need the exact value, such as
+  // tests, and after lane mode is turned off (tests only), when unflushed slots would otherwise
+  // stay as they are.
+  void FlushLaneBatches();
+
+  // Returns the memory consumed in bytes. For a lane-batched tracker this is the shared value,
+  // which can differ from the tracked total by up to L x --mem_tracker_lane_batch_bytes (see
+  // EnableLaneBatching); limit checks use the same value.
   int64_t consumption() const {
     return consumption_.current_value();
   }
@@ -401,7 +438,8 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
   // Note that if consumption_ is based on consumption_func_, this
   // will be the max value we've recorded in consumption(), not
   // necessarily the highest value consumption_func_ has ever
-  // reached.
+  // reached. For a lane-batched tracker it is the peak of the shared value, which can understate
+  // the peak of the tracked total by up to L x --mem_tracker_lane_batch_bytes.
   int64_t peak_consumption() const { return consumption_.max_value(); }
 
   // Retrieve the parent tracker, or NULL If one is not set.
@@ -443,6 +481,12 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
 
   // This is needed in some tests to create deterministic GC behavior.
   static void TEST_SetReleasedMemorySinceGC(int64_t bytes);
+  static int64_t TEST_ReleasedMemorySinceGC();
+  // Sum of the lane slots of the memory released since the last GC.
+  static int64_t TEST_UnflushedReleasedMemorySinceGC();
+
+  // Sum of this tracker's lane slots.
+  int64_t TEST_UnflushedLaneBatches() const;
 
   bool IsRoot() {
     return is_root_tracker_;
@@ -480,8 +524,12 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
     const std::string& id, std::shared_ptr<MemTracker> child);
 
   bool ShouldForceUpdateConsumption() const;
+  // Through the calling thread's lane slot when the tracker is batched, else IncrementSharedBy.
   void IncrementBy(int64_t amount);
   bool TryIncrementBy(int64_t amount);
+  void IncrementSharedBy(int64_t amount);
+  bool TryIncrementSharedBy(int64_t amount);
+  void EnableLaneBatchingForChild(const MemTrackerPtr& child);
   void DoUpdateConsumption();
   void IncrementMetricBy(int64_t amount);
 
@@ -506,6 +554,14 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
   std::unique_ptr<TrackerMetrics> metrics_;
 
   HighWaterMark consumption_{0};
+
+  class LaneBatches;
+  // Set once by EnableLaneBatching and kept until destruction.
+  std::atomic<LaneBatches*> lane_batches_{nullptr};
+  // Whether children created later are batched too, and whether with their own subtrees: set by
+  // EnableLaneBatching with kChildren or kSubtree, read when a child is created.
+  std::atomic<bool> lane_batch_children_{false};
+  std::atomic<bool> lane_batch_subtree_{false};
 
   // this tracker plus all of its ancestors
   std::vector<MemTracker*> all_trackers_;

@@ -15,6 +15,7 @@
 
 #include "yb/gutil/bind.h"
 
+#include "yb/rpc/connection_context.h"
 #include "yb/rpc/messenger.h"
 
 #include "yb/util/cpu_topology.h"
@@ -22,6 +23,7 @@
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
+#include "yb/util/mem_tracker.h"
 #include "yb/util/metrics.h"
 
 static_assert(yb::kMaxLanes == 254, "Keep the tserver_lanes validator in sync with kMaxLanes");
@@ -203,6 +205,18 @@ void RegisterTserverLaneMetrics(const scoped_refptr<MetricEntity>& entity) {
   }
   entity->NeverRetire(METRIC_lane_entries_from_unlaned.InstantiateFunctionGauge(
       entity, Bind(&LaneEntriesFromUnlanedCount)));
+}
+
+void EnableTserverLaneMemTrackerBatching(const std::shared_ptr<MemTracker>& server_tracker) {
+  if (!LaneModeActive()) {
+    return;
+  }
+  MemTracker::GetRootTracker()->EnableLaneBatching();
+  // The server tracker's children are server-wide (RPC buffers and calls, tablets overhead, the
+  // global log cache, block cache, PG response cache, big shared memory, ...); per-tablet trackers
+  // are further down and stay unbatched, since only their tablet's lane updates them.
+  server_tracker->EnableLaneBatching(MemTrackerLaneBatching::kChildren);
+  rpc::EnableLaneBatchingForRpcMemTrackers(server_tracker);
 }
 
 } // namespace yb::tserver

@@ -84,4 +84,12 @@ RpcMetrics::RpcMetrics(const scoped_refptr<MetricEntity>& metric_entity) {
   }
 }
 
+void RpcMetrics::EnableLaneCells() {
+  for (const auto& gauge : {inbound_calls_alive, outbound_calls_alive, busy_reactors}) {
+    if (gauge) {
+      gauge->EnableLaneCells();
+    }
+  }
+}
+
 } // namespace yb::rpc

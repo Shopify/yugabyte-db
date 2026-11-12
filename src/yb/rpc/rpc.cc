@@ -424,5 +424,39 @@ void Rpcs::RequestAbortAll() {
   DoRequestAbortAll(RequestShutdown::kFalse);
 }
 
+LaneShardedRpcs::LaneShardedRpcs() {
+  if (LaneModeActive()) {
+    lane_registries_.Allocate(GetLaneTopology().num_lanes());
+  }
+}
+
+LaneShardedRpcs::~LaneShardedRpcs() {
+  Shutdown();
+}
+
+void LaneShardedRpcs::StartShutdown() {
+  ForEachRegistry([](Rpcs& rpcs) { rpcs.StartShutdown(); });
+}
+
+void LaneShardedRpcs::CompleteShutdown() {
+  ForEachRegistry([](Rpcs& rpcs) { rpcs.CompleteShutdown(); });
+}
+
+void LaneShardedRpcs::Shutdown() {
+  // All registries start aborting before waiting for any.
+  StartShutdown();
+  CompleteShutdown();
+}
+
+void LaneShardedRpcs::RequestAbortAll() {
+  ForEachRegistry([](Rpcs& rpcs) { rpcs.RequestAbortAll(); });
+}
+
+size_t LaneShardedRpcs::TEST_NumActiveCalls() {
+  size_t result = 0;
+  ForEachRegistry([&result](Rpcs& rpcs) { result += rpcs.TEST_NumActiveCalls(); });
+  return result;
+}
+
 } // namespace rpc
 } // namespace yb

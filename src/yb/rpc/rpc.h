@@ -42,6 +42,7 @@
 
 #include "yb/util/dist_trace.h"
 #include "yb/util/enums.h"
+#include "yb/util/lanes.h"
 #include "yb/util/monotime.h"
 #include "yb/util/scope_exit.h"
 
@@ -316,6 +317,53 @@ class Rpcs {
   Calls calls_;
   bool shutdown_  GUARDED_BY(mutex_) = false;
   CoarseTimePoint shutdown_deadline_ GUARDED_BY(mutex_);
+};
+
+// Rpcs registries for calls that threads of every lane start, such as a client's master lookups
+// and transaction RPCs: one registry per lane plus one for threads without a lane when lane mode
+// is active at construction, else only the latter, so that registering a call writes no state
+// shared by all lanes. A Handle belongs to the registry it was registered in, which may be
+// unregistered or aborted from another lane's thread, so a caller picks a registry once (Local, the
+// calling thread's lane) and keeps it with every handle it registers there, InvalidHandle()
+// included. Shutdown and RequestAbortAll cover every registry.
+class LaneShardedRpcs {
+ public:
+  LaneShardedRpcs();
+  ~LaneShardedRpcs();
+
+  LaneShardedRpcs(const LaneShardedRpcs&) = delete;
+  void operator=(const LaneShardedRpcs&) = delete;
+
+  // The calling thread's lane's registry; the unlaned one for a thread without a lane, with lanes
+  // off, or when the registries were built without lanes.
+  Rpcs& Local() {
+    auto* registry = lane_registries_.LaneLocal();
+    return registry ? *registry : unlaned_;
+  }
+
+  // The registry of threads without a lane.
+  Rpcs& Unlaned() { return unlaned_; }
+
+  // Registries per lane (0 when built without lanes).
+  size_t num_lanes() const { return lane_registries_.num_lanes(); }
+
+  void StartShutdown();
+  void CompleteShutdown();
+  void Shutdown();
+  void RequestAbortAll();
+
+  size_t TEST_NumActiveCalls();
+
+ private:
+  template <class F>
+  void ForEachRegistry(const F& f) {
+    f(unlaned_);
+    lane_registries_.ForEach(f);
+  }
+
+  Rpcs unlaned_;
+  // Allocated only when lane mode is active at construction. Its spare slot is not used.
+  LaneSharded<Rpcs> lane_registries_;
 };
 
 template<class Iter>

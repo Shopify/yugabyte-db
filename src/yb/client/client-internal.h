@@ -621,7 +621,9 @@ class YBClient::Data {
   // Ref-counted RPC instance: since 'SetMasterServerProxyAsync' call
   // is asynchronous, we need to hold a reference in this class
   // itself, as to avoid a "use-after-free" scenario.
-  rpc::Rpcs rpcs_;
+  // Master and lookup rpcs register in the registry of the lane that creates them
+  // (ClientMasterRpcBase::rpcs()); the leader master determination uses the unlaned one.
+  rpc::LaneShardedRpcs rpcs_;
   rpc::Rpcs::Handle leader_master_rpc_;
   std::vector<StdStatusCallback> leader_master_callbacks_;
 

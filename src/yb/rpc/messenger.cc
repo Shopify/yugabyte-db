@@ -553,8 +553,12 @@ void Messenger::UnregisterAllServices() {
   if (!rpc_services_stopped_.Set()) {
     return;
   }
-  CHECK_OK(rpc_services_counter_.DisableAndWaitForOps(CoarseTimePoint::max(), Stop::kTrue));
-  rpc_services_counter_.UnlockExclusiveOpMutex();
+  // Every call that got past its counter has finished Handle once all are drained, whichever
+  // lane's counter it took.
+  ForEachRpcServicesCounter([](RWOperationCounter& counter) {
+    CHECK_OK(counter.DisableAndWaitForOps(CoarseTimePoint::max(), Stop::kTrue));
+    counter.UnlockExclusiveOpMutex();
+  });
 
   for (const auto& [_, rpc_service]  : rpc_services_) {
     rpc_service->StartShutdown();
@@ -602,13 +606,49 @@ void Messenger::QueueOutboundCall(OutboundCallPtr call) {
   reactor->QueueOutboundCall(std::move(call));
 }
 
+RWOperationCounter& Messenger::RpcServicesCounter() const {
+  if (num_lanes_ && LaneModeActive()) {
+    const auto lane = ThisThreadLane();
+    if (lane < num_lanes_) {
+      return lane_call_states_[lane]->rpc_services_counter;
+    }
+  }
+  return rpc_services_counter_;
+}
+
+template <class F>
+void Messenger::ForEachRpcServicesCounter(const F& f) const {
+  f(rpc_services_counter_);
+  for (const auto& state : lane_call_states_) {
+    f(state->rpc_services_counter);
+  }
+}
+
+std::vector<const RWOperationCounter*> Messenger::TEST_RpcServicesCounters() const {
+  std::vector<const RWOperationCounter*> result;
+  ForEachRpcServicesCounter([&result](const RWOperationCounter& counter) {
+    result.push_back(&counter);
+  });
+  return result;
+}
+
+const RWOperationCounter* Messenger::TEST_RpcServicesCounterOfThisThread() const {
+  return &RpcServicesCounter();
+}
+
+LocalYBInboundCallTracker& Messenger::LocalCallTracker(LaneId lane) {
+  // A call of lane T queued from a thread of another lane writes T's tracker, along with the
+  // handoff into T's pool that the call makes anyway.
+  return lane < num_lanes_ ? lane_call_states_[lane]->local_call_tracker : local_call_tracker_;
+}
+
 void Messenger::HandleLocal(LocalYBInboundCallPtr call, Queue queue) {
-  local_call_tracker_.Enqueue(call);
+  LocalCallTracker(call->lane()).Enqueue(call);
   Handle(std::move(call), queue);
 }
 
 void Messenger::Handle(InboundCallPtr call, Queue queue) {
-  ScopedRWOperation op(&rpc_services_counter_, CoarseTimePoint::min());
+  ScopedRWOperation op(&RpcServicesCounter(), CoarseTimePoint::min());
   if (!op.ok()) {
     call->RespondFailure(ErrorStatusPB::FATAL_SERVER_SHUTTING_DOWN, MoveStatus(op));
     return;
@@ -646,7 +686,7 @@ void Messenger::Handle(InboundCallPtr call, Queue queue) {
 }
 
 RpcServicePtr Messenger::TEST_rpc_service(const std::string& service_name) const {
-  ScopedRWOperation op(&rpc_services_counter_, CoarseTimePoint::min());
+  ScopedRWOperation op(&RpcServicesCounter(), CoarseTimePoint::min());
   if (!op.ok()) {
     return nullptr;
   }
@@ -799,7 +839,10 @@ Status Messenger::InitLaned(const MessengerBuilder &bld) {
         });
     lane_pools->normal = VERIFY_RESULT(lane_pools->tagged->Pool(/*tag=*/0));
     lane_pools_.push_back(std::move(lane_pools));
+    lane_call_states_.push_back(std::make_unique<LaneCallState>(
+        Format("$0 endpoints L$1", name_, lane), scheduler_));
   }
+  rpc_metrics_->EnableLaneCells();
   // Set last: the lane accessors are used only once all lane state is built.
   num_lanes_ = num_lanes;
   return Status::OK();
@@ -864,7 +907,11 @@ Status Messenger::DumpRunningRpcs(const DumpRunningRpcsRequestPB& req,
     }
   }
   if (req.get_local_calls()) {
+    // Each tracker appends its calls to the same local_calls entry.
     RETURN_NOT_OK(local_call_tracker_.DumpRunningRpcs(req, resp));
+    for (const auto& state : lane_call_states_) {
+      RETURN_NOT_OK(state->local_call_tracker.DumpRunningRpcs(req, resp));
+    }
   }
   return Status::OK();
 }
