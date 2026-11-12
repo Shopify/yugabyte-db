@@ -43,9 +43,9 @@ namespace yb {
 // taken under load; a thread that locked while lane mode was off and unlocks after it turned on
 // would unlock the wrong slot, so callers must not hold this lock across SetLaneTopology.
 //
-// Provides lock/unlock/try_lock and lock_shared/unlock_shared (no try_lock_shared: the slot's
-// rw_spinlock has none), so SharedLock<LaneShardedRwMutex>, std::shared_lock, std::lock_guard,
-// std::unique_lock and UniqueLock all apply.
+// Provides lock/unlock and lock_shared/unlock_shared, so SharedLock<LaneShardedRwMutex>,
+// std::shared_lock, std::lock_guard, std::unique_lock and UniqueLock apply. No try_lock: the
+// slot's rw_spinlock::try_lock waits for readers, which is not what a caller of try_lock expects.
 class CAPABILITY("mutex") LaneShardedRwMutex {
  public:
   LaneShardedRwMutex() = default;
@@ -71,18 +71,6 @@ class CAPABILITY("mutex") LaneShardedRwMutex {
     for (auto it = slots_.rbegin(); it != slots_.rend(); ++it) {
       it->lock.unlock();
     }
-  }
-
-  bool try_lock() TRY_ACQUIRE(true) {
-    for (size_t i = 0; i < slots_.size(); ++i) {
-      if (!slots_[i].lock.try_lock()) {
-        while (i--) {
-          slots_[i].lock.unlock();
-        }
-        return false;
-      }
-    }
-    return true;
   }
 
   // True if any slot is write-locked.

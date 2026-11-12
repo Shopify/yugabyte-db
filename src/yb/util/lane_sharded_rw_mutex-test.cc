@@ -12,12 +12,12 @@
 //
 
 #include <atomic>
+#include <chrono>
+#include <functional>
 #include <mutex>
 #include <thread>
 
 #include <gtest/gtest.h>
-
-#include "yb/gutil/thread_annotations.h"
 
 #include "yb/util/lane_sharded_rw_mutex.h"
 #include "yb/util/lanes.h"
@@ -26,53 +26,61 @@
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 
+using namespace std::literals;
+
 namespace yb {
 
-class LaneShardedRwMutexTest : public YBTest {};
+class LaneShardedRwMutexTest : public YBTest {
+ protected:
+  // Runs f on a thread of the given lane (kNoLane: the service mask) and reports whether it
+  // finished within the wait; the thread is joined either way once `release` lets f return.
+  struct Probe {
+    std::thread thread;
+    std::atomic<bool> done{false};
 
-namespace {
-
-// try_lock as a scoped acquisition, so the thread-safety analysis sees the matching unlock.
-class SCOPED_CAPABILITY TryWriteLock {
- public:
-  explicit TryWriteLock(LaneShardedRwMutex& mutex) TRY_ACQUIRE(true, mutex)  // NOLINT
-      : mutex_(mutex), locked_(mutex.try_lock()) {}
-  ~TryWriteLock() RELEASE() {
-    if (locked_) {
-      mutex_.unlock();
+    void Start(LaneId lane, std::function<void()> f) {
+      thread = std::thread([this, lane, f = std::move(f)] {
+        if (lane == kNoLane) {
+          ApplyServiceMaskToCurrentThread();
+        } else {
+          ApplyLaneToCurrentThread(lane);
+        }
+        f();
+        done = true;
+      });
     }
-  }
-  bool locked() const { return locked_; }
 
- private:
-  LaneShardedRwMutex& mutex_;
-  const bool locked_;
+    bool DoneWithin(std::chrono::milliseconds wait) {
+      auto deadline = std::chrono::steady_clock::now() + wait;
+      while (!done && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(1ms);
+      }
+      return done;
+    }
+  };
 };
 
-}  // namespace
-
-// With lane mode off every thread shares the spare slot: a writer excludes readers and vice versa.
+// With lane mode off every thread shares the spare slot: a writer excludes readers.
 TEST_F(LaneShardedRwMutexTest, LaneModeOffIsOneMutex) {
   TEST_SetLaneTopology scope;
   ASSERT_FALSE(LaneModeActive());
   ASSERT_EQ(LaneShardedRwMutex::SlotIndex(), kMaxLanes);
 
   LaneShardedRwMutex mutex;
+  Probe reader;
   {
-    SharedLock lock(mutex);
-    TryWriteLock write(mutex);
-    ASSERT_FALSE(write.locked());
-    ASSERT_FALSE(mutex.is_write_locked());
-  }
-  {
-    TryWriteLock write(mutex);
-    ASSERT_TRUE(write.locked());
+    std::lock_guard lock(mutex);
     ASSERT_TRUE(mutex.is_write_locked());
+    reader.Start(kNoLane, [&] { SharedLock lock(mutex); });
+    ASSERT_FALSE(reader.DoneWithin(100ms));
   }
+  ASSERT_TRUE(reader.DoneWithin(5000ms));
+  reader.thread.join();
   ASSERT_FALSE(mutex.is_write_locked());
 }
 
-// Readers of different lanes use different slots; a writer still excludes all of them.
+// Readers of different lanes use different slots and do not wait for each other; a writer waits
+// for readers of every lane and, while it holds, excludes readers of every lane.
 TEST_F(LaneShardedRwMutexTest, ReadersShardByLaneWritersLockAll) {
   auto topology = MakeTwoLaneTestTopology();
   if (!topology) {
@@ -82,56 +90,57 @@ TEST_F(LaneShardedRwMutexTest, ReadersShardByLaneWritersLockAll) {
   ASSERT_TRUE(LaneModeActive());
 
   LaneShardedRwMutex mutex;
-  std::atomic<bool> lane0_holds{false};
-  std::atomic<bool> release{false};
-  std::atomic<size_t> lane1_slot{0};
+  std::atomic<bool> release0{false};
+  std::atomic<size_t> slot0{0}, slot1{0};
 
-  // A lane-0 reader holds its slot until told to release.
-  std::thread reader0([&] {
-    ApplyLaneToCurrentThread(0);
-    ASSERT_EQ(LaneShardedRwMutex::SlotIndex(), 0);
+  Probe reader0;
+  reader0.Start(0, [&] {
+    slot0 = LaneShardedRwMutex::SlotIndex();
     SharedLock lock(mutex);
-    lane0_holds = true;
-    while (!release) {
-      std::this_thread::yield();
+    while (!release0) {
+      std::this_thread::sleep_for(1ms);
     }
   });
-  while (!lane0_holds) {
-    std::this_thread::yield();
-  }
-
-  // A lane-1 reader takes a different slot: try_lock on the whole mutex fails because of lane 0,
-  // but the lane-1 reader is not blocked by it.
-  RunOnStdThread([&] {
-    ApplyLaneToCurrentThread(1);
-    lane1_slot = LaneShardedRwMutex::SlotIndex();
+  // A lane-1 reader completes while lane 0 holds its slot.
+  Probe reader1;
+  reader1.Start(1, [&] {
+    slot1 = LaneShardedRwMutex::SlotIndex();
     SharedLock lock(mutex);
   });
-  ASSERT_EQ(lane1_slot, 1);
-  {
-    TryWriteLock write(mutex);
-    ASSERT_FALSE(write.locked());
-  }
+  ASSERT_TRUE(reader1.DoneWithin(5000ms));
+  reader1.thread.join();
+  ASSERT_EQ(slot0, 0);
+  ASSERT_EQ(slot1, 1);
 
-  release = true;
-  reader0.join();
-
-  // With no readers, the writer takes every slot and readers of any lane are excluded.
-  std::atomic<bool> reader_done{false};
-  std::thread reader1;
-  {
-    TryWriteLock write(mutex);
-    ASSERT_TRUE(write.locked());
-    reader1 = std::thread([&] {
-      ApplyLaneToCurrentThread(1);
-      SharedLock lock(mutex);
-      reader_done = true;
-    });
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    ASSERT_FALSE(reader_done);
+  // A writer waits for the lane-0 reader.
+  std::atomic<bool> release_writer{false};
+  std::atomic<bool> writer_holds{false};
+  Probe writer;
+  writer.Start(kNoLane, [&] {
+    std::lock_guard lock(mutex);
+    writer_holds = true;
+    while (!release_writer) {
+      std::this_thread::sleep_for(1ms);
+    }
+  });
+  std::this_thread::sleep_for(100ms);
+  ASSERT_FALSE(writer_holds);
+  release0 = true;
+  reader0.thread.join();
+  while (!writer_holds) {
+    std::this_thread::sleep_for(1ms);
   }
-  reader1.join();
-  ASSERT_TRUE(reader_done);
+  ASSERT_TRUE(mutex.is_write_locked());
+
+  // While the writer holds, a reader of lane 1 is excluded.
+  Probe reader1_again;
+  reader1_again.Start(1, [&] { SharedLock lock(mutex); });
+  ASSERT_FALSE(reader1_again.DoneWithin(100ms));
+  release_writer = true;
+  writer.thread.join();
+  ASSERT_TRUE(reader1_again.DoneWithin(5000ms));
+  reader1_again.thread.join();
+  ASSERT_FALSE(mutex.is_write_locked());
 }
 
 // Many readers across lanes and a few writers keep a guarded counter consistent.
@@ -146,9 +155,9 @@ TEST_F(LaneShardedRwMutexTest, Stress) {
   int64_t guarded = 0;
   std::atomic<bool> stop{false};
   std::atomic<int64_t> reads{0};
-  std::vector<std::thread> threads;
+  std::vector<std::thread> readers;
   for (int i = 0; i < 6; ++i) {
-    threads.emplace_back([&, i] {
+    readers.emplace_back([&, i] {
       ApplyLaneToCurrentThread(static_cast<LaneId>(i % 2));
       while (!stop) {
         SharedLock lock(mutex);
@@ -157,8 +166,9 @@ TEST_F(LaneShardedRwMutexTest, Stress) {
       }
     });
   }
+  std::vector<std::thread> writers;
   for (int i = 0; i < 2; ++i) {
-    threads.emplace_back([&] {
+    writers.emplace_back([&] {
       ApplyServiceMaskToCurrentThread();
       for (int n = 0; n < 2000; ++n) {
         std::lock_guard lock(mutex);
@@ -166,11 +176,12 @@ TEST_F(LaneShardedRwMutexTest, Stress) {
       }
     });
   }
-  threads[6].join();
-  threads[7].join();
+  for (auto& t : writers) {
+    t.join();
+  }
   stop = true;
-  for (int i = 0; i < 6; ++i) {
-    threads[i].join();
+  for (auto& t : readers) {
+    t.join();
   }
   ASSERT_EQ(guarded, 4000);
   ASSERT_GT(reads, 0);
