@@ -129,8 +129,8 @@ The tool validates the draft, checks repository visibility and source freshness,
 creates missing known template labels in the fork, and creates or recovers the
 public issue. It records the public URL privately; public content has no reverse
 link to the private source. When the work goes upstream, the upstream issue is
-derived from this fork issue; the upcoming `shopify-upstream-pr` skill handles that
-creation, not this one.
+derived from this fork issue; the [shopify-upstream-pr](../shopify-upstream-pr/SKILL.md)
+skill handles that creation, not this one.
 
 For an existing public issue, record only its private association:
 
