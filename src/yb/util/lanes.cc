@@ -359,4 +359,12 @@ uint64_t LaneEntriesFromUnlanedCount() {
   return CrossingCounters().Sum(kEntriesFromUnlanedCounter);
 }
 
+uint64_t LaneCrossingCountOfLane(LaneCrossingCategory category, LaneId lane) {
+  return CrossingCounters().SlotValue(lane, static_cast<size_t>(category));
+}
+
+uint64_t LaneEntriesFromUnlanedCountOfLane(LaneId lane) {
+  return CrossingCounters().SlotValue(lane, kEntriesFromUnlanedCounter);
+}
+
 } // namespace yb

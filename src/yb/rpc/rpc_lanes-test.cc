@@ -1021,7 +1021,7 @@ TEST_F(RpcLanesTest, ServicePoolLaneAdmission) {
       kLimit, [thread_pool = NoWorkersPool()](auto, auto) { return thread_pool; },
       &messenger->scheduler(), std::make_unique<GenericCalculatorService>(), metric_entity(),
       kLanes);
-  auto slots = [&pool] { return pool->TEST_LaneQueuedCalls(); };
+  auto slots = [&pool] { return pool->LaneQueuedCalls(); };
   using Slots = std::vector<int64_t>;
 
   // Below the share: only the lane's slot is written; the position is that slot's count.
@@ -1030,14 +1030,14 @@ TEST_F(RpcLanesTest, ServicePoolLaneAdmission) {
   }
   ASSERT_EQ(slots(), (Slots{kShare, 0, 0, 0, 0}));
   ASSERT_EQ(pool->TEST_SharedQueuedCalls(), 0);
-  ASSERT_EQ(pool->TEST_LanesOverShare(), 0);
+  ASSERT_EQ(pool->LanesOverShare(), 0);
 
   // A hot lane fills the whole queue.
   for (size_t i = kShare; i != kLimit; ++i) {
     ASSERT_TRUE(pool->TEST_CallQueued(0));
   }
   ASSERT_FALSE(pool->TEST_CallQueued(0));
-  ASSERT_EQ(pool->TEST_LanesOverShare(), 1);
+  ASSERT_EQ(pool->LanesOverShare(), 1);
   // An idle lane, below its share, is refused too: the queue is full.
   ASSERT_FALSE(pool->TEST_CallQueued(1));
   ASSERT_EQ(pool->QueuedCalls(), kLimit);
@@ -1057,7 +1057,7 @@ TEST_F(RpcLanesTest, ServicePoolLaneAdmission) {
     pool->TEST_CallDequeued(0);
   }
   ASSERT_EQ(slots(), (Slots{0, 0, 0, 0, 0}));
-  ASSERT_EQ(pool->TEST_LanesOverShare(), 0);
+  ASSERT_EQ(pool->LanesOverShare(), 0);
   pool->StartShutdown();
   pool->CompleteShutdown();
 
@@ -1066,7 +1066,7 @@ TEST_F(RpcLanesTest, ServicePoolLaneAdmission) {
       kLimit, [thread_pool = NoWorkersPool()](auto, auto) { return thread_pool; },
       &messenger->scheduler(), std::make_unique<GenericCalculatorService>(), metric_entity());
   ASSERT_TRUE(unlaned->TEST_CallQueued(0));
-  ASSERT_TRUE(unlaned->TEST_LaneQueuedCalls().empty());
+  ASSERT_TRUE(unlaned->LaneQueuedCalls().empty());
   ASSERT_EQ(unlaned->TEST_SharedQueuedCalls(), 1);
   unlaned->TEST_CallDequeued(0);
   unlaned->StartShutdown();
@@ -1107,20 +1107,20 @@ TEST_F(RpcLanesTest, ServicePoolSpareSlotBound) {
   }
   ASSERT_EQ(fill_to_share(kNoLane), 0);
   ASSERT_LE(pool->QueuedCalls(), kLimit + static_cast<int64_t>(kLanes) - 1);
-  ASSERT_EQ(pool->TEST_LaneQueuedCalls(), (Slots{kShare, kShare, kShare, kShare, 0}));
-  drain(pool->TEST_LaneQueuedCalls());
-  ASSERT_EQ(pool->TEST_LanesOverShare(), 0);
+  ASSERT_EQ(pool->LaneQueuedCalls(), (Slots{kShare, kShare, kShare, kShare, 0}));
+  drain(pool->LaneQueuedCalls());
+  ASSERT_EQ(pool->LanesOverShare(), 0);
 
   // Spare first: while it holds calls the lanes take the sum, so the queue stops at the limit.
   ASSERT_EQ(fill_to_share(kNoLane), kShare);
-  ASSERT_EQ(pool->TEST_LanesOverShare(), 1);
+  ASSERT_EQ(pool->LanesOverShare(), 1);
   for (LaneId lane = 0; lane != kLanes; ++lane) {
     fill_to_share(lane);
   }
   ASSERT_EQ(pool->QueuedCalls(), kLimit);
-  drain(pool->TEST_LaneQueuedCalls());
+  drain(pool->LaneQueuedCalls());
   ASSERT_EQ(pool->QueuedCalls(), 0);
-  ASSERT_EQ(pool->TEST_LanesOverShare(), 0);
+  ASSERT_EQ(pool->LanesOverShare(), 0);
   pool->StartShutdown();
   pool->CompleteShutdown();
 }
@@ -1175,7 +1175,7 @@ TEST_F(RpcLanesTest, ServicePoolConcurrentAdmissionBound) {
   ASSERT_GE(max_admitted.load(), kLimit - static_cast<int64_t>(kLanes));
   ASSERT_GT(rejected.load(), 0);
   ASSERT_EQ(pool->QueuedCalls(), 0);
-  ASSERT_EQ(pool->TEST_LanesOverShare(), 0);
+  ASSERT_EQ(pool->LanesOverShare(), 0);
   pool->StartShutdown();
   pool->CompleteShutdown();
 }
@@ -1230,7 +1230,7 @@ TEST_F(RpcLanesTest, LanedServiceQueueOverflow) {
       refused.ToString(),
       Format("dropped due to backpressure. The service queue is full, it has $0 items", kLimit));
   ASSERT_EQ(overflow->value() - overflow_before, 1);
-  auto slots = pool->TEST_LaneQueuedCalls();
+  auto slots = pool->LaneQueuedCalls();
   ASSERT_EQ(std::count(slots.begin(), slots.end(), kLimit), 1) << AsString(slots);
   ASSERT_EQ(pool->QueuedCalls(), kLimit);
 

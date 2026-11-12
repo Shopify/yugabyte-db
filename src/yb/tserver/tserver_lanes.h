@@ -47,6 +47,17 @@ Result<LaneTopology> ComputeTserverLaneTopology(std::string* description = nullp
 // error is logged as a WARNING and the tserver runs with lanes off.
 void InitTserverLaneTopology();
 
+// What the last InitTserverLaneTopology in this process found: whether the topology it computed was
+// active, and its one-line summary (the "Lane topology: ..." log line), or why lanes are off
+// (tserver_lanes=1, one CPU domain, no CPUs left after service CPUs, a discovery error). Empty
+// description before the first call.
+struct TserverLaneTopologySummary {
+  bool active = false;
+  std::string description;
+};
+
+TserverLaneTopologySummary GetTserverLaneTopologySummary();
+
 // Makes builder build a laned messenger when the installed topology is active, with the
 // tserver_lane_reactors and tserver_lane_connections_per_remote settings; does nothing
 // otherwise. Only the tablet server's own messenger is laned.

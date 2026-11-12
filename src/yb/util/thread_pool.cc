@@ -983,6 +983,13 @@ size_t YBTaggedThreadPools::ActivePools() {
   return pools_.size();
 }
 
+void YBTaggedThreadPools::ForEachPool(const std::function<void(Tag, const YBThreadPool&)>& f) {
+  SharedLock lock(mutex_);
+  for (const auto& [tag, pool] : pools_) {
+    f(tag, *pool);
+  }
+}
+
 std::vector<YBThreadPoolPtr> YBTaggedThreadPools::CleanupIdlePools() {
   std::vector<YBThreadPoolPtr> to_shutdown;
   auto itr = pools_.begin();

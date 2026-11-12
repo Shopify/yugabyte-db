@@ -16,6 +16,7 @@
 #pragma once
 
 #include <concepts>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -364,6 +365,10 @@ class YBTaggedThreadPools {
   Result<YBThreadPoolPtr> Pool(Tag tag) EXCLUDES(mutex_);
 
   size_t ActivePools() EXCLUDES(mutex_);
+
+  // Calls f on every existing pool under the shared lock; creates none. f must not call back
+  // into this object.
+  void ForEachPool(const std::function<void(Tag, const YBThreadPool&)>& f) EXCLUDES(mutex_);
 
  private:
   YBThreadPoolPtr LookupPool(Tag tag) REQUIRES_SHARED(mutex_);

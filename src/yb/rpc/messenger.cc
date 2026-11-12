@@ -512,6 +512,33 @@ ThreadPoolPtr Messenger::HandlerThreadPool(
   return ThreadPoolPtr(priority, lane);
 }
 
+void Messenger::ForEachHandlerPool(
+    LaneId lane, const std::function<void(const rpc::ThreadPool&)>& f) {
+  auto visit_tagged = [&f](TaggedThreadPools::Tag, const rpc::ThreadPool& pool) { f(pool); };
+  if (auto* lane_pools = LanePoolsOf(lane)) {
+    // The lane's normal pool is its tagged pool for tag 0.
+    lane_pools->tagged->ForEachPool(visit_tagged);
+    if (lane_pools->high_ready.load(std::memory_order_acquire)) {
+      f(*lane_pools->high);
+    }
+    return;
+  }
+  normal_thread_pools_->ForEachPool(visit_tagged);
+  if (high_priority_thread_pool_ready_.load(std::memory_order_acquire)) {
+    f(*high_priority_thread_pool_);
+  }
+}
+
+void Messenger::ForEachService(const std::function<void(const RpcService&)>& f) const {
+  ScopedRWOperation op(&RpcServicesCounter(), CoarseTimePoint::min());
+  if (!op.ok()) {
+    return;
+  }
+  for (const auto& [_, service] : rpc_services_) {
+    f(*service);
+  }
+}
+
 size_t Messenger::TEST_ActiveTaggedPools(LaneId lane) {
   auto* lane_pools = LanePoolsOf(lane);
   return lane_pools ? lane_pools->tagged->ActivePools() : normal_thread_pools_->ActivePools();

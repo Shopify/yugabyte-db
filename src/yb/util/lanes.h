@@ -231,6 +231,13 @@ class LaneShardedCounters {
     return result;
   }
 
+  // The count of one slot: lane's for a lane below kMaxLanes, the spare slot's otherwise.
+  uint64_t SlotValue(LaneId lane, size_t counter) const {
+    return counter < N
+        ? slots_[std::min<size_t>(lane, kMaxLanes)].values[counter].load(std::memory_order_relaxed)
+        : 0;
+  }
+
  private:
   static_assert(sizeof(std::atomic<uint64_t>) * N <= CACHELINE_SIZE);
 
@@ -338,6 +345,12 @@ uint64_t LaneCrossingCount(LaneCrossingCategory category);
 // Handoffs from a thread with no lane to a laned pool, strand or task stream thread. Handoffs from
 // such a thread into a reactor are not counted (see CountLaneHandoffFromThisThread).
 uint64_t LaneEntriesFromUnlanedCount();
+
+// The part of LaneCrossingCount and LaneEntriesFromUnlanedCount counted by threads of lane: the
+// executing thread for pools, strands and task streams, the submitting thread for reactor handoffs.
+// So a lane's count is not the number of crossings into that lane.
+uint64_t LaneCrossingCountOfLane(LaneCrossingCategory category, LaneId lane);
+uint64_t LaneEntriesFromUnlanedCountOfLane(LaneId lane);
 
 // Counts a handoff that the calling thread executes and that was submitted from submitter: a
 // crossing when both are laned and differ, an entry from unlaned when only the calling thread is

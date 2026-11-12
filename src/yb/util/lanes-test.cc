@@ -456,8 +456,18 @@ TEST_F(LanesTest, HandoffCounting) {
   ASSERT_EQ(from_lane_1.submitter(), 1);
   ASSERT_EQ(from_unlaned.submitter(), kNoLane);
 
+  auto lane_counts = [](LaneId lane) {
+    LaneHandoffCounts result;
+    for (auto category : LaneCrossingCategoryList()) {
+      result.crossings[static_cast<size_t>(category)] = LaneCrossingCountOfLane(category, lane);
+    }
+    result.entries_from_unlaned = LaneEntriesFromUnlanedCountOfLane(lane);
+    return result;
+  };
   RunOnStdThread([&] {
     ApplyLaneToCurrentThread(0);
+    const auto lane_0_before = lane_counts(0);
+    const auto lane_1_before = lane_counts(1);
     auto counts = LaneHandoffCounts::Now();
     from_lane_0.RecordExecution(LaneCrossingCategory::kRpcHandler);
     uncounted.RecordExecution(LaneCrossingCategory::kRpcHandler);
@@ -489,6 +499,17 @@ TEST_F(LanesTest, HandoffCounting) {
     delta = LaneHandoffCounts::Now() - counts;
     ASSERT_EQ(delta.crossing(LaneCrossingCategory::kReactor), 1) << delta.ToString();
     ASSERT_EQ(delta.total_crossings(), 3);
+
+    // Every count above went to the slot of this thread's lane, the executor's for the pool-style
+    // handoffs and the submitter's for the reactor one, which went into lane 1.
+    for (auto category : LaneCrossingCategoryList()) {
+      ASSERT_EQ(LaneCrossingCountOfLane(category, 0) - lane_0_before.crossing(category),
+                delta.crossing(category)) << category;
+      ASSERT_EQ(LaneCrossingCountOfLane(category, 1), lane_1_before.crossing(category))
+          << category;
+    }
+    ASSERT_EQ(LaneEntriesFromUnlanedCountOfLane(0) - lane_0_before.entries_from_unlaned, 1);
+    ASSERT_EQ(LaneEntriesFromUnlanedCountOfLane(1), lane_1_before.entries_from_unlaned);
   });
 
   // An unlaned submitter counts nothing into a reactor.
@@ -523,6 +544,12 @@ TEST_F(LanesTest, LaneShardedCounters) {
   ASSERT_EQ(counters->Sum(0), 3);
   ASSERT_EQ(counters->Sum(1), 1);
   ASSERT_EQ(counters->Sum(2), 0);
+  ASSERT_EQ(counters->SlotValue(0, 0), 1);
+  ASSERT_EQ(counters->SlotValue(1, 0), 0);
+  ASSERT_EQ(counters->SlotValue(kMaxLanes - 1, 0), 1);
+  ASSERT_EQ(counters->SlotValue(kNoLane, 0), 1);
+  ASSERT_EQ(counters->SlotValue(kNoLane, 1), 1);
+  ASSERT_EQ(counters->SlotValue(0, 2), 0);
 }
 
 // LaneSharded is sized by the lane count given to Allocate, gives every lane its own cache line,

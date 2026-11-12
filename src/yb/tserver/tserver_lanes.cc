@@ -13,7 +13,10 @@
 
 #include "yb/tserver/tserver_lanes.h"
 
+#include <mutex>
+
 #include "yb/gutil/bind.h"
+#include "yb/gutil/thread_annotations.h"
 
 #include "yb/rpc/connection_context.h"
 #include "yb/rpc/messenger.h"
@@ -156,19 +159,40 @@ Result<LaneTopology> ComputeTserverLaneTopology(std::string* description) {
   return topology;
 }
 
+namespace {
+
+std::mutex topology_summary_mutex;
+TserverLaneTopologySummary topology_summary GUARDED_BY(topology_summary_mutex);
+
+void SetTopologySummary(bool active, std::string description) {
+  std::lock_guard lock(topology_summary_mutex);
+  topology_summary = {.active = active, .description = std::move(description)};
+}
+
+} // namespace
+
 void InitTserverLaneTopology() {
   if (FLAGS_tserver_lanes == 1) {
+    SetTopologySummary(false, "lanes disabled (tserver_lanes=1)");
     return;
   }
   std::string description;
   auto topology = ComputeTserverLaneTopology(&description);
   if (!topology.ok()) {
-    LOG(WARNING) << "CPU topology discovery failed, running with lanes off: "
-                 << topology.status();
+    auto message = Format(
+        "CPU topology discovery failed, running with lanes off: $0", topology.status());
+    LOG(WARNING) << message;
+    SetTopologySummary(false, std::move(message));
     return;
   }
   LOG(INFO) << "Lane topology: " << description;
   SetLaneTopology(*topology);
+  SetTopologySummary(topology->active(), std::move(description));
+}
+
+TserverLaneTopologySummary GetTserverLaneTopologySummary() {
+  std::lock_guard lock(topology_summary_mutex);
+  return topology_summary;
 }
 
 void SetupTserverLaneMessenger(rpc::MessengerBuilder* builder) {

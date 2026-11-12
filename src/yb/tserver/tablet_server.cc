@@ -3197,6 +3197,13 @@ Result<std::string> TabletServer::GetUniverseUuid() const {
   return fs_manager_->GetUniverseUuidFromTserverInstanceMetadata();
 }
 
+void TabletServer::VisitPgClientService(
+    const std::function<void(const PgClientServiceImpl&)>& f) {
+  if (auto holder = pg_client_service_.lock()) {
+    f(holder->impl);
+  }
+}
+
 PgClientServiceImpl* TabletServer::TEST_GetPgClientService() {
   auto holder = pg_client_service_.lock();
   return holder ? &holder->impl : nullptr;

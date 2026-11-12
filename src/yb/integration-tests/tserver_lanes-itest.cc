@@ -38,6 +38,7 @@
 #include "yb/integration-tests/external_mini_cluster.h"
 #include "yb/integration-tests/external_mini_cluster-itest-base.h"
 #include "yb/integration-tests/mini_cluster.h"
+#include "yb/integration-tests/path_handlers_util.h"
 #include "yb/integration-tests/tablet-split-itest-base.h"
 #include "yb/integration-tests/test_workload.h"
 
@@ -59,6 +60,7 @@
 #include "yb/util/countdown_latch.h"
 #include "yb/util/cpu_topology.h"
 #include "yb/util/cpu_topology_test_util.h"
+#include "yb/util/json_document.h"
 #include "yb/util/lanes.h"
 #include "yb/util/lanes_test_util.h"
 #include "yb/util/metrics.h"
@@ -439,6 +441,180 @@ TEST_F(TserverLanesITest, CallbackInIssuingLaneAfterSharedLookup) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_lookup_cache_refresh_secs) = 0;
 }
 
+namespace {
+
+Result<std::set<std::string>> JsonKeys(const JsonValue& value) {
+  std::set<std::string> result;
+  for (const auto& [key, _] : VERIFY_RESULT(value.GetObject())) {
+    result.emplace(key);
+  }
+  return result;
+}
+
+const std::map<LaneCrossingCategory, std::string> kCrossingCategoryKeys = {
+    {LaneCrossingCategory::kReactor, "reactor"},
+    {LaneCrossingCategory::kRpcHandler, "rpc_handler"},
+    {LaneCrossingCategory::kTabletPipeline, "tablet_pipeline"},
+    {LaneCrossingCategory::kCallback, "callback"},
+    {LaneCrossingCategory::kOther, "other"},
+};
+
+const std::set<std::string> kCrossingKeys = {
+    "reactor", "rpc_handler", "tablet_pipeline", "callback", "other", "entries_from_unlaned"};
+
+const std::set<std::string> kLaneRowKeys = {
+    "tablet_replicas", "tablet_leaders", "pg_sessions", "reactors", "client_connections",
+    "server_connections", "handler_threads", "pipeline_threads", "exchange_threads",
+    "queued_calls"};
+
+} // namespace
+
+// The /lanes page and /api/v1/lanes show the topology the server installed and, per lane, the
+// tablets it hosts and leads, its reactors and live threads, and the crossing and preamble
+// counters, without creating pools.
+TEST_F(TserverLanesITest, LanesPage) {
+  SetNumTablets(8);
+  CreateTable();
+  ASSERT_OK(WaitAllReplicasReady(cluster_.get(), table_->id(), 30s * kTimeMultiplier));
+  ASSERT_OK(WriteRows(&table_, 100, 1));
+  ASSERT_OK(WaitReplicated());
+  const auto& topology = GetLaneTopology();
+  auto* ts = cluster_->mini_tablet_server(0);
+  auto* messenger = ts->server()->messenger();
+  const auto url = Format("http://$0", ts->bound_http_addr());
+  std::vector<size_t> tagged_pools;
+  for (LaneId lane = 0; lane != 4; ++lane) {
+    tagged_pools.push_back(messenger->TEST_ActiveTaggedPools(lane));
+  }
+
+  // Tablet counts as the tablet manager reports them; leadership can move while the page is read,
+  // so both are read until they agree.
+  using LaneCounts = std::vector<std::pair<int64_t, int64_t>>;
+  auto expected_counts = [ts] {
+    LaneCounts result(4);
+    for (const auto& peer : ts->server()->tablet_manager()->GetTabletPeers()) {
+      auto& counts = result[LaneOf(peer->tablet_id())];
+      ++counts.first;
+      counts.second += peer->IsLeaderAndReady();
+    }
+    return result;
+  };
+  std::string json;
+  LaneCounts page_counts;
+  LaneHandoffCounts crossings_before;
+  LaneHandoffCounts crossings_after;
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    const auto expected = expected_counts();
+    crossings_before = LaneHandoffCounts::Now();
+    faststring body;
+    RETURN_NOT_OK(integration_tests::path_handlers_util::GetUrl(url + "/api/v1/lanes", &body));
+    crossings_after = LaneHandoffCounts::Now();
+    json = body.ToString();
+    JsonDocument doc;
+    auto root = VERIFY_RESULT(doc.Parse(json));
+    page_counts.clear();
+    for (const auto& lane : VERIFY_RESULT(root["lanes"].GetArray())) {
+      page_counts.emplace_back(
+          VERIFY_RESULT(lane["tablet_replicas"].GetInt64()),
+          VERIFY_RESULT(lane["tablet_leaders"].GetInt64()));
+    }
+    return page_counts == expected && expected == expected_counts();
+  }, 30s * kTimeMultiplier, "Page tablet counts match the tablet manager"));
+  LOG(INFO) << "/api/v1/lanes: " << json;
+
+  JsonDocument doc;
+  auto root = ASSERT_RESULT(doc.Parse(json));
+  ASSERT_EQ(ASSERT_RESULT(JsonKeys(root)), (std::set<std::string>{
+      "lanes_active", "topology", "num_lanes", "cpu_affinity", "service_cpus", "process_cpus",
+      "domains", "lanes", "unlaned", "crossings", "service_queue_lanes_over_share", "preamble"}));
+  ASSERT_TRUE(ASSERT_RESULT(root["lanes_active"].GetBool()));
+  ASSERT_TRUE(ASSERT_RESULT(root["topology"].GetString()).starts_with(
+      "lanes active (tserver_lanes=4), 2 CPU domain(s) from "))
+      << ASSERT_RESULT(root["topology"].GetString());
+  ASSERT_EQ(ASSERT_RESULT(root["num_lanes"].GetUint64()), 4);
+  ASSERT_TRUE(ASSERT_RESULT(root["cpu_affinity"].GetBool()));
+  ASSERT_EQ(ASSERT_RESULT(root["service_cpus"].GetString()), topology.service_mask().ToString());
+  ASSERT_EQ(ASSERT_RESULT(root["process_cpus"].GetString()), "0-3");
+  std::vector<std::string> domains;
+  for (const auto& domain : ASSERT_RESULT(root["domains"].GetArray())) {
+    domains.push_back(ASSERT_RESULT(domain.GetString()));
+  }
+  ASSERT_EQ(domains, (std::vector<std::string>{"0-1", "2-3"}));
+
+  auto lanes = ASSERT_RESULT(root["lanes"].GetArray());
+  ASSERT_EQ(lanes.size(), 4);
+  auto lane_keys = kLaneRowKeys;
+  lane_keys.insert({"lane", "cpus", "crossings_counted"});
+  std::array<uint64_t, kLaneCrossingCategoryMapSize> lane_crossing_sums = {};
+  int64_t replicas = 0;
+  for (LaneId lane = 0; lane != 4; ++lane) {
+    SCOPED_TRACE(Format("lane $0", lane));
+    auto row = lanes[lane];
+    ASSERT_EQ(ASSERT_RESULT(JsonKeys(row)), lane_keys);
+    ASSERT_EQ(ASSERT_RESULT(row["lane"].GetUint64()), lane);
+    ASSERT_EQ(ASSERT_RESULT(row["cpus"].GetString()), topology.lane_mask(lane).ToString());
+    replicas += page_counts[lane].first;
+    ASSERT_EQ(ASSERT_RESULT(row["reactors"].GetUint64()), messenger->ReactorsOfLane(lane).size());
+    ASSERT_GT(ASSERT_RESULT(row["reactors"].GetUint64()), 0);
+    // Each of the lane's five pipeline pools keeps one persistent worker.
+    ASSERT_GE(ASSERT_RESULT(row["pipeline_threads"].GetUint64()), 5);
+    ASSERT_EQ(ASSERT_RESULT(row["pg_sessions"].GetUint64()), 0);
+    ASSERT_EQ(ASSERT_RESULT(row["exchange_threads"].GetUint64()), 0);
+    auto counted = row["crossings_counted"];
+    ASSERT_EQ(ASSERT_RESULT(JsonKeys(counted)), kCrossingKeys);
+    for (auto category : LaneCrossingCategoryList()) {
+      lane_crossing_sums[static_cast<size_t>(category)] +=
+          ASSERT_RESULT(counted[kCrossingCategoryKeys.at(category)].GetUint64());
+    }
+  }
+  ASSERT_EQ(replicas, ts->server()->tablet_manager()->GetTabletPeers().size());
+  // Raft replicates on lane-keyed connections, owned and served by lane reactors and handled by
+  // lane handler pools.
+  uint64_t lane_client_connections = 0;
+  uint64_t lane_server_connections = 0;
+  uint64_t lane_handler_threads = 0;
+  for (const auto& row : lanes) {
+    lane_client_connections += ASSERT_RESULT(row["client_connections"].GetUint64());
+    lane_server_connections += ASSERT_RESULT(row["server_connections"].GetUint64());
+    lane_handler_threads += ASSERT_RESULT(row["handler_threads"].GetUint64());
+  }
+  ASSERT_GT(lane_client_connections, 0);
+  ASSERT_GT(lane_server_connections, 0);
+  ASSERT_GT(lane_handler_threads, 0);
+
+  auto unlaned = root["unlaned"];
+  ASSERT_EQ(ASSERT_RESULT(JsonKeys(unlaned)), kLaneRowKeys);
+  ASSERT_EQ(ASSERT_RESULT(unlaned["tablet_replicas"].GetUint64()), 0);
+  ASSERT_EQ(ASSERT_RESULT(unlaned["reactors"].GetUint64()), 0);
+  ASSERT_GE(ASSERT_RESULT(unlaned["pipeline_threads"].GetUint64()), 5);
+
+  auto crossings = root["crossings"];
+  ASSERT_EQ(ASSERT_RESULT(JsonKeys(crossings)), kCrossingKeys);
+  for (auto category : LaneCrossingCategoryList()) {
+    SCOPED_TRACE(AsString(category));
+    const auto total = ASSERT_RESULT(crossings[kCrossingCategoryKeys.at(category)].GetUint64());
+    ASSERT_GE(total, crossings_before.crossing(category));
+    ASSERT_LE(total, crossings_after.crossing(category));
+    ASSERT_LE(lane_crossing_sums[static_cast<size_t>(category)], total);
+  }
+  ASSERT_EQ(ASSERT_RESULT(JsonKeys(root["preamble"])),
+            (std::set<std::string>{"bound", "absent", "peek_timeouts", "stripped_late"}));
+  ASSERT_GT(ASSERT_RESULT(root["preamble"]["bound"].GetInt64()), 0);
+
+  for (LaneId lane = 0; lane != 4; ++lane) {
+    ASSERT_EQ(messenger->TEST_ActiveTaggedPools(lane), tagged_pools[lane]);
+  }
+
+  faststring html;
+  ASSERT_OK(integration_tests::path_handlers_util::GetUrl(url + "/lanes", &html));
+  for (const auto* text : {
+           "<h2>CPU lanes</h2>", "Lane mode is active: lanes active (tserver_lanes=4)",
+           "<h3>Topology</h3>", "<h3>Lanes</h3>", "<h3>Lane crossings</h3>",
+           "<h3>Lane preamble</h3>", "<td>rpc_lane_preamble_bound</td>"}) {
+    ASSERT_STR_CONTAINS(html.ToString(), text);
+  }
+}
+
 // Split children and a remote-bootstrapped replica run in the lanes of their own tablet ids.
 TEST_F(TserverLanesITest, SplitChildrenAndRemoteBootstrapUseTheirLanes) {
   const auto parent_id = ASSERT_RESULT(CreateSingleTabletAndSplit(kDefaultNumRows));
@@ -523,6 +699,100 @@ TEST_F(TserverMixedLanesITest, WritesAndReadsWithMixedLaneCounts) {
   for (size_t i = 1; i != 3; ++i) {
     ASSERT_GT(ASSERT_RESULT(preamble_counter(i, METRIC_rpc_lane_preamble_bound)), 0);
   }
+}
+
+// Promoting and demoting the lane preamble AutoFlag at runtime in a universe whose tablet server 0
+// runs with lanes off. Every process starts with the flag explicitly off, which AutoFlag promotion
+// at universe creation leaves alone. The flag is read when a connection is created, so after each
+// flip the test restarts tablet servers 0 and 1 to make the others open new connections to them.
+// Tablet server 1's inbound lane-keyed connections then come only from tablet server 2 (tablet
+// server 0 keys none by lane), so its bound count shows tablet server 2's runtime value; tablet
+// server 0's late strips show what tablet servers 1 and 2 send.
+TEST_F(TserverMixedLanesITest, PreamblePromoteAndDemote) {
+  ASSERT_NO_FATALS(StartCluster(
+      {"--tserver_lanes=4", "--enable_rpc_lane_preamble=false"},
+      {"--enable_rpc_lane_preamble=false"}));
+  auto* ts0 = cluster_->tablet_server(0);
+  auto* ts1 = cluster_->tablet_server(1);
+  ts0->Shutdown();
+  ts0->mutable_flags()->push_back("--tserver_lanes=1");
+  ASSERT_OK(ts0->Restart());
+  ASSERT_OK(cluster_->WaitForTabletServerCount(3, 30s * kTimeMultiplier));
+  for (size_t i = 0; i != 3; ++i) {
+    ASSERT_EQ(ASSERT_RESULT(cluster_->GetFlag(cluster_->tablet_server(i), "tserver_lanes")),
+              i == 0 ? "1" : "4");
+  }
+
+  int64_t rows_inserted = 0;
+  client::YBTableName table_name;
+  auto run_workload = [this, &rows_inserted, &table_name] {
+    TestYcqlWorkload workload(cluster_.get());
+    workload.set_num_tablets(6);
+    workload.set_num_write_threads(2);
+    workload.Setup();
+    workload.Start();
+    workload.WaitInserted(200);
+    workload.StopAndJoin();
+    rows_inserted += workload.rows_inserted();
+    table_name = workload.table_name();
+  };
+  auto counter = [this](size_t ts_idx, const CounterPrototype& prototype) {
+    return cluster_->tablet_server(ts_idx)->GetMetric<int64>(
+        &METRIC_ENTITY_server, "yb.tabletserver", &prototype, "value");
+  };
+  auto restart = [this](ExternalTabletServer* ts) -> Status {
+    ts->Shutdown();
+    RETURN_NOT_OK(ts->Restart());
+    return cluster_->WaitForTabletServerCount(3, 30s * kTimeMultiplier);
+  };
+  auto set_flag = [this](const std::string& value) -> Status {
+    RETURN_NOT_OK(cluster_->SetFlagOnMasters("enable_rpc_lane_preamble", value));
+    return cluster_->SetFlagOnTServers("enable_rpc_lane_preamble", value);
+  };
+
+  // Flag off: no preamble anywhere. The laned servers' acceptors instantiate their counters; the
+  // lanes=1 server has nothing to strip, so it instantiates none.
+  ASSERT_NO_FATALS(run_workload());
+  for (size_t i = 1; i != 3; ++i) {
+    ASSERT_EQ(ASSERT_RESULT(counter(i, METRIC_rpc_lane_preamble_bound)), 0);
+    ASSERT_GT(ASSERT_RESULT(counter(i, METRIC_rpc_lane_preamble_absent)), 0);
+  }
+  ASSERT_NOK(counter(0, METRIC_rpc_lane_preamble_stripped_late));
+
+  // Promote at runtime; existing connections stay unbound, so nothing moves until the restarts.
+  ASSERT_OK(set_flag("true"));
+  ASSERT_NO_FATALS(run_workload());
+  for (size_t i = 1; i != 3; ++i) {
+    ASSERT_EQ(ASSERT_RESULT(counter(i, METRIC_rpc_lane_preamble_bound)), 0);
+  }
+  ASSERT_NOK(counter(0, METRIC_rpc_lane_preamble_stripped_late));
+  // Tablet server 1 restarts with the flag off on its command line, then gets it at runtime.
+  ASSERT_OK(restart(ts1));
+  ASSERT_OK(cluster_->SetFlag(ts1, "enable_rpc_lane_preamble", "true"));
+  ASSERT_OK(restart(ts0));
+  ASSERT_NO_FATALS(run_workload());
+  ASSERT_GT(ASSERT_RESULT(counter(1, METRIC_rpc_lane_preamble_bound)), 0);
+  const auto stripped_promoted = ASSERT_RESULT(counter(0, METRIC_rpc_lane_preamble_stripped_late));
+  ASSERT_GT(stripped_promoted, 0);
+  const auto bound2_promoted = ASSERT_RESULT(counter(2, METRIC_rpc_lane_preamble_bound));
+
+  // Demote at runtime: existing connections, bound or not, keep working and new ones carry no
+  // preamble.
+  ASSERT_OK(set_flag("false"));
+  ASSERT_NO_FATALS(run_workload());
+  ASSERT_EQ(ASSERT_RESULT(counter(0, METRIC_rpc_lane_preamble_stripped_late)), stripped_promoted);
+  ASSERT_EQ(ASSERT_RESULT(counter(2, METRIC_rpc_lane_preamble_bound)), bound2_promoted);
+  ASSERT_OK(restart(ts1));
+  ASSERT_OK(restart(ts0));
+  ASSERT_NO_FATALS(run_workload());
+  ASSERT_EQ(ASSERT_RESULT(counter(1, METRIC_rpc_lane_preamble_bound)), 0);
+  ASSERT_GT(ASSERT_RESULT(counter(1, METRIC_rpc_lane_preamble_absent)), 0);
+  ASSERT_NOK(counter(0, METRIC_rpc_lane_preamble_stripped_late));
+  ASSERT_EQ(ASSERT_RESULT(counter(2, METRIC_rpc_lane_preamble_bound)), bound2_promoted);
+
+  ClusterVerifier verifier(cluster_.get());
+  ASSERT_NO_FATALS(verifier.CheckCluster());
+  ASSERT_NO_FATALS(verifier.CheckRowCount(table_name, ClusterVerifier::AT_LEAST, rows_inserted));
 }
 
 } // namespace yb

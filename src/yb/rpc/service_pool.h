@@ -98,11 +98,14 @@ class ServicePool : public RpcService {
   // Calls counted as queued (for a laned pool, the sum over its lanes).
   int64_t QueuedCalls() const;
 
-  // Per-lane counts of a laned pool, the spare slot last; empty for an unlaned pool.
-  std::vector<int64_t> TEST_LaneQueuedCalls() const;
+  // Per-lane queued-call counts of a laned pool, the spare slot (calls without a lane) last; empty
+  // for an unlaned pool. Relaxed reads of the slots, for display.
+  std::vector<int64_t> LaneQueuedCalls() const;
+  // Number of lane slots of a laned pool currently above their share of the queue limit; 0 for an
+  // unlaned pool.
+  int64_t LanesOverShare() const;
   // The count an unlaned pool uses; stays 0 in a laned pool.
   int64_t TEST_SharedQueuedCalls() const;
-  int64_t TEST_LanesOverShare() const;
   // Admission and release as for a call of lane, without a call.
   std::optional<int64_t> TEST_CallQueued(LaneId lane);
   void TEST_CallDequeued(LaneId lane);

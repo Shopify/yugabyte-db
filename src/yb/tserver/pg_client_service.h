@@ -185,6 +185,17 @@ class PgClientServiceImpl : public PgClientServiceIf {
   // Number of live sessions in each lane of the server's messenger; empty unless it is laned.
   std::vector<size_t> SessionsPerLane() const;
 
+  struct LaneCounts {
+    // As SessionsPerLane.
+    std::vector<size_t> sessions;
+    // Live workers of each lane's shared memory exchange pool; empty unless the messenger is laned
+    // and a shared memory session has created the pools.
+    std::vector<size_t> exchange_workers;
+  };
+
+  // For status pages: reads counters and pool sizes only.
+  LaneCounts GetLaneCounts() const;
+
   // Lane of the session of the backend with the given pid: kNoLane unless the messenger is laned,
   // nullopt if no session belongs to that pid.
   std::optional<LaneId> TEST_SessionLane(pid_t pid);

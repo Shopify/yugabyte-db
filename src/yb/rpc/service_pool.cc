@@ -243,7 +243,7 @@ class ServicePoolImpl final : public InboundCallHandler {
     return result;
   }
 
-  std::vector<int64_t> TEST_LaneQueuedCalls() const {
+  std::vector<int64_t> LaneQueuedCalls() const {
     std::vector<int64_t> result;
     for (size_t i = 0; num_lanes_ && i <= num_lanes_; ++i) {
       result.push_back(lane_queues_[i].queued.load(std::memory_order_relaxed));
@@ -255,7 +255,7 @@ class ServicePoolImpl final : public InboundCallHandler {
     return queued_calls_.load(std::memory_order_relaxed);
   }
 
-  int64_t TEST_LanesOverShare() const {
+  int64_t LanesOverShare() const {
     return lanes_over_share_.load(std::memory_order_relaxed);
   }
 
@@ -655,16 +655,16 @@ int64_t ServicePool::QueuedCalls() const {
   return impl_->QueuedCalls();
 }
 
-std::vector<int64_t> ServicePool::TEST_LaneQueuedCalls() const {
-  return impl_->TEST_LaneQueuedCalls();
+std::vector<int64_t> ServicePool::LaneQueuedCalls() const {
+  return impl_->LaneQueuedCalls();
 }
 
 int64_t ServicePool::TEST_SharedQueuedCalls() const {
   return impl_->TEST_SharedQueuedCalls();
 }
 
-int64_t ServicePool::TEST_LanesOverShare() const {
-  return impl_->TEST_LanesOverShare();
+int64_t ServicePool::LanesOverShare() const {
+  return impl_->LanesOverShare();
 }
 
 std::optional<int64_t> ServicePool::TEST_CallQueued(LaneId lane) {

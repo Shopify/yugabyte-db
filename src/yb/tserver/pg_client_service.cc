@@ -960,6 +960,7 @@ class PgClientServiceImpl::Impl : public SessionProvider, public SessionRegistry
         .worker_name_prefix = lane_name + "_shmem",
       }));
     }
+    exchange_thread_pools_created_.store(true, std::memory_order_release);
   }
 
   YBThreadPool& ExchangeThreadPool(LaneId lane) {
@@ -3117,6 +3118,17 @@ class PgClientServiceImpl::Impl : public SessionProvider, public SessionRegistry
     return result;
   }
 
+  PgClientServiceImpl::LaneCounts GetLaneCounts() const {
+    PgClientServiceImpl::LaneCounts result{.sessions = SessionsPerLane(), .exchange_workers = {}};
+    if (exchange_thread_pools_created_.load(std::memory_order_acquire)) {
+      result.exchange_workers.reserve(exchange_thread_pools_.size());
+      for (const auto& pool : exchange_thread_pools_) {
+        result.exchange_workers.push_back(pool->NumWorkers());
+      }
+    }
+    return result;
+  }
+
   void TEST_SetMockService(PgClientServiceMockImpl* mock) {
     session_context_.TEST_mock_service = mock;
   }
@@ -3273,6 +3285,8 @@ class PgClientServiceImpl::Impl : public SessionProvider, public SessionRegistry
   const std::string instance_id_;
   std::once_flag exchange_thread_pools_once_flag_;
   std::vector<std::unique_ptr<YBThreadPool>> exchange_thread_pools_;
+  // Set once the lane exchange pools exist, for readers outside the call_once that creates them.
+  std::atomic<bool> exchange_thread_pools_created_{false};
 
   // Live sessions per lane, empty unless the messenger is laned. Written at session creation and
   // expiry only.
@@ -3357,6 +3371,10 @@ std::optional<LaneId> PgClientServiceImpl::TEST_SessionLane(pid_t pid) {
 
 std::vector<size_t> PgClientServiceImpl::SessionsPerLane() const {
   return impl_->SessionsPerLane();
+}
+
+PgClientServiceImpl::LaneCounts PgClientServiceImpl::GetLaneCounts() const {
+  return impl_->GetLaneCounts();
 }
 
 void PgClientServiceImpl::TEST_SetMockService(PgClientServiceMockImpl* mock) {

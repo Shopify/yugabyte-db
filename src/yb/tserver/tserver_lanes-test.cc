@@ -171,6 +171,9 @@ TEST_F(TserverLanesTest, OneLaneSkipsDiscovery) {
   ASSERT_EQ(GetLaneTopology(), LaneTopology());
   ASSERT_EQ(CountContaining(sink, "Lane topology"), 0);
   ASSERT_EQ(CountContaining(sink, "lanes"), 0);
+  auto summary = GetTserverLaneTopologySummary();
+  ASSERT_FALSE(summary.active);
+  ASSERT_EQ(summary.description, "lanes disabled (tserver_lanes=1)");
 
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_lanes) = 0;
   ASSERT_NOK(ComputeTserverLaneTopology());
@@ -214,6 +217,10 @@ TEST_F(TserverLanesTest, RepeatInitWithEqualTopologyIsNoOp) {
   ASSERT_EQ(&GetLaneTopology(), installed);
   ASSERT_EQ(CountContaining(sink, "already set"), 0);
   ASSERT_EQ(CountContaining(sink, "Lane topology: lanes active"), 1);
+  auto summary = GetTserverLaneTopologySummary();
+  ASSERT_TRUE(summary.active);
+  ASSERT_TRUE(summary.description.starts_with("lanes active (tserver_lanes=0), 2 CPU domain(s)"))
+      << summary.description;
 }
 
 // Discovery errors never fail startup: the tserver runs with lanes off.
@@ -230,6 +237,10 @@ TEST_F(TserverLanesTest, DiscoveryErrorRunsInactive) {
   InitTserverLaneTopology();
   ASSERT_EQ(GetLaneTopology(), LaneTopology());
   ASSERT_EQ(CountContaining(sink, "CPU topology discovery failed, running with lanes off"), 1);
+  auto summary = GetTserverLaneTopologySummary();
+  ASSERT_FALSE(summary.active);
+  ASSERT_TRUE(summary.description.starts_with(
+      "CPU topology discovery failed, running with lanes off: ")) << summary.description;
 }
 
 // A tablet server restarted in the same process runs Init again, possibly on a thread already

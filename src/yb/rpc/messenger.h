@@ -379,6 +379,15 @@ class Messenger : public ProxyContext {
   rpc::ThreadPoolPtr HandlerThreadPool(
       ServicePriority priority, ThreadPoolTag tag, LaneId lane);
 
+  // Calls f on each existing handler pool of lane, reduced modulo num_lanes(), or on the unlaned
+  // pools for kNoLane or in an unlaned messenger: the normal and tagged pools, and the
+  // high-priority pool if it was created. Unlike ThreadPool and TaggedThreadPool it never creates a
+  // pool, so readers such as status pages change nothing.
+  void ForEachHandlerPool(LaneId lane, const std::function<void(const rpc::ThreadPool&)>& f);
+
+  // Calls f on each registered service, unless services are being shut down.
+  void ForEachService(const std::function<void(const RpcService&)>& f) const;
+
   // Number of tagged pools of lane (unlaned for kNoLane), including the normal pool.
   size_t TEST_ActiveTaggedPools(LaneId lane = kNoLane);
 
