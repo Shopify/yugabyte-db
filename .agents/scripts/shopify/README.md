@@ -8,8 +8,9 @@ are no additional Python dependencies.
 Run commands from the repository root. Configure the private tracker through
 `SHOPIFY_YB_PRIVATE_REPO` or `--private-repo owner/repo` before the subcommand.
 The tracker must be private and have the `Yugabyte Contrib` label. Public creation
-is fixed to `Shopify/yugabyte-db`; existing issues in `yugabyte/yugabyte-db` can be
-linked but this tool never creates them.
+is fixed to `Shopify/yugabyte-db`; this tool never creates issues in
+`yugabyte/yugabyte-db`. An upstream issue created outside the tool is recorded with
+`link`.
 
 ## Inputs
 
@@ -66,6 +67,14 @@ it is never sent to the public repository. An empty list is valid when the sourc
 has no such terms. Each supplied term must have at least three characters. The
 public title gets its component prefix from the selected template.
 
+The description may end with a `## Shopify context` section for public-safe Shopify
+context: why it matters to Shopify, fork PR links, release targets needed, and a
+fork-side workaround. It must be the last section of the description with exactly
+that heading and no `###` sub-headings inside it, because the upstream copy of the
+issue omits it along with the tool's publication marker. The renderer places the description under `### Description` and
+appends the form's remaining `###` sections after it, so the section ends at the
+next `###` heading. Disclosure checks cover it like the rest of the description.
+
 | Template | Issue Type field | Additional fields |
 |---|---|---|
 | `docDB`, `ysql`, `ycql` | Required | None |
@@ -91,7 +100,7 @@ python3 .agents/scripts/shopify/issues.py publish \
 # Local rendering/checks only; does not verify source freshness or contact GitHub.
 python3 .agents/scripts/shopify/issues.py validate --draft <workspace>/public.json
 
-# Link an existing public issue; no public write.
+# Record an existing public issue, fork or upstream; no public write.
 python3 .agents/scripts/shopify/issues.py link \
   --issue <private-issue-url> --public-issue <public-issue-url>
 
