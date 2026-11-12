@@ -13,11 +13,11 @@ tablet pipelines, and laned PG sessions. With lanes on, the tserver messenger ru
 reactors and handler pools per lane, and an inbound call is handled in the lane of the reactor that
 read it. Each tablet's Raft, log, preparer, leader-side apply and service-strand work and its
 RocksDB background jobs run in its lane, and consensus peers send their RPCs with the tablet's lane
-hint. Each PG session runs in a lane, and the tserver's embedded client sends its tablet RPCs with
-the tablet's lane hint and calls back in the lane that issued them. Inbound connections are not yet
-bound to lanes: an inbound write crosses into the tablet's lane once, at the preparer, and a
-follower prepares and applies follower-side operations inline in its `UpdateConsensus` handler, in
-the lane of the reactor that read the call.
+hint. Each PG session has a lane, in which a shared-memory session's operations run, and clients
+built on the server messenger send their tablet RPCs with the tablet's lane hint and call back in
+the lane that issued them. Inbound connections are not yet bound to lanes: an inbound write crosses
+into the tablet's lane once, at the preparer, and a follower prepares and applies follower-side
+operations inline in its `UpdateConsensus` handler, in the lane of the reactor that read the call.
 
 ## Definitions
 
@@ -317,8 +317,10 @@ costs locality only.
 **Session lane.** `PgClientServiceImpl` gives each PG session a lane in the `Heartbeat` call that
 creates it: `session_id % L` of the server messenger, which is round-robin since session ids are
 sequential, or `kNoLane` when the messenger is unlaned (lanes off, and the PgClientService of a
-master). The lane says where the session's tserver-side work runs; backends float. The service
-counts live sessions per lane (`PgClientServiceImpl::SessionsPerLane`) when a session is
+master). For a shared-memory session the lane says where its operations run: their exchange, client
+work and completions (see below for the exceptions). A TCP session's calls run in the lane that
+handled them, so its lane governs only its deferred processing and its count. Backends float. The
+service counts live sessions per lane (`PgClientServiceImpl::SessionsPerLane`) when a session is
 registered and when it expires, never per operation.
 
 **Exchange pools.** A shared-memory session's exchange is a long-running task, one worker per
@@ -333,47 +335,60 @@ counted as `other` when that handler is in another lane.
 
 **TCP calls.** PgClientService calls that arrive over TCP (`Perform` without shared memory,
 `Heartbeat`, `OpenTable`, ...) carry no lane: they are handled in the lane of the reactor that read
-them, like any inbound call, and the client work they start runs there.
+them, like any inbound call, and the client work they start, with its completions, runs there.
 
-**Follow-up work.** A session's deferred processing of pending requests, which runs when its lock
-is released on another thread and so can run per operation, goes to the normal handler pool of the
+**Follow-up work.** A session's deferred processing of pending requests, which runs when its lock is
+released on another thread and so can run per operation, goes to the normal handler pool of the
 session's lane (`Messenger::ThreadPool(kNormal, lane)`). The drain of an expired session and the
-table cache's loads stay on the unlaned pool.
+table cache's loads stay on the unlaned pool. A `Perform` that has to wait for a table-cache load (a
+table the backend uses before the service has loaded it, such as after DDL invalidates the cache)
+continues on that unlaned pool, so that operation's tablet RPCs are issued, and call back, in the
+service set. This happens once per table load, not per operation; a backend usually loads the table
+through `OpenTable` first, in which case its operations find it cached.
 
-**Hints.** The tablet server's embedded `YBClient` is built on the server messenger. When that
-messenger is laned, `TabletInvoker::Execute` sets `LaneOf(tablet_id)` (with the messenger's `L`) as
-the hint right before every send, since `RpcController::Reset()` before a retry clears it, and
-recomputes it when the invoker's tablet changes. It sets none for the master's sys catalog tablet:
-YSQL catalog reads are tablet RPCs to the master, and lane hints are for tablet servers of this
-universe. Masters build their clients on unlaned messengers and never hint, and so do clients of
-other universes, which build their own messengers: xCluster's `XClusterRemoteClientHolder`
-(`xcluster-remote`) and external clients. The hint covers every RPC the server client sends
-through `TabletInvoker`, all to tablets of this universe: PG sessions' reads and writes,
-`WaitForAsyncWriteRpc`, transaction status and participant RPCs (`TransactionRpc`), CDC
-`GetChanges` calls the CDC service proxies to a tablet leader, and the xCluster consumer's writes
-and schema-version lookups on its local tablets (`XClusterWriteRpc`,
+**Hints.** Two clients of a tablet server are built on the server messenger: the embedded `YBClient`
+(the server client) and the metrics snapshotter's (`--tserver_enable_metrics_snapshotter`, which
+writes the metrics table). The auto-flags manager also builds short-lived clients on it, but they
+only call the master. When that messenger is laned, `TabletInvoker::Execute` sets
+`LaneOf(tablet_id)` (with the messenger's `L`) as the hint right before every send, since
+`RpcController::Reset()` before a retry clears it, and recomputes it when the invoker's tablet
+changes. It sets none for the master's sys catalog tablet: YSQL catalog reads are tablet RPCs to the
+master, and lane hints are for tablet servers of this universe. Masters build their clients on
+unlaned messengers and never hint, and so do clients of other universes, which build their own
+messengers: xCluster's `XClusterRemoteClientHolder` (`xcluster-remote`) and external clients. The
+hint covers every RPC the server client sends through `TabletInvoker`, all to tablets of this
+universe: PG sessions' reads and writes, `WaitForAsyncWriteRpc`, transaction status and participant
+RPCs (`TransactionRpc`), CDC `GetChanges` calls the CDC service proxies to a tablet leader, and the
+xCluster consumer's writes and schema-version lookups on its local tablets (`XClusterWriteRpc`,
 `GetCompatibleSchemaVersionRpc`); the consumer's `GetChanges` to the source universe goes through
-the remote client. Calls that bypass `TabletInvoker` carry no hint: master RPCs (lookups, DDL) by
-design, and calls through a `RemoteTabletServer`'s proxy, such as the PgClientService fan-out to
-every tablet server (tablet and transaction status, lock status, cancellation,
-`yb_servers_metrics`, remote exec, snapshot import), which is not per-operation. From a lane
-thread they reach another lane's reactor `(L-1)/L` of the time.
+the remote client. The metrics snapshotter's writes are hinted the same way. Calls that bypass
+`TabletInvoker` carry no hint: master RPCs (lookups, DDL) by design, and calls through a
+`RemoteTabletServer`'s proxy, such as the PgClientService fan-out to every tablet server (tablet and
+transaction status, lock status, cancellation, `yb_servers_metrics`, remote exec, snapshot import),
+which is not per-operation. From a lane thread they reach another lane's reactor `(L-1)/L` of the
+time.
 
-**Issuing lane.** A command's callbacks run in the lane that started it. `TabletInvoker` takes
-that lane from the thread that constructs it, or from its owner: a `Batcher` records the lane of
-the thread that flushes it and passes it to its RPCs. The invoker pins it on the controller for
-every send (`RpcController::set_issuing_lane`), because a send can run on another lane's thread:
-tablet lookups for many callers share one master RPC, whose completion runs every waiter's
-continuation on the thread that completed it, and a `Batcher` creates and sends its RPCs on the
-thread that completes its last lookup or makes its transaction ready.
+**Issuing lane.** A command's callbacks run in the lane of the thread that started it.
+`TabletInvoker` takes that lane from the thread that constructs it, or from its owner: a `Batcher`
+records the lane of the thread that flushes it and passes it to its RPCs. The invoker pins the lane
+on the controller for every send (`RpcController::set_issuing_lane`), because a send can run on
+another lane's thread: tablet lookups for many callers share one master RPC, whose completion runs
+every waiter's continuation on the thread that completed it, and a `Batcher` creates and sends its
+RPCs on the thread that completes its last lookup or makes its transaction ready. An owner that
+constructs its invoker on another thread than the one that started its command calls back in that
+thread's lane instead. For example, a `YBTransaction` whose status tablet is not cached builds its
+first heartbeat on the thread that completes the lookup, once per transaction; the batchers waiting
+for it keep their own lanes.
 
 **Callbacks.** The server client has no callback pool (no `set_callback_threadpool_size`, and
 `TEST_yb_client_num_callback_threads` defaults to 0), so `Batcher::RunCallback` runs the flush
-callback inline on the RPC callback thread, a worker of the issuing lane's pool: a session's
-completions, including the response it writes for its backend, run in its lane. A configured
-callback pool would move them onto that unlaned pool, in the service set.
+callback inline on the RPC callback thread, a worker of the issuing lane's pool: a shared-memory
+session's completions, including the response it writes for its backend, run in its lane, and a TCP
+call's in the lane that handled it. A configured callback pool would move them onto that unlaned
+pool, in the service set.
 
-**Crossings.** Handoffs of a session in lane `s`, with the tablet `T` of each tablet RPC:
+**Crossings.** Handoffs of a shared-memory session in lane `s` (for a TCP call, `s` is the lane that
+handled it), with the tablet `T` of each tablet RPC:
 
 | Handoff | Primitive | Category | Crosses when |
 | --- | --- | --- | --- |
