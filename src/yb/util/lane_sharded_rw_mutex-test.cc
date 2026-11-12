@@ -17,6 +17,8 @@
 
 #include <gtest/gtest.h>
 
+#include "yb/gutil/thread_annotations.h"
+
 #include "yb/util/lane_sharded_rw_mutex.h"
 #include "yb/util/lanes.h"
 #include "yb/util/lanes_test_util.h"
@@ -28,6 +30,27 @@ namespace yb {
 
 class LaneShardedRwMutexTest : public YBTest {};
 
+namespace {
+
+// try_lock as a scoped acquisition, so the thread-safety analysis sees the matching unlock.
+class SCOPED_CAPABILITY TryWriteLock {
+ public:
+  explicit TryWriteLock(LaneShardedRwMutex& mutex) TRY_ACQUIRE(true, mutex)  // NOLINT
+      : mutex_(mutex), locked_(mutex.try_lock()) {}
+  ~TryWriteLock() RELEASE() {
+    if (locked_) {
+      mutex_.unlock();
+    }
+  }
+  bool locked() const { return locked_; }
+
+ private:
+  LaneShardedRwMutex& mutex_;
+  const bool locked_;
+};
+
+}  // namespace
+
 // With lane mode off every thread shares the spare slot: a writer excludes readers and vice versa.
 TEST_F(LaneShardedRwMutexTest, LaneModeOffIsOneMutex) {
   TEST_SetLaneTopology scope;
@@ -37,12 +60,15 @@ TEST_F(LaneShardedRwMutexTest, LaneModeOffIsOneMutex) {
   LaneShardedRwMutex mutex;
   {
     SharedLock lock(mutex);
-    ASSERT_FALSE(mutex.try_lock());
+    TryWriteLock write(mutex);
+    ASSERT_FALSE(write.locked());
     ASSERT_FALSE(mutex.is_write_locked());
   }
-  ASSERT_TRUE(mutex.try_lock());
-  ASSERT_TRUE(mutex.is_write_locked());
-  mutex.unlock();
+  {
+    TryWriteLock write(mutex);
+    ASSERT_TRUE(write.locked());
+    ASSERT_TRUE(mutex.is_write_locked());
+  }
   ASSERT_FALSE(mutex.is_write_locked());
 }
 
@@ -82,22 +108,28 @@ TEST_F(LaneShardedRwMutexTest, ReadersShardByLaneWritersLockAll) {
     SharedLock lock(mutex);
   });
   ASSERT_EQ(lane1_slot, 1);
-  ASSERT_FALSE(mutex.try_lock());
+  {
+    TryWriteLock write(mutex);
+    ASSERT_FALSE(write.locked());
+  }
 
   release = true;
   reader0.join();
 
   // With no readers, the writer takes every slot and readers of any lane are excluded.
-  ASSERT_TRUE(mutex.try_lock());
   std::atomic<bool> reader_done{false};
-  std::thread reader1([&] {
-    ApplyLaneToCurrentThread(1);
-    SharedLock lock(mutex);
-    reader_done = true;
-  });
-  std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  ASSERT_FALSE(reader_done);
-  mutex.unlock();
+  std::thread reader1;
+  {
+    TryWriteLock write(mutex);
+    ASSERT_TRUE(write.locked());
+    reader1 = std::thread([&] {
+      ApplyLaneToCurrentThread(1);
+      SharedLock lock(mutex);
+      reader_done = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_FALSE(reader_done);
+  }
   reader1.join();
   ASSERT_TRUE(reader_done);
 }
