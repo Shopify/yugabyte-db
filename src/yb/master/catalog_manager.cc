@@ -1695,7 +1695,7 @@ Status CatalogManager::RunLoaders(SysCatalogLoadingState* state) {
   }
 
   {
-    LockGuard lock(permissions_manager()->mutex());
+    std::lock_guard lock(permissions_manager()->mutex());
 
     // Clear the roles mapping.
     permissions_manager()->ClearRolesUnlocked();
@@ -1904,7 +1904,7 @@ std::vector<std::string> CatalogManager::GetMasterAddresses() {
 
 Status CatalogManager::PrepareDefaultSysConfig(int64_t term) {
   {
-    LockGuard lock(permissions_manager()->mutex());
+    std::lock_guard lock(permissions_manager()->mutex());
     RETURN_NOT_OK(permissions_manager()->PrepareDefaultSecurityConfigUnlocked(term));
   }
 

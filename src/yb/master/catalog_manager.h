@@ -2708,7 +2708,11 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   // easy to make a "gettable set".
 
   // Lock protecting the various in memory storage structures.
-  using MutexType = rw_spinlock;
+  // On Linux writers go ahead of readers. A waiting writer blocks new readers, and a writer that
+  // unlocks hands the lock to the next waiting writer first. Waiters sleep instead of spinning.
+  struct MutexType : RWMutex {
+    MutexType() : RWMutex(Priority::PREFER_WRITING) {}
+  };
   using SharedLock = NonRecursiveSharedLock<MutexType>;
   using UniqueLock = yb::UniqueLock<MutexType>;
   using LockGuard = std::lock_guard<MutexType>;

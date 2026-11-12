@@ -24,6 +24,7 @@
 #include "yb/rpc/rpc_fwd.h"
 
 #include "yb/util/debug/lock_debug.h"
+#include "yb/util/rw_mutex.h"
 #include "yb/util/status_callback.h"
 #include "yb/util/status_fwd.h"
 
@@ -182,7 +183,7 @@ class PermissionsManager final {
   scoped_refptr<SysConfigInfo> security_config_ GUARDED_BY(mutex_);
 
   CatalogManager* catalog_manager_;
-  MutexType& cm_mutex_;
+  RWMutex& cm_mutex_;
 
   DISALLOW_COPY_AND_ASSIGN(PermissionsManager);
 };
