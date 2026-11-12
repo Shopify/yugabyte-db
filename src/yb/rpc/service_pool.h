@@ -71,11 +71,13 @@ using ThreadPoolProvider = std::function<ThreadPoolPtr(ThreadPoolTag, LaneId)>;
 // Also includes a queue that calls get pushed onto for handling by the pool.
 class ServicePool : public RpcService {
  public:
-  // num_lanes: the lane count of a laned messenger, 0 for an unlaned one. A laned pool keeps its
-  // queued-call count and timeout pre-check queue per lane (plus one for calls without a lane),
-  // and admits a call without a shared write while its lane is below its share of max_tasks
-  // (calls without a lane always sum the lanes); see ServicePoolImpl::LaneCallQueued. An unlaned
-  // pool keeps one count and one queue.
+  // num_lanes (L): the lane count of a laned messenger, 0 for an unlaned one. A laned pool keeps
+  // its queued-call count and timeout pre-check queue per lane (plus one for calls without a lane),
+  // and, with limit = max_tasks and share = ceil(limit / L), admits a call without a shared write
+  // while its lane slot is below share and no slot is above its share; otherwise it sums the slots.
+  // The spare slot's share is 0, so calls without a lane always sum. The queue never holds more
+  // than max(limit, L x share) <= limit + L - 1 calls; see ServicePoolImpl::LaneCallQueued. An
+  // unlaned pool keeps one count and one queue.
   ServicePool(size_t max_tasks,
               ThreadPoolProvider thread_pool_provider,
               Scheduler* scheduler,
