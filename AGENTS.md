@@ -2,7 +2,7 @@
 
 This document provides a guide for agents working on YugabyteDB
 
-### Shopify contribution issues
+### Shopify contributions
 
 For Shopify-originated issue intake, public issue publication, or private/public
 issue linking, use
@@ -10,13 +10,53 @@ issue linking, use
 publication target is `Shopify/yugabyte-db`. Source evidence stays in the configured
 private tracker; normal sanitized publication does not require a separate approval.
 Use the Shopify tool for publication and recovery rather than the inherited
-upstream `create-issue` workflow. Existing public upstream issues can be reused.
+upstream `create-issue` workflow. Existing public upstream issues are reused as the
+public record, and the fork PR cites them directly.
 
-Shopify contributions require an approving review from `yugabyte-code-reviewers`
-and a merge into the Shopify integration branch before maintainer-led upstream
-submission. The integration branch is `master-shopify`; series and maintenance
-branches use the `<release>-shopify` suffix. Repository setup and the remaining
-PR/backport skills are separate rollout steps from the issue-publishing tool.
+A Shopify contribution is a reviewed PR merged into `master-shopify` with an
+approving review from `Shopify/yugabyte-code-reviewers`. Series and maintenance
+branches use the `<release>-shopify` suffix. Every merge into `master-shopify` is
+upstream-bound by default, tooling and CI changes included. The `upstream: skip`
+label on the fork PR opts out: the change stays in the fork and is not submitted,
+and removing the label makes a change that has not been submitted upstream-bound again.
+
+Every fork PR merges into `master-shopify` before it is submitted upstream, stack
+layers included. Fork PRs squash-merge, so each lands as one `(#N)` commit. A feature
+stack whose layers are useless apart lands whole with
+`gh stack merge <top-pr> --yes --squash`; independent fixes land on their own.
+
+Submission is developer-forward: the original developer runs one command, `submit`,
+which performs shopify-upstream-pr's steps under their own identity. Until `submit`
+exists, developers do these steps by hand following the skills; the
+`shopify-upstream-pr`, `shopify-create-pr`, and `shopify-backport` skills are being
+added in following changes.
+
+Upstream PRs are opened in `yugabyte/yugabyte-db` from branches under
+`feature-stack/Shopify/<slug>`, where Shopify developers have push access.
+Dependants are stacked: a dependant PR's base is its parent's branch. A PR has
+landed only when its merge commit is on upstream `master`, whatever base GitHub
+records: a stack merge records upper layers against their parent branch, and a stack
+reorder can mark a PR merged without landing it, which is a restructure. After a
+parent squash-merges, the developer rebases and force-pushes their branch.
+
+Fork-only work needs no issue. Its PR title carries `[shopify-only]` in place of or
+after the issue ID, paired with the `upstream: skip` label; CI checks the title, and
+the pairing is a convention. Upstream requires an issue reference on every PR, a
+GitHub issue or a YB Jira ID, and Shopify cannot create YB Jira tickets. An
+upstream-bound fork PR cites an upstream issue, the number its upstream PR will
+carry: an existing one, or one the developer opens upstream when the problem carries
+no private context. Work that starts from private evidence goes through
+shopify-create-issue; when no upstream issue covers the problem, that skill publishes
+a sanitized fork issue, the fork PR cites it, and the upstream issue is derived from
+it at submission. The body's first line is `Refs <full issue URL>`, because a bare
+`#N` in a fork title links to the fork. Fork PR titles follow `.github/workflows/pr-title.yml`:
+`[#issue] area: Short description`, with a `[BACKPORT <branch>]` or `[<branch>]` tag
+on release bases and none on `master-shopify` or feature bases.
+
+Evidence lives on the fork PR. After opening the upstream PR, comment
+`Upstream: <upstream PR url>` there; add a new comment if the upstream PR is
+replaced. `Available: <version>` labels keep recording backport availability as
+today. Nothing is read from upstream PR labels.
 
 ### Deploying and running
 

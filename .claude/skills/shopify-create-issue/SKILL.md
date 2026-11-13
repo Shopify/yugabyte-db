@@ -32,10 +32,11 @@ cannot be resolved from the available information. Honor requests for preview.
 - For an existing private issue, use its full URL and inspect it below.
 - For new Shopify-originated work, find any existing private tracker before
   creating another. Preserve relevant incident links in that private record.
-- For an existing public upstream issue with no additional private context,
-  return that issue as the tracker. No duplicate private or fork issue is needed.
+- For an existing public upstream issue with no additional private context, use it
+  as the public record; no private or fork issue is needed. The fork PR cites the
+  upstream issue directly.
 - If an existing upstream issue needs private supporting evidence, create or reuse
-  the private tracker and use `link`. Create a fork issue only when it is needed.
+  the private tracker and use `link`.
 
 Issue URLs must be fully qualified. A bare `#123` is ambiguous across repositories.
 Use explicit repositories for any `gh` searches. Publication goes through the
@@ -103,6 +104,13 @@ evidence, and a minimal reproduction or proposed solution:
   ones found in linked evidence. This list stays private. Do not put general
   vocabulary, public code symbols, or public release versions in it.
 
+When Shopify-specific context helps, end the description with a `## Shopify context`
+section: why the problem matters to Shopify in sanitized terms, fork PR links,
+release targets needed, and any fork-side workaround. Use exactly that heading and
+keep it as the last section of the description, with no `###` sub-headings inside it;
+it is stripped when the text is copied upstream. It links only to public locations,
+and the disclosure checks cover it like the rest of the description.
+
 Review the proposed title and description against the source for remaining
 identifiers, proprietary operational detail, misleading generalization, and lost
 reproduction conditions. The deterministic checks cannot recognize every private
@@ -120,8 +128,9 @@ python3 .agents/scripts/shopify/issues.py publish \
 The tool validates the draft, checks repository visibility and source freshness,
 creates missing known template labels in the fork, and creates or recovers the
 public issue. It records the public URL privately; public content has no reverse
-link to the private source. New upstream issues belong to the later maintainer
-upstream-submission workflow.
+link to the private source. When the work goes upstream, the upstream issue is
+derived from this fork issue; the upcoming `shopify-upstream-pr` skill handles that
+creation, not this one.
 
 For an existing public issue, record only its private association:
 
