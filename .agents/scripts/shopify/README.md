@@ -187,3 +187,36 @@ Before rollout, exercise the skill itself against synthetic incident reports:
 
 Review disclosure and technical usefulness separately. Real incident examples
 and their evaluation results belong in private storage, not this repository.
+
+## Release planner
+
+`release.py` plans a Shopify release of YugabyteDB: the Shopify patches to
+cherry-pick onto an upstream release tag, and the git commands that create or
+resume the `<version>-shopify-<sequence>-candidate` branch. It replaces the Ruby
+`version_builder.rb` from the private build tooling; the release process itself
+is unchanged.
+
+```bash
+# From a checkout of this repository (the default --repo-path is the current checkout).
+python3 .agents/scripts/shopify/release.py --version 2025.2.8.0
+python3 .agents/scripts/shopify/release.py --version v2025.2.8.0 --no-fetch \
+  --target-branch 2025.2.8.0-shopify-2-candidate --previous-release 2025.2.7.0-shopify-3
+```
+
+Planning is read-only. It fetches (`git fetch --all --tags`, unless `--no-fetch`),
+reads fork PRs through `gh`, and prints commands; it never creates or moves refs.
+`--repo-path` points it at another checkout.
+
+Patches are fork PRs carrying `Available:` labels. `Available: X.Y.Z` means
+upstream includes the fix from that version: the PR is skipped when the target is
+at or after `X.Y.Z` in the same series, or when `X.Y.Z` is the first release of an
+earlier series. `Available: nil` is a permanent fork patch. A landed PR contributes
+its merge commit (with `-m 1` only for a real merge commit); an open PR contributes
+its branch commits. Commits are ordered by committer time, reuse the previous
+Shopify release's cherry-pick where one exists so that conflict resolutions carry
+over, and are reported as done when the candidate branch already has them.
+
+The sequence comes from existing `<version>-shopify-<n>` tags and branches; an
+unreleased `-candidate` branch that descends from the upstream tag is resumed, and
+one that does not is an error. Exit codes: 0, 2 for usage errors, 1 otherwise.
+`test_release.py` runs under the same `unittest discover` command as above.
