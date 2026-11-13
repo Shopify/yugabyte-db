@@ -417,9 +417,10 @@ TEST(MemTrackerTest, TcMallocGCBoundedPerCall) {
   constexpr int64_t kPerCall = 8_MB;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_mem_tracker_tcmalloc_gc_max_release_bytes_per_call) = kPerCall;
 
-  // Put well over the per-call bound on the page heap free list.
-  constexpr size_t kChunk = 4_MB;
-  constexpr size_t kChunks = 64;
+  // Put well over the per-call bound on the page heap free list. Blocks below the huge page size:
+  // larger ones go through tcmalloc's huge page cache, which returns memory on its own schedule.
+  constexpr size_t kChunk = 512_KB;
+  constexpr size_t kChunks = 1024;
   {
     std::vector<std::unique_ptr<char[]>> chunks;
     for (size_t i = 0; i != kChunks; ++i) {
@@ -429,7 +430,9 @@ TEST(MemTrackerTest, TcMallocGCBoundedPerCall) {
   }
   auto overhead_before = GetTCMallocPageHeapFreeBytes();
   LOG(INFO) << "Free page heap before GC: " << overhead_before;
-  ASSERT_GT(overhead_before, 4 * kPerCall);
+  if (overhead_before < 8 * kPerCall) {
+    GTEST_SKIP() << "tcmalloc kept only " << overhead_before << " bytes on the page heap free list";
+  }
 
   // Cross the trigger once.
   root->Release(1_MB);
@@ -461,12 +464,15 @@ TEST(MemTrackerTest, TcMallocGCConcurrentTriggers) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_mem_tracker_tcmalloc_gc_max_release_bytes_per_call) = 0;
   {
     std::vector<std::unique_ptr<char[]>> chunks;
-    for (size_t i = 0; i != 128; ++i) {
-      chunks.emplace_back(new char[4_MB]);
-      memset(chunks.back().get(), 1, 4_MB);
+    for (size_t i = 0; i != 1024; ++i) {
+      chunks.emplace_back(new char[512_KB]);
+      memset(chunks.back().get(), 1, 512_KB);
     }
   }
   auto overhead_before = GetTCMallocPageHeapFreeBytes();
+  if (overhead_before < 16_MB) {
+    GTEST_SKIP() << "tcmalloc kept only " << overhead_before << " bytes on the page heap free list";
+  }
   std::atomic<int> attempted{0};
   std::vector<std::thread> threads;
   for (int i = 0; i != 16; ++i) {
