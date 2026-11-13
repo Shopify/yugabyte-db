@@ -470,7 +470,7 @@ TEST(MemTrackerTest, TcMallocGCConcurrentTriggers) {
     }
   }
   auto overhead_before = GetTCMallocPageHeapFreeBytes();
-  if (overhead_before < 16_MB) {
+  if (overhead_before < static_cast<int64_t>(16_MB)) {
     GTEST_SKIP() << "tcmalloc kept only " << overhead_before << " bytes on the page heap free list";
   }
   std::atomic<int> attempted{0};
