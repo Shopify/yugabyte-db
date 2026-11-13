@@ -1093,6 +1093,11 @@ TEST_F(MetricsTest, FlushStalePreAggregatedAttribute) {
   TEST_SYNC_POINT("tablet_holder_ready");
 
   flush_thread.join();
+
+  // The callback refers to locals of this test: it must not stay behind for the tests that follow
+  // (any of them that writes Prometheus output would run it on this test's dead stack frame).
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 METRIC_DEFINE_gauge_int64(server, test_lane_gauge, "Lane gauge", MetricUnit::kRequests,
