@@ -177,14 +177,24 @@ HybridTimeRange HybridClock::NowRange() {
 void HybridClock::NowWithError(HybridTime *hybrid_time, uint64_t *max_error_usec) {
   DCHECK_EQ(state_, kInitialized) << "Clock not initialized. Must call Init() first.";
 
-  HybridClockComponents current_components = components_.load(boost::memory_order_acquire);
-
+  // Read the physical clock before touching components_, so that nothing slow sits between
+  // reading components_ and swapping it below.
   auto now = clock_->Now();
   if (PREDICT_FALSE(!now.ok())) {
     TryRunClockDiagnosticsOnce();
     LOG(FATAL) << Format("Couldn't get the current time: Clock unsynchronized. "
         "Status: $0", now.status().ToString());
   }
+
+  // Read components_ with a compare-and-swap that leaves it as it is, instead of a load. Every
+  // call ends in a successful swap, and with all threads of the server calling, the cache line of
+  // components_ is contended: a load takes the line shared and the swap then has to upgrade it,
+  // by which time another core has usually taken it and the swap fails. A compare-and-swap takes
+  // the line for writing whether or not it succeeds, and on failure returns the current value, so
+  // the read and the swap that follows share one transfer of the line. What the function returns
+  // and stores is unchanged.
+  HybridClockComponents current_components;
+  components_.compare_exchange_strong(current_components, current_components);
 
   // If the current time surpasses the last update just return it
   HybridClockComponents new_components = { now->time_point, 1 };

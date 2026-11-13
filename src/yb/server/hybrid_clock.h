@@ -40,6 +40,7 @@
 
 #include <boost/atomic.hpp>
 
+#include "yb/gutil/port.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/server/clock.h"
 #include "yb/util/locks.h"
@@ -133,13 +134,19 @@ class HybridClock : public Clock {
   int64_t SkewForMetrics();
 
   PhysicalClockPtr clock_;
-  boost::atomic<HybridClockComponents> components_{HybridClockComponents(0, 0)};
   State state_ = kNotInitialized;
+
+  // On a cache line of its own. Every NowWithError() writes it, from every thread of the server,
+  // so the line is always owned by whichever core wrote it last; anything sharing the line (clock_,
+  // which every call reads first) would miss along with it.
+  alignas(CACHELINE_SIZE) boost::atomic<HybridClockComponents> components_{
+      HybridClockComponents(0, 0)};
 
   // Clock metrics are set to detach to their last value. This means
   // that, during our destructor, we'll need to access other class members
   // declared above this. Hence, this member must be declared last.
-  std::shared_ptr<void> metric_detacher_;
+  // Aligned so that it does not share the line of components_.
+  alignas(CACHELINE_SIZE) std::shared_ptr<void> metric_detacher_;
 };
 
 }  // namespace server

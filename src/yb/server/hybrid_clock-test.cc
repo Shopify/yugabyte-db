@@ -31,7 +31,10 @@
 //
 
 #include <algorithm>
+#include <atomic>
+#include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "yb/util/logging.h"
@@ -104,6 +107,59 @@ TEST_F(HybridClockTest, TestNow_ValuesIncreaseMonotonically) {
   const HybridTime now1 = clock_->Now();
   const HybridTime now2 = clock_->Now();
   ASSERT_LT(now1.value(), now2.value());
+}
+
+// Concurrent readers never get the same hybrid time, and each reader's values only increase.
+TEST_F(HybridClockTest, TestNow_ConcurrentValuesAreUniqueAndIncreasePerThread) {
+  constexpr int kThreads = 8;
+  constexpr int kReadsPerThread = 200000;
+  std::vector<std::vector<uint64_t>> values(kThreads);
+  std::vector<std::thread> threads;
+  for (int i = 0; i != kThreads; ++i) {
+    threads.emplace_back([this, &out = values[i]] {
+      out.reserve(kReadsPerThread);
+      for (int n = 0; n != kReadsPerThread; ++n) {
+        out.push_back(clock_->Now().ToUint64());
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  std::vector<uint64_t> all;
+  all.reserve(kThreads * kReadsPerThread);
+  for (const auto& thread_values : values) {
+    ASSERT_TRUE(std::adjacent_find(
+        thread_values.begin(), thread_values.end(), std::greater_equal<uint64_t>()) ==
+            thread_values.end()) << "A reader saw a value that did not increase";
+    all.insert(all.end(), thread_values.begin(), thread_values.end());
+  }
+  std::sort(all.begin(), all.end());
+  ASSERT_TRUE(std::adjacent_find(all.begin(), all.end()) == all.end())
+      << "Two readers got the same hybrid time";
+}
+
+// An update to a later time is never undone by concurrent readers: after Update(t) returns, every
+// Now() is above t.
+TEST_F(HybridClockTest, TestUpdate_HoldsAgainstConcurrentReaders) {
+  std::atomic<bool> stop{false};
+  std::vector<std::thread> readers;
+  for (int i = 0; i != 4; ++i) {
+    readers.emplace_back([this, &stop] {
+      while (!stop.load(std::memory_order_relaxed)) {
+        clock_->Now();
+      }
+    });
+  }
+  for (int n = 0; n != 20000; ++n) {
+    auto target = clock_->Now().AddMicroseconds(50);
+    clock_->Update(target);
+    ASSERT_GT(clock_->Now().ToUint64(), target.ToUint64());
+  }
+  stop = true;
+  for (auto& reader : readers) {
+    reader.join();
+  }
 }
 
 // Tests the clock updates with the incoming value if it is higher.
