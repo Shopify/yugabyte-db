@@ -16,7 +16,7 @@ cannot push to the fork. This skill is the fork overlay on create-pr (confidenti
 components, body) and [stack-prs](../stack-prs/SKILL.md) (gh stack setup and operation):
 every rule in those skills holds here except the ones named below. Submitting a merged
 contribution upstream is [shopify-upstream-pr](../shopify-upstream-pr/SKILL.md); a backport
-to a release base is `shopify-backport`, being added in a following change.
+to a release base is [shopify-backport](../shopify-backport/SKILL.md).
 
 ## Preconditions
 
@@ -53,7 +53,8 @@ The base is `master-shopify`. A stacked layer's base is its parent's branch, set
 `gh stack`. Release bases (`<version>-shopify`, `<version>-shopify-N`,
 `<version>-shopify-N-candidate`) take only
 release-specific changes, with the release tag in the title; backports are
-`shopify-backport`'s. The fork's `master` mirrors upstream and is never a base.
+[shopify-backport](../shopify-backport/SKILL.md)'s. The fork's `master` mirrors upstream
+and is never a base.
 
 Name the branch for the change, in any shape; it need not match the upstream branch. Keep
 it outside `feature-stack/`, the upstream submission namespace. A single PR is a

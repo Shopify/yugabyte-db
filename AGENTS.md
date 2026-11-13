@@ -33,8 +33,11 @@ merged contribution upstream, including its upstream issue, stack placement, and
 [shopify-upstream-pr](.claude/skills/shopify-upstream-pr/SKILL.md). To open a PR in
 `Shopify/yugabyte-db`, use
 [shopify-create-pr](.claude/skills/shopify-create-pr/SKILL.md), not the inherited
-`create-pr`, which opens PRs in `yugabyte/yugabyte-db`; the `shopify-backport` skill is
-being added in a following change.
+`create-pr`, which opens PRs in `yugabyte/yugabyte-db`. To backport a merged change to a
+Shopify release line, use
+[shopify-backport](.claude/skills/shopify-backport/SKILL.md); the inherited
+`backport-commit` command and `review-backport` skill target upstream release branches
+and Phorge, not the fork.
 
 Upstream PRs are opened in `yugabyte/yugabyte-db` from branches under
 `feature-stack/Shopify/<slug>`, where Shopify developers have push access.
