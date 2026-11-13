@@ -242,9 +242,10 @@ class ThreadSafeObjectPool {
     // OSX doesn't have a way to get the CPU, so we'll pick a random one.
     return std::hash<std::thread::id>()(std::this_thread::get_id()) % pools_.size();
 #else
-    size_t cpu = sched_getcpu();
-    DCHECK_LT(cpu, pools_.size());
-    return cpu;
+    // sched_getcpu() can exceed the online CPU count the pools are sized by: CPUs can be
+    // offline, and a container whose /proc and /sys show only its own CPUs still runs on host
+    // CPU numbers. Any pool is correct, so wrap rather than index past the end.
+    return static_cast<size_t>(sched_getcpu()) % pools_.size();
 #endif // defined(__APPLE__)
   }
 
