@@ -997,26 +997,27 @@ bool MemTracker::GcTcmallocIfNeeded() {
   constexpr int64_t kReleaseStep = 1_MB;
   // Reading the tcmalloc statistics walks the per-CPU caches, so re-read them once per chunk.
   constexpr int64_t kRecheckBytes = 16_MB;
-  const int64_t max_release = FLAGS_mem_tracker_tcmalloc_gc_max_release_bytes_per_call;
-  int64_t released = 0;
-  for (;;) {
-    // Number of bytes in the 'NORMAL' free list (i.e reserved by tcmalloc but
-    // not in use).
-    int64_t bytes_overhead = GetTCMallocPageHeapFreeBytes();
-    // Bytes allocated by the application.
-    int64_t bytes_used = GetTCMallocCurrentAllocatedBytes();
 
+  // Bytes in the 'NORMAL' free list (reserved by tcmalloc but not in use) above the allowed share
+  // of the bytes allocated by the application.
+  auto excess = [] {
+    int64_t bytes_overhead = GetTCMallocPageHeapFreeBytes();
+    int64_t bytes_used = GetTCMallocCurrentAllocatedBytes();
     int64_t max_overhead = bytes_used * FLAGS_tcmalloc_max_free_bytes_percentage / 100.0;
-    // The excess is re-read every chunk: the workload allocates from the same free list while we
-    // release, so the amount computed at entry goes stale.
-    int64_t extra = std::min(bytes_overhead - max_overhead, kRecheckBytes);
-    if (max_release > 0) {
-      extra = std::min(extra, max_release - released);
-    }
-    if (extra <= 0) {
-      break;
-    }
-    while (extra > 0) {
+    return bytes_overhead - max_overhead;
+  };
+
+  // Never ask for more than the excess seen on entry, nor more than the per-call bound. tcmalloc
+  // cannot always return what it reports as free (free pages inside partly used huge pages), so
+  // "until the excess is gone" may never end; the re-read below only ends the GC early.
+  int64_t remaining = excess();
+  const int64_t max_release = FLAGS_mem_tracker_tcmalloc_gc_max_release_bytes_per_call;
+  if (max_release > 0) {
+    remaining = std::min(remaining, max_release);
+  }
+  int64_t released = 0;
+  while (remaining > 0) {
+    for (int64_t chunk = std::min(remaining, kRecheckBytes); chunk > 0; chunk -= kReleaseStep) {
       // Release 1MB at a time, so that tcmalloc releases its page heap lock
       // allowing other threads to make progress. This still disrupts the current
       // thread, but is better than disrupting all.
@@ -1025,9 +1026,12 @@ bool MemTracker::GcTcmallocIfNeeded() {
 #else
       MallocExtension::instance()->ReleaseToSystem(kReleaseStep);
 #endif  // YB_GOOGLE_TCMALLOC
-      extra -= kReleaseStep;
+      remaining -= kReleaseStep;
       released += kReleaseStep;
     }
+    // The workload allocates from the same free list while we release, so the excess seen on
+    // entry goes stale: stop once there is none left.
+    remaining = std::min(remaining, excess());
   }
   return released > 0;
 #else

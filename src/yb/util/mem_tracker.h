@@ -323,9 +323,9 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
   // the OS. This is problematic since it is memory we are not constantly tracking which
   // can cause us to go way over mem limits.
   // Returns whether we've really attempted to do GC.
-  // Only one thread runs the GC at a time (a concurrent caller returns false), the excess is
-  // re-read as it goes, and one call returns at most
-  // mem_tracker_tcmalloc_gc_max_release_bytes_per_call to the system.
+  // Only one thread runs the GC at a time (a concurrent caller returns false). One call asks
+  // tcmalloc for at most the excess seen on entry and at most
+  // mem_tracker_tcmalloc_gc_max_release_bytes_per_call, and stops early once no excess is left.
   static bool GcTcmallocIfNeeded();
 
   // Tries to update consumption from external source.
