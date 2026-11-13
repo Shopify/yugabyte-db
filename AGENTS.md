@@ -27,9 +27,11 @@ stack whose layers are useless apart lands whole with
 
 Submission is developer-forward: the original developer runs one command, `submit`,
 which performs shopify-upstream-pr's steps under their own identity. Until `submit`
-exists, developers do these steps by hand following the skills; the
-`shopify-upstream-pr`, `shopify-create-pr`, and `shopify-backport` skills are being
-added in following changes.
+exists, developers do these steps by hand following the skills. To submit a
+merged contribution upstream, including its upstream issue, stack placement, and the
+`Upstream:` record, use
+[shopify-upstream-pr](.claude/skills/shopify-upstream-pr/SKILL.md); the
+`shopify-create-pr` and `shopify-backport` skills are being added in following changes.
 
 Upstream PRs are opened in `yugabyte/yugabyte-db` from branches under
 `feature-stack/Shopify/<slug>`, where Shopify developers have push access.
