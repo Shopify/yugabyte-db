@@ -419,17 +419,21 @@ TEST(MemTrackerTest, TcMallocGCBoundedPerCall) {
 
   // Put well over the per-call bound on the page heap free list. Blocks below the huge page size:
   // larger ones go through tcmalloc's huge page cache, which returns memory on its own schedule.
+  // tcmalloc also sizes what it keeps by recent demand, so the first cycles can leave little.
   constexpr size_t kChunk = 512_KB;
   constexpr size_t kChunks = 1024;
-  {
-    std::vector<std::unique_ptr<char[]>> chunks;
-    for (size_t i = 0; i != kChunks; ++i) {
-      chunks.emplace_back(new char[kChunk]);
-      memset(chunks.back().get(), 1, kChunk);
+  int64_t overhead_before = 0;
+  for (int cycle = 0; cycle != 4 && overhead_before < 8 * kPerCall; ++cycle) {
+    {
+      std::vector<std::unique_ptr<char[]>> chunks;
+      for (size_t i = 0; i != kChunks; ++i) {
+        chunks.emplace_back(new char[kChunk]);
+        memset(chunks.back().get(), 1, kChunk);
+      }
     }
+    overhead_before = GetTCMallocPageHeapFreeBytes();
+    LOG(INFO) << "Free page heap after allocation cycle " << cycle << ": " << overhead_before;
   }
-  auto overhead_before = GetTCMallocPageHeapFreeBytes();
-  LOG(INFO) << "Free page heap before GC: " << overhead_before;
   if (overhead_before < 8 * kPerCall) {
     GTEST_SKIP() << "tcmalloc kept only " << overhead_before << " bytes on the page heap free list";
   }
