@@ -16,12 +16,14 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 
 #include "yb/util/lane_sharded_rw_mutex.h"
 #include "yb/util/lanes.h"
 #include "yb/util/lanes_test_util.h"
+#include "yb/util/logging.h"
 #include "yb/util/shared_lock.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
@@ -185,6 +187,58 @@ TEST_F(LaneShardedRwMutexTest, Stress) {
   }
   ASSERT_EQ(guarded, 4000);
   ASSERT_GT(reads, 0);
+}
+
+// A writer is not starved by readers that never stop: with the writer bit set by an atomic OR, each
+// exclusive acquisition finishes as soon as the readers inside leave. (Raising the bit with
+// compare-and-swap against the reader count let busy readers hold a writer off for seconds.)
+TEST_F(LaneShardedRwMutexTest, WriterProgressUnderContinuousReaders) {
+  auto topology = MakeTwoLaneTestTopology();
+  if (!topology) {
+    GTEST_SKIP() << "Needs at least 2 CPUs";
+  }
+  TEST_SetLaneTopology scope(*topology);
+
+  LaneShardedRwMutex mutex;
+  int64_t guarded = 0;
+  std::atomic<bool> stop{false};
+  std::atomic<int64_t> reads{0};
+  std::vector<std::thread> readers;
+  // More reader threads than CPUs in each lane, none of which ever pauses outside the lock.
+  for (int i = 0; i < 16; ++i) {
+    readers.emplace_back([&, i] {
+      ApplyLaneToCurrentThread(static_cast<LaneId>(i % 2));
+      while (!stop.load(std::memory_order_relaxed)) {
+        SharedLock lock(mutex);
+        ASSERT_GE(guarded, 0);
+        reads.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+  while (reads < 1000) {
+    std::this_thread::sleep_for(1ms);
+  }
+
+  constexpr int kWrites = 2000;
+  auto start = std::chrono::steady_clock::now();
+  std::thread writer([&] {
+    ApplyServiceMaskToCurrentThread();
+    for (int n = 0; n < kWrites; ++n) {
+      std::lock_guard lock(mutex);
+      ++guarded;
+    }
+  });
+  writer.join();
+  auto elapsed = std::chrono::steady_clock::now() - start;
+  stop = true;
+  for (auto& t : readers) {
+    t.join();
+  }
+  ASSERT_EQ(guarded, kWrites);
+  LOG(INFO) << kWrites << " exclusive acquisitions against 16 spinning readers took "
+            << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() << " ms";
+  // Generous: each acquisition should take microseconds; starvation showed up as seconds each.
+  ASSERT_LT(elapsed, 60s);
 }
 
 }  // namespace yb

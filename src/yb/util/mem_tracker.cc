@@ -54,6 +54,7 @@
 #include "yb/util/metrics.h"
 #include "yb/util/mutex.h"
 #include "yb/util/random_util.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/size_literals.h"
 #include "yb/util/status.h"
 #include "yb/util/status_log.h"
@@ -122,6 +123,13 @@ DEFINE_RUNTIME_int64(mem_tracker_tcmalloc_gc_release_bytes, -1,
     "this flag, a new tcmalloc GC will be triggered. This GC will clear the tcmalloc "
     "page heap freelist. A higher value implies less aggressive GC, i.e. higher memory "
     "overhead, but more efficient in terms of runtime.");
+
+DEFINE_RUNTIME_int64(mem_tracker_tcmalloc_gc_max_release_bytes_per_call, 128 * 1024 * 1024,
+    "Upper bound on the memory one tcmalloc GC, triggered by mem_tracker_tcmalloc_gc_release_bytes, "
+    "returns to the system. The GC runs on the thread whose Release() crossed the trigger, so this "
+    "bounds how long that thread is held up; what is left over is released by later GCs. 0 or "
+    "less removes the bound.");
+TAG_FLAG(mem_tracker_tcmalloc_gc_max_release_bytes_per_call, advanced);
 
 DEFINE_NON_RUNTIME_int64(mem_tracker_lane_batch_bytes, 64 * 1024,
     "In lane mode, the delta a lane thread accumulates per lane-batched memory tracker (and in the "
@@ -974,29 +982,54 @@ bool MemTracker::GcTcmallocIfNeeded() {
   released_memory_since_gc = 0;
   TRACE_EVENT0("process", "MemTracker::GcTcmallocIfNeeded");
 
-  // Number of bytes in the 'NORMAL' free list (i.e reserved by tcmalloc but
-  // not in use).
-  int64_t bytes_overhead = GetTCMallocPageHeapFreeBytes();
-  // Bytes allocated by the application.
-  int64_t bytes_used = GetTCMallocCurrentAllocatedBytes();
-
-  int64_t max_overhead = bytes_used * FLAGS_tcmalloc_max_free_bytes_percentage / 100.0;
-  int64_t extra = bytes_overhead - max_overhead;
-  if (extra <= 0) {
+  // One thread at a time. Release() calls this on whichever thread crossed the trigger, and every
+  // release serializes inside tcmalloc, so concurrent GCs only queue behind each other: with a
+  // large free page heap (after dropping big tables, say) dozens of request threads, reactors
+  // among them, each sat in their own multi-gigabyte release loop for the length of a workload.
+  // A thread that finds a GC running leaves it to that thread; the trigger counter restarts and
+  // a later Release() picks up whatever is still above the limit.
+  static std::atomic<bool> gc_running{false};
+  if (gc_running.exchange(true, std::memory_order_acquire)) {
     return false;
   }
-  while (extra > 0) {
-    // Release 1MB at a time, so that tcmalloc releases its page heap lock
-    // allowing other threads to make progress. This still disrupts the current
-    // thread, but is better than disrupting all.
+  auto clear_running = ScopeExit([] { gc_running.store(false, std::memory_order_release); });
+
+  constexpr int64_t kReleaseStep = 1_MB;
+  // Reading the tcmalloc statistics walks the per-CPU caches, so re-read them once per chunk.
+  constexpr int64_t kRecheckBytes = 16_MB;
+  const int64_t max_release = FLAGS_mem_tracker_tcmalloc_gc_max_release_bytes_per_call;
+  int64_t released = 0;
+  for (;;) {
+    // Number of bytes in the 'NORMAL' free list (i.e reserved by tcmalloc but
+    // not in use).
+    int64_t bytes_overhead = GetTCMallocPageHeapFreeBytes();
+    // Bytes allocated by the application.
+    int64_t bytes_used = GetTCMallocCurrentAllocatedBytes();
+
+    int64_t max_overhead = bytes_used * FLAGS_tcmalloc_max_free_bytes_percentage / 100.0;
+    // The excess is re-read every chunk: the workload allocates from the same free list while we
+    // release, so the amount computed at entry goes stale.
+    int64_t extra = std::min(bytes_overhead - max_overhead, kRecheckBytes);
+    if (max_release > 0) {
+      extra = std::min(extra, max_release - released);
+    }
+    if (extra <= 0) {
+      break;
+    }
+    while (extra > 0) {
+      // Release 1MB at a time, so that tcmalloc releases its page heap lock
+      // allowing other threads to make progress. This still disrupts the current
+      // thread, but is better than disrupting all.
 #if YB_GOOGLE_TCMALLOC
-    tcmalloc::MallocExtension::ReleaseMemoryToSystem(1024 * 1024);
+      tcmalloc::MallocExtension::ReleaseMemoryToSystem(kReleaseStep);
 #else
-    MallocExtension::instance()->ReleaseToSystem(1024 * 1024);
+      MallocExtension::instance()->ReleaseToSystem(kReleaseStep);
 #endif  // YB_GOOGLE_TCMALLOC
-    extra -= 1024 * 1024;
+      extra -= kReleaseStep;
+      released += kReleaseStep;
+    }
   }
-  return true;
+  return released > 0;
 #else
   return false;
 #endif  // YB_TCMALLOC_ENABLED
