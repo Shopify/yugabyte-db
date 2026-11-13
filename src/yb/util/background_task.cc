@@ -64,6 +64,13 @@ void BackgroundTask::CompleteShutdown() {
 }
 
 Status BackgroundTask::Wake() {
+  // A run is already pending: have_job_ is only cleared by the task's thread right before it
+  // starts a run, so that run starts after this call, which is all a wake-up asks for. And
+  // whoever set have_job_ notifies the thread. Without this, callers that wake the task from many
+  // threads while a condition lasts serialize on mutex_.
+  if (have_job_.load(std::memory_order_acquire) && !closing_.load(std::memory_order_acquire)) {
+    return Status::OK();
+  }
   {
     std::lock_guard lock(mutex_);
     if (closing_) {

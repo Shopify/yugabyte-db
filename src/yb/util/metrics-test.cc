@@ -1246,6 +1246,79 @@ TEST_F(MetricsTest, LaneCellsMatchUnshardedOutput) {
   ASSERT_EQ(sharded.gauge->value(), 42);
 }
 
+// A pre-aggregated value (shared by a metric of every tablet of a table) gets a cell per lane, but
+// only in lane mode and only once laned threads have incremented it often enough; its total is
+// exact throughout.
+TEST_F(MetricsTest, PreAggregatedValueLaneCells) {
+  constexpr auto kThreshold = PreAggregatedValue::kLaneCellsAfterIncrements;
+  auto increment_in_lane = [](PreAggregatedValue* value, LaneId lane, int64_t times) {
+    RunOnStdThread([value, lane, times] {
+      SetThisThreadLane(lane);
+      for (int64_t i = 0; i != times; ++i) {
+        value->IncrementBy(1);
+      }
+    });
+  };
+  {
+    // Lanes off.
+    PreAggregatedValue value;
+    increment_in_lane(&value, 1, 2 * kThreshold);
+    ASSERT_FALSE(value.TEST_has_lane_cells());
+    ASSERT_EQ(value.Load(), 2 * kThreshold);
+  }
+
+  TEST_SetLaneTopology scope(MetricTestLanes(2));
+  PreAggregatedValue value;
+  // What a metric brings along, and increments from threads without a lane, do not count.
+  value.AddShared(5);
+  for (int64_t i = 0; i != 2 * kThreshold; ++i) {
+    value.IncrementBy(1);
+  }
+  ASSERT_FALSE(value.TEST_has_lane_cells());
+  increment_in_lane(&value, 0, kThreshold - 1);
+  ASSERT_FALSE(value.TEST_has_lane_cells());
+  increment_in_lane(&value, 1, 1);
+  ASSERT_TRUE(value.TEST_has_lane_cells());
+  int64_t expected = 5 + 3 * kThreshold;
+  ASSERT_EQ(value.Load(), expected);
+
+  // Added in one lane, taken back in another and by a thread without a lane.
+  RunOnStdThread([&value] {
+    SetThisThreadLane(0);
+    value.IncrementBy(100);
+  });
+  RunOnStdThread([&value] {
+    SetThisThreadLane(1);
+    value.IncrementBy(-60);
+  });
+  value.IncrementBy(-40);
+  value.AddShared(-5);
+  expected -= 5;
+  ASSERT_EQ(value.Load(), expected);
+
+  // Concurrent writers of both lanes and without a lane, across the allocation of the cells.
+  constexpr int64_t kIncrements = 200000;
+  PreAggregatedValue busy;
+  std::vector<std::thread> threads;
+  for (LaneId lane : {LaneId(0), LaneId(0), LaneId(1), LaneId(1), kNoLane}) {
+    threads.emplace_back([&busy, lane] {
+      SetThisThreadLane(lane);
+      for (int64_t i = 0; i != kIncrements; ++i) {
+        busy.IncrementBy(i % 3 == 0 ? -1 : 2);
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  int64_t per_thread = 0;
+  for (int64_t i = 0; i != kIncrements; ++i) {
+    per_thread += i % 3 == 0 ? -1 : 2;
+  }
+  ASSERT_TRUE(busy.TEST_has_lane_cells());
+  ASSERT_EQ(busy.Load(), 5 * per_thread);
+}
+
 // With lanes off, or for a metric of another entity type, EnableLaneCells does nothing, and every
 // thread writes the shared value.
 TEST_F(MetricsTest, LaneCellsOffOrNotServer) {

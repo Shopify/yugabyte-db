@@ -12,9 +12,11 @@
 //
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <memory>
+#include <mutex>
 
 #include "yb/gutil/ref_counted.h"
 
@@ -46,6 +48,9 @@ class BackgroundTask {
 
   void Shutdown();
 
+  // Makes the task run (again) after this call. Cheap when a run is already pending: callers may
+  // wake the task from many threads for as long as some condition holds (the global memstore limit
+  // does, from every thread that writes to a memtable).
   Status Wake();
 
  private:
@@ -54,8 +59,9 @@ class BackgroundTask {
   // Wait for a job or closing. Return true if got a job, false if closing.
   bool WaitForJob();
 
-  bool closing_ = false;
-  bool have_job_ = false;
+  // Written under mutex_; also read without it by Wake().
+  std::atomic<bool> closing_{false};
+  std::atomic<bool> have_job_{false};
 
   std::function<void()> task_;
   std::string category_;

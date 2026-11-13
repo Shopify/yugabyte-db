@@ -792,7 +792,7 @@ class AtomicGauge : public Gauge {
     // total dips when a tablet goes away and rate() spikes. Only real gauges should decrement.
     if (aggregated_prometheus_value_holder_ != nullptr &&
         prototype_->type() != MetricType::kCounter) {
-      aggregated_prometheus_value_holder_->IncrementBy(-value());
+      aggregated_prometheus_value_holder_->AddShared(-value());
     }
     metrics_internal::DeleteLaneValueCells(lane_cells_.load(std::memory_order_acquire));
   }
@@ -863,7 +863,7 @@ class AtomicGauge : public Gauge {
             default_aggregation_levels, prototype_->entity_type(), aggregation_id,
             MetricType::PrometheusType(prototype_->type()), prototype_->description());
 
-    aggregated_prometheus_value_holder_->IncrementBy(value());
+    aggregated_prometheus_value_holder_->AddShared(value());
 
     return Status::OK();
   }
@@ -908,7 +908,7 @@ class AtomicGauge : public Gauge {
   }
   AtomicInt<int64_t> value_;
 
-  std::shared_ptr<AtomicInt<int64_t>> aggregated_prometheus_value_holder_;
+  PreAggregatedValuePtr aggregated_prometheus_value_holder_;
 
   std::atomic<metrics_internal::LaneValueCells*> lane_cells_{nullptr};
  private:
@@ -1078,7 +1078,7 @@ class Counter : public Metric {
 
   LongAdder value_;
 
-  std::shared_ptr<AtomicInt<int64_t>> aggregated_prometheus_value_holder_;
+  PreAggregatedValuePtr aggregated_prometheus_value_holder_;
 
   DISALLOW_COPY_AND_ASSIGN(Counter);
 };

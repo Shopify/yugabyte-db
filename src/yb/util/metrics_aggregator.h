@@ -21,6 +21,7 @@
 
 #include "yb/util/atomic.h"
 #include "yb/util/metric_entity.h"
+#include "yb/util/pre_aggregated_value.h"
 #include "yb/util/shared_lock.h"
 
 namespace yb {
@@ -41,7 +42,7 @@ class PreAggregatedMetricInfo {
       help_and_type_(help_and_type),
       metric_prototype_holder_(std::move(metric_prototype_holder)) {}
 
-  std::shared_ptr<AtomicInt<int64_t>>
+  PreAggregatedValuePtr
   CreateOrFindPreAggregatedValueHolder(const std::string& aggregation_id)
       EXCLUDES(aggregated_value_holders_mutex_);
 
@@ -68,7 +69,7 @@ class PreAggregatedMetricInfo {
   mutable std::mutex aggregated_value_holders_mutex_;
 
   // Pre-aggregated values for different aggregation_ids (table id or stream id)
-  std::unordered_map<std::string, std::shared_ptr<AtomicInt<int64_t>>> aggregated_value_holders_
+  std::unordered_map<std::string, PreAggregatedValuePtr> aggregated_value_holders_
       GUARDED_BY(aggregated_value_holders_mutex_);
 };
 
@@ -88,7 +89,7 @@ class MetricsAggregator {
 
   // Store its metadata and attributes if this is the first time encountering this metric.
   // Next, find or create the pre-aggregated value holder for the metric, then return it.
-  std::shared_ptr<AtomicInt<int64_t>> CreateOrFindPreAggregatedMetricValueHolder(
+  PreAggregatedValuePtr CreateOrFindPreAggregatedMetricValueHolder(
       const MetricEntity::AttributeMap& attributes,
       std::shared_ptr<MetricPrototype> metric_prototype_holder,
       const std::string& metric_name,

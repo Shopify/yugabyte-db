@@ -24,12 +24,12 @@
 
 namespace yb {
 
-std::shared_ptr<AtomicInt<int64_t>>
+PreAggregatedValuePtr
 PreAggregatedMetricInfo::CreateOrFindPreAggregatedValueHolder(const std::string& aggregation_id) {
   std::lock_guard l(aggregated_value_holders_mutex_);
   auto& value_holder_ptr = aggregated_value_holders_[aggregation_id];
   if (value_holder_ptr == nullptr) {
-    value_holder_ptr = std::make_shared<AtomicInt<int64_t>>(0);
+    value_holder_ptr = std::make_shared<PreAggregatedValue>();
   }
   return value_holder_ptr;
 }
@@ -96,7 +96,7 @@ bool MetricsAggregator::IsPreAggregationSupported(
   return false;
 }
 
-std::shared_ptr<AtomicInt<int64_t>>
+PreAggregatedValuePtr
 MetricsAggregator::CreateOrFindPreAggregatedMetricValueHolder(
     const MetricEntity::AttributeMap& attributes,
     std::shared_ptr<MetricPrototype> metric_prototype_holder,
