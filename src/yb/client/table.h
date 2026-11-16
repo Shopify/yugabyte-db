@@ -30,6 +30,7 @@
 #include "yb/qlexpr/qlexpr_fwd.h"
 
 #include "yb/util/enums.h"
+#include "yb/util/lanes.h"
 #include "yb/util/locks.h"
 #include "yb/util/memory/arena_fwd.h"
 #include "yb/util/slice.h"
@@ -156,11 +157,34 @@ class YBTable : public std::enable_shared_from_this<YBTable> {
 
   size_t FindPartitionStartIndex(const std::string& partition_key, size_t group_by = 1) const;
 
+  // A lane's own reference to the partition list (see lane_partitions_).
+  struct LanePartitions {
+    mutable simple_spinlock mutex;
+    VersionedTablePartitionListPtr partitions GUARDED_BY(mutex);
+  };
+
+  // Calls f with the current partition list and returns what it returns. f must not call back into
+  // this table.
+  template <class F>
+  auto ReadPartitions(const F& f) const;
+
+  // Gives every lane a reference to partitions.
+  void SetLanePartitions(const VersionedTablePartitionListPtr& partitions);
+
   const std::unique_ptr<const YBTableInfo> info_;
 
   // Mutex protecting partitions_.
   mutable rw_spinlock mutex_;
   VersionedTablePartitionListPtr partitions_ GUARDED_BY(mutex_);
+
+  // In lane mode, what the threads of a lane read the partition list through. Every operation of
+  // every session reads the list, and through mutex_ and partitions_ that is two writes of the
+  // lock word and a reference count taken and dropped on the list, all on words that every lane
+  // shares (even a shared lock of an rw_spinlock writes it). Each lane has a spinlock and a
+  // separately counted reference of its own instead, which no other lane's readers touch.
+  // A refresh sets partitions_ and then every lane's reference, under mutex_.
+  // Not allocated with lanes off; threads without a lane use mutex_ and partitions_.
+  LaneSharded<LanePartitions> lane_partitions_;
 
   std::atomic<bool> partitions_are_stale_{false};
 

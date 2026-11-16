@@ -79,6 +79,28 @@ TableType ClientToPBTableType(YBTableType table_type) {
 
 YBTable::YBTable(const YBTableInfo& info, VersionedTablePartitionListPtr partitions)
     : info_(std::make_unique<YBTableInfo>(info)), partitions_(std::move(partitions)) {
+  if (LaneModeActive()) {
+    lane_partitions_.Allocate(GetLaneTopology().num_lanes());
+    SetLanePartitions(partitions_);
+  }
+}
+
+void YBTable::SetLanePartitions(const VersionedTablePartitionListPtr& partitions) {
+  lane_partitions_.ForEach([&partitions](LanePartitions& lane) {
+    auto reference = SeparatelyCounted(partitions);
+    std::lock_guard lock(lane.mutex);
+    lane.partitions.swap(reference);
+  });
+}
+
+template <class F>
+auto YBTable::ReadPartitions(const F& f) const {
+  if (const auto* lane = lane_partitions_.LaneLocal()) {
+    std::lock_guard lock(lane->mutex);
+    return f(lane->partitions);
+  }
+  SharedLock<decltype(mutex_)> lock(mutex_);
+  return f(partitions_);
 }
 
 YBTable::~YBTable() {
@@ -158,34 +180,38 @@ bool YBTable::IsRangePartitioned() const {
 }
 
 std::shared_ptr<const TablePartitionList> YBTable::GetPartitionsShared() const {
-  SharedLock<decltype(mutex_)> lock(mutex_);
-  return std::shared_ptr<const TablePartitionList>(partitions_, &partitions_->keys);
+  return ReadPartitions([](const VersionedTablePartitionListPtr& partitions) {
+    return std::shared_ptr<const TablePartitionList>(partitions, &partitions->keys);
+  });
 }
 
 VersionedTablePartitionListPtr YBTable::GetVersionedPartitions() const {
-  SharedLock<decltype(mutex_)> lock(mutex_);
-  return partitions_;
+  return ReadPartitions([](const VersionedTablePartitionListPtr& partitions) {
+    return partitions;
+  });
 }
 
 TablePartitionList YBTable::GetPartitionsCopy() const {
-  TablePartitionList result;
-
-  SharedLock<decltype(mutex_)> lock(mutex_);
-  result.reserve(partitions_->keys.size());
-  for (const auto& key : partitions_->keys) {
-    result.push_back(key);
-  }
-  return result;
+  return ReadPartitions([](const VersionedTablePartitionListPtr& partitions) {
+    TablePartitionList result;
+    result.reserve(partitions->keys.size());
+    for (const auto& key : partitions->keys) {
+      result.push_back(key);
+    }
+    return result;
+  });
 }
 
 int32_t YBTable::GetPartitionCount() const {
-  SharedLock<decltype(mutex_)> lock(mutex_);
-  return narrow_cast<int32_t>(partitions_->keys.size());
+  return ReadPartitions([](const VersionedTablePartitionListPtr& partitions) {
+    return narrow_cast<int32_t>(partitions->keys.size());
+  });
 }
 
 PartitionListVersion YBTable::GetPartitionListVersion() const {
-  SharedLock<decltype(mutex_)> lock(mutex_);
-  return partitions_->version;
+  return ReadPartitions([](const VersionedTablePartitionListPtr& partitions) {
+    return partitions->version;
+  });
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -217,15 +243,17 @@ std::unique_ptr<YBqlReadOp> YBTable::NewQLRead(
 }
 
 size_t YBTable::FindPartitionStartIndex(const PartitionKey& partition_key, size_t group_by) const {
-  SharedLock<decltype(mutex_)> lock(mutex_);
-  return client::FindPartitionStartIndex(partitions_->keys, partition_key, group_by);
+  return ReadPartitions([&](const VersionedTablePartitionListPtr& partitions) {
+    return client::FindPartitionStartIndex(partitions->keys, partition_key, group_by);
+  });
 }
 
 PartitionKeyPtr YBTable::FindPartitionStart(
     const PartitionKey& partition_key, size_t group_by) const {
-  SharedLock<decltype(mutex_)> lock(mutex_);
-  size_t idx = FindPartitionStartIndex(partition_key, group_by);
-  return std::shared_ptr<const std::string>(partitions_, &partitions_->keys[idx]);
+  return ReadPartitions([&](const VersionedTablePartitionListPtr& partitions) {
+    size_t idx = client::FindPartitionStartIndex(partitions->keys, partition_key, group_by);
+    return std::shared_ptr<const std::string>(partitions, &partitions->keys[idx]);
+  });
 }
 
 void YBTable::InvokeRefreshPartitionsCallbacks(const Status& status) {
@@ -273,6 +301,7 @@ void YBTable::RefreshPartitions(YBClient* client, StdStatusCallback callback) {
         return;
       }
       partitions_ = partitions;
+      SetLanePartitions(partitions);
       partitions_are_stale_ = false;
       VLOG_WITH_FUNC(1) << Format("Table $0 partitions updated: $1", info_->table_id, partitions_);
     }
