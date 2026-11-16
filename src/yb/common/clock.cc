@@ -28,9 +28,13 @@ DEFINE_UNKNOWN_uint64(wait_hybrid_time_sleep_interval_us, 10000,
 namespace yb {
 
 Result<HybridTime> WaitUntil(ClockBase* clock, HybridTime hybrid_time, CoarseTimePoint deadline) {
-  // Only asks whether hybrid_time has passed: no need to advance the clock for that. Every Now()
-  // after this returns more than what CoarseNow() returned.
+  // Whether hybrid_time has passed can usually be told without advancing the clock: every Now()
+  // after CoarseNow() returns more than CoarseNow() did. CoarseNow() may be slightly behind the
+  // physical clock, though, so before deciding to wait, ask precisely.
   auto ht_now = clock->CoarseNow();
+  if (ht_now < hybrid_time) {
+    ht_now = clock->Now();
+  }
   while (ht_now < hybrid_time) {
     if (CoarseMonoClock::now() > deadline) {
       return STATUS_FORMAT(TimedOut, "Timed out waiting for $0, now $1", deadline, ht_now);
@@ -38,7 +42,7 @@ Result<HybridTime> WaitUntil(ClockBase* clock, HybridTime hybrid_time, CoarseTim
     auto delta_micros = hybrid_time.GetPhysicalValueMicros() - ht_now.GetPhysicalValueMicros();
     std::this_thread::sleep_for(
         std::max(FLAGS_wait_hybrid_time_sleep_interval_us, delta_micros) * 1us);
-    ht_now = clock->CoarseNow();
+    ht_now = clock->Now();
   }
 
   return ht_now;
