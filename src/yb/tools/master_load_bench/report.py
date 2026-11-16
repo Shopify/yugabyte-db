@@ -82,6 +82,18 @@ def summarize(metrics):
             lat_count = metrics.get("bench_%s_latency_count" % base)
             if lat_sum and lat_count and delta(lat_count) > 0:
                 out[base + " latency"] = (delta(lat_sum) / delta(lat_count) / 1000.0, "ms")
+        elif name.startswith("bench_balancer_") and name.endswith("_total"):
+            request, kind = name[len("bench_balancer_"):-len("_total")].rsplit("_", 1)
+            if delta(series) > 0:
+                out["balancer %s %s" % (request, kind)] = (int(delta(series)), "")
+        elif name == "load_balancer_duration_sum":
+            count = metrics.get("load_balancer_duration_count")
+            if count and delta(count) > 0:
+                out["balancer runs"] = (int(delta(count)), "")
+                out["balancer s/run"] = (delta(series) / delta(count) / 1000.0, "s")
+        elif name.startswith("bench_zone_"):
+            zone, kind = name[len("bench_zone_"):].rsplit("_", 1)
+            out["zone %s %s" % (zone, kind)] = (int(series[-1][1]), "")
         elif name.startswith("bench_sql_") and name.endswith("_latency_ms"):
             values = [v for _, v in series]
             label = name[len("bench_sql_"):-len("_latency_ms")]
@@ -121,9 +133,9 @@ def fmt(value, unit):
 
 
 def row_order(key):
-    """Master process, bench senders, master handlers, queues, then sql by name."""
+    """Master process, bench senders, master handlers, queues, balancer, zones, then sql."""
     groups = ["window_sec", "master_cpu", "master_rss", "rpc_", "ysql_connect", "master ",
-              "rpcs_", "sql "]
+              "rpcs_", "balancer ", "zone ", "sql "]
     suffixes = [" ok/s", " /s", " failed", " latency", " n", " mean", " p50", " max"]
     sub = next((j for j, suffix in enumerate(suffixes) if key.endswith(suffix)), -1)
     stem = key[:-len(suffixes[sub])] if sub >= 0 else key
