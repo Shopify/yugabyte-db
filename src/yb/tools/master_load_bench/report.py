@@ -3,6 +3,7 @@
 
     report.py run.csv              one run, one column per window between marks
     report.py base.csv new.csv     two runs side by side, with deltas, for windows both have
+    report.py --balancer run.csv   load balancer per minute, the last 10 minutes
 
 A window is a stretch of rows with the same phase (the label of the last `mark`). Counters
 are reported as rates over the window, latency sums as means, gauges as mean/last.
@@ -12,6 +13,7 @@ import argparse
 import csv
 import statistics
 import sys
+import time
 from collections import OrderedDict, defaultdict
 
 
@@ -185,13 +187,58 @@ def print_pair(base, new, base_name, new_name):
         print()
 
 
+BALANCER_REQUESTS = ["AddServer", "RemoveServer", "LeaderStepDown", "DeleteTablet"]
+
+
+def print_balancer(path, last):
+    """One row per minute: requests received/applied, balancer runs and seconds per run."""
+    minutes = OrderedDict()  # minute -> {metric: last value in that minute}
+    prev_elapsed = -1.0
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            elapsed = float(row["elapsed_sec"])
+            if elapsed < prev_elapsed:
+                minutes = OrderedDict()
+            prev_elapsed = elapsed
+            metric = row["metric"]
+            if metric.startswith(("bench_balancer_", "load_balancer_duration_")):
+                minute = int(row["epoch_ms"]) // 60000
+                minutes.setdefault(minute, {})[metric] = float(row["value"])
+    rows = []
+    prev = {}
+    for minute, values in minutes.items():
+        def diff(metric):
+            return values.get(metric, prev.get(metric, 0.0)) - prev.get(metric, 0.0)
+        cells = [time.strftime("%H:%M", time.localtime(minute * 60))]
+        for request in BALANCER_REQUESTS:
+            cells.append("%d/%d" % (diff("bench_balancer_%s_received_total" % request),
+                                    diff("bench_balancer_%s_applied_total" % request)))
+        runs = diff("load_balancer_duration_count")
+        cells.append("%d" % runs)
+        cells.append("%.2f" % (diff("load_balancer_duration_sum") / runs / 1000.0) if runs
+                     else "-")
+        rows.append(cells)
+        prev.update(values)
+    print_table([["time"] + BALANCER_REQUESTS + ["runs", "s/run"]] +
+                (rows[-last:] if last > 0 else rows))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("csv", nargs="+", help="one CSV, or base and new")
+    parser.add_argument("--balancer", action="store_true",
+                        help="load balancer per minute: requests received/applied, runs, s/run")
+    parser.add_argument("--last", type=int, default=10,
+                        help="with --balancer, minutes to print; 0 for the whole run")
     args = parser.parse_args()
     if len(args.csv) > 2:
         parser.error("at most two CSVs")
+    if args.balancer:
+        if len(args.csv) != 1:
+            parser.error("--balancer takes one CSV")
+        print_balancer(args.csv[0], args.last)
+        return 0
     if len(args.csv) == 1:
         print_single(load(args.csv[0]))
     else:
