@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import functools
 import json
 import os
+from pathlib import Path
 import re
 import shlex
 import subprocess
@@ -23,6 +24,7 @@ GITHUB_REPO = "Shopify/yugabyte-db"
 RELEASE_NAME = re.compile(
     r"(?P<version>[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?)-shopify-(?P<sequence>[0-9]+)")
 CHERRY_PICKED = re.compile(r"\(cherry picked from commit ([a-f0-9]+)\)")
+OID = re.compile(r"[0-9a-f]{40}")
 
 
 class Error(Exception):
@@ -92,7 +94,6 @@ class AvailabilityLabels:
         unknown: bool
         unrecognized: list
         status: str
-        verified: bool = False
 
     @classmethod
     def inspect_pull_request(cls, pull_request, target):
@@ -185,14 +186,19 @@ class Planner:
         elif self.repo.origin_branch_exists(candidate_branch):
             candidate_ref = "origin/" + candidate_branch
         if candidate_ref is not None and not self.repo.ancestor(upstream_commit, candidate_ref):
+            released, candidates = self._sequences(upstream)
+            free = max(released + candidates) + 1
             raise Error(f"Candidate branch {candidate_branch} conflicts with upstream tag "
-                        f"{upstream_tag}: it is not based on that tag")
+                        f"{upstream_tag}: it is not based on that tag; plan a new sequence with "
+                        f"--target-branch {upstream.full}-shopify-{free}-candidate")
         if previous_release is None:
             previous_release = self._find_previous_release(upstream)
         elif not RELEASE_NAME.fullmatch(previous_release):
             raise Error(f"Invalid previous release {previous_release!r}: "
                         "expected <version>-shopify-<sequence>")
-        entries = AvailabilityLabels.inspect_all(pull_requests, upstream)
+        # Oldest PR first, so equal ordering keys do not depend on the gh listing order.
+        entries = sorted(AvailabilityLabels.inspect_all(pull_requests, upstream),
+                         key=lambda entry: entry.number)
         return Plan(upstream.full, upstream.series, upstream_tag, upstream_commit, sequence,
                     candidate_branch, candidate_ref, release_name, previous_release, entries,
                     AvailabilityLabels.selected_numbers(entries), self.repo.path)
@@ -217,11 +223,14 @@ class Planner:
     def _candidate_pattern(upstream):
         return re.compile(re.escape(upstream.full) + r"-shopify-([0-9]+)-candidate")
 
-    def _next_sequence(self, upstream):
-        released = list(self._release_refs(upstream))
+    def _sequences(self, upstream):
+        """(released, candidate) sequence numbers in use for this upstream version."""
         pattern = self._candidate_pattern(upstream)
-        candidates = [int(match[1]) for match in map(
+        return list(self._release_refs(upstream)), [int(match[1]) for match in map(
             pattern.fullmatch, self.repo.local_branches() + self.repo.origin_branches()) if match]
+
+    def _next_sequence(self, upstream):
+        released, candidates = self._sequences(upstream)
         if not released and not candidates:
             return 1
         highest = max(released + candidates)
@@ -261,8 +270,11 @@ class Repository:
             raise GitError(f"Repository path {self.path} is not a git repository")
 
     def _git(self, *args):
-        return subprocess.run(["git", "-C", self.path, *args], capture_output=True,
-                              encoding="utf-8", errors="replace")
+        try:
+            return subprocess.run(["git", "-C", self.path, *args], capture_output=True,
+                                  encoding="utf-8", errors="replace")
+        except FileNotFoundError as error:
+            raise GitError("git was not found; install git") from error
 
     def _run(self, *args):
         result = self._git(*args)
@@ -326,8 +338,8 @@ class Repository:
     def cherry_picked_commits_between(self, from_rev, to_rev):
         return self._log_shas("--grep", "cherry picked from commit", f"{from_rev}..{to_rev}")
 
-    def show(self, commit):
-        return self._run("show", commit)
+    def message(self, commit):
+        return self._run("show", "--no-patch", "--format=%B", commit)
 
     def fetch_all_with_tags(self):
         return self._run("fetch", "--all", "--tags")
@@ -375,10 +387,11 @@ class Commit:
 class CherryPickList:
     """Turns a plan's selected PRs into ordered commits and the cherry-picks still to run."""
 
-    def __init__(self, repo, github, github_repo):
+    def __init__(self, repo, github, github_repo, err=None):
         self.repo = repo
         self.github = github
         self.github_repo = github_repo
+        self.err = sys.stderr if err is None else err
 
     def commits(self, plan):
         found = [c for number in plan.cherry_pick_prs for c in self._commits_for_pr(number)]
@@ -418,11 +431,23 @@ class CherryPickList:
         # A landed PR is its mergeCommit alone; a squash merge's is single-parent and needs no
         # -m 1. For a rebase merge gh reports only the last rebased commit, so the PR's other
         # commits are not listed (as in the Ruby).
-        return [Commit(oid, number, self.repo.commit_timestamp(oid),
-                       self.repo.commit_timestamp(self.repo.parent_commit(oid)),
-                       merge_commit=self.repo.parent_count(oid) > 1, merged=merge is not None)
-                for oid in (entry["oid"] for entry in
-                            ([merge] if merge is not None else info["commits"]))]
+        oids = [entry["oid"] for entry in ([merge] if merge is not None else info["commits"])]
+        for oid in oids:
+            if not isinstance(oid, str) or not OID.fullmatch(oid):
+                raise Error(f"PR #{number}: gh returned an invalid commit id {oid!r}")
+        found = []
+        for oid in oids:
+            timestamp = self.repo.commit_timestamp(oid)
+            merge_commit = self.repo.parent_count(oid) > 1
+            if merge_commit and merge is None:
+                # A merge inside an open PR's branch brings in unrelated work; skip it.
+                self.err.write(f"warning: PR #{number}: skipping merge commit {oid}; "
+                               "cherry-pick its branch commits only\n")
+                continue
+            found.append(Commit(oid, number, timestamp,
+                                self.repo.commit_timestamp(self.repo.parent_commit(oid)),
+                                merge_commit=merge_commit, merged=merge is not None))
+        return found
 
     def _previous_release_ref(self, previous_release):
         if self.repo.origin_branch_exists(previous_release):
@@ -435,7 +460,8 @@ class CherryPickList:
     def _already_cherry_picked(self, plan):
         found = []
         for sha in self.repo.cherry_picked_commits_between(plan.upstream_tag, plan.candidate_ref):
-            matches = [m for m in map(CHERRY_PICKED.search, self.repo.show(sha).split("\n")) if m]
+            matches = [m for m in map(CHERRY_PICKED.search, self.repo.message(sha).split("\n"))
+                       if m]
             if matches:
                 found.append(matches[-1][1])
         return found
@@ -455,8 +481,9 @@ def parser():
     result.add_argument("--version", metavar="version",
                         help='upstream version (e.g. "v2025.1.1.2" or "2025.1.1.2")')
     result.add_argument("--repo-path", "--repo_path", dest="repo_path", metavar="path",
+                        default=str(Path(__file__).resolve().parents[3]),
                         help="path to the yugabyte-db checkout "
-                             "(default: the git repository containing the current directory)")
+                             "(default: the checkout containing this script)")
     result.add_argument("--target-branch", "--target_branch", dest="target_branch",
                         metavar="branch", help="target candidate branch "
                         '(default: "${version}-shopify-${sequence}-candidate")')
@@ -467,15 +494,6 @@ def parser():
                         help="do not run `git fetch --all --tags` before planning")
     result.add_argument("-h", "--help", action="store_true", help="Prints this help")
     return result
-
-
-def default_repo_path():
-    result = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
-                            text=True)
-    if result.returncode or not result.stdout.strip():
-        raise UsageError(
-            "--repo-path is required when the current directory is not a git repository")
-    return result.stdout.rstrip("\n")
 
 
 class Cli:
@@ -497,10 +515,9 @@ class Cli:
             if args.help:
                 self.out.write(options.format_help())
                 return 0
-            repo_path = default_repo_path() if args.repo_path is None else args.repo_path
             if args.version is None:
                 raise UsageError("--version is required")
-            self.execute(args, repo_path)
+            self.execute(args)
             return 0
         except UsageError as error:
             self.say(str(error), stream=self.err)
@@ -509,8 +526,8 @@ class Cli:
             self.say(str(error), stream=self.err)
             return 1
 
-    def execute(self, args, repo_path):
-        repo = Repository(repo_path)
+    def execute(self, args):
+        repo = Repository(args.repo_path)
         if args.fetch:
             repo.fetch_all_with_tags()
         plan = Planner(repo).plan(args.version, self.github.pull_requests(GITHUB_REPO),
@@ -528,10 +545,16 @@ class Cli:
             self.say(f"Using previous Shopify release: {plan.previous_release}")
         else:
             self.say("Warning: Failed to find previous Shopify release, starting from scratch")
-        listing = CherryPickList(repo, self.github, GITHUB_REPO)
+        listing = CherryPickList(repo, self.github, GITHUB_REPO, self.err)
         commits = listing.commits(plan)
         self.say(f"The following commits are necessary for upstream version "
                  f"{plan.upstream_version}:", *(f"{c.commit}, PR: {c.pr}" for c in commits))
+        unknown = [e for e in plan.label_inspection if e.status == "unknown_availability"]
+        if unknown:
+            self.say("")
+        for e in unknown:
+            values = ", ".join(f"Available: {v}" for v in e.unrecognized) or "Available: nil"
+            self.say(f"PR {e.number} is included because its availability is unknown: {values}")
         done = listing.done(plan, commits)
         if done:
             self.say("", f"The following commits have already been applied to "
@@ -544,7 +567,10 @@ class Cli:
         self.print_commands(plan, remaining)
 
     def print_commands(self, plan, remaining):
-        if not plan.candidate_exists:
+        if plan.candidate_exists:
+            # git creates a tracking branch when the candidate exists only on origin.
+            self.say(f"git checkout {plan.candidate_branch}")
+        else:
             self.say(f"cd {shlex.quote(plan.repo_path)}", "git fetch --all --tags",
                      f"git checkout {plan.upstream_tag}",
                      f"git checkout -b {plan.candidate_branch}")

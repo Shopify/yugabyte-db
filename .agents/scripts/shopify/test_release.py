@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 from release import (
     AvailabilityLabels, CherryPickList, Cli, Commit, Error, GitError, GitHub, Planner, Repository,
-    UpstreamVersion,
+    UpstreamVersion, parser,
 )
 
 
@@ -47,9 +47,10 @@ class GitFixture:
             raise AssertionError(f"git {' '.join(args)} failed: {result.stderr}")
         return result.stdout.strip()
 
-    def commit(self, message=None, timestamp=None):
+    def commit(self, message=None, timestamp=None, content=None):
         self.counter += 1
-        Path(self.path, f"file{self.counter}.txt").write_text(f"content {self.counter}\n")
+        Path(self.path, f"file{self.counter}.txt").write_text(
+            content or f"content {self.counter}\n")
         self.git("add", ".")
         dates = None
         if timestamp is not None:
@@ -205,7 +206,6 @@ class AvailabilityLabelsTest(unittest.TestCase):
         entry = self.inspect_pr(["Available: 2025.1.3"], "2025.1.5")
 
         self.assertEqual("covered_by_label", entry.status)
-        self.assertFalse(entry.verified)
 
     def test_label_equal_to_the_target_is_covered(self):
         self.assertEqual("covered_by_label",
@@ -359,7 +359,19 @@ class PlannerTest(RepoTestCase):
 
         self.assert_plan_error(
             "Candidate branch 2025.2.8.0-shopify-1-candidate conflicts with upstream tag "
-            "v2025.2.8.0: it is not based on that tag", "2025.2.8.0")
+            "v2025.2.8.0: it is not based on that tag; plan a new sequence with --target-branch "
+            "2025.2.8.0-shopify-2-candidate", "2025.2.8.0")
+
+    def test_the_suggested_sequence_is_past_every_release_and_candidate(self):
+        self.fixture.tag("2025.2.8.0-shopify-1")
+        self.fixture.tag("2025.2.8.0-shopify-3")
+        self.fixture.branch("2025.2.8.0-shopify-2-candidate", "v2025.1.2")
+
+        self.assert_plan_error(
+            "Candidate branch 2025.2.8.0-shopify-2-candidate conflicts with upstream tag "
+            "v2025.2.8.0: it is not based on that tag; plan a new sequence with --target-branch "
+            "2025.2.8.0-shopify-4-candidate", "2025.2.8.0",
+            target_branch="2025.2.8.0-shopify-2-candidate")
 
     def test_rejects_an_explicit_candidate_whose_sequence_is_already_released(self):
         self.fixture.tag("2025.2.8.0-shopify-1")
@@ -461,6 +473,13 @@ class GitRepositoryTest(RepoTestCase):
 
         self.assert_git_error(f"Repository path {plain} is not a git repository", plain)
 
+    def test_a_missing_git_binary_is_a_clear_error(self):
+        empty = os.path.join(self.tmpdir, "empty-path")
+        os.mkdir(empty)
+
+        with patch.dict(os.environ, {"PATH": empty}):
+            self.assert_git_error("git was not found; install git", self.fixture.path)
+
     def test_commands_run_against_the_given_path_not_the_working_directory(self):
         self.fixture.commit()
         self.fixture.tag("v1.0.0")
@@ -541,16 +560,16 @@ class CliTest(RepoTestCase):
         self.assertEqual([], os.listdir(home))
         self.assertEqual([], os.listdir(cwd))
 
-    def test_missing_repo_path_outside_a_repository_is_a_usage_error_without_touching_any_checkout(
-            self):
-        result, home, cwd = self.run_script(SCRIPT, "--version", "2025.1.2")
+    def default_repo_path_from(self, cwd):
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(cwd)
+        return parser().parse_args(["--version", "2025.1.2"]).repo_path
 
-        self.assertEqual(2, result.returncode)
-        self.assertEqual(
-            "--repo-path is required when the current directory is not a git repository\n",
-            result.stderr)
-        self.assertEqual([], os.listdir(home))
-        self.assertEqual([], os.listdir(cwd))
+    def test_repo_path_defaults_to_the_scripts_checkout_from_an_unrelated_directory(self):
+        unrelated = os.path.join(self.tmpdir, "unrelated")
+        os.mkdir(unrelated)
+
+        self.assertEqual(str(Path(SCRIPT).parents[3]), self.default_repo_path_from(unrelated))
 
     def test_nonexistent_repo_path_is_reported(self):
         missing = os.path.join(self.tmpdir, "nope")
@@ -583,15 +602,9 @@ class CliTest(RepoTestCase):
         self.assertEqual(2, result.returncode)
         self.assertEqual("--version is required\n", result.stderr)
 
-    def test_repo_path_defaults_to_the_repository_containing_the_working_directory(self):
-        github = unlabelled_github({42: [self.tagged_patch()]})
-        self.addCleanup(os.chdir, os.getcwd())
-        os.chdir(self.fixture.path)
-
-        code, out, err = self.cli("--version", "2025.2.8.0", "--no-fetch", github=github)
-
-        self.assertEqual(0, code, err)
-        self.assertIn("cd " + shlex.quote(os.path.realpath(self.fixture.path)), out.splitlines())
+    def test_repo_path_ignores_a_repository_containing_the_working_directory(self):
+        self.assertEqual(str(Path(SCRIPT).parents[3]),
+                         self.default_repo_path_from(self.fixture.path))
 
     def test_prints_checkout_instructions_with_the_real_v_prefixed_tag(self):
         patch_commit = self.tagged_patch()
@@ -689,7 +702,7 @@ class CliTest(RepoTestCase):
         self.assertIn("All commits have been applied.", out)
         self.assertNotIn("git cherry-pick", out)
 
-    def test_resumed_candidate_with_remaining_commits_prints_no_checkout_commands(self):
+    def test_resumed_candidate_with_remaining_commits_checks_out_the_candidate_first(self):
         self.fixture.tag("v2025.2.8.0", self.fixture.commit("base", T0))
         self.fixture.git("checkout", "--quiet", "-b", "source")
         a, b = self.fixture.commit("a", T0 + DAY), self.fixture.commit("b", T0 + 2 * DAY)
@@ -699,8 +712,62 @@ class CliTest(RepoTestCase):
         code, out, err = self.plan_cli(unlabelled_github({1: [a], 2: [b]}))
 
         self.assertEqual(0, code, err)
-        self.assertEqual([f"git cherry-pick -x {b}"],
+        self.assertEqual(["git checkout 2025.2.8.0-shopify-1-candidate", f"git cherry-pick -x {b}"],
                          [line for line in out.splitlines() if line.startswith("git ")])
+
+    def test_resuming_an_origin_only_candidate_checks_out_its_local_name(self):
+        self.fixture.tag("v2025.2.8.0", self.fixture.commit("base", T0))
+        self.fixture.git("checkout", "--quiet", "-b", "source")
+        a, b = self.fixture.commit("a", T0 + DAY), self.fixture.commit("b", T0 + 2 * DAY)
+        self.fixture.git("checkout", "--quiet", "-b", "picked", "main")
+        self.fixture.git("cherry-pick", "-x", a)
+        self.fixture.remote_branch("2025.2.8.0-shopify-1-candidate", "picked")
+        self.fixture.git("checkout", "--quiet", "main")
+        self.fixture.git("branch", "-D", "picked")
+
+        code, out, err = self.plan_cli(unlabelled_github({1: [a], 2: [b]}))
+
+        self.assertEqual(0, code, err)
+        self.assertEqual(["git checkout 2025.2.8.0-shopify-1-candidate", f"git cherry-pick -x {b}"],
+                         [line for line in out.splitlines() if line.startswith("git ")])
+        self.assertNotIn("origin/", out)
+
+    def test_reports_prs_included_because_their_availability_is_unknown(self):
+        base = self.fixture.commit("base", T0)
+        self.fixture.tag("v2025.2.8.0", base)
+        github = FakeGitHub([pr(8, "Available: nil"), pr(7, "Available: soon")],
+                            {7: pr_commits(self.fixture.commit("a", T0 + DAY)),
+                             8: pr_commits(self.fixture.commit("b", T0 + 2 * DAY))})
+
+        code, out, err = self.plan_cli(github)
+
+        self.assertEqual(0, code, err)
+        lines = out.splitlines()
+        self.assertIn("PR 7 is included because its availability is unknown: Available: soon",
+                      lines)
+        self.assertIn("PR 8 is included because its availability is unknown: Available: nil",
+                      lines)
+
+    def test_versioned_labels_alone_report_no_unknown_availability(self):
+        self.fixture.tag("v2025.2.8.0", self.fixture.commit("base"))
+        github = FakeGitHub([pr(7, "Available: 2025.2.9.0")],
+                            {7: pr_commits(self.fixture.commit("a"))})
+
+        code, out, err = self.plan_cli(github)
+
+        self.assertEqual(0, code, err)
+        self.assertNotIn("availability is unknown", out)
+
+    def test_a_malformed_commit_id_from_gh_is_rejected_before_reaching_git(self):
+        self.fixture.tag("v2025.2.8.0", self.fixture.commit("base"))
+        injected = os.path.join(self.tmpdir, "injected")
+        for oid in (f"--output={injected}", f"--output={injected}{'0' * 40}", "abc123"):
+            with self.subTest(oid=oid):
+                code, _, err = self.plan_cli(unlabelled_github({7: [oid]}))
+
+                self.assertEqual(1, code)
+                self.assertEqual(f"PR #7: gh returned an invalid commit id {oid!r}\n", err)
+                self.assertFalse(os.path.exists(injected))
 
 
 class CherryPickListTest(RepoTestCase):
@@ -769,7 +836,9 @@ class CherryPickListTest(RepoTestCase):
         self.assertEqual([f"git cherry-pick -x {other}", f"git cherry-pick -x -m 1 {merge}"],
                          [line for line in out.splitlines() if line.startswith("git cherry-pick")])
 
-    def test_squash_merge_after_a_true_merge_is_ordered_after_it_whatever_gh_lists_first(self):
+    def test_squash_merge_after_a_true_merge_is_ordered_after_it_even_with_a_lower_pr_number(self):
+        # The squash is PR 1 and the merge PR 2, so the oldest-PR tie-break cannot mask a
+        # squash commit wrongly ordered by its parent's timestamp (which equals the merge's).
         self.fixture.tag("v2025.2.8.0", self.fixture.commit("base", T0))
         self.fixture.git("checkout", "--quiet", "-b", "feature")
         feature = self.fixture.commit("feature", T0 + DAY)
@@ -778,10 +847,10 @@ class CherryPickListTest(RepoTestCase):
         self.fixture.git("merge", "--quiet", "--no-ff", "-m", "merge feature", "feature",
                          env={"GIT_AUTHOR_DATE": merged, "GIT_COMMITTER_DATE": merged})
         merge = self.fixture.git("rev-parse", "HEAD")
-        squash = self.fixture.commit("squashed PR 2", T0 + 10 * DAY)
-        github = FakeGitHub([pr(2, "Available: nil"), pr(1, "Available: nil")],
-                            {1: pr_commits(feature, merge=merge),
-                             2: pr_commits("f" * 40, merge=squash)})
+        squash = self.fixture.commit("squashed PR 1", T0 + 10 * DAY)
+        github = FakeGitHub([pr(1, "Available: nil"), pr(2, "Available: nil")],
+                            {2: pr_commits(feature, merge=merge),
+                             1: pr_commits("f" * 40, merge=squash)})
 
         code, out, err = self.plan_cli(github)
 
@@ -804,7 +873,7 @@ class CherryPickListTest(RepoTestCase):
         self.assertEqual([f"git cherry-pick -x {a}", f"git cherry-pick -x {b}"],
                          [line for line in out.splitlines() if line.startswith("git cherry-pick")])
 
-    def test_open_pr_commits_with_the_same_parent_keep_the_listing_order(self):
+    def test_open_pr_commits_with_the_same_parent_resolve_oldest_pr_first(self):
         self.fixture.tag("v2025.2.8.0", self.fixture.commit("base", T0))
         self.fixture.git("checkout", "--quiet", "-b", "a", "v2025.2.8.0")
         a = self.fixture.commit("a", T0 + 3 * DAY)
@@ -814,8 +883,46 @@ class CherryPickListTest(RepoTestCase):
         code, out, err = self.plan_cli(unlabelled_github({2: [a], 1: [b]}))
 
         self.assertEqual(0, code, err)
-        self.assertEqual([f"git cherry-pick -x {a}", f"git cherry-pick -x {b}"],
+        self.assertEqual([f"git cherry-pick -x {b}", f"git cherry-pick -x {a}"],
                          [line for line in out.splitlines() if line.startswith("git cherry-pick")])
+
+    def test_open_pr_merge_commits_are_skipped_with_a_warning(self):
+        self.fixture.tag("v2025.2.8.0", self.fixture.commit("base", T0))
+        self.fixture.git("checkout", "--quiet", "-b", "feature")
+        first = self.fixture.commit("first", T0 + DAY)
+        self.fixture.git("checkout", "--quiet", "main")
+        self.fixture.commit("unrelated main work", T0 + 2 * DAY)
+        self.fixture.git("checkout", "--quiet", "feature")
+        merged = f"{T0 + 3 * DAY} +0000"
+        self.fixture.git("merge", "--quiet", "--no-ff", "-m", "merge main into feature", "main",
+                         env={"GIT_AUTHOR_DATE": merged, "GIT_COMMITTER_DATE": merged})
+        merge = self.fixture.git("rev-parse", "HEAD")
+        second = self.fixture.commit("second", T0 + 4 * DAY)
+        github = FakeGitHub([pr(12, "Available: nil")], {12: pr_commits(first, merge, second)})
+
+        code, out, err = self.plan_cli(github)
+
+        self.assertEqual(0, code, err)
+        self.assertEqual([f"git cherry-pick -x {first}", f"git cherry-pick -x {second}"],
+                         [line for line in out.splitlines() if line.startswith("git cherry-pick")])
+        self.assertNotIn(merge, out)
+        self.assertEqual(f"warning: PR #12: skipping merge commit {merge}; "
+                         "cherry-pick its branch commits only\n", err)
+
+    def test_cherry_pick_trailer_text_inside_a_diff_is_not_attributed(self):
+        self.fixture.tag("v2025.2.8.0", self.fixture.commit("base"))
+        self.fixture.git("checkout", "--quiet", "-b", "source")
+        patch_commit = self.fixture.commit(
+            "patch", content=f"(cherry picked from commit {'e' * 40})\n")
+        self.fixture.git("checkout", "--quiet", "-b", "2025.2.8.0-shopify-1-candidate", "main")
+        self.fixture.git("cherry-pick", "-x", patch_commit)
+        self.fixture.git("checkout", "--quiet", "main")
+
+        code, out, err = self.plan_cli(unlabelled_github({1: [patch_commit]}))
+
+        self.assertEqual(0, code, err)
+        self.assertIn("All commits have been applied.", out)
+        self.assertNotIn("git cherry-pick", out)
 
     def test_done_detects_a_pr_commit_that_sits_directly_on_the_candidate(self):
         self.fixture.tag("v2025.2.8.0", self.fixture.commit("base"))
