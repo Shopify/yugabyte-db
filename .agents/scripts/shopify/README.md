@@ -1,4 +1,4 @@
-# Shopify contribution issue tool
+# Shopify contribution tools
 
 `issues.py` implements the mechanical part of `shopify-create-issue`: private
 intake, public-form rendering, disclosure checks, fork publication, and private
@@ -187,3 +187,44 @@ Before rollout, exercise the skill itself against synthetic incident reports:
 
 Review disclosure and technical usefulness separately. Real incident examples
 and their evaluation results belong in private storage, not this repository.
+
+## Release planner
+
+`release.py` plans a Shopify release of YugabyteDB: the Shopify patches to
+cherry-pick onto an upstream release tag, and the git commands that create or
+resume the `<version>-shopify-<sequence>-candidate` branch. It succeeds the Ruby
+`version_builder.rb` in the private build tooling, which remains until this has
+planned a release; the release process itself is unchanged.
+
+```bash
+# The default --repo-path is the checkout containing this script.
+python3 .agents/scripts/shopify/release.py --version 2025.2.8.0
+python3 .agents/scripts/shopify/release.py --version v2025.2.8.0 --no-fetch \
+  --target-branch 2025.2.8.0-shopify-2-candidate --previous-release 2025.2.7.0-shopify-3
+```
+
+Planning is read-only. It fetches (`git fetch --all --tags`, unless `--no-fetch`),
+reads fork PRs through `gh`, and prints commands; it never creates or moves refs.
+`--repo-path` points it at another checkout.
+
+Patches are fork PRs carrying `Available:` labels. Selection is label-driven
+regardless of PR state: a closed PR with an `Available:` label is still a patch.
+`Available: X.Y.Z` means upstream includes the fix from that version: the PR is
+skipped when the target is at or after `X.Y.Z` in the same series, or when `X.Y.Z`
+is the first release of an earlier series. `Available: nil` is a permanent fork
+patch; the report lists PRs included because their availability is unknown. A
+landed PR contributes its merge commit (with `-m 1` only for a real merge commit);
+an open PR contributes its branch commits, skipping merge commits with a warning.
+Commits are ordered by committer time (oldest PR first on ties), reuse the previous
+Shopify release's cherry-pick where one exists so that conflict resolutions carry
+over, and are reported as done when the candidate branch already has them.
+
+The sequence comes from existing `<version>-shopify-<n>` tags and branches; an
+unreleased `-candidate` branch that descends from the upstream tag is resumed, and
+one that does not is an error. Exit codes: 0, 2 for usage errors, 1 otherwise.
+
+The previous Shopify release whose cherry-picks are reused is the highest lower
+release in any series, so a series' first Shopify release reuses them from an
+earlier series and later ones reuse them from their own.
+
+`test_release.py` runs under the same `unittest discover` command as above.
