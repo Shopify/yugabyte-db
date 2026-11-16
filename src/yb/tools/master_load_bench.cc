@@ -200,7 +200,8 @@ DEFINE_NON_RUNTIME_string(metric_substrings,
     "rpcs_timed_out_in_queue,"
     "rpcs_timed_out_early_in_queue,"
     "service_request_bytes_yb_master_,"
-    "service_response_bytes_yb_master_",
+    "service_response_bytes_yb_master_,"
+    "load_balancer_duration",
     "Master prometheus metrics to collect: comma-separated substrings; matching series are "
     "summed per metric name.");
 
@@ -2936,8 +2937,8 @@ class MasterLoadBench {
       }
       zone_out << region_header << "\n" << zone_header << "   (tablets/leaders)\n";
       request_out << StringPrintf(
-          "%-8s%-16s%-16s%-16s%-16s(received/applied per minute)\n", "time", "AddServer",
-          "RemoveServer", "LeaderStepDown", "DeleteTablet");
+          "%-8s%-16s%-16s%-16s%-16s%-16s(received/applied per minute; balancer runs/s per run)\n",
+          "time", "AddServer", "RemoveServer", "LeaderStepDown", "DeleteTablet", "Balancer");
     }
     zone_out << StringPrintf("%-8s", now);
     for (const auto& [region, zones] : regions) {
@@ -2961,6 +2962,20 @@ class MasterLoadBench {
           Format("$0/$1", received - last_requests_[i].first,
                  applied - last_requests_[i].second).c_str());
       last_requests_[i] = {received, applied};
+    }
+    std::map<string, double> balancer;
+    EasyCurl curl;
+    faststring body;
+    if (curl.FetchURL(
+            Format("http://127.0.0.1:$0/prometheus-metrics", FLAGS_master_web_port), &body).ok()) {
+      ParsePrometheusMetrics(body.ToString(), {"load_balancer_duration"}, &balancer);
+    }
+    const auto runs = balancer["load_balancer_duration_count"] - last_balancer_.first;
+    const auto run_ms = balancer["load_balancer_duration_sum"] - last_balancer_.second;
+    request_out << (runs > 0 ? StringPrintf("%.0f/%.2f", runs, run_ms / runs / 1000) : "0/-");
+    if (!balancer.empty()) {
+      last_balancer_ = {balancer["load_balancer_duration_count"],
+                        balancer["load_balancer_duration_sum"]};
     }
     request_out << "\n";
   }
@@ -4668,6 +4683,8 @@ class MasterLoadBench {
   static constexpr int kZoneColumn = 12;
   int zone_load_lines_ = 0;
   std::pair<int64_t, int64_t> last_requests_[4];
+  // Balancer run count and total run time (ms) at the previous row.
+  std::pair<double, double> last_balancer_;
   HollowTServerRegistry registry_;
 
   std::mutex universe_uuid_mutex_;
