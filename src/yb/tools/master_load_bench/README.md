@@ -179,6 +179,19 @@ This copies the snapshot back into `--data_dir` and then behaves like `--resume`
 metadata stores absolute paths, so a snapshot only restores into the `--data_dir` it was taken
 from.
 
+## Simulated masters
+
+`--num_masters=N` (default 7) makes the spawned yb-master the leader of N masters. The other
+N - 1 are simulated inside the bench: they vote for the spawned master, acknowledge every
+UpdateConsensus at once and store nothing. Every sys catalog write is replicated to them and
+waits for a majority as in production, and the spawned master always stays the leader.
+`--num_masters=1` runs the spawned master alone.
+
+They listen on `--simulated_master_port` (default 21110) and the ports after it, and the real
+tserver is given all N addresses. The number of masters and the port are fixed once the cluster
+is created: a `--resume` or `--from_snapshot` run takes both from `meta.txt`, and a snapshot made
+before this flag existed runs with one master.
+
 ## Load balancing
 
 The master's load balancer is on by default, on macOS and Linux alike; no flag is needed. The
