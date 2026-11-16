@@ -367,6 +367,14 @@ python3 src/yb/tools/master_load_bench/report.py /tmp/mlb-smoke.csv
 python3 src/yb/tools/master_load_bench/report.py before.csv after.csv
 ```
 
+`--balancer` prints the load balancer per minute instead: requests received/applied, runs and
+seconds per run, for the last 10 minutes (`--last=N`, 0 for the whole run). It works on the CSV
+of a run in progress; the load balancer is done when the request columns are all zeros.
+
+```
+python3 src/yb/tools/master_load_bench/report.py --balancer /tmp/mlb.csv
+```
+
 The two-file form compares a run before a master change with one after: each window shows both
 runs side by side with the delta per metric. The bench appends to an existing `--csv`, so a file
 can hold several runs; the report takes the last one and says so.
