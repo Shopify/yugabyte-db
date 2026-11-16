@@ -241,6 +241,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <set>
 #include <string>
 
@@ -504,6 +505,13 @@ class Metric : public RefCountedThreadSafe<Metric> {
 };
 
 using MetricPtr = scoped_refptr<Metric>;
+
+// Registers `callback` to run at the start of every MetricRegistry::WriteForPrometheus, before
+// pre-aggregated values are read. Lets metrics that defer their pre-aggregation updates bring the
+// aggregates up to date for the scrape. Callbacks are never removed, so captured objects must
+// outlive the process. Concurrent scrapes may run a callback concurrently, so it must be
+// thread-safe.
+void AddPrometheusPreScrapeCallback(std::function<void()> callback);
 
 // Registry of all the metrics for a server.
 //
