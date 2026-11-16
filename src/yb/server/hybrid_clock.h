@@ -38,7 +38,6 @@
 #include <sys/timex.h>
 #endif // !defined(__APPLE__)
 
-#include <boost/atomic.hpp>
 
 #include "yb/gutil/port.h"
 #include "yb/gutil/ref_counted.h"
@@ -48,40 +47,6 @@
 
 namespace yb {
 namespace server {
-
-struct HybridClockComponents {
-  // The last clock read/update, in microseconds.
-  MicrosTime last_usec = 0;
-
-  // The next logical value to be assigned to a hybrid time.
-  uint64_t logical = 0;
-
-  HybridClockComponents() noexcept {}
-
-  HybridClockComponents(MicrosTime last_usec_, LogicalTimeComponent logical_)
-      : last_usec(last_usec_),
-        logical(logical_) {
-  }
-
-  HybridClockComponents(HybridClockComponents&& other) = default;
-  HybridClockComponents(const HybridClockComponents& other) = default;
-  HybridClockComponents& operator=(const HybridClockComponents& other) = default;
-  HybridClockComponents& operator=(HybridClockComponents&& other) = default;
-
-  bool operator< (const HybridClockComponents& o) const {
-    return last_usec < o.last_usec || (last_usec == o.last_usec && logical < o.logical);
-  }
-
-  bool operator<= (const HybridClockComponents& o) const {
-    return last_usec < o.last_usec || (last_usec == o.last_usec && logical <= o.logical);
-  }
-
-  void HandleLogicalComponentOverflow();
-
-  std::string ToString() const;
-};
-
-std::ostream& operator<<(std::ostream& out, const HybridClockComponents& components);
 
 // The HybridTime clock.
 //
@@ -96,6 +61,11 @@ class HybridClock : public Clock {
   Status Init() override;
 
   HybridTimeRange NowRange() override;
+
+  // See ClockBase::CoarseNow. Returns the clock's latest hybrid time without advancing the clock
+  // while that is within FLAGS_hybrid_clock_coarse_now_max_lag_us of the physical clock, and
+  // NowRange() otherwise or when the flag is negative.
+  HybridTimeRange CoarseNowRange() override;
 
   // Updates the clock with a hybrid_time originating on another machine.
   void Update(const HybridTime& to_update) override;
@@ -133,19 +103,29 @@ class HybridClock : public Clock {
   // Used to get the current error, for metrics.
   int64_t SkewForMetrics();
 
-  PhysicalClockPtr clock_;
+  // Reports a physical clock that is behind the clock's hybrid time by more than the allowed skew.
+  void CheckSkew(const PhysicalTime& now, MicrosTime last_usec);
+
+  // Read by every call and never written after Init(): on a cache line of their own, away from the
+  // reference count in the base class, which every copy of a ClockPtr writes, and from next_.
+  alignas(CACHELINE_SIZE) PhysicalClockPtr clock_;
   State state_ = kNotInitialized;
 
-  // On a cache line of its own. Every NowWithError() writes it, from every thread of the server,
-  // so the line is always owned by whichever core wrote it last; anything sharing the line (clock_,
-  // which every call reads first) would miss along with it.
-  alignas(CACHELINE_SIZE) boost::atomic<HybridClockComponents> components_{
-      HybridClockComponents(0, 0)};
+  // The smallest hybrid time, as HybridTime::ToUint64, that this clock has not returned yet: every
+  // hybrid time it has returned or was given in Update() is below it. The physical microseconds and
+  // the logical counter that used to be two fields are the high and low bits of this one value
+  // (HybridTime is microseconds * 4096 + logical, and the logical part carries into the
+  // microseconds), so that reading it is a plain load. As a 16-byte atomic even a load was a locked
+  // compare-and-swap, which took the cache line for writing: every call, also an Update() that
+  // changed nothing, did that from every thread of the server.
+  //
+  // On a cache line of its own: Now() writes it.
+  alignas(CACHELINE_SIZE) std::atomic<uint64_t> next_{0};
 
   // Clock metrics are set to detach to their last value. This means
   // that, during our destructor, we'll need to access other class members
   // declared above this. Hence, this member must be declared last.
-  // Aligned so that it does not share the line of components_.
+  // Aligned so that it does not share the line of next_.
   alignas(CACHELINE_SIZE) std::shared_ptr<void> metric_detacher_;
 };
 

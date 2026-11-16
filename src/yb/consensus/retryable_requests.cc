@@ -402,7 +402,7 @@ class RetryableRequests::Impl {
       const auto retryable_request_timeout = request_timeout_secs_ * 1s;
       const auto max_clock_skew = FLAGS_max_clock_skew_usec * 1us;
       if (PREDICT_TRUE(retryable_request_timeout > max_clock_skew)) {
-        const auto now_micros = server_clock_->Now().GetPhysicalValueMicros();
+        const auto now_micros = server_clock_->CoarseNow().GetPhysicalValueMicros();
         VLOG_WITH_PREFIX(4) << Format(
             "Checking start_time(now:$0 start:$1)", now_micros, data.write().start_time_micros());
         if (data.write().start_time_micros() * 1us <

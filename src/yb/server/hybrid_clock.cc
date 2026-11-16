@@ -84,6 +84,16 @@ DEFINE_UNKNOWN_uint64(clock_skew_force_crash_bound_usec, 60000000,
               "for avoiding really large hybrid clock jumps. Set to 0 to disable the check. Note "
               "that this check is only preformed for clock skew greater than max_clock_skew_usec.");
 
+DEFINE_RUNTIME_int64(hybrid_clock_coarse_now_max_lag_us, 100,
+    "How far behind the physical clock, in microseconds, the hybrid time may be that the clock "
+    "hands to callers that do not need a unique hybrid time (CoarseNow: message stamps, lease and "
+    "timeout arithmetic, the bound of a wait). Such a caller gets the latest hybrid time of the "
+    "clock without advancing it, unless that is further behind than this, in which case the clock "
+    "is advanced as by Now(). The effect on those callers is that of a physical clock that is "
+    "slow by at most this much, so keep it far below max_clock_skew_usec. Negative: every such "
+    "read advances the clock, as before this flag existed.");
+TAG_FLAG(hybrid_clock_coarse_now_max_lag_us, advanced);
+
 DECLARE_uint64(max_clock_skew_usec);
 
 
@@ -174,11 +184,34 @@ HybridTimeRange HybridClock::NowRange() {
   return std::make_pair(now, max_global_now);
 }
 
+void HybridClock::CheckSkew(const PhysicalTime& now, MicrosTime last_usec) {
+  auto delta_us = last_usec - now.time_point;
+  // Propagated hybrid time cannot be higher than the global limit.
+  auto max_global_time = clock_->MaxGlobalTime(now);
+  if (delta_us > FLAGS_max_clock_skew_usec || last_usec > max_global_time) {
+    auto delta = MonoDelta::FromMicroseconds(delta_us);
+    auto max_allowed = MonoDelta::FromMicroseconds(
+        std::min(FLAGS_max_clock_skew_usec, max_global_time - now.time_point));
+    if ((ANNOTATE_UNPROTECTED_READ(FLAGS_fail_on_out_of_range_clock_skew) ||
+         (ANNOTATE_UNPROTECTED_READ(FLAGS_clock_skew_force_crash_bound_usec) > 0 &&
+          delta_us > ANNOTATE_UNPROTECTED_READ(FLAGS_clock_skew_force_crash_bound_usec))) &&
+        clock_skew_control_enabled.load(std::memory_order_acquire)) {
+      TryRunClockDiagnosticsOnce();
+      LOG(FATAL) << "Too big clock skew is detected: " << delta << ", while max allowed is: "
+                 << max_allowed << "; clock_skew_force_crash_bound_usec="
+                 << ANNOTATE_UNPROTECTED_READ(FLAGS_clock_skew_force_crash_bound_usec);
+    } else {
+      YB_LOG_EVERY_N_SECS(ERROR, 1)
+          << "Too big clock skew is detected: " << delta << ", while max allowed is: "
+          << max_allowed << "; clock_skew_force_crash_bound_usec="
+          << ANNOTATE_UNPROTECTED_READ(FLAGS_clock_skew_force_crash_bound_usec);
+    }
+  }
+}
+
 void HybridClock::NowWithError(HybridTime *hybrid_time, uint64_t *max_error_usec) {
   DCHECK_EQ(state_, kInitialized) << "Clock not initialized. Must call Init() first.";
 
-  // Read the physical clock before touching components_, so that nothing slow sits between
-  // reading components_ and swapping it below.
   auto now = clock_->Now();
   if (PREDICT_FALSE(!now.ok())) {
     TryRunClockDiagnosticsOnce();
@@ -186,60 +219,45 @@ void HybridClock::NowWithError(HybridTime *hybrid_time, uint64_t *max_error_usec
         "Status: $0", now.status().ToString());
   }
 
-  // Read components_ with a compare-and-swap that leaves it as it is, instead of a load. Every
-  // call ends in a successful swap, and with all threads of the server calling, the cache line of
-  // components_ is contended: a load takes the line shared and the swap then has to upgrade it,
-  // by which time another core has usually taken it and the swap fails. A compare-and-swap takes
-  // the line for writing whether or not it succeeds, and on failure returns the current value, so
-  // the read and the swap that follows share one transfer of the line. What the function returns
-  // and stores is unchanged.
-  HybridClockComponents current_components;
-  components_.compare_exchange_strong(current_components, current_components);
-
-  // If the current time surpasses the last update just return it
-  HybridClockComponents new_components = { now->time_point, 1 };
-
-  VLOG(4) << __func__ << ", new: " << new_components << ", current: " << current_components;
-
-  if (now->time_point < current_components.last_usec) {
-    auto delta_us = current_components.last_usec - now->time_point;
-    // Propagated hybrid time cannot be higher than the global limit.
-    auto max_global_time = clock_->MaxGlobalTime(*now);
-    if (delta_us > FLAGS_max_clock_skew_usec ||
-        current_components.last_usec > max_global_time) {
-      auto delta = MonoDelta::FromMicroseconds(delta_us);
-      auto max_allowed = MonoDelta::FromMicroseconds(
-          std::min(FLAGS_max_clock_skew_usec, max_global_time - now->time_point));
-      if ((ANNOTATE_UNPROTECTED_READ(FLAGS_fail_on_out_of_range_clock_skew) ||
-           (ANNOTATE_UNPROTECTED_READ(FLAGS_clock_skew_force_crash_bound_usec) > 0 &&
-            delta_us > ANNOTATE_UNPROTECTED_READ(FLAGS_clock_skew_force_crash_bound_usec))) &&
-          clock_skew_control_enabled.load(std::memory_order_acquire)) {
-        TryRunClockDiagnosticsOnce();
-        LOG(FATAL) << "Too big clock skew is detected: " << delta << ", while max allowed is: "
-                   << max_allowed << "; clock_skew_force_crash_bound_usec="
-                   << ANNOTATE_UNPROTECTED_READ(FLAGS_clock_skew_force_crash_bound_usec);
-      } else {
-        YB_LOG_EVERY_N_SECS(ERROR, 1)
-            << "Too big clock skew is detected: " << delta << ", while max allowed is: "
-            << max_allowed << "; clock_skew_force_crash_bound_usec="
-            << ANNOTATE_UNPROTECTED_READ(FLAGS_clock_skew_force_crash_bound_usec);
+  // The hybrid time to return is the physical time with a zero logical part, or, when the clock is
+  // already at or past that (another call in the same microsecond, a physical clock that went
+  // back, a larger hybrid time from another server), the next value after the last one returned.
+  // That is max(physical, next_), and next_ becomes the result plus one.
+  //
+  // The usual case under load is the second: one atomic add takes the value and advances the
+  // clock, and cannot fail whatever other threads do.
+  const uint64_t physical = HybridTime::FromMicros(now->time_point).ToUint64();
+  uint64_t issued = next_.fetch_add(1, std::memory_order_acq_rel);
+  if (issued < physical) {
+    // The physical clock is ahead: move the clock up to it. The value taken above is dropped (it
+    // is below the physical time and nobody else can get it).
+    uint64_t next = issued + 1;
+    for (;;) {
+      if (next > physical) {
+        // Another thread moved the clock to this physical time, or past it, first.
+        issued = next_.fetch_add(1, std::memory_order_acq_rel);
+        break;
       }
-    }
-  } else {
-    // Loop over the check in case of concurrent updates making the CAS fail.
-    while (now->time_point > current_components.last_usec) {
-      if (components_.compare_exchange_weak(current_components, new_components)) {
-        *hybrid_time = HybridTime::FromMicros(new_components.last_usec);
-        *max_error_usec = now->max_error;
-        if (PREDICT_FALSE(VLOG_IS_ON(2))) {
-          VLOG(2) << "Current clock is higher than the last one. Resetting logical values."
-              << " Time: " << *hybrid_time << ", Error: " << *max_error_usec;
-        }
-        return;
+      if (next_.compare_exchange_weak(next, physical + 1, std::memory_order_acq_rel,
+                                      std::memory_order_acquire)) {
+        issued = physical;
+        break;
       }
     }
   }
 
+  *hybrid_time = HybridTime(issued);
+  if (issued == physical) {
+    *max_error_usec = now->max_error;
+    if (PREDICT_FALSE(VLOG_IS_ON(2))) {
+      VLOG(2) << "Current clock is higher than the last one. Resetting logical values."
+          << " Time: " << *hybrid_time << ", Error: " << *max_error_usec;
+    }
+    return;
+  }
+
+  // The clock is ahead of the physical time read above.
+  //
   // We don't have the last time read max error since it might have originated
   // in another machine, but we can put a bound on the maximum error of the
   // hybrid_time we are providing.
@@ -257,24 +275,40 @@ void HybridClock::NowWithError(HybridTime *hybrid_time, uint64_t *max_error_usec
   // always return: last - (now - e) as the new maximum error.
   // This broadens the error interval for both cases but always returns
   // a correct error interval.
-
-  do {
-    new_components.last_usec = current_components.last_usec;
-    new_components.logical = current_components.logical + 1;
-    new_components.HandleLogicalComponentOverflow();
-    // Loop over the check until the CAS succeeds, in case there are concurrent updates.
-  } while (!components_.compare_exchange_weak(current_components, new_components));
-
-  *max_error_usec = new_components.last_usec - (now->time_point - now->max_error);
-
-  // We've already atomically incremented the logical, so subtract 1.
-  *hybrid_time = HybridTime::FromMicrosecondsAndLogicalValue(
-      new_components.last_usec,
-      narrow_cast<LogicalTimeComponent>(new_components.logical)).Decremented();
+  const MicrosTime last_usec = HybridTime(issued + 1).GetPhysicalValueMicros();
+  if (now->time_point < last_usec) {
+    CheckSkew(*now, last_usec);
+  }
+  *max_error_usec = last_usec - (now->time_point - now->max_error);
   if (PREDICT_FALSE(VLOG_IS_ON(2))) {
     VLOG(2) << "Current clock is lower than the last one. Returning last read and incrementing"
         " logical values. Hybrid time: " << *hybrid_time << " Error: " << *max_error_usec;
   }
+}
+
+HybridTimeRange HybridClock::CoarseNowRange() {
+  const int64_t max_lag_us = FLAGS_hybrid_clock_coarse_now_max_lag_us;
+  if (max_lag_us < 0) {
+    return NowRange();
+  }
+  auto now = clock_->Now();
+  const uint64_t next = next_.load(std::memory_order_acquire);
+  if (PREDICT_FALSE(!now.ok() || next == 0)) {
+    return NowRange();
+  }
+  // The latest hybrid time the clock returned or was updated to: at least every hybrid time anyone
+  // got from this clock before the load above, and below every hybrid time Now() returns after it.
+  const HybridTime latest(next - 1);
+  const MicrosTime latest_usec = latest.GetPhysicalValueMicros();
+  // Not when it is too far behind the physical clock (the caller wants the current time), and not
+  // when it is ahead by more than the allowed skew (Now() reports that).
+  if (latest_usec + max_lag_us < now->time_point ||
+      latest_usec > now->time_point + FLAGS_max_clock_skew_usec) {
+    return NowRange();
+  }
+  const MicrosTime usec = std::max(latest_usec, now->time_point);
+  const uint64_t error = usec - (now->time_point - now->max_error);
+  return std::make_pair(latest, HybridTime::FromMicros(clock_->MaxGlobalTime({usec, error})));
 }
 
 void HybridClock::Update(const HybridTime& to_update) {
@@ -282,21 +316,21 @@ void HybridClock::Update(const HybridTime& to_update) {
     return;
   }
 
-  HybridClockComponents current_components = components_.load(boost::memory_order_acquire);
-  HybridClockComponents new_components = {
-    to_update.GetPhysicalValueMicros(), to_update.GetLogicalValue() + 1
-  };
+  // Every hybrid time returned from now on must be above to_update. Nothing is written when the
+  // clock is there already, which is the usual case for a replica that follows a leader whose clock
+  // is not ahead of its own.
+  const uint64_t target = to_update.ToUint64() + 1;
+  uint64_t next = next_.load(std::memory_order_acquire);
 
   // VLOG(4) crashes in TSAN mode
   if (VLOG_IS_ON(4)) {
-    LOG(INFO) << __func__ << ", new: " << new_components << ", current: " << current_components;
+    LOG(INFO) << __func__ << ", new: " << HybridTime(target) << ", current: " << HybridTime(next);
   }
 
-  new_components.HandleLogicalComponentOverflow();
-
   // Keep trying to CAS until it works or until HT has advanced past this update.
-  while (current_components < new_components &&
-      !components_.compare_exchange_weak(current_components, new_components)) {}
+  while (next < target &&
+         !next_.compare_exchange_weak(next, target, std::memory_order_acq_rel,
+                                      std::memory_order_acquire)) {}
 }
 
 // Used to get the hybrid_time for metrics.
@@ -314,7 +348,8 @@ uint64_t HybridClock::ErrorForMetrics() {
 }
 
 int64_t HybridClock::SkewForMetrics() {
-  HybridClockComponents current_components = components_.load(boost::memory_order_acquire);
+  const MicrosTime last_usec =
+      HybridTime(next_.load(std::memory_order_acquire)).GetPhysicalValueMicros();
   auto now = clock_->Now();
   if (PREDICT_FALSE(!now.ok())) {
     LOG(DFATAL) << Format("Couldn't get the current time: Clock unsynchronized. "
@@ -322,31 +357,8 @@ int64_t HybridClock::SkewForMetrics() {
     return 0;
   }
   // Making sure we don't return a negative value.
-  int64_t potential_skew = current_components.last_usec - now->time_point;
+  int64_t potential_skew = last_usec - now->time_point;
   return std::max<int64_t>(0, potential_skew);
-}
-
-std::string HybridClockComponents::ToString() const {
-  return Format("{ last_usec: $0 logical: $1 }", last_usec, logical);
-}
-
-std::ostream& operator<<(std::ostream& out, const HybridClockComponents& components) {
-  return out << components.ToString();
-}
-
-void HybridClockComponents::HandleLogicalComponentOverflow() {
-  if (logical > HybridTime::kLogicalBitMask) {
-    static constexpr uint64_t kMaxOverflowValue = 1ULL << HybridTime::kBitsForLogicalComponent;
-    if (logical > kMaxOverflowValue) {
-      LOG(FATAL) << "Logical component is too high: last_usec=" << last_usec
-                 << "logical=" << logical << ", max allowed is " << kMaxOverflowValue;
-    }
-    YB_LOG_EVERY_N_SECS(WARNING, 5) << "Logical component overflow: "
-        << "last_usec=" << last_usec << ", logical=" << logical;
-
-    last_usec += logical >> HybridTime::kBitsForLogicalComponent;
-    logical &= HybridTime::kLogicalBitMask;
-  }
 }
 
 void HybridClock::RegisterMetrics(const scoped_refptr<MetricEntity>& metric_entity) {

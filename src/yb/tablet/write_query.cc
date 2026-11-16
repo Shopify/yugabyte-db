@@ -955,7 +955,8 @@ Status WriteQuery::DoExecute() {
   if (isolation_level_ == IsolationLevel::NON_TRANSACTIONAL) {
     SCHECK(!is_advisory_lock_request, InvalidArgument,
            "Unexpected advisory lock request with NON_TRANSACTIONAL isolation level");
-    auto now = tablet->clock()->Now();
+    // Where conflict resolution starts from: a current time, not an identity.
+    auto now = tablet->clock()->CoarseNow();
     auto conflict_management_policy = GetConflictManagementPolicy(
         wait_queue, write_batch, is_advisory_lock_request);
 
@@ -1071,7 +1072,7 @@ Status WriteQuery::PickReadTimeIfNecessary() {
   auto safe_time = VERIFY_RESULT(tablet->SafeTime(RequireLease::kTrue));
   if (!read_time_) {
     read_time_ = ReadHybridTime::FromHybridTimeRange(
-        {safe_time, tablet->clock()->NowRange().second});
+        {safe_time, tablet->clock()->CoarseNowRange().second});
     read_time_.local_limit = safe_time;
     metrics_->Increment(tablet::TabletCounters::kPickReadTimeOnDocDB);
     return Status::OK();

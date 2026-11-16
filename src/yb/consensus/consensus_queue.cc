@@ -518,8 +518,10 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
     HybridTime now_ht;
 
     is_new = peer->is_new;
+    // now_ht stamps the request and gives the physical time the leases count from. Neither needs
+    // a unique hybrid time; a value that is slightly behind only makes the lease start earlier.
     if (!is_new) {
-      now_ht = clock_->Now();
+      now_ht = clock_->CoarseNow();
 
       auto ht_lease_expiration_micros = now_ht.GetPhysicalValueMicros() +
                                         FLAGS_ht_lease_duration_ms * 1000;
@@ -542,7 +544,7 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
           CoarseMonoClock::Now() + leader_lease_duration_ms * 1ms - kCoarseClockPrecision * 2;
       peer->leader_ht_lease_expiration.last_sent = ht_lease_expiration_micros;
     } else {
-      now_ht = clock_->Now();
+      now_ht = clock_->CoarseNow();
       request->clear_leader_lease_duration_ms();
       request->clear_ht_lease_expiration();
       peer->leader_lease_expiration.Reset();

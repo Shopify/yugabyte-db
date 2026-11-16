@@ -649,7 +649,7 @@ class WriteQueryCompletionCallback {
     if (include_trace_ && trace_) {
       response_->dup_trace_buffer(trace_->DumpToString(true));
     }
-    response_->set_propagated_hybrid_time(clock_->Now().ToUint64());
+    response_->set_propagated_hybrid_time(clock_->CoarseNow().ToUint64());
     FillTabletConsensusInfoIfRequestOpIdStale(tablet_peer_, query_->client_request(), response_);
     context_->RespondSuccess();
     VLOG(1) << __PRETTY_FUNCTION__ << " RespondedSuccess";
@@ -2967,7 +2967,7 @@ void ConsensusServiceImpl::CompleteUpdateConsensusResponse(
       resp->set_pending_post_split_compaction(true);
     }
   }
-  resp->set_propagated_hybrid_time(tablet_peer->clock().Now().ToUint64());
+  resp->set_propagated_hybrid_time(tablet_peer->clock().CoarseNow().ToUint64());
 }
 
 void ConsensusServiceImpl::MultiRaftUpdateConsensus(

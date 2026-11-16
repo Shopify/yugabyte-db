@@ -149,6 +149,10 @@ void ConsistentReadPoint::UpdateClock(HybridTime propagated_hybrid_time) {
   clock_->Update(propagated_hybrid_time);
 }
 
+HybridTime ConsistentReadPoint::CoarseNow() const {
+  return clock_->CoarseNow();
+}
+
 HybridTime ConsistentReadPoint::Now() const {
   return clock_->Now();
 }
