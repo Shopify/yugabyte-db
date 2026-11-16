@@ -91,6 +91,22 @@ Options not used today, kept for when the load has to be cut down:
   tablet count per tserver is part of the production shape being reproduced; `SPLIT AT` clauses
   are left alone either way.
 
+## Steps of a run
+
+Every run goes through the same steps in this order. Each of steps 1, 2, 3 and 5 is chosen
+independently, so there are 3 × 2 × 2 × 2 = 24 ways to start the bench.
+
+| Step | Choices | Flags |
+|---|---|---|
+| 1. Start state | fresh empty cluster, resume, or restore from a snapshot | none, `--resume`, `--from_snapshot=<dir>` |
+| 2. Load SQL files | with or without | `--input-dir` or `--sql_file` |
+| 3. Scenario | with or without | `--scenario=<file>` |
+| 4. Idle | always | `--run_seconds=N` (0, the default, idles until Ctrl-C) |
+| 5. Snapshot on exit | with or without | `--snapshot_dir=<dir>` |
+
+`--resume` and `--from_snapshot` are mutually exclusive. The sections below show the common
+combinations.
+
 ## 3. Load
 
 ```
@@ -162,6 +178,36 @@ build/latest/bin/master-load-bench --flagfile=src/yb/tools/master_load_bench/ben
 This copies the snapshot back into `--data_dir` and then behaves like `--resume`. Tablet
 metadata stores absolute paths, so a snapshot only restores into the `--data_dir` it was taken
 from.
+
+## Load balancing
+
+The master's load balancer is on by default, on macOS and Linux alike; no flag is needed. The
+bench keeps it off while it sets up a fresh cluster and while the SQL files load, and turns it
+on for the scenario and the idle. The hollow tservers carry out its requests: add and remove a
+replica, leader stepdown, delete a tablet.
+
+To keep it off for the whole run, for example to save a snapshot that is not balanced yet, add
+`--enable_load_balancing=false` to the master's flags. `--master_flags` on the command line
+replaces the value from the flag file, so repeat what the flag file has.
+
+macOS:
+
+```
+build/latest/bin/master-load-bench --flagfile=src/yb/tools/master_load_bench/bench.flags \
+    --num_tservers=100 --input-dir=/tmp/mlb-prep --snapshot_dir=/tmp/mlb-snapshot \
+    --master_flags=--flagfile=src/yb/tools/master_load_bench/master.flags,--enable_load_balancing=false
+```
+
+Linux:
+
+```
+build/latest/bin/master-load-bench --flagfile=src/yb/tools/master_load_bench/bench-linux.flags \
+    --num_tservers=100 --input-dir=/tmp/mlb-prep --snapshot_dir=/tmp/mlb-snapshot \
+    --master_flags=--flagfile=src/yb/tools/master_load_bench/master.flags,--num_reactor_threads=192,--enable_load_balancing=false
+```
+
+The setting is not stored in the snapshot: a run that starts from it without the flag has the
+load balancer on.
 
 ## 6. Scenario file
 
@@ -305,11 +351,16 @@ The CSV is long format, one row per metric per 5 s sample: `epoch_ms, elapsed_se
 metric, value`. Per sample: master CPU seconds and RSS, the master Prometheus series matching
 `--metric_substrings` (per-method handler latency, queue depth and time, overflows, bytes), and
 the bench's own counters `bench_rpc_<Method>_{ok_total,failed_total,latency_us_sum,latency_count}`
-and `bench_ysql_connect_{...}`. Written immediately rather than per sample: `mark,<label>` and
+and `bench_ysql_connect_{...}`. For load balancing: `load_balancer_duration_{count,sum}` (runs and
+total run time in ms), `bench_balancer_<Request>_{received_total,applied_total}` for AddServer,
+RemoveServer, LeaderStepDown and DeleteTablet as seen by the hollow tservers (received minus
+applied is what the tablet's leader rejected), and `bench_zone_<zone>_{tablets,leaders}`.
+Written immediately rather than per sample: `mark,<label>` and
 `bench_sql_<name|lineN>_latency_ms` per `sql` statement.
 
 `report.py` prints, per window between marks, master CPU and RSS, per-method rate and mean
-latency, queue depth, failures and `sql` latencies:
+latency, queue depth, failures, `sql` latencies, load balancer runs and seconds per run, the
+load balancer's requests, and tablets and leaders per zone at the end of the window:
 
 ```
 python3 src/yb/tools/master_load_bench/report.py /tmp/mlb-smoke.csv

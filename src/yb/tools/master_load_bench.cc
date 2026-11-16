@@ -959,7 +959,7 @@ class HollowTServerRegistry {
 
   const std::vector<std::unique_ptr<HollowTServer>>& tservers() const { return tservers_; }
 
-  // Load balancer requests received and applied by hollow tservers, for the idle-phase log.
+  // Load balancer requests received and applied by hollow tservers, for the CSV.
   struct RequestCount {
     std::atomic<int64_t> received{0};
     std::atomic<int64_t> applied{0};
@@ -2923,13 +2923,8 @@ class MasterLoadBench {
         ? MonoTime::Now() + MonoDelta::FromSeconds(FLAGS_run_seconds) : MonoTime::Max();
     LOG(INFO) << "Idle" << (FLAGS_run_seconds > 0 ? Format(" for $0s", FLAGS_run_seconds) : "")
               << "; SIGINT/SIGTERM stops the run";
-    auto next_zone_load = MonoTime::Now();
     while (!g_stop_requested.load(std::memory_order_acquire) && MonoTime::Now() < idle_deadline) {
       RETURN_NOT_OK(CheckMasterAlive());
-      if (MonoTime::Now() >= next_zone_load) {
-        LogZoneLoad();
-        next_zone_load = MonoTime::Now() + MonoDelta::FromSeconds(60);
-      }
       SleepFor(500ms);
     }
     if (!FLAGS_snapshot_dir.empty()) {
@@ -2949,102 +2944,6 @@ class MasterLoadBench {
   }
 
  private:
-  // Appends one row per call to two tables in the data dir: tablets/leaders per zone, and the
-  // load balancer's requests to hollow tservers since the previous row.
-  void LogZoneLoad() {
-    struct Zone {
-      string name;
-      size_t tablets = 0;
-      size_t leaders = 0;
-    };
-    std::vector<std::pair<string, std::vector<Zone>>> regions;
-    for (const auto& ts : registry_.tservers()) {
-      const auto& cloud = ts->cloud_info();
-      auto region = std::ranges::find_if(
-          regions, [&](const auto& r) { return r.first == cloud.placement_region(); });
-      if (region == regions.end()) {
-        region = regions.emplace(regions.end(), cloud.placement_region(), std::vector<Zone>());
-      }
-      auto zone = std::ranges::find_if(
-          region->second, [&](const auto& z) { return z.name == cloud.placement_zone(); });
-      if (zone == region->second.end()) {
-        zone = region->second.emplace(region->second.end(), Zone{cloud.placement_zone()});
-      }
-      zone->tablets += ts->NumTablets();
-      zone->leaders += ts->NumLeaders();
-    }
-    char now[8];
-    const time_t seconds = time(nullptr);
-    struct tm local;
-    localtime_r(&seconds, &local);
-    strftime(now, sizeof(now), "%H:%M", &local);
-
-    const auto first = zone_load_lines_++ == 0;
-    const auto mode = first ? std::ios::trunc : std::ios::app;
-    const auto zone_path = JoinPathSegments(FLAGS_data_dir, "zone-load.txt");
-    const auto request_path = JoinPathSegments(FLAGS_data_dir, "balancer-requests.txt");
-    std::ofstream zone_out(zone_path, mode);
-    std::ofstream request_out(request_path, mode);
-    if (first) {
-      LOG(INFO) << "Per-minute tables: " << zone_path << ", " << request_path;
-      auto region_header = StringPrintf("%-8s", "");
-      auto zone_header = StringPrintf("%-8s", "time");
-      for (const auto& [region, zones] : regions) {
-        region_header += StringPrintf(
-            "%-*s", narrow_cast<int>(kZoneColumn * zones.size()), region.c_str());
-        for (const auto& zone : zones) {
-          // us-east4-a is listed as a under us-east4.
-          const auto prefix = region + "-";
-          const auto name =
-              zone.name.starts_with(prefix) ? zone.name.substr(prefix.size()) : zone.name;
-          zone_header += StringPrintf("%-*s", kZoneColumn, name.c_str());
-        }
-      }
-      zone_out << region_header << "\n" << zone_header << "   (tablets/leaders)\n";
-      request_out << StringPrintf(
-          "%-8s%-16s%-16s%-16s%-16s%-16s(received/applied per minute; balancer runs/s per run)\n",
-          "time", "AddServer", "RemoveServer", "LeaderStepDown", "DeleteTablet", "Balancer");
-    }
-    zone_out << StringPrintf("%-8s", now);
-    for (const auto& [region, zones] : regions) {
-      for (const auto& zone : zones) {
-        zone_out << StringPrintf(
-            "%-*s", kZoneColumn, Format("$0/$1", zone.tablets, zone.leaders).c_str());
-      }
-    }
-    zone_out << "\n";
-
-    // Received minus applied is what the tablet's leader rejected.
-    const HollowTServerRegistry::RequestCount* counts[] = {
-        &registry_.add_server, &registry_.remove_server, &registry_.leader_step_down,
-        &registry_.delete_tablet};
-    request_out << StringPrintf("%-8s", now);
-    for (size_t i = 0; i < std::size(counts); ++i) {
-      const auto received = counts[i]->received.load();
-      const auto applied = counts[i]->applied.load();
-      request_out << StringPrintf(
-          "%-16s",
-          Format("$0/$1", received - last_requests_[i].first,
-                 applied - last_requests_[i].second).c_str());
-      last_requests_[i] = {received, applied};
-    }
-    std::map<string, double> balancer;
-    EasyCurl curl;
-    faststring body;
-    if (curl.FetchURL(
-            Format("http://127.0.0.1:$0/prometheus-metrics", FLAGS_master_web_port), &body).ok()) {
-      ParsePrometheusMetrics(body.ToString(), {"load_balancer_duration"}, &balancer);
-    }
-    const auto runs = balancer["load_balancer_duration_count"] - last_balancer_.first;
-    const auto run_ms = balancer["load_balancer_duration_sum"] - last_balancer_.second;
-    request_out << (runs > 0 ? StringPrintf("%.0f/%.2f", runs, run_ms / runs / 1000) : "0/-");
-    if (!balancer.empty()) {
-      last_balancer_ = {balancer["load_balancer_duration_count"],
-                        balancer["load_balancer_duration_sum"]};
-    }
-    request_out << "\n";
-  }
-
   string PidFilePath(const string& name) const {
     return JoinPathSegments(FLAGS_data_dir, name + ".pid");
   }
@@ -4539,6 +4438,20 @@ class MasterLoadBench {
         values[prefix + "latency_us_sum"] = stats->latency_us_sum.load();
         values[prefix + "latency_count"] = stats->latency_count.load();
       }
+      // Received minus applied is what the tablet's leader rejected.
+      const std::pair<const char*, const HollowTServerRegistry::RequestCount*> requests[] = {
+          {"AddServer", &registry_.add_server}, {"RemoveServer", &registry_.remove_server},
+          {"LeaderStepDown", &registry_.leader_step_down},
+          {"DeleteTablet", &registry_.delete_tablet}};
+      for (const auto& [name, count] : requests) {
+        values[Format("bench_balancer_$0_received_total", name)] = count->received.load();
+        values[Format("bench_balancer_$0_applied_total", name)] = count->applied.load();
+      }
+      for (const auto& ts : registry_.tservers()) {
+        const auto prefix = Format("bench_zone_$0_", ts->cloud_info().placement_zone());
+        values[prefix + "tablets"] += ts->NumTablets();
+        values[prefix + "leaders"] += ts->NumLeaders();
+      }
 
       const auto pid = master_process_ ? master_process_->pid() : 0;
       if (pid > 0) {
@@ -4741,11 +4654,6 @@ class MasterLoadBench {
   scoped_refptr<rpc::ServicePool> ts_service_pool_;
   scoped_refptr<rpc::ServicePool> generic_service_pool_;
   scoped_refptr<rpc::ServicePool> consensus_service_pool_;
-  static constexpr int kZoneColumn = 12;
-  int zone_load_lines_ = 0;
-  std::pair<int64_t, int64_t> last_requests_[4];
-  // Balancer run count and total run time (ms) at the previous row.
-  std::pair<double, double> last_balancer_;
   HollowTServerRegistry registry_;
 
   std::mutex universe_uuid_mutex_;
