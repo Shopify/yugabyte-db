@@ -73,6 +73,8 @@
 #include "yb/gutil/strings/split.h"
 
 #include "yb/master/master_cluster.proxy.h"
+#include "yb/master/master_cluster.service.h"
+#include "yb/master/master_encryption.service.h"
 #include "yb/master/master_defaults.h"
 #include "yb/master/master_heartbeat.proxy.h"
 #include "yb/master/master_ysql_lease.proxy.h"
@@ -174,6 +176,12 @@ DEFINE_NON_RUNTIME_string(csv_path, "",
     "Append long-format samples to this CSV file; empty = summary on stdout only.");
 DEFINE_NON_RUNTIME_int32(master_rpc_port, 21100, "RPC port for the spawned master.");
 DEFINE_NON_RUNTIME_int32(master_web_port, 21101, "Webserver port for the spawned master.");
+DEFINE_NON_RUNTIME_int32(num_masters, 7,
+    "Masters in the cluster: the spawned master plus num_masters - 1 simulated followers that "
+    "vote for it and acknowledge what it replicates. Fixed once the cluster is created.");
+DEFINE_NON_RUNTIME_int32(simulated_master_port, 21110,
+    "RPC port of the first simulated master; each next one takes the next port. Fixed once the "
+    "cluster is created.");
 DEFINE_NON_RUNTIME_string(master_flags, "",
     "Comma-separated extra --flag=value arguments passed to yb-master.");
 DEFINE_NON_RUNTIME_string(master_cpus, "",
@@ -1529,6 +1537,231 @@ class HollowGenericService : public server::GenericServiceIf {
 #undef HOLLOW_UNSUPPORTED_METHOD
 };
 
+// A follower of the spawned master: it votes for the spawned master and acknowledges what it
+// replicates, stores nothing and never starts an election.
+struct SimulatedMaster {
+  string uuid;
+  HostPort host_port;
+};
+
+const SimulatedMaster* FindSimulatedMaster(
+    const std::vector<SimulatedMaster>& masters, const string& uuid) {
+  const auto it = std::ranges::find_if(masters, [&](const auto& m) { return m.uuid == uuid; });
+  return it == masters.end() ? nullptr : &*it;
+}
+
+// GetNodeInstance and GetMasterRegistration carry no uuid; the port they arrived on tells which
+// simulated master was asked.
+const SimulatedMaster* FindSimulatedMaster(
+    const std::vector<SimulatedMaster>& masters, const rpc::RpcContext& context) {
+  const auto port = context.local_address().port();
+  const auto it = std::ranges::find_if(
+      masters, [&](const auto& m) { return m.host_port.port() == port; });
+  return it == masters.end() ? nullptr : &*it;
+}
+
+#define SIMULATED_MASTER_UNSUPPORTED(Method, ReqType, RespType) \
+  void Method(const ReqType*, RespType*, rpc::RpcContext context) override { \
+    context.RespondFailure(STATUS(NotSupported, #Method " not implemented by simulated master")); \
+  }
+
+class SimulatedMasterConsensusService : public consensus::ConsensusServiceIf {
+ public:
+  SimulatedMasterConsensusService(
+      const scoped_refptr<MetricEntity>& entity, const std::vector<SimulatedMaster>* masters,
+      uint64_t instance_seqno)
+      : consensus::ConsensusServiceIf(entity), masters_(masters),
+        instance_seqno_(instance_seqno) {}
+
+  // Everything the leader sends counts as received and applied.
+  void UpdateConsensus(
+      const consensus::LWConsensusRequestPB* req, consensus::LWConsensusResponsePB* resp,
+      rpc::RpcContext context) override {
+    const auto* master = FindSimulatedMaster(*masters_, req->dest_uuid().ToBuffer());
+    if (!master) {
+      context.RespondFailure(STATUS_FORMAT(NotFound, "Unknown dest_uuid $0", req->dest_uuid()));
+      return;
+    }
+    const auto last_received = req->ops().empty()
+        ? OpId::FromPB(req->preceding_id()) : OpId::FromPB(req->ops().rbegin()->id());
+    const auto committed = OpId::FromPB(req->committed_op_id());
+    resp->dup_responder_uuid(master->uuid);
+    resp->set_responder_term(req->caller_term());
+    auto* status = resp->mutable_status();
+    last_received.ToPB(status->mutable_last_received());
+    last_received.ToPB(status->mutable_last_received_current_leader());
+    status->set_last_committed_idx(committed.index);
+    committed.ToPB(status->mutable_last_applied());
+    context.RespondSuccess();
+  }
+
+  // The spawned master is the only candidate there can be.
+  void RequestConsensusVote(
+      const consensus::VoteRequestPB* req, consensus::VoteResponsePB* resp,
+      rpc::RpcContext context) override {
+    const auto* master = FindSimulatedMaster(*masters_, req->dest_uuid());
+    if (!master) {
+      context.RespondFailure(STATUS_FORMAT(NotFound, "Unknown dest_uuid $0", req->dest_uuid()));
+      return;
+    }
+    resp->set_responder_uuid(master->uuid);
+    resp->set_responder_term(req->candidate_term());
+    resp->set_preelection(req->preelection());
+    resp->set_vote_granted(true);
+    context.RespondSuccess();
+  }
+
+  // A new master builds its Raft config from these answers.
+  void GetNodeInstance(
+      const consensus::GetNodeInstanceRequestPB* req, consensus::GetNodeInstanceResponsePB* resp,
+      rpc::RpcContext context) override {
+    const auto* master = FindSimulatedMaster(*masters_, context);
+    if (!master) {
+      context.RespondFailure(STATUS(NotFound, "Not a simulated master port"));
+      return;
+    }
+    resp->mutable_node_instance()->set_permanent_uuid(master->uuid);
+    resp->mutable_node_instance()->set_instance_seqno(instance_seqno_);
+    HostPortToPB(master->host_port, resp->mutable_registration()->add_private_rpc_addresses());
+    context.RespondSuccess();
+  }
+
+  SIMULATED_MASTER_UNSUPPORTED(RunLeaderElection, consensus::RunLeaderElectionRequestPB,
+                               consensus::RunLeaderElectionResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(ChangeConfig, consensus::ChangeConfigRequestPB,
+                               consensus::ChangeConfigResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(LeaderStepDown, consensus::LeaderStepDownRequestPB,
+                               consensus::LeaderStepDownResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(MultiRaftUpdateConsensus, consensus::MultiRaftConsensusRequestPB,
+                               consensus::MultiRaftConsensusResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(UnsafeChangeConfig, consensus::UnsafeChangeConfigRequestPB,
+                               consensus::UnsafeChangeConfigResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(LeaderElectionLost, consensus::LeaderElectionLostRequestPB,
+                               consensus::LeaderElectionLostResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(GetLastOpId, consensus::GetLastOpIdRequestPB,
+                               consensus::GetLastOpIdResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(GetConsensusState, consensus::GetConsensusStateRequestPB,
+                               consensus::GetConsensusStateResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(StartRemoteBootstrap, consensus::StartRemoteBootstrapRequestPB,
+                               consensus::StartRemoteBootstrapResponsePB)
+
+ private:
+  const std::vector<SimulatedMaster>* masters_;
+  const uint64_t instance_seqno_;
+};
+
+class SimulatedMasterClusterService : public master::MasterClusterIf {
+ public:
+  SimulatedMasterClusterService(
+      const scoped_refptr<MetricEntity>& entity, const std::vector<SimulatedMaster>* masters,
+      uint64_t instance_seqno)
+      : master::MasterClusterIf(entity), masters_(masters), instance_seqno_(instance_seqno) {}
+
+  // How tservers and clients find the leader: they ask every master for its role.
+  void GetMasterRegistration(
+      const master::GetMasterRegistrationRequestPB* req,
+      master::GetMasterRegistrationResponsePB* resp, rpc::RpcContext context) override {
+    const auto* master = FindSimulatedMaster(*masters_, context);
+    if (!master) {
+      context.RespondFailure(STATUS(NotFound, "Not a simulated master port"));
+      return;
+    }
+    resp->mutable_instance_id()->set_permanent_uuid(master->uuid);
+    resp->mutable_instance_id()->set_instance_seqno(instance_seqno_);
+    HostPortToPB(master->host_port, resp->mutable_registration()->add_private_rpc_addresses());
+    resp->set_role(PeerRole::FOLLOWER);
+    context.RespondSuccess();
+  }
+
+  SIMULATED_MASTER_UNSUPPORTED(ListTabletServers, master::ListTabletServersRequestPB,
+                               master::ListTabletServersResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(ListLiveTabletServers, master::ListLiveTabletServersRequestPB,
+                               master::ListLiveTabletServersResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(RemoveTabletServer, master::RemoveTabletServerRequestPB,
+                               master::RemoveTabletServerResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(ListMasters, master::ListMastersRequestPB,
+                               master::ListMastersResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(ListMasterRaftPeers, master::ListMasterRaftPeersRequestPB,
+                               master::ListMasterRaftPeersResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(GetAutoFlagsConfig, master::GetAutoFlagsConfigRequestPB,
+                               master::GetAutoFlagsConfigResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(PromoteAutoFlags, master::PromoteAutoFlagsRequestPB,
+                               master::PromoteAutoFlagsResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(RollbackAutoFlags, master::RollbackAutoFlagsRequestPB,
+                               master::RollbackAutoFlagsResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(PromoteSingleAutoFlag, master::PromoteSingleAutoFlagRequestPB,
+                               master::PromoteSingleAutoFlagResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(DemoteSingleAutoFlag, master::DemoteSingleAutoFlagRequestPB,
+                               master::DemoteSingleAutoFlagResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(ValidateAutoFlagsConfig, master::ValidateAutoFlagsConfigRequestPB,
+                               master::ValidateAutoFlagsConfigResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(IsMasterLeaderServiceReady, master::IsMasterLeaderReadyRequestPB,
+                               master::IsMasterLeaderReadyResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(DumpState, master::DumpMasterStateRequestPB,
+                               master::DumpMasterStateResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(ChangeLoadBalancerState, master::ChangeLoadBalancerStateRequestPB,
+                               master::ChangeLoadBalancerStateResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(GetLoadBalancerState, master::GetLoadBalancerStateRequestPB,
+                               master::GetLoadBalancerStateResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(RemovedMasterUpdate, master::RemovedMasterUpdateRequestPB,
+                               master::RemovedMasterUpdateResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(SetPreferredZones, master::SetPreferredZonesRequestPB,
+                               master::SetPreferredZonesResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(GetMasterClusterConfig, master::GetMasterClusterConfigRequestPB,
+                               master::GetMasterClusterConfigResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(GetMasterXClusterConfig, master::GetMasterXClusterConfigRequestPB,
+                               master::GetMasterXClusterConfigResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(
+      ChangeMasterClusterConfig, master::ChangeMasterClusterConfigRequestPB,
+      master::ChangeMasterClusterConfigResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(GetLoadMoveCompletion, master::GetLoadMovePercentRequestPB,
+                               master::GetLoadMovePercentResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(
+      GetLeaderBlacklistCompletion, master::GetLeaderBlacklistPercentRequestPB,
+      master::GetLoadMovePercentResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(IsLoadBalanced, master::IsLoadBalancedRequestPB,
+                               master::IsLoadBalancedResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(IsLoadBalancerIdle, master::IsLoadBalancerIdleRequestPB,
+                               master::IsLoadBalancerIdleResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(
+      AreLeadersOnPreferredOnly, master::AreLeadersOnPreferredOnlyRequestPB,
+      master::AreLeadersOnPreferredOnlyResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(CheckMasterTabletHealth, master::CheckMasterTabletHealthRequestPB,
+                               master::CheckMasterTabletHealthResponsePB)
+
+ private:
+  const std::vector<SimulatedMaster>* masters_;
+  const uint64_t instance_seqno_;
+};
+
+class SimulatedMasterEncryptionService : public master::MasterEncryptionIf {
+ public:
+  explicit SimulatedMasterEncryptionService(const scoped_refptr<MetricEntity>& entity)
+      : master::MasterEncryptionIf(entity) {}
+
+  // A starting master asks every other master for the keys until each one answers; no keys is
+  // the answer of a master without encryption at rest.
+  void GetUniverseKeyRegistry(
+      const master::GetUniverseKeyRegistryRequestPB* req,
+      master::GetUniverseKeyRegistryResponsePB* resp, rpc::RpcContext context) override {
+    resp->mutable_universe_keys();
+    context.RespondSuccess();
+  }
+
+  SIMULATED_MASTER_UNSUPPORTED(ChangeEncryptionInfo, master::ChangeEncryptionInfoRequestPB,
+                               master::ChangeEncryptionInfoResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(IsEncryptionEnabled, master::IsEncryptionEnabledRequestPB,
+                               master::IsEncryptionEnabledResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(AddUniverseKeys, master::AddUniverseKeysRequestPB,
+                               master::AddUniverseKeysResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(
+      GetFullUniverseKeyRegistry, master::GetFullUniverseKeyRegistryRequestPB,
+      master::GetFullUniverseKeyRegistryResponsePB)
+  SIMULATED_MASTER_UNSUPPORTED(HasUniverseKeyInMemory, master::HasUniverseKeyInMemoryRequestPB,
+                               master::HasUniverseKeyInMemoryResponsePB)
+};
+#undef SIMULATED_MASTER_UNSUPPORTED
+
 // Shared state of mirror mode: heartbeat templates, measured cadence, and captured requests
 // queued for replay, all fed by the relay's request-stream tap.
 class MirrorState {
@@ -2746,6 +2979,7 @@ class MasterLoadBench {
     } else {
       SCHECK(!FLAGS_topology.empty(), InvalidArgument, "--topology is required");
       SCHECK_GT(FLAGS_num_tservers, 0, InvalidArgument, "--num_tservers must be positive");
+      SCHECK_GT(FLAGS_num_masters, 0, InvalidArgument, "--num_masters must be positive");
       SCHECK_GE(FLAGS_num_tservers, FLAGS_replication_factor, InvalidArgument,
                 "Need at least replication_factor tservers");
       topology_ = VERIFY_RESULT(ParseTopologyFile(FLAGS_topology));
@@ -2788,6 +3022,7 @@ class MasterLoadBench {
     start_time_ = MonoTime::Now();
     RETURN_NOT_OK(OpenCsv());
 
+    RETURN_NOT_OK(StartSimulatedMasters());
     RETURN_NOT_OK(StartMaster());
     if (!restoring_ || num_sql_files_ > 0) {
       RETURN_NOT_OK(SetLoadBalancerEnabled(false));
@@ -2915,6 +3150,78 @@ class MasterLoadBench {
     return env->DeleteFile(pid_file);
   }
 
+  // Before the master starts: a new master asks every address for its uuid, and a restarted one
+  // needs their votes.
+  Status StartSimulatedMasters() {
+    if (FLAGS_num_masters <= 1) {
+      return Status::OK();
+    }
+    const auto instance_seqno = static_cast<uint64_t>(GetCurrentTimeMicros());
+    rpc::MessengerBuilder builder("bench-masters");
+    builder.set_metric_entity(metric_entity_);
+    builder.set_num_reactors(2);
+    master_messenger_ = VERIFY_RESULT(builder.Build());
+    auto factory = rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>();
+    for (int i = 1; i < FLAGS_num_masters; ++i) {
+      const auto port = narrow_cast<uint16_t>(FLAGS_simulated_master_port + i - 1);
+      RETURN_NOT_OK_PREPEND(
+          master_messenger_->ListenAddress(
+              factory, Endpoint(boost::asio::ip::address_v4::loopback(), port)),
+          Format("Simulated master port $0", port));
+      // Tserver uuids count up from 1; these cannot collide with them.
+      simulated_masters_.push_back(SimulatedMaster{
+          .uuid = StringPrintf("f%031x", i), .host_port = HostPort("127.0.0.1", port)});
+    }
+
+    master_service_thread_pool_ = std::make_shared<rpc::ThreadPool>(rpc::ThreadPoolOptions{
+        .name = "sim_master",
+        .max_workers = 4,
+    });
+    auto consensus_service = std::make_unique<SimulatedMasterConsensusService>(
+        metric_entity_, &simulated_masters_, instance_seqno);
+    const auto consensus_service_name = consensus_service->service_name();
+    master_consensus_service_pool_ = make_scoped_refptr<rpc::ServicePool>(
+        /* max_tasks= */ 10000, [pool = master_service_thread_pool_](auto) { return pool; },
+        &master_messenger_->scheduler(), std::move(consensus_service),
+        master_messenger_->metric_entity());
+    RETURN_NOT_OK(master_messenger_->RegisterService(
+        consensus_service_name, master_consensus_service_pool_));
+
+    auto cluster_service = std::make_unique<SimulatedMasterClusterService>(
+        metric_entity_, &simulated_masters_, instance_seqno);
+    const auto cluster_service_name = cluster_service->service_name();
+    master_cluster_service_pool_ = make_scoped_refptr<rpc::ServicePool>(
+        /* max_tasks= */ 10000, [pool = master_service_thread_pool_](auto) { return pool; },
+        &master_messenger_->scheduler(), std::move(cluster_service),
+        master_messenger_->metric_entity());
+    RETURN_NOT_OK(master_messenger_->RegisterService(
+        cluster_service_name, master_cluster_service_pool_));
+
+    auto encryption_service = std::make_unique<SimulatedMasterEncryptionService>(metric_entity_);
+    const auto encryption_service_name = encryption_service->service_name();
+    master_encryption_service_pool_ = make_scoped_refptr<rpc::ServicePool>(
+        /* max_tasks= */ 10000, [pool = master_service_thread_pool_](auto) { return pool; },
+        &master_messenger_->scheduler(), std::move(encryption_service),
+        master_messenger_->metric_entity());
+    RETURN_NOT_OK(master_messenger_->RegisterService(
+        encryption_service_name, master_encryption_service_pool_));
+
+    RETURN_NOT_OK(master_messenger_->StartAcceptor());
+    LOG(INFO) << "Started " << simulated_masters_.size() << " simulated masters on ports "
+              << FLAGS_simulated_master_port << "-"
+              << FLAGS_simulated_master_port + FLAGS_num_masters - 2;
+    return Status::OK();
+  }
+
+  // The spawned master, reached at the given port, then the simulated ones.
+  string MasterAddresses(int spawned_master_port) const {
+    auto result = Format("127.0.0.1:$0", spawned_master_port);
+    for (const auto& master : simulated_masters_) {
+      result += "," + master.host_port.ToString();
+    }
+    return result;
+  }
+
   Status StartMaster() {
     const auto data_dir = JoinPathSegments(FLAGS_data_dir, kMasterDataDir);
     const auto log_dir = JoinPathSegments(FLAGS_data_dir, "master-logs");
@@ -2931,7 +3238,7 @@ class MasterLoadBench {
         "--fs_data_dirs=" + data_dir,
         "--log_dir=" + log_dir,
         Format("--rpc_bind_addresses=127.0.0.1:$0", FLAGS_master_rpc_port),
-        Format("--master_addresses=127.0.0.1:$0", FLAGS_master_rpc_port),
+        "--master_addresses=" + MasterAddresses(FLAGS_master_rpc_port),
         "--webserver_interface=127.0.0.1",
         Format("--webserver_port=$0", FLAGS_master_web_port),
         Format("--replication_factor=$0", FLAGS_replication_factor),
@@ -3031,7 +3338,7 @@ class MasterLoadBench {
         "--webserver_interface=127.0.0.1",
         Format("--webserver_port=$0", FLAGS_tserver_web_port),
         // Heartbeats reach the master through the relay, where they are captured.
-        Format("--tserver_master_addrs=127.0.0.1:$0", FLAGS_relay_port),
+        "--tserver_master_addrs=" + MasterAddresses(FLAGS_relay_port),
         Format("--heartbeat_interval_ms=$0", FLAGS_heartbeat_interval_ms),
         "--enable_ysql=true",
         "--start_pgsql_proxy",
@@ -4172,8 +4479,10 @@ class MasterLoadBench {
       zones += Format("$0/$1/$2=$3\n", topology_[i].cloud, topology_[i].region,
                       topology_[i].zone, allocation_[i]);
     }
-    return Format("num_tservers=$0\nreplication_factor=$1\n$2",
-                  FLAGS_num_tservers, FLAGS_replication_factor, zones);
+    return Format("num_tservers=$0\nreplication_factor=$1\nnum_masters=$2\n"
+                  "simulated_master_port=$3\n$4",
+                  FLAGS_num_tservers, FLAGS_replication_factor, FLAGS_num_masters,
+                  FLAGS_simulated_master_port, zones);
   }
 
   Status LoadRegistryMeta() {
@@ -4182,6 +4491,8 @@ class MasterLoadBench {
     SCHECK_FORMAT(meta.good(), NotFound, "No $0: nothing to resume", path);
     topology_.clear();
     allocation_.clear();
+    // A snapshot from before simulated masters has the spawned master alone.
+    FLAGS_num_masters = 1;
     string line;
     while (std::getline(meta, line)) {
       const auto eq = line.find('=');
@@ -4192,6 +4503,10 @@ class MasterLoadBench {
         FLAGS_num_tservers = value;
       } else if (key == "replication_factor") {
         FLAGS_replication_factor = value;
+      } else if (key == "num_masters") {
+        FLAGS_num_masters = value;
+      } else if (key == "simulated_master_port") {
+        FLAGS_simulated_master_port = value;
       } else {
         const std::vector<string> parts = strings::Split(key, "/");
         SCHECK_FORMAT(parts.size() == 3, Corruption, "$0: bad zone '$1'", path, key);
@@ -4552,6 +4867,13 @@ class MasterLoadBench {
     if (messenger_) {
       messenger_->Shutdown();
     }
+    if (master_messenger_) {
+      master_messenger_->UnregisterAllServices();
+      master_consensus_service_pool_->Shutdown();
+      master_cluster_service_pool_->Shutdown();
+      master_encryption_service_pool_->Shutdown();
+      master_messenger_->Shutdown();
+    }
     if (tserver_process_) {
       WARN_NOT_OK(tserver_process_->Kill(SIGTERM), "Failed to SIGTERM tserver");
       int exit_code = 0;
@@ -4585,6 +4907,12 @@ class MasterLoadBench {
   std::unique_ptr<TcpRelay> relay_;
   rpc::ProxyPtr generic_proxy_;
   std::unique_ptr<rpc::Messenger> messenger_;
+  std::vector<SimulatedMaster> simulated_masters_;
+  std::unique_ptr<rpc::Messenger> master_messenger_;
+  rpc::ThreadPoolPtr master_service_thread_pool_;
+  scoped_refptr<rpc::ServicePool> master_consensus_service_pool_;
+  scoped_refptr<rpc::ServicePool> master_cluster_service_pool_;
+  scoped_refptr<rpc::ServicePool> master_encryption_service_pool_;
   std::unique_ptr<rpc::ProxyCache> proxy_cache_;
   std::unique_ptr<master::MasterClusterProxy> cluster_proxy_;
   std::unique_ptr<tserver::TabletServerServiceProxy> read_proxy_;
