@@ -20,8 +20,9 @@ up to E may then serve catalog reads at S.
 
 The certification is the one xCluster uses for its apply safe time:
 
-1. `SafeTime(RequireLease::kTrue)` on the sys catalog tablet gives S. Without a leader lease it
-   fails, so a deposed leader cannot certify.
+1. `SafeTime(RequireLease::kTrue)` on the sys catalog tablet gives S, no later than the last
+   majority-replicated hybrid time lease. It does not check that this master still leads; a deposed
+   leader is stopped by step 4.
 2. `ResolveIntents(S)` waits until every transaction that may commit at or before S has its apply
    record in the WAL.
 3. E is the `majority_replicated_index` at that point.
@@ -79,7 +80,9 @@ share it. The catalog manager requests one once a new leader has loaded the cata
 do not keep the old leader's safe time for up to an interval. After a failed cycle the thread runs
 the next one within 1 s rather than a full interval. Tests run cycles with `TEST_RunCycle()`, which
 never skips one either. Cycles are serialized by `cycle_mutex_`; a master that is not the leader
-returns nullopt and resets its gauges.
+returns nullopt and resets its gauges. A leader without its leader lease (for example, just elected
+or cut off from a majority) cannot certify or reseed: its cycle ends with TryAgain, is not counted
+as a failure, keeps the gauges, and is retried within 1 s.
 
 ### Object locking off
 
@@ -103,7 +106,10 @@ check and the target list use that one snapshot. Replaced tservers are left out:
 reaches the tserver that replaced it. The `targets_` map is rebuilt each cycle, so tservers that
 lose their lease drop out. A `Target` keeps, across cycles, the copy's
 last reported position and safe time and whether it has no copy. A new lease epoch means a new
-process, so that state is reset and the copy is asked for its position again.
+process, so that state is reset and the copy is asked for its position again. Lease epochs survive
+a master failover, so every target's state is also reset when the leader term changes: another
+leader may have pushed to the copies meanwhile, and a returning leader must not act on what they
+answered in its earlier term.
 
 Targets are held by value. The send queue holds `Target*` during a cycle, so `targets_` must not
 change between `RebuildTargets` and the end of the send loop. `RebuildTargets` moves each kept
@@ -176,6 +182,11 @@ log no longer holds the next entry, or a read returns nothing (committed index b
 cache over its memory limit), the copy is sent what was read so far; with nothing read, a missing
 entry reseeds and an empty read waits until the RPC timeout.
 
+A point-in-time restore of the catalog is one `RESTORE_SYS_CATALOG` snapshot entry: each master
+rewrites the restored rows into RocksDB as it applies that entry, so the rows are never in the log
+and `PopulateXClusterRecords` passes over the entry. A batch therefore ends before such an entry,
+and a copy whose next entry is one is reseeded, like a copy whose next entry is gone.
+
 ## Metrics
 
 All metrics are on the master's cluster metric entity, prefixed `local_catalog_push_`. They are
@@ -243,7 +254,7 @@ only to reseeds.
 | `master/ts_descriptor.h` | `LocalCatalogServiceProxy` added to the per-tserver proxy cache. |
 | `tserver/tablet_server.{h,cc}` | Registers the service behind the flag, with its own queue length flag. |
 | `common/common_flags.{h,cc}` | `enable_local_tserver_catalog`. |
-| `yql/pgwrapper/pg_local_catalog-test.cc` | 39 tests, listed under [Tests](#tests). |
+| `yql/pgwrapper/pg_local_catalog-test.cc` | 41 tests, listed under [Tests](#tests). |
 
 ## Tests
 
@@ -269,6 +280,7 @@ All in `yql/pgwrapper/pg_local_catalog-test.cc`, grouped by fixture.
 | `LogGoneMidBatchSendsWhatWasRead` | Log gone mid batch: what was read is sent without the safe time, and the next batch continues. |
 | `EmptyReadMidBatchSendsWhatWasRead` | An empty read mid batch: what was read is sent, and the next batch continues. |
 | `ChangeMetadataEndsBatch` | A tablet metadata change ends its batch. |
+| `CopyBehindCatalogRestoreIsReseeded` | A copy behind a point-in-time restore is pushed up to the restore, then reseeded. |
 | **`PgLocalCatalogPushLogGcTest`** | |
 | `CopyBehindLogGcIsReseeded` | A copy behind log GC is reseeded. |
 | **`PgLocalCatalogPushTwoCopiesTest`** | |
@@ -286,12 +298,14 @@ All in `yql/pgwrapper/pg_local_catalog-test.cc`, grouped by fixture.
 | **`PgLocalCatalogPushFailoverTest`** (three masters) | |
 | `NewLeaderPushesFromCopyPositions` | A new leader continues from the copies' positions, without a reseed. |
 | `NewLeaderPushesWithoutWaiting` | A new leader pushes once it has loaded the catalog. |
-| `LeaseLapseKeepsGauges` | A leader without its lease pushes nothing and keeps its gauges. |
+| `LeaseLapseKeepsGauges` | A leader without its lease pushes nothing, ends its cycle with an uncounted TryAgain, and keeps its gauges. |
 | `LeaderChangeBeforePushEndsCycle` | A leader change after resolving intents ends the cycle uncounted. |
 | `OldLeaderDoesNotReseed` | A deposed leader sends no reseed and counts no failure. |
 | `ShutdownWithPushInFlight` | Shutdown does not wait for an in-flight answer; the next leader catches up. |
 | **`PgLocalCatalogPushFailoverTwoCopiesTest`** | |
 | `OldLeaderDoesNotSendSharedReseed` | A reseed built for one copy is not sent to another once the leader is deposed. |
+| **`PgLocalCatalogPushFailoverLogGcTest`** | |
+| `ReturningLeaderDoesNotReseedFromOldPosition` | A leader that leads again, with its log GCed past what the copies told it earlier, pushes from their current positions without a reseed. |
 | **`PgLocalCatalogPushTimerTest`** | |
 | `MasterWriteArrivesOnTimer` | A master-only write reaches the copy on the timer. |
 | `TimerCatchesUpCopyLeftBehind` | The timer catches up a copy left behind although the WAL is idle. |
