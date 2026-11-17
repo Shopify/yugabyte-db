@@ -35,6 +35,7 @@
 #include "yb/util/status_log.h"
 #include "yb/util/std_util.h"
 #include "yb/util/strongly_typed_bool.h"
+#include "yb/util/sync_point.h"
 
 namespace yb::tserver {
 namespace {
@@ -307,28 +308,42 @@ class PgTableCache::Impl {
       // cached, loaded and current. That case only reads the cache, under the shared side of the
       // mutex, and takes the tables from the entries there: no reference to an entry is taken,
       // which would be one more count that the sessions of all lanes share.
+      // An entry that is current but still loading is found here too, and waited on outside the
+      // lock. Otherwise every statement on a table that is being loaded would take the exclusive
+      // side, and each exclusive acquisition stalls the readers of every table. Only such an entry
+      // is referenced, so that it outlives an invalidation that erases it from the cache.
       boost::container::small_vector<PgTablesQueryResult::TableInfo, 8> infos;
       infos.reserve(tables_sz);
-      bool all_usable = true;
+      boost::container::small_vector<CacheEntryPtr, 4> loading_entries;
+      bool all_found = true;
       {
         SharedLock lock(mutex_);
         for (const auto& table_id : table_ids) {
           auto* entry = FindUsableEntryUnlocked(table_id, options);
-          if (!entry || !entry->GetIfUsable(&infos.emplace_back())) {
-            all_usable = false;
+          if (!entry) {
+            all_found = false;
             break;
+          }
+          if (!entry->GetIfUsable(&infos.emplace_back())) [[unlikely]] {
+            infos.pop_back();
+            loading_entries.push_back(entry->shared_from_this());
           }
         }
       }
-      if (all_usable) {
+      if (all_found) {
         Waiter waiter{tables_sz, listener, notification_pool_};
         for (const auto& info : infos) {
           waiter.TableReady(info, NonBlockingCallsOnly::kFalse);
+        }
+        // Nothing to load: the call that put each of these entries in the cache starts its load.
+        for (const auto& entry : loading_entries) {
+          entry->Wait(waiter);
         }
         return;
       }
     }
 
+    TEST_SYNC_POINT_CALLBACK("PgTableCache::GetTables:Exclusive", &table_ids);
     boost::container::small_vector<std::pair<const TableId*, CacheEntryPtr>, 8> entries;
     entries.reserve(tables_sz);
     {
@@ -441,8 +456,8 @@ class PgTableCache::Impl {
   }
 
   // The entry DoGetEntryUnlocked would return for table_id when it would return it as it is, with
-  // nothing to load and nothing in the cache to change; nullptr otherwise. Valid while mutex_ is
-  // held.
+  // nothing to load and nothing in the cache to change; nullptr otherwise. The entry may still be
+  // loading. Valid while mutex_ is held.
   CacheEntry* FindUsableEntryUnlocked(
       TableIdView table_id, const PgTableCacheGetOptions& options) REQUIRES_SHARED(mutex_) {
     if (options.reopen) {
@@ -516,6 +531,8 @@ class PgTableCache::Impl {
                   << result.status().ToString();
         }
       }
+      auto loaded_table_id = table_id;
+      TEST_SYNC_POINT_CALLBACK("PgTableCache::LoadEntry:BeforeSetValue", &loaded_table_id);
       entry->SetValue(CheckTableType(result));
     };
 
@@ -526,9 +543,9 @@ class PgTableCache::Impl {
 
   std::shared_future<client::YBClient*> client_future_;
   YBThreadPool& notification_pool_;
-  // Shared for lookups that find what they need, exclusive for everything that changes the cache.
-  // Sharded by lane on the shared side: with std::shared_mutex the readers of all lanes would
-  // still write one word.
+  // Exclusive for what changes the cache: a miss, the replacement of a failed or reopened entry, an
+  // invalidation. Shared for finding an entry, loaded or loading. Sharded by lane on the shared
+  // side: with std::shared_mutex the readers of all lanes would still write one word.
   LaneShardedRwMutex mutex_;
   using PgTableMap = UnorderedStringMap<TableId, CacheEntryPtr>;
   // db_id -> (table_id -> table_cache_entry, catalog_version)
