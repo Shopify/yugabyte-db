@@ -93,6 +93,11 @@ def summarize(metrics):
             if count and delta(count) > 0:
                 out["balancer runs"] = (int(delta(count)), "")
                 out["balancer s/run"] = (delta(series) / delta(count) / 1000.0, "s")
+        elif name == "catalog_manager_bg_task_duration_sum":
+            count = metrics.get("catalog_manager_bg_task_duration_count")
+            if count and delta(count) > 0:
+                out["bg task passes"] = (int(delta(count)), "")
+                out["bg task ms/pass"] = (delta(series) / delta(count), "ms")
         elif name.startswith("bench_zone_"):
             zone, kind = name[len("bench_zone_"):].rsplit("_", 1)
             out["zone %s %s" % (zone, kind)] = (int(series[-1][1]), "")

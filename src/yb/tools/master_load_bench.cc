@@ -210,7 +210,8 @@ DEFINE_NON_RUNTIME_string(metric_substrings,
     "rpcs_timed_out_early_in_queue,"
     "service_request_bytes_yb_master_,"
     "service_response_bytes_yb_master_,"
-    "load_balancer_duration",
+    "load_balancer_duration,"
+    "catalog_manager_bg_task_duration",
     "Master prometheus metrics to collect: comma-separated substrings; matching series are "
     "summed per metric name.");
 
