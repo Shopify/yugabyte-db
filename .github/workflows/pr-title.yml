@@ -18,10 +18,19 @@ jobs:
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
+          # Branch tag grammar: optional upstream-style v, two or more numeric parts, optional -shopify,
+          # and a numbered release -shopify-N or candidate -shopify-N-candidate (N without leading zeros).
+          # VERSION_RE must stay identical in all steps of this workflow that define it.
+          VERSION_RE='v?[0-9]+(\.[0-9]+)+(-shopify(-[1-9][0-9]*(-candidate)?)?)?'
           ISSUES_RE='\[((#[0-9]+(,#[0-9]+)*)|([A-Z]+-[0-9]+(,[A-Z]+-[0-9]+)*))\]'
+          # [shopify-only] marks a change that stays in this fork and is never submitted upstream.
+          # It may replace the issue ID or follow it, on any base branch. Pair it with the
+          # "upstream: skip" label; that pairing is a convention here, not something this check enforces.
+          SHOPIFY_ONLY_RE='\[shopify-only\]'
+          ISSUE_OR_TAG_RE="(${ISSUES_RE}(${SHOPIFY_ONLY_RE})?|${SHOPIFY_ONLY_RE})"
           # Titles on PG-version development branches (e.g. pg19) lead with [pgNN], and the issue
           # ID is optional there.
-          TITLE_RE="^((\[(BACKPORT )?([0-9]+(\.[0-9]+)+(-shopify)?)\])?${ISSUES_RE}|\[(BACKPORT )?pg[0-9]+\](${ISSUES_RE})?)"
+          TITLE_RE="^((\[(BACKPORT )?(${VERSION_RE})\])?${ISSUE_OR_TAG_RE}|\[(BACKPORT )?pg[0-9]+\](${ISSUE_OR_TAG_RE})?)"
           TITLE_RE+=' [a-zA-Z0-9_-]+(,[a-zA-Z0-9_-]+)*:'
           TITLE_RE+=' \S.{8,98}\S$'
 
@@ -29,6 +38,7 @@ jobs:
             echo "::error ::Pull Request title must include issue ID, code area,"
             echo "::error ::  and a short description, with no extra whitespace."
             echo "::error ::Issue ID is optional after a [pgNN] branch tag."
+            echo "::error ::Fork-only changes may use [shopify-only] in place of, or after, the issue ID."
             echo "::error ::Issue referenced must be a github issue or YB-internal Jira ID."
             echo "::error ::Short description must be less than 100 characters."
             echo "::error ::Backport branch should be used only for non-master release branches."
@@ -36,6 +46,7 @@ jobs:
             echo "::error ::  [#12345,#12367] area: Cool feature xyz"
             echo "::error ::  [BACKPORT 2045.1][#12345] area1,area2: Must have fix"
             echo "::error ::  [pg19] area: PG19-only change"
+            echo "::error ::  [shopify-only] Build: Fork-only CI change"
             exit 1
           fi
           echo "Pull Request title is valid."
@@ -44,8 +55,13 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           BASE_REF: ${{ github.base_ref }}
         run: |
-          BACKPORT_RE='^\[(BACKPORT )?([0-9]+(\.[0-9]+)+(-shopify)?|pg[0-9]+)\]'
-          RELEASE_BRANCH_RE='^([0-9]+(\.[0-9]+)+(-shopify)?|pg[0-9]+)$'
+          # Branch tag grammar: optional upstream-style v, two or more numeric parts, optional -shopify,
+          # and a numbered release -shopify-N or candidate -shopify-N-candidate (N without leading zeros).
+          # VERSION_RE must stay identical in all steps of this workflow that define it.
+          VERSION_RE='v?[0-9]+(\.[0-9]+)+(-shopify(-[1-9][0-9]*(-candidate)?)?)?'
+          # BASH_REMATCH[2] is the whole (version|pgNN) group; inner VERSION_RE groups follow it.
+          BACKPORT_RE="^\[(BACKPORT )?(${VERSION_RE}|pg[0-9]+)\]"
+          RELEASE_BRANCH_RE="^(${VERSION_RE}|pg[0-9]+)\$"
           # Stacked PRs target feature branches; only release targets need a branch tag.
           if [[ ! "$BASE_REF" =~ $RELEASE_BRANCH_RE ]]; then
             if [[ "$PR_TITLE" =~ $BACKPORT_RE ]]; then
@@ -76,7 +92,11 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          BACKPORT_RE='^\[BACKPORT ([0-9]+(\.[0-9]+)+(-shopify)?|pg[0-9]+)\]'
+          # Branch tag grammar: optional upstream-style v, two or more numeric parts, optional -shopify,
+          # and a numbered release -shopify-N or candidate -shopify-N-candidate (N without leading zeros).
+          # VERSION_RE must stay identical in all steps of this workflow that define it.
+          VERSION_RE='v?[0-9]+(\.[0-9]+)+(-shopify(-[1-9][0-9]*(-candidate)?)?)?'
+          BACKPORT_RE="^\[BACKPORT (${VERSION_RE}|pg[0-9]+)\]"
           # Check for true backport, not just target branch in title.
           if [[ "$PR_TITLE" =~ $BACKPORT_RE ]]; then
             body="$PR_BODY"
