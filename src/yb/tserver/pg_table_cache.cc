@@ -276,7 +276,19 @@ class PgTableCache::Impl {
       : client_future_(std::move(client_future)), notification_pool_(pool) {}
 
   Result<client::YBTablePtr> Get(TableIdView table_id) {
-    return GetEntry(table_id)->Get();
+    // As in GetTables, an entry that is there to use, loaded or loading, is found under the shared
+    // side of the mutex.
+    CacheEntryPtr entry;
+    {
+      SharedLock lock(mutex_);
+      if (auto* found = FindUsableEntryUnlocked(table_id, {})) {
+        entry = found->shared_from_this();
+      }
+    }
+    if (!entry) {
+      entry = GetEntry(table_id);
+    }
+    return entry->Get();
   }
 
   void GetIfCached(
@@ -475,6 +487,7 @@ class PgTableCache::Impl {
 
   std::pair<CacheEntryPtr, bool> DoGetEntry(
       TableIdView table_id, const PgTableCacheGetOptions& options) {
+    TEST_SYNC_POINT_CALLBACK("PgTableCache::GetEntry:Exclusive", &table_id);
     std::lock_guard lock(mutex_);
     return DoGetEntryUnlocked(table_id, options);
   }
@@ -514,7 +527,10 @@ class PgTableCache::Impl {
 
   void LoadEntry(
       TableIdView table_id, master::IncludeHidden include_hidden, const CacheEntryPtr& entry) {
-    auto callback = [entry, table_id](const Result<client::YBTablePtr>& result) {
+    // The id is copied: table_id may refer to the caller's storage, which can be gone by the time
+    // the load completes.
+    auto callback = [entry, table_id = TableId(table_id)](
+        const Result<client::YBTablePtr>& result) {
       if (VLOG_IS_ON(4)) {
         if (result.ok()) {
           // Include schema_version, num_columns, and the full schema dump so we can verify
@@ -531,7 +547,7 @@ class PgTableCache::Impl {
                   << result.status().ToString();
         }
       }
-      auto loaded_table_id = table_id;
+      TableIdView loaded_table_id = table_id;
       TEST_SYNC_POINT_CALLBACK("PgTableCache::LoadEntry:BeforeSetValue", &loaded_table_id);
       entry->SetValue(CheckTableType(result));
     };

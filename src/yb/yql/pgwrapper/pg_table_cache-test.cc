@@ -156,21 +156,29 @@ void PgTableCacheTest::TestGetTablesWhileLoading(
   });
   sync_point->EnableProcessing();
 
-  auto get_tables = [this, &table_id, &check](const std::shared_ptr<GetTablesResults>& results) {
+  auto get_tables = [this, &check](
+      const TableId& id, const std::shared_ptr<GetTablesResults>& results) {
     table_cache_->GetTables(
-        {&table_id, 1},
+        {&id, 1},
         std::make_shared<MockPgTablesQueryListener>([results, check](PgTablesQueryResult&& r) {
           results->Add(check(r));
         }));
   };
 
   auto results = std::make_shared<GetTablesResults>(1 + kConcurrentCallers);
-  get_tables(results);
+  {
+    // The caller's ids may be gone before the load completes, so the load must not refer to them:
+    // the load hook above only holds a load whose id is table_id.
+    TableId caller_table_id = table_id;
+    get_tables(caller_table_id, results);
+    std::ranges::fill(caller_table_id, 'x');
+  }
   ASSERT_EQ(exclusive_passes.load(), 1);
   {
     TestThreadHolder threads;
     for (size_t i = 0; i != kConcurrentCallers; ++i) {
-      threads.AddThreadFunctor([&get_tables, results] { get_tables(results); });
+      threads.AddThreadFunctor(
+          [&get_tables, &table_id, results] { get_tables(table_id, results); });
     }
     threads.JoinAll();
   }
@@ -267,6 +275,68 @@ TEST_F(PgTableCacheTest, ConcurrentGetTablesWhileLoading) {
         SCHECK_EQ(table->id(), table_id, IllegalState, "Wrong table");
         return Status::OK();
       }));
+}
+
+// The test checks that Get finds an entry that is loading, and one that is loaded, under the shared
+// side of the cache's mutex: only the miss that starts the load takes the exclusive side.
+TEST_F(PgTableCacheTest, GetOfLoadingAndLoadedTable) {
+  constexpr size_t kConcurrentCallers = 4;
+  const auto kWaitTimeout = 30s * kTimeMultiplier;
+
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t(k INT PRIMARY KEY, v INT)"));
+  const auto table_id = PgObjectId{
+      ASSERT_RESULT(CurrentDatabaseOid(conn)),
+      ASSERT_RESULT(conn.FetchRow<PGOid>("SELECT 't'::regclass::oid"))}.GetYbTableId();
+  table_cache_->Invalidate(table_id);
+
+  std::atomic<size_t> exclusive_gets{0};
+  std::atomic<size_t> loads{0};
+  CountDownLatch release_load{1};
+  SyncPointScope sync_point;
+  // Before sync_point's destructor, which waits for its running callbacks.
+  ScopeExit release_load_on_exit{[&release_load] { release_load.CountDown(); }};
+
+  sync_point->SetCallBack("PgTableCache::GetEntry:Exclusive", [&](void* arg) {
+    if (*static_cast<TableIdView*>(arg) == table_id) {
+      ++exclusive_gets;
+    }
+  });
+  sync_point->SetCallBack("PgTableCache::LoadEntry:BeforeSetValue", [&](void* arg) {
+    if (*static_cast<TableIdView*>(arg) != table_id) {
+      return;
+    }
+    ++loads;
+    // Runs on a client callback thread: bounded, so that a failed test does not hold it forever.
+    release_load.WaitFor(kWaitTimeout);
+  });
+  sync_point->EnableProcessing();
+
+  auto check_get = [this, &table_id]() -> Status {
+    auto table = VERIFY_RESULT(table_cache_->Get(table_id));
+    SCHECK_EQ(table->id(), table_id, IllegalState, "Wrong table");
+    return Status::OK();
+  };
+
+  // The miss, which starts the load.
+  table_cache_->GetTables(
+      {&table_id, 1}, std::make_shared<MockPgTablesQueryListener>([](PgTablesQueryResult&&) {}));
+  {
+    TestThreadHolder threads;
+    std::vector<Status> statuses(kConcurrentCallers);
+    for (auto& status : statuses) {
+      // Finds the entry loading, and waits for the held load, unless the thread starts late.
+      threads.AddThreadFunctor([&check_get, &status] { status = check_get(); });
+    }
+    release_load.CountDown();
+    threads.JoinAll();
+    for (const auto& status : statuses) {
+      ASSERT_OK(status);
+    }
+  }
+  ASSERT_OK(check_get());
+  ASSERT_EQ(loads.load(), 1);
+  ASSERT_EQ(exclusive_gets.load(), 0);
 }
 
 // The test checks that concurrent GetTables calls for a table whose entry is loading all get the
