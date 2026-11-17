@@ -48,9 +48,11 @@ class BackgroundTask {
 
   void Shutdown();
 
-  // Makes the task run (again) after this call. Cheap when a run is already pending: callers may
-  // wake the task from many threads for as long as some condition holds (the global memstore limit
-  // does, from every thread that writes to a memtable).
+  // Makes the task run (again) after this call. That run sees what the caller wrote before the
+  // call to atomics or under a lock the task also takes; a plain write that the task reads
+  // without that lock is a data race regardless. Cheap when a run is already pending (a fence,
+  // no lock): callers may wake the task from many threads for as long as some condition holds
+  // (the global memstore limit does, from every thread that writes to a memtable).
   Status Wake();
 
  private:

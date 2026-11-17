@@ -64,10 +64,16 @@ void BackgroundTask::CompleteShutdown() {
 }
 
 Status BackgroundTask::Wake() {
-  // A run is already pending: have_job_ is only cleared by the task's thread right before it
-  // starts a run, so that run starts after this call, which is all a wake-up asks for. And
-  // whoever set have_job_ notifies the thread. Without this, callers that wake the task from many
-  // threads while a condition lasts serialize on mutex_.
+  // Return without mutex_ when a run is already pending: callers that wake the task from many
+  // threads while a condition lasts would otherwise serialize on it. Whoever set have_job_
+  // notified the thread. The pending run must also see what the caller wrote before this call,
+  // but nothing orders those writes before the have_job_ load, nor the task's clear before its
+  // reads, so without fences the load can return a true the task already cleared while the run
+  // misses the writes (store buffering). This fence pairs with the one in WaitForJob(): by the
+  // fence rule ([atomics.order]), either this one comes first in their total order and the run
+  // that clears the have_job_ read here sees the caller's writes, or the task's comes first and
+  // the load sees the clear, so the caller takes the mutex path.
+  std::atomic_thread_fence(std::memory_order_seq_cst);
   if (have_job_.load(std::memory_order_acquire) && !closing_.load(std::memory_order_acquire)) {
     return Status::OK();
   }
@@ -97,6 +103,9 @@ bool BackgroundTask::WaitForJob() {
     }
     if (have_job_) {
       have_job_ = false;
+      // Orders the clear before the run's reads; pairs with the fence in Wake(). Covers runs
+      // started by the interval too, which set have_job_ below and clear it here.
+      std::atomic_thread_fence(std::memory_order_seq_cst);
       return true;
     }
 

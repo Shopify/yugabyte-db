@@ -30,8 +30,10 @@
 // under the License.
 //
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -39,9 +41,11 @@
 
 #include "yb/util/background_task.h"
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/barrier.h"
 #include "yb/util/format.h"
 #include "yb/util/result.h"
 #include "yb/util/test_macros.h"
+#include "yb/util/test_thread_holder.h"
 #include "yb/util/test_util.h"
 #include "yb/util/tsan_util.h"
 
@@ -158,6 +162,78 @@ TEST_F(BackgroundTaskTest, ConcurrentWakesAreNotLost) {
   slow.Shutdown();
   ASSERT_TRUE(slow.Wake().IsShutdownInProgress());
   task.Shutdown();
+}
+
+// A run that a Wake() call relies on, because a run was already pending, must see what the caller
+// wrote before the call. Each waker publishes a value with a relaxed store and wakes the task
+// right after a wake-up that the task may be consuming at that moment, so the second Wake() can
+// find have_job_ still set. The task records what it sees. With interval 0, a run that misses the
+// value and leaves no run pending is never followed by another, so the waker times out. All
+// wakers stop waking at the end of each round, so no other wake-up hides a lost one.
+// Probabilistic: it can miss the race (more likely on weakly ordered CPUs), but it can't fail on
+// correct code. Publishing with a seq_cst store or read-modify-write would hide the race.
+TEST_F(BackgroundTaskTest, WakeRunSeesRelaxedWritesBeforeWake) {
+  constexpr int kWakers = 3;
+  const auto kBudget = 3s * kTimeMultiplier;
+  const auto kWaitForRun = 10s * kTimeMultiplier;
+  struct Slot {
+    std::atomic<int64_t> published{0};
+    std::atomic<int64_t> observed{0};
+  };
+  std::array<Slot, kWakers> slots;
+  BackgroundTask task([&slots] {
+    for (auto& slot : slots) {
+      slot.observed.store(slot.published.load(std::memory_order_relaxed),
+                          std::memory_order_release);
+    }
+  }, "test", "test");
+  ASSERT_OK(task.Init());
+
+  Barrier barrier(kWakers);
+  // Set to the current round before the barrier and checked after it, so all wakers leave after
+  // the same round: a waker can't enter the next round, and write here again, before all of them
+  // saw this value.
+  std::atomic<int64_t> last_round{std::numeric_limits<int64_t>::max()};
+  std::atomic<int> lost{0};
+  std::atomic<int64_t> rounds{0};
+  const auto deadline = std::chrono::steady_clock::now() + kBudget;
+  TestThreadHolder thread_holder;
+  for (int i = 0; i != kWakers; ++i) {
+    thread_holder.AddThreadFunctor([&, i] {
+      auto& slot = slots[i];
+      for (int64_t n = 1;; ++n) {
+        ASSERT_OK(task.Wake());
+        // Vary where the publish lands relative to the task consuming that wake-up.
+        for (volatile int d = (n * 7 + i * 13) % 64; d > 0; d = d - 1) {}
+        slot.published.store(n, std::memory_order_relaxed);
+        ASSERT_OK(task.Wake());
+        const auto wait_deadline = std::chrono::steady_clock::now() + kWaitForRun;
+        while (slot.observed.load(std::memory_order_acquire) < n) {
+          if (std::chrono::steady_clock::now() > wait_deadline) {
+            LOG(ERROR) << "Waker " << i << " lost the wake-up of round " << n;
+            lost.fetch_add(1);
+            last_round.store(n);
+            break;
+          }
+          std::this_thread::yield();
+        }
+        if (i == 0) {
+          rounds.store(n);
+          if (std::chrono::steady_clock::now() > deadline) {
+            last_round.store(n);
+          }
+        }
+        barrier.Wait();
+        if (n >= last_round.load()) {
+          break;
+        }
+      }
+    });
+  }
+  thread_holder.JoinAll();
+  task.Shutdown();
+  LOG(INFO) << "Rounds: " << rounds.load() << ", wakers: " << kWakers;
+  ASSERT_EQ(lost.load(), 0);
 }
 
 class BackgroundTaskShutdownTest :
