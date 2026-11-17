@@ -103,8 +103,16 @@ class HybridClock : public Clock {
   // Used to get the current error, for metrics.
   int64_t SkewForMetrics();
 
-  // Reports a physical clock that is behind the clock's hybrid time by more than the allowed skew.
-  void CheckSkew(const PhysicalTime& now, MicrosTime last_usec);
+  // Whether the physical time now is behind the clock's hybrid time last_usec by more than the
+  // allowed skew. No side effects.
+  bool IsSkewed(const PhysicalTime& now, MicrosTime last_usec);
+
+  // Reports a skew that IsSkewed() found: LOG(FATAL) when clock skew control is enabled and the
+  // flags ask to fail, an error otherwise.
+  void ReportSkew(const PhysicalTime& now, MicrosTime last_usec);
+
+  // Reads the physical clock, LOG(FATAL)'s when that fails.
+  PhysicalTime ReadPhysicalClock();
 
   // Read by every call and never written after Init(): on a cache line of their own, away from the
   // reference count in the base class, which every copy of a ClockPtr writes, and from next_.

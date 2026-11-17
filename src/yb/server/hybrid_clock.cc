@@ -184,40 +184,51 @@ HybridTimeRange HybridClock::NowRange() {
   return std::make_pair(now, max_global_now);
 }
 
-void HybridClock::CheckSkew(const PhysicalTime& now, MicrosTime last_usec) {
-  auto delta_us = last_usec - now.time_point;
+bool HybridClock::IsSkewed(const PhysicalTime& now, MicrosTime last_usec) {
+  if (now.time_point >= last_usec) {
+    return false;
+  }
   // Propagated hybrid time cannot be higher than the global limit.
+  return last_usec - now.time_point > FLAGS_max_clock_skew_usec ||
+         last_usec > clock_->MaxGlobalTime(now);
+}
+
+void HybridClock::ReportSkew(const PhysicalTime& now, MicrosTime last_usec) {
+  auto delta_us = last_usec - now.time_point;
   auto max_global_time = clock_->MaxGlobalTime(now);
-  if (delta_us > FLAGS_max_clock_skew_usec || last_usec > max_global_time) {
-    auto delta = MonoDelta::FromMicroseconds(delta_us);
-    auto max_allowed = MonoDelta::FromMicroseconds(
-        std::min(FLAGS_max_clock_skew_usec, max_global_time - now.time_point));
-    if ((ANNOTATE_UNPROTECTED_READ(FLAGS_fail_on_out_of_range_clock_skew) ||
-         (ANNOTATE_UNPROTECTED_READ(FLAGS_clock_skew_force_crash_bound_usec) > 0 &&
-          delta_us > ANNOTATE_UNPROTECTED_READ(FLAGS_clock_skew_force_crash_bound_usec))) &&
-        clock_skew_control_enabled.load(std::memory_order_acquire)) {
-      TryRunClockDiagnosticsOnce();
-      LOG(FATAL) << "Too big clock skew is detected: " << delta << ", while max allowed is: "
-                 << max_allowed << "; clock_skew_force_crash_bound_usec="
-                 << ANNOTATE_UNPROTECTED_READ(FLAGS_clock_skew_force_crash_bound_usec);
-    } else {
-      YB_LOG_EVERY_N_SECS(ERROR, 1)
-          << "Too big clock skew is detected: " << delta << ", while max allowed is: "
-          << max_allowed << "; clock_skew_force_crash_bound_usec="
-          << ANNOTATE_UNPROTECTED_READ(FLAGS_clock_skew_force_crash_bound_usec);
-    }
+  auto delta = MonoDelta::FromMicroseconds(delta_us);
+  auto max_allowed = MonoDelta::FromMicroseconds(
+      std::min(FLAGS_max_clock_skew_usec, max_global_time - now.time_point));
+  if ((ANNOTATE_UNPROTECTED_READ(FLAGS_fail_on_out_of_range_clock_skew) ||
+       (ANNOTATE_UNPROTECTED_READ(FLAGS_clock_skew_force_crash_bound_usec) > 0 &&
+        delta_us > ANNOTATE_UNPROTECTED_READ(FLAGS_clock_skew_force_crash_bound_usec))) &&
+      clock_skew_control_enabled.load(std::memory_order_acquire)) {
+    TryRunClockDiagnosticsOnce();
+    LOG(FATAL) << "Too big clock skew is detected: " << delta << ", while max allowed is: "
+               << max_allowed << "; clock_skew_force_crash_bound_usec="
+               << ANNOTATE_UNPROTECTED_READ(FLAGS_clock_skew_force_crash_bound_usec);
+  } else {
+    YB_LOG_EVERY_N_SECS(ERROR, 1)
+        << "Too big clock skew is detected: " << delta << ", while max allowed is: "
+        << max_allowed << "; clock_skew_force_crash_bound_usec="
+        << ANNOTATE_UNPROTECTED_READ(FLAGS_clock_skew_force_crash_bound_usec);
   }
 }
 
-void HybridClock::NowWithError(HybridTime *hybrid_time, uint64_t *max_error_usec) {
-  DCHECK_EQ(state_, kInitialized) << "Clock not initialized. Must call Init() first.";
-
+PhysicalTime HybridClock::ReadPhysicalClock() {
   auto now = clock_->Now();
   if (PREDICT_FALSE(!now.ok())) {
     TryRunClockDiagnosticsOnce();
     LOG(FATAL) << Format("Couldn't get the current time: Clock unsynchronized. "
         "Status: $0", now.status().ToString());
   }
+  return *now;
+}
+
+void HybridClock::NowWithError(HybridTime *hybrid_time, uint64_t *max_error_usec) {
+  DCHECK_EQ(state_, kInitialized) << "Clock not initialized. Must call Init() first.";
+
+  auto now = ReadPhysicalClock();
 
   // The hybrid time to return is the physical time with a zero logical part, or, when the clock is
   // already at or past that (another call in the same microsecond, a physical clock that went
@@ -226,7 +237,7 @@ void HybridClock::NowWithError(HybridTime *hybrid_time, uint64_t *max_error_usec
   //
   // The usual case under load is the second: one atomic add takes the value and advances the
   // clock, and cannot fail whatever other threads do.
-  const uint64_t physical = HybridTime::FromMicros(now->time_point).ToUint64();
+  const uint64_t physical = HybridTime::FromMicros(now.time_point).ToUint64();
   uint64_t issued = next_.fetch_add(1, std::memory_order_acq_rel);
   if (issued < physical) {
     // The physical clock is ahead: move the clock up to it. The value taken above is dropped (it
@@ -248,7 +259,7 @@ void HybridClock::NowWithError(HybridTime *hybrid_time, uint64_t *max_error_usec
 
   *hybrid_time = HybridTime(issued);
   if (issued == physical) {
-    *max_error_usec = now->max_error;
+    *max_error_usec = now.max_error;
     if (PREDICT_FALSE(VLOG_IS_ON(2))) {
       VLOG(2) << "Current clock is higher than the last one. Resetting logical values."
           << " Time: " << *hybrid_time << ", Error: " << *max_error_usec;
@@ -276,10 +287,16 @@ void HybridClock::NowWithError(HybridTime *hybrid_time, uint64_t *max_error_usec
   // This broadens the error interval for both cases but always returns
   // a correct error interval.
   const MicrosTime last_usec = HybridTime(issued + 1).GetPhysicalValueMicros();
-  if (now->time_point < last_usec) {
-    CheckSkew(*now, last_usec);
+  if (PREDICT_FALSE(IsSkewed(now, last_usec))) {
+    // The physical time was read before the hybrid time was taken, so a thread that stalled in
+    // between while others advanced the clock sees the clock ahead of a stale sample. A fresh read
+    // is ordered after taking the hybrid time; only that one can show real skew.
+    now = ReadPhysicalClock();
+    if (IsSkewed(now, last_usec)) {
+      ReportSkew(now, last_usec);
+    }
   }
-  *max_error_usec = last_usec - (now->time_point - now->max_error);
+  *max_error_usec = std::max(last_usec, now.time_point) - (now.time_point - now.max_error);
   if (PREDICT_FALSE(VLOG_IS_ON(2))) {
     VLOG(2) << "Current clock is lower than the last one. Returning last read and incrementing"
         " logical values. Hybrid time: " << *hybrid_time << " Error: " << *max_error_usec;

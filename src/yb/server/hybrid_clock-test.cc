@@ -33,7 +33,9 @@
 #include <algorithm>
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -46,6 +48,7 @@
 #include "yb/server/hybrid_clock.h"
 
 #include "yb/util/atomic.h"
+#include "yb/util/logging_test_util.h"
 #include "yb/util/monotime.h"
 #include "yb/util/random.h"
 #include "yb/util/random_util.h"
@@ -180,6 +183,105 @@ TEST(MockHybridClockTest, LogicalOverflowCarries) {
   // The physical clock catches up to a microsecond the logical part already carried into.
   mock_clock.Set({5001, 0});
   ASSERT_GT(clock->Now(), prev);
+}
+
+namespace {
+
+// Physical clock that, on its first read after Arm(), moves the hybrid clock to
+// HybridTime::FromMicros(kStalled + kAdvance) and returns kStalled: as if this thread stalled after
+// reading the physical clock while another one advanced the hybrid clock. Later reads return
+// kStalled + kAdvance, or kStalled again if the skew is real.
+//
+// MaxGlobalTime is the time point itself, as in MockClock, so a hybrid time any amount ahead of a
+// sample counts as skew; kAdvance stays far below max_clock_skew_usec.
+class StallingClock : public PhysicalClock {
+ public:
+  static constexpr MicrosTime kStalled = 1000000;
+  static constexpr MicrosTime kAdvance = 1000;
+  static constexpr MicrosTime kError = 50;
+
+  explicit StallingClock(bool skew_persists) : skew_persists_(skew_persists) {}
+
+  void Arm(HybridClock* hybrid_clock) { hybrid_clock_ = hybrid_clock; }
+
+  Result<PhysicalTime> Now() override {
+    ++reads_;
+    if (hybrid_clock_ && !fired_) {
+      fired_ = true;
+      hybrid_clock_->Update(HybridTime::FromMicros(kStalled + kAdvance));
+      return PhysicalTime{kStalled, kError};
+    }
+    return PhysicalTime{skew_persists_ ? kStalled : kStalled + kAdvance, kError};
+  }
+
+  MicrosTime MaxGlobalTime(PhysicalTime time) override {
+    return time.time_point;
+  }
+
+  int reads() const { return reads_; }
+
+ private:
+  const bool skew_persists_;
+  HybridClock* hybrid_clock_ = nullptr;
+  bool fired_ = false;
+  int reads_ = 0;
+};
+
+size_t CountContaining(const StringVectorSink& sink, std::string_view text) {
+  return std::count_if(
+      sink.logged_msgs().begin(), sink.logged_msgs().end(),
+      [text](const std::string& msg) { return msg.find(text) != std::string::npos; });
+}
+
+} // namespace
+
+class HybridClockSkewTest : public YBTest {
+ protected:
+  void Init(bool skew_persists) {
+    physical_ = std::make_shared<StallingClock>(skew_persists);
+    clock_.reset(new HybridClock(physical_));
+    ASSERT_OK(clock_->Init());
+    physical_->Arm(clock_.get());
+  }
+
+  std::shared_ptr<StallingClock> physical_;
+  scoped_refptr<HybridClock> clock_;
+};
+
+// The hybrid clock moving ahead between the physical read and the hybrid time being taken is not
+// skew: a fresh physical read is not behind it.
+TEST_F(HybridClockSkewTest, StalledPhysicalSampleIsNotSkew) {
+  ASSERT_NO_FATALS(Init(/* skew_persists= */ false));
+  StringVectorSink sink;
+  ScopedRegisterSink registration(&sink);
+
+  HybridTime hybrid_time;
+  uint64_t max_error_usec;
+  clock_->NowWithError(&hybrid_time, &max_error_usec);
+  ASSERT_EQ(CountContaining(sink, "Too big clock skew"), 0);
+  ASSERT_GT(hybrid_time, HybridTime::FromMicros(StallingClock::kStalled + StallingClock::kAdvance));
+  // From the fresh sample, which is at the hybrid time's microsecond.
+  ASSERT_EQ(max_error_usec, StallingClock::kError);
+  ASSERT_EQ(physical_->reads(), 2);
+
+  // No apparent skew: one physical read.
+  clock_->NowWithError(&hybrid_time, &max_error_usec);
+  ASSERT_EQ(physical_->reads(), 3);
+  ASSERT_EQ(CountContaining(sink, "Too big clock skew"), 0);
+}
+
+// A physical clock that is still behind on the second read is reported.
+TEST_F(HybridClockSkewTest, PersistentSkewIsReported) {
+  ASSERT_NO_FATALS(Init(/* skew_persists= */ true));
+  StringVectorSink sink;
+  ScopedRegisterSink registration(&sink);
+
+  HybridTime hybrid_time;
+  uint64_t max_error_usec;
+  clock_->NowWithError(&hybrid_time, &max_error_usec);
+  ASSERT_EQ(CountContaining(sink, "Too big clock skew"), 1);
+  ASSERT_GT(hybrid_time, HybridTime::FromMicros(StallingClock::kStalled + StallingClock::kAdvance));
+  ASSERT_EQ(max_error_usec, StallingClock::kAdvance + StallingClock::kError);
 }
 
 // Test that two subsequent time reads are monotonically increasing.
