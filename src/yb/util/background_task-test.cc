@@ -168,8 +168,9 @@ TEST_F(BackgroundTaskTest, ConcurrentWakesAreNotLost) {
 // wrote before the call. Each waker publishes a value with a relaxed store and wakes the task
 // right after a wake-up that the task may be consuming at that moment, so the second Wake() can
 // find have_job_ still set. The task records what it sees. With interval 0, a run that misses the
-// value and leaves no run pending is never followed by another, so the waker times out. All
-// wakers stop waking at the end of each round, so no other wake-up hides a lost one.
+// value and leaves no run pending is never followed by another, so the waker times out. A barrier
+// ends each round, so a wake-up from a later round can't hide a lost one; another waker's wake-up
+// later in the same round still can, so only a lost wake-up that no other waker follows shows.
 // Probabilistic: it can miss the race (more likely on weakly ordered CPUs), but it can't fail on
 // correct code. Publishing with a seq_cst store or read-modify-write would hide the race.
 TEST_F(BackgroundTaskTest, WakeRunSeesRelaxedWritesBeforeWake) {
