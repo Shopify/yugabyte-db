@@ -48,6 +48,7 @@
 #include "yb/server/hybrid_clock.h"
 
 #include "yb/util/atomic.h"
+#include "yb/util/backoff_waiter.h"
 #include "yb/util/logging_test_util.h"
 #include "yb/util/monotime.h"
 #include "yb/util/random.h"
@@ -237,11 +238,12 @@ size_t CountContaining(const StringVectorSink& sink, std::string_view text) {
 
 class HybridClockSkewTest : public YBTest {
  protected:
-  void Init(bool skew_persists) {
+  Status Init(bool skew_persists) {
     physical_ = std::make_shared<StallingClock>(skew_persists);
     clock_.reset(new HybridClock(physical_));
-    ASSERT_OK(clock_->Init());
+    RETURN_NOT_OK(clock_->Init());
     physical_->Arm(clock_.get());
+    return Status::OK();
   }
 
   std::shared_ptr<StallingClock> physical_;
@@ -251,13 +253,15 @@ class HybridClockSkewTest : public YBTest {
 // The hybrid clock moving ahead between the physical read and the hybrid time being taken is not
 // skew: a fresh physical read is not behind it.
 TEST_F(HybridClockSkewTest, StalledPhysicalSampleIsNotSkew) {
-  ASSERT_NO_FATALS(Init(/* skew_persists= */ false));
+  ASSERT_OK(Init(/* skew_persists= */ false));
   StringVectorSink sink;
   ScopedRegisterSink registration(&sink);
 
   HybridTime hybrid_time;
   uint64_t max_error_usec;
   clock_->NowWithError(&hybrid_time, &max_error_usec);
+  // The report is rate limited per process, so this alone can miss a false report after another
+  // test's; the read count and the error from the fresh sample catch it regardless.
   ASSERT_EQ(CountContaining(sink, "Too big clock skew"), 0);
   ASSERT_GT(hybrid_time, HybridTime::FromMicros(StallingClock::kStalled + StallingClock::kAdvance));
   // From the fresh sample, which is at the hybrid time's microsecond.
@@ -272,16 +276,27 @@ TEST_F(HybridClockSkewTest, StalledPhysicalSampleIsNotSkew) {
 
 // A physical clock that is still behind on the second read is reported.
 TEST_F(HybridClockSkewTest, PersistentSkewIsReported) {
-  ASSERT_NO_FATALS(Init(/* skew_persists= */ true));
+  ASSERT_OK(Init(/* skew_persists= */ true));
   StringVectorSink sink;
   ScopedRegisterSink registration(&sink);
 
   HybridTime hybrid_time;
   uint64_t max_error_usec;
   clock_->NowWithError(&hybrid_time, &max_error_usec);
-  ASSERT_EQ(CountContaining(sink, "Too big clock skew"), 1);
   ASSERT_GT(hybrid_time, HybridTime::FromMicros(StallingClock::kStalled + StallingClock::kAdvance));
   ASSERT_EQ(max_error_usec, StallingClock::kAdvance + StallingClock::kError);
+  ASSERT_EQ(physical_->reads(), 2);
+
+  // The report is logged at most once a second per process, so a skew another test in this process
+  // logged just before can suppress the first one: retry on a fresh clock until it shows.
+  ASSERT_OK(WaitFor([this, &sink, &hybrid_time, &max_error_usec]() -> Result<bool> {
+    if (CountContaining(sink, "Too big clock skew") != 0) {
+      return true;
+    }
+    RETURN_NOT_OK(Init(/* skew_persists= */ true));
+    clock_->NowWithError(&hybrid_time, &max_error_usec);
+    return CountContaining(sink, "Too big clock skew") != 0;
+  }, 5s, "Skew reported"));
 }
 
 // Test that two subsequent time reads are monotonically increasing.

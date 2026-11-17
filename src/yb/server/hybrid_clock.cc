@@ -268,24 +268,6 @@ void HybridClock::NowWithError(HybridTime *hybrid_time, uint64_t *max_error_usec
   }
 
   // The clock is ahead of the physical time read above.
-  //
-  // We don't have the last time read max error since it might have originated
-  // in another machine, but we can put a bound on the maximum error of the
-  // hybrid_time we are providing.
-  // In particular we know that the "true" time falls within the interval
-  // now_usec +- now.maxerror so we get the following situations:
-  //
-  // 1)
-  // --------|----------|----|---------|--------------------------> time
-  //     now - e       now  last   now + e
-  // 2)
-  // --------|----------|--------------|------|-------------------> time
-  //     now - e       now         now + e   last
-  //
-  // Assuming, in the worst case, that the "true" time is now - error we need to
-  // always return: last - (now - e) as the new maximum error.
-  // This broadens the error interval for both cases but always returns
-  // a correct error interval.
   const MicrosTime last_usec = HybridTime(issued + 1).GetPhysicalValueMicros();
   if (PREDICT_FALSE(IsSkewed(now, last_usec))) {
     // The physical time was read before the hybrid time was taken, so a thread that stalled in
@@ -296,6 +278,26 @@ void HybridClock::NowWithError(HybridTime *hybrid_time, uint64_t *max_error_usec
       ReportSkew(now, last_usec);
     }
   }
+
+  // We don't have the last time read max error since it might have originated
+  // in another machine, but we can put a bound on the maximum error of the
+  // hybrid_time we are providing.
+  // In particular we know that the "true" time falls within the interval
+  // now_usec +- now.maxerror, where now is the physical sample kept above,
+  // so we get the following situations:
+  //
+  // 1)
+  // --------|----------|----|---------|--------------------------> time
+  //     now - e       now  last   now + e
+  // 2)
+  // --------|----------|--------------|------|-------------------> time
+  //     now - e       now         now + e   last
+  // 3) A fresh sample read at or past last: the sample's own error, e, applies.
+  //
+  // Assuming, in the worst case, that the "true" time is now - error we need to
+  // return: max(last, now) - (now - e) as the new maximum error.
+  // This broadens the error interval for cases 1 and 2 but always returns
+  // a correct error interval.
   *max_error_usec = std::max(last_usec, now.time_point) - (now.time_point - now.max_error);
   if (PREDICT_FALSE(VLOG_IS_ON(2))) {
     VLOG(2) << "Current clock is lower than the last one. Returning last read and incrementing"
