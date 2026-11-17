@@ -2364,13 +2364,13 @@ void MetaCache::LookupTabletByKey(const std::shared_ptr<YBTable>& table,
                     << ", partition_start: " << Slice(*partition_start).ToDebugHexString();
 
   PartitionGroupStartKeyPtr partition_group_start;
-  if (DoLookupTabletByKey<SharedLock<std::shared_timed_mutex>>(
+  if (DoLookupTabletByKey<SharedLock<LaneShardedRwMutex>>(
           table, table_partition_list, partition_start, deadline, &callback,
           &partition_group_start)) {
     return;
   }
 
-  bool result = DoLookupTabletByKey<std::lock_guard<std::shared_timed_mutex>>(
+  bool result = DoLookupTabletByKey<std::lock_guard<LaneShardedRwMutex>>(
       table, table_partition_list, partition_start, deadline, &callback, &partition_group_start);
   LOG_IF(DFATAL, !result)
       << "Lookup was not started for table " << table->ToString()
@@ -2401,11 +2401,11 @@ void MetaCache::LookupAllTablets(const std::shared_ptr<YBTable>& table,
 
   // We first want to check the cache in read-only mode, and only if we can't find anything
   // do a lookup in write mode.
-  if (DoLookupAllTablets<SharedLock<std::shared_timed_mutex>>(table, deadline, &callback)) {
+  if (DoLookupAllTablets<SharedLock<LaneShardedRwMutex>>(table, deadline, &callback)) {
     return;
   }
 
-  bool result = DoLookupAllTablets<std::lock_guard<std::shared_timed_mutex>>(
+  bool result = DoLookupAllTablets<std::lock_guard<LaneShardedRwMutex>>(
       table, deadline, &callback);
   LOG_IF(DFATAL, !result)
       << "Full table lookup was not started for table " << table->ToString();

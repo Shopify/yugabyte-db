@@ -36,6 +36,9 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <atomic>
+#include <cstring>
+#include <thread>
 #include <vector>
 
 #include "yb/gutil/strings/human_readable.h"
@@ -62,7 +65,9 @@ DECLARE_bool(mem_tracker_include_pageheap_free_in_root_consumption);
 DECLARE_double(mem_tracker_external_consumption_accuracy_percentage);
 DECLARE_int32(memory_limit_soft_percentage);
 DECLARE_int64(mem_tracker_lane_batch_bytes);
+DECLARE_int64(mem_tracker_tcmalloc_gc_max_release_bytes_per_call);
 DECLARE_int64(mem_tracker_tcmalloc_gc_release_bytes);
+DECLARE_int32(tcmalloc_max_free_bytes_percentage);
 DECLARE_int64(mem_tracker_update_consumption_interval_us);
 
 using namespace std::literals;
@@ -398,6 +403,98 @@ TEST(MemTrackerTest, TcMallocGC) {
   auto overhead_final = GetTCMallocPageHeapFreeBytes();
   LOG(INFO) << "Final overhead " << overhead_final;
   ASSERT_GT(overhead_after, overhead_final);
+}
+
+// One GC returns at most mem_tracker_tcmalloc_gc_max_release_bytes_per_call to the system, however
+// large the free page heap is, and later GCs release the rest. Without the bound, the thread whose
+// Release() crossed the trigger released the whole excess before returning.
+TEST(MemTrackerTest, TcMallocGCBoundedPerCall) {
+  MemTracker::TEST_SetReleasedMemorySinceGC(0);
+  shared_ptr<MemTracker> root = MemTracker::GetRootTracker();
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_mem_tracker_tcmalloc_gc_release_bytes) = 1_MB;
+  // Any free page heap byte counts as excess.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tcmalloc_max_free_bytes_percentage) = 0;
+  constexpr int64_t kPerCall = 8_MB;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_mem_tracker_tcmalloc_gc_max_release_bytes_per_call) = kPerCall;
+
+  // Put well over the per-call bound on the page heap free list. Blocks below the huge page size:
+  // larger ones go through tcmalloc's huge page cache, which returns memory on its own schedule.
+  // tcmalloc also sizes what it keeps by recent demand, so the first cycles can leave little.
+  constexpr size_t kChunk = 512_KB;
+  constexpr size_t kChunks = 1024;
+  int64_t overhead_before = 0;
+  for (int cycle = 0; cycle != 4 && overhead_before < 8 * kPerCall; ++cycle) {
+    {
+      std::vector<std::unique_ptr<char[]>> chunks;
+      for (size_t i = 0; i != kChunks; ++i) {
+        chunks.emplace_back(new char[kChunk]);
+        memset(chunks.back().get(), 1, kChunk);
+      }
+    }
+    overhead_before = GetTCMallocPageHeapFreeBytes();
+    LOG(INFO) << "Free page heap after allocation cycle " << cycle << ": " << overhead_before;
+  }
+  if (overhead_before < 8 * kPerCall) {
+    GTEST_SKIP() << "tcmalloc kept only " << overhead_before << " bytes on the page heap free list";
+  }
+
+  // Cross the trigger once.
+  root->Release(1_MB);
+  root->Release(1);
+  auto overhead_after_one = GetTCMallocPageHeapFreeBytes();
+  LOG(INFO) << "Free page heap after one GC: " << overhead_after_one;
+  ASSERT_LT(overhead_after_one, overhead_before);
+  // tcmalloc releases whole spans, so one call can exceed the bound by a span or a huge page per
+  // step; it must still be far from releasing everything.
+  ASSERT_LE(overhead_before - overhead_after_one, 4 * kPerCall);
+  ASSERT_GT(overhead_after_one, overhead_before / 2);
+
+  // Further triggers keep releasing.
+  for (int i = 0; i != 8; ++i) {
+    root->Release(1_MB);
+    root->Release(1);
+  }
+  auto overhead_after_more = GetTCMallocPageHeapFreeBytes();
+  LOG(INFO) << "Free page heap after nine GCs: " << overhead_after_more;
+  ASSERT_LT(overhead_after_more, overhead_after_one);
+}
+
+// Concurrent triggers do not queue behind each other: one thread runs the GC and the rest return.
+TEST(MemTrackerTest, TcMallocGCConcurrentTriggers) {
+  MemTracker::TEST_SetReleasedMemorySinceGC(0);
+  shared_ptr<MemTracker> root = MemTracker::GetRootTracker();
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_mem_tracker_tcmalloc_gc_release_bytes) = 1_MB;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tcmalloc_max_free_bytes_percentage) = 0;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_mem_tracker_tcmalloc_gc_max_release_bytes_per_call) = 0;
+  {
+    std::vector<std::unique_ptr<char[]>> chunks;
+    for (size_t i = 0; i != 1024; ++i) {
+      chunks.emplace_back(new char[512_KB]);
+      memset(chunks.back().get(), 1, 512_KB);
+    }
+  }
+  auto overhead_before = GetTCMallocPageHeapFreeBytes();
+  if (overhead_before < static_cast<int64_t>(16_MB)) {
+    GTEST_SKIP() << "tcmalloc kept only " << overhead_before << " bytes on the page heap free list";
+  }
+  std::atomic<int> attempted{0};
+  std::vector<std::thread> threads;
+  for (int i = 0; i != 16; ++i) {
+    threads.emplace_back([&attempted] {
+      for (int n = 0; n != 4; ++n) {
+        if (MemTracker::GcTcmallocIfNeeded()) {
+          attempted.fetch_add(1);
+        }
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  LOG(INFO) << "GCs that released memory: " << attempted << " of 64 calls; free page heap "
+            << overhead_before << " -> " << GetTCMallocPageHeapFreeBytes();
+  ASSERT_GE(attempted, 1);
+  ASSERT_LT(GetTCMallocPageHeapFreeBytes(), overhead_before);
 }
 
 namespace {

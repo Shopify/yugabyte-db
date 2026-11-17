@@ -65,6 +65,7 @@
 #include "yb/tserver/tserver_fwd.h"
 
 #include "yb/util/format.h"
+#include "yb/util/lane_sharded_rw_mutex.h"
 #include "yb/util/locks.h"
 #include "yb/util/lockfree.h"
 #include "yb/util/monotime.h"
@@ -800,7 +801,10 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
 
   YBClient* const client_;
 
-  mutable std::shared_timed_mutex mutex_;
+  // Sharded by lane: lookups take only their lane's slot, updates take every slot. One
+  // std::shared_timed_mutex here made the session threads of every lane convoy on a single
+  // futex word (see util/lane_sharded_rw_mutex.h).
+  mutable LaneShardedRwMutex mutex_;
 
   // Cache of Tablet Server locations: TS UUID -> RemoteTabletServer*.
   //
