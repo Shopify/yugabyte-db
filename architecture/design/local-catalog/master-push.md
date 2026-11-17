@@ -243,7 +243,62 @@ only to reseeds.
 | `master/ts_descriptor.h` | `LocalCatalogServiceProxy` added to the per-tserver proxy cache. |
 | `tserver/tablet_server.{h,cc}` | Registers the service behind the flag, with its own queue length flag. |
 | `common/common_flags.{h,cc}` | `enable_local_tserver_catalog`. |
-| `yql/pgwrapper/pg_local_catalog-test.cc` | 39 tests: batching, sharing, failed batch builds and their retry, a failed push to one copy, reseeds (divergence, log GC, log gone mid read), stalls and gaps, failover and deposed leaders (including a shared reseed), a new leader pushing without waiting, shutdown with a push in flight, timer skip and catch-up, requested cycles, lease changes, object locking off, tservers without the service, gauges and memory accounting. |
+| `yql/pgwrapper/pg_local_catalog-test.cc` | 39 tests, listed under [Tests](#tests). |
+
+## Tests
+
+All in `yql/pgwrapper/pg_local_catalog-test.cc`, grouped by fixture.
+
+| Test | Checks |
+|---|---|
+| **`PgLocalCatalogTest`** | |
+| `TestReceiverAppliesBatchesInOrder` | The test receiver records only a batch at its position, acks one it is past, answers with position and safe time. |
+| **`PgLocalCatalogPushTest`** (one copy) | |
+| `LongCatchUpIsSplitIntoBatches` | A far-behind copy catches up in one cycle through a chain of batches. |
+| `CycleAfterDdlPushesDdl` | A DDL's rows and apply record are pushed, with a safe time at or after its commit. |
+| `RequestedCycleMovesSafeTime` | Every requested cycle certifies a new safe time. |
+| `RequestCycleRunsOnPusherThread` | A requested cycle runs at once, and is not skipped when nothing moved. |
+| `FailedCycleIsRetried` | A failed cycle is retried without waiting for the interval. |
+| `GapAnswerIsStall` | A GAP answer stalls the copy and ends its cycle. |
+| `BatchMemoryIsChargedWhileInFlight` | A batch is charged to the memory tracker while its push is in flight. |
+| `DivergedCopyIsReseeded` | A copy whose position's term differs from the log is reseeded. |
+| `CycleWaitsForCommittedDdlApply` | An open DDL's rows are pushed; after commit, the safe time waits for its apply record. |
+| `CycleFailsWithoutDdlApply` | A cycle fails if a committed DDL's apply record never shows up. |
+| `CopyFallingBackIsLeftForNextCycle` | A copy that keeps answering without progress is left after its fourth such answer. |
+| `LogGoneAtFirstReadIsReseeded` | A copy is reseeded when the log is gone at the first read. |
+| `LogGoneMidBatchSendsWhatWasRead` | Log gone mid batch: what was read is sent without the safe time, and the next batch continues. |
+| `EmptyReadMidBatchSendsWhatWasRead` | An empty read mid batch: what was read is sent, and the next batch continues. |
+| `ChangeMetadataEndsBatch` | A tablet metadata change ends its batch. |
+| **`PgLocalCatalogPushLogGcTest`** | |
+| `CopyBehindLogGcIsReseeded` | A copy behind log GC is reseeded. |
+| **`PgLocalCatalogPushTwoCopiesTest`** | |
+| `OlderCopyGetsRecordsFromItsPosition` | Copies at different positions are each sent from their own position. |
+| `ManyBatchesWithOneRpcInFlight` | Copies at one position share every batch of a long catch-up, one RPC in flight. |
+| `FailedBatchBuildEndsCycle` | A failed batch build fails the cycle without sending or rebuilding it. |
+| `FailedPushLeavesOtherCopyCatchingUp` | A failed push to one copy does not stop the other from catching up. |
+| `TserverThatLeavesIsDropped` | A tserver that shuts down loses its lease and is no longer a target. |
+| `RestartedTserverIsReseeded` | A restarted tserver with an empty copy is reseeded. |
+| `JoiningTserverIsCaughtUp` | A joining tserver becomes a target and is caught up. |
+| `TserverWithoutLocalCatalogHasNoCopy` | A tserver without the service counts as a target without a copy. |
+| **`PgLocalCatalogPushLegacyTest`** (object locking off) | |
+| `DdlReachesEveryCopy` | Every lease holder is a target, and a DDL reaches every copy. |
+| `GateOffPushesNothing` | Nothing is pushed while the YSQL lease or invalidation messages are off. |
+| **`PgLocalCatalogPushFailoverTest`** (three masters) | |
+| `NewLeaderPushesFromCopyPositions` | A new leader continues from the copies' positions, without a reseed. |
+| `NewLeaderPushesWithoutWaiting` | A new leader pushes once it has loaded the catalog. |
+| `LeaseLapseKeepsGauges` | A leader without its lease pushes nothing and keeps its gauges. |
+| `LeaderChangeBeforePushEndsCycle` | A leader change after resolving intents ends the cycle uncounted. |
+| `OldLeaderDoesNotReseed` | A deposed leader sends no reseed and counts no failure. |
+| `ShutdownWithPushInFlight` | Shutdown does not wait for an in-flight answer; the next leader catches up. |
+| **`PgLocalCatalogPushFailoverTwoCopiesTest`** | |
+| `OldLeaderDoesNotSendSharedReseed` | A reseed built for one copy is not sent to another once the leader is deposed. |
+| **`PgLocalCatalogPushTimerTest`** | |
+| `MasterWriteArrivesOnTimer` | A master-only write reaches the copy on the timer. |
+| `TimerCatchesUpCopyLeftBehind` | The timer catches up a copy left behind although the WAL is idle. |
+| `TimerSkipsTargetWithoutCopy` | A target without a copy is pushed to only once the WAL moves. |
+| `LagGaugesTrackCopyLeftBehind` | The lag gauges grow while a copy lags and drop to 0 once caught up. |
+| **`PgLocalCatalogMasterOffTest`** | |
+| `MasterWithoutLocalCatalogPushesNothing` | A master without the local catalog has no pusher or metrics and pushes nothing. |
 
 ## Known limitations (TODOs in the code)
 
