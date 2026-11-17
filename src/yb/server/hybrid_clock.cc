@@ -320,9 +320,9 @@ HybridTimeRange HybridClock::CoarseNowRange() {
   const HybridTime latest(next - 1);
   const MicrosTime latest_usec = latest.GetPhysicalValueMicros();
   // Not when it is too far behind the physical clock (the caller wants the current time), and not
-  // when it is ahead by more than the allowed skew (Now() reports that).
-  if (latest_usec + max_lag_us < now->time_point ||
-      latest_usec > now->time_point + FLAGS_max_clock_skew_usec) {
+  // when it is ahead by more than Now() allows, by either the skew flag or the physical clock's
+  // MaxGlobalTime (Now() reports that, and the caller would propagate it).
+  if (latest_usec + max_lag_us < now->time_point || IsSkewed(*now, latest_usec)) {
     return NowRange();
   }
   const MicrosTime usec = std::max(latest_usec, now->time_point);

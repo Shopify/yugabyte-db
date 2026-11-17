@@ -59,9 +59,10 @@
 
 using std::vector;
 
-DECLARE_uint64(max_clock_sync_error_usec);
 DECLARE_bool(disable_clock_sync_error);
 DECLARE_int64(hybrid_clock_coarse_now_max_lag_us);
+DECLARE_uint64(max_clock_skew_usec);
+DECLARE_uint64(max_clock_sync_error_usec);
 
 using namespace std::literals;
 
@@ -85,7 +86,29 @@ class HybridClockTest : public YBTest {
   scoped_refptr<HybridClock> clock_;
 };
 
-TEST(MockHybridClockTest, TestMockedSystemClock) {
+// YBTest restores the flags these tests set.
+class MockHybridClockTest : public YBTest {
+};
+
+namespace {
+
+// MockClock whose MaxGlobalTime is the time point plus a fixed bound, so a hybrid time up to that
+// far ahead of the physical clock is not skew.
+class BoundedMockClock : public MockClock {
+ public:
+  explicit BoundedMockClock(MicrosTime bound) : bound_(bound) {}
+
+  MicrosTime MaxGlobalTime(PhysicalTime time) override {
+    return time.time_point + bound_;
+  }
+
+ private:
+  const MicrosTime bound_;
+};
+
+} // namespace
+
+TEST_F(MockHybridClockTest, TestMockedSystemClock) {
   ASSERT_EQ(kMaxHybridTimePhysicalMicros, HybridTime::kMax.GetPhysicalValueMicros());
   MockClock mock_clock;
   scoped_refptr<HybridClock> clock(new HybridClock(mock_clock.AsClock()));
@@ -112,12 +135,14 @@ TEST(MockHybridClockTest, TestMockedSystemClock) {
 }
 
 // CoarseNow() against a mocked physical clock: it returns the clock's latest hybrid time without
-// advancing the clock while that is within the allowed lag of the physical clock, and advances
-// the clock otherwise. It never returns less than what the clock returned or was updated to
-// before, and Now() after it is always larger.
-TEST(MockHybridClockTest, CoarseNow) {
+// advancing the clock while that is within the allowed lag behind the physical clock, or ahead of
+// it by no more than the physical clock's MaxGlobalTime allows, and advances the clock otherwise.
+// It never returns less than what the clock returned or was updated to before, and Now() after it
+// is always larger. The bound here is loose; CoarseNowFallsBackBeyondMaxGlobalTime covers a tight
+// one.
+TEST_F(MockHybridClockTest, CoarseNow) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_hybrid_clock_coarse_now_max_lag_us) = 100;
-  MockClock mock_clock;
+  BoundedMockClock mock_clock(/* bound= */ 1000);
   scoped_refptr<HybridClock> clock(new HybridClock(mock_clock.AsClock()));
   ASSERT_OK(clock->Init());
   constexpr MicrosTime kStart = 1000000;
@@ -148,7 +173,8 @@ TEST(MockHybridClockTest, CoarseNow) {
   ASSERT_EQ(clock->CoarseNow(), at(kStart + 201, 0));
   ASSERT_EQ(clock->Now(), at(kStart + 201, 1));
 
-  // A hybrid time from another server moves the latest value; a lower one changes nothing.
+  // A hybrid time from another server, ahead of the physical clock within the bound, moves the
+  // latest value; a lower one changes nothing.
   const auto ahead = at(kStart + 500, 7);
   clock->Update(ahead);
   ASSERT_EQ(clock->CoarseNow(), ahead);
@@ -167,8 +193,47 @@ TEST(MockHybridClockTest, CoarseNow) {
   ASSERT_EQ(clock->CoarseNow(), at(kStart + 500, 11));
 }
 
+// With a MaxGlobalTime far tighter than max_clock_skew_usec, as with clockbound, a latest hybrid
+// time beyond MaxGlobalTime(now) is not handed out: CoarseNow() advances the clock as Now() does.
+// One at MaxGlobalTime(now) is still returned without advancing the clock. Asserts the returned
+// hybrid times, so it does not depend on the rate-limited skew report the fallback logs.
+TEST_F(MockHybridClockTest, CoarseNowFallsBackBeyondMaxGlobalTime) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_hybrid_clock_coarse_now_max_lag_us) = 100;
+  constexpr MicrosTime kBound = 50;
+  // The leads below are within max_clock_skew_usec: only MaxGlobalTime can make them skew.
+  ASSERT_LT(kBound + 1, FLAGS_max_clock_skew_usec);
+  BoundedMockClock mock_clock(kBound);
+  scoped_refptr<HybridClock> clock(new HybridClock(mock_clock.AsClock()));
+  ASSERT_OK(clock->Init());
+  constexpr MicrosTime kStart = 1000000;
+  auto at = [](MicrosTime micros, LogicalTimeComponent logical) {
+    return HybridTime::FromMicrosecondsAndLogicalValue(micros, logical);
+  };
+
+  mock_clock.Set({kStart, 0});
+  ASSERT_EQ(clock->Now(), at(kStart, 0));
+
+  // At the bound: the latest value, and the clock stays where it is.
+  clock->Update(at(kStart + kBound, 3));
+  ASSERT_EQ(clock->CoarseNow(), at(kStart + kBound, 3));
+  ASSERT_EQ(clock->CoarseNow(), at(kStart + kBound, 3));
+  ASSERT_EQ(clock->Now(), at(kStart + kBound, 4));
+
+  // Beyond it: each CoarseNow() returns the next value and advances the clock.
+  clock->Update(at(kStart + kBound + 1, 0));
+  ASSERT_EQ(clock->CoarseNow(), at(kStart + kBound + 1, 1));
+  ASSERT_EQ(clock->CoarseNow(), at(kStart + kBound + 1, 2));
+  ASSERT_EQ(clock->Now(), at(kStart + kBound + 1, 3));
+
+  // The physical clock catches up to within the bound: the latest value again.
+  mock_clock.Set({kStart + 1, 0});
+  ASSERT_EQ(clock->CoarseNow(), at(kStart + kBound + 1, 3));
+  ASSERT_EQ(clock->CoarseNow(), at(kStart + kBound + 1, 3));
+  ASSERT_EQ(clock->Now(), at(kStart + kBound + 1, 4));
+}
+
 // The logical part carries into the microseconds, as it did when the two were separate fields.
-TEST(MockHybridClockTest, LogicalOverflowCarries) {
+TEST_F(MockHybridClockTest, LogicalOverflowCarries) {
   MockClock mock_clock;
   scoped_refptr<HybridClock> clock(new HybridClock(mock_clock.AsClock()));
   ASSERT_OK(clock->Init());

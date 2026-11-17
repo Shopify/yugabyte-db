@@ -64,7 +64,8 @@ class HybridClock : public Clock {
 
   // See ClockBase::CoarseNow. Returns the clock's latest hybrid time without advancing the clock
   // while that is within FLAGS_hybrid_clock_coarse_now_max_lag_us of the physical clock, and
-  // NowRange() otherwise or when the flag is negative.
+  // NowRange() otherwise, when the flag is negative, or when the latest hybrid time is ahead of
+  // the physical clock by more than Now() allows (IsSkewed()).
   HybridTimeRange CoarseNowRange() override;
 
   // Updates the clock with a hybrid_time originating on another machine.
