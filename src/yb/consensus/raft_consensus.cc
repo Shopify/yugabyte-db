@@ -1773,7 +1773,7 @@ Status RaftConsensus::Update(
         std::to_underlying(yb::ash::FixedQueryId::kQueryIdForRaftUpdateConsensus));
   }
   follower_last_update_received_time_ms_.store(
-      clock_->Now().GetPhysicalValueMillis(), std::memory_order_release);
+      clock_->CoarseNow().GetPhysicalValueMillis(), std::memory_order_release);
   if (PREDICT_FALSE(FLAGS_TEST_follower_reject_update_consensus_requests)) {
     return STATUS(IllegalState, "Rejected: --TEST_follower_reject_update_consensus_requests "
                                 "is set to true.");

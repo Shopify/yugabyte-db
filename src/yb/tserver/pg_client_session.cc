@@ -1191,7 +1191,9 @@ HybridTime GetInTxnLimit(const PB& options, ClockBase* clock) {
     return {};
   }
   auto in_txn_limit = HybridTime::FromPB(options.in_txn_limit_ht().value());
-  return in_txn_limit ? in_txn_limit : clock->Now();
+  // A bound: at least every hybrid time this server has seen, which covers the writes the
+  // transaction made before this statement, and below the hybrid time of any write made after.
+  return in_txn_limit ? in_txn_limit : clock->CoarseNow();
 }
 
 PgClientSessionKind GetSessionKindBasedOnDDLOptions(

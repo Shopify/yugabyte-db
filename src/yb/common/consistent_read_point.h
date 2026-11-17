@@ -78,6 +78,9 @@ class ConsistentReadPoint {
   // Return the current time to propagate.
   [[nodiscard]] HybridTime Now() const EXCLUDES(mutex_);
 
+  // The clock's CoarseNow(): for stamping a request with the sender's hybrid time.
+  [[nodiscard]] HybridTime CoarseNow() const EXCLUDES(mutex_);
+
   // Prepare the read time and local limits in a child transaction.
   void PrepareChildTransactionData(ChildTransactionDataPB* data) const EXCLUDES(mutex_);
 

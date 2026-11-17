@@ -530,7 +530,7 @@ Status Counter::SetUpPreAggregationForPrometheus(
           default_aggregation_levels, prototype_->entity_type(), aggregation_id,
           MetricType::PrometheusType(prototype_->type()), prototype_->description());
 
-  aggregated_prometheus_value_holder_->IncrementBy(value());
+  aggregated_prometheus_value_holder_->AddShared(value());
 
   return Status::OK();
 }

@@ -532,7 +532,7 @@ AsyncRpcBase<Req, Resp>::AsyncRpcBase(
       metadata.transaction.isolation == IsolationLevel::SERIALIZABLE_ISOLATION;
   bool has_read_time = false;
   if (read_point) {
-    req_.set_propagated_hybrid_time(read_point->Now().ToUint64());
+    req_.set_propagated_hybrid_time(read_point->CoarseNow().ToUint64());
     // Set read time for consistent read only for sequences_data table or if the table is
     // transaction-enabled and consistent read is required.
     if (table()->id() == kPgSequencesDataTableId ||

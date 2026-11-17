@@ -13,9 +13,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <memory>
 #include <random>
 #include <set>
 #include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -653,6 +655,78 @@ TEST_F(LanesTest, LaneShardedAllocateWhileInUse) {
   ASSERT_EQ(sum, total.load());
   ASSERT_GT(unsharded.load(), 0);
   ASSERT_GT(sum, unsharded.load());
+}
+
+// SeparatelyCounted: the same object, kept alive by either pointer, counted apart.
+TEST_F(LanesTest, SeparatelyCounted) {
+  struct Tracked {
+    explicit Tracked(bool* destroyed_) : destroyed(destroyed_) {}
+    ~Tracked() { *destroyed = true; }
+    bool* destroyed;
+    int value = 7;
+  };
+  ASSERT_TRUE(SeparatelyCounted(std::shared_ptr<Tracked>()) == nullptr);
+
+  bool destroyed = false;
+  auto original = std::make_shared<Tracked>(&destroyed);
+  auto lane_a = SeparatelyCounted(original);
+  auto lane_b = SeparatelyCounted(original);
+  ASSERT_EQ(lane_a.get(), original.get());
+  ASSERT_EQ(lane_a, lane_b);  // compares the objects
+
+  // Copies of a lane's reference count on that reference only.
+  ASSERT_EQ(original.use_count(), 3);  // original and one per separately counted reference
+  {
+    auto copy1 = lane_a;
+    auto copy2 = copy1;
+    ASSERT_EQ(lane_a.use_count(), 3);
+    ASSERT_EQ(lane_b.use_count(), 1);
+    ASSERT_EQ(original.use_count(), 3);
+  }
+  ASSERT_EQ(lane_a.use_count(), 1);
+
+  // Works for a pointer to const, and an aliasing pointer made from the result keeps the object.
+  std::shared_ptr<const Tracked> const_original = original;
+  auto const_lane = SeparatelyCounted(const_original);
+  std::shared_ptr<const int> field(const_lane, &const_lane->value);
+  const_original.reset();
+  const_lane.reset();
+
+  // The object lives until the last pointer of any kind is gone.
+  original.reset();
+  lane_b.reset();
+  ASSERT_FALSE(destroyed);
+  ASSERT_EQ(*field, 7);
+  auto last_copy = lane_a;
+  lane_a.reset();
+  field.reset();
+  ASSERT_FALSE(destroyed);
+  last_copy.reset();
+  ASSERT_TRUE(destroyed);
+
+  // Many threads copying and dropping their own reference never touch the others' counts.
+  bool destroyed2 = false;
+  auto shared = std::make_shared<Tracked>(&destroyed2);
+  std::vector<std::shared_ptr<Tracked>> per_thread;
+  for (int i = 0; i != 4; ++i) {
+    per_thread.push_back(SeparatelyCounted(shared));
+  }
+  std::vector<std::thread> threads;
+  for (int i = 0; i != 4; ++i) {
+    threads.emplace_back([&mine = per_thread[i]] {
+      for (int n = 0; n != 100000; ++n) {
+        auto copy = mine;
+        ASSERT_EQ(copy->value, 7);
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  ASSERT_EQ(shared.use_count(), 5);
+  per_thread.clear();
+  shared.reset();
+  ASSERT_TRUE(destroyed2);
 }
 
 } // namespace yb

@@ -31,12 +31,17 @@
 //
 
 #include <algorithm>
+#include <atomic>
+#include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "yb/util/logging.h"
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+
+#include "yb/common/clock.h"
 
 #include "yb/server/hybrid_clock.h"
 
@@ -52,6 +57,9 @@ using std::vector;
 
 DECLARE_uint64(max_clock_sync_error_usec);
 DECLARE_bool(disable_clock_sync_error);
+DECLARE_int64(hybrid_clock_coarse_now_max_lag_us);
+
+using namespace std::literals;
 
 namespace yb {
 namespace server {
@@ -99,11 +107,197 @@ TEST(MockHybridClockTest, TestMockedSystemClock) {
             HybridTime::FromMicrosecondsAndLogicalValue(time.time_point, 1).ToUint64());
 }
 
+// CoarseNow() against a mocked physical clock: it returns the clock's latest hybrid time without
+// advancing the clock while that is within the allowed lag of the physical clock, and advances
+// the clock otherwise. It never returns less than what the clock returned or was updated to
+// before, and Now() after it is always larger.
+TEST(MockHybridClockTest, CoarseNow) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_hybrid_clock_coarse_now_max_lag_us) = 100;
+  MockClock mock_clock;
+  scoped_refptr<HybridClock> clock(new HybridClock(mock_clock.AsClock()));
+  ASSERT_OK(clock->Init());
+  constexpr MicrosTime kStart = 1000000;
+  auto at = [](MicrosTime micros, LogicalTimeComponent logical) {
+    return HybridTime::FromMicrosecondsAndLogicalValue(micros, logical);
+  };
+
+  // A clock that has not returned anything yet is advanced.
+  mock_clock.Set({kStart, 0});
+  ASSERT_EQ(clock->CoarseNow(), at(kStart, 0));
+  // In the same microsecond: the same value again, and the clock stays where it is.
+  ASSERT_EQ(clock->CoarseNow(), at(kStart, 0));
+  ASSERT_EQ(clock->CoarseNow(), at(kStart, 0));
+  ASSERT_EQ(clock->Now(), at(kStart, 1));
+  ASSERT_EQ(clock->CoarseNow(), at(kStart, 1));
+
+  // The physical clock is ahead by no more than the lag: still the latest value, but the global
+  // limit follows the physical clock.
+  mock_clock.Set({kStart + 100, 0});
+  auto range = clock->CoarseNowRange();
+  ASSERT_EQ(range.first, at(kStart, 1));
+  ASSERT_EQ(range.second, clock->NowRange().second);
+  // (NowRange advanced the clock to the physical time.)
+  ASSERT_EQ(clock->CoarseNow(), at(kStart + 100, 0));
+
+  // Ahead by more than the lag: advances the clock, as Now() does.
+  mock_clock.Set({kStart + 201, 0});
+  ASSERT_EQ(clock->CoarseNow(), at(kStart + 201, 0));
+  ASSERT_EQ(clock->Now(), at(kStart + 201, 1));
+
+  // A hybrid time from another server moves the latest value; a lower one changes nothing.
+  const auto ahead = at(kStart + 500, 7);
+  clock->Update(ahead);
+  ASSERT_EQ(clock->CoarseNow(), ahead);
+  clock->Update(at(kStart, 0));
+  ASSERT_EQ(clock->CoarseNow(), ahead);
+  ASSERT_EQ(clock->Now(), at(kStart + 500, 8));
+
+  // The physical clock going back does not take CoarseNow() back.
+  mock_clock.Set({kStart + 300, 0});
+  ASSERT_EQ(clock->CoarseNow(), at(kStart + 500, 8));
+  ASSERT_EQ(clock->Now(), at(kStart + 500, 9));
+
+  // Negative lag: every read advances the clock.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_hybrid_clock_coarse_now_max_lag_us) = -1;
+  ASSERT_EQ(clock->CoarseNow(), at(kStart + 500, 10));
+  ASSERT_EQ(clock->CoarseNow(), at(kStart + 500, 11));
+}
+
+// The logical part carries into the microseconds, as it did when the two were separate fields.
+TEST(MockHybridClockTest, LogicalOverflowCarries) {
+  MockClock mock_clock;
+  scoped_refptr<HybridClock> clock(new HybridClock(mock_clock.AsClock()));
+  ASSERT_OK(clock->Init());
+  mock_clock.Set({5000, 0});
+  HybridTime prev = clock->Now();
+  ASSERT_EQ(prev, HybridTime::FromMicros(5000));
+  for (uint64_t i = 1; i <= 2 * HybridTime::kLogicalBitMask + 5; ++i) {
+    auto now = clock->Now();
+    ASSERT_EQ(now.ToUint64(), prev.ToUint64() + 1);
+    prev = now;
+  }
+  ASSERT_EQ(prev.GetPhysicalValueMicros(), 5002);
+  // The physical clock catches up to a microsecond the logical part already carried into.
+  mock_clock.Set({5001, 0});
+  ASSERT_GT(clock->Now(), prev);
+}
+
 // Test that two subsequent time reads are monotonically increasing.
 TEST_F(HybridClockTest, TestNow_ValuesIncreaseMonotonically) {
   const HybridTime now1 = clock_->Now();
   const HybridTime now2 = clock_->Now();
   ASSERT_LT(now1.value(), now2.value());
+}
+
+// Concurrent readers never get the same hybrid time, and each reader's values only increase.
+TEST_F(HybridClockTest, TestNow_ConcurrentValuesAreUniqueAndIncreasePerThread) {
+  constexpr int kThreads = 8;
+  constexpr int kReadsPerThread = 200000;
+  std::vector<std::vector<uint64_t>> values(kThreads);
+  std::vector<std::thread> threads;
+  for (int i = 0; i != kThreads; ++i) {
+    threads.emplace_back([this, &out = values[i]] {
+      out.reserve(kReadsPerThread);
+      for (int n = 0; n != kReadsPerThread; ++n) {
+        out.push_back(clock_->Now().ToUint64());
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  std::vector<uint64_t> all;
+  all.reserve(kThreads * kReadsPerThread);
+  for (const auto& thread_values : values) {
+    ASSERT_TRUE(std::adjacent_find(
+        thread_values.begin(), thread_values.end(), std::greater_equal<uint64_t>()) ==
+            thread_values.end()) << "A reader saw a value that did not increase";
+    all.insert(all.end(), thread_values.begin(), thread_values.end());
+  }
+  std::sort(all.begin(), all.end());
+  ASSERT_TRUE(std::adjacent_find(all.begin(), all.end()) == all.end())
+      << "Two readers got the same hybrid time";
+}
+
+// An update to a later time is never undone by concurrent readers: after Update(t) returns, every
+// Now() is above t.
+TEST_F(HybridClockTest, TestUpdate_HoldsAgainstConcurrentReaders) {
+  std::atomic<bool> stop{false};
+  std::vector<std::thread> readers;
+  for (int i = 0; i != 4; ++i) {
+    readers.emplace_back([this, &stop] {
+      while (!stop.load(std::memory_order_relaxed)) {
+        clock_->Now();
+      }
+    });
+  }
+  for (int n = 0; n != 20000; ++n) {
+    auto target = clock_->Now().AddMicroseconds(50);
+    clock_->Update(target);
+    ASSERT_GT(clock_->Now().ToUint64(), target.ToUint64());
+  }
+  stop = true;
+  for (auto& reader : readers) {
+    reader.join();
+  }
+}
+
+// Now() and CoarseNow() from many threads. Whatever a call returned before another call started
+// is a floor for that call: CoarseNow() returns at least the floor and Now() returns more. Now()
+// values are unique.
+TEST_F(HybridClockTest, CoarseNowIsOrderedWithNow) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_hybrid_clock_coarse_now_max_lag_us) = 100;
+  constexpr int kThreads = 8;
+  constexpr int kIterations = 200000;
+  std::atomic<uint64_t> max_returned{0};
+  std::atomic<int> violations{0};
+  std::vector<std::vector<uint64_t>> unique_values(kThreads);
+  std::vector<std::thread> threads;
+  for (int i = 0; i != kThreads; ++i) {
+    threads.emplace_back([this, i, &max_returned, &violations, &out = unique_values[i]] {
+      out.reserve(kIterations / 2 + 1);
+      for (int n = 0; n != kIterations; ++n) {
+        const bool unique = (n + i) % 2 == 0;
+        const auto floor = max_returned.load();
+        const auto value = (unique ? clock_->Now() : clock_->CoarseNow()).ToUint64();
+        if (unique ? value <= floor : value < floor) {
+          ++violations;
+        }
+        if (unique) {
+          out.push_back(value);
+        }
+        auto seen = max_returned.load();
+        while (seen < value && !max_returned.compare_exchange_weak(seen, value)) {}
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  ASSERT_EQ(violations.load(), 0);
+  std::vector<uint64_t> all;
+  for (const auto& values : unique_values) {
+    all.insert(all.end(), values.begin(), values.end());
+  }
+  std::sort(all.begin(), all.end());
+  ASSERT_TRUE(std::adjacent_find(all.begin(), all.end()) == all.end())
+      << "Two Now() calls returned the same hybrid time";
+}
+
+// WaitUntil returns at once for a hybrid time that has passed, waits for one that has not, and in
+// both cases the clock is past the hybrid time afterwards. (Its deadline is not tested: it is only
+// checked before each sleep, and a sleep lasts until the hybrid time.)
+TEST_F(HybridClockTest, WaitUntil) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_hybrid_clock_coarse_now_max_lag_us) = 100;
+  const auto past = clock_->Now();
+  auto result = ASSERT_RESULT(WaitUntil(clock_.get(), past, CoarseMonoClock::now() + 10s));
+  ASSERT_GE(result, past);
+  ASSERT_GT(clock_->Now(), result);
+
+  const auto future = clock_->Now().AddMicroseconds(20000);
+  result = ASSERT_RESULT(WaitUntil(clock_.get(), future, CoarseMonoClock::now() + 10s));
+  ASSERT_GE(result, future);
+  ASSERT_GT(clock_->Now(), result);
 }
 
 // Tests the clock updates with the incoming value if it is higher.

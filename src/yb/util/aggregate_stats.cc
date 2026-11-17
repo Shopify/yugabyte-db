@@ -101,12 +101,11 @@ void AggregateStats::Add(const AggregateStats& other) {
 }
 
 Status AggregateStats::SetUpPreAggregationForPrometheus(
-    std::shared_ptr<AtomicInt<int64_t>> aggregated_prometheus_sum_value_holder,
-    std::shared_ptr<AtomicInt<int64_t>> aggregated_prometheus_count_value_holder) {
+    PreAggregatedValuePtr aggregated_prometheus_sum_value_holder,
+    PreAggregatedValuePtr aggregated_prometheus_count_value_holder) {
   RETURN_NOT_OK(aggregator_.InitializeValueHolders(
       aggregated_prometheus_sum_value_holder, aggregated_prometheus_count_value_holder));
-  aggregator_.SumIncrementBy(total_sum_.Load());
-  aggregator_.CountIncrementBy(total_count_.Load());
+  aggregator_.AddExisting(total_sum_.Load(), total_count_.Load());
   return Status::OK();
 }
 
@@ -115,8 +114,8 @@ bool AggregateStats::IsPreAggregatedForPrometheus() const {
 }
 
 Status AggregateStats::Aggregator::InitializeValueHolders(
-    std::shared_ptr<AtomicInt<int64_t>> aggregated_prometheus_sum_value_holder,
-    std::shared_ptr<AtomicInt<int64_t>> aggregated_prometheus_count_value_holder) {
+    PreAggregatedValuePtr aggregated_prometheus_sum_value_holder,
+    PreAggregatedValuePtr aggregated_prometheus_count_value_holder) {
   RSTATUS_DCHECK(!HasValueHolders(), IllegalState, "Aggregator value holders are already set.");
 
   if (aggregated_prometheus_sum_value_holder != nullptr &&

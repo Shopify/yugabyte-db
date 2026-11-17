@@ -30,8 +30,10 @@
 // under the License.
 //
 
+#include <atomic>
 #include <chrono>
 #include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -93,6 +95,69 @@ TEST_F(BackgroundTaskTest, YB_DISABLE_TEST_ON_MACOS(RunsTaskOnInterval)) {
 
   bg_task->StartShutdown();
   bg_task->CompleteShutdown();
+}
+
+// Wake() from many threads, also while the task is running and while a run is pending: every
+// wake-up is followed by a run that starts after it, and concurrent wake-ups share runs.
+TEST_F(BackgroundTaskTest, ConcurrentWakesAreNotLost) {
+  constexpr int kThreads = 8;
+  constexpr int kWakesPerThread = 2000;
+  std::atomic<int64_t> runs_started{0};
+  BackgroundTask task([&runs_started] {
+    runs_started.fetch_add(1);
+    // Long enough for wake-ups to arrive during a run.
+    std::this_thread::sleep_for(20us);
+  }, "test", "test");
+  ASSERT_OK(task.Init());
+
+  std::atomic<int> lost{0};
+  std::vector<std::thread> threads;
+  for (int i = 0; i != kThreads; ++i) {
+    threads.emplace_back([&] {
+      for (int n = 0; n != kWakesPerThread; ++n) {
+        const auto started_before = runs_started.load();
+        ASSERT_OK(task.Wake());
+        // A run that starts after Wake() returned is counted at once: a run that was in progress
+        // when Wake() was called does not count, so wait for two more starts at most.
+        const auto deadline = std::chrono::steady_clock::now() + 10s * kTimeMultiplier;
+        while (runs_started.load() == started_before) {
+          if (std::chrono::steady_clock::now() > deadline) {
+            lost.fetch_add(1);
+            return;
+          }
+          std::this_thread::yield();
+        }
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  ASSERT_EQ(lost.load(), 0);
+  ASSERT_LE(runs_started.load(), kThreads * kWakesPerThread + 1);
+
+  // Wake-ups during one long run cost one more run, not one each.
+  std::atomic<bool> release{false};
+  BackgroundTask slow([&] {
+    run_count_.fetch_add(1);
+    while (!release.load()) {
+      std::this_thread::sleep_for(1ms);
+    }
+  }, "test", "slow");
+  ASSERT_OK(slow.Init());
+  ASSERT_OK(slow.Wake());
+  ASSERT_OK(WaitFor([this] { return run_count_ == 1; }, 10s * kTimeMultiplier, "First run"));
+  for (int i = 0; i != 1000; ++i) {
+    ASSERT_OK(slow.Wake());
+  }
+  release = true;
+  ASSERT_OK(WaitFor([this] { return run_count_ == 2; }, 10s * kTimeMultiplier, "Second run"));
+  std::this_thread::sleep_for(50ms);
+  ASSERT_EQ(run_count_, 2);
+
+  slow.Shutdown();
+  ASSERT_TRUE(slow.Wake().IsShutdownInProgress());
+  task.Shutdown();
 }
 
 class BackgroundTaskShutdownTest :

@@ -1028,6 +1028,37 @@ TEST_F(MemTrackerLaneTest, MetricFlushedWithSlot) {
   ASSERT_EQ(ASSERT_RESULT(gauge_value()), 0);
 }
 
+// The gauge of a tracker on the server entity gets a cell per lane, so trackers that share a metric
+// name (the tracker of every tablet shares "PerTablet") do not all write one word per call.
+TEST_F(MemTrackerLaneTest, ServerGaugeHasLaneCells) {
+  TEST_SetLaneTopology scope(TestLanes(2));
+  MetricRegistry registry;
+  auto entity = METRIC_ENTITY_server.Instantiate(&registry, "lane-gauge");
+  auto tracker = MemTracker::CreateTracker("lane-gauge");
+  tracker->SetMetricEntity(entity);
+  AtomicGauge<int64_t>* gauge = nullptr;
+  for (const auto& [prototype, metric] : entity->TEST_UsageMetricsMap()) {
+    if (prototype->name() == tracker->metric_name()) {
+      gauge = down_cast<AtomicGauge<int64_t>*>(metric.get());
+    }
+  }
+  ASSERT_NE(gauge, nullptr);
+  ASSERT_TRUE(gauge->lane_cells_enabled());
+  // Not lane-batched: the gauge moves on every call, in the calling thread's lane cell.
+  RunInLane(0, [&] { tracker->Consume(100); });
+  RunInLane(1, [&] { tracker->Consume(50); });
+  ASSERT_EQ(gauge->value(), 150);
+  ASSERT_EQ(gauge->TEST_shared_value(), 0);
+  // A count may be released from another lane than it was consumed in: cells hold signed deltas.
+  RunInLane(1, [&] { tracker->Release(150); });
+  ASSERT_EQ(gauge->value(), 0);
+  // A thread without a lane writes the shared value.
+  tracker->Consume(7);
+  ASSERT_EQ(gauge->TEST_shared_value(), 7);
+  tracker->Release(7);
+  ASSERT_EQ(gauge->value(), 0);
+}
+
 // Touches the root tracker: batching the root also batches the memory released since the last
 // tcmalloc GC, so a GC is triggered no later than the threshold + L x batch.
 TEST_F(MemTrackerLaneTest, ReleasedSinceGcBatched) {

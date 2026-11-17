@@ -28,7 +28,10 @@
 #include "yb/tserver/pg_client.pb.h"
 
 #include "yb/util/async_util.h"
+#include "yb/util/lane_sharded_rw_mutex.h"
+#include "yb/util/lanes.h"
 #include "yb/util/scope_exit.h"
+#include "yb/util/shared_lock.h"
 #include "yb/util/status_log.h"
 #include "yb/util/std_util.h"
 #include "yb/util/strongly_typed_bool.h"
@@ -121,10 +124,21 @@ class Waiter {
 
 class CacheEntry : public std::enable_shared_from_this<CacheEntry> {
  public:
-  CacheEntry() : future_(promise_.get_future()) {
+  CacheEntry()
+      : future_(promise_.get_future()),
+        schema_(std::make_shared<master::GetTableSchemaResponsePB>()) {
   }
 
   void SetValue(const Result<client::YBTablePtr>& value) {
+    // Before has_value_ is set, which publishes them.
+    ready_value_.emplace(value);
+    if (value.ok() && LaneModeActive()) {
+      lane_infos_.Allocate(GetLaneTopology().num_lanes());
+      lane_infos_.ForEach([this, &table = *value](PgTablesQueryResult::TableInfo& info) {
+        info.table = SeparatelyCounted(table);
+        info.schema = SeparatelyCounted(schema_);
+      });
+    }
     promise_.set_value(value);
 
     Waiters waiters;
@@ -143,51 +157,84 @@ class CacheEntry : public std::enable_shared_from_this<CacheEntry> {
   }
 
   void Wait(Waiter waiter) {
-    {
+    // A loaded entry is the case of every statement on a table that is in use: no mutex then.
+    if (!has_value_.load(std::memory_order_acquire)) {
       std::lock_guard lock(mutex_);
       if (!has_value_.load(std::memory_order_relaxed)) {
         waiters_.push_back(std::move(waiter));
         return;
       }
     }
-    waiter.TableReady(MakeTableInfo(future_.get()), NonBlockingCallsOnly::kFalse);
+    waiter.TableReady(MakeTableInfo(*ready_value_), NonBlockingCallsOnly::kFalse);
   }
 
   const Result<client::YBTablePtr>& Get() const {
+    if (has_value_.load(std::memory_order_acquire)) {
+      return *ready_value_;
+    }
     return future_.get();
   }
 
   master::GetTableSchemaResponsePB& schema() {
-    return schema_;
+    return *schema_;
+  }
+
+  // The table info of an entry that is loaded and usable, for the calling thread; false if the
+  // entry is still loading or failed. Does not block and takes no lock.
+  bool GetIfUsable(PgTablesQueryResult::TableInfo* info) {
+    if (!has_value_.load(std::memory_order_acquire) || !ready_value_->ok()) {
+      return false;
+    }
+    *info = TableInfoForThisThread(**ready_value_);
+    return true;
   }
 
   bool Failed() const {
-    return has_value_.load() && !future_.get().ok();
+    return has_value_.load(std::memory_order_acquire) && !ready_value_->ok();
   }
 
   // Non-blocking: nullptr while the load is in flight or if it failed.
   client::YBTablePtr GetIfReady() const {
-    if (!has_value_.load()) {
+    if (!has_value_.load(std::memory_order_acquire)) {
       return nullptr;
     }
-    const auto& value = future_.get();
+    const auto& value = *ready_value_;
     return value.ok() ? *value : nullptr;
   }
 
  private:
   Result<PgTablesQueryResult::TableInfo> MakeTableInfo(const Result<client::YBTablePtr>& value) {
     RETURN_NOT_OK(value);
-    return PgTablesQueryResult::TableInfo {
-      .table = *value,
-      .schema = std::shared_ptr<master::GetTableSchemaResponsePB>(
-        shared_from_this(), &schema_)
-    };
+    return TableInfoForThisThread(*value);
+  }
+
+  // In lane mode a thread of a lane gets its lane's references (see lane_infos_).
+  PgTablesQueryResult::TableInfo TableInfoForThisThread(const client::YBTablePtr& table) {
+    if (const auto* info = lane_infos_.LaneLocal()) {
+      return *info;
+    }
+    return PgTablesQueryResult::TableInfo { .table = table, .schema = schema_ };
   }
 
   std::atomic<bool> has_value_{false};
+  // The value given to promise_, readable without the future once has_value_ is set:
+  // shared_future::get() takes the mutex of the shared state, and every statement of every session
+  // that uses the table would take it.
+  std::optional<Result<client::YBTablePtr>> ready_value_;
   std::promise<Result<client::YBTablePtr>> promise_;
   std::shared_future<Result<client::YBTablePtr>> future_;
-  master::GetTableSchemaResponsePB schema_;
+  // Owned separately from the entry, so that a reference to it does not have to be one to the
+  // entry.
+  const std::shared_ptr<master::GetTableSchemaResponsePB> schema_;
+
+  // In lane mode, a reference to the table and to the schema for each lane, each with a reference
+  // count of its own (SeparatelyCounted). A statement copies and drops the table pointer it gets
+  // from here some twenty times (operations, RPCs and lookups each hold or take one), and with one
+  // pointer for all sessions every one of those is a write to a word that all lanes share, on the
+  // cache line of the table object itself. With a lane's sessions starting from their lane's
+  // reference, that counting stays inside the lane.
+  // Filled by SetValue before has_value_ is set, and not changed afterwards.
+  LaneSharded<PgTablesQueryResult::TableInfo> lane_infos_;
 
   std::mutex mutex_;
   using Waiters = std::vector<Waiter>;
@@ -236,7 +283,7 @@ class PgTableCache::Impl {
       boost::container::small_vector_base<client::YBTablePtr>& tables) {
     boost::container::small_vector<CacheEntryPtr, 4> entries;
     {
-      std::lock_guard lock(mutex_);
+      SharedLock lock(mutex_);
       for (const auto& table_id : table_ids) {
         entries.push_back(FindEntryUnlocked(table_id));
       }
@@ -253,6 +300,33 @@ class PgTableCache::Impl {
     if (!tables_sz) [[unlikely]] {
       listener->ResultReady({}, nullptr);
       return;
+    }
+
+    {
+      // Every statement of every session comes through here, nearly always for tables that are
+      // cached, loaded and current. That case only reads the cache, under the shared side of the
+      // mutex, and takes the tables from the entries there: no reference to an entry is taken,
+      // which would be one more count that the sessions of all lanes share.
+      boost::container::small_vector<PgTablesQueryResult::TableInfo, 8> infos;
+      infos.reserve(tables_sz);
+      bool all_usable = true;
+      {
+        SharedLock lock(mutex_);
+        for (const auto& table_id : table_ids) {
+          auto* entry = FindUsableEntryUnlocked(table_id, options);
+          if (!entry || !entry->GetIfUsable(&infos.emplace_back())) {
+            all_usable = false;
+            break;
+          }
+        }
+      }
+      if (all_usable) {
+        Waiter waiter{tables_sz, listener, notification_pool_};
+        for (const auto& info : infos) {
+          waiter.TableReady(info, NonBlockingCallsOnly::kFalse);
+        }
+        return;
+      }
     }
 
     boost::container::small_vector<std::pair<const TableId*, CacheEntryPtr>, 8> entries;
@@ -353,7 +427,7 @@ class PgTableCache::Impl {
     return p.first;
   }
 
-  CacheEntryPtr FindEntryUnlocked(TableIdView table_id) REQUIRES(mutex_) {
+  CacheEntryPtr FindEntryUnlocked(TableIdView table_id) REQUIRES_SHARED(mutex_) {
     const auto db_oid = GetPgsqlDatabaseOid(table_id);
     if (!db_oid.ok()) {
       return nullptr;
@@ -364,6 +438,24 @@ class PgTableCache::Impl {
     }
     auto it = iter->second.first.find(table_id);
     return it != iter->second.first.end() ? it->second : nullptr;
+  }
+
+  // The entry DoGetEntryUnlocked would return for table_id when it would return it as it is, with
+  // nothing to load and nothing in the cache to change; nullptr otherwise. Valid while mutex_ is
+  // held.
+  CacheEntry* FindUsableEntryUnlocked(
+      TableIdView table_id, const PgTableCacheGetOptions& options) REQUIRES_SHARED(mutex_) {
+    if (options.reopen) {
+      return nullptr;
+    }
+    const auto db_oid = CHECK_RESULT(GetPgsqlDatabaseOid(table_id));
+    const auto iter = caches_.find(db_oid);
+    if (iter == caches_.end() || iter->second.second < options.min_ysql_catalog_version) {
+      return nullptr;
+    }
+    const auto& db_cache = iter->second.first;
+    const auto it = db_cache.find(table_id);
+    return it != db_cache.end() && !it->second->Failed() ? it->second.get() : nullptr;
   }
 
   std::pair<CacheEntryPtr, bool> DoGetEntry(
@@ -434,7 +526,10 @@ class PgTableCache::Impl {
 
   std::shared_future<client::YBClient*> client_future_;
   YBThreadPool& notification_pool_;
-  std::mutex mutex_;
+  // Shared for lookups that find what they need, exclusive for everything that changes the cache.
+  // Sharded by lane on the shared side: with std::shared_mutex the readers of all lanes would
+  // still write one word.
+  LaneShardedRwMutex mutex_;
   using PgTableMap = UnorderedStringMap<TableId, CacheEntryPtr>;
   // db_id -> (table_id -> table_cache_entry, catalog_version)
   std::unordered_map<uint32_t, std::pair<PgTableMap, uint64_t>> caches_ GUARDED_BY(mutex_);

@@ -40,31 +40,60 @@
 namespace yb {
 namespace tserver {
 
+PgMutationCounter::Shard& PgMutationCounter::LocalShard() {
+  if (auto* shard = lane_shards_.LaneLocal()) {
+    return *shard;
+  }
+  if (LaneModeActive() && ThisThreadLane() != kNoLane && !lane_shards_.allocated()) {
+    lane_shards_.Allocate(GetLaneTopology().num_lanes());
+    if (auto* shard = lane_shards_.LaneLocal()) {
+      return *shard;
+    }
+  }
+  return shared_shard_;
+}
+
 void PgMutationCounter::Increase(const TableId& table_id, uint64 mutation_count) {
   VLOG_WITH_FUNC(4) << "table_id: " << table_id << " mutation_count: " << mutation_count;
+  auto& shard = LocalShard();
   {
-    // The mutex_ is used for only guarding membership changes to the map. A shared lock is needed
+    // The mutex is used for only guarding membership changes to the map. A shared lock is needed
     // when checking for membership and an exclusive lock is needed if updating membership i.e.,
     // adding/ removing a key from the map.
     //
     // Incrementing the counters doesn't need a mutex because we use atomic for the counter.
-    SharedLock shared_lock(mutex_);
-    auto it = table_mutation_counts_.find(table_id);
-    if (it != table_mutation_counts_.end()) {
+    SharedLock shared_lock(shard.mutex);
+    auto it = shard.counts.find(table_id);
+    if (it != shard.counts.end()) {
       it->second += mutation_count;
       return;
     }
   }
 
-  std::lock_guard lock(mutex_);
-  table_mutation_counts_[table_id] += mutation_count;
+  std::lock_guard lock(shard.mutex);
+  shard.counts[table_id] += mutation_count;
+}
+
+void PgMutationCounter::MoveCounts(Shard* shard, TableMutationCounts* out) {
+  TableMutationCounts counts;
+  {
+    std::lock_guard lock(shard->mutex);
+    counts.swap(shard->counts);
+  }
+  if (out->empty()) {
+    out->swap(counts);
+    return;
+  }
+  for (const auto& [table_id, count] : counts) {
+    (*out)[table_id] += count.load();
+  }
 }
 
 TableMutationCounts PgMutationCounter::GetAndClear() {
   VLOG_WITH_FUNC(4) << "Getting and clearing global table mutation counter";
-  decltype(table_mutation_counts_) result;
-  std::lock_guard lock(mutex_);
-  table_mutation_counts_.swap(result);
+  TableMutationCounts result;
+  MoveCounts(&shared_shard_, &result);
+  lane_shards_.ForEach([&result](Shard& shard) { MoveCounts(&shard, &result); });
   return result;
 }
 

@@ -31,6 +31,19 @@ class ClockBase : public RefCountedThreadSafe<ClockBase> {
 
   virtual HybridTimeRange NowRange() = 0;
 
+  // The current hybrid time for a caller that does not need it to be unique: one that stamps a
+  // message with the sender's time, takes the physical part for lease or timeout arithmetic, or
+  // asks whether a hybrid time has passed. Like Now(), the result is at least every hybrid time
+  // this clock has returned or was given in Update() before the call, and every Now() after the
+  // call returns a larger one. Unlike Now(), the call need not advance the clock, so:
+  //   - other calls may get the same value, and it may be a value that Now() returned to someone;
+  //   - it may be behind the physical clock, by an amount the implementation bounds.
+  // Use Now() for a hybrid time that identifies something (an operation, a commit).
+  // The default advances the clock.
+  HybridTime CoarseNow() { return CoarseNowRange().first; }
+
+  virtual HybridTimeRange CoarseNowRange() { return NowRange(); }
+
   virtual void Update(const HybridTime& to_update) = 0;
 
   virtual ~ClockBase() {}

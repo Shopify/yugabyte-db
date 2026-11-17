@@ -309,6 +309,11 @@ class MemTracker::TrackerMetrics {
             CreateMetricLabel(mem_tracker), MetricUnit::kBytes,
             CreateMetricDescription(mem_tracker), yb::MetricLevel::kInfo)),
         static_cast<int64_t>(0));
+    // Trackers that share a metric name share the gauge: the tracker of every tablet updates the
+    // one "PerTablet" gauge of the server on each Consume() and Release() below it, from the
+    // threads of every lane. Give the gauge a cell per lane (no-op with lanes off and for gauges
+    // that are not server-level).
+    metric_->EnableLaneCells();
     // Consumption could be changed when gauge is created, so set it separately.
     metric_->set_value(mem_tracker.consumption());
   }

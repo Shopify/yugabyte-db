@@ -15,6 +15,7 @@
 #include "yb/gutil/macros.h"
 
 #include "yb/util/atomic.h"
+#include "yb/util/pre_aggregated_value.h"
 #include "yb/util/status_fwd.h"
 #include "yb/util/strongly_typed_bool.h"
 
@@ -70,8 +71,8 @@ class AggregateStats {
   size_t DynamicMemoryUsage() const { return sizeof(*this); }
 
   Status SetUpPreAggregationForPrometheus(
-      std::shared_ptr<AtomicInt<int64_t>> aggregated_prometheus_total_sum_value,
-      std::shared_ptr<AtomicInt<int64_t>> aggregated_prometheus_total_count_value);
+      PreAggregatedValuePtr aggregated_prometheus_total_sum_value,
+      PreAggregatedValuePtr aggregated_prometheus_total_count_value);
 
   bool IsPreAggregatedForPrometheus() const;
 
@@ -82,8 +83,16 @@ class AggregateStats {
     Aggregator() = default;
 
     Status InitializeValueHolders(
-        std::shared_ptr<AtomicInt<int64_t>> aggregated_prometheus_sum_value_holder,
-        std::shared_ptr<AtomicInt<int64_t>> aggregated_prometheus_count_value_holder);
+        PreAggregatedValuePtr aggregated_prometheus_sum_value_holder,
+        PreAggregatedValuePtr aggregated_prometheus_count_value_holder);
+
+    // Adds the totals a stats object has when it joins the aggregate.
+    void AddExisting(int64_t sum, int64_t count) {
+      if (HasValueHolders()) {
+        sum_holder_->AddShared(sum);
+        count_holder_->AddShared(count);
+      }
+    }
 
     void SumIncrementBy(int64_t value) {
       if (sum_holder_ != nullptr) {
@@ -103,8 +112,8 @@ class AggregateStats {
 
    private:
     // Both sum_holder_ and count_holder_ must either be nullptrs or non-nullptrs.
-    std::shared_ptr<AtomicInt<int64_t>> sum_holder_;
-    std::shared_ptr<AtomicInt<int64_t>> count_holder_;
+    PreAggregatedValuePtr sum_holder_;
+    PreAggregatedValuePtr count_holder_;
   };
 
  private:

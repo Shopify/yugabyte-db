@@ -678,7 +678,7 @@ void Batcher::ExecuteOperations(Initial initial) {
   // Set batcher's 'rpcs_start_time_micros_' only when it is uninitialized, i.e, only for
   // a new batcher and not a retry_batcher.
   if (Clock() && rpcs_start_time_micros() == 0) {
-    SetRpcStartTime(Clock()->Now().GetPhysicalValueMicros());
+    SetRpcStartTime(Clock()->CoarseNow().GetPhysicalValueMicros());
   }
   auto self = shared_from_this();
   for (const auto& group : ops_info_.groups) {

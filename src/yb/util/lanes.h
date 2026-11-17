@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <memory>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -338,6 +339,26 @@ class LaneSharded {
   // Written once, before slots_ is published.
   size_t num_lanes_ = 0;
 };
+
+// A shared_ptr to the object of ptr with a reference count of its own. Copying and dropping the
+// result, and every copy made from it, counts in a control block that copies of ptr never touch;
+// the object lives as long as any of them does.
+//
+// For an object that threads of every lane take and drop references to per operation, such as a
+// table of the embedded client: all of those references count on one word, which every lane then
+// writes. Keep one of these per lane (LaneSharded) and give a lane's threads copies of their
+// lane's, and that counting stays inside the lane.
+//
+// The result does not share a control block with ptr: its use_count() is its own, and a weak_ptr
+// made from it expires when the last copy of the result is gone, which can be before the object is.
+template <class T>
+std::shared_ptr<T> SeparatelyCounted(const std::shared_ptr<T>& ptr) {
+  if (!ptr) {
+    return nullptr;
+  }
+  T* object = ptr.get();
+  return std::shared_ptr<T>(std::make_shared<std::shared_ptr<T>>(ptr), object);
+}
 
 // Cross-lane handoffs counted in lane mode, by the category of the executing thread.
 uint64_t LaneCrossingCount(LaneCrossingCategory category);
