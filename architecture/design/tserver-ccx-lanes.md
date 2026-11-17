@@ -648,7 +648,10 @@ spare, sized by the lane count when its owner allocates it, which the owner does
 possibly while the object is in use (the root memory tracker exists before the topology is
 installed). `LaneLocal()` gives a thread of lane `l < L` slot `l` and every other thread nothing, so
 state updated per operation keeps its unsharded path for unlaned threads (masters, the service set)
-rather than sharing the spare slot among all of them. A lane value never indexes past the array:
+rather than sharing the spare slot among all of them. The exception is `PreAggregatedValue`, a
+table's value of a metric pre-aggregated for Prometheus: once its cells exist, unlaned threads add
+to the spare slot, so its shared word, which is unpadded because there is one per metric per table,
+stays off the per-operation path. A lane value never indexes past the array:
 `kNoLane` and a thread lane left over from an earlier topology select the spare slot or nothing.
 Where a count is raised and lowered on different threads, either the slot is chosen by the object
 that owns the count and stored with it (service queue counts by the call's lane), or slots hold

@@ -56,6 +56,7 @@
 #include "yb/util/metrics_aggregator.h"
 #include "yb/util/sync_point.h"
 #include "yb/util/test_macros.h"
+#include "yb/util/test_thread_holder.h"
 #include "yb/util/test_util.h"
 
 using std::string;
@@ -1322,6 +1323,81 @@ TEST_F(MetricsTest, PreAggregatedValueLaneCells) {
   }
   ASSERT_TRUE(busy.TEST_has_lane_cells());
   ASSERT_EQ(busy.Load(), 5 * per_thread);
+}
+
+// Once a pre-aggregated value has its cells, an increment from a thread without a cell of its own
+// (no lane, a lane left over from a larger topology, or lane mode off) goes to the spare cell, so
+// the shared word is only written by AddShared.
+TEST_F(MetricsTest, PreAggregatedValueUnlanedAfterCells) {
+  constexpr auto kThreshold = PreAggregatedValue::kLaneCellsAfterIncrements;
+  LOG(INFO) << "sizeof(PreAggregatedValue): " << sizeof(PreAggregatedValue);
+  ASSERT_LE(sizeof(PreAggregatedValue), CACHELINE_SIZE);
+
+  TEST_SetLaneTopology scope(MetricTestLanes(2));
+  PreAggregatedValue value;
+  value.AddShared(7);
+  RunOnStdThread([&value] {
+    SetThisThreadLane(0);
+    for (int64_t i = 0; i != kThreshold; ++i) {
+      value.IncrementBy(1);
+    }
+  });
+  ASSERT_TRUE(value.TEST_has_lane_cells());
+  int64_t shared = 7 + kThreshold;
+  int64_t expected = shared;
+  ASSERT_EQ(value.TEST_shared_value(), shared);
+  ASSERT_EQ(value.Load(), expected);
+
+  RunOnStdThread([&value] {
+    value.IncrementBy(3);
+  });
+  RunOnStdThread([&value] {
+    SetThisThreadLane(5);
+    value.IncrementBy(-11);
+  });
+  expected += 3 - 11;
+  ASSERT_EQ(value.TEST_shared_value(), shared);
+  ASSERT_EQ(value.Load(), expected);
+
+  value.AddShared(-7);
+  shared -= 7;
+  expected -= 7;
+  ASSERT_EQ(value.TEST_shared_value(), shared);
+  ASSERT_EQ(value.Load(), expected);
+
+  {
+    TEST_SetLaneTopology lanes_off;
+    ASSERT_FALSE(LaneModeActive());
+    RunOnStdThread([&value] {
+      SetThisThreadLane(0);
+      value.IncrementBy(13);
+    });
+    expected += 13;
+    ASSERT_EQ(value.TEST_shared_value(), shared);
+    ASSERT_EQ(value.Load(), expected);
+  }
+
+  // Concurrent writers with a lane, without one and with a stale one.
+  constexpr int64_t kIncrements = 100000;
+  {
+    TestThreadHolder thread_holder;
+    for (LaneId lane : {LaneId(0), LaneId(1), kNoLane, kNoLane, LaneId(5)}) {
+      thread_holder.AddThreadFunctor([&value, lane] {
+        SetThisThreadLane(lane);
+        for (int64_t i = 0; i != kIncrements; ++i) {
+          value.IncrementBy(i % 3 == 0 ? -1 : 2);
+        }
+      });
+    }
+    thread_holder.JoinAll();
+  }
+  int64_t per_thread = 0;
+  for (int64_t i = 0; i != kIncrements; ++i) {
+    per_thread += i % 3 == 0 ? -1 : 2;
+  }
+  expected += 5 * per_thread;
+  ASSERT_EQ(value.TEST_shared_value(), shared);
+  ASSERT_EQ(value.Load(), expected);
 }
 
 // With lanes off, or for a metric of another entity type, EnableLaneCells does nothing, and every

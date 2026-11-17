@@ -34,9 +34,10 @@ namespace yb {
 // signed deltas that are only ever summed, so an amount may be added in one lane and taken back in
 // another.
 //
-// The cells cost (L + 1) cache lines and there is a value per metric per table, so they are only
-// allocated after kLaneCellsAfterIncrements increments from laned threads: metrics that are never
-// or rarely updated, and tables without traffic, do not pay. With lanes off nothing is allocated.
+// There is a value per metric per table, lanes on or off, so the value itself is kept to a few
+// words. The cells cost (L + 1) cache lines, so they are only allocated after
+// kLaneCellsAfterIncrements increments from laned threads: metrics that are never or rarely
+// updated, and tables without traffic, do not pay. With lanes off nothing is allocated.
 class PreAggregatedValue {
  public:
   static constexpr int64_t kLaneCellsAfterIncrements = 1000;
@@ -50,6 +51,13 @@ class PreAggregatedValue {
   void IncrementBy(int64_t amount) {
     if (auto* cell = lane_cells_.LaneLocal()) {
       cell->fetch_add(amount, std::memory_order_relaxed);
+      return;
+    }
+    // Unlike other LaneSharded owners, unlaned threads take the spare cell once the cells exist:
+    // that keeps value_, which shares a cache line with lane_cells_, off the per-operation path,
+    // and the unlaned threads share one word either way.
+    if (auto* spare = lane_cells_.Get(kNoLane)) {
+      spare->fetch_add(amount, std::memory_order_relaxed);
       return;
     }
     value_.fetch_add(amount, std::memory_order_relaxed);
@@ -78,15 +86,21 @@ class PreAggregatedValue {
     return lane_cells_.allocated();
   }
 
+  int64_t TEST_shared_value() const {
+    return value_.load(std::memory_order_relaxed);
+  }
+
  private:
   // Read by every increment and written once.
   LaneSharded<std::atomic<int64_t>> lane_cells_;
 
-  // Written by threads without a lane, and by all threads until the cells exist: kept off the
-  // cache line of lane_cells_, which laned threads read on every increment.
-  alignas(CACHELINE_SIZE) std::atomic<int64_t> value_{0};
+  // Needs no cache line of its own: until the cells exist every increment writes it anyway, and
+  // after that only AddShared does, when a metric joins or leaves the aggregate.
+  std::atomic<int64_t> value_{0};
   std::atomic<int64_t> laned_increments_{0};
 };
+
+static_assert(sizeof(PreAggregatedValue) <= CACHELINE_SIZE);
 
 using PreAggregatedValuePtr = std::shared_ptr<PreAggregatedValue>;
 
