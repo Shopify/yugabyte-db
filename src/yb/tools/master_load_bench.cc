@@ -3144,6 +3144,7 @@ class MasterLoadBench {
     if (!scenario_.empty()) {
       RETURN_NOT_OK(RunDirectives(
           std::vector<Directive>(load_end, scenario_.end()), /* iter= */ 1));
+      RETURN_NOT_OK(CloseSqlSessions());
       LOG(INFO) << "Load complete " << (MonoTime::Now() - start_time_).ToSeconds()
                 << "s after start";
     }
@@ -4207,7 +4208,7 @@ class MasterLoadBench {
   }
 
   Status RunDirective(const Directive& d, int64_t iter) {
-    const auto started = MonoTime::Now();
+    auto started = MonoTime::Now();
     LOG(INFO) << "Directive line " << d.line << ": " << d.kind
               << (d.arg.empty() ? "" : " " + d.arg.substr(0, 80));
     Status status;
@@ -4217,7 +4218,10 @@ class MasterLoadBench {
       std::lock_guard l(db_mutex_);
       current_db_ = d.arg;
     } else if (d.kind == "sql") {
-      status = RunSql(d, iter);
+      // Connecting is not part of the statement's time.
+      auto session = VERIFY_RESULT(TakeSqlSession());
+      started = MonoTime::Now();
+      status = RunSql(d, iter, std::move(session));
     } else if (d.kind == "sql_file") {
       status = RunSqlFile(d.arg);
     } else if (d.kind == "rpc" || d.kind == kYsqlConnect) {
@@ -4326,8 +4330,8 @@ class MasterLoadBench {
     return Status::OK();
   }
 
-  // One ysqlsh session kept open across the statements of a sql directive. Completion of each
-  // statement is detected by a `\warn` marker: stderr is unbuffered, stdout is not on a pipe.
+  // One ysqlsh session, kept open for the whole scenario. Completion of each statement is
+  // detected by a `\warn` marker: stderr is unbuffered, stdout is not on a pipe.
   class YsqlshSession {
    public:
     YsqlshSession(string ysqlsh_bin, string db)
@@ -4338,6 +4342,8 @@ class MasterLoadBench {
         WARN_NOT_OK(Close(), "ysqlsh session close failed");
       }
     }
+
+    const string& db() const { return db_; }
 
     Status Start() {
       std::vector<string> argv = {
@@ -4453,18 +4459,55 @@ class MasterLoadBench {
     string buffer_;
   };
 
-  Status RunSql(const Directive& d, int64_t iter) {
+  // sql directives share one session per database; only directives running at the same time in
+  // a parallel block open more.
+  Result<std::unique_ptr<YsqlshSession>> TakeSqlSession() {
+    const auto db = CurrentDb();
+    {
+      std::lock_guard l(sql_sessions_mutex_);
+      auto& idle = sql_sessions_[db];
+      if (!idle.empty()) {
+        auto session = std::move(idle.back());
+        idle.pop_back();
+        return session;
+      }
+    }
+    auto session = std::make_unique<YsqlshSession>(ysqlsh_bin_, db);
+    RETURN_NOT_OK(session->Start());
+    // Returns once the connection is up and the backend has answered.
+    RETURN_NOT_OK(session->Execute("SELECT 1"));
+    return session;
+  }
+
+  void ReturnSqlSession(std::unique_ptr<YsqlshSession> session) {
+    std::lock_guard l(sql_sessions_mutex_);
+    sql_sessions_[session->db()].push_back(std::move(session));
+  }
+
+  Status CloseSqlSessions() {
+    decltype(sql_sessions_) sessions;
+    {
+      std::lock_guard l(sql_sessions_mutex_);
+      sessions.swap(sql_sessions_);
+    }
+    for (auto& [db, idle] : sessions) {
+      for (auto& session : idle) {
+        RETURN_NOT_OK(session->Close());
+      }
+    }
+    return Status::OK();
+  }
+
+  Status RunSql(const Directive& d, int64_t iter, std::unique_ptr<YsqlshSession> session) {
     const auto stop = RegisterStop(d.name);
-    auto status = RunSqlStatements(d, stop, iter);
+    auto status = RunSqlStatements(d, stop, iter, std::move(session));
     UnregisterStop(d.name, stop);
     return status;
   }
 
   Status RunSqlStatements(const Directive& d, const std::shared_ptr<std::atomic<bool>>& stop,
-                          int64_t iter) {
+                          int64_t iter, std::unique_ptr<YsqlshSession> session) {
     const auto label = d.name.empty() ? Format("line$0", d.line) : d.name;
-    YsqlshSession session(ysqlsh_bin_, CurrentDb());
-    RETURN_NOT_OK(session.Start());
     const auto end = d.duration.Initialized() ? MonoTime::Now() + d.duration : MonoTime::Max();
     // Bare = once; interval alone = until duration or stop.
     const int64_t count = d.count > 0 ? d.count : (d.interval.Initialized() ? -1 : 1);
@@ -4477,7 +4520,7 @@ class MasterLoadBench {
       ctx.iter = iter;
       ctx.seq = sent + 1;
       const auto started = MonoTime::Now();
-      RETURN_NOT_OK(session.Execute(VERIFY_RESULT(ExpandFunctions(d.arg, ctx, nullptr))));
+      RETURN_NOT_OK(session->Execute(VERIFY_RESULT(ExpandFunctions(d.arg, ctx, nullptr))));
       const auto latency = MonoTime::Now() - started;
       WriteCsvRow("bench_sql_" + label + "_latency_ms",
                   std::to_string(latency.ToMicroseconds() / 1000.0));
@@ -4488,7 +4531,8 @@ class MasterLoadBench {
         RETURN_NOT_OK(SleepInterruptible(d.interval - latency, stop));
       }
     }
-    return session.Close();
+    ReturnSqlSession(std::move(session));
+    return Status::OK();
   }
 
   string CurrentDb() {
@@ -5020,6 +5064,10 @@ class MasterLoadBench {
   bool load_balancer_paused_ = false;
   std::mutex db_mutex_;
   string current_db_ GUARDED_BY(db_mutex_) = "yugabyte";
+  std::mutex sql_sessions_mutex_;
+  // Idle sessions by database.
+  std::map<string, std::vector<std::unique_ptr<YsqlshSession>>> sql_sessions_
+      GUARDED_BY(sql_sessions_mutex_);
 
   std::mutex phase_mutex_;
   string phase_ GUARDED_BY(phase_mutex_) = "start";
