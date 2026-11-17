@@ -246,21 +246,23 @@ Wire Protocol
 Connection establishment and connection header
 ----------------------------------------------
 
-After the client connects to a server, the client first sends a connection header.
-The connection header consists of a magic number "hrpc" and three byte flags,
-for a total of 7 bytes:
+After the client connects to a server, the first bytes the client sends are, in
+order:
 
-+----------------------------------+
-|  "hrpc" 4 bytes                  |
-+----------------------------------+
-|  Version (1 byte)                |
-+----------------------------------+
-|  ServiceClass (1 byte)           |
-+----------------------------------+
-|  AuthProtocol (1 byte)           |
-+----------------------------------+
+1. Optionally, a 3-byte lane preamble: "YL" followed by one lane byte. Only a
+   laned tablet server sends it, on connections it keys by lane, and only while
+   the enable_rpc_lane_preamble AutoFlag is set. It is plaintext and comes before
+   everything below, so that a laned receiver can pick a reactor of that lane
+   when it accepts the connection. Every receiver whose inbound protocol is YB
+   RPC drops it, so the layers below never see it. See rpc/lane_preamble.h.
 
-Currently, the RPC version is 9. The ServiceClass and AuthProtocol fields are unused.
+2. With TLS, the TLS ClientHello; everything after it is encrypted.
+
+3. With compression, a 3-byte compression header: "YB" followed by the
+   algorithm id, sent inside TLS when TLS is on.
+
+4. The 3-byte connection header "YB\1", sent inside the compressed and TLS
+   streams when those are on. The byte after "YB" is reserved.
 
 
 Message framing and request/response headers

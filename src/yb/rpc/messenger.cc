@@ -43,6 +43,7 @@
 
 #include "yb/util/logging.h"
 
+#include "yb/gutil/casts.h"
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/stl_util.h"
 
@@ -142,6 +143,26 @@ MessengerBuilder& MessengerBuilder::set_connection_keepalive_time(
 
 MessengerBuilder& MessengerBuilder::set_num_reactors(int num_reactors) {
   num_reactors_ = num_reactors;
+  return *this;
+}
+
+MessengerBuilder& MessengerBuilder::set_reactor_lanes(std::vector<LaneId> lanes) {
+  reactor_lanes_ = std::move(lanes);
+  return *this;
+}
+
+MessengerBuilder& MessengerBuilder::set_lane_topology(const LaneTopology* topology) {
+  lane_topology_ = topology;
+  return *this;
+}
+
+MessengerBuilder& MessengerBuilder::set_reactors_per_lane(int value) {
+  reactors_per_lane_ = value;
+  return *this;
+}
+
+MessengerBuilder& MessengerBuilder::set_connections_per_lane_remote(int value) {
+  connections_per_lane_remote_ = value;
   return *this;
 }
 
@@ -262,9 +283,12 @@ Status Messenger::ListenAddress(
   {
     std::lock_guard guard(lock_);
     if (!acceptor_) {
+      // Only a laned messenger, whose reactors are grouped by lane, peeks for a lane preamble, and
+      // only for a protocol that accepts one; the acceptor serves every later ListenAddress too.
       acceptor_.reset(new Acceptor(
-          metric_entity_, std::bind(&Messenger::RegisterInboundSocket, this, factory, _1, _2),
-          system_high_cgroup_));
+          metric_entity_,
+          std::bind(&Messenger::RegisterInboundSocket, this, factory, _1, _2, _3),
+          system_high_cgroup_, factory->AcceptsLanePreamble() ? num_lanes_ : 0));
     }
     auto accept_host = accept_endpoint.address();
     auto& outbound_address = accept_host.is_v6() ? outbound_address_v6_
@@ -414,11 +438,30 @@ void Messenger::ShutdownAcceptor() {
   }
 }
 
-rpc::ThreadPool& Messenger::ThreadPool(ServicePriority priority) {
-  return *ThreadPoolPtr(priority);
+rpc::ThreadPool& Messenger::ThreadPool(ServicePriority priority, LaneId lane) {
+  return *ThreadPoolPtr(priority, lane);
 }
 
-const ThreadPoolPtr& Messenger::ThreadPoolPtr(ServicePriority priority) {
+const ThreadPoolPtr& Messenger::ThreadPoolPtr(ServicePriority priority, LaneId lane) {
+  if (auto* lane_pools = LanePoolsOf(lane)) {
+    switch (priority) {
+      case ServicePriority::kNormal:
+        return lane_pools->normal;
+      case ServicePriority::kHigh:
+        if (lane_pools->high_ready.load(std::memory_order_acquire)) {
+          return lane_pools->high;
+        }
+        std::lock_guard lock(lane_pools->high_mutex);
+        if (lane_pools->high_ready.load(std::memory_order_acquire)) {
+          return lane_pools->high;
+        }
+        lane_pools->high = std::make_shared<rpc::ThreadPool>(MakeLaneThreadPoolOptions(
+            narrow_cast<LaneId>(lane % num_lanes_), ServicePriority::kHigh, /* tag= */ 0));
+        lane_pools->high_ready.store(true, std::memory_order_release);
+        return lane_pools->high;
+    }
+    FATAL_INVALID_ENUM_VALUE(ServicePriority, priority);
+  }
   switch (priority) {
     case ServicePriority::kNormal:
       return default_normal_thread_pool_;
@@ -444,8 +487,71 @@ const ThreadPoolPtr& Messenger::ThreadPoolPtr(ServicePriority priority) {
   FATAL_INVALID_ENUM_VALUE(ServicePriority, priority);
 }
 
-Result<ThreadPoolPtr> Messenger::TaggedThreadPool(TaggedThreadPools::Tag tag) {
+Result<ThreadPoolPtr> Messenger::TaggedThreadPool(TaggedThreadPools::Tag tag, LaneId lane) {
+  if (auto* lane_pools = LanePoolsOf(lane)) {
+    // The lane holds its normal pool, so the common case takes no lock.
+    if (tag == 0) {
+      return lane_pools->normal;
+    }
+    return lane_pools->tagged->Pool(tag);
+  }
   return normal_thread_pools_->Pool(tag);
+}
+
+ThreadPoolPtr Messenger::HandlerThreadPool(
+    ServicePriority priority, ThreadPoolTag tag, LaneId lane) {
+  if (priority == ServicePriority::kNormal) {
+    auto result = TaggedThreadPool(tag, lane);
+    if (result.ok()) {
+      return *result;
+    }
+    // Could be shutting down.
+    LOG_WITH_PREFIX(WARNING) << "Failed to get thread pool with tag " << tag << ": "
+                             << result.status();
+  }
+  return ThreadPoolPtr(priority, lane);
+}
+
+void Messenger::ForEachHandlerPool(
+    LaneId lane, const std::function<void(const rpc::ThreadPool&)>& f) {
+  auto visit_tagged = [&f](TaggedThreadPools::Tag, const rpc::ThreadPool& pool) { f(pool); };
+  if (auto* lane_pools = LanePoolsOf(lane)) {
+    // The lane's normal pool is its tagged pool for tag 0.
+    lane_pools->tagged->ForEachPool(visit_tagged);
+    if (lane_pools->high_ready.load(std::memory_order_acquire)) {
+      f(*lane_pools->high);
+    }
+    return;
+  }
+  normal_thread_pools_->ForEachPool(visit_tagged);
+  if (high_priority_thread_pool_ready_.load(std::memory_order_acquire)) {
+    f(*high_priority_thread_pool_);
+  }
+}
+
+void Messenger::ForEachService(const std::function<void(const RpcService&)>& f) const {
+  ScopedRWOperation op(&RpcServicesCounter(), CoarseTimePoint::min());
+  if (!op.ok()) {
+    return;
+  }
+  for (const auto& [_, service] : rpc_services_) {
+    f(*service);
+  }
+}
+
+size_t Messenger::TEST_ActiveTaggedPools(LaneId lane) {
+  auto* lane_pools = LanePoolsOf(lane);
+  return lane_pools ? lane_pools->tagged->ActivePools() : normal_thread_pools_->ActivePools();
+}
+
+std::span<const std::unique_ptr<Reactor>> Messenger::ReactorsOfLane(LaneId lane) const {
+  if (lane == kNoLane || num_lanes_ == 0) {
+    return {};
+  }
+  lane %= num_lanes_;
+  std::span<const std::unique_ptr<Reactor>> all(reactors_);
+  return all.subspan(
+      lane_reactor_begin_[lane], lane_reactor_begin_[lane + 1] - lane_reactor_begin_[lane]);
 }
 
 // Register a new RpcService to handle inbound requests.
@@ -458,9 +564,18 @@ Status Messenger::RegisterService(
 
 void Messenger::ShutdownThreadPools() {
   normal_thread_pools_->Shutdown();
-  std::lock_guard lock(mutex_high_priority_thread_pool_);
-  if (high_priority_thread_pool_) {
-    high_priority_thread_pool_->Shutdown();
+  {
+    std::lock_guard lock(mutex_high_priority_thread_pool_);
+    if (high_priority_thread_pool_) {
+      high_priority_thread_pool_->Shutdown();
+    }
+  }
+  for (auto& lane_pools : lane_pools_) {
+    lane_pools->tagged->Shutdown();
+    std::lock_guard lock(lane_pools->high_mutex);
+    if (lane_pools->high) {
+      lane_pools->high->Shutdown();
+    }
   }
 }
 
@@ -468,8 +583,12 @@ void Messenger::UnregisterAllServices() {
   if (!rpc_services_stopped_.Set()) {
     return;
   }
-  CHECK_OK(rpc_services_counter_.DisableAndWaitForOps(CoarseTimePoint::max(), Stop::kTrue));
-  rpc_services_counter_.UnlockExclusiveOpMutex();
+  // Every call that got past its counter has finished Handle once all are drained, whichever
+  // lane's counter it took.
+  ForEachRpcServicesCounter([](RWOperationCounter& counter) {
+    CHECK_OK(counter.DisableAndWaitForOps(CoarseTimePoint::max(), Stop::kTrue));
+    counter.UnlockExclusiveOpMutex();
+  });
 
   for (const auto& [_, rpc_service]  : rpc_services_) {
     rpc_service->StartShutdown();
@@ -501,7 +620,7 @@ class NotifyDisconnectedReactorTask : public ReactorTask {
 
 void Messenger::QueueOutboundCall(OutboundCallPtr call) {
   const auto& remote = call->conn_id().remote();
-  Reactor *reactor = RemoteToReactor(remote, call->conn_id().idx());
+  Reactor *reactor = RemoteToReactor(remote, call->conn_id().idx(), call->conn_id().lane());
 
   if (TEST_ShouldArtificiallyRejectOutgoingCallsTo(remote.address())) {
     VLOG_WITH_PREFIX(1) << "TEST: Rejected connection to " << remote;
@@ -517,13 +636,49 @@ void Messenger::QueueOutboundCall(OutboundCallPtr call) {
   reactor->QueueOutboundCall(std::move(call));
 }
 
+RWOperationCounter& Messenger::RpcServicesCounter() const {
+  if (num_lanes_ && LaneModeActive()) {
+    const auto lane = ThisThreadLane();
+    if (lane < num_lanes_) {
+      return lane_call_states_[lane]->rpc_services_counter;
+    }
+  }
+  return rpc_services_counter_;
+}
+
+template <class F>
+void Messenger::ForEachRpcServicesCounter(const F& f) const {
+  f(rpc_services_counter_);
+  for (const auto& state : lane_call_states_) {
+    f(state->rpc_services_counter);
+  }
+}
+
+std::vector<const RWOperationCounter*> Messenger::TEST_RpcServicesCounters() const {
+  std::vector<const RWOperationCounter*> result;
+  ForEachRpcServicesCounter([&result](const RWOperationCounter& counter) {
+    result.push_back(&counter);
+  });
+  return result;
+}
+
+const RWOperationCounter* Messenger::TEST_RpcServicesCounterOfThisThread() const {
+  return &RpcServicesCounter();
+}
+
+LocalYBInboundCallTracker& Messenger::LocalCallTracker(LaneId lane) {
+  // A call of lane T queued from a thread of another lane writes T's tracker, along with the
+  // handoff into T's pool that the call makes anyway.
+  return lane < num_lanes_ ? lane_call_states_[lane]->local_call_tracker : local_call_tracker_;
+}
+
 void Messenger::HandleLocal(LocalYBInboundCallPtr call, Queue queue) {
-  local_call_tracker_.Enqueue(call);
+  LocalCallTracker(call->lane()).Enqueue(call);
   Handle(std::move(call), queue);
 }
 
 void Messenger::Handle(InboundCallPtr call, Queue queue) {
-  ScopedRWOperation op(&rpc_services_counter_, CoarseTimePoint::min());
+  ScopedRWOperation op(&RpcServicesCounter(), CoarseTimePoint::min());
   if (!op.ok()) {
     call->RespondFailure(ErrorStatusPB::FATAL_SERVER_SHUTTING_DOWN, MoveStatus(op));
     return;
@@ -561,7 +716,7 @@ void Messenger::Handle(InboundCallPtr call, Queue queue) {
 }
 
 RpcServicePtr Messenger::TEST_rpc_service(const std::string& service_name) const {
-  ScopedRWOperation op(&rpc_services_counter_, CoarseTimePoint::min());
+  ScopedRWOperation op(&RpcServicesCounter(), CoarseTimePoint::min());
   if (!op.ok()) {
     return nullptr;
   }
@@ -574,7 +729,8 @@ const std::shared_ptr<MemTracker>& Messenger::parent_mem_tracker() {
 }
 
 void Messenger::RegisterInboundSocket(
-    const ConnectionContextFactoryPtr& factory, Socket *new_socket, const Endpoint& remote) {
+    const ConnectionContextFactoryPtr& factory, Socket *new_socket, const Endpoint& remote,
+    LaneId lane) {
   if (TEST_ShouldArtificiallyRejectIncomingCallsFrom(remote.address())) {
     auto status = new_socket->Close();
     VLOG_WITH_PREFIX(1) << "TEST: Rejected connection from " << remote
@@ -593,8 +749,17 @@ void Messenger::RegisterInboundSocket(
     return;
   }
 
-  int idx = num_connections_accepted_.fetch_add(1) % num_connections_to_server_;
-  Reactor *reactor = RemoteToReactor(remote, idx);
+  Reactor* reactor;
+  if (lane != kNoLane && num_lanes_ != 0) {
+    lane %= num_lanes_;
+    // Connections bound to a lane take its reactors in turn, so that a lane's few connections from
+    // each remote spread over all of them.
+    auto group = ReactorsOfLane(lane);
+    reactor = group[inbound_lane_connections_[lane]++ % group.size()].get();
+  } else {
+    int idx = num_connections_accepted_.fetch_add(1) % num_connections_to_server_;
+    reactor = RemoteToReactor(remote, idx);
+  }
   reactor->RegisterInboundSocket(new_socket, *receive_buffer_size, remote, factory);
 }
 
@@ -647,8 +812,13 @@ size_t Messenger::max_concurrent_requests() const {
   return num_connections_to_server_;
 }
 
-Reactor* Messenger::RemoteToReactor(const Endpoint& remote, uint32_t idx) {
+Reactor* Messenger::RemoteToReactor(const Endpoint& remote, uint32_t idx, LaneId lane) {
   auto hash_code = hash_value(remote);
+  if (lane != kNoLane && num_lanes_ != 0) {
+    // Lane groups are never empty, and may differ in size.
+    auto group = ReactorsOfLane(lane);
+    return group[(hash_code + idx) % group.size()].get();
+  }
   auto reactor_idx = (hash_code + idx) % reactors_.size();
   // This is just a static partitioning; where each connection
   // to a remote is assigned to a particular reactor. We could
@@ -657,10 +827,96 @@ Reactor* Messenger::RemoteToReactor(const Endpoint& remote, uint32_t idx) {
   return reactors_[reactor_idx].get();
 }
 
+Status Messenger::InitLaned(const MessengerBuilder &bld) {
+  if (*bld.lane_topology_ != GetLaneTopology()) {
+    return STATUS_FORMAT(
+        InvalidArgument, "Lane topology $0 is not the process lane topology $1",
+        *bld.lane_topology_, GetLaneTopology());
+  }
+  if (!bld.reactor_lanes_.empty()) {
+    return STATUS(InvalidArgument, "Reactor lanes can't be set with a lane topology");
+  }
+  if (bld.reactors_per_lane_ < 0) {
+    return STATUS_FORMAT(InvalidArgument, "Invalid reactors per lane: $0", bld.reactors_per_lane_);
+  }
+  if (bld.connections_per_lane_remote_ < 1 || bld.connections_per_lane_remote_ > 256) {
+    return STATUS_FORMAT(
+        InvalidArgument, "Connections per lane and remote must be in [1, 256]: $0",
+        bld.connections_per_lane_remote_);
+  }
+  lane_topology_ = *bld.lane_topology_;
+  connections_per_lane_remote_ = bld.connections_per_lane_remote_;
+  const auto num_lanes = lane_topology_.num_lanes();
+  lane_reactor_begin_.reserve(num_lanes + 1);
+  lane_reactor_begin_.push_back(0);
+  inbound_lane_connections_.assign(num_lanes, 0);
+  std::string per_lane;
+  for (size_t lane = 0; lane != num_lanes; ++lane) {
+    size_t reactors = bld.reactors_per_lane_;
+    if (reactors == 0) {
+      // Lanes sharing one domain range (more lanes than domains) split its CPUs.
+      const auto domains = lane_topology_.lane_domains(narrow_cast<LaneId>(lane));
+      size_t sharing = 0;
+      for (size_t other = 0; other != num_lanes; ++other) {
+        sharing += lane_topology_.lane_domains(narrow_cast<LaneId>(other)) == domains;
+      }
+      reactors = std::max<size_t>(
+          1, lane_topology_.lane_mask(narrow_cast<LaneId>(lane)).Count() / 4 / sharing);
+    }
+    lane_reactor_begin_.push_back(lane_reactor_begin_.back() + reactors);
+    per_lane += Format("$0$1", per_lane.empty() ? "" : ",", reactors);
+  }
+  LOG_WITH_PREFIX(INFO) << Format(
+      "Lane mode: $0 lanes, $1 reactors (per lane: $2); the configured reactor count $3 "
+      "(--num_reactor_threads) is ignored", num_lanes, lane_reactor_begin_.back(), per_lane,
+      bld.num_reactors_);
+
+  lane_pools_.reserve(num_lanes);
+  for (size_t lane = 0; lane != num_lanes; ++lane) {
+    auto lane_pools = std::make_unique<LanePools>();
+    lane_pools->tagged = std::make_unique<TaggedThreadPools>(
+        [this, lane = narrow_cast<LaneId>(lane)](TaggedThreadPools::Tag tag) {
+          return MakeLaneThreadPoolOptions(lane, ServicePriority::kNormal, tag);
+        });
+    lane_pools->normal = VERIFY_RESULT(lane_pools->tagged->Pool(/*tag=*/0));
+    lane_pools_.push_back(std::move(lane_pools));
+    lane_call_states_.push_back(std::make_unique<LaneCallState>(
+        Format("$0 endpoints L$1", name_, lane), scheduler_));
+  }
+  rpc_metrics_->EnableLaneCells();
+  // Set last: the lane accessors are used only once all lane state is built.
+  num_lanes_ = num_lanes;
+  return Status::OK();
+}
+
 Status Messenger::Init(const MessengerBuilder &bld) {
   default_normal_thread_pool_ = VERIFY_RESULT(normal_thread_pools_->Pool(/*tag=*/0));
+  if (!bld.reactor_lanes_.empty() && std::ssize(bld.reactor_lanes_) != bld.num_reactors_) {
+    return STATUS_FORMAT(
+        InvalidArgument, "$0 reactor lanes given for $1 reactors", bld.reactor_lanes_.size(),
+        bld.num_reactors_);
+  }
 
-  reactors_.reserve(bld.num_reactors_);
+  // Lane and index within the lane of each reactor.
+  std::vector<std::pair<LaneId, int>> reactor_lanes;
+  if (bld.lane_topology_ && bld.lane_topology_->active()) {
+    RETURN_NOT_OK(InitLaned(bld));
+    for (size_t lane = 0; lane != num_lanes_; ++lane) {
+      for (auto i = lane_reactor_begin_[lane]; i != lane_reactor_begin_[lane + 1]; ++i) {
+        reactor_lanes.emplace_back(
+            narrow_cast<LaneId>(lane), narrow_cast<int>(i - lane_reactor_begin_[lane]));
+      }
+    }
+  } else {
+    std::vector<int> lane_counts(kMaxLanes);
+    for (int i = 0; i < bld.num_reactors_; ++i) {
+      auto lane = bld.reactor_lanes_.empty()
+          ? kNoLane : NormalizeLane(GetLaneTopology(), bld.reactor_lanes_[i]);
+      reactor_lanes.emplace_back(lane, lane == kNoLane ? 0 : lane_counts[lane]++);
+    }
+  }
+
+  reactors_.reserve(reactor_lanes.size());
   ReactorMonitor* reactor_monitor = nullptr;
   if (FLAGS_rpc_reactor_task_timeout_ms) {
     std::lock_guard lock(lock_);
@@ -668,8 +924,9 @@ Status Messenger::Init(const MessengerBuilder &bld) {
         name_, FLAGS_rpc_reactor_task_timeout_ms * 1ms);
     reactor_monitor = reactor_monitor_.get();
   }
-  for (int i = 0; i < bld.num_reactors_; ++i) {
-    auto reactor = std::make_unique<Reactor>(this, i, bld);
+  for (int i = 0; i < std::ssize(reactor_lanes); ++i) {
+    auto reactor = std::make_unique<Reactor>(
+        this, i, bld, reactor_lanes[i].first, reactor_lanes[i].second);
     if (PREDICT_FALSE(FLAGS_TEST_rpc_reactor_index_for_init_failure_simulation == i)) {
       return STATUS(InternalError, "Reactor::Init simulated error");
     }
@@ -691,7 +948,11 @@ Status Messenger::DumpRunningRpcs(const DumpRunningRpcsRequestPB& req,
     }
   }
   if (req.get_local_calls()) {
+    // Each tracker appends its calls to the same local_calls entry.
     RETURN_NOT_OK(local_call_tracker_.DumpRunningRpcs(req, resp));
+    for (const auto& state : lane_call_states_) {
+      RETURN_NOT_OK(state->local_call_tracker.DumpRunningRpcs(req, resp));
+    }
   }
   return Status::OK();
 }
@@ -775,8 +1036,14 @@ Result<ScheduledTaskId> Messenger::ScheduleOnReactor(
     }
   }
   if (chosen_reactor == nullptr) {
-    // Not running on a reactor thread, pick one at random.
-    chosen_reactor = reactors_[rand() % reactors_.size()].get();
+    // Not running on a reactor thread, pick one at random, among the calling thread's lane's
+    // reactors when it has one.
+    auto candidates = num_lanes_ != 0 ? ReactorsOfLane(ThisThreadLane())
+                                      : std::span<const std::unique_ptr<Reactor>>();
+    if (candidates.empty()) {
+      candidates = reactors_;
+    }
+    chosen_reactor = candidates[rand() % candidates.size()].get();
   }
 
   auto task_id = next_task_id_.fetch_add(1);
@@ -803,6 +1070,34 @@ Result<ScheduledTaskId> Messenger::ScheduleOnReactor(
 
 scoped_refptr<MetricEntity> Messenger::metric_entity() const {
   return metric_entity_;
+}
+
+ThreadPoolOptions Messenger::MakeLaneThreadPoolOptions(
+    LaneId lane, ServicePriority priority, TaggedThreadPools::Tag tag) const {
+  // Linux shows the first 15 characters of a thread name, so worker names start with the lane.
+  const auto lane_name = Format("L$0", ZeroPadded(lane, 3));
+  ThreadPoolOptions options {
+    .name = Format("$0_$1", name_, lane_name),
+    .max_workers = thread_pool_workers_limit_,
+    .lane = lane,
+    .crossing_category = LaneCrossingCategory::kRpcHandler,
+    .worker_name_prefix = lane_name + "_rpc",
+  };
+  if (priority == ServicePriority::kHigh) {
+    options.name += "-high-pri";
+    options.worker_name_prefix = lane_name + "_high";
+    options.max_workers = FLAGS_rpc_high_priority_workers_limit > 0
+        ? static_cast<size_t>(FLAGS_rpc_high_priority_workers_limit)
+        : thread_pool_workers_limit_;
+    options.cgroup = system_high_cgroup_;
+  } else if (tag == 0) {
+    options.cgroup = system_med_cgroup_;
+  } else {
+    options.name += Format("_pool_$0", tag);
+    options.worker_name_prefix = Format("$0_t$1", lane_name, tag);
+    options.cgroup = cgroup_provider_ ? cgroup_provider_(tag) : nullptr;
+  }
+  return options;
 }
 
 ThreadPoolOptions Messenger::MakeNormalThreadPoolOptions(TaggedThreadPools::Tag tag) const {

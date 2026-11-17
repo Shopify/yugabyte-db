@@ -34,6 +34,7 @@
 
 #include "yb/rpc/connection.h"
 #include "yb/rpc/connection_context.h"
+#include "yb/rpc/reactor.h"
 #include "yb/rpc/rpc_metrics.h"
 #include "yb/rpc/service_if.h"
 
@@ -153,6 +154,10 @@ ConnectionPtr InboundCall::connection() const {
   return conn_;
 }
 
+LaneId InboundCall::connection_lane() const {
+  return conn_ ? conn_->reactor()->lane() : kNoLane;
+}
+
 ConnectionContext& InboundCall::connection_context() const {
   return conn_->context();
 }
@@ -181,10 +186,12 @@ MonoDelta InboundCall::GetTimeInQueue() const {
 
 ThreadPoolTask* InboundCall::BindTask(InboundCallHandler* handler, int64_t rpc_queue_limit) {
   auto shared_this = shared_from(this);
-  std::optional<int64_t> rpc_queue_position = handler->CallQueued(rpc_queue_limit);
+  const auto lane = this->lane();
+  std::optional<int64_t> rpc_queue_position = handler->CallQueued(rpc_queue_limit, lane);
   if (!rpc_queue_position) {
     return nullptr;
   }
+  queued_lane_ = lane;
   rpc_queue_position_ = *rpc_queue_position;
   tracker_ = handler;
   task_.Bind(handler, shared_this);

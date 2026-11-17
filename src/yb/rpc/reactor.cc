@@ -86,6 +86,14 @@ using namespace std::literals;
 
 DEFINE_UNKNOWN_uint64(rpc_read_buffer_size, 0,
               "RPC connection read buffer size. 0 to auto detect.");
+DEFINE_RUNTIME_AUTO_bool(enable_rpc_lane_preamble, kLocalVolatile, false, true,
+    "Laned tablet servers write a lane preamble at the start of each connection they key by lane, "
+    "so that a receiving tablet server with lanes on can bind it to a reactor of that lane. "
+    "Receivers that predate the preamble reject such connections, so enable it only after every "
+    "process in the universe runs a version that accepts it. Read when a connection is created: a "
+    "change affects only connections created afterwards.");
+TAG_FLAG(enable_rpc_lane_preamble, advanced);
+
 DECLARE_string(local_ip_for_outbound_sockets);
 DECLARE_int32(num_connections_to_server);
 DECLARE_int32(socket_receive_buffer_size);
@@ -242,7 +250,20 @@ CoarseTimePoint ExpirationEnforcementTime(CoarseTimePoint expires_at) {
       : expires_at + 1ms * FLAGS_reactor_based_outbound_call_expiration_delay_ms;
 }
 
+thread_local bool is_reactor_thread = false;
+
+std::string ReactorThreadName(const std::string& messenger_name, LaneId lane, int index_in_lane) {
+  if (lane == kNoLane) {
+    return messenger_name + "_reactor";
+  }
+  return Format("L$0_reactor_$1", ZeroPadded(lane, 3), index_in_lane);
+}
+
 } // anonymous namespace
+
+bool Reactor::IsReactorThread() {
+  return is_reactor_thread;
+}
 
 // ------------------------------------------------------------------------------------------------
 // Public methods of Reactor
@@ -250,9 +271,13 @@ CoarseTimePoint ExpirationEnforcementTime(CoarseTimePoint expires_at) {
 
 Reactor::Reactor(Messenger* messenger,
                  int index,
-                 const MessengerBuilder &bld)
+                 const MessengerBuilder &bld,
+                 LaneId lane,
+                 int index_in_lane)
     : messenger_(*messenger),
-      name_(Format("$0_R$1", messenger->name(), ZeroPadded(index, 3))),
+      name_(lane == kNoLane
+          ? Format("$0_R$1", messenger->name(), ZeroPadded(index, 3))
+          : Format("$0_L$1_R$2", messenger->name(), ZeroPadded(lane, 3), ZeroPadded(index, 3))),
       log_prefix_(name_ + ": "),
       loop_(kDefaultLibEvFlags),
       connection_keepalive_time_(bld.connection_keepalive_time()),
@@ -260,7 +285,8 @@ Reactor::Reactor(Messenger* messenger,
       process_outbound_queue_task_(
           MakeFunctorReactorTask(std::bind(&Reactor::ProcessOutboundQueue, this),
                                  SOURCE_LOCATION())),
-      num_connections_to_server_(bld.num_connections_to_server()),
+      lane_(lane),
+      thread_name_(ReactorThreadName(messenger->name(), lane, index_in_lane)),
       completed_call_queue_(std::make_shared<CompletedCallQueue>()),
       cur_time_(CoarseMonoClock::Now()),
       cgroup_(bld.system_high_cgroup()) {
@@ -310,7 +336,7 @@ Status Reactor::Init() {
 
   // Create Reactor thread.
   const std::string group_name = messenger_.name() + "_reactor";
-  return Thread::Create(group_name, group_name, &Reactor::RunThread, this, &thread_);
+  return Thread::Create(group_name, thread_name_, &Reactor::RunThread, this, &thread_);
 }
 
 void Reactor::StartShutdown() {
@@ -404,6 +430,18 @@ void Reactor::ShutdownInternal() {
   processing_outbound_queue_.clear();
 
   completed_call_queue_->Shutdown();
+}
+
+Result<std::vector<ConnectionId>> Reactor::TEST_ClientConnectionIds() {
+  std::vector<ConnectionId> result;
+  RETURN_NOT_OK(RunOnReactorThread([&result](Reactor* reactor) {
+    ReactorThreadRoleGuard guard;
+    for (const auto& [id, conn] : reactor->client_conns_) {
+      result.push_back(id);
+    }
+    return Status::OK();
+  }, SOURCE_LOCATION()));
+  return result;
 }
 
 Status Reactor::GetMetrics(ReactorMetrics *metrics) {
@@ -737,6 +775,8 @@ void Reactor::RunThread() {
                 LogPrefix() + "Failed to move reactor thread to cgroup");
   }
 #endif
+  is_reactor_thread = true;
+  ApplyLaneToCurrentThread(lane_);
   ThreadRestrictions::SetWaitAllowed(false);
   ThreadRestrictions::SetIOAllowed(false);
   DVLOG_WITH_PREFIX(6) << "Calling Reactor::RunThread()...";
@@ -815,6 +855,14 @@ Status Reactor::FindOrStartConnection(const ConnectionId &conn_id,
 
   auto receive_buffer_size = PatchReceiveBufferSize(VERIFY_RESULT(sock.GetReceiveBufferSize()));
 
+  // Only a laned messenger keys connections by lane (Proxy::QueueCall), for calls with a lane hint:
+  // consensus peers and clients built on the laned tablet server messenger set hints, never for the
+  // master's sys catalog tablet. So masters, unlaned calls and clients of other universes, which
+  // build their own unlaned messengers, never send a preamble.
+  const auto lane_preamble =
+      messenger_.laned() && conn_id.lane() != kNoLane && FLAGS_enable_rpc_lane_preamble
+          ? conn_id.lane() : kNoLane;
+
   auto stream = VERIFY_RESULT(CreateStream(
       messenger_.stream_factories_, conn_id.protocol(),
       StreamCreateData {
@@ -824,6 +872,7 @@ Status Reactor::FindOrStartConnection(const ConnectionId &conn_id,
         .receive_buffer_size = receive_buffer_size,
         .mem_tracker = messenger_.connection_context_factory_->buffer_tracker(),
         .metric_entity = messenger_.metric_entity(),
+        .lane_preamble = lane_preamble,
       }));
   auto context = messenger_.connection_context_factory_->Create(receive_buffer_size);
 
@@ -838,6 +887,7 @@ Status Reactor::FindOrStartConnection(const ConnectionId &conn_id,
   RETURN_NOT_OK(connection->Start(&loop_));
 
   // Insert into the client connection map to avoid duplicate connection requests.
+  connection->set_client_id(conn_id);
   CHECK(client_conns_.emplace(conn_id, connection).second);
 
   conn->swap(connection);
@@ -875,22 +925,20 @@ void Reactor::DestroyConnection(Connection *conn, const Status &conn_status) {
 
   // Unlink connection from lists.
   if (conn->direction() == ConnectionDirection::CLIENT) {
-    bool erased = false;
-    for (int idx = 0; idx < num_connections_to_server_; idx++) {
-      auto it = client_conns_.find(ConnectionId(conn->remote(), idx, conn->protocol()));
-      if (it != client_conns_.end() && it->second.get() == conn) {
-        client_conns_.erase(it);
-        erased = true;
-      }
-    }
-    if (!erased) {
+    // Erase by the key the connection was registered under: keys of laned connections can't be
+    // rebuilt from the connection's remote and protocol.
+    auto it = client_conns_.find(conn->client_id());
+    if (it != client_conns_.end() && it->second.get() == conn) {
+      client_conns_.erase(it);
+    } else {
       LOG_WITH_PREFIX(WARNING) << "Looking for " << conn->ToString();
       for (auto &p : client_conns_) {
         LOG_WITH_PREFIX(WARNING) << "  Client connection: " << p.first.ToString() << ", "
                                  << p.second->ToString();
       }
       LOG_WITH_PREFIX(FATAL)
-          << "Couldn't find connection for any index to " << conn->ToString()
+          << "Couldn't find client connection " << conn->ToString() << " registered as "
+          << conn->client_id().ToString()
           << ", destroy reason: " << conn_status;
     }
   } else if (conn->direction() == ConnectionDirection::SERVER) {
@@ -963,8 +1011,9 @@ void Reactor::QueueOutboundCall(OutboundCallPtr call) {
     call->Transferred(AbortedError(), nullptr /* conn */);
     return;
   }
+  CountLaneHandoff();
   if (was_empty) {
-    auto scheduling_status = ScheduleReactorTask(process_outbound_queue_task_);
+    auto scheduling_status = ScheduleDrainTask(process_outbound_queue_task_);
     // We should not call call->Transferred(scheduling_status, ...) here, because the call has
     // already been added to the outbound queue. ShutdownInternal will abort it.
     LOG_IF_WITH_PREFIX(WARNING, !scheduling_status.ok())
@@ -988,7 +1037,8 @@ void Reactor::RegisterInboundSocket(
         .socket = socket,
         .receive_buffer_size = receive_buffer_size,
         .mem_tracker = factory->buffer_tracker(),
-        .metric_entity = messenger_.metric_entity()
+        .metric_entity = messenger_.metric_entity(),
+        .strip_lane_preamble = factory->AcceptsLanePreamble(),
       });
   if (!stream.ok()) {
     LOG_WITH_PREFIX(DFATAL) << "Failed to create stream for " << remote << ": " << stream.status();
@@ -1010,6 +1060,11 @@ void Reactor::RegisterInboundSocket(
 }
 
 Status Reactor::ScheduleReactorTask(ReactorTaskPtr task, bool even_if_not_running) {
+  CountLaneHandoff();
+  return DoScheduleReactorTask(std::move(task), even_if_not_running);
+}
+
+Status Reactor::DoScheduleReactorTask(ReactorTaskPtr task, bool even_if_not_running) {
   // task should never be null, so not using an SCHECK here.
   CHECK_NOTNULL(task);
   bool was_empty;

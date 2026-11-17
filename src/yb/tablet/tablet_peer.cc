@@ -283,6 +283,7 @@ Status TabletPeer::InitTabletPeer(
 
     ConsensusOptions options;
     options.tablet_id = meta_->raft_group_id();
+    options.lane = lane_;
 
     TRACE("Creating consensus instance");
 

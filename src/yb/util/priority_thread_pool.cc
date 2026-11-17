@@ -305,6 +305,8 @@ class PriorityThreadPoolWorker : public PriorityThreadPoolSuspender {
         yb::ReverseLock<decltype(lock)> rlock(lock);
         for (;;) {
           VLOG(4) << "Worker " << this << " running task: " << task_->ToString();
+          // Workers are shared by tasks of every lane; the mask changes only when the lane does.
+          ApplyLaneToCurrentThread(task_->task()->task_lane());
           PriorityThreadPoolTaskExecutor::Run(*task_->task(), Status::OK(), this);
           if (!context_->NotifyWorkerFinished(this)) {
             break;

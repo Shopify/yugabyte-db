@@ -19,6 +19,7 @@
 
 #include "yb/gutil/casts.h"
 
+#include "yb/util/lanes.h"
 #include "yb/util/status_fwd.h"
 #include "yb/util/thread.h"
 
@@ -79,6 +80,11 @@ class PriorityThreadPoolTask {
   void SetTaskCgroup(Cgroup* cgroup) { task_cgroup_ = cgroup; }
   Cgroup* task_cgroup() const { return task_cgroup_; }
 
+  // In lane mode the worker runs the task confined to this lane's CPUs, or to the service mask
+  // for kNoLane. No effect when lane mode is off.
+  void SetTaskLane(LaneId lane) { task_lane_ = lane; }
+  LaneId task_lane() const { return task_lane_; }
+
  private:
   // An internal method which controls task execution and should be triggered to run a task.
   // A special tag is required to deny the method overloading in a user's code and to allow
@@ -89,6 +95,7 @@ class PriorityThreadPoolTask {
 
   const size_t serial_no_;
   [[maybe_unused]] Cgroup* task_cgroup_ = nullptr;
+  LaneId task_lane_ = kNoLane;
 
   friend class PriorityThreadPoolTokenTask;
   friend class PriorityThreadPoolTaskExecutor;

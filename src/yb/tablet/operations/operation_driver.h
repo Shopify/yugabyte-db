@@ -52,6 +52,7 @@
 #include "yb/tablet/operations/operation.h"
 
 #include "yb/util/dist_trace.h"
+#include "yb/util/lanes.h"
 #include "yb/util/status_fwd.h"
 #include "yb/util/lockfree.h"
 #include "yb/util/trace.h"
@@ -208,6 +209,10 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
 
   size_t ReplicateMsgSize();
 
+  // Lane handoff of a leader-side driver queued on the tablet's preparer, which drains many
+  // drivers per pool task.
+  LaneHandoff& prepare_lane_handoff() { return prepare_lane_handoff_; }
+
  private:
   friend class RefCountedThreadSafe<OperationDriver>;
   enum ReplicationState {
@@ -284,6 +289,8 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
 
   MvccManager* mvcc_ = nullptr;
   HybridTime propagated_safe_time_;
+
+  LaneHandoff prepare_lane_handoff_;
 
   DISALLOW_COPY_AND_ASSIGN(OperationDriver);
 };

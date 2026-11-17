@@ -245,6 +245,20 @@ std::string TransactionApplyData::ToString() const {
       apply_state);
 }
 
+namespace {
+
+// Parent of every tablet's participant tracker, updated by all their lanes: lane-batched when the
+// trackers above it are (the tablet server's in lane mode).
+MemTrackerPtr ParticipantsMemTracker(const MemTrackerPtr& tablets_mem_tracker) {
+  auto result = MemTracker::FindOrCreateTracker(kParentMemTrackerId, tablets_mem_tracker);
+  if (tablets_mem_tracker && tablets_mem_tracker->lane_batching_enabled()) {
+    result->EnableLaneBatching();
+  }
+  return result;
+}
+
+} // namespace
+
 void UpdateHistoricalMaxOpId(std::atomic<OpId>* historical_max_op_id, OpId const& op_id) {
   OpId prev_value = (*historical_max_op_id);
   while (prev_value < op_id && !historical_max_op_id->compare_exchange_weak(prev_value, op_id)) {
@@ -263,7 +277,7 @@ class TransactionParticipant::Impl
         mem_tracker_(MemTracker::CreateTracker(
             Format("$0-$1", kParentMemTrackerId, participant_context_.tablet_id()),
             /* metric_name */ "PerTransaction",
-            MemTracker::FindOrCreateTracker(kParentMemTrackerId, tablets_mem_tracker),
+            ParticipantsMemTracker(tablets_mem_tracker),
             AddToParent::kTrue,
             CreateMetrics::kFalse)),
         recently_applied_(typename RecentlyAppliedTransactions::allocator_type(mem_tracker_)),

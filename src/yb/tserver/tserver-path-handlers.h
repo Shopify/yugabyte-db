@@ -90,6 +90,10 @@ class TabletServerPathHandlers {
   void HandleSnapshotsPage(const Webserver::WebRequest& req,
                            Webserver::WebResponse* resp);
   void HandleTabletMetaCacheJSON(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
+  // Lane topology and per-lane state (tablets, sessions, reactors, threads, crossing and preamble
+  // counters); with lanes off, that lane mode is inactive and why.
+  void HandleLanesPage(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
+  void HandleLanesJSON(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
 
   std::string ConsensusStatePBToHtml(const consensus::ConsensusStatePB& cstate) const;
   std::string GetDashboardLine(const std::string& link,

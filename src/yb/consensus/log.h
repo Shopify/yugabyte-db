@@ -388,6 +388,8 @@ class Log : public RefCountedThreadSafe<Log> {
   }
 
   Status TEST_SubmitFuncToAppendToken(const std::function<void()>& func);
+  Status TEST_SubmitFuncToAllocationToken(const std::function<void()>& func);
+  Status TEST_SubmitFuncToBackgroundSyncToken(const std::function<void()>& func);
 
   // Number of segments GetSegmentOpIdRelation has read in full.
   size_t TEST_NumSegmentOpIdRelationReads() const {

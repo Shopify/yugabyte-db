@@ -50,6 +50,8 @@
 #include "yb/util/cgroups.h"
 #include "yb/util/countdown_latch.h"
 #include "yb/util/format.h"
+#include "yb/util/lanes.h"
+#include "yb/util/lanes_test_util.h"
 #include "yb/util/locks.h"
 #include "yb/util/metrics.h"
 #include "yb/util/promise.h"
@@ -784,5 +786,45 @@ TEST_F(TestThreadPool, TestCgroupTaggedPools) {
   ASSERT_EQ(tagged_pools.ActivePools(), kTotalPools);
 }
 #endif
+
+// SERIAL tokens are strands and CONCURRENT tokens sub-pools: either way one task submitted from
+// another lane is one crossing, in the pool's category.
+TEST_F(TestThreadPool, TokensCountLaneHandoffsOnce) {
+  auto topology = MakeTwoLaneTestTopology();
+  if (!topology) {
+    GTEST_SKIP() << "Needs at least 2 CPUs";
+  }
+  TEST_SetLaneTopology scope(*topology);
+  std::unique_ptr<ThreadPool> pool;
+  ASSERT_OK(ThreadPoolBuilder("lane1")
+      .set_max_threads(2)
+      .set_lane(1)
+      .set_crossing_category(LaneCrossingCategory::kCallback)
+      .Build(&pool));
+  ASSERT_STR_CONTAINS(pool->options().ToString(), "lane: 1 crossing_category: kCallback");
+  for (auto mode : {ThreadPool::ExecutionMode::SERIAL, ThreadPool::ExecutionMode::CONCURRENT}) {
+    auto token = pool->NewToken(mode);
+    auto counts = LaneHandoffCounts::Now();
+    std::atomic<LaneId> lane{kNoLane};
+    RunOnStdThread([&token, &lane] {
+      ApplyLaneToCurrentThread(0);
+      CountDownLatch latch(1);
+      ASSERT_OK(token->SubmitFunc([&lane, &latch] {
+        lane = ThisThreadLane();
+        latch.CountDown();
+      }));
+      latch.Wait();
+    });
+    ASSERT_EQ(lane.load(), 1);
+    auto delta = LaneHandoffCounts::Now() - counts;
+    ASSERT_EQ(delta.crossing(LaneCrossingCategory::kCallback), 1)
+        << (mode == ThreadPool::ExecutionMode::SERIAL ? "serial" : "concurrent") << ": "
+        << delta.ToString();
+    ASSERT_EQ(delta.total_crossings(), 1);
+    ASSERT_EQ(delta.entries_from_unlaned, 0);
+    token->Shutdown();
+  }
+  pool->Shutdown();
+}
 
 } // namespace yb

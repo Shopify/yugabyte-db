@@ -101,8 +101,18 @@ class TaskStream {
   // This is set to true immediately before the thread exits.
   std::atomic<bool> stopped_{false};
 
+  // An item and the lane it was submitted from. A stream that is already draining picks items up
+  // without a pool enqueue, so each item counts its own lane handoff.
+  struct QueuedItem {
+    T* item;
+    LaneHandoff lane_handoff;
+
+    // For BlockingQueue::ToString.
+    T* operator->() const { return item; }
+  };
+
   // The objects in the queue are owned by the queue and ownership gets tranferred to ProcessItem.
-  BlockingQueue<T*> queue_;
+  BlockingQueue<QueuedItem> queue_;
 
   // This mutex/condition combination is used in Stop() in case multiple threads are calling that
   // function concurrently. One of them will ask the taskstream thread to stop and wait for it, and
@@ -112,6 +122,7 @@ class TaskStream {
 
   std::unique_ptr<ThreadPoolToken> taskstream_pool_token_;
   std::function<void(T*)> process_item_;
+  const LaneCrossingCategory crossing_category_;
   ThreadIdForStack run_tid_ = 0;
 
   // Maximum time to wait for the queue to become non-empty.
@@ -131,6 +142,7 @@ TaskStream<T>::TaskStream(std::function<void(T*)> process_item,
       // unnecessary checks in thread pool.
       taskstream_pool_token_(thread_pool->NewToken(ThreadPool::ExecutionMode::CONCURRENT)),
       process_item_(process_item),
+      crossing_category_(thread_pool->options().crossing_category),
       queue_max_wait_(queue_max_wait) {
 }
 
@@ -170,7 +182,9 @@ Status TaskStream<T>::Submit(T *task) {
   if (stop_requested_.load(std::memory_order_acquire)) {
     return STATUS(IllegalState, "Tablet is shutting down");
   }
-  if (!queue_.BlockingPut(task)) {
+  QueuedItem queued_item{.item = task, .lane_handoff = {}};
+  queued_item.lane_handoff.RecordSubmitter();
+  if (!queue_.BlockingPut(queued_item)) {
     return STATUS_FORMAT(ServiceUnavailable,
                          "TaskStream queue is full (max capacity $0)",
                          queue_.max_size());
@@ -182,7 +196,7 @@ Status TaskStream<T>::Submit(T *task) {
     // run_state_ was not idle, so we are not creating a task to process operations.
     return Status::OK();
   }
-  return taskstream_pool_token_->SubmitFunc(std::bind(&TaskStream::Run, this));
+  return taskstream_pool_token_->SubmitDrainFunc(std::bind(&TaskStream::Run, this));
 }
 
 template <typename T>
@@ -197,12 +211,13 @@ void TaskStream<T>::Run() {
   run_tid_ = Thread::CurrentThreadIdForStack();
   for (;;) {
     MonoTime wait_timeout_deadline = MonoTime::Now() + queue_max_wait_;
-    std::vector<T *> group;
+    std::vector<QueuedItem> group;
     queue_.BlockingDrainTo(&group, wait_timeout_deadline);
     if (!group.empty()) {
       ChangeRunState(RunState::kDrain, RunState::kProcess);
-      for (T* item : group) {
-        ProcessItem(item);
+      for (const auto& queued_item : group) {
+        queued_item.lane_handoff.RecordExecution(crossing_category_);
+        ProcessItem(queued_item.item);
       }
       ChangeRunState(RunState::kProcess, RunState::kComplete);
       ProcessItem(nullptr);

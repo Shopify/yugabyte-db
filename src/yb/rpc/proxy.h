@@ -83,8 +83,18 @@ YB_DEFINE_ENUM(ResolveState, (kIdle)(kResolving)(kNotifying)(kFinished));
 // calls to an endpoint on one socket, but a reconnect or a re-resolved address may still reach
 // another server.
 //
+// Lanes:
+// In a laned messenger (ProxyContext::num_lanes() != 0) a call whose controller has a lane hint
+// (RpcController::set_lane) goes on one of connections_per_lane_remote() connections keyed by
+// (remote, lane) instead, owned by that lane's reactors. Successive calls from threads of one lane
+// rotate over them through a counter of that lane, so threads of different lanes calling through
+// one proxy don't share a counter. Callbacks run in the handler pool of the lane that issued the
+// call (RpcController::issuing_lane).
+//
 // When remote endpoint is blank (i.e. HostPort()), the proxy will attempt to
-// call the service locally in the messenger instead.
+// call the service locally in the messenger instead. In a laned messenger the local call is
+// handled by the pool of the controller's lane hint, or of the issuing lane without a hint, and
+// runs inline only from a handler thread of that lane's pool.
 //
 // Proxy objects are thread-safe after initialization only.
 // Setters on the Proxy are not thread-safe, and calling a setter after any RPC
@@ -168,6 +178,10 @@ class Proxy {
     return remote_;
   }
 
+  // Calls with a lane hint counted from threads of lane submitter (kNoLane: unlaned threads); 0
+  // for an unlaned context.
+  size_t TEST_LaneCallCount(LaneId submitter) const;
+
  private:
   void Resolve();
   void HandleResolve(const Result<IpAddress>& result);
@@ -175,7 +189,13 @@ class Proxy {
   void NotifyAllFailed(const Status& status);
   void QueueCall(RpcController* controller, const Endpoint& endpoint);
   ThreadPool *GetCallbackThreadPool(
-      bool force_run_callback_on_reactor, InvokeCallbackMode invoke_callback_mode);
+      bool force_run_callback_on_reactor, const RpcController& controller);
+
+  // Index of the calling thread's counter in lane_call_counters_: its lane, or the last slot for
+  // unlaned threads.
+  size_t LaneCallCounterIndex(LaneId lane) const {
+    return lane < num_lanes_ ? lane : num_lanes_;
+  }
 
   // Implements logic for AsyncRequest function, but allows to force to run callback on
   // reactor thread. This is an optimisation used by SyncRequest function.
@@ -224,6 +244,16 @@ class Proxy {
 
   // Number of outbound connections to create per each destination server address.
   int num_connections_to_server_;
+
+  // Lanes of a laned context (0 otherwise), and the connection index counters of its laned calls:
+  // one cache line per submitting lane plus one for unlaned threads, each written only by threads
+  // of its lane. Allocated only for a laned context.
+  struct alignas(CACHELINE_SIZE) LaneCallCounter {
+    std::atomic<size_t> value{0};
+  };
+  const size_t num_lanes_;
+  const int connections_per_lane_remote_;
+  std::unique_ptr<LaneCallCounter[]> lane_call_counters_;
 
   std::shared_ptr<MemTracker> mem_tracker_;
 };

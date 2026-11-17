@@ -412,7 +412,7 @@ shared_ptr<RaftConsensus> RaftConsensus::Create(
     MultiRaftManager* multi_raft_manager) {
 
   auto rpc_factory = std::make_unique<RpcPeerProxyFactory>(
-    messenger, proxy_cache, local_peer_pb.cloud_info());
+    messenger, proxy_cache, local_peer_pb.cloud_info(), options.lane);
 
   // The message queue that keeps track of which operations need to be replicated
   // where.
@@ -4162,6 +4162,14 @@ Status RaftConsensus::SetLastFlushedOpIdInRetryableRequests(const OpId& op_id) {
 
 int64_t RaftConsensus::follower_lag_ms() const {
   return follower_last_update_time_ms_metric_->lag_ms();
+}
+
+Status RaftConsensus::TEST_SubmitToRaftPool(const std::function<void()>& func) {
+  return raft_pool_concurrent_token_->SubmitFunc(func);
+}
+
+void RaftConsensus::TEST_EnqueueNotification(std::function<void()> func) {
+  queue_->TEST_EnqueueNotification(std::move(func));
 }
 
 RetryableRequestsCounts RaftConsensus::TEST_CountRetryableRequests() {

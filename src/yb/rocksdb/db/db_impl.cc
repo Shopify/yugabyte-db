@@ -240,7 +240,9 @@ YB_DEFINE_ENUM(BgTaskType, (kFlush)(kCompaction)(kDBPathMoveCompaction));
 
 class DBImpl::ThreadPoolTask : public yb::PriorityThreadPoolTask {
  public:
-  explicit ThreadPoolTask(DBImpl* db_impl) : db_impl_(db_impl) {}
+  explicit ThreadPoolTask(DBImpl* db_impl) : db_impl_(db_impl) {
+    SetTaskLane(db_impl->task_lane());
+  }
 
   void Run(const Status& status, yb::PriorityThreadPoolSuspender* suspender) override {
     if (!status.ok()) {
@@ -3861,7 +3863,10 @@ void DBImpl::SchedulePendingCompaction(ColumnFamilyData* cfd) {
 void DBImpl::BGWorkFlush(void* db) {
   IOSTATS_SET_THREAD_POOL_ID(Env::Priority::HIGH);
   DEBUG_ONLY_TEST_SYNC_POINT("DBImpl::BGWorkFlush");
-  reinterpret_cast<DBImpl*>(db)->BackgroundCallFlush(nullptr /* cfd */);
+  auto* db_impl = reinterpret_cast<DBImpl*>(db);
+  // Env pool threads serve every DB, so each job takes its DB's lane, as priority pool tasks do.
+  yb::ApplyLaneToCurrentThread(db_impl->task_lane());
+  db_impl->BackgroundCallFlush(nullptr /* cfd */);
   DEBUG_ONLY_TEST_SYNC_POINT("DBImpl::BGWorkFlush:done");
 }
 
@@ -3870,7 +3875,9 @@ void DBImpl::BGWorkCompaction(void* arg) {
   delete reinterpret_cast<CompactionArg*>(arg);
   IOSTATS_SET_THREAD_POOL_ID(Env::Priority::LOW);
   DEBUG_ONLY_TEST_SYNC_POINT("DBImpl::BGWorkCompaction");
-  reinterpret_cast<DBImpl*>(ca.db)->BackgroundCallCompaction(ca.m);
+  auto* db_impl = reinterpret_cast<DBImpl*>(ca.db);
+  yb::ApplyLaneToCurrentThread(db_impl->task_lane());
+  db_impl->BackgroundCallCompaction(ca.m);
 }
 
 void DBImpl::UnscheduleCallback(void* arg) {

@@ -479,6 +479,10 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   Status ReloadKeysAndCertificates() override;
   std::string GetCertificateDetails() override;
 
+  // Calls f with the PgClientService, which stays alive until f returns; does nothing once the
+  // service is gone (shutdown). Unlike TEST_GetPgClientService, safe for status pages.
+  void VisitPgClientService(const std::function<void(const PgClientServiceImpl&)>& f);
+
   PgClientServiceImpl* TEST_GetPgClientService();
 
   PgClientServiceMockImpl* TEST_GetPgClientServiceMock();

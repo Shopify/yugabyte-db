@@ -62,6 +62,7 @@
 #include "yb/util/errno.h"
 #include "yb/util/format.h"
 #include "yb/util/html_print_helper.h"
+#include "yb/util/lanes.h"
 #include "yb/util/lockfree.h"
 #include "yb/util/logging.h"
 #include "yb/util/metrics.h"
@@ -1026,6 +1027,9 @@ void* Thread::SuperviseThread(void* arg) {
   // exception) because pthread_cleanup_push() creates a scoped object
   // whose destructor invokes the provided callback.
   pthread_cleanup_push(&Thread::FinishThread, t);
+  // A thread inherits its creator's mask, which may be a lane's. Every new thread starts in the
+  // service set; lane pool workers and reactors then apply their own lane in their body.
+  ApplyServiceMaskToCurrentThread();
   t->functor_();
   pthread_cleanup_pop(true);
 

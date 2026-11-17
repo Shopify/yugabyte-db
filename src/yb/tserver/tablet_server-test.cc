@@ -76,6 +76,8 @@
 #include "yb/util/crc.h"
 #include "yb/util/curl_util.h"
 #include "yb/util/format.h"
+#include "yb/util/lanes.h"
+#include "yb/util/lanes_test_util.h"
 #include "yb/util/metrics.h"
 #include "yb/util/monotime.h"
 #include "yb/util/prometheus_metric_filter.h"
@@ -99,6 +101,7 @@ DEFINE_NON_RUNTIME_int32(single_threaded_insert_latency_bench_insert_rows, 1000,
 DECLARE_bool(enable_tiered_storage);
 DECLARE_bool(enforce_xcluster_guarded_lease);
 DECLARE_int32(metrics_retirement_age_ms);
+DECLARE_int32(tserver_lanes);
 DECLARE_string(block_manager);
 DECLARE_string(rpc_bind_addresses);
 DECLARE_bool(disable_clock_sync_error);
@@ -107,6 +110,8 @@ DECLARE_uint32(max_active_table_metrics_table_count);
 DECLARE_string(metric_node_name);
 
 // Declare these metrics prototypes for simpler unit testing of their behavior.
+METRIC_DECLARE_counter(rpc_lane_preamble_absent);
+METRIC_DECLARE_counter(rpc_lane_preamble_bound);
 METRIC_DECLARE_counter(rows_inserted);
 METRIC_DECLARE_counter(rows_updated);
 METRIC_DECLARE_counter(rows_deleted);
@@ -187,6 +192,94 @@ TEST_F(TabletServerTest, TestPingServer) {
   server::PingResponsePB resp;
   RpcController controller;
   ASSERT_OK(generic_proxy_->Ping(req, &resp, &controller));
+}
+
+// With default flags (lanes off) a started tablet server serving a write never touches a thread
+// mask or a lane counter, and registers no lane metrics.
+TEST_F(TabletServerTest, NoLaneActivityWithLanesOff) {
+  WriteRequestPB req;
+  req.set_tablet_id(kTabletId);
+  AddTestRowInsert(1, 2, "lanes off", &req);
+  WriteResponsePB resp;
+  RpcController controller;
+  ASSERT_OK(proxy_->Write(req, &resp, &controller));
+  ASSERT_FALSE(resp.has_error()) << resp.ShortDebugString();
+
+  ASSERT_FALSE(LaneModeActive());
+  ASSERT_EQ(TEST_CpuAffinityCallCount(), 0);
+  auto counts = LaneHandoffCounts::Now();
+  ASSERT_EQ(counts.total_crossings(), 0) << counts.ToString();
+  ASSERT_EQ(counts.entries_from_unlaned, 0);
+  for (const auto& [prototype, metric] :
+       mini_server_->server()->metric_entity()->TEST_UsageMetricsMap()) {
+    const std::string_view name(prototype->name());
+    ASSERT_FALSE(name.starts_with("lane_") || name.starts_with("rpc_lane_")) << name;
+  }
+}
+
+class TabletServerLanesTest : public TabletServerTest {
+ public:
+  void SetUp() override {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_lanes) = 2;
+    // Unset, so that the tablet server installs its topology; restored after the server stops.
+    lane_scope_.emplace();
+    TabletServerTest::SetUp();
+  }
+
+  void TearDown() override {
+    TabletServerTest::TearDown();
+    lane_scope_.reset();
+  }
+
+ private:
+  std::optional<TEST_SetLaneTopology> lane_scope_;
+};
+
+// With forced lanes the tablet server's messenger is laned: each lane gets the default reactor
+// count and its own handler pools, which handle inbound calls.
+TEST_F(TabletServerLanesTest, LanedMessengerServesWrites) {
+  ASSERT_TRUE(LaneModeActive());
+  const auto& topology = GetLaneTopology();
+  ASSERT_EQ(topology.num_lanes(), 2);
+  auto* messenger = mini_server_->server()->messenger();
+  ASSERT_TRUE(messenger->laned());
+  ASSERT_EQ(messenger->lane_topology(), topology);
+  size_t expected_reactors = 0;
+  for (LaneId lane = 0; lane != 2; ++lane) {
+    size_t sharing = 0;
+    for (LaneId other = 0; other != 2; ++other) {
+      sharing += topology.lane_domains(other) == topology.lane_domains(lane);
+    }
+    auto expected = std::max<size_t>(1, topology.lane_mask(lane).Count() / 4 / sharing);
+    ASSERT_EQ(messenger->ReactorsOfLane(lane).size(), expected);
+    expected_reactors += expected;
+  }
+  ASSERT_EQ(messenger->num_reactors(), expected_reactors);
+
+  WriteRequestPB req;
+  req.set_tablet_id(kTabletId);
+  AddTestRowInsert(1, 2, "lanes on", &req);
+  WriteResponsePB resp;
+  RpcController controller;
+  ASSERT_OK(proxy_->Write(req, &resp, &controller));
+  ASSERT_FALSE(resp.has_error()) << resp.ShortDebugString();
+  VerifyRows(schema_, { KeyValue(1, 2) });
+
+  size_t lane_workers = 0;
+  for (LaneId lane = 0; lane != 2; ++lane) {
+    lane_workers += messenger->ThreadPool(rpc::ServicePriority::kNormal, lane).NumWorkers();
+  }
+  ASSERT_GT(lane_workers, 0);
+  bool lane_metrics = false;
+  for (const auto& [prototype, metric] :
+       mini_server_->server()->metric_entity()->TEST_UsageMetricsMap()) {
+    lane_metrics = lane_metrics || std::string_view(prototype->name()) == "lane_crossings_reactor";
+  }
+  ASSERT_TRUE(lane_metrics);
+  // The test's proxy is on an unlaned messenger, so its connection carries no lane preamble.
+  const auto& entity = mini_server_->server()->metric_entity();
+  ASSERT_EQ(entity->FindOrNull<Counter>(METRIC_rpc_lane_preamble_bound)->value(), 0);
+  ASSERT_GE(entity->FindOrNull<Counter>(METRIC_rpc_lane_preamble_absent)->value(), 1);
 }
 
 // The active-table list applies only to YSQL tables, so this test uses one.

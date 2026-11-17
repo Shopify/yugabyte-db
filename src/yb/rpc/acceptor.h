@@ -40,6 +40,7 @@
 #include <ev++.h> // NOLINT
 
 #include "yb/gutil/ref_counted.h"
+#include "yb/util/lanes.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/net/socket.h"
 #include "yb/util/status_fwd.h"
@@ -54,14 +55,21 @@ class Thread;
 
 namespace rpc {
 
-// Take ownership of the socket via Socket::Release
-using NewSocketHandler = std::function<void(Socket*, const Endpoint&)>;
+// Called on the acceptor thread with each accepted socket, which it takes over by moving it, and
+// the remote address. lane is the lane of the socket's lane preamble, already reduced modulo the
+// acceptor's lane count, or kNoLane when the socket is not bound to a lane.
+using NewSocketHandler = std::function<void(Socket*, const Endpoint&, LaneId lane)>;
 
 // A acceptor that calls accept() to create new connections.
 class Acceptor {
  public:
+  // num_lanes is the lane count of a laned messenger whose inbound protocol accepts a lane
+  // preamble (rpc/lane_preamble.h). The acceptor then holds each accepted socket in its own loop,
+  // never blocking, until the socket's first bytes show whether they are a preamble, for at most
+  // --rpc_lane_preamble_peek_timeout_ms; it consumes a preamble and passes its lane, and passes
+  // any other socket with nothing consumed. With 0, sockets are passed on as soon as accepted.
   Acceptor(const scoped_refptr<MetricEntity>& metric_entity, NewSocketHandler handler,
-           Cgroup* cgroup = nullptr);
+           Cgroup* cgroup = nullptr, size_t num_lanes = 0);
   ~Acceptor();
 
   // Setup acceptor to listen address.
@@ -75,6 +83,14 @@ class Acceptor {
   void RunThread();
   void IoHandler(ev::io& io, int events); // NOLINT
   void AsyncHandler(ev::async& async, int events); // NOLINT
+
+  struct PendingSocket;
+
+  void PeekLanePreamble(Socket socket, const Endpoint& remote);
+  // Peeks at the first bytes of a held socket, passes it on once they decide, or once wait is false
+  // or its deadline passed, and otherwise keeps holding it.
+  void DecideLanePreamble(PendingSocket* pending, bool wait);
+  void PassPending(PendingSocket* pending, LaneId lane);
 
   struct AcceptingSocket {
     std::unique_ptr<ev::io> io;
@@ -92,12 +108,22 @@ class Acceptor {
 
   scoped_refptr<Counter> rpc_connections_accepted_;
 
+  const size_t num_lanes_;
+  // Instantiated only when num_lanes_ is not 0.
+  scoped_refptr<Counter> lane_preamble_bound_;
+  scoped_refptr<Counter> lane_preamble_absent_;
+  scoped_refptr<Counter> lane_preamble_peek_timeouts_;
+
   bool closing_ = false;
   ev::dynamic_loop loop_;
   ev::async async_;
 #ifdef __linux__
   Cgroup* cgroup_ = nullptr;
 #endif
+
+  // Sockets held until their first bytes show whether they start with a lane preamble. Used only
+  // on the acceptor thread, and declared after loop_ since their watchers stop on destruction.
+  std::unordered_map<PendingSocket*, std::unique_ptr<PendingSocket>> pending_sockets_;
 
   DISALLOW_COPY_AND_ASSIGN(Acceptor);
 };

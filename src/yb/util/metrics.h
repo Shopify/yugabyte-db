@@ -402,6 +402,34 @@ namespace yb {
 class JsonWriter;
 class ThreadPool;
 
+namespace metrics_internal {
+
+// Per-lane cells of a server-level metric that threads of many lanes update per operation (see
+// AtomicGauge::EnableLaneCells, EventStats::EnableLaneCells and Histogram::EnableLaneCells). A
+// thread with a lane updates its lane's cell; other threads, and every thread while lane mode is
+// off, update the metric's own value; readers combine them. Defined in metrics.cc.
+class LaneHistogramCells;
+class LaneStatsCells;
+class LaneValueCells;
+
+// Whether a metric may have lane cells: only server-level metrics, which are never pre-aggregated
+// for Prometheus.
+bool LaneCellsAllowed(const MetricPrototype* prototype);
+
+// nullptr unless lane mode is active.
+LaneValueCells* NewLaneValueCells();
+void DeleteLaneValueCells(LaneValueCells* cells);
+// Adds amount to the calling thread's lane cell; false, adding nothing, for a thread without one.
+bool AddToLaneValueCell(LaneValueCells* cells, int64_t amount);
+int64_t SumLaneValueCells(const LaneValueCells* cells);
+// Empties every cell and returns the sum of what they held.
+int64_t DrainLaneValueCells(LaneValueCells* cells);
+
+bool AddToLaneStatsCell(LaneStatsCells* cells, int64_t value, uint64_t count);
+bool AddToLaneHistogramCell(LaneHistogramCells* cells, int64_t value, int64_t count);
+
+} // namespace metrics_internal
+
 // Unit types to be used with metrics.
 // As additional units are required, add them to this enum and also to Name().
 struct MetricUnit {
@@ -766,14 +794,22 @@ class AtomicGauge : public Gauge {
         prototype_->type() != MetricType::kCounter) {
       aggregated_prometheus_value_holder_->IncrementBy(-value());
     }
+    metrics_internal::DeleteLaneValueCells(lane_cells_.load(std::memory_order_acquire));
   }
 
   T value() const {
-    return static_cast<T>(value_.Load(kMemOrderNoBarrier));
+    auto result = value_.Load(kMemOrderNoBarrier);
+    if (auto* cells = lane_cells_.load(std::memory_order_acquire)) {
+      result += metrics_internal::SumLaneValueCells(cells);
+    }
+    return static_cast<T>(result);
   }
   virtual void set_value(const T& value) {
     int64_t new_value = static_cast<int64_t>(value);
     int64_t old_value = value_.Exchange(new_value, kMemOrderNoBarrier);
+    if (auto* cells = lane_cells_.load(std::memory_order_acquire)) {
+      old_value += metrics_internal::DrainLaneValueCells(cells);
+    }
 
     if (aggregated_prometheus_value_holder_ != nullptr) {
       aggregated_prometheus_value_holder_->IncrementBy(new_value - old_value);
@@ -783,6 +819,10 @@ class AtomicGauge : public Gauge {
     IncrementBy(1);
   }
   virtual void IncrementBy(int64_t amount) {
+    if (auto* cells = lane_cells_.load(std::memory_order_acquire);
+        cells && metrics_internal::AddToLaneValueCell(cells, amount)) {
+      return;
+    }
     value_.IncrementBy(amount, kMemOrderNoBarrier);
 
     if (aggregated_prometheus_value_holder_ != nullptr) {
@@ -832,6 +872,36 @@ class AtomicGauge : public Gauge {
     return aggregated_prometheus_value_holder_ != nullptr;
   }
 
+  // For a server-level gauge that threads of many lanes update per operation: when lane mode is
+  // active, gives each lane a cell of its own for increments from its threads, so that only
+  // threads without a lane write the gauge's shared value, and value() adds the cells. The
+  // increment and decrement of one count may come from threads of different lanes: cells hold
+  // signed deltas that are only ever summed. No-op with lanes off, for a gauge of another entity
+  // type, or when already enabled. Costs (L + 1) cache lines.
+  void EnableLaneCells() {
+    if (lane_cells_.load(std::memory_order_acquire) ||
+        !metrics_internal::LaneCellsAllowed(prototype_)) {
+      return;
+    }
+    auto* cells = metrics_internal::NewLaneValueCells();
+    if (!cells) {
+      return;
+    }
+    metrics_internal::LaneValueCells* expected = nullptr;
+    if (!lane_cells_.compare_exchange_strong(expected, cells, std::memory_order_acq_rel)) {
+      metrics_internal::DeleteLaneValueCells(cells);
+    }
+  }
+
+  bool lane_cells_enabled() const {
+    return lane_cells_.load(std::memory_order_acquire) != nullptr;
+  }
+
+  // The gauge's shared value, without the lane cells.
+  int64_t TEST_shared_value() const {
+    return value_.Load(kMemOrderNoBarrier);
+  }
+
  protected:
   virtual void WriteValue(JsonWriter* writer) const override {
     writer->Value(value());
@@ -839,6 +909,8 @@ class AtomicGauge : public Gauge {
   AtomicInt<int64_t> value_;
 
   std::shared_ptr<AtomicInt<int64_t>> aggregated_prometheus_value_holder_;
+
+  std::atomic<metrics_internal::LaneValueCells*> lane_cells_{nullptr};
  private:
   DISALLOW_COPY_AND_ASSIGN(AtomicGauge);
 };
@@ -1143,36 +1215,28 @@ class BaseStats : public Metric {
   // Increment the histogram for the given value.
   // 'value' must be non-negative.
   void Increment(int64_t value) {
-      AsStats()->mutable_underlying()->Increment(value);
+      AsStats()->DoIncrementBy(value, 1);
   }
 
   // Increment the histogram for the given value by the given amount.
   // 'value' and 'amount' must be non-negative.
   void IncrementBy(int64_t value, int64_t amount) {
-      AsStats()->mutable_underlying()->IncrementBy(value, amount);
+      AsStats()->DoIncrementBy(value, amount);
   }
+
+  // The readers below include the lane cells, if any (see EnableLaneCells of the subclasses).
 
   // Return the total number of values added to the histogram (via Increment()
   // or IncrementBy()).
-  uint64_t TotalCount() const {
-    return AsConstStats()->underlying()->TotalCount();
-  }
+  uint64_t TotalCount() const;
 
   // Return the total sum of values added to the histogram (via Increment()
   // or IncrementBy()).
-  uint64_t TotalSum() const {
-    return AsConstStats()->underlying()->TotalSum();
-  }
+  uint64_t TotalSum() const;
 
-  uint64_t MinValue() const {
-    return AsConstStats()->underlying()->MinValue();
-  }
-  uint64_t MaxValue() const {
-    return AsConstStats()->underlying()->MaxValue();
-  }
-  double MeanValue() const {
-    return AsConstStats()->underlying()->MeanValue();
-  }
+  uint64_t MinValue() const;
+  uint64_t MaxValue() const;
+  double MeanValue() const;
 
   void Reset() const;
 
@@ -1213,13 +1277,34 @@ class Histogram : public BaseStats<Histogram> {
   uint64_t CountInBucketForValueForTests(uint64_t value) const;
 
   // Returns a pointer to the underlying histogram. The implementation of HdrHistogram
-  // is thread safe.
+  // is thread safe. It does not include the lane cells (see EnableLaneCells); the readers of
+  // BaseStats and the JSON and Prometheus output do.
   const HdrHistogram* underlying() const { return histogram_.get(); }
 
   size_t DynamicMemoryUsage() const { return histogram_->DynamicMemoryUsage() + sizeof(*this); }
 
+  // For a server-level histogram that threads of many lanes record into per operation: when lane
+  // mode is active, gives each lane a histogram of its own, created when a thread of the lane
+  // first records, so that only threads without a lane write the shared one. Readers merge them
+  // (bucket counts add, min and max combine), so the output is what one histogram with the same
+  // values would give. No-op with lanes off, for a histogram of another entity type, or when
+  // already enabled. Costs a pointer per lane, plus one HdrHistogram per lane that records.
+  void EnableLaneCells();
+
+  bool lane_cells_enabled() const {
+    return lane_cells_.load(std::memory_order_acquire) != nullptr;
+  }
+
  protected:
   HdrHistogram* mutable_underlying() { return histogram_.get(); }
+
+  void DoIncrementBy(int64_t value, int64_t count) {
+    if (auto* cells = lane_cells_.load(std::memory_order_acquire);
+        cells && metrics_internal::AddToLaneHistogramCell(cells, value, count)) {
+      return;
+    }
+    histogram_->IncrementBy(value, count);
+  }
 
   Status SetUpPreAggregationForPrometheus(
       MetricsAggregator* metrics_aggregator,
@@ -1247,7 +1332,10 @@ class Histogram : public BaseStats<Histogram> {
   explicit Histogram(const HistogramPrototype* proto);
   explicit Histogram(std::shared_ptr<HistogramPrototype> proto);
 
+  ~Histogram();
+
   const std::unique_ptr<HdrHistogram> histogram_;
+  std::atomic<metrics_internal::LaneHistogramCells*> lane_cells_{nullptr};
   DISALLOW_COPY_AND_ASSIGN(Histogram);
 };
 
@@ -1261,8 +1349,26 @@ class EventStats : public BaseStats<EventStats> {
 
   size_t DynamicMemoryUsage() const { return stats_->DynamicMemoryUsage() + sizeof(*this); }
 
+  // For server-level stats that threads of many lanes record into per operation: when lane mode
+  // is active, gives each lane AggregateStats of its own, so that only threads without a lane
+  // write the shared ones; readers combine them. No-op with lanes off, for stats of another entity
+  // type, or when already enabled. Costs (L + 1) x 128 bytes.
+  void EnableLaneCells();
+
+  bool lane_cells_enabled() const {
+    return lane_cells_.load(std::memory_order_acquire) != nullptr;
+  }
+
  protected:
   AggregateStats* mutable_underlying() { return stats_.get(); }
+
+  void DoIncrementBy(int64_t value, int64_t count) {
+    if (auto* cells = lane_cells_.load(std::memory_order_acquire);
+        cells && metrics_internal::AddToLaneStatsCell(cells, value, count)) {
+      return;
+    }
+    stats_->IncrementBy(value, count);
+  }
 
   Status SetUpPreAggregationForPrometheus(
       MetricsAggregator* metrics_aggregator,
@@ -1290,6 +1396,7 @@ class EventStats : public BaseStats<EventStats> {
   ~EventStats();
 
   const std::unique_ptr<AggregateStats> stats_;
+  std::atomic<metrics_internal::LaneStatsCells*> lane_cells_{nullptr};
 
   DISALLOW_COPY_AND_ASSIGN(EventStats);
 };

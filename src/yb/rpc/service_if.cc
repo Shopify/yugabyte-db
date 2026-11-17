@@ -53,6 +53,11 @@ RpcMethodMetrics::RpcMethodMetrics(const scoped_refptr<Counter>& request_bytes_,
                                    const scoped_refptr<Histogram>& handler_latency_)
     : request_bytes(request_bytes_), response_bytes(response_bytes_),
       handler_latency(handler_latency_) {
+  // Recorded per call by the handler thread, in every lane; cells are created only for lanes that
+  // call the method. No-op with lanes off.
+  if (handler_latency) {
+    handler_latency->EnableLaneCells();
+  }
 }
 
 RpcMethodMetrics::~RpcMethodMetrics() = default;

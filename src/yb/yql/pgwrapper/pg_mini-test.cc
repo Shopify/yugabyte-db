@@ -70,6 +70,7 @@
 #include "yb/util/debug-util.h"
 #include "yb/util/enums.h"
 #include "yb/util/format.h"
+#include "yb/util/lanes.h"
 #include "yb/util/logging_test_util.h"
 #include "yb/util/random_util.h"
 #include "yb/util/range.h"
@@ -82,6 +83,7 @@
 #include "yb/util/test_thread_holder.h"
 #include "yb/util/tsan_util.h"
 
+#include "yb/rpc/messenger.h"
 #include "yb/rpc/rpc_context.h"
 
 #include "yb/yql/pggate/pggate_flags.h"
@@ -138,6 +140,7 @@ DECLARE_int32(timestamp_history_retention_interval_sec);
 DECLARE_int32(timestamp_syscatalog_history_retention_interval_sec);
 DECLARE_int32(tracing_level);
 DECLARE_int32(tserver_heartbeat_metrics_interval_ms);
+DECLARE_int32(tserver_lanes);
 DECLARE_int32(tablet_creation_timeout_ms);
 DECLARE_int32(txn_max_apply_batch_records);
 DECLARE_int32(yb_num_shards_per_tserver);
@@ -600,6 +603,49 @@ TEST_F(PgMiniTest, Simple) {
 
   auto value = ASSERT_RESULT(conn.FetchRow<std::string>("SELECT value FROM t WHERE key = 1"));
   ASSERT_EQ(value, "hello");
+}
+
+class PgMiniLanesTest : public PgMiniTest {
+ protected:
+  void SetUp() override {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_lanes) = 2;
+    // Unset, so that the tablet servers install their topology; restored after the cluster stops.
+    lane_scope_.emplace();
+    PgMiniTest::SetUp();
+  }
+
+  void DoTearDown() override {
+    PgMiniTest::DoTearDown();
+    lane_scope_.reset();
+  }
+
+  std::optional<TEST_SetLaneTopology> lane_scope_;
+};
+
+// Tablet servers started with forced lanes serve YSQL through laned messengers, whose lane
+// handler pools handle the calls; the in-process master's messenger stays unlaned.
+TEST_F(PgMiniLanesTest, LanedTabletServersServeYsql) {
+  ASSERT_TRUE(LaneModeActive());
+  ASSERT_EQ(GetLaneTopology().num_lanes(), 2);
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t (key INT PRIMARY KEY, value TEXT)"));
+  ASSERT_OK(conn.Execute("INSERT INTO t SELECT i, 'x' || i FROM generate_series(1, 1000) i"));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<PGUint64>("SELECT COUNT(*) FROM t")), 1000);
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<std::string>("SELECT value FROM t WHERE key = 7")), "x7");
+
+  size_t lane_workers = 0;
+  for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
+    auto* messenger = cluster_->mini_tablet_server(i)->server()->messenger();
+    ASSERT_TRUE(messenger->laned());
+    ASSERT_EQ(messenger->num_lanes(), 2);
+    for (LaneId lane = 0; lane != 2; ++lane) {
+      ASSERT_FALSE(messenger->ReactorsOfLane(lane).empty());
+      lane_workers += messenger->ThreadPool(rpc::ServicePriority::kNormal, lane).NumWorkers();
+      lane_workers += messenger->ThreadPool(rpc::ServicePriority::kHigh, lane).NumWorkers();
+    }
+  }
+  ASSERT_GT(lane_workers, 0);
+  ASSERT_FALSE(cluster_->mini_master(0)->master()->messenger()->laned());
 }
 
 class PgMiniTestTracing : public PgMiniTest, public ::testing::WithParamInterface<bool> {

@@ -39,7 +39,12 @@ YB_DEFINE_ENUM(StrandTaskState, (kIdle)(kPending)(kRunning)(kStopped));
 
 class Strand::Task : public ThreadPoolTask {
  public:
-  explicit Task(std::atomic<size_t>& active_enqueues) : active_enqueues_(active_enqueues) {}
+  Task(std::atomic<size_t>& active_enqueues, LaneCrossingCategory crossing_category)
+      : active_enqueues_(active_enqueues), crossing_category_(crossing_category) {
+    // Each queued StrandTask counts its own handoff; counting the wrapper too would count one
+    // handoff twice, or attribute later items to the submitter that woke the strand.
+    lane_handoff().DisableCounting();
+  }
 
   ~Task() {
     const auto state = state_.load();
@@ -102,6 +107,7 @@ class Strand::Task : public ThreadPoolTask {
   }
 
   std::atomic<size_t>& active_enqueues_;
+  const LaneCrossingCategory crossing_category_;
 
   // Whether the top-level strand task is currently running in the underlying thread pool.
   std::atomic<StrandTaskState> state_{StrandTaskState::kIdle};
@@ -113,7 +119,7 @@ class Strand::Task : public ThreadPoolTask {
 
 Strand::Strand(YBThreadPool* thread_pool)
     : ThreadSubPoolBase(thread_pool),
-      task_(new Task(active_enqueues_)) {
+      task_(new Task(active_enqueues_, thread_pool->options().crossing_category)) {
   task_->set_run_token(run_token_);
 }
 
@@ -126,6 +132,7 @@ Strand::~Strand() {
 
 bool Strand::Enqueue(StrandTask* task) {
   task->set_trace_parent(dist_trace::GetActiveSpanContext());
+  task->lane_handoff().RecordSubmitter();
   return EnqueueHelper([this, task](bool ok) {
     if (ok) {
       if (task_->Enqueue(task)) {
@@ -160,6 +167,7 @@ void Strand::Task::Done(const Status& status) {
       const auto& actual_status = running ? status : StrandAbortedStatus();
       dist_trace::ScopedAdoptSpan parent_scope(task->trace_parent());
       if (actual_status.ok()) {
+        task->lane_handoff().RecordExecution(crossing_category_);
         task->Run();
       }
       task->Done(actual_status);

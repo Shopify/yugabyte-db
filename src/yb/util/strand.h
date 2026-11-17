@@ -35,6 +35,8 @@ class StrandTask : public MPSCQueueEntry<StrandTask> {
     trace_parent_ = std::move(trace_parent);
   }
 
+  LaneHandoff& lane_handoff() { return lane_handoff_; }
+
   virtual ~StrandTask() = default;
 
  private:
@@ -48,6 +50,7 @@ class StrandTask : public MPSCQueueEntry<StrandTask> {
 
   StrandTask* next_ = nullptr;
   std::optional<dist_trace::trace::SpanContext> trace_parent_;
+  LaneHandoff lane_handoff_;
 };
 
 template <class F>

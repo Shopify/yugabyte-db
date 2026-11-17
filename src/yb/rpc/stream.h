@@ -16,6 +16,7 @@
 #include "yb/rpc/rpc_fwd.h"
 #include "yb/rpc/reactor_thread_role.h"
 
+#include "yb/util/lanes.h"
 #include "yb/util/status_fwd.h"
 #include "yb/util/net/socket.h"
 
@@ -151,6 +152,12 @@ struct StreamCreateData {
   size_t receive_buffer_size;
   std::shared_ptr<MemTracker> mem_tracker;
   scoped_refptr<MetricEntity> metric_entity;
+  // Client streams: the lane to send in a lane preamble (rpc/lane_preamble.h) before any other
+  // byte; kNoLane sends none. Only lane-keyed connections of a laned messenger set it.
+  LaneId lane_preamble = kNoLane;
+  // Server streams: drop a lane preamble at the start of the stream, which the acceptor did not
+  // consume. Set for messengers whose inbound protocol is YB RPC, whose senders may write one.
+  bool strip_lane_preamble = false;
 };
 
 class StreamFactory {

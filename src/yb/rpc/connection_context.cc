@@ -15,8 +15,9 @@
 
 #include "yb/rpc/connection.h"
 
-#include "yb/util/mem_tracker.h"
 #include "yb/util/flags.h"
+#include "yb/util/lanes.h"
+#include "yb/util/mem_tracker.h"
 
 DEFINE_UNKNOWN_int64(read_buffer_memory_limit, -5,
              "Overall limit for read buffers. "
@@ -38,6 +39,13 @@ void ConnectionContext::UpdateLastRead(const ConnectionPtr& connection) {
   connection->UpdateLastActivity();
 }
 
+namespace {
+
+const char* const kReadBufferTrackerId = "Read Buffer";
+const char* const kCallTrackerId = "Call";
+
+} // namespace
+
 ConnectionContextFactory::ConnectionContextFactory(
     int64_t memory_limit, const std::string& name,
     const std::shared_ptr<MemTracker>& parent_mem_tracker)
@@ -47,13 +55,24 @@ ConnectionContextFactory::ConnectionContextFactory(
   });
 
   auto root_buffer_tracker = MemTracker::FindOrCreateTracker(
-      root_buffer_limit, "Read Buffer", parent_mem_tracker);
+      root_buffer_limit, kReadBufferTrackerId, parent_mem_tracker);
   memory_limit = AbsRelMemLimit(memory_limit, [&root_buffer_tracker] {
     return root_buffer_tracker->limit();
   });
   buffer_tracker_ = MemTracker::FindOrCreateTracker(memory_limit, name, root_buffer_tracker);
-  auto root_call_tracker = MemTracker::FindOrCreateTracker("Call", parent_mem_tracker);
+  auto root_call_tracker = MemTracker::FindOrCreateTracker(kCallTrackerId, parent_mem_tracker);
   call_tracker_ = MemTracker::FindOrCreateTracker(name, root_call_tracker);
+}
+
+void EnableLaneBatchingForRpcMemTrackers(const std::shared_ptr<MemTracker>& parent) {
+  if (!LaneModeActive()) {
+    return;
+  }
+  for (const auto* id : {kReadBufferTrackerId, kCallTrackerId}) {
+    if (auto tracker = MemTracker::FindTracker(id, parent)) {
+      tracker->EnableLaneBatching(MemTrackerLaneBatching::kSubtree);
+    }
+  }
 }
 
 ConnectionContextFactory::~ConnectionContextFactory() = default;

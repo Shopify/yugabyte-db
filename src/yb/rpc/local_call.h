@@ -47,10 +47,11 @@ class LocalOutboundCall : public OutboundCall {
       const MemTrackerPtr& mem_tracker) override;
 
   // Non-null buffers_holder lets the call time out at its deadline, see
-  // RpcController::set_local_call_buffers_holder.
+  // RpcController::set_local_call_buffers_holder. lane is the lane whose handler pool handles the
+  // call, see LocalYBInboundCall::lane().
   const std::shared_ptr<LocalYBInboundCall>& CreateLocalInboundCall(
       CallStateListenerFactory* call_state_listener_factory,
-      std::shared_ptr<void> buffers_holder);
+      std::shared_ptr<void> buffers_holder, LaneId lane);
 
   size_t ObjectSize() const override { return sizeof(*this); }
 
@@ -90,7 +91,8 @@ class LocalYBInboundCall : public YBInboundCall, public RpcCallParams {
                      std::weak_ptr<LocalOutboundCall> outbound_call,
                      AnyMessageConstPtr request, AnyMessagePtr response, ThreadPoolTag pool_tag,
                      CoarseTimePoint deadline, std::shared_ptr<void> buffers_holder,
-                     CallStateListenerFactory* call_state_listener_factory);
+                     CallStateListenerFactory* call_state_listener_factory,
+                     LaneId lane = kNoLane);
 
   bool IsLocalCall() const override { return true; }
 
@@ -109,6 +111,10 @@ class LocalYBInboundCall : public YBInboundCall, public RpcCallParams {
   CoarseTimePoint GetClientDeadline() const override { return deadline_; }
 
   ThreadPoolTag pool_tag() const override;
+
+  // Lane given by the caller: a local call has no connection, so the handler pool's lane comes
+  // from the caller's controller (its lane hint, else its issuing lane) rather than a reactor.
+  LaneId lane() const override { return lane_; }
 
   Status ParseParam(RpcCallParams* params) override;
 
@@ -140,6 +146,7 @@ class LocalYBInboundCall : public YBInboundCall, public RpcCallParams {
   const AnyMessagePtr response_;
   const ThreadPoolTag pool_tag_;
   const CoarseTimePoint deadline_;
+  const LaneId lane_;
 
   // Keeps request_ and response_ alive after the outbound call has timed out.
   std::shared_ptr<void> buffers_holder_;

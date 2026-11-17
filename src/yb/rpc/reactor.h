@@ -67,6 +67,7 @@
 #include "yb/util/async_util.h"
 #include "yb/util/condition_variable.h"
 #include "yb/util/countdown_latch.h"
+#include "yb/util/lanes.h"
 #include "yb/util/locks.h"
 #include "yb/util/mem_tracker.h"
 #include "yb/util/monotime.h"
@@ -127,8 +128,15 @@ class DelayedTask;
 
 class Reactor {
  public:
-  Reactor(Messenger* messenger, int index, const MessengerBuilder &bld);
+  // lane is the reactor's lane (kNoLane for none), already reduced to the process topology, and
+  // index_in_lane its position among the messenger's reactors of that lane, used in the thread
+  // name.
+  Reactor(Messenger* messenger, int index, const MessengerBuilder &bld,
+          LaneId lane = kNoLane, int index_in_lane = 0);
   ~Reactor();
+
+  // Whether the calling thread is a reactor thread of any messenger.
+  static bool IsReactorThread();
 
   // This may be called from another thread.
   const std::string &name() const { return name_; }
@@ -136,6 +144,9 @@ class Reactor {
   const std::string& LogPrefix() { return log_prefix_; }
 
   Messenger& messenger() const { return messenger_; }
+
+  // Lane the reactor thread runs in; kNoLane unless the messenger assigned one in lane mode.
+  LaneId lane() const { return lane_; }
 
   // Returns the latest current time updated by this reactor's thread.
   CoarseTimePoint cur_time() const { return cur_time_.load(std::memory_order_acquire); }
@@ -151,6 +162,17 @@ class Reactor {
   template<class F>
   Status ScheduleReactorFunctor(const F& f, const SourceLocation& source_location) {
     return ScheduleReactorTask(MakeFunctorReactorTask(f, source_location));
+  }
+
+  // For callers that put items on their own queue and schedule one task to drain a batch:
+  // CountLaneHandoff counts one item handed to this reactor by the calling thread, and
+  // ScheduleDrainTask schedules the drain task without counting it, so each item counts once.
+  void CountLaneHandoff() const {
+    CountLaneHandoffFromThisThread(lane_, LaneCrossingCategory::kReactor);
+  }
+
+  Status ScheduleDrainTask(ReactorTaskPtr task) {
+    return DoScheduleReactorTask(std::move(task), /* even_if_not_running= */ false);
   }
 
   // This should not be called on reactor thread, as the reactor thread should not even be running
@@ -199,6 +221,9 @@ class Reactor {
   // Collect metrics. Works by scheduling a task on reactor thread and waiting for it.
   Status GetMetrics(ReactorMetrics *metrics) EXCLUDES_REACTOR_THREAD;
 
+  // Keys of this reactor's client connections.
+  Result<std::vector<ConnectionId>> TEST_ClientConnectionIds() EXCLUDES_REACTOR_THREAD;
+
   // Waits up to 30 seconds to join the reactor thread. If that fails, logs a warning and returns
   // in debug mode, but falls back to unlimited join in release mode after logging the warning.
   void Join() EXCLUDES_REACTOR_THREAD;
@@ -216,6 +241,7 @@ class Reactor {
   // Queue a new incoming connection. Takes ownership of the underlying fd from
   // 'socket', but not the Socket object itself.
   // If the reactor is already shut down, takes care of closing the socket.
+  // The stream drops a lane preamble at its start when factory accepts one.
   void RegisterInboundSocket(
       Socket *socket, size_t receive_buffer_size, const Endpoint& remote,
       const ConnectionContextFactoryPtr& factory)
@@ -251,11 +277,16 @@ class Reactor {
   // Can be called on any thread, including the reactor thread.
   Status ScheduleReactorTask(ReactorTaskPtr task, bool even_if_not_running);
 
+  // ScheduleReactorTask without counting a lane handoff.
+  Status DoScheduleReactorTask(ReactorTaskPtr task, bool even_if_not_running);
+
   // Find or create a new connection to the given remote.
   // If such a connection already exists, returns that, otherwise creates a new one.
   // May return a bad Status if the connect() call fails.
   // The resulting connection object is managed internally by the reactor thread.
   // Deadline specifies latest time allowed for initializing the connection.
+  // A new lane-keyed connection of a laned messenger starts with a lane preamble while
+  // enable_rpc_lane_preamble is set.
   Status FindOrStartConnection(
       const ConnectionId &conn_id,
       const std::string& hostname,
@@ -323,8 +354,10 @@ class Reactor {
 
   const ReactorTaskPtr process_outbound_queue_task_;
 
-  // Number of outbound connections to create per each destination server address.
-  const int num_connections_to_server_;
+  const LaneId lane_;
+
+  // OS-visible thread name: carries the lane within the first 15 characters for a laned reactor.
+  const std::string thread_name_;
 
   const std::shared_ptr<CompletedCallQueue> completed_call_queue_;
 

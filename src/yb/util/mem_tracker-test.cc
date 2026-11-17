@@ -43,21 +43,31 @@
 #include "yb/tserver/server_main_util.h"
 
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/flags.h"
+#include "yb/util/lanes.h"
+#include "yb/util/lanes_test_util.h"
+#include "yb/util/metrics.h"
 #include "yb/util/monotime.h"
+#include "yb/util/random_util.h"
 #include "yb/util/result.h"
 #include "yb/util/size_literals.h"
 #include "yb/util/status_format.h"
 #include "yb/util/stopwatch.h"
 #include "yb/util/test_macros.h"
+#include "yb/util/test_thread_holder.h"
+#include "yb/util/test_util.h"
 #include "yb/util/tcmalloc_util.h"
 
 DECLARE_bool(mem_tracker_include_pageheap_free_in_root_consumption);
 DECLARE_double(mem_tracker_external_consumption_accuracy_percentage);
 DECLARE_int32(memory_limit_soft_percentage);
+DECLARE_int64(mem_tracker_lane_batch_bytes);
 DECLARE_int64(mem_tracker_tcmalloc_gc_release_bytes);
 DECLARE_int64(mem_tracker_update_consumption_interval_us);
 
 using namespace std::literals;
+
+METRIC_DEFINE_entity(mem_tracker_lane_test);
 
 namespace yb {
 
@@ -613,6 +623,390 @@ TEST(MemTrackerTest, ValidateMemoryLimitToRamRatio_EdgeCases) {
   // Test near boundaries.
   EXPECT_TRUE(internal::ValidateMemoryLimitToRamRatio("test_flag", 0.0001));  // Just above 0.
   EXPECT_FALSE(internal::ValidateMemoryLimitToRamRatio("test_flag", 1.0001)); // Just above 1.
+}
+
+// Lane batching. These tests build their own tracker trees under trackers that are not the root,
+// except where they say they touch the root, which is process-wide and tcmalloc-backed.
+class MemTrackerLaneTest : public YBTest {
+ protected:
+  static constexpr int64_t kBatch = 1000;
+
+  void SetUp() override {
+    YBTest::SetUp();
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_mem_tracker_lane_batch_bytes) = kBatch;
+  }
+
+  // num_lanes lanes of one fake CPU each, without affinity: only ThisThreadLane matters here.
+  static LaneTopology TestLanes(size_t num_lanes) {
+    std::vector<CpuSet> domains(num_lanes);
+    for (size_t i = 0; i != num_lanes; ++i) {
+      domains[i].Set(i);
+    }
+    return LaneTopology::Build(LaneTopologyOptions{
+        .domains = domains,
+        .process_cpuset = CpuSet::FirstN(num_lanes),
+        .requested_lanes = num_lanes,
+        .affinity_enabled = false,
+    });
+  }
+
+  static void RunInLane(LaneId lane, const std::function<void()>& f) {
+    RunOnStdThread([lane, &f] {
+      SetThisThreadLane(lane);
+      f();
+    });
+  }
+};
+
+// With lanes off nothing is batched, and a thread with a lane updates the shared value per call.
+// With lanes on, a batch size of 0 disables batching, and an unlaned thread updates the shared
+// value per call of a batched tracker.
+TEST_F(MemTrackerLaneTest, OffOrUnlanedIsUnbatched) {
+  auto parent = MemTracker::CreateTracker("lane-off-parent");
+  auto child = MemTracker::CreateTracker("lane-off-child", parent);
+  ASSERT_FALSE(parent->EnableLaneBatching(MemTrackerLaneBatching::kSubtree));
+  ASSERT_FALSE(parent->lane_batching_enabled());
+  ASSERT_FALSE(child->lane_batching_enabled());
+  RunInLane(0, [&] {
+    for (int i = 1; i <= 3; ++i) {
+      child->Consume(100);
+      ASSERT_EQ(child->consumption(), 100 * i);
+      ASSERT_EQ(parent->consumption(), 100 * i);
+    }
+    ASSERT_TRUE(child->TryConsume(100));
+    ASSERT_EQ(parent->consumption(), 400);
+    child->Release(400);
+    ASSERT_EQ(parent->consumption(), 0);
+  });
+
+  TEST_SetLaneTopology scope(TestLanes(2));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_mem_tracker_lane_batch_bytes) = 0;
+  ASSERT_FALSE(parent->EnableLaneBatching());
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_mem_tracker_lane_batch_bytes) = kBatch;
+  ASSERT_TRUE(parent->EnableLaneBatching(MemTrackerLaneBatching::kSubtree));
+  ASSERT_TRUE(child->lane_batching_enabled());
+  for (int i = 1; i <= 3; ++i) {
+    child->Consume(100);
+    ASSERT_EQ(child->consumption(), 100 * i);
+    ASSERT_EQ(parent->consumption(), 100 * i);
+  }
+  child->Release(300);
+  ASSERT_EQ(parent->consumption(), 0);
+  ASSERT_EQ(parent->TEST_UnflushedLaneBatches(), 0);
+}
+
+// Scopes: kSubtree batches existing and later descendants, kChildren only the children, kTracker
+// only the tracker.
+TEST_F(MemTrackerLaneTest, Scopes) {
+  TEST_SetLaneTopology scope(TestLanes(2));
+  auto subtree = MemTracker::CreateTracker("lane-subtree");
+  auto existing = MemTracker::CreateTracker("existing", subtree);
+  ASSERT_TRUE(subtree->EnableLaneBatching(MemTrackerLaneBatching::kSubtree));
+  auto later = MemTracker::CreateTracker("later", existing);
+  auto found = MemTracker::FindOrCreateTracker("found", later);
+  for (const auto& tracker : {subtree, existing, later, found}) {
+    ASSERT_TRUE(tracker->lane_batching_enabled()) << tracker->ToString();
+  }
+
+  auto children = MemTracker::CreateTracker("lane-children");
+  auto child = MemTracker::CreateTracker("child", children);
+  ASSERT_TRUE(children->EnableLaneBatching(MemTrackerLaneBatching::kChildren));
+  auto later_child = MemTracker::FindOrCreateTracker("later-child", children);
+  auto grandchild = MemTracker::CreateTracker("grandchild", child);
+  ASSERT_TRUE(child->lane_batching_enabled());
+  ASSERT_TRUE(later_child->lane_batching_enabled());
+  ASSERT_FALSE(grandchild->lane_batching_enabled());
+
+  auto single = MemTracker::CreateTracker("lane-single");
+  ASSERT_TRUE(single->EnableLaneBatching());
+  ASSERT_FALSE(MemTracker::CreateTracker("child", single)->lane_batching_enabled());
+}
+
+// A lane thread's deltas stay in its lane slot until the slot exceeds the batch, then move to the
+// shared value; a delta larger than the batch goes to the shared value directly.
+TEST_F(MemTrackerLaneTest, AbsorbsAndFlushes) {
+  TEST_SetLaneTopology scope(TestLanes(2));
+  auto parent = MemTracker::CreateTracker("lane-flush-parent");
+  auto child = MemTracker::CreateTracker("lane-flush-child", parent);
+  ASSERT_TRUE(parent->EnableLaneBatching(MemTrackerLaneBatching::kSubtree));
+  RunInLane(0, [&] {
+    child->Consume(600);
+    child->Consume(kBatch - 600);
+    for (const auto& tracker : {child, parent}) {
+      ASSERT_EQ(tracker->consumption(), 0);
+      ASSERT_EQ(tracker->TEST_UnflushedLaneBatches(), kBatch);
+    }
+    child->Consume(1);
+    for (const auto& tracker : {child, parent}) {
+      ASSERT_EQ(tracker->consumption(), kBatch + 1);
+      ASSERT_EQ(tracker->TEST_UnflushedLaneBatches(), 0);
+    }
+  });
+  RunInLane(1, [&] {
+    child->Release(500);
+    ASSERT_EQ(child->consumption(), kBatch + 1);
+    ASSERT_EQ(child->TEST_UnflushedLaneBatches(), -500);
+    child->Consume(5 * kBatch);
+    ASSERT_EQ(child->consumption(), 6 * kBatch + 1);
+    ASSERT_EQ(child->TEST_UnflushedLaneBatches(), -500);
+  });
+  for (const auto& tracker : {child, parent}) {
+    tracker->FlushLaneBatches();
+    ASSERT_EQ(tracker->consumption(), 6 * kBatch + 1 - 500);
+    ASSERT_EQ(tracker->TEST_UnflushedLaneBatches(), 0);
+  }
+  child->Release(child->consumption());
+}
+
+// Consume and Release from several lanes at once: the shared value stays within L x batch of the
+// tracked total and equals it after FlushLaneBatches.
+TEST_F(MemTrackerLaneTest, MultiLaneConvergence) {
+  constexpr size_t kLanes = 4;
+  TEST_SetLaneTopology scope(TestLanes(kLanes));
+  auto parent = MemTracker::CreateTracker("lane-converge-parent");
+  auto child = MemTracker::CreateTracker("lane-converge-child", parent);
+  ASSERT_TRUE(parent->EnableLaneBatching(MemTrackerLaneBatching::kSubtree));
+  std::atomic<int64_t> total{0};
+  TestThreadHolder threads;
+  for (LaneId lane = 0; lane != kLanes; ++lane) {
+    threads.AddThreadFunctor([&, lane] {
+      SetThisThreadLane(lane);
+      int64_t mine = 0;
+      for (int i = 0; i != 20000; ++i) {
+        auto bytes = RandomUniformInt<int64_t>(1, 300);
+        if (mine >= bytes && RandomUniformBool()) {
+          child->Release(bytes);
+          mine -= bytes;
+        } else {
+          child->Consume(bytes);
+          mine += bytes;
+        }
+      }
+      total += mine;
+    });
+  }
+  threads.JoinAll();
+  for (const auto& tracker : {child, parent}) {
+    ASSERT_LE(std::abs(tracker->consumption() - total.load()), kLanes * kBatch);
+    ASSERT_EQ(tracker->consumption() + tracker->TEST_UnflushedLaneBatches(), total.load());
+    tracker->FlushLaneBatches();
+    ASSERT_EQ(tracker->consumption(), total.load());
+  }
+  child->Release(total.load());
+}
+
+// TryConsume on a batched limited tracker fails no later than limit + L x batch, from lanes taking
+// turns and from lanes at once, and its rollback of an ancestor's batch is exact.
+TEST_F(MemTrackerLaneTest, TryConsumeBound) {
+  constexpr size_t kLanes = 4;
+  constexpr int64_t kLimit = 10 * kBatch;
+  constexpr int64_t kBytes = 100;
+  TEST_SetLaneTopology scope(TestLanes(kLanes));
+  auto limited = MemTracker::CreateTracker(kLimit, "lane-try-limited");
+  ASSERT_TRUE(limited->EnableLaneBatching());
+
+  // Lanes taking turns on one thread, each until its first failure.
+  int64_t admitted = 0;
+  RunOnStdThread([&] {
+    std::vector<bool> failed(kLanes);
+    for (size_t active = kLanes; active;) {
+      for (LaneId lane = 0; lane != kLanes; ++lane) {
+        if (failed[lane]) {
+          continue;
+        }
+        SetThisThreadLane(lane);
+        if (limited->TryConsume(kBytes)) {
+          admitted += kBytes;
+        } else {
+          failed[lane] = true;
+          --active;
+        }
+      }
+    }
+    // At the limit, a lane with an empty batch is refused too: it checks the shared value before
+    // admitting into its batch.
+    for (LaneId lane = 0; lane != kLanes; ++lane) {
+      SetThisThreadLane(lane);
+      ASSERT_FALSE(limited->TryConsume(kBytes));
+    }
+  });
+  // The other lanes' batches let the total pass the limit, but by no more than L x batch.
+  ASSERT_LE(admitted, kLimit + static_cast<int64_t>(kLanes) * kBatch);
+  ASSERT_GT(admitted, kLimit);
+  limited->FlushLaneBatches();
+  ASSERT_EQ(limited->consumption(), admitted);
+  limited->Release(admitted);
+
+  // Lanes at once: calls racing with one check can each add kBytes.
+  std::atomic<int64_t> concurrent{0};
+  TestThreadHolder threads;
+  for (LaneId lane = 0; lane != kLanes; ++lane) {
+    threads.AddThreadFunctor([&, lane] {
+      SetThisThreadLane(lane);
+      while (limited->TryConsume(kBytes)) {
+        concurrent += kBytes;
+      }
+    });
+  }
+  threads.JoinAll();
+  ASSERT_LE(concurrent.load(), kLimit + static_cast<int64_t>(kLanes) * (kBatch + kBytes));
+  ASSERT_GT(concurrent.load(), kLimit - kBytes);
+  limited->FlushLaneBatches();
+  ASSERT_EQ(limited->consumption(), concurrent.load());
+  limited->Release(concurrent.load());
+
+  // A child's own limit fails after the batched ancestor admitted the bytes into its slot.
+  auto child = MemTracker::CreateTracker(50, "lane-try-child", limited);
+  RunInLane(0, [&] {
+    MemTracker* blocking = nullptr;
+    ASSERT_FALSE(child->TryConsume(kBytes, &blocking));
+    ASSERT_EQ(blocking, child.get());
+  });
+  limited->FlushLaneBatches();
+  ASSERT_EQ(limited->consumption(), 0);
+  ASSERT_EQ(child->consumption(), 0);
+}
+
+// A destroyed tracker releases its unflushed slots to its ancestors too.
+TEST_F(MemTrackerLaneTest, DestructionReleasesUnflushed) {
+  TEST_SetLaneTopology scope(TestLanes(2));
+  auto parent = MemTracker::CreateTracker("lane-destroy-parent");
+  auto child = MemTracker::CreateTracker("lane-destroy-child", parent);
+  ASSERT_TRUE(parent->EnableLaneBatching(MemTrackerLaneBatching::kSubtree));
+  RunInLane(0, [&] {
+    child->Consume(500);
+  });
+  ASSERT_EQ(child->TEST_UnflushedLaneBatches(), 500);
+  child->UnregisterFromParent();
+  child.reset();
+  parent->FlushLaneBatches();
+  ASSERT_EQ(parent->consumption(), 0);
+}
+
+// When lane mode turns off (tests only), unflushed slots stay until FlushLaneBatches, and every
+// thread updates the shared value directly.
+TEST_F(MemTrackerLaneTest, LaneModeOffKeepsSlotsUntilFlushed) {
+  auto tracker = MemTracker::CreateTracker("lane-mode-off");
+  {
+    TEST_SetLaneTopology scope(TestLanes(2));
+    ASSERT_TRUE(tracker->EnableLaneBatching());
+    RunInLane(1, [&] {
+      tracker->Consume(500);
+    });
+  }
+  ASSERT_FALSE(LaneModeActive());
+  RunInLane(1, [&] {
+    tracker->Consume(100);
+  });
+  ASSERT_EQ(tracker->consumption(), 100);
+  ASSERT_EQ(tracker->TEST_UnflushedLaneBatches(), 500);
+  tracker->FlushLaneBatches();
+  ASSERT_EQ(tracker->consumption(), 600);
+  tracker->Release(600);
+}
+
+// The tracker's metric moves with the shared value: not per call, but when a slot is flushed.
+TEST_F(MemTrackerLaneTest, MetricFlushedWithSlot) {
+  TEST_SetLaneTopology scope(TestLanes(2));
+  MetricRegistry registry;
+  auto entity = METRIC_ENTITY_mem_tracker_lane_test.Instantiate(&registry, "lane-metric");
+  auto tracker = MemTracker::CreateTracker("lane-metric");
+  tracker->SetMetricEntity(entity);
+  ASSERT_TRUE(tracker->EnableLaneBatching());
+  auto gauge_value = [&]() -> Result<int64_t> {
+    for (const auto& [prototype, metric] : entity->TEST_UsageMetricsMap()) {
+      if (prototype->name() == tracker->metric_name()) {
+        return down_cast<AtomicGauge<int64_t>*>(metric.get())->value();
+      }
+    }
+    return STATUS(NotFound, "No gauge");
+  };
+  RunInLane(0, [&] {
+    tracker->Consume(kBatch);
+    ASSERT_EQ(ASSERT_RESULT(gauge_value()), 0);
+    tracker->Consume(1);
+    ASSERT_EQ(ASSERT_RESULT(gauge_value()), kBatch + 1);
+  });
+  tracker->Release(kBatch + 1);
+  ASSERT_EQ(ASSERT_RESULT(gauge_value()), 0);
+}
+
+// Touches the root tracker: batching the root also batches the memory released since the last
+// tcmalloc GC, so a GC is triggered no later than the threshold + L x batch.
+TEST_F(MemTrackerLaneTest, ReleasedSinceGcBatched) {
+  constexpr size_t kLanes = 2;
+  constexpr int64_t kThreshold = 2 * kBatch;
+  TEST_SetLaneTopology scope(TestLanes(kLanes));
+  const auto& root = MemTracker::GetRootTracker();
+  ASSERT_TRUE(root->EnableLaneBatching());
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_mem_tracker_tcmalloc_gc_release_bytes) = kThreshold;
+  auto tracker = MemTracker::CreateTracker("lane-gc");
+  tracker->Consume(10 * kBatch);
+  MemTracker::TEST_SetReleasedMemorySinceGC(0);
+  const auto unflushed_before = MemTracker::TEST_UnflushedReleasedMemorySinceGC();
+
+  constexpr int64_t kRelease = 900;
+  RunInLane(0, [&] { tracker->Release(kRelease); });
+  RunInLane(1, [&] { tracker->Release(kRelease); });
+  ASSERT_EQ(MemTracker::TEST_ReleasedMemorySinceGC(), 0);
+  ASSERT_EQ(MemTracker::TEST_UnflushedReleasedMemorySinceGC() - unflushed_before, 2 * kRelease);
+  // Lane 0's slot passes the batch and moves to the shared count, still below the threshold.
+  RunInLane(0, [&] { tracker->Release(kRelease); });
+  ASSERT_EQ(MemTracker::TEST_ReleasedMemorySinceGC(), 2 * kRelease);
+  // Lane 1's flush crosses the threshold: the GC runs and resets the shared count. The released
+  // total at that point, 4 x 900, is within the threshold + L x batch.
+  RunInLane(1, [&] { tracker->Release(kRelease); });
+  ASSERT_LE(4 * kRelease, kThreshold + static_cast<int64_t>(kLanes) * kBatch);
+#if YB_TCMALLOC_ENABLED
+  ASSERT_EQ(MemTracker::TEST_ReleasedMemorySinceGC(), 0);
+#endif
+  // An unlaned thread adds to the shared count directly.
+  MemTracker::TEST_SetReleasedMemorySinceGC(0);
+  tracker->Release(100);
+  ASSERT_EQ(MemTracker::TEST_ReleasedMemorySinceGC(), 100);
+  tracker->Release(tracker->consumption());
+  root->FlushLaneBatches();
+}
+
+// Touches the root tracker: an update from its consumption functor drops its unflushed slots,
+// since the functor's value already includes the memory they stand for.
+TEST_F(MemTrackerLaneTest, RootResyncDropsSlots) {
+  const auto& root = MemTracker::GetRootTracker();
+  if (!root->HasExternalSource()) {
+    GTEST_SKIP() << "Root tracker has no consumption functor in this build";
+  }
+  TEST_SetLaneTopology scope(TestLanes(2));
+  ASSERT_TRUE(root->EnableLaneBatching());
+  auto tracker = MemTracker::CreateTracker("lane-resync");
+  // Long interval, so that only the forced update below reads the functor.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_mem_tracker_update_consumption_interval_us) = 3600'000'000;
+  ASSERT_TRUE(root->MaybeUpdateConsumption(/* force= */ true));
+  RunInLane(0, [&] {
+    tracker->Consume(500);
+  });
+  ASSERT_EQ(root->TEST_UnflushedLaneBatches(), 500);
+  ASSERT_TRUE(root->MaybeUpdateConsumption(/* force= */ true));
+  ASSERT_EQ(root->TEST_UnflushedLaneBatches(), 0);
+  tracker->Release(500);
+}
+
+// The batch flag accepts 0 (off) up to 16 MiB, and describes the bound it sets.
+TEST_F(MemTrackerLaneTest, BatchFlag) {
+  for (auto value : {"0", "1", "65536", "16777216"}) {
+    ASSERT_OK(flags_internal::ValidateFlagValue("mem_tracker_lane_batch_bytes", value));
+  }
+  for (auto value : {"-1", "16777217"}) {
+    ASSERT_NOK(flags_internal::ValidateFlagValue("mem_tracker_lane_batch_bytes", value));
+  }
+  gflags::CommandLineFlagInfo info;
+  ASSERT_TRUE(gflags::GetCommandLineFlagInfo("mem_tracker_lane_batch_bytes", &info));
+  ASSERT_EQ(info.default_value, "65536");
+  ASSERT_EQ(info.description,
+            "In lane mode, the delta a lane thread accumulates per lane-batched memory tracker "
+            "(and in the memory released since the last tcmalloc GC) before applying it to the "
+            "shared value. Shared consumption values, the limit checks that use them and the GC "
+            "trigger can lag the tracked total by up to the number of lanes times this value. 0 "
+            "disables lane batching.");
 }
 
 } // namespace yb

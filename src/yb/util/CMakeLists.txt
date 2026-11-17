@@ -119,6 +119,7 @@ set(UTIL_SRCS
   concurrent_value.cc
   condition_variable.cc
   countdown_latch.cc
+  cpu_topology.cc
   crash_point.cc
   crc.cc
   crc32c/crc32c_abseil.cc
@@ -167,6 +168,7 @@ set(UTIL_SRCS
   jsonwriter.cc
   jwt_util.cc
   jwtcpp_util.cc
+  lanes.cc
   locks.cc
   logging.cc
   malloc.cc
@@ -344,7 +346,9 @@ ADD_YB_LIBRARY(yb_util_shmem
 
 ADD_YB_TEST_LIBRARY(
   yb_test_util
-  SRCS logging_test_util.cc memory/memory_usage_test_util.cc test_util.cc
+  SRCS cpu_topology_test_util.cc lanes_test_util.cc logging_test_util.cc
+       memory/memory_usage_test_util.cc
+       test_util.cc
        multi_drive_test_env.cc power_loss_env.cc
   DEPS gflags glog gmock gtest yb_util yb_util_shmem)
 
@@ -396,6 +400,7 @@ if (NOT APPLE)
 endif()
 ADD_YB_TEST(callback_bind-test)
 ADD_YB_TEST(countdown_latch-test)
+ADD_YB_TEST(cpu_topology-test)
 ADD_YB_TEST(crash_point-test)
 ADD_YB_TEST(crc-test)
 YB_TEST_TARGET_LINK_LIBRARIES(crc-test.cc yb_ash)
@@ -422,6 +427,7 @@ ADD_YB_TEST(inline_slice-test)
 ADD_YB_TEST(json_document-test)
 ADD_YB_TEST(jwt_util-test)
 ADD_YB_TEST(jwtcpp_util-test)
+ADD_YB_TEST(lanes-test)
 ADD_YB_TEST(lockfree-test)
 ADD_YB_TEST(logging-test)
 ADD_YB_TEST(lru_cache-test)

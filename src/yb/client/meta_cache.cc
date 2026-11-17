@@ -2000,7 +2000,7 @@ void MetaCache::LookupByKeyFailed(
     SET_WAIT_STATUS(YBClient_LookingUpTablet);
     auto rpc = std::make_shared<LookupByKeyRpc>(
         this, table, partition_group_start, request_no, max_deadline);
-    client_->data_->rpcs_.RegisterAndStart(rpc, rpc->RpcHandle());
+    rpc->rpcs().RegisterAndStart(rpc, rpc->RpcHandle());
   }
 }
 
@@ -2025,7 +2025,7 @@ void MetaCache::LookupFullTableFailed(const std::shared_ptr<const YBTable>& tabl
     ASH_ENABLE_CONCURRENT_UPDATES();
     SET_WAIT_STATUS(YBClient_LookingUpTablet);
     auto rpc = std::make_shared<LookupFullTableRpc>(this, table, request_no, max_deadline);
-    client_->data_->rpcs_.RegisterAndStart(rpc, rpc->RpcHandle());
+    rpc->rpcs().RegisterAndStart(rpc, rpc->RpcHandle());
   }
 }
 
@@ -2075,7 +2075,7 @@ void MetaCache::LookupByIdFailed(
     SET_WAIT_STATUS(YBClient_LookingUpTablet);
     auto rpc = std::make_shared<LookupByIdRpc>(
         this, tablet_id, table, include_hidden, include_deleted, request_no, max_deadline, 0);
-    client_->data_->rpcs_.RegisterAndStart(rpc, rpc->RpcHandle());
+    rpc->rpcs().RegisterAndStart(rpc, rpc->RpcHandle());
   }
 }
 
@@ -2262,7 +2262,7 @@ bool MetaCache::DoLookupTabletByKey(
       << "Started lookup for table: " << table->ToString()
       << ", partition_group_start: " << Slice(**partition_group_start).ToDebugHexString()
       << ", rpc: " << AsString(rpc);
-  client_->data_->rpcs_.RegisterAndStart(rpc, rpc->RpcHandle());
+  rpc->rpcs().RegisterAndStart(rpc, rpc->RpcHandle());
   return true;
 }
 
@@ -2310,7 +2310,7 @@ bool MetaCache::DoLookupAllTablets(const std::shared_ptr<const YBTable>& table,
       << "Start lookup for table: " << table->ToString();
 
   auto rpc = std::make_shared<LookupFullTableRpc>(this, table, request_no, deadline);
-  client_->data_->rpcs_.RegisterAndStart(rpc, rpc->RpcHandle());
+  rpc->rpcs().RegisterAndStart(rpc, rpc->RpcHandle());
   return true;
 }
 
@@ -2501,7 +2501,7 @@ bool MetaCache::DoLookupTabletById(
   auto rpc = std::make_shared<LookupByIdRpc>(
       this, tablet_id, table, include_hidden, include_deleted, request_no, deadline,
       lookups_without_new_replicas);
-  client_->data_->rpcs_.RegisterAndStart(rpc, rpc->RpcHandle());
+  rpc->rpcs().RegisterAndStart(rpc, rpc->RpcHandle());
   return true;
 }
 

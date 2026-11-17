@@ -57,6 +57,7 @@
 #include "yb/util/status_fwd.h"
 #include "yb/util/atomic.h"
 #include "yb/util/countdown_latch.h"
+#include "yb/util/lanes.h"
 #include "yb/util/locks.h"
 #include "yb/util/memory/arena.h"
 #include "yb/util/net/net_util.h"
@@ -357,9 +358,10 @@ class PeerProxyFactory {
 };
 
 // PeerProxy implementation that does RPC calls
+// Sets the controller's lane hint on every call, since RpcController::Reset() clears it.
 class RpcPeerProxy : public PeerProxy {
  public:
-  RpcPeerProxy(HostPort hostport, ConsensusServiceProxyPtr consensus_proxy);
+  RpcPeerProxy(HostPort hostport, ConsensusServiceProxyPtr consensus_proxy, LaneId lane);
 
   virtual void UpdateAsync(const LWConsensusRequestPB* request,
                            RequestTriggerMode trigger_mode,
@@ -390,14 +392,26 @@ class RpcPeerProxy : public PeerProxy {
   virtual ~RpcPeerProxy();
 
  private:
+  void SetLane(rpc::RpcController* controller) const {
+    if (lane_ != kNoLane) {
+      controller->set_lane(lane_);
+    }
+  }
+
   HostPort hostport_;
   ConsensusServiceProxyPtr consensus_proxy_;
+  const LaneId lane_;
 };
 
 // PeerProxyFactory implementation that generates RPCPeerProxies
+//
+// Proxies carry lane as their hint only when messenger is laned, so replicas whose servers have
+// unlaned messengers (masters) never send one.
 class RpcPeerProxyFactory : public PeerProxyFactory {
  public:
-  RpcPeerProxyFactory(rpc::Messenger* messenger, rpc::ProxyCache* proxy_cache, CloudInfoPB from);
+  RpcPeerProxyFactory(
+      rpc::Messenger* messenger, rpc::ProxyCache* proxy_cache, CloudInfoPB from,
+      LaneId lane = kNoLane);
 
   PeerProxyPtr NewProxy(const RaftPeerPB& peer_pb) override;
 
@@ -409,6 +423,7 @@ class RpcPeerProxyFactory : public PeerProxyFactory {
   rpc::Messenger* messenger_ = nullptr;
   rpc::ProxyCache* const proxy_cache_;
   const CloudInfoPB from_;
+  const LaneId lane_;
 };
 
 // Query the consensus service at last known host/port that is specified in 'remote_peer' and set

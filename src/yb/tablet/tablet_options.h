@@ -116,6 +116,10 @@ struct TabletInitData {
   // requested by the intents DB flush filter. Required when the tablet has a transaction
   // participant.
   ThreadPool* intent_cleanup_pool = nullptr;
+  // CPU lane of the tablet's RocksDB flush and compaction tasks, passed to every open of the
+  // regular and intents DBs (rocksdb::DBOptions::task_lane). kNoLane runs them on the service mask
+  // in lane mode.
+  LaneId rocksdb_task_lane = kNoLane;
   scoped_refptr<yb::AtomicGauge<uint64_t>> post_split_compaction_added;
   std::shared_ptr<TierMigrationHooks> tier_migration_hooks;
   client::YBMetaDataCache* metadata_cache;

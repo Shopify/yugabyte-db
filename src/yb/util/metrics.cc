@@ -32,7 +32,9 @@
 
 #include "yb/util/metrics.h"
 
+#include <cstring>
 #include <map>
+#include <optional>
 #include <set>
 
 #include "yb/gutil/atomicops.h"
@@ -45,6 +47,7 @@
 #include "yb/util/hdr_histogram.h"
 #include "yb/util/histogram.pb.h"
 #include "yb/util/jsonwriter.h"
+#include "yb/util/lanes.h"
 #include "yb/util/locks.h"
 #include "yb/util/status.h"
 #include "yb/util/status_log.h"
@@ -602,6 +605,185 @@ Status AtomicMillisLag::WriteAsJson(JsonWriter* writer, const MetricJsonOptions&
 }
 
 /////////////////////////////////////////////////
+// Lane cells
+/////////////////////////////////////////////////
+
+namespace metrics_internal {
+
+class LaneValueCells {
+ public:
+  explicit LaneValueCells(size_t num_lanes) {
+    cells_.Allocate(num_lanes);
+  }
+
+  const LaneSharded<std::atomic<int64_t>>& cells() const { return cells_; }
+
+ private:
+  LaneSharded<std::atomic<int64_t>> cells_;
+};
+
+class LaneStatsCells {
+ public:
+  explicit LaneStatsCells(size_t num_lanes) {
+    cells_.Allocate(num_lanes);
+  }
+
+  const LaneSharded<AggregateStats>& cells() const { return cells_; }
+
+ private:
+  LaneSharded<AggregateStats> cells_;
+};
+
+// A lane's histogram is created when a thread of the lane first records, so methods that are
+// never called from a lane cost only the pointer array.
+class LaneHistogramCells {
+ public:
+  LaneHistogramCells(uint64_t highest_trackable_value, int num_significant_digits, size_t num_lanes)
+      : highest_trackable_value_(highest_trackable_value),
+        num_significant_digits_(num_significant_digits),
+        num_lanes_(num_lanes),
+        cells_(new std::atomic<Cell*>[num_lanes]()) {}
+
+  ~LaneHistogramCells() {
+    for (size_t i = 0; i != num_lanes_; ++i) {
+      delete cells_[i].load(std::memory_order_acquire);
+    }
+  }
+
+  HdrHistogram* LaneLocal() {
+    if (!LaneModeActive()) {
+      return nullptr;
+    }
+    const auto lane = ThisThreadLane();
+    if (lane >= num_lanes_) {
+      return nullptr;
+    }
+    auto& entry = cells_[lane];
+    auto* cell = entry.load(std::memory_order_acquire);
+    if (!cell) {
+      auto* created = new Cell(highest_trackable_value_, num_significant_digits_);
+      if (entry.compare_exchange_strong(cell, created, std::memory_order_acq_rel)) {
+        cell = created;
+      } else {
+        delete created;
+      }
+    }
+    return &cell->histogram;
+  }
+
+  template <class F>
+  void ForEach(const F& f) const {
+    for (size_t i = 0; i != num_lanes_; ++i) {
+      if (auto* cell = cells_[i].load(std::memory_order_acquire)) {
+        f(cell->histogram);
+      }
+    }
+  }
+
+ private:
+  struct alignas(CACHELINE_SIZE) Cell {
+    Cell(uint64_t highest_trackable_value, int num_significant_digits)
+        : histogram(highest_trackable_value, num_significant_digits) {}
+
+    HdrHistogram histogram;
+  };
+
+  const uint64_t highest_trackable_value_;
+  const int num_significant_digits_;
+  const size_t num_lanes_;
+  const std::unique_ptr<std::atomic<Cell*>[]> cells_;
+};
+
+bool LaneCellsAllowed(const MetricPrototype* prototype) {
+  return strcmp(prototype->entity_type(), "server") == 0;
+}
+
+LaneValueCells* NewLaneValueCells() {
+  return LaneModeActive() ? new LaneValueCells(GetLaneTopology().num_lanes()) : nullptr;
+}
+
+void DeleteLaneValueCells(LaneValueCells* cells) {
+  delete cells;
+}
+
+bool AddToLaneValueCell(LaneValueCells* cells, int64_t amount) {
+  auto* cell = cells->cells().LaneLocal();
+  if (!cell) {
+    return false;
+  }
+  cell->fetch_add(amount, std::memory_order_relaxed);
+  return true;
+}
+
+int64_t SumLaneValueCells(const LaneValueCells* cells) {
+  int64_t result = 0;
+  cells->cells().ForEach([&result](std::atomic<int64_t>& cell) {
+    result += cell.load(std::memory_order_relaxed);
+  });
+  return result;
+}
+
+int64_t DrainLaneValueCells(LaneValueCells* cells) {
+  int64_t result = 0;
+  cells->cells().ForEach([&result](std::atomic<int64_t>& cell) {
+    result += cell.exchange(0, std::memory_order_relaxed);
+  });
+  return result;
+}
+
+bool AddToLaneStatsCell(LaneStatsCells* cells, int64_t value, uint64_t count) {
+  auto* cell = cells->cells().LaneLocal();
+  if (!cell) {
+    return false;
+  }
+  cell->IncrementBy(value, count);
+  return true;
+}
+
+bool AddToLaneHistogramCell(LaneHistogramCells* cells, int64_t value, int64_t count) {
+  auto* cell = cells->LaneLocal();
+  if (!cell) {
+    return false;
+  }
+  cell->IncrementBy(value, count);
+  return true;
+}
+
+} // namespace metrics_internal
+
+namespace {
+
+template <class F>
+void ForEachLaneCell(const metrics_internal::LaneHistogramCells* cells, const F& f) {
+  if (cells) {
+    cells->ForEach(f);
+  }
+}
+
+template <class F>
+void ForEachLaneCell(const metrics_internal::LaneStatsCells* cells, const F& f) {
+  if (cells) {
+    cells->cells().ForEach(f);
+  }
+}
+
+template <class Cells, class Create>
+void InstallLaneCells(
+    const MetricPrototype* prototype, std::atomic<Cells*>* holder, const Create& create) {
+  if (holder->load(std::memory_order_acquire) || !LaneModeActive() ||
+      !metrics_internal::LaneCellsAllowed(prototype)) {
+    return;
+  }
+  auto cells = create(GetLaneTopology().num_lanes());
+  Cells* expected = nullptr;
+  if (holder->compare_exchange_strong(expected, cells.get(), std::memory_order_acq_rel)) {
+    cells.release();
+  }
+}
+
+} // namespace
+
+/////////////////////////////////////////////////
 // HistogramPrototype
 /////////////////////////////////////////////////
 
@@ -646,6 +828,86 @@ template<typename Stats>
 void BaseStats<Stats>::Reset() const {
   auto derived = const_cast<Stats*>(static_cast<const Stats*>(this));
   derived->mutable_underlying()->Reset();
+  ForEachLaneCell(derived->lane_cells_.load(std::memory_order_acquire), [](auto& cell) {
+    cell.Reset();
+  });
+}
+
+template<typename Stats>
+uint64_t BaseStats<Stats>::TotalCount() const {
+  const auto* stats = AsConstStats();
+  uint64_t result = stats->underlying()->TotalCount();
+  ForEachLaneCell(stats->lane_cells_.load(std::memory_order_acquire), [&result](auto& cell) {
+    result += cell.TotalCount();
+  });
+  return result;
+}
+
+template<typename Stats>
+uint64_t BaseStats<Stats>::TotalSum() const {
+  const auto* stats = AsConstStats();
+  uint64_t result = stats->underlying()->TotalSum();
+  ForEachLaneCell(stats->lane_cells_.load(std::memory_order_acquire), [&result](auto& cell) {
+    result += cell.TotalSum();
+  });
+  return result;
+}
+
+template<typename Stats>
+uint64_t BaseStats<Stats>::MinValue() const {
+  const auto* stats = AsConstStats();
+  const auto* cells = stats->lane_cells_.load(std::memory_order_acquire);
+  if (!cells) {
+    return stats->underlying()->MinValue();
+  }
+  // Only cells that recorded since the last reset have a minimum.
+  using Value = decltype(stats->underlying()->MinValue());
+  std::optional<Value> result;
+  auto add = [&result](const auto& cell) {
+    if (cell.CurrentCount() != 0) {
+      const Value value = cell.MinValue();
+      result = result ? std::min(*result, value) : value;
+    }
+  };
+  add(*stats->underlying());
+  ForEachLaneCell(cells, add);
+  return result ? *result : 0;
+}
+
+template<typename Stats>
+uint64_t BaseStats<Stats>::MaxValue() const {
+  const auto* stats = AsConstStats();
+  const auto* cells = stats->lane_cells_.load(std::memory_order_acquire);
+  if (!cells) {
+    return stats->underlying()->MaxValue();
+  }
+  using Value = decltype(stats->underlying()->MaxValue());
+  std::optional<Value> result;
+  auto add = [&result](const auto& cell) {
+    if (cell.CurrentCount() != 0) {
+      const Value value = cell.MaxValue();
+      result = result ? std::max(*result, value) : value;
+    }
+  };
+  add(*stats->underlying());
+  ForEachLaneCell(cells, add);
+  return result ? *result : 0;
+}
+
+template<typename Stats>
+double BaseStats<Stats>::MeanValue() const {
+  const auto* stats = AsConstStats();
+  const auto* cells = stats->lane_cells_.load(std::memory_order_acquire);
+  if (!cells) {
+    return stats->underlying()->MeanValue();
+  }
+  auto sum = stats->underlying()->CurrentSum();
+  auto count = stats->underlying()->CurrentCount();
+  ForEachLaneCell(cells, [&sum, &count](const auto& cell) {
+    sum += cell.CurrentSum();
+    count += cell.CurrentCount();
+  });
+  return count == 0 ? 0.0 : static_cast<double>(sum) / count;
 }
 
 template<typename Stats>
@@ -763,8 +1025,23 @@ Histogram::Histogram(std::shared_ptr<HistogramPrototype> proto)
         down_cast<const HistogramPrototype*>(prototype_)->num_sig_digits())) {
 }
 
+Histogram::~Histogram() {
+  delete lane_cells_.load(std::memory_order_acquire);
+}
+
+void Histogram::EnableLaneCells() {
+  InstallLaneCells(prototype_, &lane_cells_, [this](size_t num_lanes) {
+    return std::make_unique<metrics_internal::LaneHistogramCells>(
+        histogram_->highest_trackable_value(), histogram_->num_significant_digits(), num_lanes);
+  });
+}
+
 uint64_t Histogram::CountInBucketForValueForTests(uint64_t value) const {
-  return histogram_->CountInBucketForValue(value);
+  auto result = histogram_->CountInBucketForValue(value);
+  ForEachLaneCell(lane_cells_.load(std::memory_order_acquire), [&result, value](auto& cell) {
+    result += cell.CountInBucketForValue(value);
+  });
+  return result;
 }
 
 Status Histogram::SetUpPreAggregationForPrometheus(
@@ -791,18 +1068,30 @@ Status Histogram::WritePercentilesForPrometheus(
         description, prototype_holder_);
   };
 
-  RETURN_NOT_OK(WriteQuantile("p50", underlying()->ValueAtPercentile(50)));
-  RETURN_NOT_OK(WriteQuantile("p95", underlying()->ValueAtPercentile(95)));
-  RETURN_NOT_OK(WriteQuantile("p99", underlying()->ValueAtPercentile(99)));
-  RETURN_NOT_OK(WriteQuantile("mean", underlying()->MeanValue()));
-  RETURN_NOT_OK(WriteQuantile("max", underlying()->MaxValue()));
-  RETURN_NOT_OK(WriteQuantile("min", underlying()->MinValue()));
+  const HdrHistogram* histogram = underlying();
+  std::optional<HdrHistogram> merged;
+  if (const auto* cells = lane_cells_.load(std::memory_order_acquire)) {
+    merged.emplace(*histogram_);
+    ForEachLaneCell(cells, [&merged](const HdrHistogram& cell) {
+      merged->MergeFrom(cell);
+    });
+    histogram = &*merged;
+  }
+  RETURN_NOT_OK(WriteQuantile("p50", histogram->ValueAtPercentile(50)));
+  RETURN_NOT_OK(WriteQuantile("p95", histogram->ValueAtPercentile(95)));
+  RETURN_NOT_OK(WriteQuantile("p99", histogram->ValueAtPercentile(99)));
+  RETURN_NOT_OK(WriteQuantile("mean", histogram->MeanValue()));
+  RETURN_NOT_OK(WriteQuantile("max", histogram->MaxValue()));
+  RETURN_NOT_OK(WriteQuantile("min", histogram->MinValue()));
   return Status::OK();
 }
 
 Status Histogram::GetAndResetHistogramSnapshotPB(
     HistogramSnapshotPB* snapshot_pb, const MetricJsonOptions& opts) const {
   HdrHistogram snapshot(*histogram_);
+  ForEachLaneCell(lane_cells_.load(std::memory_order_acquire), [&snapshot](const auto& cell) {
+    snapshot.MergeFrom(cell);
+  });
   if (opts.include_schema_info) {
     snapshot_pb->set_max_trackable_value(snapshot.highest_trackable_value());
     snapshot_pb->set_num_significant_digits(snapshot.num_significant_digits());
@@ -874,7 +1163,15 @@ Status EventStats::SetUpPreAggregationForPrometheus(
       aggregated_prometheus_sum_value_holder, aggregated_prometheus_count_value_holder);
 }
 
-EventStats::~EventStats() {}
+EventStats::~EventStats() {
+  delete lane_cells_.load(std::memory_order_acquire);
+}
+
+void EventStats::EnableLaneCells() {
+  InstallLaneCells(prototype_, &lane_cells_, [](size_t num_lanes) {
+    return std::make_unique<metrics_internal::LaneStatsCells>(num_lanes);
+  });
+}
 
 /////////////////////////////////////////////////
 // ScopedLatencyMetric

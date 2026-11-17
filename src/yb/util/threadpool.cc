@@ -121,26 +121,11 @@ class ThreadPoolTokenImpl : public ThreadPoolToken {
   }
 
   Status SubmitFunc(std::function<void()> f) override {
-#ifdef __linux__
-    if (task_cgroup_) {
-      Cgroup* cg = task_cgroup_;
-      f = [orig = std::move(f), cg]() {
-        WARN_NOT_OK(cg->MoveCurrentThreadToGroup(),
-                    "Failed to move thread to per-db cgroup");
-        orig();
-      };
-    }
-#endif
-    if (impl_.EnqueueFunctor(std::move(f))) {
-      return Status::OK();
-    }
-    if (impl_.IsClosing()) {
-      return STATUS(ShutdownInProgress, "Thread pool token was shut down.", "", Errno(ESHUTDOWN));
-    }
-    // Mirrors DoSubmit: the only non-closing reason the underlying pool can reject this
-    // enqueue is a worker-thread creation failure under kUnlimitedWorkersWithoutQueue,
-    // unreachable today via ThreadPoolBuilder.
-    return STATUS(ServiceUnavailable, "Failed to enqueue task to the thread pool token.");
+    return DoSubmit(std::move(f), /* count_lane_handoff= */ true);
+  }
+
+  Status SubmitDrainFunc(std::function<void()> f) override {
+    return DoSubmit(std::move(f), /* count_lane_handoff= */ false);
   }
 
   void SetTaskCgroup([[maybe_unused]] Cgroup* cgroup) override {
@@ -154,6 +139,36 @@ class ThreadPoolTokenImpl : public ThreadPoolToken {
   }
 
  private:
+  using TaskType = std::conditional_t<
+      std::is_base_of_v<TaskRecipient<StrandTask>, Impl>, StrandTask, ThreadPoolTask>;
+
+  Status DoSubmit(std::function<void()> f, bool count_lane_handoff) {
+#ifdef __linux__
+    if (task_cgroup_) {
+      Cgroup* cg = task_cgroup_;
+      f = [orig = std::move(f), cg]() {
+        WARN_NOT_OK(cg->MoveCurrentThreadToGroup(),
+                    "Failed to move thread to per-db cgroup");
+        orig();
+      };
+    }
+#endif
+    auto* task = MakeFunctorThreadPoolTask<std::function<void()>, TaskType>(std::move(f));
+    if (!count_lane_handoff) {
+      task->lane_handoff().DisableCounting();
+    }
+    if (impl_.Enqueue(task)) {
+      return Status::OK();
+    }
+    if (impl_.IsClosing()) {
+      return STATUS(ShutdownInProgress, "Thread pool token was shut down.", "", Errno(ESHUTDOWN));
+    }
+    // Mirrors ThreadPool::DoSubmit: the only non-closing reason the underlying pool can reject
+    // this enqueue is a worker-thread creation failure under kUnlimitedWorkersWithoutQueue,
+    // unreachable today via ThreadPoolBuilder.
+    return STATUS(ServiceUnavailable, "Failed to enqueue task to the thread pool token.");
+  }
+
   Impl impl_;
 #ifdef __linux__
   Cgroup* task_cgroup_ = nullptr;
