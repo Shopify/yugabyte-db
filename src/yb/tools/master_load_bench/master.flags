@@ -9,6 +9,8 @@
 --rpc_workers_limit=4096
 --master_svc_queue_length=5000
 --master_tserver_svc_queue_length=10000
+# Symbolized stacks of slow calls stall the master when 2000 tservers register at once.
+--stack_trace_symbolize=false
 # The transactions table is pinned to the real tserver; keep its tablet count fixed (prod: 200).
 --auto_create_local_transaction_tables=false
 --transaction_table_num_tablets=24
