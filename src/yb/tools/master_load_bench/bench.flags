@@ -10,3 +10,4 @@
 --heartbeat_interval_ms=1000
 --master_flags=--flagfile=src/yb/tools/master_load_bench/master.flags
 --tserver_flags=--flagfile=src/yb/tools/master_load_bench/tserver.flags
+--stack_trace_symbolize=false

@@ -9,3 +9,4 @@
 # internal relcache-init connection is never used.
 --ysql_catalog_preload_additional_tables=true
 --ysql_catalog_preload_additional_table_list=pg_statistic,pg_amop,pg_operator,pg_namespace,pg_auth_members,pg_range
+--stack_trace_symbolize=false

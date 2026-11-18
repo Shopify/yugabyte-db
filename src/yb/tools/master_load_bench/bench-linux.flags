@@ -11,3 +11,4 @@
 --master_cpus=0-95
 --master_flags=--flagfile=src/yb/tools/master_load_bench/master.flags,--num_reactor_threads=192
 --tserver_flags=--flagfile=src/yb/tools/master_load_bench/tserver.flags
+--stack_trace_symbolize=false
