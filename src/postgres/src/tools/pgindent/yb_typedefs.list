@@ -175,7 +175,9 @@ YbPgInheritsCacheEntryData
 YbPgMemTracker
 YbPgRpcStats
 YbPgssCounters
+YbPgssEntryDumpLayout
 YbPgssFillInConstantLengths
+YbPgssPending
 YbPgssQueryNeedingNormalization
 YbPlanInfo
 YbPlanStatePtr
