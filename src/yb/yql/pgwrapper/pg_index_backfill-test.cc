@@ -3784,6 +3784,14 @@ INSTANTIATE_TEST_CASE_P(, PgIndexBackfillIgnoreApplyTest, ::testing::Bool());
 
 class PgIndexBackfillRpcStatsTest : public PgIndexBackfillTest {
  protected:
+  // The BACKFILL statements run in the backfill worker's backend, and the checks read their
+  // counters from another one, so pg_stat_statements must update them per statement.
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    PgIndexBackfillTest::UpdateMiniClusterOptions(options);
+    AppendCsvFlagValue(
+        options->extra_tserver_flags, "ysql_pg_conf_csv", "pg_stat_statements.yb_flush_interval=0");
+  }
+
   Result<int64_t> GetBackfillReadRpcs() {
     return conn_->FetchRow<int64_t>(
         "SELECT COALESCE(sum(docdb_read_rpcs)::int8, 0) "
@@ -4253,11 +4261,12 @@ class PgIndexBackfillPredicatePushdownTest : public PgIndexBackfillRpcStatsTest 
     PgIndexBackfillRpcStatsTest::UpdateMiniClusterOptions(options);
     const auto predicate_pushdown_enabled = GetParam() ? "true" : "false";
     options->replication_factor = 1;
-    options->extra_tserver_flags.push_back(Format(
-        "--ysql_pg_conf_csv=yb_enable_pg_stat_statements_rpc_stats=true,"
-        "yb_fetch_row_limit=$0,"
-        "yb_enable_index_backfill_scan_optimization=$1",
-        kFetchRowLimit, predicate_pushdown_enabled));
+    AppendCsvFlagValue(
+        options->extra_tserver_flags, "ysql_pg_conf_csv",
+        Format("yb_enable_pg_stat_statements_rpc_stats=true,"
+               "yb_fetch_row_limit=$0,"
+               "yb_enable_index_backfill_scan_optimization=$1",
+               kFetchRowLimit, predicate_pushdown_enabled));
   }
 
   void SetUp() override {

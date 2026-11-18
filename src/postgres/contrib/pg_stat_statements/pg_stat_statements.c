@@ -314,11 +314,47 @@ typedef struct pgssEntry
 	int			query_len;		/* # of valid bytes in query string, or -1 */
 	int			encoding;		/* query text encoding */
 	slock_t		mutex;			/* protects the counters only */
+	uint32		yb_incarnation; /* never 0; see entry_alloc. In padding, see
+								 * YbPgssEntryDumpLayout */
 	size_t		yb_slow_executions; /* # of executions >= yb_hdr_max_value *
 									 * yb_hdr_latency_res_ms */
 	hdr_histogram yb_hdr_histogram; /* flexible array member at end - MUST BE
 									 * LAST */
 } pgssEntry;
+
+/*
+ * YB: The layout of pgssEntry in PGSS_DUMP_FILE for PGSS_FILE_HEADER
+ * 0x20250425.  pgss_shmem_shutdown writes raw pgssEntry bytes and
+ * read_entry_hdr reads them back with sizeof(pgssEntry), so a field may be
+ * added to pgssEntry only where this layout has padding; otherwise restore
+ * across an upgrade or rollback reads garbage.  yb_incarnation uses the padding
+ * after mutex: restore copies only key, counters, the text metadata and the
+ * bytes from yb_slow_executions on, so the padding is ignored in both
+ * directions.
+ */
+typedef struct YbPgssEntryDumpLayout
+{
+	pgssHashKey key;
+	Counters	counters;
+	Size		query_offset;
+	int			query_len;
+	int			encoding;
+	slock_t		mutex;
+	size_t		yb_slow_executions;
+	hdr_histogram yb_hdr_histogram;
+} YbPgssEntryDumpLayout;
+
+StaticAssertDecl(sizeof(pgssEntry) == sizeof(YbPgssEntryDumpLayout),
+				 "pgssEntry must keep the size of its dump layout");
+StaticAssertDecl(offsetof(pgssEntry, mutex) ==
+				 offsetof(YbPgssEntryDumpLayout, mutex),
+				 "pgssEntry must keep the dump layout before yb_incarnation");
+StaticAssertDecl(offsetof(pgssEntry, yb_slow_executions) ==
+				 offsetof(YbPgssEntryDumpLayout, yb_slow_executions),
+				 "yb_incarnation must fit in the padding after mutex");
+StaticAssertDecl(offsetof(pgssEntry, yb_hdr_histogram) ==
+				 offsetof(YbPgssEntryDumpLayout, yb_hdr_histogram),
+				 "pgssEntry must keep the dump layout after yb_incarnation");
 
 typedef struct
 {
@@ -345,6 +381,20 @@ typedef struct pgssSharedState
 	int			n_writers;		/* number of active writers to query file */
 	int			gc_count;		/* query file garbage collection cycle count */
 	pgssGlobalStats stats;		/* global statistics for pgss */
+
+	/*
+	 * YB: Bumped, under the exclusive lock, by every entry_reset and
+	 * entry_dealloc.  Every tracked statement reads it without a lock, so it
+	 * has a cache line of its own, away from mutex and extent, which
+	 * qtext_store writes.
+	 */
+	pg_atomic_uint64 removal_gen pg_attribute_aligned(PG_CACHE_LINE_SIZE);
+
+	/*
+	 * YB: Source of pgssEntry.yb_incarnation; written under the exclusive
+	 * lock.  Its own line keeps those writes from invalidating removal_gen's.
+	 */
+	uint64		next_incarnation pg_attribute_aligned(PG_CACHE_LINE_SIZE);
 } pgssSharedState;
 
 /*---- Local variables ----*/
@@ -385,6 +435,50 @@ static int	plan_nested_level = 0;
 typedef uint64 YbPgssQueryNeedingNormalization;
 
 static HTAB *yb_pgss_queries_needing_normalization = NULL;
+
+/*
+ * YB: Backend-local pending statistics.
+ *
+ * A client backend adds the statistics of a statement to a pending record for
+ * its key instead of to the shared entry, and folds all its records into the
+ * shared entries at most once per pg_stat_statements.yb_flush_interval.  This
+ * keeps pgss->lock and the entry spinlock off the per-statement path.
+ *
+ * A record may take statistics only while the shared entry is known to exist:
+ * its incarnation was read together with gen under pgss->lock, and
+ * pgss->removal_gen still equals gen (no entry has been removed since).  A
+ * store for a key with no record, or a stale one, takes the synchronous path
+ * (which creates the entry with its text and applies the normalization discard
+ * rule) and then starts or refreshes the record.  A fold drops a record whose
+ * entry is gone or has another incarnation: its statements predate a reset or
+ * eviction, which discards them anyway.
+ */
+#define YB_PGSS_PENDING_MAX_KEYS 64
+
+typedef struct YbPgssPending
+{
+	pgssHashKey key;			/* hash key - MUST BE FIRST */
+	uint32		incarnation;	/* yb_incarnation of the shared entry */
+	uint64		gen;			/* removal_gen read with incarnation */
+	bool		has_data;		/* holds statistics not yet folded */
+
+	/*
+	 * Deltas, in the shape of a shared entry so that stores update both the
+	 * same way: counters (per-kind mean and sum_var are the Welford partials
+	 * of this batch; usage is unused), yb_slow_executions and
+	 * yb_hdr_histogram (configured with cfg).  The other fields are unused.
+	 */
+	pgssEntry  *delta;
+} YbPgssPending;
+
+static MemoryContext yb_pgss_pending_cxt = NULL;
+static HTAB *yb_pgss_pending_hash = NULL;
+static int	yb_pgss_pending_dirty = 0;	/* records with has_data */
+
+/* When the oldest statistics not yet folded were recorded */
+static instr_time yb_pgss_pending_since;
+static bool yb_pgss_in_fold = false;
+static bool yb_pgss_exit_callback_registered = false;
 
 /* Saved hook values in case of unload */
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
@@ -445,6 +539,8 @@ static int64_t yb_hdr_max_value = YB_HDR_DEFAULT_MAX_VALUE; /* default hardcode 
 static struct hdr_histogram_bucket_config cfg;
 static int	yb_qtext_size_limit = YB_DEFAULT_QTEXT_LIMIT_KB;
 static int	yb_max_query_text_length = YB_DEFAULT_MAX_QUERY_TEXT_LENGTH;
+static int	yb_flush_interval = 1000;	/* ms; 0 = update shared entries per
+										 * statement */
 
 /*
  * yb_hdr_max_value is the integer representation of the max query latency we
@@ -518,7 +614,8 @@ static void pgss_store(const char *query, uint64 queryId,
 					   const struct JitInstrumentation *jitusage,
 					   JumbleState *jstate,
 					   bool yb_is_sensitive_stmt,
-					   YbInstrumentation *yb_stats);
+					   YbInstrumentation *yb_stats,
+					   const instr_time *yb_end_time);
 static void pg_stat_statements_internal(FunctionCallInfo fcinfo,
 										pgssVersion api_version,
 										bool showtext);
@@ -567,6 +664,28 @@ static void yb_pgss_mark_needs_normalization(uint64 queryId);
 static bool yb_pgss_needs_normalization(uint64 queryId);
 static char *yb_truncate_query_text(const char *query, int *query_len,
 									int encoding);
+static void yb_pgss_counters_accum(volatile pgssEntry *e,
+								   pgssStoreKind kind, double total_time,
+								   uint64 rows, const BufferUsage *bufusage,
+								   const WalUsage *walusage,
+								   const struct JitInstrumentation *jitusage,
+								   YbInstrumentation *yb_stats);
+static int	yb_pgss_effective_flush_interval(void);
+static void yb_pgss_pending_key(pgssHashKey *key, uint64 queryId);
+static bool yb_pgss_pending_is_current(uint64 queryId);
+static bool yb_pgss_store_pending(uint64 queryId, pgssStoreKind kind,
+								  double total_time, uint64 rows,
+								  const BufferUsage *bufusage,
+								  const WalUsage *walusage,
+								  const struct JitInstrumentation *jitusage,
+								  YbInstrumentation *yb_stats, int interval,
+								  const instr_time *end_time);
+static void yb_pgss_pending_track(const pgssHashKey *key, uint32 incarnation,
+								  uint64 gen, int interval,
+								  const instr_time *end_time);
+static void yb_pgss_pending_maybe_fold(int interval, const instr_time *end_time);
+static void yb_pgss_fold_pending(void);
+static void yb_pgss_pending_shmem_exit(int code, Datum arg);
 
 /*
  * Module load callback
@@ -687,6 +806,22 @@ _PG_init(void)
 							INT_MAX / 2,
 							PGC_SUSET,
 							GUC_UNIT_BYTE,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_stat_statements.yb_flush_interval",
+							"Sets how long a client backend may keep statement statistics in local memory before adding them to pg_stat_statements.",
+							"0 adds them at the end of every statement. Otherwise other sessions see a statement's statistics "
+							"once its backend adds them: at the end of a statement that finishes at least this long after "
+							"the oldest statistics it holds, before it reads or resets pg_stat_statements, and when it exits. "
+							"The backend's own reads see its statements at once.",
+							&yb_flush_interval,
+							1000,
+							0,
+							60000,
+							PGC_SUSET,
+							GUC_UNIT_MS,
 							NULL,
 							NULL,
 							NULL);
@@ -1157,6 +1292,9 @@ pgss_shmem_startup(void)
 		pgss->gc_count = 0;
 		pgss->stats.dealloc = 0;
 		pgss->stats.stats_reset = GetCurrentTimestamp();
+		/* YB: before the saved-file load below, whose entry_alloc uses them */
+		pg_atomic_init_u64(&pgss->removal_gen, 0);
+		pgss->next_incarnation = 1;
 	}
 
 	info.keysize = sizeof(pgssHashKey);
@@ -1509,8 +1647,12 @@ pgss_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
 	 * record the normalized form of the query string.  If there were no such
 	 * constants, the normalized string would be the same as the query text
 	 * anyway, so there's no need for an early entry.
+	 *
+	 * YB: A current pending record proves that the entry exists, so the
+	 * shared lookup can be skipped.
 	 */
-	if (jstate && jstate->clocations_count > 0)
+	if (jstate && jstate->clocations_count > 0 &&
+		!yb_pgss_pending_is_current(query->queryId))
 		pgss_store(pstate->p_sourcetext,
 				   query->queryId,
 				   query->stmt_location,
@@ -1523,7 +1665,8 @@ pgss_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
 				   NULL,
 				   jstate,
 				   false /* yb_is_sensitive_stmt */ ,
-				   NULL /* yb_stats */ );
+				   NULL /* yb_stats */ ,
+				   NULL /* yb_end_time */ );
 }
 
 /*
@@ -1556,6 +1699,7 @@ pgss_planner(Query *parse,
 	{
 		instr_time	start;
 		instr_time	duration;
+		instr_time	yb_end;
 		BufferUsage bufusage_start,
 					bufusage;
 		WalUsage	walusage_start,
@@ -1588,6 +1732,7 @@ pgss_planner(Query *parse,
 		PG_END_TRY();
 
 		INSTR_TIME_SET_CURRENT(duration);
+		yb_end = duration;
 		INSTR_TIME_SUBTRACT(duration, start);
 
 		/* calc differences of buffer counters. */
@@ -1610,7 +1755,8 @@ pgss_planner(Query *parse,
 				   NULL,
 				   NULL,
 				   false /* yb_is_sensitive_stmt */ ,
-				   NULL /* yb_stats */ );
+				   NULL /* yb_stats */ ,
+				   &yb_end);
 	}
 	else
 	{
@@ -1731,7 +1877,8 @@ pgss_ExecutorEnd(QueryDesc *queryDesc)
 				   queryDesc->estate->es_jit ? &queryDesc->estate->es_jit->instr : NULL,
 				   NULL,
 				   false /* yb_is_sensitive_stmt */ ,
-				   &queryDesc->yb_query_stats->yb_instr);
+				   &queryDesc->yb_query_stats->yb_instr,
+				   NULL /* yb_end_time */ );
 	}
 
 	if (prev_ExecutorEnd)
@@ -1793,6 +1940,7 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 	{
 		instr_time	start;
 		instr_time	duration;
+		instr_time	yb_end;
 		uint64		rows;
 		BufferUsage bufusage_start,
 					bufusage;
@@ -1832,6 +1980,7 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 		 */
 
 		INSTR_TIME_SET_CURRENT(duration);
+		yb_end = duration;
 		INSTR_TIME_SUBTRACT(duration, start);
 
 		/*
@@ -1881,7 +2030,8 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 					   NULL,
 					   NULL,
 					   false /* yb_is_sensitive_stmt */ ,
-					   YBGetUtilityOperationStats());
+					   YBGetUtilityOperationStats(),
+					   &yb_end);
 			pfree(norm_query);
 		}
 		else
@@ -1898,7 +2048,8 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 					   NULL,
 					   NULL,
 					   true /* yb_is_sensitive_stmt */ ,
-					   YBGetUtilityOperationStats());
+					   YBGetUtilityOperationStats(),
+					   &yb_end);
 		}
 	}
 	else
@@ -1935,12 +2086,18 @@ pgss_store(const char *query, uint64 queryId,
 		   const struct JitInstrumentation *jitusage,
 		   JumbleState *jstate,
 		   bool yb_is_sensitive_stmt,
-		   YbInstrumentation *yb_stats)
+		   YbInstrumentation *yb_stats,
+		   const instr_time *yb_end_time)
 {
 	pgssHashKey key;
 	pgssEntry  *entry;
 	char	   *norm_query = NULL;
 	int			encoding = GetDatabaseEncoding();
+	int			yb_interval;
+	bool		yb_track_pending = false;
+	bool		yb_pending_valid = false;
+	uint32		yb_pending_incarnation = 0;
+	uint64		yb_pending_gen = 0;
 
 	Assert(query != NULL);
 
@@ -1959,6 +2116,29 @@ pgss_store(const char *query, uint64 queryId,
 	{
 		return;
 	}
+
+	/*
+	 * YB: With a flush interval, a statement whose key has a current pending
+	 * record is accumulated locally, before any text work.  Otherwise it takes
+	 * the synchronous path below, which then starts or refreshes the record.
+	 * With no interval, the synchronous path is the whole store, as without
+	 * pending statistics; data left pending from a nonzero interval is folded
+	 * first.
+	 */
+	yb_interval = yb_pgss_effective_flush_interval();
+	if (yb_interval > 0)
+	{
+		if (!jstate)
+		{
+			if (yb_pgss_store_pending(queryId, kind, total_time, rows, bufusage,
+								   walusage, jitusage, yb_stats, yb_interval,
+								   yb_end_time))
+				return;
+			yb_track_pending = true;
+		}
+	}
+	else if (yb_pgss_pending_dirty > 0)
+		yb_pgss_fold_pending();
 
 	/*
 	 * Confine our attention to the relevant part of the string, if the query
@@ -2099,160 +2279,24 @@ pgss_store(const char *query, uint64 queryId,
 		Assert(kind == PGSS_PLAN || kind == PGSS_EXEC);
 
 		SpinLockAcquire(&e->mutex);
-
-		/* "Unstick" entry if it was previously sticky */
-		if (IS_STICKY(e->counters))
-			e->counters.usage = USAGE_INIT;
-
-		e->counters.calls[kind] += 1;
-		e->counters.total_time[kind] += total_time;
+		yb_pgss_counters_accum(e, kind, total_time, rows, bufusage, walusage,
+							   jitusage, yb_stats);
+		SpinLockRelease(&e->mutex);
 
 		/*
-		 * Add record for only execution time for queries in latency
-		 * histograms
+		 * YB: Read under pgss->lock, in the same critical section as the
+		 * lookup or creation of the entry: removal_gen is bumped only under
+		 * the exclusive lock, so this gen pairs exactly with this incarnation.
+		 * A gen read after unlocking could postdate a reset that removed this
+		 * entry: the record would look current, and the statements it then
+		 * collects would be dropped at the fold.
 		 */
-		if (IsYugaByteEnabled() && kind == PGSS_EXEC)
+		if (yb_track_pending)
 		{
-			int64_t		tt_int = (int64_t) (total_time / yb_hdr_latency_res_ms);
-
-			if (tt_int < yb_hdr_max_value)
-				hdr_record_value((hdr_histogram *) &e->yb_hdr_histogram, tt_int);
-			else
-				e->yb_slow_executions++;
+			yb_pending_incarnation = entry->yb_incarnation;
+			yb_pending_gen = pg_atomic_read_u64(&pgss->removal_gen);
+			yb_pending_valid = true;
 		}
-
-
-		if (e->counters.calls[kind] == 1)
-		{
-			e->counters.min_time[kind] = total_time;
-			e->counters.max_time[kind] = total_time;
-			e->counters.mean_time[kind] = total_time;
-		}
-		else
-		{
-			/*
-			 * Welford's method for accurately computing variance. See
-			 * <http://www.johndcook.com/blog/standard_deviation/>
-			 */
-			double		old_mean = e->counters.mean_time[kind];
-
-			e->counters.mean_time[kind] +=
-				(total_time - old_mean) / e->counters.calls[kind];
-			e->counters.sum_var_time[kind] +=
-				(total_time - old_mean) * (total_time - e->counters.mean_time[kind]);
-
-			/* calculate min and max time */
-			if (e->counters.min_time[kind] > total_time)
-				e->counters.min_time[kind] = total_time;
-			if (e->counters.max_time[kind] < total_time)
-				e->counters.max_time[kind] = total_time;
-		}
-		e->counters.rows += rows;
-		e->counters.shared_blks_hit += bufusage->shared_blks_hit;
-		e->counters.shared_blks_read += bufusage->shared_blks_read;
-		e->counters.shared_blks_dirtied += bufusage->shared_blks_dirtied;
-		e->counters.shared_blks_written += bufusage->shared_blks_written;
-		e->counters.local_blks_hit += bufusage->local_blks_hit;
-		e->counters.local_blks_read += bufusage->local_blks_read;
-		e->counters.local_blks_dirtied += bufusage->local_blks_dirtied;
-		e->counters.local_blks_written += bufusage->local_blks_written;
-		e->counters.temp_blks_read += bufusage->temp_blks_read;
-		e->counters.temp_blks_written += bufusage->temp_blks_written;
-		e->counters.blk_read_time += INSTR_TIME_GET_MILLISEC(bufusage->blk_read_time);
-		e->counters.blk_write_time += INSTR_TIME_GET_MILLISEC(bufusage->blk_write_time);
-		e->counters.temp_blk_read_time += INSTR_TIME_GET_MILLISEC(bufusage->temp_blk_read_time);
-		e->counters.temp_blk_write_time += INSTR_TIME_GET_MILLISEC(bufusage->temp_blk_write_time);
-		e->counters.usage += USAGE_EXEC(total_time);
-		e->counters.wal_records += walusage->wal_records;
-		e->counters.wal_fpi += walusage->wal_fpi;
-		e->counters.wal_bytes += walusage->wal_bytes;
-		if (jitusage)
-		{
-			e->counters.jit_functions += jitusage->created_functions;
-			e->counters.jit_generation_time += INSTR_TIME_GET_MILLISEC(jitusage->generation_counter);
-
-			if (INSTR_TIME_GET_MILLISEC(jitusage->inlining_counter))
-				e->counters.jit_inlining_count++;
-			e->counters.jit_inlining_time += INSTR_TIME_GET_MILLISEC(jitusage->inlining_counter);
-
-			if (INSTR_TIME_GET_MILLISEC(jitusage->optimization_counter))
-				e->counters.jit_optimization_count++;
-			e->counters.jit_optimization_time += INSTR_TIME_GET_MILLISEC(jitusage->optimization_counter);
-
-			if (INSTR_TIME_GET_MILLISEC(jitusage->emission_counter))
-				e->counters.jit_emission_count++;
-			e->counters.jit_emission_time += INSTR_TIME_GET_MILLISEC(jitusage->emission_counter);
-		}
-
-		if (kind == PGSS_EXEC)
-		{
-			if (yb_stats)
-			{
-				e->counters.yb_counters.counters[YB_INT_DOCDB_READ_RPCS] +=
-					yb_stats->tbl_reads.count + yb_stats->index_reads.count;
-				e->counters.yb_counters.counters[YB_INT_DOCDB_READ_OPS] +=
-					yb_stats->tbl_reads.ops_count + yb_stats->index_reads.ops_count;
-				e->counters.yb_counters.counters[YB_INT_DOCDB_WRITE_RPCS] +=
-					yb_stats->write_flushes.count;
-				e->counters.yb_counters.counters[YB_INT_DOCDB_WRITE_OPS] +=
-					yb_stats->tbl_writes + yb_stats->index_writes;
-				e->counters.yb_counters.counters[YB_INT_DOCDB_ROWS_SCANNED] +=
-					yb_stats->tbl_reads.rows_scanned + yb_stats->index_reads.rows_scanned;
-				e->counters.yb_counters.counters[YB_INT_DOCDB_ROWS_RETURNED] +=
-					yb_stats->tbl_reads.rows_received + yb_stats->index_reads.rows_received;
-
-				e->counters.yb_counters.counters_dbl[YB_DBL_CATALOG_WAIT_TIME_MS] +=
-					(yb_stats->catalog_reads.wait_time) / 1000000.0;
-				e->counters.yb_counters.counters_dbl[YB_DBL_DOCDB_WAIT_TIME_MS] +=
-					(yb_stats->tbl_reads.wait_time + yb_stats->write_flushes.wait_time +
-					 yb_stats->index_reads.wait_time) / 1000000.0;
-			}
-
-			/* Update retry statistics, only after the statement has completed */
-			e->counters.yb_counters.counters[YB_INT_CONFLICT_RETRIES] +=
-				YbGetRetryCount(YB_TXN_CONFLICT);
-			e->counters.yb_counters.counters[YB_INT_READ_RESTART_RETRIES] +=
-				YbGetRetryCount(YB_TXN_RESTART_READ);
-			e->counters.yb_counters.counters[YB_INT_TOTAL_RETRIES] += YbGetTotalRetryCount();
-
-			if (yb_stats && yb_stats->read_metrics.version)
-			{
-				e->counters.yb_counters.counters[YB_INT_DOCDB_OBSOLETE_ROWS_SCANNED] +=
-					yb_stats->read_metrics.counters[YB_STORAGE_COUNTER_DOCDB_OBSOLETE_KEYS_FOUND];
-				e->counters.yb_counters.counters[YB_INT_DOCDB_SEEKS] +=
-					yb_stats->read_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_NUMBER_DB_SEEK];
-				e->counters.yb_counters.counters[YB_INT_DOCDB_NEXTS] +=
-					yb_stats->read_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_NUMBER_DB_NEXT];
-				e->counters.yb_counters.counters[YB_INT_DOCDB_PREVS] +=
-					yb_stats->read_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_NUMBER_DB_PREV];
-				e->counters.yb_counters.counters[YB_INT_DOCDB_BLOOM_FILTER_USEFUL] +=
-					yb_stats->read_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_BLOOM_FILTER_USEFUL];
-				e->counters.yb_counters.counters[YB_INT_DOCDB_BLOOM_FILTER_CHECKED] +=
-					yb_stats->read_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_BLOOM_FILTER_CHECKED];
-				e->counters.yb_counters.counters_dbl[YB_DBL_DOCDB_READ_TIME_MS] +=
-					yb_stats->read_metrics.events[YB_STORAGE_EVENT_QL_READ_LATENCY].sum / 1000.0;
-			}
-
-			if (yb_stats && yb_stats->write_metrics.version)
-			{
-				e->counters.yb_counters.counters[YB_INT_DOCDB_OBSOLETE_ROWS_SCANNED] +=
-					yb_stats->write_metrics.counters[YB_STORAGE_COUNTER_DOCDB_OBSOLETE_KEYS_FOUND];
-				e->counters.yb_counters.counters[YB_INT_DOCDB_SEEKS] +=
-					yb_stats->write_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_NUMBER_DB_SEEK];
-				e->counters.yb_counters.counters[YB_INT_DOCDB_NEXTS] +=
-					yb_stats->write_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_NUMBER_DB_NEXT];
-				e->counters.yb_counters.counters[YB_INT_DOCDB_PREVS] +=
-					yb_stats->write_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_NUMBER_DB_PREV];
-				e->counters.yb_counters.counters[YB_INT_DOCDB_BLOOM_FILTER_USEFUL] +=
-					yb_stats->write_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_BLOOM_FILTER_USEFUL];
-				e->counters.yb_counters.counters[YB_INT_DOCDB_BLOOM_FILTER_CHECKED] +=
-					yb_stats->write_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_BLOOM_FILTER_CHECKED];
-				e->counters.yb_counters.counters_dbl[YB_DBL_DOCDB_WRITE_TIME_MS] +=
-					yb_stats->write_metrics.events[YB_STORAGE_EVENT_QL_WRITE_LATENCY].sum / 1000.0;
-			}
-		}
-
-		SpinLockRelease(&e->mutex);
 	}
 
 done:
@@ -2261,6 +2305,580 @@ done:
 	/* We postpone this clean-up until we're out of the lock */
 	if (norm_query)
 		pfree(norm_query);
+
+	if (yb_track_pending)
+	{
+		if (yb_pending_valid)
+			yb_pgss_pending_track(&key, yb_pending_incarnation, yb_pending_gen,
+							   yb_interval, yb_end_time);
+		else
+			yb_pgss_pending_maybe_fold(yb_interval, yb_end_time);
+	}
+}
+
+/*
+ * Add one statement's statistics to e's counters, latency histogram and
+ * yb_slow_executions.  Used for a shared entry, under its spinlock, and for
+ * the deltas of a backend-local pending record.  Retry counts are read here,
+ * at store time, in both cases.
+ */
+static void
+yb_pgss_counters_accum(volatile pgssEntry *e, pgssStoreKind kind,
+					   double total_time, uint64 rows,
+					   const BufferUsage *bufusage, const WalUsage *walusage,
+					   const struct JitInstrumentation *jitusage,
+					   YbInstrumentation *yb_stats)
+{
+	/* "Unstick" entry if it was previously sticky */
+	if (IS_STICKY(e->counters))
+		e->counters.usage = USAGE_INIT;
+
+	e->counters.calls[kind] += 1;
+	e->counters.total_time[kind] += total_time;
+
+	/*
+	 * Add record for only execution time for queries in latency
+	 * histograms
+	 */
+	if (IsYugaByteEnabled() && kind == PGSS_EXEC)
+	{
+		int64_t		tt_int = (int64_t) (total_time / yb_hdr_latency_res_ms);
+
+		if (tt_int < yb_hdr_max_value)
+			hdr_record_value((hdr_histogram *) &e->yb_hdr_histogram, tt_int);
+		else
+			e->yb_slow_executions++;
+	}
+
+
+	if (e->counters.calls[kind] == 1)
+	{
+		e->counters.min_time[kind] = total_time;
+		e->counters.max_time[kind] = total_time;
+		e->counters.mean_time[kind] = total_time;
+	}
+	else
+	{
+		/*
+		 * Welford's method for accurately computing variance. See
+		 * <http://www.johndcook.com/blog/standard_deviation/>
+		 */
+		double		old_mean = e->counters.mean_time[kind];
+
+		e->counters.mean_time[kind] +=
+			(total_time - old_mean) / e->counters.calls[kind];
+		e->counters.sum_var_time[kind] +=
+			(total_time - old_mean) * (total_time - e->counters.mean_time[kind]);
+
+		/* calculate min and max time */
+		if (e->counters.min_time[kind] > total_time)
+			e->counters.min_time[kind] = total_time;
+		if (e->counters.max_time[kind] < total_time)
+			e->counters.max_time[kind] = total_time;
+	}
+	e->counters.rows += rows;
+	e->counters.shared_blks_hit += bufusage->shared_blks_hit;
+	e->counters.shared_blks_read += bufusage->shared_blks_read;
+	e->counters.shared_blks_dirtied += bufusage->shared_blks_dirtied;
+	e->counters.shared_blks_written += bufusage->shared_blks_written;
+	e->counters.local_blks_hit += bufusage->local_blks_hit;
+	e->counters.local_blks_read += bufusage->local_blks_read;
+	e->counters.local_blks_dirtied += bufusage->local_blks_dirtied;
+	e->counters.local_blks_written += bufusage->local_blks_written;
+	e->counters.temp_blks_read += bufusage->temp_blks_read;
+	e->counters.temp_blks_written += bufusage->temp_blks_written;
+	e->counters.blk_read_time += INSTR_TIME_GET_MILLISEC(bufusage->blk_read_time);
+	e->counters.blk_write_time += INSTR_TIME_GET_MILLISEC(bufusage->blk_write_time);
+	e->counters.temp_blk_read_time += INSTR_TIME_GET_MILLISEC(bufusage->temp_blk_read_time);
+	e->counters.temp_blk_write_time += INSTR_TIME_GET_MILLISEC(bufusage->temp_blk_write_time);
+	e->counters.usage += USAGE_EXEC(total_time);
+	e->counters.wal_records += walusage->wal_records;
+	e->counters.wal_fpi += walusage->wal_fpi;
+	e->counters.wal_bytes += walusage->wal_bytes;
+	if (jitusage)
+	{
+		e->counters.jit_functions += jitusage->created_functions;
+		e->counters.jit_generation_time += INSTR_TIME_GET_MILLISEC(jitusage->generation_counter);
+
+		if (INSTR_TIME_GET_MILLISEC(jitusage->inlining_counter))
+			e->counters.jit_inlining_count++;
+		e->counters.jit_inlining_time += INSTR_TIME_GET_MILLISEC(jitusage->inlining_counter);
+
+		if (INSTR_TIME_GET_MILLISEC(jitusage->optimization_counter))
+			e->counters.jit_optimization_count++;
+		e->counters.jit_optimization_time += INSTR_TIME_GET_MILLISEC(jitusage->optimization_counter);
+
+		if (INSTR_TIME_GET_MILLISEC(jitusage->emission_counter))
+			e->counters.jit_emission_count++;
+		e->counters.jit_emission_time += INSTR_TIME_GET_MILLISEC(jitusage->emission_counter);
+	}
+
+	if (kind == PGSS_EXEC)
+	{
+		if (yb_stats)
+		{
+			e->counters.yb_counters.counters[YB_INT_DOCDB_READ_RPCS] +=
+				yb_stats->tbl_reads.count + yb_stats->index_reads.count;
+			e->counters.yb_counters.counters[YB_INT_DOCDB_READ_OPS] +=
+				yb_stats->tbl_reads.ops_count + yb_stats->index_reads.ops_count;
+			e->counters.yb_counters.counters[YB_INT_DOCDB_WRITE_RPCS] +=
+				yb_stats->write_flushes.count;
+			e->counters.yb_counters.counters[YB_INT_DOCDB_WRITE_OPS] +=
+				yb_stats->tbl_writes + yb_stats->index_writes;
+			e->counters.yb_counters.counters[YB_INT_DOCDB_ROWS_SCANNED] +=
+				yb_stats->tbl_reads.rows_scanned + yb_stats->index_reads.rows_scanned;
+			e->counters.yb_counters.counters[YB_INT_DOCDB_ROWS_RETURNED] +=
+				yb_stats->tbl_reads.rows_received + yb_stats->index_reads.rows_received;
+
+			e->counters.yb_counters.counters_dbl[YB_DBL_CATALOG_WAIT_TIME_MS] +=
+				(yb_stats->catalog_reads.wait_time) / 1000000.0;
+			e->counters.yb_counters.counters_dbl[YB_DBL_DOCDB_WAIT_TIME_MS] +=
+				(yb_stats->tbl_reads.wait_time + yb_stats->write_flushes.wait_time +
+				 yb_stats->index_reads.wait_time) / 1000000.0;
+		}
+
+		/* Update retry statistics, only after the statement has completed */
+		e->counters.yb_counters.counters[YB_INT_CONFLICT_RETRIES] +=
+			YbGetRetryCount(YB_TXN_CONFLICT);
+		e->counters.yb_counters.counters[YB_INT_READ_RESTART_RETRIES] +=
+			YbGetRetryCount(YB_TXN_RESTART_READ);
+		e->counters.yb_counters.counters[YB_INT_TOTAL_RETRIES] += YbGetTotalRetryCount();
+
+		if (yb_stats && yb_stats->read_metrics.version)
+		{
+			e->counters.yb_counters.counters[YB_INT_DOCDB_OBSOLETE_ROWS_SCANNED] +=
+				yb_stats->read_metrics.counters[YB_STORAGE_COUNTER_DOCDB_OBSOLETE_KEYS_FOUND];
+			e->counters.yb_counters.counters[YB_INT_DOCDB_SEEKS] +=
+				yb_stats->read_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_NUMBER_DB_SEEK];
+			e->counters.yb_counters.counters[YB_INT_DOCDB_NEXTS] +=
+				yb_stats->read_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_NUMBER_DB_NEXT];
+			e->counters.yb_counters.counters[YB_INT_DOCDB_PREVS] +=
+				yb_stats->read_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_NUMBER_DB_PREV];
+			e->counters.yb_counters.counters[YB_INT_DOCDB_BLOOM_FILTER_USEFUL] +=
+				yb_stats->read_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_BLOOM_FILTER_USEFUL];
+			e->counters.yb_counters.counters[YB_INT_DOCDB_BLOOM_FILTER_CHECKED] +=
+				yb_stats->read_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_BLOOM_FILTER_CHECKED];
+			e->counters.yb_counters.counters_dbl[YB_DBL_DOCDB_READ_TIME_MS] +=
+				yb_stats->read_metrics.events[YB_STORAGE_EVENT_QL_READ_LATENCY].sum / 1000.0;
+		}
+
+		if (yb_stats && yb_stats->write_metrics.version)
+		{
+			e->counters.yb_counters.counters[YB_INT_DOCDB_OBSOLETE_ROWS_SCANNED] +=
+				yb_stats->write_metrics.counters[YB_STORAGE_COUNTER_DOCDB_OBSOLETE_KEYS_FOUND];
+			e->counters.yb_counters.counters[YB_INT_DOCDB_SEEKS] +=
+				yb_stats->write_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_NUMBER_DB_SEEK];
+			e->counters.yb_counters.counters[YB_INT_DOCDB_NEXTS] +=
+				yb_stats->write_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_NUMBER_DB_NEXT];
+			e->counters.yb_counters.counters[YB_INT_DOCDB_PREVS] +=
+				yb_stats->write_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_NUMBER_DB_PREV];
+			e->counters.yb_counters.counters[YB_INT_DOCDB_BLOOM_FILTER_USEFUL] +=
+				yb_stats->write_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_BLOOM_FILTER_USEFUL];
+			e->counters.yb_counters.counters[YB_INT_DOCDB_BLOOM_FILTER_CHECKED] +=
+				yb_stats->write_metrics.gauges[YB_STORAGE_GAUGE_REGULARDB_BLOOM_FILTER_CHECKED];
+			e->counters.yb_counters.counters_dbl[YB_DBL_DOCDB_WRITE_TIME_MS] +=
+				yb_stats->write_metrics.events[YB_STORAGE_EVENT_QL_WRITE_LATENCY].sum / 1000.0;
+		}
+	}
+}
+
+/*
+ * YB: Statements of other processes, such as background workers and
+ * walsenders, keep updating the shared entries synchronously: only client
+ * backends are guaranteed to reach the points where pending statistics are
+ * folded, and the others run statements at low rates.
+ */
+static int
+yb_pgss_effective_flush_interval(void)
+{
+	return MyBackendType == B_BACKEND ? yb_flush_interval : 0;
+}
+
+static void
+yb_pgss_pending_key(pgssHashKey *key, uint64 queryId)
+{
+	/* clear padding: the hash uses HASH_BLOBS */
+	memset(key, 0, sizeof(pgssHashKey));
+	key->userid = GetUserId();
+	key->dbid = MyDatabaseId;
+	key->queryid = queryId;
+	key->toplevel = (exec_nested_level == 0);
+}
+
+static YbPgssPending *
+yb_pgss_pending_find(uint64 queryId)
+{
+	pgssHashKey key;
+
+	if (yb_pgss_pending_hash == NULL)
+		return NULL;
+	yb_pgss_pending_key(&key, queryId);
+	return (YbPgssPending *) hash_search(yb_pgss_pending_hash, &key,
+										 HASH_FIND, NULL);
+}
+
+/*
+ * Whether this backend holds a current pending record for queryId, which
+ * proves that the shared entry exists.  Without a lock, a reset that has just
+ * happened can be missed; statements recorded meanwhile are dropped at the
+ * fold, as if they had completed before the reset.
+ */
+static bool
+yb_pgss_pending_is_current(uint64 queryId)
+{
+	YbPgssPending *p;
+
+	if (!pgss || yb_pgss_effective_flush_interval() == 0)
+		return false;
+	p = yb_pgss_pending_find(queryId);
+	return p && p->gen == pg_atomic_read_u64(&pgss->removal_gen);
+}
+
+static void
+yb_pgss_pending_clear(YbPgssPending *p)
+{
+	if (!p->has_data)
+		return;
+	memset(&p->delta->counters, 0, sizeof(Counters));
+	p->delta->yb_slow_executions = 0;
+	if (p->delta->yb_hdr_histogram.total_count > 0)
+		hdr_reset(&p->delta->yb_hdr_histogram);
+	p->has_data = false;
+	yb_pgss_pending_dirty--;
+}
+
+/*
+ * Fold if the oldest pending statistics are at least interval ms old.  The
+ * caller's end-of-statement instant is reused when it has one.
+ */
+static void
+yb_pgss_pending_maybe_fold(int interval, const instr_time *end_time)
+{
+	instr_time	elapsed;
+
+	if (yb_pgss_pending_dirty == 0)
+		return;
+	if (end_time)
+		elapsed = *end_time;
+	else
+		INSTR_TIME_SET_CURRENT(elapsed);
+	INSTR_TIME_SUBTRACT(elapsed, yb_pgss_pending_since);
+	if (INSTR_TIME_GET_MILLISEC(elapsed) >= interval)
+		yb_pgss_fold_pending();
+}
+
+/*
+ * Fast path of pgss_store: if this backend has a current pending record for
+ * the key, add the statement to it and return true.  No shared lock is taken
+ * and no shared memory is written.
+ *
+ * This path skips the yb_pgss_needs_normalization discard rule of the
+ * synchronous path.  That is correct only because a current record proves
+ * that the entry exists, so no text is stored here.
+ */
+static bool
+yb_pgss_store_pending(uint64 queryId, pgssStoreKind kind,
+					  double total_time, uint64 rows,
+					  const BufferUsage *bufusage,
+					  const WalUsage *walusage,
+					  const struct JitInstrumentation *jitusage,
+					  YbInstrumentation *yb_stats, int interval,
+					  const instr_time *end_time)
+{
+	YbPgssPending *p;
+
+	p = yb_pgss_pending_find(queryId);
+	if (p == NULL)
+		return false;
+
+	if (p->gen != pg_atomic_read_u64(&pgss->removal_gen))
+	{
+		/*
+		 * Something was reset or evicted since the record was made current.
+		 * The fold drops the record's data if its entry is gone, or merges
+		 * it and makes the record current again.
+		 */
+		yb_pgss_fold_pending();
+		p = yb_pgss_pending_find(queryId);
+		if (p == NULL || p->gen != pg_atomic_read_u64(&pgss->removal_gen))
+			return false;
+	}
+
+	if (yb_enable_query_diagnostics)
+		YbQueryDiagnosticsAccumulatePgss(queryId, (YbQdPgssStoreKind) kind,
+										 total_time, rows, bufusage, walusage,
+										 jitusage);
+
+	yb_pgss_counters_accum(p->delta, kind, total_time, rows, bufusage, walusage,
+						   jitusage, yb_stats);
+
+	if (!p->has_data)
+	{
+		p->has_data = true;
+		if (yb_pgss_pending_dirty++ == 0)
+		{
+			if (end_time)
+				yb_pgss_pending_since = *end_time;
+			else
+				INSTR_TIME_SET_CURRENT(yb_pgss_pending_since);
+			/* The check below cannot fire for data just recorded. */
+			return true;
+		}
+	}
+
+	yb_pgss_pending_maybe_fold(interval, end_time);
+	return true;
+}
+
+/*
+ * After the synchronous path has updated the entry, start or refresh the
+ * pending record for its key.  incarnation and gen were read together under
+ * pgss->lock.  Allocation happens here, outside any lock.
+ */
+static void
+yb_pgss_pending_track(const pgssHashKey *key, uint32 incarnation, uint64 gen,
+					  int interval, const instr_time *end_time)
+{
+	YbPgssPending *p;
+
+	if (yb_pgss_pending_hash == NULL)
+	{
+		HASHCTL		ctl;
+
+		if (yb_pgss_pending_cxt == NULL)
+			yb_pgss_pending_cxt = AllocSetContextCreate(TopMemoryContext,
+														"pg_stat_statements pending",
+														ALLOCSET_DEFAULT_SIZES);
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(pgssHashKey);
+		ctl.entrysize = sizeof(YbPgssPending);
+		ctl.hcxt = yb_pgss_pending_cxt;
+		yb_pgss_pending_hash = hash_create("pg_stat_statements pending",
+										   YB_PGSS_PENDING_MAX_KEYS, &ctl,
+										   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	if (!yb_pgss_exit_callback_registered)
+	{
+		before_shmem_exit(yb_pgss_pending_shmem_exit, (Datum) 0);
+		yb_pgss_exit_callback_registered = true;
+	}
+
+	p = (YbPgssPending *) hash_search(yb_pgss_pending_hash, key, HASH_FIND,
+									  NULL);
+	if (p == NULL)
+	{
+		/* Zeroed: hdr_init_preallocated does not zero the counts. */
+		pgssEntry  *delta = MemoryContextAllocZero(yb_pgss_pending_cxt,
+												   sizeof(pgssEntry) +
+												   cfg.counts_len * sizeof(count_t));
+		bool		found;
+
+		hdr_init_preallocated(&delta->yb_hdr_histogram, &cfg);
+		p = (YbPgssPending *) hash_search(yb_pgss_pending_hash, key, HASH_ENTER,
+										  &found);
+		Assert(!found);
+		p->has_data = false;
+		p->delta = delta;
+	}
+	else if (p->incarnation != incarnation)
+	{
+		/* Data for an entry that no longer exists; a fold would drop it. */
+		yb_pgss_pending_clear(p);
+	}
+	p->incarnation = incarnation;
+	p->gen = gen;
+
+	if (hash_get_num_entries(yb_pgss_pending_hash) >= YB_PGSS_PENDING_MAX_KEYS)
+		yb_pgss_fold_pending();
+	else
+		yb_pgss_pending_maybe_fold(interval, end_time);
+}
+
+/*
+ * Merge a pending record into its shared entry.  Caller holds pgss->lock.
+ * Nothing here allocates or can raise an error.
+ */
+static void
+yb_pgss_entry_merge(pgssEntry *entry, const YbPgssPending *p)
+{
+	volatile pgssEntry *e = (volatile pgssEntry *) entry;
+	const Counters *src = &p->delta->counters;
+	Counters   *dst;
+
+	SpinLockAcquire(&e->mutex);
+	dst = (Counters *) &e->counters;
+
+	/* "Unstick" entry if it was previously sticky, as yb_pgss_counters_accum */
+	if (IS_STICKY((*dst)))
+		dst->usage = USAGE_INIT;
+
+	for (int kind = 0; kind < PGSS_NUMKIND; kind++)
+	{
+		int64		n_a = dst->calls[kind];
+		int64		n_b = src->calls[kind];
+
+		if (n_b == 0)
+			continue;
+		if (n_a == 0)
+		{
+			dst->min_time[kind] = src->min_time[kind];
+			dst->max_time[kind] = src->max_time[kind];
+			dst->mean_time[kind] = src->mean_time[kind];
+			dst->sum_var_time[kind] = src->sum_var_time[kind];
+		}
+		else
+		{
+			/*
+			 * Pairwise update (Chan et al.) of the mean and the sum of
+			 * squared deviations; equal to adding the statements one by one
+			 * up to floating-point rounding.
+			 */
+			double		n = (double) (n_a + n_b);
+			double		delta = src->mean_time[kind] - dst->mean_time[kind];
+
+			dst->mean_time[kind] += delta * (double) n_b / n;
+			dst->sum_var_time[kind] += src->sum_var_time[kind] +
+				delta * delta * (double) n_a * (double) n_b / n;
+			if (dst->min_time[kind] > src->min_time[kind])
+				dst->min_time[kind] = src->min_time[kind];
+			if (dst->max_time[kind] < src->max_time[kind])
+				dst->max_time[kind] = src->max_time[kind];
+		}
+		dst->calls[kind] += n_b;
+		dst->total_time[kind] += src->total_time[kind];
+	}
+
+	dst->rows += src->rows;
+	dst->shared_blks_hit += src->shared_blks_hit;
+	dst->shared_blks_read += src->shared_blks_read;
+	dst->shared_blks_dirtied += src->shared_blks_dirtied;
+	dst->shared_blks_written += src->shared_blks_written;
+	dst->local_blks_hit += src->local_blks_hit;
+	dst->local_blks_read += src->local_blks_read;
+	dst->local_blks_dirtied += src->local_blks_dirtied;
+	dst->local_blks_written += src->local_blks_written;
+	dst->temp_blks_read += src->temp_blks_read;
+	dst->temp_blks_written += src->temp_blks_written;
+	dst->blk_read_time += src->blk_read_time;
+	dst->blk_write_time += src->blk_write_time;
+	dst->temp_blk_read_time += src->temp_blk_read_time;
+	dst->temp_blk_write_time += src->temp_blk_write_time;
+	/* USAGE_EXEC() is added once per store and ignores its argument */
+	dst->usage += USAGE_EXEC(0) *
+		(double) (src->calls[PGSS_PLAN] + src->calls[PGSS_EXEC]);
+	dst->wal_records += src->wal_records;
+	dst->wal_fpi += src->wal_fpi;
+	dst->wal_bytes += src->wal_bytes;
+	dst->jit_functions += src->jit_functions;
+	dst->jit_generation_time += src->jit_generation_time;
+	dst->jit_inlining_count += src->jit_inlining_count;
+	dst->jit_inlining_time += src->jit_inlining_time;
+	dst->jit_optimization_count += src->jit_optimization_count;
+	dst->jit_optimization_time += src->jit_optimization_time;
+	dst->jit_emission_count += src->jit_emission_count;
+	dst->jit_emission_time += src->jit_emission_time;
+	for (int i = 0; i < YB_NUM_COUNTERS_INT; i++)
+		dst->yb_counters.counters[i] += src->yb_counters.counters[i];
+	for (int i = 0; i < YB_NUM_COUNTERS_DBL; i++)
+		dst->yb_counters.counters_dbl[i] += src->yb_counters.counters_dbl[i];
+
+	/*
+	 * Both histograms use cfg, so hdr_add drops nothing and allocates
+	 * nothing.  It re-records each bucket at the bucket's lowest value, so
+	 * the shared histogram's min_value and max_value become bucket bounds;
+	 * nothing reads them.
+	 */
+	if (p->delta->yb_hdr_histogram.total_count > 0)
+		(void) hdr_add((hdr_histogram *) &e->yb_hdr_histogram,
+					   &p->delta->yb_hdr_histogram);
+	e->yb_slow_executions += p->delta->yb_slow_executions;
+
+	SpinLockRelease(&e->mutex);
+}
+
+/*
+ * Fold this backend's pending statistics into the shared entries, under one
+ * shared acquisition of pgss->lock.  Must not raise an error: it runs from
+ * statement end, read and reset functions, and backend exit.
+ */
+static void
+yb_pgss_fold_pending(void)
+{
+	if (yb_pgss_in_fold || yb_pgss_pending_hash == NULL)
+		return;
+
+	if (yb_pgss_pending_dirty > 0 && pgss && pgss_hash)
+	{
+		HASH_SEQ_STATUS hash_seq;
+		YbPgssPending *p;
+		uint64		gen;
+
+		yb_pgss_in_fold = true;
+		LWLockAcquire(pgss->lock, LW_SHARED);
+		gen = pg_atomic_read_u64(&pgss->removal_gen);
+
+		hash_seq_init(&hash_seq, yb_pgss_pending_hash);
+		while ((p = hash_seq_search(&hash_seq)) != NULL)
+		{
+			pgssEntry  *entry;
+
+			if (!p->has_data)
+				continue;
+
+			entry = (pgssEntry *) hash_search(pgss_hash, &p->key, HASH_FIND,
+											  NULL);
+
+			/*
+			 * An absent entry or another incarnation means a reset or
+			 * eviction removed the entry the data belongs to: drop it.  The
+			 * record's gen is then older than removal_gen, so its next store
+			 * takes the synchronous path.
+			 */
+			if (entry && entry->yb_incarnation == p->incarnation)
+			{
+				yb_pgss_entry_merge(entry, p);
+				if (yb_enable_query_diagnostics)
+					YbSetPgssNormalizedQueryText(p->key.queryid,
+												 entry->query_offset,
+												 entry->query_len);
+				/* Read under the same lock as the incarnation check */
+				p->gen = gen;
+			}
+			yb_pgss_pending_clear(p);
+		}
+
+		LWLockRelease(pgss->lock);
+		yb_pgss_in_fold = false;
+	}
+
+	/*
+	 * At the cap, start over with an empty table: each key then takes the
+	 * synchronous path once more.  This bounds the memory of a backend that
+	 * cycles through many statement shapes.
+	 */
+	if (yb_pgss_pending_dirty == 0 &&
+		hash_get_num_entries(yb_pgss_pending_hash) >= YB_PGSS_PENDING_MAX_KEYS)
+	{
+		MemoryContextDelete(yb_pgss_pending_cxt);
+		yb_pgss_pending_cxt = NULL;
+		yb_pgss_pending_hash = NULL;
+	}
+}
+
+/*
+ * before_shmem_exit callback, so that statistics survive a disconnect and
+ * reach the postmaster's dump at shutdown.  It is registered after
+ * ShutdownPostgres and so runs before LWLocks are released on a FATAL exit:
+ * folding while pgss->lock is held, or from inside a fold, could self-deadlock
+ * or count statements twice.
+ */
+static void
+yb_pgss_pending_shmem_exit(int code, Datum arg)
+{
+	if (!pgss || !pgss_hash || yb_pgss_in_fold || LWLockHeldByMe(pgss->lock))
+		return;
+	yb_pgss_fold_pending();
 }
 
 /*
@@ -2269,6 +2887,9 @@ done:
 Datum
 pg_stat_statements_reset_1_7(PG_FUNCTION_ARGS)
 {
+	/* YB: reset this backend's statistics like everyone's */
+	yb_pgss_fold_pending();
+
 	if (yb_enable_query_diagnostics)
 		*yb_pgss_last_reset_time = GetCurrentTimestamp();
 
@@ -2291,6 +2912,9 @@ pg_stat_statements_reset_1_7(PG_FUNCTION_ARGS)
 Datum
 pg_stat_statements_reset(PG_FUNCTION_ARGS)
 {
+	/* YB: reset this backend's statistics like everyone's */
+	yb_pgss_fold_pending();
+
 	if (yb_enable_query_diagnostics)
 		*yb_pgss_last_reset_time = GetCurrentTimestamp();
 
@@ -2452,6 +3076,12 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 	int			gc_count = 0;
 	HASH_SEQ_STATUS hash_seq;
 	pgssEntry  *entry;
+	bool		yb_show_histogram;
+	hdr_histogram *yb_hist = NULL;
+	size_t		yb_slow_executions = 0;
+
+	/* YB: so that this backend reads its own statements */
+	yb_pgss_fold_pending();
 
 	/*
 	 * Superusers or roles with the privileges of pg_read_all_stats members
@@ -2569,6 +3199,16 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 	 * we need to partition the hash table to limit the time spent holding any
 	 * one lock.
 	 */
+	yb_show_histogram = (api_version == YB_PGSS_V1_4 ||
+						 api_version == YB_PGSS_V1_10 ||
+						 api_version == YB_V2_0_PGSS_V1_10 ||
+						 api_version == YB_V2_1_PGSS_V1_10 ||
+						 api_version == YB_V2_2_PGSS_V1_10);
+	/* YB: allocated before the lock; filled under each entry's spinlock */
+	if (yb_show_histogram)
+		yb_hist = palloc(sizeof(hdr_histogram) +
+						 cfg.counts_len * sizeof(count_t));
+
 	LWLockAcquire(pgss->lock, LW_SHARED);
 
 	if (showtext)
@@ -2670,6 +3310,12 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 
 			SpinLockAcquire(&e->mutex);
 			tmp = e->counters;
+			if (yb_hist)
+			{
+				memcpy(yb_hist, (const hdr_histogram *) &e->yb_hdr_histogram,
+					   sizeof(hdr_histogram) + cfg.counts_len * sizeof(count_t));
+				yb_slow_executions = e->yb_slow_executions;
+			}
 			SpinLockRelease(&e->mutex);
 		}
 
@@ -2758,15 +3404,9 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 			values[i++] = Float8GetDatumFast(tmp.jit_emission_time);
 		}
 
-		if (api_version == YB_PGSS_V1_4 || api_version == YB_PGSS_V1_10 ||
-			api_version == YB_V2_0_PGSS_V1_10 || api_version == YB_V2_1_PGSS_V1_10 ||
-			api_version == YB_V2_2_PGSS_V1_10)
-		{
-			values[i++] = yb_get_histogram_jsonb_args(queryid,
-													  entry->key.userid,
-													  entry->key.dbid,
-													  entry->key.toplevel);
-		}
+		if (yb_show_histogram)
+			values[i++] = yb_add_histogram_jsonb(NULL, yb_hist,
+												 yb_slow_executions);
 
 		if (api_version >= YB_V2_0_PGSS_V1_10)
 		{
@@ -2820,6 +3460,8 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 
 	if (qbuffer)
 		pfree(qbuffer);
+	if (yb_hist)
+		pfree(yb_hist);
 }
 
 /* Number of output arguments (columns) for pg_stat_statements_info */
@@ -2835,6 +3477,9 @@ pg_stat_statements_info(PG_FUNCTION_ARGS)
 	TupleDesc	tupdesc;
 	Datum		values[PG_STAT_STATEMENTS_INFO_COLS];
 	bool		nulls[PG_STAT_STATEMENTS_INFO_COLS];
+
+	/* YB: so that this backend reads its own statements */
+	yb_pgss_fold_pending();
 
 	if (!pgss || !pgss_hash)
 		ereport(ERROR,
@@ -2928,6 +3573,15 @@ entry_alloc(pgssHashKey *key, Size query_offset, int query_len, int encoding,
 		/* zero out histogram space when new entry is created */
 		yb_hdr_reset(&entry->yb_hdr_histogram);
 		hdr_init_preallocated(&entry->yb_hdr_histogram, &cfg);
+
+		/*
+		 * YB: A new incarnation tells a fold that pending statistics recorded
+		 * for an earlier entry with this key must be dropped.  Zero is never
+		 * assigned, so a zeroed incarnation matches no entry.
+		 */
+		entry->yb_incarnation = (uint32) pgss->next_incarnation++;
+		if (entry->yb_incarnation == 0)
+			entry->yb_incarnation = (uint32) pgss->next_incarnation++;
 	}
 
 	return entry;
@@ -2977,6 +3631,9 @@ entry_dealloc(void)
 	 * making two passes to get a more current result.  Likewise, the new
 	 * cur_median_usage includes the entries we're about to zap.
 	 */
+
+	/* YB: makes backends revalidate their pending records */
+	(void) pg_atomic_fetch_add_u64(&pgss->removal_gen, 1);
 
 	entries = palloc(hash_get_num_entries(pgss_hash) * sizeof(pgssEntry *));
 
@@ -3533,6 +4190,13 @@ entry_reset(Oid userid, Oid dbid, uint64 queryid)
 				 errmsg("pg_stat_statements must be loaded via shared_preload_libraries")));
 
 	LWLockAcquire(pgss->lock, LW_EXCLUSIVE);
+
+	/*
+	 * YB: Bump first, whether or not anything is removed, so that every form
+	 * and every exit below makes backends revalidate their pending records.
+	 */
+	(void) pg_atomic_fetch_add_u64(&pgss->removal_gen, 1);
+
 	num_entries = hash_get_num_entries(pgss_hash);
 
 	if (userid != 0 && dbid != 0 && queryid != UINT64CONST(0))
@@ -3888,6 +4552,17 @@ yb_get_histogram_jsonb_args(uint64 queryid, Oid userid, Oid dbid, bool top_level
 	dbid = dbid != InvalidOid ? dbid : MyDatabaseId;
 	pgssHashKey key;
 	pgssEntry  *entry;
+	hdr_histogram *hist;
+	size_t		yb_slow_executions = 0;
+	Datum		result;
+
+	if (!pgss || !pgss_hash)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pg_stat_statements must be loaded via shared_preload_libraries")));
+
+	/* So that this backend reads its own statements */
+	yb_pgss_fold_pending();
 
 	memset(&key, 0, sizeof(pgssHashKey));
 	key.queryid = queryid;
@@ -3895,7 +4570,26 @@ yb_get_histogram_jsonb_args(uint64 queryid, Oid userid, Oid dbid, bool top_level
 	key.dbid = dbid;
 	key.toplevel = top_level;
 
+	/*
+	 * Copy the histogram under the entry's spinlock, as other backends write
+	 * it under that lock, and build the jsonb from the copy with no lock
+	 * held.
+	 */
+	hist = palloc(sizeof(hdr_histogram) + cfg.counts_len * sizeof(count_t));
+
+	LWLockAcquire(pgss->lock, LW_SHARED);
 	entry = (pgssEntry *) hash_search(pgss_hash, &key, HASH_FIND, NULL);
+	if (entry)
+	{
+		volatile pgssEntry *e = (volatile pgssEntry *) entry;
+
+		SpinLockAcquire(&e->mutex);
+		memcpy(hist, (const hdr_histogram *) &e->yb_hdr_histogram,
+			   sizeof(hdr_histogram) + cfg.counts_len * sizeof(count_t));
+		yb_slow_executions = e->yb_slow_executions;
+		SpinLockRelease(&e->mutex);
+	}
+	LWLockRelease(pgss->lock);
 
 	if (!entry)
 	{
@@ -3905,10 +4599,9 @@ yb_get_histogram_jsonb_args(uint64 queryid, Oid userid, Oid dbid, bool top_level
 		PG_RETURN_DATUM(0);
 	}
 
-	JsonbParseState *state = NULL;
-
-	return yb_add_histogram_jsonb(state, &entry->yb_hdr_histogram,
-								  entry->yb_slow_executions);
+	result = yb_add_histogram_jsonb(NULL, hist, yb_slow_executions);
+	pfree(hist);
+	return result;
 }
 
 /*

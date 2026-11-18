@@ -392,6 +392,10 @@ class PgBackendsTestNoWaitQueues : public PgBackendsTest {
     PgBackendsTest::UpdateMiniClusterOptions(options);
     options->extra_tserver_flags.push_back("--enable_wait_queues=false");
     options->extra_tserver_flags.push_back("--yb_enable_read_committed_isolation=true");
+    // CheckPgssConflictRetries reads counters that another backend wrote, so pg_stat_statements
+    // must update them per statement.
+    AppendCsvFlagValue(
+        options->extra_tserver_flags, "ysql_pg_conf_csv", "pg_stat_statements.yb_flush_interval=0");
   }
 
   // Simulates a transaction conflict scenario to test retry counting

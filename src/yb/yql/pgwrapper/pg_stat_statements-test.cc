@@ -11,7 +11,12 @@
 // under the License.
 //
 
+#include <fstream>
+#include <optional>
+#include <sstream>
+
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/path_util.h"
 #include "yb/util/test_thread_holder.h"
 #include "yb/yql/pgwrapper/libpq_test_base.h"
 
@@ -28,6 +33,81 @@ class PgStatStatementsTest : public LibPqTestBase {
   void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
     options->replication_factor = 1;
     options->extra_tserver_flags.push_back("--ysql_enable_auto_analyze=false");
+  }
+
+ protected:
+  // A backend keeps its statistics in local memory and adds them to pg_stat_statements when it
+  // folds: at the end of a statement after pg_stat_statements.yb_flush_interval, when it reads or
+  // resets pg_stat_statements, and when it exits. The first store for a key in a backend, and the
+  // first after any reset or eviction, is synchronous; with track_planning on (the default) that
+  // is the plan of the first execution, and its execution is already pending. So the cases below
+  // that check lag compare deltas or bounds, and the others read after the writer has folded.
+
+  static Result<int32_t> BackendPid(PGConn* conn) {
+    return conn->FetchRow<int32_t>("SELECT pg_backend_pid()");
+  }
+
+  // A backend leaves pg_stat_activity in an on_shmem_exit callback, after the before_shmem_exit
+  // callback that folds its statistics.
+  static Status WaitForBackendsGone(PGConn* reader, const std::vector<int32_t>& pids) {
+    std::string pid_list;
+    for (auto pid : pids) {
+      pid_list += Format("$0$1", pid_list.empty() ? "" : ",", pid);
+    }
+    return LoggedWaitFor(
+        [reader, &pid_list]() -> Result<bool> {
+          return VERIFY_RESULT(reader->FetchRow<int64_t>(Format(
+              "SELECT count(*) FROM pg_stat_activity "
+              "WHERE backend_type = 'client backend' AND pid IN ($0)", pid_list))) == 0;
+        },
+        30s * kTimeMultiplier, "waiting for writer backends to exit");
+  }
+
+  static Result<int64_t> SumCalls(PGConn* conn, const std::string& where) {
+    return conn->FetchRow<int64_t>(Format(
+        "SELECT COALESCE(sum(calls), 0)::bigint FROM pg_stat_statements WHERE $0", where));
+  }
+
+  static Result<int64_t> SumRows(PGConn* conn, const std::string& where) {
+    return conn->FetchRow<int64_t>(Format(
+        "SELECT COALESCE(sum(rows), 0)::bigint FROM pg_stat_statements WHERE $0", where));
+  }
+
+  // Sum of every bucket of the latency histogram, including the one for slow executions.
+  static Result<int64_t> SumHistogram(PGConn* conn, const std::string& where) {
+    return conn->FetchRow<int64_t>(Format(
+        "SELECT COALESCE(sum(b.value::bigint), 0)::bigint "
+        "FROM pg_stat_statements s, jsonb_array_elements(s.yb_latency_histogram) h, "
+        "jsonb_each_text(h) b WHERE $0", where));
+  }
+
+  // A statement with no constants whose shape differs for each n.
+  static std::string ShapeQuery(int n) {
+    std::string query = "SELECT k";
+    for (int i = 1; i < n; ++i) {
+      query += ", k";
+    }
+    return query + " FROM test_table";
+  }
+
+  static constexpr auto kInsertWhere = "query LIKE 'INSERT INTO test_table%'";
+  static constexpr auto kSetLongInterval = "SET pg_stat_statements.yb_flush_interval = 60000";
+};
+
+class PgStatStatementsMaxTest : public PgStatStatementsTest {
+ public:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    PgStatStatementsTest::UpdateMiniClusterOptions(options);
+    AppendCsvFlagValue(
+        options->extra_tserver_flags, "ysql_pg_conf_csv", "pg_stat_statements.max=100");
+  }
+};
+
+class PgStatStatementsQueryDiagnosticsTest : public PgStatStatementsTest {
+ public:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    PgStatStatementsTest::UpdateMiniClusterOptions(options);
+    options->extra_tserver_flags.push_back("--ysql_yb_enable_query_diagnostics=true");
   }
 };
 
@@ -456,8 +536,9 @@ TEST_F(PgStatStatementsTest, FunctionPlanCachedWhileUntrackedNotLeaked) {
   ASSERT_TRUE(rows.empty())
       << "pg_stat_statements contains an unnormalized entry: " << rows[0];
 
-  // The top-level calls are still recorded.
-  auto calls = ASSERT_RESULT(conn1.FetchRow<int64_t>(
+  // The top-level calls are still recorded.  conn2 reads them, as its last execution may still be
+  // pending in its backend; its read folds it.
+  auto calls = ASSERT_RESULT(conn2.FetchRow<int64_t>(
       "SELECT calls FROM pg_stat_statements WHERE query = 'SELECT test_func()'"));
   ASSERT_EQ(calls, 2);
 }
@@ -493,12 +574,402 @@ TEST_F(PgStatStatementsTest, ReparsedWhileUntrackedNotLeaked) {
   ASSERT_TRUE(rows.empty())
       << "pg_stat_statements contains an unnormalized entry: " << rows[0];
 
-  // The execution before the table change is recorded with normalized text.
-  rows = ASSERT_RESULT(conn1.FetchRows<std::string>(
+  // The execution before the table change is recorded with normalized text.  conn2 reads it, as
+  // that execution may still be pending in its backend; its read folds it.
+  rows = ASSERT_RESULT(conn2.FetchRows<std::string>(
       "SELECT query || ' calls=' || calls FROM pg_stat_statements "
       "WHERE query LIKE 'PREPARE test_stmt%'"));
   ASSERT_EQ(rows, std::vector<std::string>{
       "PREPARE test_stmt AS SELECT count(*) FROM test_table WHERE a = $1 calls=1"});
+}
+
+
+// Concurrent sessions on one node, half with the simple protocol and half with a prepared
+// statement: once they have all exited, their exit folds make every count exact.
+TEST_F(PgStatStatementsTest, ConcurrentCallsExactAfterDisconnect) {
+  constexpr int kSessions = 8;
+  constexpr int kExecutions = 200;
+  constexpr int64_t kTotal = kSessions * kExecutions;
+
+  auto reader = ASSERT_RESULT(Connect());
+  ASSERT_OK(reader.Execute("CREATE TABLE test_table (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(reader.Fetch("SELECT pg_stat_statements_reset()"));
+
+  std::vector<int32_t> pids(kSessions);
+  TestThreadHolder thread_holder;
+  for (int s = 0; s < kSessions; ++s) {
+    thread_holder.AddThreadFunctor([this, s, &pids] {
+      auto conn = ASSERT_RESULT(Connect());
+      pids[s] = ASSERT_RESULT(BackendPid(&conn));
+      const bool prepared = s % 2 == 1;
+      if (prepared) {
+        ASSERT_OK(conn.Prepare(
+            "ins", "INSERT INTO test_table (k, v) VALUES ($1, 1) RETURNING k"));
+      }
+      for (int i = 0; i < kExecutions; ++i) {
+        const auto k = std::to_string(s * kExecutions + i);
+        if (prepared) {
+          ASSERT_OK(conn.FetchPrepared("ins", {k.c_str()}));
+        } else {
+          ASSERT_OK(conn.ExecuteFormat("INSERT INTO test_table (k, v) VALUES ($0, 1)", k));
+        }
+      }
+    });
+  }
+  thread_holder.JoinAll();
+  ASSERT_OK(WaitForBackendsGone(&reader, pids));
+
+  ASSERT_EQ(ASSERT_RESULT(SumCalls(&reader, kInsertWhere)), kTotal);
+  ASSERT_EQ(ASSERT_RESULT(SumRows(&reader, kInsertWhere)), kTotal);
+  ASSERT_EQ(ASSERT_RESULT(SumHistogram(&reader, kInsertWhere)), kTotal);
+}
+
+// A session's own reads see its statements at once; another session's do not.
+TEST_F(PgStatStatementsTest, ReadYourOwnWrites) {
+  constexpr int kExecutions = 10;
+  auto writer = ASSERT_RESULT(Connect());
+  auto other = ASSERT_RESULT(Connect());
+  ASSERT_OK(writer.Execute("CREATE TABLE test_table (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(writer.Fetch("SELECT pg_stat_statements_reset()"));
+  ASSERT_OK(writer.Execute(kSetLongInterval));
+
+  for (int i = 0; i <= kExecutions; ++i) {
+    ASSERT_OK(writer.ExecuteFormat("INSERT INTO test_table (k, v) VALUES ($0, 1)", i));
+  }
+
+  // At most the first execution can have reached the shared entry.
+  ASSERT_LE(ASSERT_RESULT(SumCalls(&other, kInsertWhere)), 1);
+  ASSERT_EQ(ASSERT_RESULT(SumCalls(&writer, kInsertWhere)), kExecutions + 1);
+}
+
+// A full reset discards statistics another backend holds for the removed entries.
+TEST_F(PgStatStatementsTest, FullResetDiscardsPending) {
+  constexpr int kBeforeReset = 10;
+  constexpr int kAfterReset = 5;
+  auto other = ASSERT_RESULT(Connect());
+  ASSERT_OK(other.Execute("CREATE TABLE test_table (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(other.Fetch("SELECT pg_stat_statements_reset()"));
+
+  int32_t writer_pid = 0;
+  {
+    auto writer = ASSERT_RESULT(Connect());
+    writer_pid = ASSERT_RESULT(BackendPid(&writer));
+    ASSERT_OK(writer.Execute(kSetLongInterval));
+    int k = 0;
+    // The first execution warms the key; the rest are pending in the writer.
+    for (int i = 0; i <= kBeforeReset; ++i) {
+      ASSERT_OK(writer.ExecuteFormat("INSERT INTO test_table (k, v) VALUES ($0, 1)", k++));
+    }
+    ASSERT_OK(other.Fetch("SELECT pg_stat_statements_reset()"));
+    for (int i = 0; i < kAfterReset; ++i) {
+      ASSERT_OK(writer.ExecuteFormat("INSERT INTO test_table (k, v) VALUES ($0, 1)", k++));
+    }
+  }
+  ASSERT_OK(WaitForBackendsGone(&other, {writer_pid}));
+
+  ASSERT_EQ(ASSERT_RESULT(SumCalls(&other, kInsertWhere)), kAfterReset);
+}
+
+// A reset of one queryid discards pending statistics for it and keeps those of other keys.
+TEST_F(PgStatStatementsTest, PartialResetDiscardsPending) {
+  constexpr int kBeforeReset = 10;
+  constexpr int kAfterReset = 5;
+  constexpr auto kSelectWhere = "query LIKE 'SELECT v FROM test_table%'";
+  auto other = ASSERT_RESULT(Connect());
+  ASSERT_OK(other.Execute("CREATE TABLE test_table (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(other.Fetch("SELECT pg_stat_statements_reset()"));
+
+  int32_t writer_pid = 0;
+  {
+    auto writer = ASSERT_RESULT(Connect());
+    writer_pid = ASSERT_RESULT(BackendPid(&writer));
+    ASSERT_OK(writer.Execute(kSetLongInterval));
+    int k = 0;
+    for (int i = 0; i <= kBeforeReset; ++i) {
+      ASSERT_OK(writer.ExecuteFormat("INSERT INTO test_table (k, v) VALUES ($0, 1)", k++));
+      ASSERT_OK(writer.FetchFormat("SELECT v FROM test_table WHERE k = $0", i));
+    }
+    const auto insert_queryid = ASSERT_RESULT(other.FetchRow<int64_t>(Format(
+        "SELECT queryid FROM pg_stat_statements WHERE $0", kInsertWhere)));
+    ASSERT_OK(other.FetchFormat("SELECT pg_stat_statements_reset(0, 0, $0)", insert_queryid));
+    for (int i = 0; i < kAfterReset; ++i) {
+      ASSERT_OK(writer.ExecuteFormat("INSERT INTO test_table (k, v) VALUES ($0, 1)", k++));
+    }
+  }
+  ASSERT_OK(WaitForBackendsGone(&other, {writer_pid}));
+
+  ASSERT_EQ(ASSERT_RESULT(SumCalls(&other, kInsertWhere)), kAfterReset);
+  ASSERT_EQ(ASSERT_RESULT(SumCalls(&other, kSelectWhere)), kBeforeReset + 1);
+}
+
+// An entry recreated after a reset does not receive statistics another backend held for the
+// entry the reset removed.
+TEST_F(PgStatStatementsTest, RecreatedEntryDoesNotInheritPending) {
+  constexpr int kBeforeReset = 10;
+  constexpr int kAfterReset = 5;
+  auto recreator = ASSERT_RESULT(Connect());
+  ASSERT_OK(recreator.Execute("CREATE TABLE test_table (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(recreator.Fetch("SELECT pg_stat_statements_reset()"));
+
+  int k = 0;
+  int32_t writer_pid = 0;
+  {
+    auto writer = ASSERT_RESULT(Connect());
+    writer_pid = ASSERT_RESULT(BackendPid(&writer));
+    ASSERT_OK(writer.Execute(kSetLongInterval));
+    for (int i = 0; i <= kBeforeReset; ++i) {
+      ASSERT_OK(writer.ExecuteFormat("INSERT INTO test_table (k, v) VALUES ($0, 1)", k++));
+    }
+    ASSERT_OK(recreator.Fetch("SELECT pg_stat_statements_reset()"));
+    for (int i = 0; i < kAfterReset; ++i) {
+      ASSERT_OK(recreator.ExecuteFormat("INSERT INTO test_table (k, v) VALUES ($0, 1)", k++));
+    }
+  }
+  // The writer's exit fold finds the recreated entry and must drop what it holds.
+  ASSERT_OK(WaitForBackendsGone(&recreator, {writer_pid}));
+
+  // Some of the recreator's own executions may be pending; its read folds them.
+  ASSERT_EQ(ASSERT_RESULT(SumCalls(&recreator, kInsertWhere)), kAfterReset);
+}
+
+// Eviction discards statistics another backend holds for the evicted entry.
+TEST_F_EX(PgStatStatementsTest, EvictionDropsPending, PgStatStatementsMaxTest) {
+  constexpr int kExecutions = 10;
+  constexpr int kMaxShapes = 300;
+  auto evictor = ASSERT_RESULT(Connect());
+  ASSERT_OK(evictor.Execute("CREATE TABLE test_table (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(evictor.Fetch("SELECT pg_stat_statements_reset()"));
+  // Updated per statement, so the evictor's shapes gain usage at once and outrank the victim.
+  ASSERT_OK(evictor.Execute("SET pg_stat_statements.yb_flush_interval = 0"));
+
+  int32_t writer_pid = 0;
+  int64_t victim_queryid = 0;
+  {
+    auto writer = ASSERT_RESULT(Connect());
+    writer_pid = ASSERT_RESULT(BackendPid(&writer));
+    ASSERT_OK(writer.Execute(kSetLongInterval));
+    for (int i = 0; i <= kExecutions; ++i) {
+      ASSERT_OK(writer.ExecuteFormat("INSERT INTO test_table (k, v) VALUES ($0, 1)", i));
+    }
+    victim_queryid = ASSERT_RESULT(evictor.FetchRow<int64_t>(Format(
+        "SELECT queryid FROM pg_stat_statements WHERE $0", kInsertWhere)));
+    const auto victim_present = Format(
+        "SELECT count(*) FROM pg_stat_statements WHERE queryid = $0", victim_queryid);
+
+    bool evicted = false;
+    for (int n = 1; n <= kMaxShapes && !evicted; ++n) {
+      for (int r = 0; r < 3; ++r) {
+        ASSERT_OK(evictor.Fetch(ShapeQuery(n)));
+      }
+      if (n % 10 == 0) {
+        evicted = ASSERT_RESULT(evictor.FetchRow<int64_t>(victim_present)) == 0;
+      }
+    }
+    ASSERT_TRUE(evicted) << "the writer's entry was never evicted";
+    ASSERT_GT(ASSERT_RESULT(evictor.FetchRow<int64_t>(
+        "SELECT dealloc FROM pg_stat_statements_info")), 0);
+  }
+  ASSERT_OK(WaitForBackendsGone(&evictor, {writer_pid}));
+
+  // The writer's exit fold must not bring back the evicted entry or add to it.
+  ASSERT_EQ(ASSERT_RESULT(evictor.FetchRow<int64_t>(Format(
+      "SELECT count(*) FROM pg_stat_statements WHERE queryid = $0", victim_queryid))), 0);
+}
+
+// With track = 'all', top-level and nested statements are both folded exactly.
+TEST_F(PgStatStatementsTest, TrackAllNestedCounts) {
+  constexpr int kExecutions = 20;
+  auto reader = ASSERT_RESULT(Connect());
+  ASSERT_OK(reader.Execute("CREATE TABLE test_table (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(reader.Execute(
+      "CREATE FUNCTION test_fn(n int) RETURNS void LANGUAGE plpgsql AS $$ "
+      "BEGIN INSERT INTO test_table (k, v) VALUES (n, 1); END $$"));
+  ASSERT_OK(reader.Fetch("SELECT pg_stat_statements_reset()"));
+
+  int32_t writer_pid = 0;
+  {
+    auto writer = ASSERT_RESULT(Connect());
+    writer_pid = ASSERT_RESULT(BackendPid(&writer));
+    ASSERT_OK(writer.Execute(kSetLongInterval));
+    ASSERT_OK(writer.Execute("SET pg_stat_statements.track = 'all'"));
+    for (int i = 0; i < kExecutions; ++i) {
+      ASSERT_OK(writer.FetchFormat("SELECT test_fn($0)", i));
+    }
+  }
+  ASSERT_OK(WaitForBackendsGone(&reader, {writer_pid}));
+
+  ASSERT_EQ(ASSERT_RESULT(SumCalls(&reader, "query LIKE 'SELECT test_fn%' AND toplevel")),
+            kExecutions);
+  ASSERT_EQ(ASSERT_RESULT(SumCalls(&reader, Format("$0 AND NOT toplevel", kInsertWhere))),
+            kExecutions);
+}
+
+// At interval 0 every statement updates the shared entry before it returns.
+TEST_F(PgStatStatementsTest, FlushIntervalZeroIsSynchronous) {
+  constexpr int kExecutions = 10;
+  auto writer = ASSERT_RESULT(Connect());
+  auto reader = ASSERT_RESULT(Connect());
+  ASSERT_OK(writer.Execute("CREATE TABLE test_table (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(writer.Fetch("SELECT pg_stat_statements_reset()"));
+  ASSERT_OK(writer.Execute("SET pg_stat_statements.yb_flush_interval = 0"));
+
+  ASSERT_OK(writer.Execute("INSERT INTO test_table (k, v) VALUES (0, 1)"));
+  const auto baseline = ASSERT_RESULT(SumCalls(&reader, kInsertWhere));
+  for (int i = 1; i <= kExecutions; ++i) {
+    ASSERT_OK(writer.ExecuteFormat("INSERT INTO test_table (k, v) VALUES ($0, 1)", i));
+  }
+  ASSERT_EQ(ASSERT_RESULT(SumCalls(&reader, kInsertWhere)), baseline + kExecutions);
+}
+
+// Planning statistics are folded with the executions they belong to.
+TEST_F(PgStatStatementsTest, TrackPlanningCounts) {
+  constexpr int kExecutions = 20;
+  auto reader = ASSERT_RESULT(Connect());
+  ASSERT_OK(reader.Execute("CREATE TABLE test_table (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(reader.Fetch("SELECT pg_stat_statements_reset()"));
+
+  int32_t writer_pid = 0;
+  {
+    auto writer = ASSERT_RESULT(Connect());
+    writer_pid = ASSERT_RESULT(BackendPid(&writer));
+    ASSERT_OK(writer.Execute(kSetLongInterval));
+    ASSERT_OK(writer.Execute("SET pg_stat_statements.track_planning = on"));
+    // Each execution of an unnamed statement is planned with a custom plan.
+    for (int i = 0; i < kExecutions; ++i) {
+      ASSERT_OK(writer.FetchFormat("SELECT v FROM test_table WHERE k = $0", i));
+    }
+  }
+  ASSERT_OK(WaitForBackendsGone(&reader, {writer_pid}));
+
+  const auto [plans, calls] = ASSERT_RESULT((reader.FetchRow<int64_t, int64_t>(
+      "SELECT plans, calls FROM pg_stat_statements WHERE query LIKE 'SELECT v FROM test_table%'")));
+  ASSERT_EQ(calls, kExecutions);
+  ASSERT_EQ(plans, kExecutions);
+}
+
+// Reaching the cap on pending keys folds everything, with the writer still connected.
+TEST_F(PgStatStatementsTest, PendingCapFolds) {
+  constexpr int kShapes = 65;
+  auto writer = ASSERT_RESULT(Connect());
+  auto reader = ASSERT_RESULT(Connect());
+  ASSERT_OK(writer.Execute("CREATE TABLE test_table (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(writer.Fetch("SELECT pg_stat_statements_reset()"));
+  ASSERT_OK(writer.Execute(kSetLongInterval));
+
+  const auto first_shape = Format("query = '$0'", ShapeQuery(1));
+  for (int n = 1; n <= kShapes; ++n) {
+    ASSERT_OK(writer.Fetch(ShapeQuery(n)));
+    ASSERT_OK(writer.Fetch(ShapeQuery(n)));
+    if (n == 2) {
+      // Far below the cap: the second execution of shape 1 is still pending.
+      ASSERT_LT(ASSERT_RESULT(SumCalls(&reader, first_shape)), 2);
+    }
+  }
+  // The writer's own SET statements also take keys, so the cap is crossed at some shape before
+  // the last one.
+  ASSERT_EQ(ASSERT_RESULT(SumCalls(&reader, first_shape)), 2);
+}
+
+class PgStatStatementsRestartTest : public PgStatStatementsTest {
+ protected:
+  // Statistics of a statement executed once to warm its key and then kExecutions more times, in a
+  // writer that is still connected at the restart when writer_connected_at_restart is set.
+  void TestStatsSurviveRestart(bool writer_connected_at_restart) {
+    constexpr int kExecutions = 10;
+    std::optional<PGConn> writer;
+    {
+      auto reader = ASSERT_RESULT(Connect());
+      ASSERT_OK(reader.Execute("CREATE TABLE test_table (k INT PRIMARY KEY, v INT)"));
+      ASSERT_OK(reader.Fetch("SELECT pg_stat_statements_reset()"));
+
+      writer.emplace(ASSERT_RESULT(Connect()));
+      const auto writer_pid = ASSERT_RESULT(BackendPid(&*writer));
+      if (writer_connected_at_restart) {
+        // Only the exit fold at shutdown can add these to the saved statistics.
+        ASSERT_OK(writer->Execute(kSetLongInterval));
+      }
+      for (int i = 0; i <= kExecutions; ++i) {
+        ASSERT_OK(writer->ExecuteFormat("INSERT INTO test_table (k, v) VALUES ($0, 1)", i));
+      }
+      if (!writer_connected_at_restart) {
+        writer.reset();
+        ASSERT_OK(WaitForBackendsGone(&reader, {writer_pid}));
+      }
+    }
+
+    // Killing the tablet server makes the postmaster do a fast shutdown, which terminates the
+    // remaining backends and then saves the statistics.
+    pg_ts->Shutdown();
+    writer.reset();
+    ASSERT_OK(pg_ts->Restart());
+
+    auto conn = ASSERT_RESULT(Connect());
+    ASSERT_EQ(ASSERT_RESULT(SumCalls(&conn, kInsertWhere)), kExecutions + 1);
+  }
+};
+
+TEST_F_EX(PgStatStatementsTest, StatsSurviveRestart, PgStatStatementsRestartTest) {
+  ASSERT_NO_FATALS(TestStatsSurviveRestart(/* writer_connected_at_restart = */ false));
+}
+
+TEST_F_EX(PgStatStatementsTest, StatsSurviveRestartWriterConnected, PgStatStatementsRestartTest) {
+  ASSERT_NO_FATALS(TestStatsSurviveRestart(/* writer_connected_at_restart = */ true));
+}
+
+// A query diagnostics bundle gets the statement's text from pg_stat_statements even when every
+// execution during the bundle was pending: the fold supplies it.
+TEST_F_EX(
+    PgStatStatementsTest, QueryDiagnosticsGetsPgssText, PgStatStatementsQueryDiagnosticsTest) {
+  constexpr int kExecutions = 10;
+  constexpr int kBundleSeconds = 5;
+  constexpr auto kNormalizedInsert = "INSERT INTO test_table VALUES ($1)";
+  auto reader = ASSERT_RESULT(Connect());
+  ASSERT_OK(reader.Execute("CREATE TABLE test_table (k INT)"));
+  ASSERT_OK(reader.Fetch("SELECT pg_stat_statements_reset()"));
+
+  int32_t writer_pid = 0;
+  int64_t queryid = 0;
+  std::string bundle_path;
+  {
+    auto writer = ASSERT_RESULT(Connect());
+    writer_pid = ASSERT_RESULT(BackendPid(&writer));
+    ASSERT_OK(writer.Execute(kSetLongInterval));
+    // Warm the key before the bundle starts, so no execution during the bundle is synchronous.
+    ASSERT_OK(writer.Execute("INSERT INTO test_table VALUES (0)"));
+    queryid = ASSERT_RESULT(reader.FetchRow<int64_t>(Format(
+        "SELECT queryid FROM pg_stat_statements WHERE query = '$0'", kNormalizedInsert)));
+    bundle_path = ASSERT_RESULT(reader.FetchRow<std::string>(Format(
+        "SELECT yb_query_diagnostics(query_id => $0, diagnostics_interval_sec => $1)",
+        queryid, kBundleSeconds)));
+    for (int i = 1; i <= kExecutions; ++i) {
+      ASSERT_OK(writer.ExecuteFormat("INSERT INTO test_table VALUES ($0)", i));
+    }
+  }
+  // The writer's exit fold, within the bundle's interval, gives the bundle the text.
+  ASSERT_OK(WaitForBackendsGone(&reader, {writer_pid}));
+
+  ASSERT_OK(LoggedWaitFor(
+      [&reader, queryid]() -> Result<bool> {
+        auto statuses = VERIFY_RESULT(reader.FetchRows<std::string>(Format(
+            "SELECT status FROM yb_query_diagnostics_status WHERE query_id = $0", queryid)));
+        return !statuses.empty() && statuses[0] != "In Progress";
+      },
+      60s * kTimeMultiplier, "waiting for the query diagnostics bundle to complete"));
+
+  std::ifstream pgss_file(JoinPathSegments(bundle_path, "pg_stat_statements.csv"));
+  ASSERT_TRUE(pgss_file.good()) << "no pg_stat_statements.csv in " << bundle_path;
+  std::string header;
+  std::string line;
+  ASSERT_TRUE(static_cast<bool>(std::getline(pgss_file, header)));
+  ASSERT_TRUE(static_cast<bool>(std::getline(pgss_file, line)));
+  std::vector<std::string> fields;
+  std::stringstream line_stream(line);
+  for (std::string field; std::getline(line_stream, field, ',');) {
+    fields.push_back(field);
+  }
+  ASSERT_GE(fields.size(), 3U) << line;
+  ASSERT_EQ(fields[1], Format("\"$0\"", kNormalizedInsert)) << line;
+  ASSERT_EQ(fields[2], std::to_string(kExecutions)) << line;
 }
 
 }  // namespace pgwrapper

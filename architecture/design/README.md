@@ -34,6 +34,7 @@ Below you can find a table of high level and non-trivial features, relevant desi
 |YCQL virtual system tables|TBD|
 |YEDIS server component|Amitanand|
 |[YSQL colocated tables](ysql-colocated-tables.md)|Jason|
+|[YSQL pg_stat_statements pending statistics](ysql-pg-stat-statements-pending-stats.md)|TBD|
 |[YSQL row level partitioning](ysql-row-level-partitioning.md)|Deepthi|
 |[YSQL tablegroups](ysql-tablegroups.md)|Mihnea|
 |[YSQL tablespaces](wip-ysql-tablespaces.md)|Deepthi|

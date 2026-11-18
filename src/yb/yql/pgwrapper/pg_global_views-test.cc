@@ -54,8 +54,12 @@ class PgGlobalViewsTest : public LibPqTestBase {
   }
 
   void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
-    options->extra_tserver_flags.push_back(
-        "--ysql_pg_conf_csv=yb_enable_global_views=true");
+    AppendCsvFlagValue(
+        options->extra_tserver_flags, "ysql_pg_conf_csv", "yb_enable_global_views=true");
+    // The checks read pg_stat_statements counters written by other backends, through remote
+    // queries, so they must be updated per statement.
+    AppendCsvFlagValue(
+        options->extra_tserver_flags, "ysql_pg_conf_csv", "pg_stat_statements.yb_flush_interval=0");
     options->extra_tserver_flags.push_back(Format(
         "--remote_pg_query_execution_rpc_timeout_ms=$0", kGlobalViewsRpcTimeoutMs));
     options->extra_tserver_flags.push_back("--vmodule=tablet_service=1");

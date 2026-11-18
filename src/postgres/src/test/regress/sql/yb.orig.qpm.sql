@@ -11,6 +11,8 @@ SET yb_pg_stat_plans_track_catalog_queries = OFF;
 
 -- The number of plans reset vary between debug and release builds. Therefore discard the result.
 DO $$ BEGIN PERFORM yb_pg_stat_plans_reset(NULL, NULL, NULL, NULL); END $$;
+-- QPM's sequential mean equals pgss mean_exec_time exactly only when pgss updates per statement.
+SET pg_stat_statements.yb_flush_interval = 0;
 SELECT pg_stat_statements_reset();
 
 SELECT val FROM qpm_timing_test WHERE id = 1;

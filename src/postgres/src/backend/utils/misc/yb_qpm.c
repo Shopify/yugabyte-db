@@ -80,8 +80,10 @@ typedef struct YbQpmHashKey
 typedef struct YbQpmTiming
 {
 	double		meanExecTime;	/* running mean execution time in ms, updated via
-								 * Welford's online algorithm and matches
-								 * pg_stat_statements mean_exec_time */
+								 * Welford's online algorithm; matches
+								 * pg_stat_statements mean_exec_time exactly at
+								 * pg_stat_statements.yb_flush_interval = 0, and
+								 * up to floating-point rounding otherwise */
 	double		estTotalCost;
 	double		worstTotalTime;
 	uint32		cnt;
@@ -1119,7 +1121,9 @@ qpmInsert(uint32 databaseId, uint32 userId, uint64 queryId, uint64 planId,
 
 			/*
 			 * Welford's online algorithm for a numerically stable running
-			 * mean. Matches pg_stat_statements mean_exec_time exactly.
+			 * mean. Matches pg_stat_statements mean_exec_time exactly at
+			 * pg_stat_statements.yb_flush_interval = 0, and up to
+			 * floating-point rounding otherwise.
 			 * See: http://www.johndcook.com/blog/standard_deviation/
 			 */
 			oldMean = hashEntry->timing.meanExecTime;
