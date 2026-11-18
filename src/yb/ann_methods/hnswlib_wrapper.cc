@@ -109,9 +109,8 @@ class YbSpace : public hnswlib::SpaceInterface<DistanceResult> {
 
  private:
   static DistanceResult DistFunc(const void* lhs, const void* rhs, const void* arg) {
-    auto& metric = *static_cast<const unum::usearch::metric_punned_t*>(arg);
-    return metric(pointer_cast<const unum::usearch::byte_t*>(lhs),
-                  pointer_cast<const unum::usearch::byte_t*>(rhs));
+    return vector_index::MetricDistance(
+        *static_cast<const unum::usearch::metric_punned_t*>(arg), lhs, rhs);
   }
 
   unum::usearch::metric_punned_t metric_;
@@ -376,7 +375,7 @@ class HnswlibIndex :
           query_vector.data(), options.max_num_results, options.tenant.AsStringView(), filter,
           options.ef);
     } else {
-      for (auto entry : hnsw_->getTenantEntries()) {
+      for (auto [_, entry] : hnsw_->getTenantEntries()) {
         auto tenant_top = hnsw_->searchKnnFrom(
             query_vector.data(), options.max_num_results, filter, options.ef, entry);
         for (; !tenant_top.empty(); tenant_top.pop()) {

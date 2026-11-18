@@ -81,9 +81,7 @@ class UsearchSpace : public hnswlib::SpaceInterface<YbHnsw::DistanceType> {
 
  private:
   static YbHnsw::DistanceType DistFunc(const void* lhs, const void* rhs, const void* arg) {
-    using unum::usearch::byte_t;
-    return (*static_cast<const UsearchMetric::Impl*>(arg))(
-        static_cast<const byte_t*>(lhs), static_cast<const byte_t*>(rhs));
+    return vector_index::MetricDistance(*static_cast<const UsearchMetric::Impl*>(arg), lhs, rhs);
   }
 
   UsearchMetric::Impl metric_;
@@ -248,7 +246,7 @@ TEST_F(YbHnswTest, IgnoreBlockTrailers) {
 TEST_F(YbHnswTest, UnknownFooterFlags) {
   TestSimple(/* load= */ true);
   const auto path = YbHnswPath();
-  for (uint8_t flags : {0x07, 0x02}) {
+  for (uint8_t flags : {0x0f, 0x02}) {
     ASSERT_OK(SetYbHnswFooterFlags(path, flags));
     YbHnsw yb_hnsw(metric_, block_cache_);
     auto status = yb_hnsw.Init(path);
