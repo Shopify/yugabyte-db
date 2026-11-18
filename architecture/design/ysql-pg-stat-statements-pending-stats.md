@@ -16,7 +16,7 @@ All of this lives in `src/postgres/contrib/pg_stat_statements/pg_stat_statements
 
 ## Pending records
 
-Each backend has a hash table, `pgssHashKey -> pgssPending`, in its own memory context under
+Each backend has a hash table, `pgssHashKey -> YbPgssPending`, in its own memory context under
 `TopMemoryContext`. A record holds:
 
 - the `incarnation` of the shared entry it belongs to and the `gen` read with it;
@@ -82,8 +82,8 @@ during transaction abort, where shared-memory work is unsafe.
 
 ## Fold
 
-`pgss_fold_pending` takes `pgss->lock` shared once and, for each record holding data, looks up its
-key:
+`yb_pgss_fold_pending` takes `pgss->lock` shared once and, for each record holding data, looks
+up its key:
 
 - entry absent, or `yb_incarnation` differs: drop the data. These statements predate a reset or
   eviction of the entry, which discards them anyway. The record stays stale, so its next store is
@@ -97,13 +97,14 @@ key:
   exactly with the incarnation just checked; an unrelated reset or eviction therefore costs no
   trip through the synchronous path.
 
-The fold neither allocates nor raises errors, and an `in_fold` flag keeps it from being re-entered.
+The fold neither allocates nor raises errors, and a `yb_pgss_in_fold` flag keeps it from being
+re-entered.
 
 Triggers:
 
-- the end of a store, when the oldest pending statistics are at least `yb_flush_interval` old. The
-  check uses a monotonic `instr_time`, reusing the end instant the planner and utility hooks
-  already take;
+- the end of a store, when the oldest pending statistics (`yb_pgss_pending_since`) are at least
+  `yb_flush_interval` old. The check uses a monotonic `instr_time`, reusing the end instant the
+  planner and utility hooks already take;
 - reaching 64 pending keys. After that fold the table is destroyed, and each key takes the
   synchronous path once more;
 - the start of `pg_stat_statements_internal` (every `pg_stat_statements*` view),

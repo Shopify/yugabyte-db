@@ -821,6 +821,26 @@ TEST_F(PgStatStatementsTest, FlushIntervalZeroIsSynchronous) {
   ASSERT_EQ(ASSERT_RESULT(SumCalls(&reader, kInsertWhere)), baseline + kExecutions);
 }
 
+// Switching to interval 0 folds what the session still holds: the SET's own store runs at
+// interval 0, and a store at interval 0 folds leftover pending statistics first.
+TEST_F(PgStatStatementsTest, SwitchToZeroFoldsPending) {
+  constexpr int kExecutions = 10;
+  auto writer = ASSERT_RESULT(Connect());
+  auto reader = ASSERT_RESULT(Connect());
+  ASSERT_OK(writer.Execute("CREATE TABLE test_table (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(writer.Fetch("SELECT pg_stat_statements_reset()"));
+  ASSERT_OK(writer.Execute(kSetLongInterval));
+
+  for (int i = 0; i <= kExecutions; ++i) {
+    ASSERT_OK(writer.ExecuteFormat("INSERT INTO test_table (k, v) VALUES ($0, 1)", i));
+  }
+  // At most the first execution can have reached the shared entry.
+  ASSERT_LE(ASSERT_RESULT(SumCalls(&reader, kInsertWhere)), 1);
+
+  ASSERT_OK(writer.Execute("SET pg_stat_statements.yb_flush_interval = 0"));
+  ASSERT_EQ(ASSERT_RESULT(SumCalls(&reader, kInsertWhere)), kExecutions + 1);
+}
+
 // Planning statistics are folded with the executions they belong to.
 TEST_F(PgStatStatementsTest, TrackPlanningCounts) {
   constexpr int kExecutions = 20;
