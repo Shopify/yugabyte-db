@@ -185,7 +185,7 @@ class SequenceRpc {
 
 class ReadonlyPgServerTest : public YBTest {
  protected:
-  void CheckCommand(bool writable);
+  void CheckCommand(bool writable, bool promote_auto_flags = true);
   void CheckQueuedPerform(int mode);
   void CheckSessionIsolation(int mode);
 
@@ -761,7 +761,7 @@ TEST_F(ReadonlyPgServerTest, LongSqlSession) {
   ASSERT_EQ(columns.size(), 720);
 }
 
-void ReadonlyPgServerTest::CheckCommand(bool writable) {
+void ReadonlyPgServerTest::CheckCommand(bool writable, bool promote_auto_flags) {
   const auto port = AllocateFreePort();
   const auto directory = GetTestPath("readonly-cli");
   const auto binary = env_util::GetRootDir("bin") + "/bin/yb-local-readonly";
@@ -769,7 +769,9 @@ void ReadonlyPgServerTest::CheckCommand(bool writable) {
     auto process = std::make_unique<Subprocess>(
         binary, std::vector<std::string>{
                     binary, "--data_dir=" + path, "--sql_port=" + std::to_string(port),
-                    std::string("--experimental_catalog_writes=") + (writable ? "true" : "false")});
+                    std::string("--experimental_catalog_writes=") + (writable ? "true" : "false"),
+                    std::string("--local_runtime_promote_ysql_auto_flags=") +
+                        (promote_auto_flags ? "true" : "false")});
     process->PipeParentStdout();
     process->ShareParentStderr();
     RETURN_NOT_OK(process->Start());
@@ -917,6 +919,12 @@ void ReadonlyPgServerTest::CheckCommand(bool writable) {
 TEST_F(ReadonlyPgServerTest, CommandLifecycle) { CheckCommand(false); }
 
 TEST_F(ReadonlyPgServerTest, CommandCatalogTransactions) { CheckCommand(true); }
+
+// The binary does not get the test framework's AutoFlag promotion, so this checks that the
+// prerequisites the runtime forces are enough on their own.
+TEST_F(ReadonlyPgServerTest, CommandCatalogTransactionsWithoutAutoFlagPromotion) {
+  CheckCommand(true, /* promote_auto_flags= */ false);
+}
 
 TEST_F(ReadonlyPgServerTest, OidReservationsSurviveRestartAndFailure) {
   const auto path = GetTestPath("oid-reservations");

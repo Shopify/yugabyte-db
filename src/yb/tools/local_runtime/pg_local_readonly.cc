@@ -93,7 +93,6 @@ DECLARE_bool(enable_ysql_conn_mgr_stats);
 DECLARE_int32(pgsql_proxy_webserver_port);
 DECLARE_bool(rpc_server_allow_ephemeral_ports);
 DECLARE_bool(ysql_disable_index_backfill);
-DECLARE_bool(ysql_enable_object_locking_infra);
 DECLARE_bool(ysql_enable_packed_row);
 DECLARE_bool(ysql_enable_packed_row_for_colocated_table);
 DECLARE_bool(ysql_enable_relcache_init_optimization);
@@ -104,6 +103,7 @@ DECLARE_bool(ysql_yb_enable_add_column_missing_default);
 DECLARE_bool(ysql_yb_enable_alter_table_rewrite);
 DECLARE_bool(ysql_yb_enable_ddl_atomicity_infra);
 DECLARE_bool(ysql_yb_enable_ddl_savepoint_infra);
+DECLARE_bool(ysql_yb_enable_global_object_locking_infra);
 DECLARE_bool(ysql_yb_enable_pg_locks);
 DECLARE_bool(ysql_yb_pg_locks_integrate_advisory_locks);
 
@@ -2903,7 +2903,9 @@ class ReadonlyPgServer::Impl : public pgwrapper::PgWrapperContext {
       // The catalog declares yb_lock_status with the advisory-lock columns; without them the
       // function returns rows PostgreSQL rejects.
       FLAGS_ysql_yb_pg_locks_integrate_advisory_locks = true;
-      FLAGS_ysql_enable_object_locking_infra = true;
+      // Global object locking is what makes PgGate send using_table_locks_globally and run DDL in
+      // the transaction block; local transactions require both.
+      FLAGS_ysql_yb_enable_global_object_locking_infra = true;
       FLAGS_enable_object_lock_fastpath = false;
       FLAGS_enable_object_locking_for_table_locks = true;
       // Foreground index build holds the exclusive catalog lease.
