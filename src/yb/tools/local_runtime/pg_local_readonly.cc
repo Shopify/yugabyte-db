@@ -1491,7 +1491,7 @@ class ReadonlyService : public UnsupportedPgClientService,
     }
     if (!options.sql_transaction_active()) return Status::OK();
     SCHECK(
-        options.is_using_table_locks(), NotSupported,
+        options.using_table_locks_globally(), NotSupported,
         "Local SQL requires native table locking and transaction-end notifications");
     SCHECK(
         !session.sql_active || session.sql_serial == options.txn_serial_no(), NotSupported,
@@ -1925,7 +1925,7 @@ class ReadonlyService : public UnsupportedPgClientService,
         options.sql_transaction_active(), NotSupported,
         "Application access requires a SQL transaction");
     SCHECK(
-        options.is_using_table_locks(), NotSupported,
+        options.using_table_locks_globally(), NotSupported,
         "Local transactions require native table locking and finish notifications");
     if (options.ddl_mode()) {
       SCHECK(
@@ -2951,6 +2951,10 @@ class ReadonlyPgServer::Impl : public pgwrapper::PgWrapperContext {
   void RegisterPgProcessRestarter(std::function<Status(void)>) override {}
   void RegisterPgProcessKiller(std::function<Status(void)>) override {}
   void RegisterPgConfigGenerator(pgwrapper::PgConfigGenerator) override {}
+  // Only PgSupervisor's paused start calls this; the runtime starts PostgreSQL directly.
+  Status RestartPG() const override {
+    return STATUS(NotSupported, "The local runtime does not restart PostgreSQL");
+  }
   Status StartSharedMemoryNegotiation() override {
     return shared_memory_.PrepareNegotiationTServer();
   }

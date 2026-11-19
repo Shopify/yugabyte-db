@@ -350,7 +350,7 @@ void ReadonlyPgServerTest::CheckSessionIsolation(int mode) {
     if (mode == 6) {
       auto* options = call->request.mutable_options();
       options->set_sql_transaction_active(true);
-      options->set_is_using_table_locks(true);
+      options->set_using_table_locks_globally(true);
       options->set_txn_serial_no(7);
       options->set_active_sub_transaction_id(1);
     }
@@ -404,7 +404,7 @@ void ReadonlyPgServerTest::CheckSessionIsolation(int mode) {
     auto* options = create.mutable_options();
     options->set_ddl_mode(true);
     options->set_ddl_use_regular_transaction_block(true);
-    options->set_is_using_table_locks(true);
+    options->set_using_table_locks_globally(true);
     options->set_sql_transaction_active(true);
     options->set_txn_serial_no(7);
     options->set_active_sub_transaction_id(1);
@@ -3245,7 +3245,7 @@ TEST_F(ReadonlyPgServerTest, SequenceRpcGuards) {
     options->set_connected_database_oid(database_oid);
     if (lease) {
       options->set_sql_transaction_active(true);
-      options->set_is_using_table_locks(true);
+      options->set_using_table_locks_globally(true);
       options->set_txn_serial_no(serial + 1);
     }
     rpc::RpcController controller;
@@ -3259,7 +3259,7 @@ TEST_F(ReadonlyPgServerTest, SequenceRpcGuards) {
     request.set_session_id(session);
     auto* options = request.mutable_options();
     options->set_sql_transaction_active(true);
-    options->set_is_using_table_locks(true);
+    options->set_using_table_locks_globally(true);
     options->set_txn_serial_no(serial + 1);
     request.set_lock_type(tserver::ACCESS_EXCLUSIVE_LOCK);
     tserver::PgAcquireObjectLockResponsePB response;
