@@ -79,6 +79,69 @@ class GitRepositoryTest(RepoTestCase):
         self.assertTrue(repo.ancestor(first, "main"))
         self.assertFalse(repo.ancestor("main", first))
 
+    def test_first_parent_commits_list_the_first_parent_line_oldest_first(self):
+        base = self.fixture.commit("base")
+        self.fixture.git("checkout", "--quiet", "-b", "side")
+        side = self.fixture.commit("side")
+        self.fixture.git("checkout", "--quiet", "main")
+        mainline = self.fixture.commit("mainline\n\nShopify-PR: #1 #2", 1793534400)
+        self.fixture.git("merge", "--quiet", "--no-ff", "-m", "merge side", "side")
+        merge = self.fixture.git("rev-parse", "HEAD")
+        self.fixture.ref("refs/remotes/upstream/master", side)
+        repo = Repository(self.fixture.path)
+
+        commits = repo.first_parent_commits(base, "main")
+
+        self.assertEqual(base, repo.merge_base("refs/remotes/upstream/master", mainline))
+        self.assertEqual([(mainline, [base], "mainline", "mainline\n\nShopify-PR: #1 #2\n"),
+                          (merge, [mainline, side], "merge side", "merge side\n")],
+                         [(c["sha"], c["parents"], c["subject"], c["message"]) for c in commits])
+        # Older git prints +00:00 for UTC and newer git prints Z.
+        self.assertIn(commits[0]["date"], ("2026-11-01T12:00:00+00:00", "2026-11-01T12:00:00Z"))
+        self.assertEqual(repo.tree(merge), commits[1]["tree"])
+
+    def test_matching_merges_lists_merges_off_the_excluded_ref_whose_message_matches(self):
+        base = self.fixture.commit("base", 1793534400)
+        self.fixture.git("checkout", "--quiet", "-b", "side")
+        self.fixture.commit("side change\n\nDropped: #1 (upstream #10)", 1793534400)
+        self.fixture.git("checkout", "--quiet", "main")
+        self.fixture.git("merge", "--quiet", "--no-ff", "-m", "plain merge", "side")
+        self.fixture.git("checkout", "--quiet", "-b", "older", base)
+        self.fixture.commit("older change", 1793534400)
+        self.fixture.git("checkout", "--quiet", "main")
+        dated = {"GIT_COMMITTER_DATE": "1793620800 +0000"}
+        self.fixture.git("merge", "--quiet", "--no-ff", "-s", "ours", "-m",
+                         "sync\n\nDropped: #2 (upstream #20)", "older", env=dated)
+        sync = self.fixture.git("rev-parse", "HEAD")
+        repo = Repository(self.fixture.path)
+
+        merges = repo.matching_merges("main", base, "^Dropped: #")
+
+        self.assertEqual([(sync, "sync\n\nDropped: #2 (upstream #20)\n")],
+                         [(m["sha"], m["message"]) for m in merges])
+        # Older git prints +00:00 for UTC and newer git prints Z.
+        self.assertIn(merges[0]["date"], ("2026-11-02T12:00:00+00:00", "2026-11-02T12:00:00Z"))
+        self.assertEqual([], repo.matching_merges("main", sync, "^Dropped: #"))
+        self.assertEqual([], repo.matching_merges("main", base, "^Dropped: #3"))
+
+    def test_fetch_updates_the_remote_tracking_ref_from_a_local_remote(self):
+        remote = os.path.join(self.tmpdir, "origin.git")
+        self.fixture.init_bare(remote)
+        self.fixture.commit("base")
+        self.fixture.git("remote", "add", "origin", remote)
+        self.fixture.git("push", "--quiet", "origin", "main")
+        pushed = self.fixture.commit("later")
+        self.fixture.git("push", "--quiet", "origin", "main")
+        self.fixture.git("update-ref", "-d", "refs/remotes/origin/main")
+        # A single-branch clone's mapping excludes main; an explicit refspec still updates it.
+        self.fixture.git("config", "remote.origin.fetch",
+                         "+refs/heads/other:refs/remotes/origin/other")
+        repo = Repository(self.fixture.path)
+
+        repo.fetch("origin", "+refs/heads/main:refs/remotes/origin/main")
+
+        self.assertEqual(pushed, self.fixture.git("rev-parse", "refs/remotes/origin/main"))
+
 
 class GitHubTest(RepoTestCase):
     def test_missing_gh_binary_is_a_clear_error(self):
