@@ -1,4 +1,4 @@
-"""Shared git and gh plumbing for the Shopify release tools.
+"""Shared git and gh plumbing for the Shopify contribution tools.
 
 Every command runs as an argv list, never via a shell. Requires Python 3.10+; importing has no
 side effects.
