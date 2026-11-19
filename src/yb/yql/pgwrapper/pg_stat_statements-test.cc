@@ -119,6 +119,9 @@ class PgStatStatementsTest : public LibPqTestBase {
     auto writer = ASSERT_RESULT(Connect());
     auto reader = ASSERT_RESULT(Connect());
     ASSERT_OK(writer.Execute("CREATE TABLE test_table (k INT PRIMARY KEY, v INT)"));
+    // The reset folds and then removes what the writer held before it, so every statistic the
+    // writer holds afterwards, BackendPid's included, was recorded after this instant.
+    const auto start = MonoTime::Now();
     ASSERT_OK(writer.Fetch("SELECT pg_stat_statements_reset()"));
     const auto writer_pid = ASSERT_RESULT(BackendPid(&writer));
     ASSERT_OK(writer.ExecuteFormat(
@@ -127,8 +130,6 @@ class PgStatStatementsTest : public LibPqTestBase {
       ASSERT_OK(writer.Execute("BEGIN"));
     }
 
-    // The writer's oldest pending statistics are recorded after this instant.
-    const auto start = MonoTime::Now();
     for (int i = 0; i <= kExecutions; ++i) {
       ASSERT_OK(writer.ExecuteFormat("INSERT INTO test_table (k, v) VALUES ($0, 1)", i));
     }
@@ -1006,6 +1007,9 @@ TEST_F(PgStatStatementsTest, IdleDoesNotFoldBeforeInterval) {
   auto reader = ASSERT_RESULT(Connect());
   ASSERT_OK(writer.Execute("CREATE TABLE test_table (k INT PRIMARY KEY, v INT)"));
   ASSERT_OK(writer.Fetch("SELECT pg_stat_statements_reset()"));
+  // Leaves an execution pending at the default interval, which arms the idle timeout for about
+  // 1 s. Raising the interval must move the timeout, or it would fold the statements below.
+  ASSERT_OK(writer.Fetch("SELECT 1"));
   ASSERT_OK(writer.Execute(kSetLongInterval));
 
   ASSERT_OK(writer.Execute("INSERT INTO test_table (k, v) VALUES (0, 1)"));
@@ -1041,6 +1045,35 @@ TEST_F(PgStatStatementsTest, SwitchToZeroWhileIdleFolds) {
 
   ASSERT_OK(writer.Execute("SET pg_stat_statements.yb_flush_interval = 0"));
   ASSERT_OK(WaitForIdleFold(&reader, kExecutions + 1, MonoTime::Now()));
+  ASSERT_EQ(ASSERT_RESULT(SumCalls(&reader, kInsertWhere)), kExecutions + 1);
+}
+
+// Lowering the interval while idle shortens the wait: the timeout armed for the longer interval
+// is moved earlier. With track_utility off, nothing but the idle fold can deliver the statistics.
+TEST_F(PgStatStatementsTest, LowerIntervalWhileIdleFolds) {
+  constexpr int kExecutions = 10;
+  constexpr int kLoweredIntervalMs = 3000;
+  auto writer = ASSERT_RESULT(Connect());
+  auto reader = ASSERT_RESULT(Connect());
+  ASSERT_OK(writer.Execute("CREATE TABLE test_table (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(writer.Fetch("SELECT pg_stat_statements_reset()"));
+  ASSERT_OK(writer.Execute("SET pg_stat_statements.track_utility = off"));
+  ASSERT_OK(writer.Execute(kSetLongInterval));
+
+  const auto start = MonoTime::Now();
+  for (int i = 0; i <= kExecutions; ++i) {
+    ASSERT_OK(writer.ExecuteFormat("INSERT INTO test_table (k, v) VALUES ($0, 1)", i));
+  }
+  // At most the first execution can have reached the shared entry.
+  ASSERT_LE(ASSERT_RESULT(SumCalls(&reader, kInsertWhere)), 1);
+
+  ASSERT_OK(writer.ExecuteFormat(
+      "SET pg_stat_statements.yb_flush_interval = $0", kLoweredIntervalMs));
+  const auto last_statement_end = MonoTime::Now();
+  // Otherwise the statistics were already due at the SET, and the hook folded them at once.
+  LOG(INFO) << "Timeout moved earlier: "
+            << ((last_statement_end - start).ToMilliseconds() < kLoweredIntervalMs);
+  ASSERT_OK(WaitForIdleFold(&reader, kExecutions + 1, last_statement_end));
   ASSERT_EQ(ASSERT_RESULT(SumCalls(&reader, kInsertWhere)), kExecutions + 1);
 }
 

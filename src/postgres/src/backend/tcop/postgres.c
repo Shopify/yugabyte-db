@@ -3825,12 +3825,18 @@ RecoveryConflictInterrupt(ProcSignalReason reason)
  * unrelated interrupt from forcing an early flush.  Error recovery's
  * disable_all_timeouts leaves the timeout inactive in the same way.
  *
- * As with IDLE_STATS_UPDATE_TIMEOUT, an active timeout is not rescheduled,
- * and it is not disarmed when a command arrives; either would cost a
- * setitimer call per statement.  So a timeout armed before the hook's due
- * time moved later may fire early; the forced flush then only shortens the
- * delay.
+ * As with IDLE_STATS_UPDATE_TIMEOUT, the timeout is not disarmed when a
+ * command arrives, which would cost a setitimer call per statement.  Unlike
+ * it, the due time can move either way while the timeout is active: later
+ * after a fold at a statement end or a larger interval, earlier after a
+ * smaller interval.  An active timeout is therefore rescheduled when its
+ * finish time is off by more than YB_IDLE_STATS_FLUSH_SLACK_MS, so that it
+ * neither forces a flush of statistics that are not due nor misses the
+ * interval.  That costs a clock read per call while the hook holds something,
+ * and a setitimer call only when the due time moves.
  */
+#define YB_IDLE_STATS_FLUSH_SLACK_MS 10
+
 static void
 YbIdleStatsFlush(bool force)
 {
@@ -3843,9 +3849,21 @@ YbIdleStatsFlush(bool force)
 	delay_ms = yb_idle_stats_flush_hook(force);
 	if (delay_ms > 0)
 	{
+		delay_ms = Min(delay_ms, INT_MAX);
 		if (!get_timeout_active(YB_IDLE_STATS_FLUSH_TIMEOUT))
-			enable_timeout_after(YB_IDLE_STATS_FLUSH_TIMEOUT,
-								 (int) Min(delay_ms, INT_MAX));
+			enable_timeout_after(YB_IDLE_STATS_FLUSH_TIMEOUT, (int) delay_ms);
+		else
+		{
+			TimestampTz fin_time;
+			TimestampTz armed;
+
+			fin_time = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+												   delay_ms);
+			armed = get_timeout_finish_time(YB_IDLE_STATS_FLUSH_TIMEOUT);
+			if (armed < fin_time - YB_IDLE_STATS_FLUSH_SLACK_MS * 1000 ||
+				armed > fin_time + YB_IDLE_STATS_FLUSH_SLACK_MS * 1000)
+				enable_timeout_at(YB_IDLE_STATS_FLUSH_TIMEOUT, fin_time);
+		}
 	}
 	else if (get_timeout_active(YB_IDLE_STATS_FLUSH_TIMEOUT))
 		disable_timeout(YB_IDLE_STATS_FLUSH_TIMEOUT, false);

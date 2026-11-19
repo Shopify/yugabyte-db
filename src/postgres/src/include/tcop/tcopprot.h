@@ -118,10 +118,11 @@ extern bool YbIsStatementTransactionStarted(void);
  * never called in signal context.
  *
  * The hook returns 0 if it holds nothing, or the number of ms until it next
- * needs to run; the caller arms the timeout for that delay unless it is
- * already armed, and disarms it on 0.  With force = true it should publish
- * everything it holds.  It must not raise an error.  Implementations chain to
- * the previous hook and return the minimum positive value of the two results.
+ * needs to run; the caller arms the timeout for that delay, rescheduling it
+ * if it is armed for another time, and disarms it on 0.  With force = true it
+ * should publish everything it holds.  It must not raise an error.
+ * Implementations chain to the previous hook and return the minimum positive
+ * value of the two results.
  */
 typedef long (*yb_idle_stats_flush_hook_type) (bool force);
 extern PGDLLIMPORT yb_idle_stats_flush_hook_type yb_idle_stats_flush_hook;
