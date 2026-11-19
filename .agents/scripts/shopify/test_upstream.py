@@ -12,7 +12,7 @@ import subprocess
 import sys
 import unittest
 
-from upstream import Cli, Error, GitHub, parser, upstream_state
+from upstream import Cli, Error, GitHub, attribute, parser, upstream_state
 import testfixtures
 
 
@@ -20,18 +20,19 @@ SCRIPT = str(Path(__file__).resolve().with_name("upstream.py"))
 T0, DAY = 1793534400, 86400  # 2026-11-01T12:00:00Z
 NOW = datetime(2026, 11, 19, 12, tzinfo=timezone.utc)
 UPSTREAM_PR = "https://github.com/yugabyte/yugabyte-db/pull/"
-MERGED_UPSTREAM = "a" * 40
+MISSING = "a" * 40  # a commit the fixture repository does not have
+TOOL_REF = "refs/shopify/upstream-master"
+SKIP = ["upstream: skip"]
 
 
 class FakeGitHub(GitHub):
-    """In-memory stand-in for the four gh queries `status` makes; anything else fails."""
+    """In-memory stand-in for the three gh queries `status` makes; anything else fails."""
 
-    def __init__(self, pull_requests=(), comments=None, upstream=None, ahead=None):
+    def __init__(self, pull_requests=(), comments=None, upstream=None):
         super().__init__(executable="/nonexistent/gh")
         self.pull_requests = list(pull_requests)
         self.comments_by_pr = comments or {}
         self.upstream = upstream or {}
-        self.ahead = ahead or {}
         self.comment_requests = []
 
     def merged_pull_requests(self):
@@ -47,14 +48,12 @@ class FakeGitHub(GitHub):
                         "no pull requests found\n")
         return self.upstream[number]
 
-    def ahead_by(self, sha):
-        return self.ahead[sha]
 
-
-def fork_pr(number, title, merge=None, labels=(), merged_at="2026-11-01T12:00:00Z"):
+def fork_pr(number, title, merge=None, labels=(), merged_at="2026-11-01T12:00:00Z",
+            base="master-shopify"):
     return {"number": number, "title": title, "mergeCommit": {"oid": merge} if merge else None,
             "mergedAt": merged_at, "labels": [{"name": label} for label in labels],
-            "author": {"login": "priya"},
+            "author": {"login": "priya"}, "baseRefName": base,
             "url": f"https://github.com/Shopify/yugabyte-db/pull/{number}"}
 
 
@@ -62,19 +61,18 @@ def comment(body, created_at="2026-11-02T00:00:00Z"):
     return {"body": body, "created_at": created_at}
 
 
-def upstream_pr(number, state, title="Expose the refresh batch metric"):
+def upstream_pr(number, state, title="Expose the refresh batch metric", merge=MISSING):
     merged = state == "MERGED"
     return {"number": number, "state": state, "title": title, "url": UPSTREAM_PR + str(number),
             "mergedAt": "2026-11-12T08:00:00Z" if merged else None,
-            "mergeCommit": {"oid": MERGED_UPSTREAM} if merged else None}
+            "mergeCommit": {"oid": merge} if merged else None}
 
 
-def submitted(number, upstream_number, state, ahead=None):
+def submitted(number, upstream_number, state, merge=MISSING):
     """A GitHub where fork PR `number` has an Upstream: comment naming `upstream_number`."""
     return FakeGitHub(
         [], {number: [comment(f"Upstream: {UPSTREAM_PR}{upstream_number}")]},
-        {upstream_number: upstream_pr(upstream_number, state)},
-        {} if ahead is None else {MERGED_UPSTREAM: ahead})
+        {upstream_number: upstream_pr(upstream_number, state, merge=merge)})
 
 
 def dates(timestamp):
@@ -107,26 +105,28 @@ class StatusTestCase(testfixtures.RepoTestCase):
         self.fixture.git("checkout", "--quiet", "main")
         return shas
 
+    def rev(self, name):
+        return self.fixture.git("rev-parse", name)
+
     def publish(self, fork="main", upstream="up"):
-        self.fixture.ref("refs/remotes/origin/master-shopify", self.fixture.git("rev-parse", fork))
+        self.fixture.ref("refs/remotes/origin/master-shopify", self.rev(fork))
         if upstream is not None:
-            self.fixture.ref("refs/remotes/upstream/master",
-                             self.fixture.git("rev-parse", upstream))
+            self.fixture.ref(TOOL_REF, self.rev(upstream))
 
     def cli(self, *argv, github=None):
         out, err = io.StringIO(), io.StringIO()
         code = Cli.run(list(argv), github=github or FakeGitHub(), out=out, err=err, now=NOW)
         return code, out.getvalue(), err.getvalue()
 
-    def report(self, github, *options, fork="main"):
-        self.publish(fork)
+    def report(self, github, *options, fork="main", upstream="up"):
+        self.publish(fork, upstream)
         code, out, err = self.cli("status", "--repo-path", self.fixture.path, "--no-fetch",
                                   *options, github=github)
         self.assertEqual((0, ""), (code, err), out)
         return out
 
-    def lines(self, github, fork="main"):
-        return self.report(github, fork=fork).splitlines()
+    def lines(self, github, fork="main", upstream="up"):
+        return self.report(github, fork=fork, upstream=upstream).splitlines()
 
     def json(self, github, fork="main"):
         return json.loads(self.report(github, "--json", fork=fork))
@@ -149,8 +149,8 @@ class LandingStateTest(StatusTestCase):
         github.pull_requests = [fork_pr(71, "[#38130] DocDB: Expose the batch metric", squash)]
 
         self.assertEqual([
-            f"master-shopify {squash[:9]}: 1 carried commit since upstream {self.base[:9]}; "
-            "no sync point",
+            f"master-shopify {squash[:9]}: 1 carried commit since upstream {self.base[:9]} "
+            "(2026-11-01); no sync point",
             "",
             "Not submitted (0)",
             "Open upstream (1)",
@@ -163,21 +163,30 @@ class LandingStateTest(StatusTestCase):
             "Unidentified commits (0)",
         ], self.lines(github))
 
-    def merged_upstream(self, state, ahead=None):
+    def merged_upstream(self, state, merge=MISSING):
         squash = self.squash(69, "Refresh the catalog cache")
-        github = submitted(69, 38110, state, ahead)
+        github = submitted(69, 38110, state, merge)
         github.pull_requests = [fork_pr(69, "[#38100] DocDB: Refresh the catalog cache", squash)]
         return self.lines(github)
 
-    def test_a_merged_upstream_pr_on_upstream_master_has_landed(self):
+    def test_a_merged_upstream_pr_whose_merge_commit_is_on_upstream_master_has_landed(self):
+        merge = self.upstream_commit("Refresh the catalog cache (#38110)", T0 + 2 * DAY)
+
         self.assertEqual(["Landed upstream, dropped at the next sync (1)",
                           "  #69  yugabyte#38110  merged 2026-11-12"],
-                         self.section(self.merged_upstream("MERGED", ahead=0), "Landed"))
+                         self.section(self.merged_upstream("MERGED", merge), "Landed"))
 
-    def test_a_merged_upstream_pr_not_on_upstream_master_was_restructured(self):
+    def test_a_merged_upstream_pr_whose_merge_commit_is_off_upstream_master_was_restructured(self):
+        merge = self.branch_commits("restack", "Refresh the catalog cache (#38110)")[0]
+
         self.assertEqual(["Restructured upstream, awaiting a replacement Upstream: comment (1)",
                           "  #69  yugabyte#38110  merged 2026-11-12"],
-                         self.section(self.merged_upstream("MERGED", ahead=3), "Restructured"))
+                         self.section(self.merged_upstream("MERGED", merge), "Restructured"))
+
+    def test_a_merged_upstream_pr_whose_merge_commit_is_not_local_was_restructured(self):
+        self.assertEqual(["Restructured upstream, awaiting a replacement Upstream: comment (1)",
+                          "  #69  yugabyte#38110  merged 2026-11-12"],
+                         self.section(self.merged_upstream("MERGED", MISSING), "Restructured"))
 
     def test_an_upstream_pr_closed_without_merging_needs_a_disposition(self):
         self.assertEqual(["Closed upstream without merging, needs a disposition (1)",
@@ -201,11 +210,44 @@ class LandingStateTest(StatusTestCase):
                           "2026-11-05T00:00:00Z"),
                   comment(f"Upstream: {UPSTREAM_PR}38120", "2026-11-02T00:00:00Z"),
                   comment("Thanks!", "2026-11-06T00:00:00Z")]},
-            {38120: upstream_pr(38120, "MERGED"), 38131: upstream_pr(38131, "OPEN")}, {})
+            {38120: upstream_pr(38120, "MERGED"), 38131: upstream_pr(38131, "OPEN")})
 
         self.assertEqual(["Open upstream (1)",
                           "  #71  yugabyte#38131  Expose the refresh batch metric"],
                          self.section(self.lines(github), "Open upstream"))
+
+    def test_browser_copied_upstream_lines_are_read(self):
+        squash = self.squash(71, "Expose the refresh batch metric")
+        url = UPSTREAM_PR + "38131"
+        bodies = (f"Upstream: <{url}>", f"Upstream: {url}.", f"Upstream: {url},",
+                  f"Upstream: {url}/files", f"Upstream: {url}#issuecomment-1",
+                  f"Upstream: {url}?x=y", f"**Upstream:** {url}", f"Upstream: <{url}>.")
+        for body in bodies:
+            with self.subTest(body=body):
+                github = FakeGitHub([fork_pr(71, "Expose the refresh batch metric", squash)],
+                                    {71: [comment(body)]}, {38131: upstream_pr(38131, "OPEN")})
+
+                lines = self.lines(github)
+
+                self.assertEqual(["Open upstream (1)",
+                                  "  #71  yugabyte#38131  Expose the refresh batch metric"],
+                                 self.section(lines, "Open upstream"))
+                self.assertNotIn("Warnings", lines)
+
+    def test_an_upstream_label_without_a_url_after_it_is_not_an_upstream_line(self):
+        squash = self.squash(71, "Expose the refresh batch metric")
+        github = FakeGitHub(
+            [fork_pr(71, "Expose the refresh batch metric", squash)],
+            {71: [comment(f"Upstream: {UPSTREAM_PR}38131", "2026-11-02T00:00:00Z"),
+                  comment(f"Upstream:\nUpstream: \n{UPSTREAM_PR}38999", "2026-11-05T00:00:00Z")]},
+            {38131: upstream_pr(38131, "OPEN")})
+
+        lines = self.lines(github)
+
+        self.assertEqual(["Open upstream (1)",
+                          "  #71  yugabyte#38131  Expose the refresh batch metric"],
+                         self.section(lines, "Open upstream"))
+        self.assertNotIn("Warnings", lines)
 
     def test_an_upstream_comment_that_is_not_an_upstream_pr_url_is_a_warning(self):
         squash = self.squash(70, "Cap the batch")
@@ -280,7 +322,23 @@ class AttributionTest(StatusTestCase):
         self.assertEqual([(40, [earlier]), (41, [merge]), (42, [merge]), (43, [merge])],
                          self.contributions(report))
         self.assertEqual([], report["unidentified"])
+        self.assertEqual([], report["warnings"])
         self.assertIn(f"{merge[:9]}: 2 carried commits", self.lines(github)[0])
+
+    def test_attribution_prefers_the_subject_then_the_trailer_then_the_merge_commit(self):
+        prs = [fork_pr(n, f"PR {n}", merge="c" * 40) for n in (1, 2, 3)]
+        landings = [
+            {"sha": "a" * 40, "subject": "Fix thing (#1)",
+             "message": "Fix thing (#1)\n\nShopify-PR: #2"},
+            {"sha": "c" * 40, "subject": "Merge pull request #3",
+             "message": "Shopify-PR: #2 #2 #9"},
+            {"sha": "d" * 40, "subject": "Merge pull request #3", "message": "nothing here"},
+        ]
+
+        landed, unidentified = attribute(landings, prs)
+
+        self.assertEqual({1: ["a" * 40], 2: ["c" * 40]}, landed)
+        self.assertEqual([{"sha": "d" * 40, "subject": "Merge pull request #3"}], unidentified)
 
     def test_a_merge_landing_with_several_commits_is_one_pr(self):
         earlier = self.squash(49, "Earlier change")
@@ -327,6 +385,29 @@ class AttributionTest(StatusTestCase):
                           f"  {typo[:9]}  Fix a typo in the runbook",
                           f"  {picked[:9]}  [#36913] CDC: Skip a scenario (#38388)"],
                          self.section(lines, "Unidentified"))
+        self.assertNotIn("Warnings", lines)
+
+    def test_a_replayed_landing_belongs_to_every_pr_its_shopify_pr_trailer_names(self):
+        replayed = self.fixture.commit("Merge pull request #64 from Shopify/stack\n\n"
+                                       "Shopify-PR: #55 #58 #59 #63 #64", T0 + DAY)
+        numbers = (55, 58, 59, 63, 64)
+        github = FakeGitHub([fork_pr(n, f"[shopify-only] Layer {n}", MISSING, SKIP)
+                             for n in numbers])
+
+        report = self.json(github)
+
+        self.assertEqual([(n, [replayed]) for n in numbers], self.contributions(report))
+        self.assertEqual(([], []), (report["unidentified"], report["warnings"]))
+
+    def test_shopify_pr_trailer_numbers_that_are_not_merged_fork_prs_are_ignored(self):
+        replayed = self.fixture.commit("Merge pull request #64 from Shopify/stack\n\n"
+                                       "Shopify-PR: #99 #64", T0 + DAY)
+        github = FakeGitHub([fork_pr(64, "[shopify-only] Layer", MISSING, SKIP)])
+
+        report = self.json(github)
+
+        self.assertEqual([(64, [replayed])], self.contributions(report))
+        self.assertEqual(([], []), (report["unidentified"], report["warnings"]))
 
 
 class SyncPointTest(StatusTestCase):
@@ -340,9 +421,27 @@ class SyncPointTest(StatusTestCase):
         lines = self.lines(github)
 
         self.assertEqual(f"master-shopify {sync[:9]}: 1 carried commit since upstream "
-                         f"{merged[:9]}; last sync 2026-11-04 (upstream merge)", lines[0])
+                         f"{merged[:9]} (2026-11-03); last sync 2026-11-04 (upstream merge)",
+                         lines[0])
         self.assertEqual("Not submitted (1)", lines[2])
         self.assertEqual("Unidentified commits (0)", lines[-1])
+
+    def test_an_upstream_merge_beyond_a_stale_upstream_ref_is_an_unattributed_merge(self):
+        squash = self.squash(70, "Cap the batch")
+        stale = self.upstream_commit("upstream change", T0 + 2 * DAY)
+        self.upstream_commit("newer upstream change", T0 + 3 * DAY)
+        merge = self.merge("up", "Merge branch 'yugabyte:master' into master-shopify", T0 + 4 * DAY)
+
+        lines = self.lines(FakeGitHub([fork_pr(70, "Cap the batch", squash)]), upstream=stale)
+
+        self.assertEqual(f"master-shopify {merge[:9]}: 2 carried commits since upstream "
+                         f"{stale[:9]} (2026-11-03); no sync point", lines[0])
+        self.assertEqual(["Unidentified commits (1)",
+                          f"  {merge[:9]}  Merge branch 'yugabyte:master' into master-shopify"],
+                         self.section(lines, "Unidentified"))
+        self.assertEqual(["Warnings", "  1 unattributed merge commit(s) on master-shopify; if the "
+                          "upstream ref is stale, run without --no-fetch"],
+                         self.section(lines, "Warnings"))
 
     def test_consecutive_upstream_merges_are_each_a_sync_point(self):
         self.squash(70, "Cap the batch")
@@ -370,7 +469,8 @@ class SyncPointTest(StatusTestCase):
                           T0 + 4 * DAY, "-s", "ours")
         self.fixture.git("cherry-pick", carried, env=dates(T0 + 4 * DAY))
         replayed = self.fixture.git("rev-parse", "HEAD")
-        github = FakeGitHub([fork_pr(70, "Cap the batch", carried)])
+        github = FakeGitHub([fork_pr(70, "Cap the batch", carried),
+                             fork_pr(69, "Refresh the cache", MISSING)])
 
         report = self.json(github, fork="sync")
         lines = self.lines(github, fork="sync")
@@ -380,14 +480,86 @@ class SyncPointTest(StatusTestCase):
                          report["sync_points"])
         self.assertEqual([(70, [replayed])],
                          [(c["number"], c["landings"]) for c in report["contributions"]])
-        self.assertEqual([{"number": 68, "upstream_number": 38100, "sync": sync},
-                          {"number": 69, "upstream_number": 38110, "sync": sync}],
+        self.assertEqual([{"number": 68, "upstream_number": 38100, "sync": sync,
+                           "date": "2026-11-05T12:00:00+00:00"},
+                          {"number": 69, "upstream_number": 38110, "sync": sync,
+                           "date": "2026-11-05T12:00:00+00:00"}],
                          report["adopted"])
         self.assertEqual(["Adopted by earlier syncs (2)",
                           "  #68  yugabyte#38100  dropped 2026-11-05",
                           "  #69  yugabyte#38110  dropped 2026-11-05"],
                          self.section(lines, "Adopted"))
         self.assertTrue(lines[0].endswith("; last sync 2026-11-05 (sync)"), lines[0])
+        self.assertEqual([], report["warnings"])
+
+    def test_prs_dropped_by_a_sync_behind_the_merge_base_are_still_adopted(self):
+        first_pr = self.squash(70, "Cap the batch")
+        second_pr = self.squash(71, "Expose the metric", T0 + 2 * DAY)
+        first_target = self.upstream_commit("upstream lands 38110", T0 + 3 * DAY)
+        self.fixture.git("checkout", "--quiet", "-b", "first-sync", first_target)
+        first_sync = self.merge("main", "Sync master-shopify to upstream\n\n"
+                                "Dropped: #70 (upstream #38110)", T0 + 4 * DAY, "-s", "ours")
+        self.fixture.git("cherry-pick", second_pr, env=dates(T0 + 4 * DAY))
+        second_target = self.upstream_commit("upstream lands 38131", T0 + 5 * DAY)
+        self.fixture.git("checkout", "--quiet", "-b", "second-sync", second_target)
+        second_sync = self.merge("first-sync", "Sync master-shopify to upstream\n\n"
+                                 "Dropped: #71 (upstream #38131)", T0 + 6 * DAY, "-s", "ours")
+        github = FakeGitHub([fork_pr(70, "Cap the batch", first_pr),
+                             fork_pr(71, "Expose the metric", second_pr)])
+
+        report = self.json(github, fork="second-sync")
+        lines = self.lines(github, fork="second-sync")
+
+        self.assertEqual(second_target, report["base"])
+        self.assertEqual([second_sync], [point["sha"] for point in report["sync_points"]])
+        self.assertEqual([{"number": 70, "upstream_number": 38110, "sync": first_sync,
+                           "date": "2026-11-05T12:00:00+00:00"},
+                          {"number": 71, "upstream_number": 38131, "sync": second_sync,
+                           "date": "2026-11-07T12:00:00+00:00"}],
+                         report["adopted"])
+        self.assertEqual(["Adopted by earlier syncs (2)",
+                          "  #70  yugabyte#38110  dropped 2026-11-05",
+                          "  #71  yugabyte#38131  dropped 2026-11-07"],
+                         self.section(lines, "Adopted"))
+        self.assertEqual([], report["warnings"])
+        self.assertNotIn("Warnings", lines)
+
+    def test_a_dropped_pr_that_is_carried_again_is_a_warning(self):
+        carried = self.squash(70, "Cap the batch")
+        target = self.upstream_commit("upstream change", T0 + 3 * DAY)
+        self.fixture.git("checkout", "--quiet", "-b", "sync", target)
+        sync = self.merge("main", "Sync master-shopify to upstream\n\n"
+                          "Dropped: #70 (upstream #38110)", T0 + 4 * DAY, "-s", "ours")
+        self.fixture.git("cherry-pick", carried, env=dates(T0 + 4 * DAY))
+
+        lines = self.lines(FakeGitHub([fork_pr(70, "Cap the batch", carried)]), fork="sync")
+
+        self.assertEqual(["Not submitted (1)", f"  #70  18d   {'Cap the batch':<60} priya"],
+                         self.section(lines, "Not submitted"))
+        self.assertEqual(["Adopted by earlier syncs (1)",
+                          "  #70  yugabyte#38110  dropped 2026-11-05"],
+                         self.section(lines, "Adopted"))
+        self.assertEqual(["Warnings",
+                          f"  PR #70 was dropped by sync {sync[:9]} but is carried again"],
+                         self.section(lines, "Warnings"))
+
+
+class CoverageTest(StatusTestCase):
+    def test_a_merged_master_shopify_pr_that_is_neither_carried_nor_adopted_is_a_warning(self):
+        squash = self.squash(70, "Cap the batch")
+        github = FakeGitHub([fork_pr(70, "Cap the batch", squash),
+                             fork_pr(72, "Lost on the way", MISSING),
+                             fork_pr(73, "Backport", MISSING, base="2025.1-shopify")])
+
+        self.assertEqual(["merged PR #72 is neither carried nor adopted"],
+                         self.json(github)["warnings"])
+
+    def test_a_pr_list_as_long_as_the_limit_may_be_truncated(self):
+        github = FakeGitHub([fork_pr(n, "Backport", MISSING, base="2025.1-shopify")
+                             for n in range(1, 5001)])
+
+        self.assertEqual(["gh pr list returned 5000 PRs; the list may be truncated"],
+                         self.json(github)["warnings"])
 
 
 class JsonTest(StatusTestCase):
@@ -401,6 +573,7 @@ class JsonTest(StatusTestCase):
 
         self.assertEqual({
             "fork": sync, "upstream": merged, "base": merged,
+            "base_date": "2026-11-04T12:00:00+00:00",
             "sync_points": [{"sha": sync, "date": "2026-11-05T12:00:00+00:00",
                              "kind": "upstream-merge"}],
             "contributions": [{
@@ -429,20 +602,19 @@ class UpstreamGitHubTest(testfixtures.RepoTestCase):
 
         self.assertEqual([{"body": "first"}, {"body": "second"}], self.gh(pages).comments(70))
 
-    def test_ahead_by_parses_the_number_gh_prints(self):
-        self.assertEqual(0, self.gh("0").ahead_by(MERGED_UPSTREAM))
-
-    def test_ahead_by_rejects_output_that_is_not_a_number(self):
-        with self.assertRaises(Error) as caught:
-            self.gh("null").ahead_by(MERGED_UPSTREAM)
-
-        self.assertEqual("Failed to read ahead_by comparing upstream master with "
-                         f"{MERGED_UPSTREAM}: 'null'", str(caught.exception))
-
     def test_a_merged_upstream_pr_without_a_merge_commit_is_restructured(self):
         view = {"state": "MERGED", "mergeCommit": None}
 
-        self.assertEqual("restructured", upstream_state(view, lambda sha: 0))
+        self.assertEqual("restructured", upstream_state(view, lambda sha: True))
+
+    def test_a_merge_commit_that_is_not_a_full_sha_never_reaches_git(self):
+        asked = []
+        for oid in ("--help", "HEAD", "abc123", "A" * 40):
+            with self.subTest(oid=oid):
+                view = {"state": "MERGED", "mergeCommit": {"oid": oid}}
+
+                self.assertEqual("restructured", upstream_state(view, asked.append))
+        self.assertEqual([], asked)
 
 
 class CliTest(StatusTestCase):
@@ -459,14 +631,47 @@ class CliTest(StatusTestCase):
     def test_a_command_is_required(self):
         self.assertEqual((2, "", "A command is required: status\n"), self.cli())
 
-    def test_a_missing_upstream_ref_without_fetching_is_a_git_error(self):
+    def test_a_missing_upstream_ref_without_fetching_says_to_fetch_once(self):
         self.publish(upstream=None)
 
         code, out, err = self.cli("status", "--repo-path", self.fixture.path, "--no-fetch")
 
         self.assertEqual((1, ""), (code, out))
-        self.assertEqual(f"upstream/master does not resolve to a commit in {self.fixture.path}\n",
-                         err)
+        self.assertEqual(f"{TOOL_REF} does not resolve to a commit in {self.fixture.path}; run "
+                         "once without --no-fetch to fetch upstream master\n", err)
+
+    def test_a_missing_explicit_upstream_ref_is_a_git_error_without_the_fetch_hint(self):
+        self.publish(upstream=None)
+
+        code, out, err = self.cli("status", "--repo-path", self.fixture.path, "--no-fetch",
+                                  "--upstream-ref", "refs/heads/absent")
+
+        self.assertEqual((1, "", f"refs/heads/absent does not resolve to a commit in "
+                                 f"{self.fixture.path}\n"), (code, out, err))
+
+    def test_status_fetches_master_shopify_and_upstream_master_into_their_refs(self):
+        upstream_repo = os.path.join(self.tmpdir, "upstream.git")
+        origin_repo = os.path.join(self.tmpdir, "origin.git")
+        self.fixture.init_bare(upstream_repo)
+        self.fixture.init_bare(origin_repo)
+        squash = self.squash(70, "Cap the batch")
+        merged = self.upstream_commit("upstream change", T0 + 2 * DAY)
+        sync = self.merge("up", "Merge branch 'yugabyte:master' into master-shopify", T0 + 3 * DAY)
+        latest = self.upstream_commit("later upstream change", T0 + 4 * DAY)
+        self.fixture.git("push", "--quiet", upstream_repo, "up:refs/heads/master")
+        self.fixture.git("push", "--quiet", origin_repo, "main:refs/heads/master-shopify")
+        self.fixture.git("remote", "add", "origin", origin_repo)
+
+        code, out, err = self.cli("status", "--repo-path", self.fixture.path,
+                                  "--upstream-url", upstream_repo,
+                                  github=FakeGitHub([fork_pr(70, "Cap the batch", squash)]))
+
+        self.assertEqual((0, ""), (code, err), out)
+        self.assertEqual((latest, sync),
+                         (self.rev(TOOL_REF), self.rev("refs/remotes/origin/master-shopify")))
+        self.assertEqual([f"master-shopify {sync[:9]}: 1 carried commit since upstream "
+                          f"{merged[:9]} (2026-11-03); last sync 2026-11-04 (upstream merge)",
+                          "", "Not submitted (1)"], out.splitlines()[:3])
 
     def test_importing_the_module_has_no_side_effects(self):
         code = f"import sys; sys.path.insert(0, {os.path.dirname(SCRIPT)!r}); import upstream"
@@ -480,7 +685,8 @@ class CliTest(StatusTestCase):
         result, home, cwd = self.run_script(SCRIPT, "status", "--help")
 
         self.assertEqual(0, result.returncode, result.stderr)
-        for option in ("--repo-path", "--no-fetch", "--upstream-ref", "--fork-ref", "--json"):
+        for option in ("--repo-path", "--no-fetch", "--upstream-ref", "--upstream-url",
+                       "--fork-ref", "--json"):
             self.assertIn(option, result.stdout)
         self.assertEqual(([], []), (os.listdir(home), os.listdir(cwd)))
 

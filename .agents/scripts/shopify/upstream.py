@@ -17,7 +17,7 @@ from pathlib import Path
 import re
 import sys
 
-from scm import ArgumentParser, Error, GitError, Repository, UsageError
+from scm import OID, ArgumentParser, Error, GitError, Repository, UsageError
 from scm import GitHub as _GitHub
 
 
@@ -25,20 +25,25 @@ FORK_REPO = "Shopify/yugabyte-db"
 FORK_BRANCH = "master-shopify"
 UPSTREAM_REPO = "yugabyte/yugabyte-db"
 UPSTREAM_URL = "https://github.com/yugabyte/yugabyte-db.git"
+UPSTREAM_REF = "refs/shopify/upstream-master"  # owned by this tool; no other fetch moves it
 SKIP_LABEL = "upstream: skip"
 SHOPIFY_ONLY = "[shopify-only]"
+PR_LIMIT = 5000
 PR_SUFFIX = re.compile(r"\(#(\d+)\)$")
-UPSTREAM_LINE = re.compile(r"^Upstream:[ \t]*(\S*)", re.MULTILINE)
-UPSTREAM_PR_URL = re.compile(r"https://github\.com/yugabyte/yugabyte-db/pull/(\d+)/?")
+SHOPIFY_PR = re.compile(r"^Shopify-PR:(.*)$", re.MULTILINE)
+UPSTREAM_LINE = re.compile(r"^(?:\*\*)?Upstream:(?:\*\*)?[ \t]*(\S+)", re.MULTILINE)
+UPSTREAM_PR_URL = re.compile(r"https://github\.com/yugabyte/yugabyte-db/pull/(\d+)(?:[/?#]\S*)?")
 DROPPED = re.compile(r"^Dropped:[ \t]*#(\d+)[ \t]+\(upstream #(\d+)\)[ \t]*$", re.MULTILINE)
+DROPPED_GREP = "^Dropped:[[:blank:]]*#"  # git log --extended-regexp --grep preselecting DROPPED
 
 
 class GitHub(_GitHub):
     """The gh queries `status` makes; only the command line entry point creates one."""
 
     def merged_pull_requests(self):
-        return self.json("pr", "list", "--repo", FORK_REPO, "--state", "merged", "-L", "1000",
-                         "--json", "number,title,mergeCommit,mergedAt,labels,author,url")
+        return self.json("pr", "list", "--repo", FORK_REPO, "--state", "merged",
+                         "-L", str(PR_LIMIT), "--json",
+                         "number,title,mergeCommit,mergedAt,labels,author,url,baseRefName")
 
     def comments(self, number):
         """Every comment on the fork PR, oldest first; --slurp returns one array per page."""
@@ -49,14 +54,6 @@ class GitHub(_GitHub):
     def upstream_pull_request(self, number):
         return self.json("pr", "view", str(number), "--repo", UPSTREAM_REPO,
                          "--json", "number,state,mergedAt,mergeCommit,url,title")
-
-    def ahead_by(self, sha):
-        """How many commits `sha` has that upstream master lacks: 0 means it has landed."""
-        output = self.run("api", f"repos/{UPSTREAM_REPO}/compare/master...{sha}",
-                          "--jq", ".ahead_by").strip()
-        if not output.isdigit():
-            raise Error(f"Failed to read ahead_by comparing upstream master with {sha}: {output!r}")
-        return int(output)
 
 
 @dataclass
@@ -88,6 +85,7 @@ class Status:
     fork: str
     upstream: str
     base: str
+    base_date: str
     sync_points: list = field(default_factory=list)
     contributions: list = field(default_factory=list)
     adopted: list = field(default_factory=list)
@@ -127,11 +125,18 @@ def dropped(message):
     return [(int(fork), int(upstream)) for fork, upstream in DROPPED.findall(message)]
 
 
+def shopify_prs(message):
+    """The PR numbers on the last `Shopify-PR: #N #M` trailer line of a commit message."""
+    lines = SHOPIFY_PR.findall(message)
+    return [int(number) for number in re.findall(r"#(\d+)", lines[-1])] if lines else []
+
+
 def attribute(landings, pull_requests):
     """Maps PR number -> landing shas, and lists the landings no merged fork PR accounts for.
 
-    A `(#N)` subject naming a merged fork PR is that PR; otherwise every PR whose mergeCommit is
-    the landing (several for a stack merge). A `(#N)` naming no fork PR is upstream's number.
+    A `(#N)` subject naming a merged fork PR is that PR; otherwise the merged fork PRs its
+    `Shopify-PR:` trailer names (a replayed landing); otherwise every PR whose mergeCommit is the
+    landing (several for a stack merge). A `(#N)` naming no fork PR is upstream's number.
     """
     numbers = {pr["number"] for pr in pull_requests}
     by_merge = {}
@@ -143,7 +148,8 @@ def attribute(landings, pull_requests):
         if match and int(match[1]) in numbers:
             owners = [int(match[1])]
         else:
-            owners = by_merge.get(commit["sha"], [])
+            named = [n for n in shopify_prs(commit.get("message", "")) if n in numbers]
+            owners = list(dict.fromkeys(named)) or by_merge.get(commit["sha"], [])
         if not owners:
             unidentified.append({"sha": commit["sha"], "subject": commit["subject"]})
         for number in owners:
@@ -164,7 +170,11 @@ def fork_only(pr):
 
 
 def upstream_link(comments):
-    """The URL on the last `Upstream:` line of the newest comment that has one, else None."""
+    """The token on the last `Upstream:` line of the newest comment that has one, else None.
+
+    A line is `Upstream:` (or `**Upstream:**`) followed by a token; the newest such line wins
+    even when its token is not a valid URL.
+    """
     link = None
     for entry in sorted(comments, key=lambda entry: entry.get("created_at") or ""):
         found = UPSTREAM_LINE.findall(entry.get("body") or "")
@@ -174,22 +184,27 @@ def upstream_link(comments):
 
 
 def upstream_number(url):
-    match = UPSTREAM_PR_URL.fullmatch(url)
+    """The upstream PR number a browser-copied URL names: `<url>`, a trailing `.` or `,`, and a
+    suffix such as `/files` or `#issuecomment-1` are accepted."""
+    match = UPSTREAM_PR_URL.fullmatch(url.strip("<>.,"))
     return int(match[1]) if match else None
 
 
-def upstream_state(view, ahead_by):
-    """open, closed, landed or restructured, from `gh pr view` of the upstream PR."""
+def upstream_state(view, is_landed):
+    """open, closed, landed or restructured, from `gh pr view` of the upstream PR; `is_landed`
+    says whether a merge commit is on upstream master."""
     state = view.get("state")
     if state == "OPEN":
         return "open"
     if state != "MERGED":
         return "closed"
     sha = (view.get("mergeCommit") or {}).get("oid")
-    return "landed" if sha and ahead_by(sha) == 0 else "restructured"
+    # Only a full sha reaches git: an option-shaped or ref-shaped value must not be asked about.
+    return "landed" if isinstance(sha, str) and OID.fullmatch(sha) and is_landed(sha) \
+        else "restructured"
 
 
-def contribution(pr, landings, github, now, warnings):
+def contribution(pr, landings, github, is_landed, now, warnings):
     author = (pr.get("author") or {}).get("login")
     result = Contribution(pr["number"], pr.get("title") or "", author, pr.get("url"),
                           pr.get("mergedAt"), landings, age_days=age_days(pr.get("mergedAt"), now))
@@ -209,42 +224,68 @@ def contribution(pr, landings, github, now, warnings):
         return result
     try:
         view = github.upstream_pull_request(number)
+        result.state = upstream_state(view, is_landed)
     except Error as error:
         reason = str(error).strip().splitlines()[-1]
         warnings.append(f"#{result.number}: could not read upstream PR yugabyte#{number}: {reason}")
         return result
-    result.state = upstream_state(view, github.ahead_by)
     result.upstream_number, result.upstream_url = number, view.get("url")
     result.upstream_state, result.upstream_title = view.get("state"), view.get("title")
     result.upstream_merged_at = view.get("mergedAt")
     return result
 
 
-def resolve(repo, ref):
+def resolve(repo, ref, hint=""):
     try:
         return repo.commit_for(ref)
     except GitError:
-        raise GitError(f"{ref} does not resolve to a commit in {repo.path}") from None
+        raise GitError(f"{ref} does not resolve to a commit in {repo.path}{hint}") from None
 
 
-def derive(repo, github, fork_ref, upstream_ref, now):
-    fork, upstream = resolve(repo, fork_ref), resolve(repo, upstream_ref)
-    status = Status(fork, upstream, repo.merge_base(upstream, fork))
+def coverage_warnings(status, landings, landed, pull_requests):
+    """Warnings for what the derivation cannot account for."""
+    accounted = landed.keys() | {entry["number"] for entry in status.adopted}
+    warnings = [f"PR #{entry['number']} was dropped by sync {entry['sync'][:9]} but is carried "
+                "again" for entry in status.adopted if entry["number"] in landed]
+    warnings += [f"merged PR #{number} is neither carried nor adopted"
+                 for number, pr in sorted(pull_requests.items())
+                 if pr.get("baseRefName") == FORK_BRANCH and number not in accounted]
+    merges = {commit["sha"] for commit in landings if len(commit["parents"]) > 1}
+    unattributed = sum(entry["sha"] in merges for entry in status.unidentified)
+    if unattributed:
+        warnings.append(f"{unattributed} unattributed merge commit(s) on {FORK_BRANCH}; if the "
+                        "upstream ref is stale, run without --no-fetch")
+    if len(pull_requests) >= PR_LIMIT:
+        warnings.append(f"gh pr list returned {len(pull_requests)} PRs; the list may be truncated")
+    return warnings
+
+
+def derive(repo, github, fork_ref, upstream_ref, now, hint=""):
+    fork, upstream = resolve(repo, fork_ref), resolve(repo, upstream_ref, hint)
+    base = repo.merge_base(upstream, fork)
+    base_date = datetime.fromtimestamp(repo.commit_timestamp(base), timezone.utc).isoformat()
+    status = Status(fork, upstream, base, base_date)
     landings = []
     for commit in repo.first_parent_commits(status.base, fork):
         kind = sync_kind(repo, commit, upstream)
         if kind is None:
             landings.append(commit)
             continue
-        point = SyncPoint(commit["sha"], parse_time(commit["date"]).isoformat(), kind)
-        status.sync_points.append(point)
-        status.adopted += [{"number": fork_pr, "upstream_number": upstream_pr, "sync": point.sha}
-                           for fork_pr, upstream_pr in dropped(repo.message(point.sha))]
+        status.sync_points.append(
+            SyncPoint(commit["sha"], parse_time(commit["date"]).isoformat(), kind))
+    # A sync behind the merge base is off the first-parent range but still on the fork.
+    for merge in repo.matching_merges(fork, upstream, DROPPED_GREP):
+        date = parse_time(merge["date"]).isoformat()
+        status.adopted += [{"number": fork_pr, "upstream_number": upstream_pr,
+                            "sync": merge["sha"], "date": date}
+                           for fork_pr, upstream_pr in dropped(merge["message"])]
     status.adopted.sort(key=lambda entry: entry["number"])
     pull_requests = {pr["number"]: pr for pr in github.merged_pull_requests()}
     landed, status.unidentified = attribute(landings, pull_requests.values())
-    status.contributions = [contribution(pull_requests[number], landed[number], github, now,
+    status.contributions = [contribution(pull_requests[number], landed[number], github,
+                                         lambda sha: repo.ancestor(sha, upstream), now,
                                          status.warnings) for number in sorted(landed)]
+    status.warnings += coverage_warnings(status, landings, landed, pull_requests)
     return status
 
 
@@ -273,7 +314,7 @@ def render(status, fork_name):
     carried = len({sha for c in status.contributions for sha in c.landings})
     carried += len(status.unidentified)
     header = (f"{fork_name} {status.fork[:9]}: {carried} carried commit{'s' * (carried != 1)} "
-              f"since upstream {status.base[:9]}; ")
+              f"since upstream {status.base[:9]} ({status.base_date[:10]}); ")
     if status.sync_points:
         last = status.sync_points[-1]
         header += f"last sync {last.date[:10]} ({last.kind.replace('-', ' ')})"
@@ -287,10 +328,9 @@ def render(status, fork_name):
     lines.append(f"Fork-only ({len(fork_only_prs)})")
     if fork_only_prs:
         lines.append("  " + " ".join(fork_only_prs))
-    dates = {point.sha: point.date[:10] for point in status.sync_points}
     lines.append(f"Adopted by earlier syncs ({len(status.adopted)})")
     lines += [f"  {'#' + str(a['number']):<4} yugabyte#{a['upstream_number']}  "
-              f"dropped {dates[a['sync']]}" for a in status.adopted]
+              f"dropped {a['date'][:10]}" for a in status.adopted]
     lines.append(f"Unidentified commits ({len(status.unidentified)})")
     lines += [f"  {u['sha'][:9]}  {u['subject']}" for u in status.unidentified]
     if status.warnings:
@@ -314,9 +354,11 @@ def parser():
                              "(default: the checkout containing this script)")
     status.add_argument("--no-fetch", dest="fetch", action="store_false",
                         help="do not fetch origin master-shopify and upstream master first")
-    status.add_argument("--upstream-ref", metavar="ref",
-                        help="upstream master (default: FETCH_HEAD, or upstream/master with "
-                             "--no-fetch)")
+    status.add_argument("--upstream-ref", metavar="ref", default=UPSTREAM_REF,
+                        help=f"upstream master (default: {UPSTREAM_REF}, which the fetch "
+                             "updates)")
+    status.add_argument("--upstream-url", metavar="url", default=UPSTREAM_URL,
+                        help=f"where to fetch upstream master from (default: {UPSTREAM_URL})")
     status.add_argument("--fork-ref", metavar="ref", default="origin/master-shopify",
                         help="the fork's master-shopify (default: origin/master-shopify)")
     status.add_argument("--json", action="store_true", help="print one JSON object")
@@ -361,12 +403,13 @@ class Cli:
     def status(self, args):
         repo = Repository(args.repo_path)
         if args.fetch:
-            # An explicit refspec updates origin/master-shopify whatever the clone's fetch
-            # mapping; FETCH_HEAD then holds upstream master.
+            # Explicit refspecs update both refs whatever the clone's fetch mapping.
             repo.fetch("origin", f"+refs/heads/{FORK_BRANCH}:refs/remotes/origin/{FORK_BRANCH}")
-            repo.fetch(UPSTREAM_URL, "master")
-        upstream_ref = args.upstream_ref or ("FETCH_HEAD" if args.fetch else "upstream/master")
-        status = derive(repo, self.github, args.fork_ref, upstream_ref, self.now)
+            repo.fetch(args.upstream_url, f"+refs/heads/master:{UPSTREAM_REF}")
+        hint = ""
+        if not args.fetch and args.upstream_ref == UPSTREAM_REF:
+            hint = "; run once without --no-fetch to fetch upstream master"
+        status = derive(repo, self.github, args.fork_ref, args.upstream_ref, self.now, hint)
         if args.json:
             self.say(json.dumps(asdict(status), indent=2))
         else:

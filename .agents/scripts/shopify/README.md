@@ -244,14 +244,50 @@ never squashed.
 `release.py` shares its git and `gh` plumbing with the other tools through `scm.py`;
 `test_release.py` and `test_scm.py` run under the same `unittest discover` command as above.
 
-## Upstream submission (planned)
+## Upstream status
 
-`upstream.py` will have three commands. `submit <fork-pr>` will perform the
-shopify-upstream-pr skill's steps under the developer's own `gh` login, as
-`python3 .agents/scripts/shopify/upstream.py submit <n>`. `status` will derive each
-contribution's state from GitHub and git, with no store of its own. `sync` will rebuild
-`master-shopify` on a newer upstream commit, as AGENTS.md describes. Until the script
-exists, submission follows the skills by hand, and no sync runs.
+`upstream.py` has one command, `status`, which shows where each change `master-shopify`
+carries stands upstream. `submit <fork-pr>`, which will perform the shopify-upstream-pr
+skill's steps under the developer's own `gh` login, and `sync`, which will rebuild
+`master-shopify` on a newer upstream commit as AGENTS.md describes, do not exist yet. Until
+they do, submission follows the skills by hand, and no sync runs.
+
+```bash
+python3 .agents/scripts/shopify/upstream.py status
+python3 .agents/scripts/shopify/upstream.py status --no-fetch --json
+```
+
+`status` stores nothing: it reads git and `gh`. Unless `--no-fetch`, it first fetches
+`origin master-shopify` into `origin/master-shopify`, and upstream `master` from
+`--upstream-url` (default `https://github.com/yugabyte/yugabyte-db.git`) into
+`refs/shopify/upstream-master`, a ref only this tool writes. `--no-fetch` reuses that ref
+and fails when it is absent. The header names the merge base of the two and its date, as in
+`since upstream ad087d0fd (2026-11-18)`; an old date is the first sign of a stale ref.
+
+It walks `git log --first-parent <merge base>..origin/master-shopify`. A merge that brings in
+upstream history on a later parent is an upstream merge (GitHub's Sync fork); one whose first
+parent is upstream and whose tree equals that parent's is a sync's `-s ours` merge. The PRs
+earlier syncs adopted come from the `Dropped: #N (upstream #M)` trailers of every merge
+reachable from `origin/master-shopify` but not from the upstream ref, since a sync's merge
+falls behind the merge base once the next sync lands. Every other commit is a
+landing: the fork PR its `(#N)` subject names; else the merged fork PRs its
+`Shopify-PR: #55 #58` trailer names, which `sync` will write when it replays a landing that had
+no `(#N)`, such as a merge landing replayed with `cherry-pick -m 1`; else every merged fork
+PR whose `mergeCommit` it is (a stack merge); else unidentified. A PR is fork-only with the
+`upstream: skip` label or a `[shopify-only]` title; otherwise the newest comment with an
+`Upstream:` line names the upstream PR, which is open, closed, landed (merged, and its merge
+commit is an ancestor of the upstream ref) or restructured (merged, and its merge commit is
+not, or is not in the checkout). The line accepts browser-copied URLs: angle brackets, a
+trailing `.` or `,`, a suffix such as `/files` or `#issuecomment-1`, and `**Upstream:**`.
+Without a readable `Upstream:` comment the PR is not submitted.
+
+Warnings cover what the derivation cannot settle: a label and title that disagree; an
+`Upstream:` line that is not an upstream PR URL, or an upstream PR it cannot read; a merged
+PR based on `master-shopify` that is neither carried nor adopted; a PR a sync dropped that is
+carried again; first-parent merge commits that are neither sync points nor attributed, which
+is how an upstream merge beyond a stale upstream ref shows; and a `gh pr list` result as long
+as its 5000-PR limit. Exit codes: 0, 2 for usage errors, 1 otherwise. `test_upstream.py` runs
+under the same `unittest discover` command as above.
 
 ## PR title cases
 
@@ -272,26 +308,3 @@ The "PR title cases" job in `shopify-contributions.yml` runs it whenever the wor
 or the cases change, including a sync that replays the fork's patch to the workflow.
 Change the cases in the same PR as the policy. `test_pr_title_cases.py` runs under
 the same `unittest discover` command as above.
-
-## Upstream status
-
-`upstream.py status` shows where each change `master-shopify` carries stands upstream. It
-stores nothing: it reads git and `gh` and, unless `--no-fetch`, first fetches
-`origin master-shopify` and upstream `master` (into `FETCH_HEAD`).
-
-```bash
-python3 .agents/scripts/shopify/upstream.py status
-python3 .agents/scripts/shopify/upstream.py status --no-fetch --upstream-ref FETCH_HEAD --json
-```
-
-It walks `git log --first-parent <merge base>..origin/master-shopify`. A merge that brings in
-upstream history on a later parent is an upstream merge (GitHub's Sync fork); one whose first
-parent is upstream and whose tree equals that parent's is a sync's `-s ours` merge, and its
-`Dropped: #N (upstream #M)` trailers list the PRs it adopted. Every other commit is a
-landing: the fork PR its `(#N)` subject names, else every merged fork PR whose `mergeCommit`
-it is (a stack merge), else unidentified. A PR is fork-only with the `upstream: skip` label
-or a `[shopify-only]` title, with a warning when only one holds; otherwise the newest
-`Upstream:` comment on it names the upstream PR, which is open, closed, landed (merged and
-on upstream `master`) or restructured (merged, not on `master`). Without a readable
-`Upstream:` comment the PR is not submitted. Exit codes: 0, 2 for usage errors, 1 otherwise.
-`test_upstream.py` runs under the same `unittest discover` command as above.

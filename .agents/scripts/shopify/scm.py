@@ -120,14 +120,25 @@ class Repository:
 
     def first_parent_commits(self, from_rev, to_rev):
         """Oldest first, the first-parent line of from_rev..to_rev as dicts with sha, parents,
-        tree, date (committer, ISO 8601) and subject."""
-        fields = ("sha", "parents", "tree", "date", "subject")
-        records = self._lines("log", "--first-parent", "--reverse",
-                              "--format=%H%x1f%P%x1f%T%x1f%cI%x1f%s", f"{from_rev}..{to_rev}")
-        commits = [dict(zip(fields, record.split("\x1f"))) for record in records]
+        tree, date (committer, ISO 8601), subject and message."""
+        fields = ("sha", "parents", "tree", "date", "subject", "message")
+        output = self._run("log", "--first-parent", "--reverse", "-z",
+                           "--format=%H%x1f%P%x1f%T%x1f%cI%x1f%s%x1f%B", f"{from_rev}..{to_rev}")
+        commits = [dict(zip(fields, record.split("\x1f", 5))) for record in output.split("\0")
+                   if record]
         for commit in commits:
             commit["parents"] = commit["parents"].split()
         return commits
+
+    def matching_merges(self, to_rev, exclude, pattern):
+        """Oldest first, the merge commits reachable from to_rev but not exclude with a message
+        line matching the extended regex `pattern`, as dicts with sha, date (committer, ISO 8601)
+        and message."""
+        fields = ("sha", "date", "message")
+        output = self._run("log", "--merges", "--extended-regexp", f"--grep={pattern}",
+                           "--reverse", "-z", "--format=%H%x1f%cI%x1f%B", to_rev, f"^{exclude}")
+        return [dict(zip(fields, record.split("\x1f", 2))) for record in output.split("\0")
+                if record]
 
     def fetch(self, *args):
         return self._run("fetch", *args)

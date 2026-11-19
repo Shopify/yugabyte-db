@@ -84,7 +84,7 @@ class GitRepositoryTest(RepoTestCase):
         self.fixture.git("checkout", "--quiet", "-b", "side")
         side = self.fixture.commit("side")
         self.fixture.git("checkout", "--quiet", "main")
-        mainline = self.fixture.commit("mainline", 1793534400)
+        mainline = self.fixture.commit("mainline\n\nShopify-PR: #1 #2", 1793534400)
         self.fixture.git("merge", "--quiet", "--no-ff", "-m", "merge side", "side")
         merge = self.fixture.git("rev-parse", "HEAD")
         self.fixture.ref("refs/remotes/upstream/master", side)
@@ -93,11 +93,36 @@ class GitRepositoryTest(RepoTestCase):
         commits = repo.first_parent_commits(base, "main")
 
         self.assertEqual(base, repo.merge_base("refs/remotes/upstream/master", mainline))
-        self.assertEqual([(mainline, [base], "mainline"), (merge, [mainline, side], "merge side")],
-                         [(c["sha"], c["parents"], c["subject"]) for c in commits])
+        self.assertEqual([(mainline, [base], "mainline", "mainline\n\nShopify-PR: #1 #2\n"),
+                          (merge, [mainline, side], "merge side", "merge side\n")],
+                         [(c["sha"], c["parents"], c["subject"], c["message"]) for c in commits])
         # Older git prints +00:00 for UTC and newer git prints Z.
         self.assertIn(commits[0]["date"], ("2026-11-01T12:00:00+00:00", "2026-11-01T12:00:00Z"))
         self.assertEqual(repo.tree(merge), commits[1]["tree"])
+
+    def test_matching_merges_lists_merges_off_the_excluded_ref_whose_message_matches(self):
+        base = self.fixture.commit("base", 1793534400)
+        self.fixture.git("checkout", "--quiet", "-b", "side")
+        self.fixture.commit("side change\n\nDropped: #1 (upstream #10)", 1793534400)
+        self.fixture.git("checkout", "--quiet", "main")
+        self.fixture.git("merge", "--quiet", "--no-ff", "-m", "plain merge", "side")
+        self.fixture.git("checkout", "--quiet", "-b", "older", base)
+        self.fixture.commit("older change", 1793534400)
+        self.fixture.git("checkout", "--quiet", "main")
+        dated = {"GIT_COMMITTER_DATE": "1793620800 +0000"}
+        self.fixture.git("merge", "--quiet", "--no-ff", "-s", "ours", "-m",
+                         "sync\n\nDropped: #2 (upstream #20)", "older", env=dated)
+        sync = self.fixture.git("rev-parse", "HEAD")
+        repo = Repository(self.fixture.path)
+
+        merges = repo.matching_merges("main", base, "^Dropped: #")
+
+        self.assertEqual([(sync, "sync\n\nDropped: #2 (upstream #20)\n")],
+                         [(m["sha"], m["message"]) for m in merges])
+        # Older git prints +00:00 for UTC and newer git prints Z.
+        self.assertIn(merges[0]["date"], ("2026-11-02T12:00:00+00:00", "2026-11-02T12:00:00Z"))
+        self.assertEqual([], repo.matching_merges("main", sync, "^Dropped: #"))
+        self.assertEqual([], repo.matching_merges("main", base, "^Dropped: #3"))
 
     def test_fetch_updates_the_remote_tracking_ref_from_a_local_remote(self):
         remote = os.path.join(self.tmpdir, "origin.git")
