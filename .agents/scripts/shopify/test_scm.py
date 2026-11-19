@@ -108,9 +108,12 @@ class GitRepositoryTest(RepoTestCase):
         pushed = self.fixture.commit("later")
         self.fixture.git("push", "--quiet", "origin", "main")
         self.fixture.git("update-ref", "-d", "refs/remotes/origin/main")
+        # A single-branch clone's mapping excludes main; an explicit refspec still updates it.
+        self.fixture.git("config", "remote.origin.fetch",
+                         "+refs/heads/other:refs/remotes/origin/other")
         repo = Repository(self.fixture.path)
 
-        repo.fetch("origin", "main")
+        repo.fetch("origin", "+refs/heads/main:refs/remotes/origin/main")
 
         self.assertEqual(pushed, self.fixture.git("rev-parse", "refs/remotes/origin/main"))
 

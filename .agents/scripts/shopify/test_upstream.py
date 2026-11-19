@@ -424,6 +424,11 @@ class UpstreamGitHubTest(testfixtures.RepoTestCase):
         os.chmod(executable, 0o755)
         return GitHub(executable=executable)
 
+    def test_comments_flatten_the_pages_gh_slurps(self):
+        pages = '[[{"body": "first"}], [{"body": "second"}]]'
+
+        self.assertEqual([{"body": "first"}, {"body": "second"}], self.gh(pages).comments(70))
+
     def test_ahead_by_parses_the_number_gh_prints(self):
         self.assertEqual(0, self.gh("0").ahead_by(MERGED_UPSTREAM))
 

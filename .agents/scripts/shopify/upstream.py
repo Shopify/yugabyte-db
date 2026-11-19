@@ -22,6 +22,7 @@ from scm import GitHub as _GitHub
 
 
 FORK_REPO = "Shopify/yugabyte-db"
+FORK_BRANCH = "master-shopify"
 UPSTREAM_REPO = "yugabyte/yugabyte-db"
 UPSTREAM_URL = "https://github.com/yugabyte/yugabyte-db.git"
 SKIP_LABEL = "upstream: skip"
@@ -40,7 +41,10 @@ class GitHub(_GitHub):
                          "--json", "number,title,mergeCommit,mergedAt,labels,author,url")
 
     def comments(self, number):
-        return self.json("api", f"repos/{FORK_REPO}/issues/{number}/comments?per_page=100")
+        """Every comment on the fork PR, oldest first; --slurp returns one array per page."""
+        pages = self.json("api", f"repos/{FORK_REPO}/issues/{number}/comments", "--paginate",
+                          "--slurp")
+        return [entry for page in pages for entry in page]
 
     def upstream_pull_request(self, number):
         return self.json("pr", "view", str(number), "--repo", UPSTREAM_REPO,
@@ -357,7 +361,9 @@ class Cli:
     def status(self, args):
         repo = Repository(args.repo_path)
         if args.fetch:
-            repo.fetch("origin", "master-shopify")
+            # An explicit refspec updates origin/master-shopify whatever the clone's fetch
+            # mapping; FETCH_HEAD then holds upstream master.
+            repo.fetch("origin", f"+refs/heads/{FORK_BRANCH}:refs/remotes/origin/{FORK_BRANCH}")
             repo.fetch(UPSTREAM_URL, "master")
         upstream_ref = args.upstream_ref or ("FETCH_HEAD" if args.fetch else "upstream/master")
         status = derive(repo, self.github, args.fork_ref, upstream_ref, self.now)
