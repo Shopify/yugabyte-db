@@ -79,6 +79,41 @@ class GitRepositoryTest(RepoTestCase):
         self.assertTrue(repo.ancestor(first, "main"))
         self.assertFalse(repo.ancestor("main", first))
 
+    def test_first_parent_commits_list_the_first_parent_line_oldest_first(self):
+        base = self.fixture.commit("base")
+        self.fixture.git("checkout", "--quiet", "-b", "side")
+        side = self.fixture.commit("side")
+        self.fixture.git("checkout", "--quiet", "main")
+        mainline = self.fixture.commit("mainline", 1793534400)
+        self.fixture.git("merge", "--quiet", "--no-ff", "-m", "merge side", "side")
+        merge = self.fixture.git("rev-parse", "HEAD")
+        self.fixture.ref("refs/remotes/upstream/master", side)
+        repo = Repository(self.fixture.path)
+
+        commits = repo.first_parent_commits(base, "main")
+
+        self.assertEqual(base, repo.merge_base("refs/remotes/upstream/master", mainline))
+        self.assertEqual([(mainline, [base], "mainline"), (merge, [mainline, side], "merge side")],
+                         [(c["sha"], c["parents"], c["subject"]) for c in commits])
+        # Older git prints +00:00 for UTC and newer git prints Z.
+        self.assertIn(commits[0]["date"], ("2026-11-01T12:00:00+00:00", "2026-11-01T12:00:00Z"))
+        self.assertEqual(repo.tree(merge), commits[1]["tree"])
+
+    def test_fetch_updates_the_remote_tracking_ref_from_a_local_remote(self):
+        remote = os.path.join(self.tmpdir, "origin.git")
+        self.fixture.init_bare(remote)
+        self.fixture.commit("base")
+        self.fixture.git("remote", "add", "origin", remote)
+        self.fixture.git("push", "--quiet", "origin", "main")
+        pushed = self.fixture.commit("later")
+        self.fixture.git("push", "--quiet", "origin", "main")
+        self.fixture.git("update-ref", "-d", "refs/remotes/origin/main")
+        repo = Repository(self.fixture.path)
+
+        repo.fetch("origin", "main")
+
+        self.assertEqual(pushed, self.fixture.git("rev-parse", "refs/remotes/origin/main"))
+
 
 class GitHubTest(RepoTestCase):
     def test_missing_gh_binary_is_a_clear_error(self):

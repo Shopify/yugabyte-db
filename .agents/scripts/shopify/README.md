@@ -272,3 +272,26 @@ The "PR title cases" job in `shopify-contributions.yml` runs it whenever the wor
 or the cases change, including a sync that replays the fork's patch to the workflow.
 Change the cases in the same PR as the policy. `test_pr_title_cases.py` runs under
 the same `unittest discover` command as above.
+
+## Upstream status
+
+`upstream.py status` shows where each change `master-shopify` carries stands upstream. It
+stores nothing: it reads git and `gh` and, unless `--no-fetch`, first fetches
+`origin master-shopify` and upstream `master` (into `FETCH_HEAD`).
+
+```bash
+python3 .agents/scripts/shopify/upstream.py status
+python3 .agents/scripts/shopify/upstream.py status --no-fetch --upstream-ref FETCH_HEAD --json
+```
+
+It walks `git log --first-parent <merge base>..origin/master-shopify`. A merge that brings in
+upstream history on a later parent is an upstream merge (GitHub's Sync fork); one whose first
+parent is upstream and whose tree equals that parent's is a sync's `-s ours` merge, and its
+`Dropped: #N (upstream #M)` trailers list the PRs it adopted. Every other commit is a
+landing: the fork PR its `(#N)` subject names, else every merged fork PR whose `mergeCommit`
+it is (a stack merge), else unidentified. A PR is fork-only with the `upstream: skip` label
+or a `[shopify-only]` title, with a warning when only one holds; otherwise the newest
+`Upstream:` comment on it names the upstream PR, which is open, closed, landed (merged and
+on upstream `master`) or restructured (merged, not on `master`). Without a readable
+`Upstream:` comment the PR is not submitted. Exit codes: 0, 2 for usage errors, 1 otherwise.
+`test_upstream.py` runs under the same `unittest discover` command as above.

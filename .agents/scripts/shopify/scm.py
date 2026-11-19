@@ -112,6 +112,26 @@ class Repository:
     def message(self, commit):
         return self._run("show", "--no-patch", "--format=%B", commit)
 
+    def merge_base(self, one, other):
+        return self._run("merge-base", one, other).strip()
+
+    def tree(self, commit):
+        return self._run("rev-parse", f"{commit}^{{tree}}").strip()
+
+    def first_parent_commits(self, from_rev, to_rev):
+        """Oldest first, the first-parent line of from_rev..to_rev as dicts with sha, parents,
+        tree, date (committer, ISO 8601) and subject."""
+        fields = ("sha", "parents", "tree", "date", "subject")
+        records = self._lines("log", "--first-parent", "--reverse",
+                              "--format=%H%x1f%P%x1f%T%x1f%cI%x1f%s", f"{from_rev}..{to_rev}")
+        commits = [dict(zip(fields, record.split("\x1f"))) for record in records]
+        for commit in commits:
+            commit["parents"] = commit["parents"].split()
+        return commits
+
+    def fetch(self, *args):
+        return self._run("fetch", *args)
+
     def fetch_all_with_tags(self):
         return self._run("fetch", "--all", "--tags")
 
