@@ -22,6 +22,7 @@
       "$BUILD_ROOT/bin/yb-bulk_load",
       "$BUILD_ROOT/bin/yb-fs_pin",
       "$BUILD_ROOT/bin/yb-generate_partitions_main",
+      "$BUILD_ROOT/bin/yb-local-readonly",
       "$BUILD_ROOT/bin/yb-master",
       "$BUILD_ROOT/bin/yb-pbc-dump",
       "$BUILD_ROOT/bin/yb-ts-cli",
