@@ -93,11 +93,12 @@ You can configure the following parameters in `postgresql.conf`:
 | Column | Type | Default | Description |
 | :----- | :--- | :------ | :---------- |
 | `pg_stat_statements.max` | integer | 5000 | Maximum number of statements tracked. |
-| `pg_stat_statements.track_planning` | boolean | off | Controls whether planning operations and duration are tracked. |
+| `pg_stat_statements.track_planning` | boolean | on | Controls whether planning operations and duration are tracked. |
 | `pg_stat_statements.track` | enum | top | Controls which statements are counted. Valid values are `top` (track statements issued directly by clients), `all` (track top-level and nested statements), and `none` (disable statement statistics collection). |
 | `pg_stat_statements.track_utility` | boolean | on | Controls whether the module tracks utility commands. |
 | `pg_stat_statements.save` | boolean | on | Specifies whether to save statement statistics across server shutdowns. |
 | `pg_stat_statements.yb_hdr_bucket_factor` | integer | 16 | Changes the number of latency range buckets. |
+| `pg_stat_statements.yb_flush_interval` | integer | 1000 | Maximum time, in milliseconds, that a session keeps the statistics of its statements in its own memory before adding them to the view. `0` adds them at the end of every statement. See [When statistics become visible](#when-statistics-become-visible). |
 | `pg_stat_statements.yb_max_query_text_length` | integer | -1 | Maximum length, in bytes, of the query text stored for each statement. Longer texts are truncated without splitting a character and end with `...`. This limits the memory used to read the `pg_stat_statements` view when the workload has very long statements, such as large batched inserts. -1 stores texts in full. The limit applies to statements recorded after it is set; existing entries keep their text until they are evicted or the statistics are reset. |
 | `yb_enable_pg_stat_statements_rpc_stats` | boolean | true (from v2026.1.1.0) | Enables RPC execution time statistics for pg_stat_statements. When enabled, populates the DocDB-related columns `docdb_read_rpcs`, `docdb_write_rpcs`, `docdb_read_operations`, `docdb_write_operations`, `docdb_wait_time`, `catalog_wait_time`. This is a runtime flag that can be changed without restarting the server. |
 | `yb_enable_pg_stat_statements_docdb_metrics` | boolean | true (from v2026.1.1.0) | Enables DocDB metrics collection for pg_stat_statements. When enabled, populates the DocDB-related columns `docdb_seeks`, `docdb_nexts`, `docdb_prevs`, `docdb_read_time`, `docdb_write_time`, `docdb_obsolete_rows_scanned`. This is a runtime flag that can be changed without restarting the server. |
@@ -132,6 +133,17 @@ yugabyte=# CREATE EXTENSION pg_stat_statements;
 ```sql
 yugabyte=# DROP EXTENSION pg_stat_statements;
 ```
+
+### When statistics become visible
+
+To avoid contention when many sessions run the same statements, each session collects the statistics of its statements in its own memory, and adds them to the pg_stat_statements view in batches, once the oldest of them are `pg_stat_statements.yb_flush_interval` milliseconds old (1000 by default). As a result:
+
+- When a session queries pg_stat_statements, the results always include the statements that session has completed.
+- Other sessions see a completed statement within `pg_stat_statements.yb_flush_interval`, plus the duration of the statement the session is running at that time. A session that is idle, including one that is idle in a transaction, adds its statistics when the interval ends.
+- A session adds all of its statistics when it disconnects. If its backend process is killed (for example, with `SIGKILL`) or crashes, at most one interval of its statistics is lost.
+- Setting `pg_stat_statements.yb_flush_interval` to `0` restores updating the view at the end of every statement.
+
+Statements run by processes other than client sessions, such as background workers, always update the view at the end of each statement.
 
 ## yb_latency_histogram column
 

@@ -40,6 +40,7 @@ volatile sig_atomic_t YbLogCatcacheStatsPending = false;
 volatile sig_atomic_t LogHeapSnapshotPending = false;
 volatile sig_atomic_t LogHeapSnapshotPeakHeap = false;
 volatile sig_atomic_t IdleStatsUpdateTimeoutPending = false;
+volatile sig_atomic_t YbIdleStatsFlushTimeoutPending = false;
 volatile uint32 InterruptHoldoffCount = 0;
 volatile uint32 QueryCancelHoldoffCount = 0;
 volatile uint32 CritSectionCount = 0;

@@ -490,6 +490,7 @@ static ExecutorRun_hook_type prev_ExecutorRun = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
+static yb_idle_stats_flush_hook_type prev_yb_idle_stats_flush_hook = NULL;
 
 /* Links to shared memory state */
 static pgssSharedState *pgss = NULL;
@@ -686,6 +687,7 @@ static void yb_pgss_pending_track(const pgssHashKey *key, uint32 incarnation,
 static void yb_pgss_pending_maybe_fold(int interval, const instr_time *end_time);
 static void yb_pgss_fold_pending(void);
 static void yb_pgss_pending_shmem_exit(int code, Datum arg);
+static long yb_pgss_idle_stats_flush(bool force);
 
 /*
  * Module load callback
@@ -812,10 +814,11 @@ _PG_init(void)
 
 	DefineCustomIntVariable("pg_stat_statements.yb_flush_interval",
 							"Sets how long a client backend may keep statement statistics in local memory before adding them to pg_stat_statements.",
-							"0 adds them at the end of every statement. Otherwise other sessions see a statement's statistics "
-							"once its backend adds them: at the end of a statement that finishes at least this long after "
-							"the oldest statistics it holds, before it reads or resets pg_stat_statements, and when it exits. "
-							"The backend's own reads see its statements at once.",
+							"0 adds them at the end of every statement. Otherwise a backend adds them once the oldest "
+							"statistics it holds are this old, at the end of a statement or while it is idle, also in a "
+							"transaction block; and before it reads or resets pg_stat_statements, and when it exits. Other "
+							"sessions see a statement's statistics within this interval plus the duration of the statement "
+							"its backend is running then. The backend's own reads see its statements at once.",
 							&yb_flush_interval,
 							1000,
 							0,
@@ -880,6 +883,8 @@ _PG_init(void)
 	ExecutorEnd_hook = pgss_ExecutorEnd;
 	prev_ProcessUtility = ProcessUtility_hook;
 	ProcessUtility_hook = pgss_ProcessUtility;
+	prev_yb_idle_stats_flush_hook = yb_idle_stats_flush_hook;
+	yb_idle_stats_flush_hook = yb_pgss_idle_stats_flush;
 
 	/* Function pointer to check if nested queries should be tracked in ASH */
 	yb_ash_track_nested_queries = yb_track_nested_queries;
@@ -2879,6 +2884,46 @@ yb_pgss_pending_shmem_exit(int code, Datum arg)
 	if (!pgss || !pgss_hash || yb_pgss_in_fold || LWLockHeldByMe(pgss->lock))
 		return;
 	yb_pgss_fold_pending();
+}
+
+/*
+ * YB: yb_idle_stats_flush_hook.  It runs before every ReadyForQuery, so when
+ * nothing is pending it must stay as cheap as a branch, and when something is
+ * pending but not due it takes only a clock reading: folding here every time
+ * would bring back a shared update per statement.  It folds at the effective
+ * interval, so at interval 0 it folds what an earlier nonzero interval left,
+ * even if tracking is now off and no store follows.
+ */
+static long
+yb_pgss_idle_stats_flush(bool force)
+{
+	long		prev_ms = 0;
+	long		my_ms = 0;
+
+	if (prev_yb_idle_stats_flush_hook)
+		prev_ms = prev_yb_idle_stats_flush_hook(force);
+
+	if (yb_pgss_pending_dirty > 0)
+	{
+		int			interval = yb_pgss_effective_flush_interval();
+		instr_time	elapsed;
+		double		elapsed_ms;
+
+		/* Idle: no statement is running and no LWLock is held. */
+		Assert(!pgss || !LWLockHeldByMe(pgss->lock));
+
+		INSTR_TIME_SET_CURRENT(elapsed);
+		INSTR_TIME_SUBTRACT(elapsed, yb_pgss_pending_since);
+		elapsed_ms = INSTR_TIME_GET_MILLISEC(elapsed);
+		if (force || elapsed_ms >= interval)
+			yb_pgss_fold_pending();
+		else
+			my_ms = Max((long) ceil(interval - elapsed_ms), 1);
+	}
+
+	if (prev_ms > 0 && (my_ms == 0 || prev_ms < my_ms))
+		return prev_ms;
+	return my_ms;
 }
 
 /*

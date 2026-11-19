@@ -12,7 +12,8 @@ into the shared entries at most once per `pg_stat_statements.yb_flush_interval` 
 On the per-statement path it writes no shared memory and takes no shared lock; it only reads one
 shared counter. With `yb_flush_interval = 0` every statement takes the upstream path unchanged.
 
-All of this lives in `src/postgres/contrib/pg_stat_statements/pg_stat_statements.c`.
+All of this lives in `src/postgres/contrib/pg_stat_statements/pg_stat_statements.c`, except the
+idle hook that core Postgres calls (see "Idle trigger").
 
 ## Pending records
 
@@ -77,8 +78,9 @@ exists. Utility statements, including the backfill worker's `BACKFILL INDEX`, ta
 The interval is effectively 0 for anything other than a client backend (`MyBackendType !=
 B_BACKEND`): background workers, walsenders and the pg_cron workers update the shared entries per
 statement. At interval 0 a store first folds whatever is still pending from an earlier nonzero
-setting, then runs the synchronous path; there is no GUC assign hook, because assign hooks also run
-during transaction abort, where shared-memory work is unsafe.
+setting, then runs the synchronous path, and the next idle folds it too if no store comes first.
+There is no GUC assign hook, because assign hooks also run during transaction abort, where
+shared-memory work is unsafe.
 
 ## Fold
 
@@ -105,6 +107,7 @@ Triggers:
 - the end of a store, when the oldest pending statistics (`yb_pgss_pending_since`) are at least
   `yb_flush_interval` old. The check uses a monotonic `instr_time`, reusing the end instant the
   planner and utility hooks already take;
+- idle, once the same age is reached (see "Idle trigger");
 - reaching 64 pending keys. After that fold the table is destroyed, and each key takes the
   synchronous path once more;
 - the start of `pg_stat_statements_internal` (every `pg_stat_statements*` view),
@@ -115,18 +118,62 @@ Triggers:
   does nothing if shared state is missing, a fold is in progress or `pgss->lock` is held. Exit
   folds run before the postmaster's shutdown dump, so a clean restart keeps them.
 
+## Idle trigger
+
+Without it, a backend that goes idle keeps its pending statistics until its next statement ends,
+which for an idle session may be never. Core Postgres therefore calls a YB hook,
+`yb_idle_stats_flush_hook` (`long (*)(bool force)`, declared in `tcop/tcopprot.h`):
+
+- `PostgresMain` calls it with `force = false` before every `ReadyForQuery`, in all three idle
+  states: idle, idle in a transaction block, and idle in an aborted one. pgstat's idle flush skips
+  transaction blocks because its counters are transactional; these statistics are not.
+- The hook returns 0 if it holds nothing, otherwise the ms until it next needs to run.
+  The caller arms `YB_IDLE_STATS_FLUSH_TIMEOUT` for a positive result unless it is already
+  armed, and disarms it on 0. As with `IDLE_STATS_UPDATE_TIMEOUT`, the timeout is not disarmed
+  when a command arrives, which would cost a `setitimer` per statement.
+- The timeout handler only sets `YbIdleStatsFlushTimeoutPending`, `InterruptPending` and the latch.
+  `ProcessInterrupts` calls the hook with `force = true` only while `DoingCommandRead`, that is,
+  while the backend waits for a command; no statement is running and no LWLock is held. If the
+  timeout fires during a statement, the flag waits for the call before the next `ReadyForQuery`.
+  Every call clears the flag, so a stale flag cannot force a fold at some later interrupt. Error
+  recovery's `disable_all_timeouts` leaves the timeout inactive, and the next idle re-arms it.
+- Hooks chain, and each returns the minimum positive value of its own result and the previous
+  hook's.
+
+pg_stat_statements' hook, `yb_pgss_idle_stats_flush`, returns 0 at once when nothing is pending.
+Otherwise it folds, and returns 0, if `force` is set or the oldest pending statistics have reached
+the effective interval; if not, it returns the remaining ms, rounded up. It never folds just
+because the backend went idle (see "Rejected alternatives"). Because it compares with the effective
+interval, a session switched to 0 folds what it holds at its next idle, even with `track = none`,
+or with `track_utility = off` so that the `SET` itself stores nothing.
+
+Per statement this costs a branch when nothing is pending and a clock read otherwise. A busy
+backend arms and disarms the timeout about once per interval. A timeout armed before a fold at a
+statement end moved the due time later can fire early; the forced fold then only shortens the
+delay.
+
+With YSQL Connection Manager a backend serves many logical clients and does not exit when one
+disconnects. Its `ReadyForQuery` goes through the same code, so the idle fold, not the exit fold,
+bounds the delay there.
+
 ## What other sessions see
 
-A completed statement becomes visible to other sessions when its backend folds: at the end of a
-statement that finishes at least `yb_flush_interval` after the oldest statistics it holds, when it
-reads or resets `pg_stat_statements`, or when it exits. Its own reads see it at once. A backend
-killed without running exit callbacks (SIGKILL, crash) loses its pending statistics.
+A completed statement becomes visible to other sessions within `yb_flush_interval` plus the
+duration of the statement its backend is running when the interval ends. The backend folds at the
+end of that statement, or, if it is idle, in a transaction block or not, when the timeout fires.
+Under `track = all` the end of each nested statement is a fold point too, so a long function call
+folds while it runs. Reads and resets of `pg_stat_statements` in the backend, and its exit, fold
+as well, and its own reads see its statements at once. A backend killed without running exit
+callbacks (SIGKILL, crash) loses at most one interval of statistics. With `yb_flush_interval = 0`
+nothing changes from upstream. Processes other than client backends are always synchronous (see
+"Store").
 
 Readers in other processes fold nothing: the tserver webserver's `/statements` endpoint
 (`getYsqlStatementStats`), and remote reads through global views such as
 `gv$partial_pg_stat_statements`. They see the shared entries as of the last folds. The webserver's
 reset (`resetYsqlStatementStats`) still goes through `entry_reset`, so it bumps `removal_gen`.
-Tests that read counters written by another backend run at `yb_flush_interval = 0`.
+Tests that read counters written by another backend either run at `yb_flush_interval = 0` or
+wait for the writer to fold.
 
 `mean` and `stddev` of a folded entry equal what adding the statements one by one would give, up
 to floating-point rounding. QPM (`yb_pg_stat_plans`) keeps its own sequential mean, which equals

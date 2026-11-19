@@ -37,11 +37,12 @@ class PgStatStatementsTest : public LibPqTestBase {
 
  protected:
   // A backend keeps its statistics in local memory and adds them to pg_stat_statements when it
-  // folds: at the end of a statement after pg_stat_statements.yb_flush_interval, when it reads or
-  // resets pg_stat_statements, and when it exits. The first store for a key in a backend, and the
-  // first after any reset or eviction, is synchronous; with track_planning on (the default) that
-  // is the plan of the first execution, and its execution is already pending. So the cases below
-  // that check lag compare deltas or bounds, and the others read after the writer has folded.
+  // folds: at the end of a statement or while idle, once its oldest statistics are
+  // pg_stat_statements.yb_flush_interval old; when it reads or resets pg_stat_statements; and when
+  // it exits. The first store for a key in a backend, and the first after any reset or eviction,
+  // is synchronous; with track_planning on (the default) that is the plan of the first execution,
+  // and its execution is already pending. So the cases below that check lag compare deltas or
+  // bounds, and the others read after the writer has folded.
 
   static Result<int32_t> BackendPid(PGConn* conn) {
     return conn->FetchRow<int32_t>("SELECT pg_backend_pid()");
@@ -90,8 +91,97 @@ class PgStatStatementsTest : public LibPqTestBase {
     return query + " FROM test_table";
   }
 
+  static Result<std::string> BackendState(PGConn* reader, int32_t pid) {
+    return reader->FetchRow<std::string>(
+        Format("SELECT state FROM pg_stat_activity WHERE pid = $0", pid));
+  }
+
+  // Waits until the reader sees at least `expected` calls of the INSERT while the writer stays
+  // idle, so only its idle fold can deliver them, and logs how long that took.
+  static Status WaitForIdleFold(PGConn* reader, int64_t expected, MonoTime last_statement_end) {
+    RETURN_NOT_OK(LoggedWaitFor(
+        [reader, expected]() -> Result<bool> {
+          return VERIFY_RESULT(SumCalls(reader, kInsertWhere)) >= expected;
+        },
+        5s * kTimeMultiplier, "waiting for the idle writer to fold"));
+    LOG(INFO) << "Idle fold visible "
+              << (MonoTime::Now() - last_statement_end).ToMilliseconds()
+              << " ms after the writer's last statement";
+    return Status::OK();
+  }
+
+  // The writer sets kIdleIntervalMs, warms the INSERT's key and runs it kExecutions more times,
+  // inside a transaction block if begin is set and then failing a statement in it if abort is set.
+  // The reader then sees those executions within the interval while the writer stays idle in the
+  // expected state.
+  void TestIdleFoldsWithinInterval(bool begin, bool abort, const std::string& idle_state) {
+    constexpr int kExecutions = 10;
+    auto writer = ASSERT_RESULT(Connect());
+    auto reader = ASSERT_RESULT(Connect());
+    ASSERT_OK(writer.Execute("CREATE TABLE test_table (k INT PRIMARY KEY, v INT)"));
+    ASSERT_OK(writer.Fetch("SELECT pg_stat_statements_reset()"));
+    const auto writer_pid = ASSERT_RESULT(BackendPid(&writer));
+    ASSERT_OK(writer.ExecuteFormat(
+        "SET pg_stat_statements.yb_flush_interval = $0", kIdleIntervalMs));
+    if (begin) {
+      ASSERT_OK(writer.Execute("BEGIN"));
+    }
+
+    // The writer's oldest pending statistics are recorded after this instant.
+    const auto start = MonoTime::Now();
+    for (int i = 0; i <= kExecutions; ++i) {
+      ASSERT_OK(writer.ExecuteFormat("INSERT INTO test_table (k, v) VALUES ($0, 1)", i));
+    }
+    if (abort) {
+      ASSERT_NOK(writer.Fetch("SELECT 1/0"));
+    }
+    const auto last_statement_end = MonoTime::Now();
+
+    const auto before_fold = ASSERT_RESULT(SumCalls(&reader, kInsertWhere));
+    const auto elapsed = MonoTime::Now() - start;
+    if (elapsed.ToMilliseconds() < kIdleIntervalMs) {
+      // No fold can have happened yet: at most the first execution reached the shared entry.
+      ASSERT_LE(before_fold, 1);
+    } else {
+      LOG(INFO) << "Skipping the check before the fold: the writer took "
+                << elapsed.ToMilliseconds() << " ms";
+    }
+
+    ASSERT_OK(WaitForIdleFold(&reader, kExecutions + 1, last_statement_end));
+    ASSERT_EQ(ASSERT_RESULT(SumCalls(&reader, kInsertWhere)), kExecutions + 1);
+    ASSERT_EQ(ASSERT_RESULT(BackendState(&reader, writer_pid)), idle_state);
+  }
+
+  // The writer holds pending statistics at interval 60000 when the given idle timeout ends its
+  // session; its exit fold must keep them.
+  void TestIdleTimeoutExitFolds(bool begin, const std::string& set_timeout) {
+    constexpr int kExecutions = 10;
+    auto writer = ASSERT_RESULT(Connect());
+    auto reader = ASSERT_RESULT(Connect());
+    ASSERT_OK(writer.Execute("CREATE TABLE test_table (k INT PRIMARY KEY, v INT)"));
+    ASSERT_OK(writer.Fetch("SELECT pg_stat_statements_reset()"));
+    const auto writer_pid = ASSERT_RESULT(BackendPid(&writer));
+    ASSERT_OK(writer.Execute(kSetLongInterval));
+    if (begin) {
+      ASSERT_OK(writer.Execute("BEGIN"));
+    }
+    for (int i = 0; i <= kExecutions; ++i) {
+      ASSERT_OK(writer.ExecuteFormat("INSERT INTO test_table (k, v) VALUES ($0, 1)", i));
+    }
+    // At most the first execution can have reached the shared entry.
+    ASSERT_LE(ASSERT_RESULT(SumCalls(&reader, kInsertWhere)), 1);
+
+    // Set last, so the timeout cannot end the session before the check above.
+    ASSERT_OK(writer.Execute(set_timeout));
+    ASSERT_OK(WaitForBackendsGone(&reader, {writer_pid}));
+    ASSERT_NOK(writer.Fetch("SELECT 1"));
+
+    ASSERT_EQ(ASSERT_RESULT(SumCalls(&reader, kInsertWhere)), kExecutions + 1);
+  }
+
   static constexpr auto kInsertWhere = "query LIKE 'INSERT INTO test_table%'";
   static constexpr auto kSetLongInterval = "SET pg_stat_statements.yb_flush_interval = 60000";
+  static constexpr int kIdleIntervalMs = 1000;
 };
 
 class PgStatStatementsMaxTest : public PgStatStatementsTest {
@@ -888,6 +978,82 @@ TEST_F(PgStatStatementsTest, PendingCapFolds) {
   // The writer's own SET statements also take keys, so the cap is crossed at some shape before
   // the last one.
   ASSERT_EQ(ASSERT_RESULT(SumCalls(&reader, first_shape)), 2);
+}
+
+// A session that stays idle after its statements folds them within the interval.
+TEST_F(PgStatStatementsTest, IdleSessionFoldsWithinInterval) {
+  ASSERT_NO_FATALS(TestIdleFoldsWithinInterval(
+      /* begin = */ false, /* abort = */ false, "idle"));
+}
+
+// Idle in a transaction block folds too: pg_stat_statements is not transactional.
+TEST_F(PgStatStatementsTest, IdleInTransactionFoldsWithinInterval) {
+  ASSERT_NO_FATALS(TestIdleFoldsWithinInterval(
+      /* begin = */ true, /* abort = */ false, "idle in transaction"));
+}
+
+// Idle in an aborted transaction block folds the statements that completed before the error. The
+// error's recovery disarms every timeout, so this also covers arming it again.
+TEST_F(PgStatStatementsTest, IdleInAbortedTransactionFoldsWithinInterval) {
+  ASSERT_NO_FATALS(TestIdleFoldsWithinInterval(
+      /* begin = */ true, /* abort = */ true, "idle in transaction (aborted)"));
+}
+
+// Going idle does not fold statistics younger than the interval.
+TEST_F(PgStatStatementsTest, IdleDoesNotFoldBeforeInterval) {
+  constexpr int kExecutions = 10;
+  auto writer = ASSERT_RESULT(Connect());
+  auto reader = ASSERT_RESULT(Connect());
+  ASSERT_OK(writer.Execute("CREATE TABLE test_table (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(writer.Fetch("SELECT pg_stat_statements_reset()"));
+  ASSERT_OK(writer.Execute(kSetLongInterval));
+
+  ASSERT_OK(writer.Execute("INSERT INTO test_table (k, v) VALUES (0, 1)"));
+  const auto baseline = ASSERT_RESULT(SumCalls(&reader, kInsertWhere));
+  for (int i = 1; i <= kExecutions; ++i) {
+    ASSERT_OK(writer.ExecuteFormat("INSERT INTO test_table (k, v) VALUES ($0, 1)", i));
+  }
+  // The writer went idle after every statement above and stays idle meanwhile.
+  SleepFor(3s * kTimeMultiplier);
+  ASSERT_EQ(ASSERT_RESULT(SumCalls(&reader, kInsertWhere)), baseline);
+
+  // The executions were pending: the writer's own read folds them.
+  ASSERT_EQ(ASSERT_RESULT(SumCalls(&writer, kInsertWhere)), kExecutions + 1);
+  ASSERT_EQ(ASSERT_RESULT(SumCalls(&reader, kInsertWhere)), kExecutions + 1);
+}
+
+// Switching to interval 0 folds pending statistics at the next idle, even though no tracked
+// statement follows: with track_utility off, the SET itself is not stored.
+TEST_F(PgStatStatementsTest, SwitchToZeroWhileIdleFolds) {
+  constexpr int kExecutions = 10;
+  auto writer = ASSERT_RESULT(Connect());
+  auto reader = ASSERT_RESULT(Connect());
+  ASSERT_OK(writer.Execute("CREATE TABLE test_table (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(writer.Fetch("SELECT pg_stat_statements_reset()"));
+  ASSERT_OK(writer.Execute("SET pg_stat_statements.track_utility = off"));
+  ASSERT_OK(writer.Execute(kSetLongInterval));
+
+  for (int i = 0; i <= kExecutions; ++i) {
+    ASSERT_OK(writer.ExecuteFormat("INSERT INTO test_table (k, v) VALUES ($0, 1)", i));
+  }
+  // At most the first execution can have reached the shared entry.
+  ASSERT_LE(ASSERT_RESULT(SumCalls(&reader, kInsertWhere)), 1);
+
+  ASSERT_OK(writer.Execute("SET pg_stat_statements.yb_flush_interval = 0"));
+  ASSERT_OK(WaitForIdleFold(&reader, kExecutions + 1, MonoTime::Now()));
+  ASSERT_EQ(ASSERT_RESULT(SumCalls(&reader, kInsertWhere)), kExecutions + 1);
+}
+
+// idle_session_timeout still ends a session that holds pending statistics, and they survive.
+TEST_F(PgStatStatementsTest, IdleSessionTimeoutExitFolds) {
+  ASSERT_NO_FATALS(TestIdleTimeoutExitFolds(
+      /* begin = */ false, "SET idle_session_timeout = '2s'"));
+}
+
+// The same for idle_in_transaction_session_timeout.
+TEST_F(PgStatStatementsTest, IdleInTransactionTimeoutExitFolds) {
+  ASSERT_NO_FATALS(TestIdleTimeoutExitFolds(
+      /* begin = */ true, "SET idle_in_transaction_session_timeout = '2s'"));
 }
 
 class PgStatStatementsRestartTest : public PgStatStatementsTest {

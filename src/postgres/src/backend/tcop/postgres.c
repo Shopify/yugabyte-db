@@ -220,6 +220,9 @@ static bool yb_need_cache_refresh = false;
  */
 static bool yb_is_multi_statement_query = false;
 
+/* YB: see tcopprot.h */
+yb_idle_stats_flush_hook_type yb_idle_stats_flush_hook = NULL;
+
 /*
  * YB: template1's shared catalog version at which, and the time when, this auth
  * passthrough control backend started its auth catalog table prefetcher.  The
@@ -275,6 +278,7 @@ static void disable_statement_timeout(void);
 
 static void yb_start_xact_command_internal(bool yb_skip_read_committed_internal_savepoint);
 static void yb_abort_xact_command(void);
+static void YbIdleStatsFlush(bool force);
 
 static YbTraceparentResult YbExtractTraceParentFromComment(const char *query, char *traceparent_out);
 static YbcOtelSpanContext yb_maybe_start_trace_root_span(const char *query_string, bool is_query_string_redacted, YbcOtelSpanContext comment_span_ctx, bool sample);
@@ -3809,6 +3813,45 @@ RecoveryConflictInterrupt(ProcSignalReason reason)
 }
 
 /*
+ * YB: Call yb_idle_stats_flush_hook and arm or disarm
+ * YB_IDLE_STATS_FLUSH_TIMEOUT for the delay it returns.  Callers are idle:
+ * about to send ReadyForQuery, or waiting for a command.
+ *
+ * Every call consumes YbIdleStatsFlushTimeoutPending.  A timeout that fires
+ * while a statement runs leaves the flag set after ProcessInterrupts has
+ * cleared InterruptPending.  The call before the next ReadyForQuery
+ * supersedes it: the hook publishes what is due, and an expired timeout is
+ * no longer active, so it is re-armed.  Clearing the flag here keeps a later,
+ * unrelated interrupt from forcing an early flush.  Error recovery's
+ * disable_all_timeouts leaves the timeout inactive in the same way.
+ *
+ * As with IDLE_STATS_UPDATE_TIMEOUT, an active timeout is not rescheduled,
+ * and it is not disarmed when a command arrives; either would cost a
+ * setitimer call per statement.  So a timeout armed before the hook's due
+ * time moved later may fire early; the forced flush then only shortens the
+ * delay.
+ */
+static void
+YbIdleStatsFlush(bool force)
+{
+	long		delay_ms;
+
+	YbIdleStatsFlushTimeoutPending = false;
+	if (!yb_idle_stats_flush_hook)
+		return;
+
+	delay_ms = yb_idle_stats_flush_hook(force);
+	if (delay_ms > 0)
+	{
+		if (!get_timeout_active(YB_IDLE_STATS_FLUSH_TIMEOUT))
+			enable_timeout_after(YB_IDLE_STATS_FLUSH_TIMEOUT,
+								 (int) Min(delay_ms, INT_MAX));
+	}
+	else if (get_timeout_active(YB_IDLE_STATS_FLUSH_TIMEOUT))
+		disable_timeout(YB_IDLE_STATS_FLUSH_TIMEOUT, false);
+}
+
+/*
  * ProcessInterrupts: out-of-line portion of CHECK_FOR_INTERRUPTS() macro
  *
  * If an interrupt condition is pending, and it's safe to service it,
@@ -4064,6 +4107,16 @@ ProcessInterrupts(void)
 		IdleStatsUpdateTimeoutPending = false;
 		pgstat_report_stat(true);
 	}
+
+	/*
+	 * YB: Unlike the pgstat flush above, this also runs in a transaction
+	 * block, aborted or not: what the hook publishes (pg_stat_statements'
+	 * pending statistics) is not transactional.  DoingCommandRead means that
+	 * no statement is running.  Otherwise leave the flag set; the backend
+	 * calls the hook before its next ReadyForQuery anyway.
+	 */
+	if (YbIdleStatsFlushTimeoutPending && DoingCommandRead)
+		YbIdleStatsFlush(true);
 
 	if (ProcSignalBarrierPending)
 		ProcessProcSignalBarrier();
@@ -7109,6 +7162,13 @@ PostgresMain(const char *dbname, const char *username)
 				if (IsYugaByteEnabled())
 					yb_pgstat_set_has_catalog_version(false);
 			}
+
+			/*
+			 * YB: In all three idle states above, unlike pgstat: what the
+			 * hook publishes is not transactional.  It publishes only what
+			 * is due, so this adds no shared update per statement.
+			 */
+			YbIdleStatsFlush(false);
 
 			/* Report any recently-changed GUC options */
 			ReportChangedGUCOptions();

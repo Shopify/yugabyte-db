@@ -108,4 +108,22 @@ extern const char *get_stats_option_name(const char *arg);
 extern bool YBRefreshCacheUsingInvalMsgs();
 extern bool YbIsStatementTransactionStarted(void);
 
+/*
+ * YB: Lets an extension that keeps statistics in backend-local memory publish
+ * them while a client backend is idle, in or out of a transaction block.
+ * PostgresMain calls the hook with force = false each time it is about to
+ * send ReadyForQuery, and ProcessInterrupts calls it with force = true when
+ * YB_IDLE_STATS_FLUSH_TIMEOUT has fired while the backend waits for a
+ * command.  Either way no statement is running and no LWLock is held; it is
+ * never called in signal context.
+ *
+ * The hook returns 0 if it holds nothing, or the number of ms until it next
+ * needs to run; the caller arms the timeout for that delay unless it is
+ * already armed, and disarms it on 0.  With force = true it should publish
+ * everything it holds.  It must not raise an error.  Implementations chain to
+ * the previous hook and return the minimum positive value of the two results.
+ */
+typedef long (*yb_idle_stats_flush_hook_type) (bool force);
+extern PGDLLIMPORT yb_idle_stats_flush_hook_type yb_idle_stats_flush_hook;
+
 #endif							/* TCOPPROT_H */

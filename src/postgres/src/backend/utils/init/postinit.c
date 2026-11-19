@@ -117,6 +117,7 @@ static void YbPresetDatabaseCollation(HeapTuple tuple);
 static void YbEnableStartupClientConnectionCheck(void);
 static void YbDisableStartupClientConnectionCheck(void);
 static void YbCheckClientConnectionFromSignalHandler(void);
+static void YbIdleStatsFlushTimeoutHandler(void);
 
 static long YbNumAuthorizedConnections = 0L;
 
@@ -1077,6 +1078,8 @@ InitPostgresImpl(const char *in_dbname, Oid dboid,
 		RegisterTimeout(CLIENT_CONNECTION_CHECK_TIMEOUT, ClientCheckTimeoutHandler);
 		RegisterTimeout(IDLE_STATS_UPDATE_TIMEOUT,
 						IdleStatsUpdateTimeoutHandler);
+		RegisterTimeout(YB_IDLE_STATS_FLUSH_TIMEOUT,
+						YbIdleStatsFlushTimeoutHandler);
 	}
 
 	MyProc->ybInitializationCompleted = true;
@@ -2177,6 +2180,18 @@ static void
 IdleStatsUpdateTimeoutHandler(void)
 {
 	IdleStatsUpdateTimeoutPending = true;
+	InterruptPending = true;
+	SetLatch(MyLatch);
+}
+
+/*
+ * YB: Only sets flags, like the handlers above: ProcessInterrupts calls
+ * yb_idle_stats_flush_hook, and only while the backend waits for a command.
+ */
+static void
+YbIdleStatsFlushTimeoutHandler(void)
+{
+	YbIdleStatsFlushTimeoutPending = true;
 	InterruptPending = true;
 	SetLatch(MyLatch);
 }
