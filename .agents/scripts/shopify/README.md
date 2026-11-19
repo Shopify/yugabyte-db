@@ -241,7 +241,8 @@ cherry-pick with a merge commit; [shopify-create-pr](../../../.claude/skills/sho
 § Release PRs gives its title, when to create the release branch, and why the PR is
 never squashed.
 
-`test_release.py` runs under the same `unittest discover` command as above.
+`release.py` shares its git and `gh` plumbing with the other tools through `scm.py`;
+`test_release.py` and `test_scm.py` run under the same `unittest discover` command as above.
 
 ## Upstream submission (planned)
 
