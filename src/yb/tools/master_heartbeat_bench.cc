@@ -681,6 +681,8 @@ class HollowTSAdminService : public tserver::TabletServerAdminServiceIf {
                             tserver::FlushTabletsResponsePB)
   HOLLOW_UNSUPPORTED_METHOD(CountIntents, tserver::CountIntentsRequestPB,
                             tserver::CountIntentsResponsePB)
+  HOLLOW_UNSUPPORTED_METHOD(ClearRocksDBCache, tserver::ClearRocksDBCacheRequestPB,
+                            tserver::ClearRocksDBCacheResponsePB)
   HOLLOW_UNSUPPORTED_METHOD(AddTableToTablet, tserver::AddTableToTabletRequestPB,
                             tserver::AddTableToTabletResponsePB)
   HOLLOW_UNSUPPORTED_METHOD(RemoveTableFromTablet, tserver::RemoveTableFromTabletRequestPB,
