@@ -132,12 +132,12 @@ which for an idle session may be never. Core Postgres therefore calls a YB hook,
 - The hook returns 0 if it holds nothing, otherwise the ms until it next needs to run.
   The caller arms `YB_IDLE_STATS_FLUSH_TIMEOUT` for a positive result and disarms it on 0. As
   with `IDLE_STATS_UPDATE_TIMEOUT`, the timeout is not disarmed when a command arrives, which
-  would cost a `setitimer` per statement. Unlike pgstat's due time, this one can move while the
-  timeout is armed: later after a fold at a statement end or a larger interval, earlier after a
-  smaller interval. So an armed timeout whose finish time is more than 10 ms off is rescheduled.
-  Otherwise a timeout armed at a short interval would force a fold of statistics that a longer
-  interval keeps pending, and one armed at a long interval would break the bound of a shorter
-  one.
+  would cost a `setitimer` per statement. pgstat's due time only moves later, and a timeout that
+  fires early merely flushes sooner. This one moves later after a fold at a statement end or a
+  larger interval, and earlier after a smaller interval. A timeout that fires early would force a
+  fold of statistics a longer interval keeps pending, and one that fires late would break the bound
+  of a shorter interval. So an armed timeout whose finish time is more than 10 ms off is
+  rescheduled.
 - The timeout handler only sets `YbIdleStatsFlushTimeoutPending`, `InterruptPending` and the latch.
   `ProcessInterrupts` calls the hook with `force = true` only while `DoingCommandRead`, that is,
   while the backend waits for a command; no statement is running and no LWLock is held. If the
