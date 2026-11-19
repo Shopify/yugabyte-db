@@ -7,76 +7,22 @@ import io
 import os
 from pathlib import Path
 import shlex
-import shutil
 import subprocess
 import sys
-import tempfile
 import unittest
-from unittest.mock import patch
 
 from release import (
-    AvailabilityLabels, CherryPickList, Cli, Commit, Error, GitError, GitHub, Planner, Repository,
+    AvailabilityLabels, CherryPickList, Cli, Commit, Error, GitHub, Planner, Repository,
     UpstreamVersion, parser,
 )
+import testfixtures
+from testfixtures import GitFixture
 
 
 SCRIPT = str(Path(__file__).resolve().with_name("release.py"))
-GIT_ENV = {
-    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
-    "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
-    "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
-}
 INVALID_VERSION = ("Invalid upstream version {!r}: expected three or four numeric parts without "
                    "leading zeros, such as 2025.1.2 or v2025.2.8.0")
 T0, DAY = 1735689600, 86400
-
-
-class GitFixture:
-    """A throwaway git repository under a temporary directory."""
-
-    def __init__(self, path):
-        self.path = path
-        self.counter = 0
-        os.makedirs(path, exist_ok=True)
-        self.git("init", "--quiet", "--initial-branch=main")
-
-    def git(self, *args, env=None):
-        result = subprocess.run(["git", "-C", self.path, *args], capture_output=True, text=True,
-                                env={**os.environ, **GIT_ENV, **(env or {})})
-        if result.returncode:
-            raise AssertionError(f"git {' '.join(args)} failed: {result.stderr}")
-        return result.stdout.strip()
-
-    def commit(self, message=None, timestamp=None, content=None):
-        self.counter += 1
-        Path(self.path, f"file{self.counter}.txt").write_text(
-            content or f"content {self.counter}\n")
-        self.git("add", ".")
-        dates = None
-        if timestamp is not None:
-            dates = {"GIT_AUTHOR_DATE": f"{timestamp} +0000",
-                     "GIT_COMMITTER_DATE": f"{timestamp} +0000"}
-        self.git("commit", "--quiet", "-m", message or f"commit {self.counter}", env=dates)
-        return self.git("rev-parse", "HEAD")
-
-    def tag(self, name, ref="HEAD"):
-        self.git("tag", name, ref)
-
-    def branch(self, name, ref="HEAD"):
-        self.git("branch", name, ref)
-
-    def remote_branch(self, name, ref="HEAD"):
-        self.git("update-ref", f"refs/remotes/origin/{name}", self.git("rev-parse", ref))
-
-    def init_bare(self, bare_path):
-        self.git("init", "--quiet", "--bare", bare_path)
-
-    def tags_list(self):
-        tags = self.git("tag")
-        return tags.split("\n") if tags else []
-
-    def refs(self):
-        return self.git("for-each-ref", "--format=%(refname) %(objectname)")
 
 
 class FakeGitHub(GitHub):
@@ -111,15 +57,7 @@ def unlabelled_github(oids_by_pr):
                       {number: pr_commits(*oids) for number, oids in oids_by_pr.items()})
 
 
-class RepoTestCase(unittest.TestCase):
-    def setUp(self):
-        self.tmpdir = tempfile.mkdtemp(prefix="yb-builds-test")
-        self.addCleanup(shutil.rmtree, self.tmpdir)
-        environment = patch.dict(os.environ, GIT_ENV)
-        environment.start()
-        self.addCleanup(environment.stop)
-        self.fixture = GitFixture(os.path.join(self.tmpdir, "yugabyte-db"))
-
+class RepoTestCase(testfixtures.RepoTestCase):
     def cli(self, *argv, github):
         out, err = io.StringIO(), io.StringIO()
         code = Cli.run(list(argv), github=github, out=out, err=err)
@@ -453,73 +391,6 @@ class PlannerTest(RepoTestCase):
         self.assertEqual([5, 6], plan.cherry_pick_prs)
 
 
-class GitRepositoryTest(RepoTestCase):
-    def assert_git_error(self, message, path):
-        with self.assertRaises(GitError) as caught:
-            Repository(path)
-        self.assertEqual(message, str(caught.exception))
-
-    def test_requires_an_explicit_path(self):
-        self.assert_git_error("A repository path is required", None)
-
-    def test_rejects_a_missing_directory_without_falling_back_to_a_default(self):
-        missing = os.path.join(self.tmpdir, "does-not-exist")
-
-        self.assert_git_error(f"Repository path {missing} is not a directory", missing)
-
-    def test_rejects_a_directory_that_is_not_a_git_repository(self):
-        plain = os.path.join(self.tmpdir, "plain")
-        os.mkdir(plain)
-
-        self.assert_git_error(f"Repository path {plain} is not a git repository", plain)
-
-    def test_a_missing_git_binary_is_a_clear_error(self):
-        empty = os.path.join(self.tmpdir, "empty-path")
-        os.mkdir(empty)
-
-        with patch.dict(os.environ, {"PATH": empty}):
-            self.assert_git_error("git was not found; install git", self.fixture.path)
-
-    def test_commands_run_against_the_given_path_not_the_working_directory(self):
-        self.fixture.commit()
-        self.fixture.tag("v1.0.0")
-        other = tempfile.mkdtemp(prefix="yb-builds-cwd")
-        self.addCleanup(shutil.rmtree, other)
-        self.addCleanup(os.chdir, os.getcwd())
-
-        os.chdir(other)
-        tags = Repository(self.fixture.path).tags()
-
-        self.assertEqual(["v1.0.0"], tags)
-
-    def test_passes_arguments_without_shell_interpretation(self):
-        self.fixture.commit()
-        marker = os.path.join(self.tmpdir, "injected")
-
-        with self.assertRaises(GitError):
-            Repository(self.fixture.path).commit_timestamp(f"HEAD; touch {marker}")
-
-        self.assertFalse(os.path.exists(marker))
-
-    def test_lists_local_and_origin_branches(self):
-        self.fixture.commit()
-        self.fixture.remote_branch("release-a")
-
-        repo = Repository(self.fixture.path)
-
-        self.assertEqual(["main"], repo.local_branches())
-        self.assertEqual(["release-a"], repo.origin_branches())
-
-    def test_ancestor_check(self):
-        first = self.fixture.commit()
-        self.fixture.tag("first")
-        self.fixture.commit()
-        repo = Repository(self.fixture.path)
-
-        self.assertTrue(repo.ancestor(first, "main"))
-        self.assertFalse(repo.ancestor("main", first))
-
-
 class CliTest(RepoTestCase):
     def run_script(self, *args, python_args=("-B",)):
         home = os.path.join(self.tmpdir, "home")
@@ -654,16 +525,6 @@ class CliTest(RepoTestCase):
         self.assertEqual(0, fetched, fetched_err)
         self.assertEqual(["v2025.2.8.0"], self.fixture.tags_list())
 
-    def test_missing_gh_binary_is_a_clear_error(self):
-        executable = os.path.join(self.tmpdir, "no-such-gh")
-
-        with self.assertRaises(Error) as caught:
-            GitHub(executable=executable).pull_requests("Shopify/yugabyte-db")
-
-        self.assertEqual(
-            f"The gh CLI was not found ({executable}); install gh and run `gh auth login`",
-            str(caught.exception))
-
     def test_cli_reports_a_missing_gh_binary_with_exit_code_1(self):
         self.fixture.tag("v2025.2.8.0", self.fixture.commit("base"))
 
@@ -768,6 +629,23 @@ class CliTest(RepoTestCase):
                 self.assertEqual(1, code)
                 self.assertEqual(f"PR #7: gh returned an invalid commit id {oid!r}\n", err)
                 self.assertFalse(os.path.exists(injected))
+
+
+class ReleaseGitHubTest(RepoTestCase):
+    def test_pull_requests_and_commits_in_pr_parse_the_json_gh_prints(self):
+        executable = os.path.join(self.tmpdir, "gh")
+        with open(executable, "w", encoding="utf-8") as script:
+            script.write("#!/bin/sh\n"
+                         "case \"$2\" in\n"
+                         "list) printf '%s\\n' '[{\"number\": 7, \"labels\": []}]';;\n"
+                         "view) printf '%s\\n' '{\"commits\": [], \"mergeCommit\": null}';;\n"
+                         "esac\n")
+        os.chmod(executable, 0o755)
+        github = GitHub(executable=executable)
+
+        self.assertEqual([{"number": 7, "labels": []}], github.pull_requests("Shopify/yugabyte-db"))
+        self.assertEqual({"commits": [], "mergeCommit": None},
+                         github.commits_in_pr("Shopify/yugabyte-db", 7))
 
 
 class CherryPickListTest(RepoTestCase):
