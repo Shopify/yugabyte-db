@@ -4,6 +4,9 @@
 --master_bin=build/latest/bin/yb-master
 --tserver_bin=build/latest/bin/yb-tserver
 --data_dir=/tmp/hb-bench
+# One bench process serves every hollow tserver; closing all idle master connections in one
+# pass stalls its heartbeats.
+--rpc_default_keepalive_time_ms=600000
 --tablet_replicas_per_tserver=100
 --master_cpus=0-95
 --master_flags=--flagfile=src/yb/tools/master_heartbeat_bench_flags/master.flags,--num_reactor_threads=192
