@@ -338,3 +338,48 @@ SELECT DISTINCT r1 FROM t WHERE r1 IN (1, 10) ORDER BY r1 DESC;
 SELECT DISTINCT r1 FROM t WHERE r1 IN (1, 10, 20) ORDER BY r1 DESC;
 
 DROP TABLE t;
+
+-- Split a duplicate prefix across tablets. Branches overlap in both rows and b values.
+CREATE TABLE range_or_t(a int, b int, id int, PRIMARY KEY(a ASC, b ASC, id ASC))
+  SPLIT AT VALUES ((2, 99, 2));
+INSERT INTO range_or_t SELECT a, b, id FROM generate_series(1, 100) a,
+  generate_series(1, 100) b, generate_series(1, 2) id;
+ANALYZE range_or_t;
+EXPLAIN (COSTS OFF) SELECT a, b FROM range_or_t WHERE a < 3 OR b > 98;
+CREATE TEMP TABLE got AS SELECT a, b FROM range_or_t WHERE a < 3 OR b > 98;
+CREATE TEMP TABLE want AS SELECT a, b FROM range_or_t
+  WHERE CASE WHEN a < 3 THEN true ELSE b > 98 END;
+SELECT count(*) FROM ((TABLE got EXCEPT ALL TABLE want) UNION ALL
+                      (TABLE want EXCEPT ALL TABLE got)) differences;
+-- Row locks and an unselective predicate keep the existing plans.
+EXPLAIN (COSTS OFF) SELECT a, b FROM range_or_t WHERE a < 3 OR b > 98 FOR UPDATE;
+EXPLAIN (COSTS OFF) SELECT a, b FROM range_or_t WHERE a < 100 OR b > 1;
+-- NOT A covers NULL only when the leading key is NOT NULL.
+CREATE TABLE range_or_nn(a int NOT NULL, b int, id int);
+CREATE INDEX range_or_nn_idx ON range_or_nn(a ASC, b ASC);
+INSERT INTO range_or_nn SELECT * FROM range_or_t;
+ANALYZE range_or_nn;
+EXPLAIN (COSTS OFF) SELECT a, b FROM range_or_nn WHERE a < 3 OR b > 98;
+CREATE TABLE range_or_null(a int, b int, id int);
+CREATE INDEX range_or_null_idx ON range_or_null(a ASC, b ASC);
+INSERT INTO range_or_null SELECT * FROM range_or_t;
+INSERT INTO range_or_null VALUES (NULL, 100, 3), (NULL, 1, 3);
+ANALYZE range_or_null;
+EXPLAIN (COSTS OFF) SELECT a, b FROM range_or_null WHERE a < 3 OR b > 98;
+SELECT count(*) FROM range_or_null WHERE a < 3 OR b > 98;
+DROP TABLE got, want, range_or_t, range_or_nn, range_or_null;
+
+-- Each scan can be a distinct scan; the parent still removes duplicates.
+CREATE TABLE range_or_d(a int, b int, n int, PRIMARY KEY (a ASC, b ASC, n ASC));
+CREATE INDEX range_or_d_idx ON range_or_d(a ASC, b ASC);
+INSERT INTO range_or_d SELECT a, b, n FROM generate_series(1, 100) a,
+  generate_series(1, 100) b, generate_series(1, 5) n;
+ANALYZE range_or_d;
+EXPLAIN (COSTS OFF) SELECT DISTINCT a, b FROM range_or_d WHERE a < 2 OR b > 99;
+CREATE TEMP TABLE got AS SELECT DISTINCT a, b FROM range_or_d WHERE a < 2 OR b > 99;
+CREATE TEMP TABLE want AS SELECT DISTINCT a, b FROM range_or_d
+  WHERE CASE WHEN a < 2 THEN true ELSE b > 99 END;
+SELECT count(*) FROM ((TABLE got EXCEPT ALL TABLE want) UNION ALL
+                      (TABLE want EXCEPT ALL TABLE got)) differences;
+SELECT count(*) FROM got;
+DROP TABLE got, want, range_or_d;
