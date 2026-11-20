@@ -1486,6 +1486,17 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 			IndexClause *iclause = (IndexClause *) lfirst(lc);
 			RestrictInfo *rinfo = iclause->rinfo;
 
+			/* YB: A tuple-array key must not overlap another bound. */
+			if (iclause->indexcols != NIL && restriction_is_or_clause(rinfo))
+			{
+				bool		has_other_key = list_length(clauses->indexclauses[indexcol]) > 1;
+
+				for (int i = 1; i < index->nkeycolumns && !has_other_key; i++)
+					has_other_key = clauses->indexclauses[i] != NIL;
+				if (has_other_key)
+					continue;
+			}
+
 			/* We might need to omit ScalarArrayOpExpr clauses */
 			if (IsA(rinfo->clause, ScalarArrayOpExpr))
 			{
@@ -5418,6 +5429,130 @@ yb_hash_code_match_index(Node *expr, IndexOptInfo *index)
 	return true;
 }
 
+/* Match complete constant equality tuples as one correlated row-array key. */
+static IndexClause *
+yb_match_or_row_equalities_to_index(PlannerInfo *root,
+									RestrictInfo *rinfo,
+									IndexOptInfo *index)
+{
+	Node	   *indexkeys[INDEX_MAX_KEYS] = {0};
+	Oid			opnos[INDEX_MAX_KEYS] = {0};
+	Oid			collids[INDEX_MAX_KEYS] = {0};
+	List	   *rows = NIL;
+	Oid			elemtype = InvalidOid;
+	ListCell   *lc;
+	ArrayExpr  *array;
+	RowCompareExpr *rowcompare;
+	RestrictInfo *derived;
+	IndexClause *iclause;
+
+	if (index->relam != LSM_AM_OID || index->nhashcolumns != 0 ||
+		index->nkeycolumns < 2 || index->indpred != NIL || rinfo->security_level != 0)
+		return NULL;
+
+	foreach(lc, castNode(BoolExpr, rinfo->clause)->args)
+	{
+		Node	   *arm = lfirst(lc);
+		List	   *equalities;
+		Node	   *values[INDEX_MAX_KEYS] = {0};
+		ListCell   *lc2;
+		RowExpr    *row;
+
+		if (!is_andclause(arm))
+			return NULL;
+		equalities = castNode(BoolExpr, arm)->args;
+		if (list_length(equalities) != index->nkeycolumns)
+			return NULL;
+
+		foreach(lc2, equalities)
+		{
+			Node	   *key;
+			Node	   *value;
+			Oid			armop = yb_split_const_opclause(lfirst(lc2), &key, &value);
+			OpExpr	   *op;
+			int			indexcol;
+
+			if (!OidIsValid(armop) || !IsA(key, Var))
+				return NULL;
+			op = lfirst_node(OpExpr, lc2);
+
+			for (indexcol = 0; indexcol < index->nkeycolumns; indexcol++)
+			{
+				if (index->indexkeys[indexcol] != 0 &&
+					match_index_to_operand(key, indexcol, index))
+					break;
+			}
+			if (indexcol == index->nkeycolumns || values[indexcol] != NULL ||
+				get_op_opfamily_strategy(armop, index->opfamily[indexcol]) !=
+				BTEqualStrategyNumber ||
+				!IndexCollMatchesExprColl(index->indexcollations[indexcol],
+										  op->inputcollid) ||
+				!op_strict(armop) || op_volatile(armop) != PROVOLATILE_IMMUTABLE ||
+				exprType(key) != exprType(value) ||
+				get_typtype(exprType(value)) != TYPTYPE_BASE ||
+				!OidIsValid(get_array_type(exprType(value))))
+				return NULL;
+
+			if (!OidIsValid(elemtype))
+				elemtype = exprType(value);
+			else if (exprType(value) != elemtype)
+				return NULL;
+
+			if (indexkeys[indexcol] == NULL)
+			{
+				indexkeys[indexcol] = key;
+				opnos[indexcol] = armop;
+				collids[indexcol] = op->inputcollid;
+			}
+			else if (!equal(indexkeys[indexcol], key) ||
+					 opnos[indexcol] != armop || collids[indexcol] != op->inputcollid)
+				return NULL;
+			values[indexcol] = value;
+		}
+
+		row = makeNode(RowExpr);
+		for (int indexcol = 0; indexcol < index->nkeycolumns; indexcol++)
+		{
+			/* Each of the nkeycolumns equalities filled a distinct column. */
+			Assert(values[indexcol] != NULL);
+			row->args = lappend(row->args, values[indexcol]);
+		}
+		row->row_typeid = RECORDOID;
+		row->row_format = COERCE_EXPLICIT_CALL;
+		row->location = -1;
+		rows = lappend(rows, row);
+	}
+
+	array = makeNode(ArrayExpr);
+	array->element_typeid = RECORDOID;
+	array->elements = rows;
+	array->location = -1;
+
+	rowcompare = makeNode(RowCompareExpr);
+	rowcompare->rctype = ROWCOMPARE_EQ;
+	rowcompare->rargs = (Node *) array;
+	iclause = makeNode(IndexClause);
+	for (int indexcol = 0; indexcol < index->nkeycolumns; indexcol++)
+	{
+		rowcompare->opnos = lappend_oid(rowcompare->opnos, opnos[indexcol]);
+		rowcompare->opfamilies =
+			lappend_oid(rowcompare->opfamilies, index->opfamily[indexcol]);
+		rowcompare->inputcollids =
+			lappend_oid(rowcompare->inputcollids, collids[indexcol]);
+		rowcompare->largs = lappend(rowcompare->largs, indexkeys[indexcol]);
+		iclause->indexcols = lappend_int(iclause->indexcols, indexcol);
+	}
+
+	derived = make_restrictinfo(root, (Expr *) rowcompare, rinfo->is_pushed_down,
+								rinfo->outerjoin_delayed, false, rinfo->security_level,
+								rinfo->required_relids, rinfo->outer_relids,
+								rinfo->nullable_relids);
+	iclause->rinfo = rinfo;
+	iclause->indexquals = list_make1(derived);
+	iclause->lossy = true;
+	return iclause;
+}
+
 /*
  * yb_match_clause_to_index
  * Like match_clause_to_indexcol, but without the index column.
@@ -5429,6 +5564,9 @@ yb_match_clause_to_index(PlannerInfo *root,
 						 RestrictInfo *rinfo,
 						 IndexOptInfo *index)
 {
+	if (restriction_is_or_clause(rinfo))
+		return yb_match_or_row_equalities_to_index(root, rinfo, index);
+
 	if (IsA(rinfo->clause, OpExpr))
 	{
 		OpExpr	   *clause = (OpExpr *) rinfo->clause;
