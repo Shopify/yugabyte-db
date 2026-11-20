@@ -43,6 +43,28 @@ INSERT INTO pk_multi(h, r, v) VALUES (1, 0, '1-0'),(1, 1, '1-1'),(1, 2, '1-2'),(
 \set query ':P :Q1 SELECT * FROM pk_multi WHERE r IN (5,3,9,2);'
 \i :run_query
 
+-- GHI #18004: a disjunction on one key can use the same bounds as IN.
+\set query ':P :Q1 SELECT * FROM pk_multi WHERE r = 5 OR 3 = r OR r = 9 OR r = 2;'
+\i :run_query
+
+-- An arm on a different column must not be discarded.
+SELECT array_agg(r ORDER BY r) AS matches FROM pk_multi WHERE r = 2 OR v = '1-0';
+
+-- A disjunction on the hash key binds the hash key like IN.
+EXPLAIN (COSTS OFF) SELECT * FROM pk_multi WHERE h = 1 OR h = 2;
+SELECT * FROM pk_multi WHERE h = 1 OR h = 2 ORDER BY r;
+
+-- A cross-type constant outside the key's range matches nothing.
+\set query ':P :Q1 SELECT * FROM pk_multi WHERE h = 1 AND (r = 2::bigint OR r = 5000000000::bigint);'
+\i :run_query
+
+-- The bound keeps the key's collation.
+CREATE TABLE or_collate(k text COLLATE "C", PRIMARY KEY (k ASC));
+INSERT INTO or_collate VALUES ('A'), ('a'), ('b');
+\set query ':P SELECT k FROM or_collate WHERE k = ''A'' OR k = ''b'' ORDER BY k;'
+\i :run_query
+DROP TABLE or_collate;
+
 \set query ':P SELECT * FROM pk_multi WHERE yb_hash_code(h) = yb_hash_code(1);'
 \i :run_query
 
