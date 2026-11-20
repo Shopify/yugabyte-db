@@ -18,7 +18,7 @@ Shopify overlay on [create-pr](../create-pr/SKILL.md) (confidentiality, lint, pu
 creation) and [stack-prs](../stack-prs/SKILL.md) (stack setup, syncing, landing): it
 states only what Shopify adds or changes, and every rule in those skills holds here.
 Step 1 takes judgement and Steps 2–6 are mechanics;
-`python3 .agents/scripts/shopify/upstream.py submit <n>` will run all six (see
+`python3 .agents/scripts/shopify/upstream.py submit <n>` runs all six (see
 [Tooling](#tooling)).
 
 ## Preconditions
@@ -81,7 +81,7 @@ always `gh issue comment <N> --repo Shopify/yugabyte-db --body "Upstream issue: 
 
 Steps 2–6 take no decisions beyond the stops they name and two inputs from the
 developer: the parent of a change outside a fork stack, and the test run on the upstream
-branch. `upstream.py submit` will run them; until it exists, run them by hand.
+branch. `upstream.py submit` runs them; the steps by hand below remain the reference.
 
 ### 2. Base or stack parent
 
@@ -91,7 +91,7 @@ other than `master-shopify` from `gh pr view <n> --repo Shopify/yugabyte-db --js
 names the parent, and
 `gh pr list --repo Shopify/yugabyte-db --state merged --head <baseRefName> --json number,url`
 finds its fork PR. A change outside a fork stack has a parent when it needs an unlanded
-Shopify change, and the developer names that parent; `upstream.py submit` will take it
+Shopify change, and the developer names that parent; `upstream.py submit` takes it
 as `--parent`. A Step 3 cherry-pick that does not apply on upstream `master` without that
 change is one sign of it, but a clean pick proves nothing: the change can call code the
 parent adds. Step 4's build and tests on the upstream branch catch a missed parent that
@@ -157,7 +157,7 @@ commit holds the whole PR: `git cherry-pick -x <commit>`, then `git commit --ame
 the subject. A landing that is not a single squash commit is cherry-picked from its own
 commits with `-n` and recommitted with
 `git commit --author="<original author>" -F <message-file>` and a `Co-authored-by:`
-trailer per other author; `upstream.py submit` will refuse such a landing with a
+trailer per other author; `upstream.py submit` refuses such a landing with a
 message. Confirm with `git diff <base>` against
 `gh pr diff <n> --repo Shopify/yugabyte-db`. The subject is the Step 4 title, and any
 bare `#N` in copied text becomes a full fork URL without its closing keyword: a fork
@@ -248,12 +248,14 @@ labels on upstream PRs.
 
 ## Tooling
 
-`python3 .agents/scripts/shopify/upstream.py submit <n>` will perform Steps 1–6 under
-the developer's own `gh` login. It applies Step 2's dependency rule, takes `--parent` to
-name or override the parent, stops where the steps stop, refuses a landing that is not
-a single squash commit, and is rerun after a failure. `upstream.py`, beside `issues.py`
-and `release.py`, will also have `status` and `sync`. Until it exists, follow the steps
-by hand as written here.
+`python3 .agents/scripts/shopify/upstream.py submit <n>` performs Steps 1–6 as described
+here under the developer's own `gh` login. It applies Step 2's dependency rule, takes
+`--parent` to name or override the parent, refuses where the steps stop and a landing that
+is not a single squash commit, stops after Step 3 for the test plan from the run on the
+upstream branch, and shows what it will write and asks once before any public write. It is
+rerun after a failure or a stop. The steps by hand above remain the reference;
+`.agents/scripts/shopify/README.md` § Upstream tooling describes its options. `upstream.py`,
+beside `issues.py` and `release.py`, also has `status`; `sync` does not exist yet.
 
 ## Commands
 

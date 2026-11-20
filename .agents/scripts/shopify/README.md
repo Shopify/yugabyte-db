@@ -244,13 +244,17 @@ never squashed.
 `release.py` shares its git and `gh` plumbing with the other tools through `scm.py`;
 `test_release.py` and `test_scm.py` run under the same `unittest discover` command as above.
 
-## Upstream status
+## Upstream tooling
 
-`upstream.py` has one command, `status`, which shows where each change `master-shopify`
-carries stands upstream. `submit <fork-pr>`, which will perform the shopify-upstream-pr
-skill's steps under the developer's own `gh` login, and `sync`, which will rebuild
-`master-shopify` on a newer upstream commit as AGENTS.md describes, do not exist yet. Until
-they do, submission follows the skills by hand, and no sync runs.
+`upstream.py` has two commands: `status`, which shows where each change `master-shopify`
+carries stands upstream, and `submit <fork-pr>`, which performs the shopify-upstream-pr
+skill's steps under the developer's own `gh` login. `sync`, which will rebuild
+`master-shopify` on a newer upstream commit as AGENTS.md describes, does not exist yet; until
+it does, no sync runs. Exit codes for both commands: 0, 2 for usage errors, 1 otherwise;
+`submit` also exits 4 when it stops for the developer. `test_upstream.py` and
+`test_upstream_submit.py` run under the same `unittest discover` command as above.
+
+### status
 
 ```bash
 python3 .agents/scripts/shopify/upstream.py status
@@ -286,8 +290,115 @@ Warnings cover what the derivation cannot settle: a label and title that disagre
 PR based on `master-shopify` that is neither carried nor adopted; a PR a sync dropped that is
 carried again; first-parent merge commits that are neither sync points nor attributed, which
 is how an upstream merge beyond a stale upstream ref shows; and a `gh pr list` result as long
-as its 5000-PR limit. Exit codes: 0, 2 for usage errors, 1 otherwise. `test_upstream.py` runs
-under the same `unittest discover` command as above.
+as its 5000-PR limit.
+
+### submit
+
+```bash
+# From the developer's yugabyte/yugabyte-db checkout, or name it with --repo-path.
+python3 <fork checkout>/.agents/scripts/shopify/upstream.py submit 71
+python3 <fork checkout>/.agents/scripts/shopify/upstream.py submit 71 \
+  --repo-path ~/src/yugabyte-db --test-plan testplan.md --yes
+```
+
+`submit` takes one fork PR merged into `master-shopify` through the skill's Steps 1–6 in two
+phases with one confirmation between them. Phase A writes only locally:
+
+- Usage, `--branch`, and the `--test-plan` and `--upgrade` files (readable and non-empty)
+  are checked first, and `gh` and `gh stack --help` before anything is fetched or cloned.
+- Upstream checkout: `--repo-path`; else `--clone-to <dir>`, cloned with
+  `git clone -o upstream`; else the current directory when `gh repo set-default --view` prints
+  `yugabyte/yugabyte-db` there; else a prompt to enter a checkout's path or clone into
+  `<parent of the current directory>/yugabyte-db-upstream`, and without a terminal an exit 4
+  with both rerun forms. A new clone gets `gh repo set-default yugabyte/yugabyte-db` and
+  `gh-stack.remote upstream`. A checkout named with `--repo-path` or at the prompt gets them
+  when unset; the current directory is never changed, and is refused when `gh-stack.remote` is
+  unset. Either setting naming something else is refused. The work tree must have no tracked
+  changes, and `gh auth status` must succeed.
+- The fork PR must be merged, approved by an active member of
+  `Shopify/yugabyte-code-reviewers`, not fork-only (`upstream: skip` or `[shopify-only]`), and
+  titled `[#N] Component: Short description`, the component one `create-pr.sh` accepts (a
+  letter, then letters and digits), with a body whose first line is `Refs <issue URL>` and
+  which has a `## Summary`. After the fetch below, a newest `Upstream:` comment naming an open
+  upstream PR, or a merged one whose merge commit is on upstream master (landed), ends the run
+  with exit 0; one merged without landing (restructured) gets a replacement PR and a new
+  `Upstream:` comment; one closed without merging is refused.
+- Upstream issue: the issue a `Refs` line names upstream; for a fork issue, `--upstream-issue`,
+  else the newest `Upstream issue: <url>` comment on the fork issue, else an upstream issue in
+  `issues.py inspect --issue <--private-issue>`'s `public_issues`, else a new issue: the fork
+  issue's title, its body without the publication marker and `## Shopify context`, and the
+  fork issue's labels that upstream also has. A reused issue, the one a `Refs` line names
+  included, that `--private-issue`'s `public_issues` lacks is recorded there with
+  `issues.py link` in Phase B, and one no fork issue comment names yet gets its
+  `Upstream issue: <url>` comment there.
+- Base: `--parent` (refused when repeated), else the merged fork PR whose head is the PR's
+  `baseRefName` when that is not `master-shopify`. No parent, or a parent whose upstream PR
+  landed (its merge commit is on upstream master): `master`. An open parent PR: its
+  `feature-stack/Shopify/<parent-change>`. Refused: a fork-only parent, one with no upstream
+  PR, one merged without landing (restructured), and one closed.
+- Landing: `master-shopify` from `--fork-url` (default
+  `https://github.com/Shopify/yugabyte-db.git`) into `refs/shopify/fork-master-shopify` and
+  upstream `master` from `--upstream-url` into `refs/shopify/upstream-master`, refs only this
+  tool writes, unless `--no-fetch`. The PR's commit on the first-parent line since their merge
+  base is found as `status` attributes it; none, several, or a merge commit is refused.
+- Branch: `feature-stack/Shopify/<change>`, `<change>` slugged from the title's description or
+  given as `--branch` (required when the slug is empty). PRs from same-named branches in other
+  repositories are ignored; a PR on the branch in `yugabyte/yugabyte-db` whose body lacks
+  `Shopify fork PR: <this fork PR's URL>` is another change's, and the run is refused with a
+  pointer to `--branch`. This change's open or landed PR leaves only its records: nothing is
+  built, and no test plan or upgrade notes are needed. Otherwise the branch is made with
+  `gh stack init` and `gh stack rebase --remote <upstream>` on `master`; on a parent outside a
+  GitHub stack, from the fetched parent branch with `gh stack init <parent> <branch>`; on a
+  parent in one, `gh stack checkout <parent PR URL>` and `gh stack add`, refused when the parent
+  is not the stack's top. Then `git cherry-pick -x`, with the subject
+  `[#<upstream issue>] Component: Short description` (the fork issue number until Phase B
+  creates the issue) and every bare `#N` in the body made a fork issue URL without its closing
+  keyword. The pick must change the landing's paths; a different `git patch-id --stable` is a
+  warning. Rewording uses `git commit --amend --only`, so nothing staged is folded in.
+- A branch that already exists is reused only where this run would have built it: its local
+  gh stack must list it on the planned base (as the bottom layer on `master`, or above the
+  parent branch), and its history must agree: the parent branch's tip is its ancestor, or, on
+  `master`, the pick's parent is on `<upstream remote>/master` (the ref
+  `gh stack rebase --remote` moves) or on `refs/shopify/upstream-master`. Unless `--no-fetch`,
+  the run fetches `<upstream remote>`'s `master` into that tracking ref too; it is needed only
+  for a branch that already exists, so a newly added remote can still build one. A branch with
+  no commits beyond the base (an aborted pick) is picked again only when it sits at either ref.
+  Otherwise the run is refused with the commands that remove it, or, when only the remote's
+  `master` has the branch's base, told to rerun without `--no-fetch` first; it never restacks a
+  branch.
+
+It then prints the branch and commit to build and test. When the commit changes `.proto`
+files, `--upgrade` is required, as `create-pr.sh` requires it: without it the run is refused
+with the rerun command before any test plan is asked for. It then asks for the test plan: a
+file path, `e` to write one in `$EDITOR`, or `q`; without a terminal it exits 4 with the rerun
+command instead.
+
+Phase B shows the issue to reuse or create, the PR's title, base, summary and test plan files,
+and the records, then asks `Publish? [y/N]`. `--yes` skips the question; it needs `--test-plan`
+unless a PR already exists for the branch. Without a terminal or `--yes` it exits 4 with the
+rerun command; for an existing PR, declining or the lack of a terminal prints the
+`gh issue comment`, `issues.py link` (each when pending) and `gh pr comment` commands that
+record it instead. Before any write it checks again that the checkout has no tracked changes,
+staged or not, since the pause for the test plan may have left some, and that the pick is the
+branch's top commit, or already cites the upstream issue when commits sit above it. It then
+creates the upstream issue when needed and comments `Upstream issue: <url>` on the fork issue,
+then records it with `issues.py link` when `--private-issue` is given; a reused issue gets
+whichever of those two records is missing. When a record fails after the issue was created, the
+error says to rerun with `--upstream-issue <N>`. It rewrites the subject with the issue number,
+runs `.agents/scripts/create-pr.sh -i -t -d -T [-U] [-D]` in the checkout, with the fork PR's
+`## Summary` (fork references linked, ending with the fork PR URL and, when stacked, the parent
+line) as the summary, and comments `Upstream: <PR URL>` on the fork PR. `create-pr.sh`'s exit 3
+(lint), 5 (`gh stack push`) and 6 (`gh stack link`) are reported with its recovery; its exit 1
+for the replacement of a restructured PR points at the skill's by-hand replay. Generated files
+go to a fresh temporary directory, kept for inspection.
+
+Every step is rerun-safe: a branch that has the landing's `(cherry picked from commit …)` line
+is reused, also with fix commits above it, and one with other commits is refused; an open or
+landed PR for the branch is recorded instead of opened, a restructured one is replaced, and a
+closed one is refused; an existing PR with no known upstream issue is refused, since creating
+one would duplicate the issue it cites; an existing `Upstream issue:` comment or private link
+is not written again, and a newest `Upstream:` comment naming an open or landed PR ends the
+run before anything is written.
 
 ## PR title cases
 
