@@ -45,11 +45,16 @@ Fork-only work carries `[shopify-only]` in the title, in place of or after the i
 and the `upstream: skip` label; the title check does not enforce the pairing.
 
 Upstream-bound work cites, as `[#N]`, the upstream issue its upstream PR will carry: an
-existing one, or one the developer opens in `yugabyte/yugabyte-db` when the problem
-carries no private context. Work that starts from private evidence goes through
+existing one, or one the developer opens in `yugabyte/yugabyte-db` with the inherited
+[create-issue](../create-issue/SKILL.md) skill when the problem carries no private
+context; when create-issue finds the problem cannot be described without private detail,
+its JIRA path does not apply to Shopify, and the work goes through
+shopify-create-issue instead. Work that starts from private evidence goes through
 [shopify-create-issue](../shopify-create-issue/SKILL.md); when no upstream issue covers
 the problem, that skill publishes a sanitized fork issue, the fork PR cites it, and
-shopify-upstream-pr derives the upstream issue from it. Fork-only work needs no issue.
+shopify-upstream-pr derives the upstream issue from it. Fork-only work cites a fork
+issue opened in `Shopify/yugabyte-db`; Shopify-only tooling outside the database, such
+as the shopify-* skills and `.agents/scripts/shopify/`, needs none.
 
 ## 2. Base and branch
 
@@ -79,7 +84,8 @@ PR body, and the fork's squash merge takes the PR title, with `(#N)` appended, a
 commit messages. The title follows `.github/workflows/pr-title.yml`:
 
 - Upstream-bound: `[#<issue>] <Component>: <Short description>`, with Step 1's issue.
-- Fork-only: `[shopify-only] <Component>: <Short description>` or `[#N][shopify-only] ...`.
+- Fork-only: `[#N][shopify-only] <Component>: <Short description>` with the fork issue;
+  `[shopify-only] <Component>: <Short description>` for Shopify-only tooling.
 - Release base: `[<base>]` first, matching the base branch exactly. `[BACKPORT <base>]` is
   a backport's and needs an `Original commit: <sha> / #<PR>` body line.
 
