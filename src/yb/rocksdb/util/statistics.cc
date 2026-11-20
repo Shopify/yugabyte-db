@@ -25,21 +25,169 @@
 
 #include <inttypes.h>
 #include <algorithm>
+#include <atomic>
+#include <unordered_map>
 
 #include "yb/rocksdb/statistics.h"
 #include "yb/rocksdb/port/likely.h"
+
+#include "yb/gutil/casts.h"
 
 #include "yb/util/aggregate_stats.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
 #include "yb/util/metrics.h"
+#include "yb/util/striped64.h"
 
 DEFINE_RUNTIME_bool(rocksdb_collect_bloom_filter_time_metrics, false,
     "Collect bloom filter time metrics. Should only be used for perf investigations since those "
     "metrics are in hot path and could affect queries execution time.");
 TAG_FLAG(rocksdb_collect_bloom_filter_time_metrics, hidden);
 
+DEFINE_NON_RUNTIME_bool(rocksdb_striped_tickers, false,
+    "Count RocksDB tickers in striped per-tablet counters, and add them to the "
+    "table-level Prometheus aggregates before each scrape instead of on every increment, which "
+    "writes a cache line shared by all tablets of the table.");
+TAG_FLAG(rocksdb_striped_tickers, advanced);
+
 namespace rocksdb {
+
+// Sums are exact after writers quiesce and synchronize with the reader, but are not atomic
+// snapshots of concurrent updates. Scrapes flush these sums before reading pre-aggregates;
+// resets require quiescent writers and may decrease the aggregate.
+class StripedTickerGauge : public yb::AtomicGauge<uint64_t> {
+ public:
+  StripedTickerGauge(const yb::GaugePrototype<uint64_t>* prototype, uint64_t initial_value)
+      : AtomicGauge(prototype, 0) {
+    adder_.IncrementBy(initial_value);
+  }
+
+  // Like AtomicGauge counters, a retired tablet keeps its contribution to the table total.
+  ~StripedTickerGauge() {
+    FlushToPreAggregation();
+  }
+
+  uint64_t striped_value() const {
+    return static_cast<uint64_t>(adder_.Value());
+  }
+
+  void IncrementBy(int64_t amount) override {
+    adder_.IncrementBy(amount);
+  }
+
+  // Resetting striped tickers requires quiescent writers and flushers, as with LongAdder::Reset.
+  void set_value(const uint64_t& value) override {
+    adder_.Reset();
+    adder_.IncrementBy(static_cast<int64_t>(value));
+    AddToPreAggregation(
+        static_cast<int64_t>(value) -
+        flushed_value_.exchange(static_cast<int64_t>(value), std::memory_order_relaxed));
+  }
+
+  // A scrape and a destroying StatisticsMetricImpl that shares this gauge's entity may flush
+  // concurrently. Each flusher claims the disjoint range (prev, value], so every increment is
+  // added once and the aggregate never decreases.
+  void FlushToPreAggregation() {
+    const auto value = adder_.Value();
+    auto prev = flushed_value_.load(std::memory_order_relaxed);
+    while (value > prev &&
+           !flushed_value_.compare_exchange_weak(prev, value, std::memory_order_relaxed)) {
+    }
+    if (value > prev) {
+      AddToPreAggregation(value - prev);
+    }
+  }
+
+  yb::Status WriteForPrometheus(
+      yb::PrometheusWriter* writer, const yb::MetricEntity::AttributeMap& attributes,
+      const yb::MetricPrometheusOptions& opts,
+      yb::AggregationLevels default_aggregation_levels) const override {
+    if (IsPreAggregated() || prototype_->level() < opts.level) {
+      return yb::Status::OK();
+    }
+    return DoWriteForPrometheus(writer, attributes, default_aggregation_levels, striped_value());
+  }
+
+ protected:
+  void WriteValue(yb::JsonWriter* writer) const override {
+    writer->Value(striped_value());
+  }
+
+ private:
+  void AddToPreAggregation(int64_t delta) {
+    if (aggregated_prometheus_value_holder_) {
+      aggregated_prometheus_value_holder_->IncrementBy(delta);
+    }
+  }
+
+  yb::LongAdder adder_;
+  std::atomic<int64_t> flushed_value_{0};
+};
+
+namespace {
+
+// Tickers that are set or decremented keep plain gauges: a LongAdder sum is not an atomic
+// snapshot, so a ticker that goes up and down could be read below its true value.
+bool IsGaugeTicker(uint32_t ticker_type) {
+  switch (ticker_type) {
+    case NO_ITERATORS:
+    case SEQUENCE_NUMBER:
+    case CURRENT_VERSION_SST_FILES_SIZE:
+    case OLD_BK_COMPAT_CURRENT_VERSION_SST_FILES_SIZE:
+    case CURRENT_VERSION_SST_FILES_UNCOMPRESSED_SIZE:
+    case CURRENT_VERSION_NUM_SST_FILES:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// StatisticsMetricImpl instances with striped tickers, flushed before every Prometheus scrape.
+// Never destroyed, so the pre-scrape callback can't outlive it. Flushes run without mutex_, so
+// a slow scrape does not block tablet creation or destruction. The callback may drop the last
+// reference to a StatisticsMetricImpl, whose destructor then takes mutex_.
+class StripedStatisticsRegistry {
+ public:
+  static StripedStatisticsRegistry& Instance() {
+    static auto* instance = new StripedStatisticsRegistry();
+    return *instance;
+  }
+
+  void Add(const std::shared_ptr<StatisticsMetricImpl>& statistics) {
+    std::lock_guard lock(mutex_);
+    live_.emplace(statistics.get(), statistics);
+  }
+
+  void Remove(StatisticsMetricImpl* statistics) {
+    std::lock_guard lock(mutex_);
+    live_.erase(statistics);
+  }
+
+ private:
+  StripedStatisticsRegistry() {
+    yb::AddPrometheusPreScrapeCallback([this] {
+      std::vector<std::weak_ptr<StatisticsMetricImpl>> live;
+      {
+        std::lock_guard lock(mutex_);
+        live.reserve(live_.size());
+        for (const auto& [_, statistics] : live_) {
+          live.push_back(statistics);
+        }
+      }
+      for (const auto& weak : live) {
+        if (auto statistics = weak.lock()) {
+          statistics->FlushTickersToPreAggregation();
+        }
+      }
+    });
+  }
+
+  std::mutex mutex_;
+  std::unordered_map<StatisticsMetricImpl*, std::weak_ptr<StatisticsMetricImpl>> live_
+      GUARDED_BY(mutex_);
+};
+
+} // namespace
 
 constexpr std::pair<Tickers, const char *> TickersNameMap[] = {
     {BLOCK_CACHE_MISS, "rocksdb_block_cache_miss"},
@@ -179,7 +327,11 @@ std::shared_ptr<Statistics> CreateDBStatistics(
     const scoped_refptr<MetricEntity>& hist_entity,
     const scoped_refptr<MetricEntity>& tick_entity,
     const bool for_intents) {
-  return std::make_shared<StatisticsMetricImpl>(hist_entity, tick_entity, for_intents);
+  auto statistics = std::make_shared<StatisticsMetricImpl>(hist_entity, tick_entity, for_intents);
+  if (statistics->has_striped_tickers()) {
+    StripedStatisticsRegistry::Instance().Add(statistics);
+  }
+  return statistics;
 }
 
 std::shared_ptr<Statistics> CreateDBStatisticsForTests(bool for_intents) {
@@ -315,18 +467,46 @@ StatisticsMetricImpl::StatisticsMetricImpl(
                                         : prototypes.regular_ticker_prototypes();
   if (tick_entity) {
     tickers_.reserve(kNumTickers);
+    if (FLAGS_rocksdb_striped_tickers) {
+      striped_tickers_.resize(kNumTickers, nullptr);
+    }
     for (size_t i = 0; i < kNumTickers; i++) {
-      tickers_.push_back(ticker_prototypes[i]->Instantiate(tick_entity, 0));
+      if (!FLAGS_rocksdb_striped_tickers || IsGaugeTicker(narrow_cast<uint32_t>(i))) {
+        tickers_.push_back(ticker_prototypes[i]->Instantiate(tick_entity, 0));
+        continue;
+      }
+      // The flag is fixed for the process, so an existing metric for this prototype is striped.
+      auto striped = tick_entity->FindOrCreateMetric<StripedTickerGauge>(
+          ticker_prototypes[i].get(), 0);
+      striped_tickers_[i] = striped.get();
+      tickers_.push_back(std::move(striped));
     }
   }
 }
 
-StatisticsMetricImpl::~StatisticsMetricImpl() {}
+StatisticsMetricImpl::~StatisticsMetricImpl() {
+  if (has_striped_tickers()) {
+    // Scrapes flush only through a shared_ptr, so none is flushing this instance now. The final
+    // flush keeps counts not flushed yet in the table total.
+    StripedStatisticsRegistry::Instance().Remove(this);
+    FlushTickersToPreAggregation();
+  }
+}
+
+void StatisticsMetricImpl::FlushTickersToPreAggregation() {
+  for (auto* ticker : striped_tickers_) {
+    if (ticker) {
+      ticker->FlushToPreAggregation();
+    }
+  }
+}
 
 uint64_t StatisticsMetricImpl::getTickerCount(uint32_t ticker_type) const {
   if (!tickers_.empty()) {
     DCHECK(ticker_type < tickers_.size());
-    // Return its own ticker version
+    if (!striped_tickers_.empty() && striped_tickers_[ticker_type]) {
+      return striped_tickers_[ticker_type]->striped_value();
+    }
     return tickers_[ticker_type]->value();
   }
 

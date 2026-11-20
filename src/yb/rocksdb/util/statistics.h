@@ -44,6 +44,7 @@ class GaugePrototype;
 namespace rocksdb {
 
 class StatisticsMetricPrototypes;
+class StripedTickerGauge;
 
 class StatisticsMetricImpl : public Statistics {
  public:
@@ -66,9 +67,17 @@ class StatisticsMetricImpl : public Statistics {
 
   const char* GetTickerName(uint32_t ticker_type) const override;
 
+  // With --rocksdb_striped_tickers, applies signed deltas (including resets) to table-level
+  // Prometheus pre-aggregates before each scrape.
+  void FlushTickersToPreAggregation();
+
+  bool has_striped_tickers() const { return !striped_tickers_.empty(); }
+
  private:
   std::vector<scoped_refptr<yb::EventStats>> histograms_;
   std::vector<scoped_refptr<yb::AtomicGauge<uint64_t>>> tickers_;
+  // Same indexes as tickers_; null for tickers that are not striped.
+  std::vector<StripedTickerGauge*> striped_tickers_;
 };
 
 class ScopedStatistics : public Statistics {

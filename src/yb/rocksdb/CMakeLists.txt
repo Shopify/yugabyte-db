@@ -277,6 +277,7 @@ if (BUILD_TESTS AND
   target_compile_options(slice_transform_test PRIVATE "-Wno-array-bounds")
 endif()
 
+ADD_YB_TEST(util/statistics_test)
 ADD_YB_TEST(utilities/options/options_util_test)
 ADD_YB_TEST(utilities/table_properties_collectors/compact_on_deletion_collector_test)
 ADD_YB_TEST(utilities/write_batch_with_index/write_batch_with_index_test)

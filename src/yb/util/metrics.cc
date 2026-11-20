@@ -33,7 +33,9 @@
 #include "yb/util/metrics.h"
 
 #include <map>
+#include <mutex>
 #include <set>
+#include <vector>
 
 #include "yb/gutil/atomicops.h"
 #include "yb/gutil/casts.h"
@@ -237,8 +239,38 @@ Status MetricRegistry::WriteAsJson(JsonWriter* writer,
   return Status::OK();
 }
 
+namespace {
+
+struct PreScrapeCallbacks {
+  std::mutex mutex;
+  std::vector<std::function<void()>> callbacks GUARDED_BY(mutex);
+};
+
+PreScrapeCallbacks& GetPreScrapeCallbacks() {
+  // Callbacks may be used by metrics during static destruction.
+  static auto* callbacks = new PreScrapeCallbacks();
+  return *callbacks;
+}
+
+} // namespace
+
+void AddPrometheusPreScrapeCallback(std::function<void()> callback) {
+  auto& callbacks = GetPreScrapeCallbacks();
+  std::lock_guard lock(callbacks.mutex);
+  callbacks.callbacks.push_back(std::move(callback));
+}
+
 Status MetricRegistry::WriteForPrometheus(PrometheusWriter* writer,
                                           const MetricPrometheusOptions& opts) const {
+  std::vector<std::function<void()>> callbacks;
+  {
+    auto& pre_scrape_callbacks = GetPreScrapeCallbacks();
+    std::lock_guard lock(pre_scrape_callbacks.mutex);
+    callbacks = pre_scrape_callbacks.callbacks;
+  }
+  for (const auto& callback : callbacks) {
+    callback();
+  }
   EntityMap entities;
   VLOG_TIMING(1, "Handle non-pre-aggregated metrics") {
     // Non-pre-aggregated metrics are processed as follows:
