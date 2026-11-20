@@ -46,24 +46,6 @@ SERIAL_BINARIES: list[list[str]] = [
     # /tmp/PgOpBufferingTest_copy_test.tmp. Different cases use tables with
     # different column counts -> concurrent writes cause COPY errors.
     ["tests-pgwrapper/pg_op_buffering-test"],
-
-    # Each case spins up 3 yb-controller daemons in SetUp(). Parallel cases
-    # across these binaries burst YBC startup-pings beyond the retry budget.
-    # One group => one worker slot shared across all three binaries.
-    [
-        "tests-tools/yb-backup-test",
-        "tests-tools/yb-backup-cross-feature-test",
-        "tests-tools/yb-backup-during-ddl-test",
-    ],
-
-    # rpc-test cases failed under parallelism, passed on rerun-individually.
-    ["tests-rpc/rpc-test"],
-
-    # these are long running tail tests
-    ["tests-pgwrapper/alter_schema_abort_txn-test"],
-    ["tests-pgwrapper/pg_tablet_shutdown-test"],
-    ["tests-integration-tests/basic_upgrade-test"],
-    ["tests-master/master-test"],
 ]
 
 
@@ -310,6 +292,8 @@ def main() -> int:
     parser.add_argument("--print-queue", action="store_true",
                         help="Print the dispatch queue (binary<TAB>Suite.Case) "
                              "and exit without running anything.")
+    parser.add_argument("--no-serial", action="store_true",
+                        help="Ignore SERIAL_BINARIES: every case runs in parallel.")
     args = parser.parse_args()
 
     specs = [parse_test_spec(t) for t in (args.test or [])]
@@ -332,7 +316,7 @@ def main() -> int:
         print(f"  {len(selections)} matched by --test specs", flush=True)
 
     print("Enumerating cases...", flush=True)
-    queue = build_queue(selections, SERIAL_BINARIES, args.workers)
+    queue = build_queue(selections, [] if args.no_serial else SERIAL_BINARIES, args.workers)
     total_cases = sum(len(wi.cases) for wi in queue)
     print(f"  {total_cases} cases in {len(queue)} work items "
           f"({sum(1 for wi in queue if wi.serial)} serial)", flush=True)
