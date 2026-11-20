@@ -3176,6 +3176,100 @@ yb_can_pushdown_as_filter(PlannerInfo *root,
 }
 
 /*
+ * Split a binary operator clause into a key and a Const value, commuting
+ * "Const op key".  Returns the operator for (key, value), or InvalidOid.
+ */
+static Oid
+yb_split_const_opclause(Node *clause, Node **key, Node **value)
+{
+	OpExpr	   *op = (OpExpr *) clause;
+
+	if (!is_opclause(clause) || list_length(op->args) != 2)
+		return InvalidOid;
+	*key = linitial(op->args);
+	*value = lsecond(op->args);
+	if (!IsA(*key, Const))
+		return IsA(*value, Const) ? op->opno : InvalidOid;
+	*key = lsecond(op->args);
+	*value = linitial(op->args);
+	return get_commutator(op->opno);
+}
+
+/* Match a disjunction of constant equalities as one LSM array scan key. */
+static IndexClause *
+yb_match_or_to_indexcol(PlannerInfo *root, RestrictInfo *rinfo,
+						int indexcol, IndexOptInfo *index)
+{
+	Node	   *indexkey = NULL;
+	Oid			opno = InvalidOid;
+	Oid			collid = InvalidOid;
+	Oid			elemtype = InvalidOid;
+	List	   *values = NIL;
+	ListCell   *lc;
+	ArrayExpr  *array;
+	ScalarArrayOpExpr *saop;
+	RestrictInfo *derived;
+	IndexClause *iclause;
+
+	foreach(lc, ((BoolExpr *) rinfo->clause)->args)
+	{
+		Node	   *key;
+		Node	   *value;
+		Oid			armop = yb_split_const_opclause(lfirst(lc), &key, &value);
+		Oid			armcollid;
+
+		if (!OidIsValid(armop))
+			return NULL;
+		armcollid = lfirst_node(OpExpr, lc)->inputcollid;
+		if (!indexkey)
+		{
+			if (!match_index_to_operand(key, indexcol, index) ||
+				get_op_opfamily_strategy(armop, index->opfamily[indexcol]) !=
+				BTEqualStrategyNumber ||
+				!op_strict(armop) || op_volatile(armop) != PROVOLATILE_IMMUTABLE)
+				return NULL;
+			indexkey = key;
+			opno = armop;
+			collid = armcollid;
+			elemtype = exprType(value);
+			if (!OidIsValid(get_array_type(elemtype)) ||
+				type_is_array_domain(elemtype) || type_is_rowtype(elemtype))
+				return NULL;
+		}
+		else if (armop != opno || armcollid != collid ||
+				 exprType(value) != elemtype || !equal(key, indexkey))
+			return NULL;
+		values = lappend(values, value);
+	}
+
+	array = makeNode(ArrayExpr);
+	array->array_typeid = get_array_type(elemtype);
+	array->element_typeid = elemtype;
+	array->array_collid = collid;
+	array->elements = values;
+	array->location = -1;
+
+	saop = makeNode(ScalarArrayOpExpr);
+	saop->opno = opno;
+	saop->opfuncid = get_opcode(opno);
+	saop->useOr = true;
+	saop->inputcollid = collid;
+	saop->location = -1;
+	saop->args = list_make2(indexkey, eval_const_expressions(root, (Node *) array));
+	if (yb_hash_code_on_left(saop))
+		return NULL;
+
+	derived = make_restrictinfo(root, (Expr *) saop, rinfo->is_pushed_down,
+								rinfo->outerjoin_delayed, false,
+								rinfo->security_level, rinfo->required_relids,
+								rinfo->outer_relids, rinfo->nullable_relids);
+	iclause = match_saopclause_to_indexcol(root, derived, indexcol, index);
+	if (iclause)
+		iclause->rinfo = rinfo; /* The derived qual enforces the whole OR. */
+	return iclause;
+}
+
+/*
  * match_clause_to_indexcol()
  *	  Determine whether a restriction clause matches a column of an index,
  *	  and if so, build an IndexClause node describing the details.
@@ -3257,6 +3351,11 @@ match_clause_to_indexcol(PlannerInfo *root,
 	 */
 	if (clause == NULL)
 		return NULL;
+
+	/* YB: LSM can bind an OR of equalities on one key as an array key. */
+	if (index->relam == LSM_AM_OID && index->amsearcharray &&
+		restriction_is_or_clause(rinfo))
+		return yb_match_or_to_indexcol(root, rinfo, indexcol, index);
 
 	/* First check for boolean-index cases. */
 	opfamily = index->opfamily[indexcol];
