@@ -7941,9 +7941,22 @@ yb_analyze_conditions_on_current_column(PlannerInfo *root,
 		}
 		else if (IsA(clause, RowCompareExpr))
 		{
-			equality_expr = true;
-			/* Strictest form of condition, so no need to check further */
-			break;
+			RowCompareExpr *rowcompare = (RowCompareExpr *) clause;
+
+			if (rowcompare->rctype == ROWCOMPARE_EQ &&
+				IsA(rowcompare->rargs, ArrayExpr))
+			{
+				in_expr = true;
+				*strictest_in_expr_array_length =
+					Min(*strictest_in_expr_array_length,
+						list_length(castNode(ArrayExpr, rowcompare->rargs)->elements));
+			}
+			else
+			{
+				equality_expr = true;
+				/* Strictest form of condition, so no need to check further */
+				break;
+			}
 		}
 		else if (IsA(clause, ScalarArrayOpExpr))
 		{
