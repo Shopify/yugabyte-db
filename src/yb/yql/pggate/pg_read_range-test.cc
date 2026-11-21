@@ -12,6 +12,8 @@
 // under the License.
 //--------------------------------------------------------------------------------------------------
 
+#include <limits>
+
 #include <gtest/gtest.h>
 
 #include "yb/common/common.pb.h"
@@ -23,6 +25,7 @@
 
 #include "yb/master/master_ddl.pb.h"
 
+#include "yb/util/format.h"
 #include "yb/util/status_log.h"
 #include "yb/util/test_util.h"
 
@@ -118,6 +121,14 @@ class PgReadRangeTest : public YBTest {
             dockv::KeyEntryValue::Int32(h1_val), dockv::KeyEntryValue::Int32(h2_val)},
         dockv::KeyEntryValues{
             dockv::KeyEntryValue::Int32(r1_val), dockv::KeyEntryValue::Int32(r2_val)});
+  }
+
+  // Whether the range contains the given full key.
+  static bool Contains(const PgReadRange& range, const PgTable& table, const dockv::DocKey& key) {
+    PgReadRange point(table);
+    point.SetDocKeyBound(key, true /* is_inclusive */, true /* is_lower */);
+    point.SetDocKeyBound(key, true /* is_inclusive */, false /* is_lower */);
+    return range.Intersects(point);
   }
 };
 
@@ -1519,6 +1530,117 @@ TEST_F(PgReadRangeTest, SetQLValueBoundsRange) {
     expected.SetDocKeyBound(k1, false, true);
     expected.SetDocKeyBound(k2, false, false);
     EXPECT_EQ(range, expected);
+  }
+}
+
+// A bound on a key prefix covers every key with that prefix when it is inclusive, and none of them
+// when it is strict. A NULL member ends the bound the same way as a missing one.
+TEST_F(PgReadRangeTest, PrefixBoundsHash) {
+  ThreadSafeArena arena;
+  LWQLValuePB value_10(&arena);
+  value_10.set_int32_value(10);
+  LWQLValuePB value_0(&arena);
+  value_0.set_int32_value(0);
+  LWQLValuePB value_null(&arena);
+  constexpr auto kMin = std::numeric_limits<int32_t>::min();
+  constexpr auto kMax = std::numeric_limits<int32_t>::max();
+  const std::vector<const LWQLValuePB*> prefix = {&value_10, &value_0, &value_10};
+  const std::vector<const LWQLValuePB*> with_null = {&value_10, &value_0, &value_10, &value_null};
+  const auto before = MakeHashDocKey(100, 10, 0, 9, kMax);
+  const auto group_first = MakeHashDocKey(100, 10, 0, 10, kMin);
+  const auto group_last = MakeHashDocKey(100, 10, 0, 10, kMax);
+  const auto after = MakeHashDocKey(100, 10, 0, 11, kMin);
+
+  for (bool is_inclusive : {true, false}) {
+    for (bool is_lower : {true, false}) {
+      SCOPED_TRACE(Format("is_inclusive: $0, is_lower: $1", is_inclusive, is_lower));
+      PgReadRange range(hash_table_);
+      ASSERT_OK(range.SetHashAndRangeValuesBound(100, prefix, is_inclusive, is_lower));
+      const auto fill = is_lower == is_inclusive ? dockv::KeyEntryType::kLowest
+                                                 : dockv::KeyEntryType::kHighest;
+      PgReadRange expected(hash_table_);
+      expected.SetDocKeyBound(
+          dockv::DocKey(
+              hash_table_->schema(), 100,
+              dockv::KeyEntryValues{
+                  dockv::KeyEntryValue::Int32(10), dockv::KeyEntryValue::Int32(0)},
+              dockv::KeyEntryValues{
+                  dockv::KeyEntryValue::Int32(10), dockv::KeyEntryValue(fill)}),
+          false /* is_inclusive */, is_lower);
+      ASSERT_EQ(range, expected);
+      ASSERT_EQ(Contains(range, hash_table_, group_first), is_inclusive);
+      ASSERT_EQ(Contains(range, hash_table_, group_last), is_inclusive);
+      ASSERT_TRUE(Contains(range, hash_table_, is_lower ? after : before));
+      ASSERT_FALSE(Contains(range, hash_table_, is_lower ? before : after));
+
+      PgReadRange null_range(hash_table_);
+      ASSERT_OK(null_range.SetHashAndRangeValuesBound(100, with_null, is_inclusive, is_lower));
+      ASSERT_EQ(null_range, range);
+    }
+  }
+
+  // A strict bound that ends inside the hashed group: ROW(yb_hash_code, h1) > ROW(100, 10).
+  const std::vector<const LWQLValuePB*> hash_prefix = {&value_10};
+  PgReadRange range(hash_table_);
+  ASSERT_OK(range.SetHashAndRangeValuesBound(100, hash_prefix, false, true));
+  ASSERT_FALSE(Contains(range, hash_table_, MakeHashDocKey(100, 10, kMax, kMax, kMax)));
+  ASSERT_TRUE(Contains(range, hash_table_, MakeHashDocKey(100, 11, kMin, kMin, kMin)));
+
+  // Key column binds are inclusive, so an IS NULL bind still covers the NULL key.
+  PgReadRange is_null(hash_table_);
+  ASSERT_OK(is_null.SetHashAndRangeValuesBound(100, with_null, true, true));
+  ASSERT_OK(is_null.SetHashAndRangeValuesBound(100, with_null, true, false));
+  ASSERT_TRUE(Contains(
+      is_null, hash_table_,
+      dockv::DocKey(
+          hash_table_->schema(), 100,
+          dockv::KeyEntryValues{dockv::KeyEntryValue::Int32(10), dockv::KeyEntryValue::Int32(0)},
+          dockv::KeyEntryValues{
+              dockv::KeyEntryValue::Int32(10),
+              dockv::KeyEntryValue(dockv::KeyEntryType::kNullLow)})));
+}
+
+TEST_F(PgReadRangeTest, PrefixBoundsRange) {
+  ThreadSafeArena arena;
+  LWQLValuePB value_100(&arena);
+  value_100.set_int32_value(100);
+  LWQLValuePB value_10(&arena);
+  value_10.set_int32_value(10);
+  LWQLValuePB value_null(&arena);
+  constexpr auto kMin = std::numeric_limits<int32_t>::min();
+  constexpr auto kMax = std::numeric_limits<int32_t>::max();
+  const std::vector<const LWQLValuePB*> prefix = {&value_100, &value_10};
+  const std::vector<const LWQLValuePB*> with_null = {&value_100, &value_10, &value_null};
+  const auto before = MakeRangeDocKey(100, 9, kMax);
+  const auto group_first = MakeRangeDocKey(100, 10, kMin);
+  const auto group_last = MakeRangeDocKey(100, 10, kMax);
+  const auto after = MakeRangeDocKey(100, 11, kMin);
+
+  for (bool is_inclusive : {true, false}) {
+    for (bool is_lower : {true, false}) {
+      SCOPED_TRACE(Format("is_inclusive: $0, is_lower: $1", is_inclusive, is_lower));
+      PgReadRange range(range_table_);
+      ASSERT_OK(range.SetRangeValuesBound(prefix, is_inclusive, is_lower));
+      const auto fill = is_lower == is_inclusive ? dockv::KeyEntryType::kLowest
+                                                 : dockv::KeyEntryType::kHighest;
+      PgReadRange expected(range_table_);
+      expected.SetDocKeyBound(
+          dockv::DocKey(
+              range_table_->schema(),
+              dockv::KeyEntryValues{
+                  dockv::KeyEntryValue::Int32(100), dockv::KeyEntryValue::Int32(10),
+                  dockv::KeyEntryValue(fill)}),
+          false /* is_inclusive */, is_lower);
+      ASSERT_EQ(range, expected);
+      ASSERT_EQ(Contains(range, range_table_, group_first), is_inclusive);
+      ASSERT_EQ(Contains(range, range_table_, group_last), is_inclusive);
+      ASSERT_TRUE(Contains(range, range_table_, is_lower ? after : before));
+      ASSERT_FALSE(Contains(range, range_table_, is_lower ? before : after));
+
+      PgReadRange null_range(range_table_);
+      ASSERT_OK(null_range.SetRangeValuesBound(with_null, is_inclusive, is_lower));
+      ASSERT_EQ(null_range, range);
+    }
   }
 }
 

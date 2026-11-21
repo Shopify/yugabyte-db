@@ -62,7 +62,7 @@ class PgReadRange {
     auto num_hash_key_columns = table_->schema().num_hash_key_columns();
     auto num_range_key_columns = table_->schema().num_range_key_columns();
     DCHECK_GT(num_hash_key_columns, 0);
-    auto null_type = is_lower ? dockv::KeyEntryType::kLowest : dockv::KeyEntryType::kHighest;
+    auto null_type = PrefixFillType(is_inclusive, is_lower);
     bool null_found = false;
     auto hashed_group = VERIFY_RESULT(MakeGroup(
         values, 0, num_hash_key_columns, null_type, &null_found));
@@ -81,7 +81,7 @@ class PgReadRange {
   Status SetRangeValuesBound(const Collection& values, bool is_inclusive, bool is_lower) {
     auto num_range_key_columns = table_->schema().num_range_key_columns();
     DCHECK_EQ(table_->schema().num_hash_key_columns(), 0);
-    auto null_type = is_lower ? dockv::KeyEntryType::kLowest : dockv::KeyEntryType::kHighest;
+    auto null_type = PrefixFillType(is_inclusive, is_lower);
     bool null_found = false;
     auto range_group = VERIFY_RESULT(MakeGroup(
         values, 0, num_range_key_columns, null_type, &null_found));
@@ -110,6 +110,18 @@ class PgReadRange {
   // method to be two-byte hash code, or error out if the bound is not derived from hash code.
   static Status ConvertBoundsToHashCode(LWPgsqlReadRequestPB& req);
  private:
+  // The key entry that replaces the first missing or NULL value of a bound. A bound on the key
+  // prefix P covers every key starting with P when it is inclusive, and none of them when it is
+  // strict, so the entry sorts before (kLowest) or after (kHighest) every value of the next column:
+  //   lower inclusive -> kLowest, lower strict -> kHighest,
+  //   upper inclusive -> kHighest, upper strict -> kLowest.
+  // HybridScanChoices uses the same rule for strict bounds. A NULL member of a row comparison
+  // decides it on the members before it, so it takes the same entry. Key column binds (=, IN,
+  // IS NULL) always set inclusive bounds.
+  static dockv::KeyEntryType PrefixFillType(bool is_inclusive, bool is_lower) {
+    return is_lower == is_inclusive ? dockv::KeyEntryType::kLowest
+                                    : dockv::KeyEntryType::kHighest;
+  }
   static Result<dockv::KeyEntryValue> AsKeyEntryValue(
       const LWQLValuePB* value, const PgColumn& column, const dockv::KeyEntryType& null_type,
       bool* null_found) {
