@@ -1,0 +1,61 @@
+# Production flag profile for yb-master, captured from 2025.2.1.0-b141.
+# Mirrors the deployment's Ansible desired state (roles/{master,tserver}/vars/main.yml + production
+# inventory overrides, rendered by roles/*/templates/*.conf.j2). Keep in sync when production
+# changes: render a host's flagfile and diff it against this file.
+# Active lines are byte-for-byte as rendered. "# PROD ... [DROPPED|SUBSTITUTED: ...]" lines are
+# production lines the test cannot apply; see pg_production_profile-test.cc for the grammar.
+# Every non-flag line must start with '#': gflags treats other non-flag lines as program filters.
+--callhome_enabled=false
+--catalog_manager_report_batch_size=100
+--default_memory_limit_to_ram_ratio=0.67
+--enable_automatic_tablet_splitting=false
+--enable_heartbeat_pg_catalog_versions_cache=true
+# PROD --fatal_details_path_prefix=<per-host> [DROPPED: harness sets a per-daemon path]
+# PROD --fs_data_dirs=<per-host> [DROPPED: harness owns data dirs]
+--leader_failure_max_missed_heartbeat_periods=10
+--load_balancer_max_concurrent_adds=480
+--load_balancer_max_concurrent_moves=1280
+--load_balancer_max_concurrent_moves_per_table=1280
+--load_balancer_max_concurrent_removals=1280
+--load_balancer_max_concurrent_tablet_remote_bootstraps=240
+--load_balancer_max_concurrent_tablet_remote_bootstraps_per_table=240
+--load_balancer_max_over_replicated_tablets=1000
+# PROD --log_dir=<per-host> [DROPPED: harness passes --log_dir= so logs go under fs_data_dirs]
+--logtostderr=false
+# PROD --master_addresses=<per-host> [DROPPED: harness allocates ports]
+--master_enable_metrics_snapshotter=true
+--master_join_existing_universe=true
+--master_svc_queue_length=5000
+--master_tserver_svc_queue_length=10000
+--max_clock_skew_usec=100000
+--max_create_tablets_per_ts=200
+--max_log_size=500
+--metrics_snapshotter_tserver_metrics_whitelist=handler_latency_yb_tserver_TabletServerService_Read_count,handler_latency_yb_tserver_TabletServerService_Write_count,handler_latency_yb_tserver_TabletServerService_Read_sum,handler_latency_yb_tserver_TabletServerService_Write_sum,disk_usage,cpu_usage,node_up
+--num_concurrent_backfills_allowed=22
+# PROD --num_reactor_threads=<per-host> [DROPPED: derived from vCPU count]
+# PROD --placement_cloud=<per-host> [DROPPED: deployment placement]
+# PROD --placement_region=<per-host> [DROPPED: deployment placement]
+# PROD --placement_zone=<per-host> [DROPPED: deployment placement]
+# PROD --replication_factor=7 [SUBSTITUTED: harness]
+# PROD --rpc_bind_addresses=<per-host> [DROPPED: harness allocates ports]
+--rpc_workers_limit=2048
+--stop_logging_if_full_disk=true
+--tablet_force_split_threshold_bytes=100000000000
+--tablet_split_high_phase_shard_count_per_node=1
+--tablet_split_high_phase_size_threshold_bytes=100000000000
+--tablet_split_limit_per_table=0
+--tablet_split_low_phase_shard_count_per_node=1
+--tablet_split_low_phase_size_threshold_bytes=100000000000
+--timestamp_history_retention_interval_sec=86400
+--timestamp_syscatalog_history_retention_interval_sec=86400
+--transaction_heartbeat_usec=1000000
+--transaction_max_missed_heartbeat_periods=30
+# PROD --transaction_table_num_tablets=200 [SUBSTITUTED: harness]
+--transaction_table_num_tablets_per_tserver=2
+--transaction_tables_use_preferred_zones=true
+--yb_client_admin_operation_timeout_sec=240
+--yb_num_shards_per_tserver=1
+--ysql_index_backfill_rpc_timeout_ms=3600000
+--ysql_num_shards_per_tserver=1
+--ysql_num_tablets=4
+

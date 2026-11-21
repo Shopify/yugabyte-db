@@ -1,0 +1,67 @@
+# Production flag profile for yb-tserver, captured from 2025.2.1.0-b141.
+# Mirrors the deployment's Ansible desired state (roles/{master,tserver}/vars/main.yml + production
+# inventory overrides, rendered by roles/*/templates/*.conf.j2). Keep in sync when production
+# changes: render a host's flagfile and diff it against this file.
+# Active lines are byte-for-byte as rendered. "# PROD ... [DROPPED|SUBSTITUTED: ...]" lines are
+# production lines the test cannot apply; see pg_production_profile-test.cc for the grammar.
+# Every non-flag line must start with '#': gflags treats other non-flag lines as program filters.
+--allowed_preview_flags_csv=ysql_yb_enable_ash
+--backfill_index_timeout_grace_margin_ms=300000
+--backfill_index_write_batch_size=1000000
+--callhome_enabled=false
+--cdc_intent_retention_ms=28800000
+--cdc_state_checkpoint_update_interval_ms=30000
+# PROD --cql_proxy_bind_address=<per-host> [DROPPED: harness allocates ports]
+--enable_heartbeat_pg_catalog_versions_cache=true
+--enable_truncate_cdcsdk_table=true
+# PROD --fatal_details_path_prefix=<per-host> [DROPPED: harness sets a per-daemon path]
+--enable_ysql
+--ysql_enable_auth
+--use_memory_defaults_optimized_for_ysql
+# PROD --fs_data_dirs=<per-host> [DROPPED: harness owns data dirs]
+--leader_failure_max_missed_heartbeat_periods=10
+--leader_lease_duration_ms=4000
+# PROD --log_dir=<per-host> [DROPPED: harness passes --log_dir= so logs go under fs_data_dirs]
+--logtostderr=false
+--max_clock_skew_usec=100000
+--max_log_size=500
+--metrics_snapshotter_tserver_metrics_whitelist=handler_latency_yb_tserver_TabletServerService_Read_count, handler_latency_yb_tserver_TabletServerService_Write_count, handler_latency_yb_tserver_TabletServerService_Read_sum, handler_latency_yb_tserver_TabletServerService_Write_sum, disk_usage,cpu_usage,node_up
+--num_concurrent_backfills_allowed=22
+# PROD --num_reactor_threads=<per-host> [DROPPED: derived from vCPU count]
+# PROD --pgsql_proxy_bind_address=<per-host> [DROPPED: harness allocates ports; a 0.0.0.0 bind would collide in CI]
+# PROD --placement_cloud=<per-host> [DROPPED: deployment placement]
+# PROD --placement_region=<per-host> [DROPPED: deployment placement]
+# PROD --placement_zone=<per-host> [DROPPED: deployment placement]
+--remote_bootstrap_rate_limit_bytes_per_sec=1073741824
+--rocksdb_max_background_compactions=12
+# PROD --rpc_bind_addresses=<per-host> [DROPPED: harness allocates ports]
+--rpc_workers_limit=2048
+--scheduled_full_compaction_frequency_hours=720
+--stop_logging_if_full_disk=true
+--timestamp_history_retention_interval_sec=86400
+--timestamp_syscatalog_history_retention_interval_sec=86400
+--transaction_heartbeat_usec=1000000
+--transaction_max_missed_heartbeat_periods=30
+--tserver_enable_metrics_snapshotter=true
+# PROD --tserver_master_addrs=<per-host> [DROPPED: harness allocates ports]
+--yb_client_admin_operation_timeout_sec=240
+--yb_enable_parallel_append=false
+--yb_enable_read_committed_isolation=true
+--yb_num_shards_per_tserver=1
+--yb_parallel_range_rows=0
+--yb_walsender_poll_sleep_duration_empty_ms=10
+--ysql_catalog_preload_additional_table_list=pg_statistic,pg_amop,pg_operator,pg_namespace,pg_auth_members,pg_range
+--ysql_catalog_preload_additional_tables=true
+--ysql_default_transaction_isolation='read committed'
+--ysql_enable_auto_analyze=false
+--ysql_hba_conf_csv="local all all trust","host all all 0.0.0.0/0 md5","host all all ::0/0 md5","host all all 0.0.0.0/0 scram-sha-256","host all all ::0/0 scram-sha-256"
+--ysql_max_connections=600
+--ysql_num_shards_per_tserver=1
+--ysql_num_tablets=4
+# NOTE: in ysql_pg_conf_csv below, log_filename's per-host token is replaced with "yb-ts".
+--ysql_pg_conf_csv="yb_enable_bitmapscan=on","password_encryption=md5","log_min_duration_statement=1000ms","statement_timeout=60000","client_connection_check_interval=1000","compute_query_id=on","track_activity_query_size=131072","log_line_prefix='%m %p [POSTGRES] %qapplication=%a username=%u dbname=%d remote_addr=%r session_id=%c sqlstate=%e command=%i query_id=%Q '","log_statement=ddl","yb_insert_on_conflict_read_batch_size=40000","yb_enable_update_reltuples_after_create_index=on","log_rotation_size='500MB'","log_file_mode='0640'","log_filename='postgresql.yb-ts.%Y-%m-%d_%H%M%S.log'"
+--ysql_yb_allow_replication_slot_lsn_types=true
+--ysql_yb_enable_ash=true
+--ysql_yb_enable_cbo=on
+--ysql_yb_skip_redundant_update_ops=false
+
