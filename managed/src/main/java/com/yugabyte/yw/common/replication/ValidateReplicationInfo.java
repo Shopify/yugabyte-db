@@ -12,7 +12,7 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections4.CollectionUtils;
-import org.yb.client.YBClient;
+import org.yb.client.YBClientApi;
 
 @Slf4j
 @Singleton
@@ -28,10 +28,9 @@ public class ValidateReplicationInfo {
   public List<Tablespace> getUnsupportedTablespacesOnUniverse(
       Universe universe, Collection<Tablespace> tablespaces) {
     String masterAddresses = universe.getMasterAddresses(true /* mastersQueryable */);
-    String certificate = universe.getCertificateNodetoNode();
     UUID primaryClusterPlacementUUID = universe.getUniverseDetails().getPrimaryCluster().uuid;
     if (CollectionUtils.isNotEmpty(tablespaces)) {
-      try (YBClient client = ybClientService.getClient(masterAddresses, certificate)) {
+      try (YBClientApi client = ybClientService.getUniverseClient(universe, masterAddresses)) {
         return tablespaces.stream()
             .filter(
                 t -> {

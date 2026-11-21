@@ -169,6 +169,17 @@ Status ChangeMetadataOperation::Apply(int64_t leader_term, Status* complete_stat
   if (request()->has_schema()) {
     const auto& schema = request()->schema();
     metadata_change = MetadataChange::SCHEMA;
+    // The table could have been removed by an earlier op, e.g. hidden table cleanup after PITR
+    // racing with a heartbeat-triggered alter. Same lookup as Tablet::AlterSchema.
+    auto table_info = tablet->metadata()->GetTableInfo(
+        request()->has_alter_table_id() ? request()->alter_table_id().ToBuffer() : "");
+    if (!table_info.ok()) {
+      if (!table_info.status().IsNotFound()) {
+        return table_info.status();
+      }
+      LOG_WITH_PREFIX(WARNING) << "Skipping alter of removed table: " << table_info.status();
+      return Status::OK();
+    }
     if (schema.has_colocated_table_id()) {
       switch (schema.colocated_table_id().value_case()) {
         case ColocatedTableIdentifierPB::kCotableId: {
@@ -256,7 +267,8 @@ Status ChangeMetadataOperation::Apply(int64_t leader_term, Status* complete_stat
       DCHECK_EQ(1, num_operations) << "Invalid number of change metadata operations: "
                                    << num_operations;
       RETURN_NOT_OK(tablet->MarkBackfillDone(
-          id, request()->backfill_done_table_id().ToBuffer()));
+          id, request()->backfill_done_table_id().ToBuffer(),
+          request()->birth_time()));
       break;
     case MetadataChange::ADD_MULTIPLE_TABLES:
       DCHECK_EQ(1, num_operations) << "Invalid number of change metadata operations: "

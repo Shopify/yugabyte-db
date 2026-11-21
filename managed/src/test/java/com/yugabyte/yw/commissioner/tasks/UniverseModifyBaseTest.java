@@ -26,7 +26,9 @@ import com.yugabyte.yw.common.ApiUtils;
 import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.common.NodeManager;
 import com.yugabyte.yw.common.PlacementInfoUtil;
+import com.yugabyte.yw.common.ProviderInitializer;
 import com.yugabyte.yw.common.ShellResponse;
+import com.yugabyte.yw.common.TestUtils;
 import com.yugabyte.yw.forms.NodeInstanceFormData;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
@@ -63,7 +65,7 @@ import org.yb.client.GetLoadMovePercentResponse;
 import org.yb.client.GetMasterClusterConfigResponse;
 import org.yb.client.ListLiveTabletServersResponse;
 import org.yb.client.ListMasterRaftPeersResponse;
-import org.yb.client.YBClient;
+import org.yb.client.YBClientApi;
 import org.yb.master.CatalogEntityInfo;
 import org.yb.util.PeerInfo;
 import play.libs.Json;
@@ -83,7 +85,7 @@ public abstract class UniverseModifyBaseTest extends CommissionerBaseTest {
   protected ShellResponse dummyShellResponse;
   protected ShellResponse preflightResponse;
 
-  protected YBClient mockClient;
+  protected YBClientApi mockClient;
 
   protected Hook hook1, hook2;
   protected HookScope hookScope1, hookScope2;
@@ -102,46 +104,8 @@ public abstract class UniverseModifyBaseTest extends CommissionerBaseTest {
     dummyShellResponse.code = ShellResponse.ERROR_CODE_SUCCESS;
     preflightResponse = new ShellResponse();
     preflightResponse.message = "{\"test\": true}";
-    AtomicInteger masterIpCnt = new AtomicInteger();
-    when(mockNodeManager.nodeCommand(any(), any()))
-        .then(
-            invocation -> {
-              if (invocation.getArgument(0).equals(NodeManager.NodeCommandType.Precheck)) {
-                NodeTaskParams params = invocation.getArgument(1);
-                assertTrue(StringUtils.isNotBlank((params.nodeName)));
-                NodeInstance.getOrBadRequest(params.nodeUuid);
-                return preflightResponse;
-              }
-              if (invocation.getArgument(0).equals(NodeManager.NodeCommandType.List)) {
-                ShellResponse listResponse = new ShellResponse();
-                NodeTaskParams params = invocation.getArgument(1);
-                ObjectNode respJson =
-                    (ObjectNode)
-                        Json.parse("{\"universe_uuid\":\"" + params.getUniverseUUID() + "\"}");
-                Universe universe = Universe.getOrBadRequest(params.getUniverseUUID());
-                NodeDetails nodeDetails = universe.getNode(params.nodeName);
-                if (nodeDetails != null
-                    && nodeDetails.dedicatedTo == UniverseTaskBase.ServerType.MASTER) {
-                  respJson.put("private_ip", "10.0.0." + masterIpCnt.incrementAndGet());
-                }
-                if (params.nodeUuid != null) {
-                  respJson.put("node_uuid", params.nodeUuid.toString());
-                }
-                listResponse.message = respJson.toString();
-                return listResponse;
-              }
-              if (invocation.getArgument(0).equals(NodeManager.NodeCommandType.Control)) {
-                AnsibleClusterServerCtl.Params params = invocation.getArgument(1);
-                assertTrue(StringUtils.isNotBlank(params.command));
-                Universe universe = Universe.getOrBadRequest(params.getUniverseUUID());
-                NodeDetails nodeDetails = universe.getNode(params.nodeName);
-                if ("stop".equalsIgnoreCase(params.command)) {
-                  assertFalse(nodeDetails.isSoftwareDeleted());
-                }
-              }
-              return dummyShellResponse;
-            });
-    mockClient = mock(YBClient.class);
+    mockNodeCommands();
+    mockClient = mock(YBClientApi.class);
     when(mockClient.waitForServer(any(), anyLong())).thenReturn(true);
     when(mockYBClient.getUniverseClient(any())).thenReturn(mockClient);
     when(mockYBClient.getClient(any(), any())).thenReturn(mockClient);
@@ -177,6 +141,50 @@ public abstract class UniverseModifyBaseTest extends CommissionerBaseTest {
         HookScope.create(defaultCustomer.getUuid(), HookScope.TriggerType.PostNodeProvision);
     hookScope1.addHook(hook1);
     hookScope2.addHook(hook2);
+  }
+
+  /** The node commands of VMs that exist and work; a test can restore them after overriding. */
+  protected void mockNodeCommands() {
+    AtomicInteger masterIpCnt = new AtomicInteger();
+    when(mockNodeManager.nodeCommand(any(), any()))
+        .then(
+            invocation -> {
+              if (invocation.getArgument(0).equals(NodeManager.NodeCommandType.Precheck)) {
+                NodeTaskParams params = invocation.getArgument(1);
+                assertTrue(StringUtils.isNotBlank((params.nodeName)));
+                NodeInstance.getOrBadRequest(params.nodeUuid);
+                return preflightResponse;
+              }
+              if (invocation.getArgument(0).equals(NodeManager.NodeCommandType.List)) {
+                ShellResponse listResponse = new ShellResponse();
+                NodeTaskParams params = invocation.getArgument(1);
+                ObjectNode respJson =
+                    (ObjectNode)
+                        Json.parse("{\"universe_uuid\":\"" + params.getUniverseUUID() + "\"}");
+                Universe universe = Universe.getOrBadRequest(params.getUniverseUUID());
+                NodeDetails nodeDetails = universe.getNode(params.nodeName);
+                if (nodeDetails != null
+                    && nodeDetails.dedicatedTo == UniverseTaskBase.ServerType.MASTER) {
+                  respJson.put("private_ip", "10.0.0." + masterIpCnt.incrementAndGet());
+                }
+                if (params.nodeUuid != null) {
+                  respJson.put("node_uuid", params.nodeUuid.toString());
+                }
+                addAzureLunIndexes(respJson, params);
+                listResponse.message = respJson.toString();
+                return listResponse;
+              }
+              if (invocation.getArgument(0).equals(NodeManager.NodeCommandType.Control)) {
+                AnsibleClusterServerCtl.Params params = invocation.getArgument(1);
+                assertTrue(StringUtils.isNotBlank(params.command));
+                Universe universe = Universe.getOrBadRequest(params.getUniverseUUID());
+                NodeDetails nodeDetails = universe.getNode(params.nodeName);
+                if ("stop".equalsIgnoreCase(params.command)) {
+                  assertFalse(nodeDetails.isSoftwareDeleted());
+                }
+              }
+              return dummyShellResponse;
+            });
   }
 
   protected void mockCommonForEditUniverseBasedTasks(Universe universe) {
@@ -255,19 +263,20 @@ public abstract class UniverseModifyBaseTest extends CommissionerBaseTest {
     // create default universe
     UniverseDefinitionTaskParams.UserIntent userIntent =
         new UniverseDefinitionTaskParams.UserIntent();
+    ProviderInitializer pi =
+        TestUtils.getProviderInitializerForTests(userIntent, provider.getUuid());
+    Common.CloudType providerType = provider.getCloudCode();
     userIntent.numNodes = numNodes;
     userIntent.ybSoftwareVersion = "yb-version";
-    userIntent.accessKeyCode = "default-key";
+    pi.setAccessCode("default-key");
     userIntent.replicationFactor = 3;
     userIntent.regionList = ImmutableList.of(region.getUuid());
-    if (provider.getCloudCode() == Common.CloudType.azu) {
-      userIntent.instanceType = "Standard_D2as_v4";
+    if (providerType == Common.CloudType.azu) {
+      pi.setInstanceType("Standard_D2as_v4");
     } else {
-      userIntent.instanceType = ApiUtils.UTIL_INST_TYPE;
+      pi.setInstanceType(ApiUtils.UTIL_INST_TYPE);
     }
-    Common.CloudType providerType = Common.CloudType.valueOf(provider.getCode());
-    userIntent.providerType = providerType;
-    userIntent.provider = provider.getUuid().toString();
+    pi.setProviderType(providerType);
     userIntent.universeName = universeName;
     userIntent.useSystemd = true;
     if (providerType == Common.CloudType.onprem) {
@@ -279,7 +288,7 @@ public abstract class UniverseModifyBaseTest extends CommissionerBaseTest {
     gflags.put("foo", "bar");
     userIntent.masterGFlags = gflags;
     userIntent.tserverGFlags = gflags;
-    userIntent.deviceInfo = ApiUtils.getDummyDeviceInfo(1, 100);
+    pi.setDeviceInfo(ApiUtils.getDummyDeviceInfo(1, 100));
     Universe result = createUniverse(universeName, defaultCustomer.getId(), providerType);
     result =
         Universe.saveDetails(
@@ -333,15 +342,16 @@ public abstract class UniverseModifyBaseTest extends CommissionerBaseTest {
     userIntent.numNodes = 3;
     userIntent.replicationFactor = 3;
     userIntent.ybSoftwareVersion = "yb-version";
-    userIntent.accessKeyCode = "default-key";
-    userIntent.instanceType = ApiUtils.UTIL_INST_TYPE;
     userIntent.regionList = new ArrayList<>(primaryCluster.userIntent.regionList);
     userIntent.enableYSQL = true;
-    Common.CloudType providerType = Common.CloudType.valueOf(provider.getCode());
-    userIntent.providerType = providerType;
-    userIntent.provider = provider.getUuid().toString();
     userIntent.universeName = universeName;
     userIntent.useSystemd = true;
+    TestUtils.initUserIntent(
+        userIntent,
+        provider,
+        ApiUtils.UTIL_INST_TYPE,
+        ApiUtils.getDummyDeviceInfo(1, 100),
+        "default-key");
 
     Region region = Region.getByProvider(provider.getUuid()).get(0);
     PlacementInfo pi = new PlacementInfo();
@@ -367,12 +377,12 @@ public abstract class UniverseModifyBaseTest extends CommissionerBaseTest {
     return accessKey;
   }
 
-  public static void mockMasterAndPeerRoles(YBClient client, Collection<String> masters) {
+  public static void mockMasterAndPeerRoles(YBClientApi client, Collection<String> masters) {
     mockMasterAndPeerRoles(client, () -> masters);
   }
 
   public static void mockMasterAndPeerRoles(
-      YBClient client, Supplier<Collection<String>> masterSupplier) {
+      YBClientApi client, Supplier<Collection<String>> masterSupplier) {
     try {
       ListMasterRaftPeersResponse listMastersResponse = mock(ListMasterRaftPeersResponse.class);
       doAnswer(
@@ -411,7 +421,7 @@ public abstract class UniverseModifyBaseTest extends CommissionerBaseTest {
   }
 
   public static void mockGetMasterRegistrationResponse(
-      YBClient client, List<String> addedIps, List<String> removedIps) {
+      YBClientApi client, List<String> addedIps, List<String> removedIps) {
     /* reimplement once correct RPC method is used
     List<GetMasterRegistrationResponse> responses = new ArrayList<>();
     responses.addAll(

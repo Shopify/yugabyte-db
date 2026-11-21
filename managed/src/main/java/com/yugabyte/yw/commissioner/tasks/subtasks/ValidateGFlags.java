@@ -38,7 +38,7 @@ import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.exception.ExceptionUtils;
-import org.yb.client.YBClient;
+import org.yb.client.YBClientApi;
 
 @Slf4j
 public class ValidateGFlags extends UniverseDefinitionTaskBase {
@@ -419,15 +419,12 @@ public class ValidateGFlags extends UniverseDefinitionTaskBase {
                 .collect(Collectors.toList());
 
         if (!csvGflags.isEmpty()) {
+          Map<String, String> redactedGFlags =
+              RedactingService.redactGFlags(
+                  gflags, taskParams().ybSoftwareVersion, gFlagsValidation);
           String csvGflagDetails =
               csvGflags.stream()
-                  .map(
-                      key ->
-                          key
-                              + "='"
-                              + RedactingService.redactSensitiveInfoInString(
-                                  gflags.get(key), taskParams().ybSoftwareVersion, gFlagsValidation)
-                              + "'")
+                  .map(key -> key + "='" + redactedGFlags.get(key) + "'")
                   .collect(Collectors.joining(", "));
 
           log.error(
@@ -460,8 +457,7 @@ public class ValidateGFlags extends UniverseDefinitionTaskBase {
         serverType,
         node.nodeName,
         azUuid,
-        RedactingService.redactSensitiveInfoInString(
-            gflags.toString(), taskParams().ybSoftwareVersion, gFlagsValidation));
+        RedactingService.redactGFlags(gflags, taskParams().ybSoftwareVersion, gFlagsValidation));
 
     return gflags;
   }
@@ -508,7 +504,7 @@ public class ValidateGFlags extends UniverseDefinitionTaskBase {
 
   private Map<String, String> validateGFlagsWithYBClient(
       Map<String, String> gflags, Universe universe, ServerType serverType, NodeDetails node) {
-    try (YBClient client = ybClientService.getUniverseClient(universe)) {
+    try (YBClientApi client = ybClientService.getUniverseClient(universe)) {
       int rpcPort = serverType == ServerType.TSERVER ? node.tserverRpcPort : node.masterRpcPort;
       HostAndPort hp = HostAndPort.fromParts(node.cloudInfo.private_ip, rpcPort);
       log.info(
@@ -575,8 +571,8 @@ public class ValidateGFlags extends UniverseDefinitionTaskBase {
 
     log.debug(
         "About to run command: {} using yb-server binary.",
-        RedactingService.redactSensitiveInfoInString(
-            command.toString(), taskParams().ybSoftwareVersion, gFlagsValidation));
+        RedactingService.redactGFlagCommand(
+            command, taskParams().ybSoftwareVersion, gFlagsValidation));
 
     try {
       // Not using bash since some gflag values may have complicated escaping needed for bash case

@@ -3,6 +3,7 @@
 package com.yugabyte.yw.common.services;
 
 import com.google.inject.Inject;
+import com.yugabyte.yw.common.certmgmt.RpcClientCert;
 import com.yugabyte.yw.common.config.GlobalConfKeys;
 import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.common.services.config.YbClientConfig;
@@ -17,6 +18,7 @@ import org.slf4j.LoggerFactory;
 import org.yb.VersionInfo;
 import org.yb.client.GetStatusResponse;
 import org.yb.client.YBClient;
+import org.yb.client.YBClientApi;
 
 @Slf4j
 @Singleton
@@ -25,47 +27,67 @@ public class LocalYBClientService implements YBClientService {
 
   @Inject private YbClientConfigFactory ybClientConfigFactory;
   @Inject private RuntimeConfGetter confGetter;
+  @Inject private RpcClientCert rpcClientCert;
 
   @Override
-  public synchronized YBClient getClient(String masterHostPorts) {
+  public synchronized YBClientApi getClient(String masterHostPorts) {
     return getClient(masterHostPorts, null);
   }
 
   @Override
-  public synchronized YBClient getClient(String masterHostPorts, String certFile) {
+  public synchronized YBClientApi getClient(String masterHostPorts, String certFile) {
     if (masterHostPorts != null) {
       return getNewClient(masterHostPorts, certFile);
     }
     return null;
   }
 
-  public synchronized YBClient getUniverseClient(Universe universe) {
-    return getClient(universe.getMasterAddresses(), universe.getCertificateNodetoNode());
+  // Not synchronized: loading the client cert may read it from its issuer.
+  public YBClientApi getUniverseClient(Universe universe) {
+    return getUniverseClient(universe, universe.getMasterAddresses());
   }
 
-  private YBClient getNewClient(String masterHPs, String certFile) {
+  @Override
+  public YBClientApi getUniverseClient(Universe universe, String masterHostPorts) {
+    if (masterHostPorts == null) {
+      return null;
+    }
+    return getClientWithConfig(
+        ybClientConfigFactory
+            .create(masterHostPorts, universe.getCertificateNodetoNode())
+            .withClientCertOf(universe));
+  }
+
+  private YBClientApi getNewClient(String masterHPs, String certFile) {
     YbClientConfig config = ybClientConfigFactory.create(masterHPs, certFile);
     return getClientWithConfig(config);
   }
 
   @Override
-  public YBClient getClientWithConfig(YbClientConfig config) {
+  public YBClientApi getClientWithConfig(YbClientConfig config) {
     if (config == null || StringUtils.isBlank(config.getMasterHostPorts())) {
       return null;
     }
-    return new YBClient.YBClientBuilder(config.getMasterHostPorts())
-        .sslCertFile(config.getCertFile())
-        .defaultAdminOperationTimeoutMs(config.getAdminOperationTimeout().toMillis())
-        .defaultOperationTimeoutMs(config.getOperationTimeout().toMillis())
-        .defaultSocketReadTimeoutMs(config.getSocketReadTimeout().toMillis())
-        .dnsDebugThresholdNs(confGetter.getGlobalConf(GlobalConfKeys.ybClientDnsDebugThresholdNs))
-        .dnsWarningThresholdNs(
-            confGetter.getGlobalConf(GlobalConfKeys.ybClientDnsWarningThresholdNs))
-        .build();
+    YBClient.YBClientBuilder builder =
+        new YBClient.YBClientBuilder(config.getMasterHostPorts())
+            .sslCertFile(config.getCertFile())
+            .defaultAdminOperationTimeoutMs(config.getAdminOperationTimeout().toMillis())
+            .defaultOperationTimeoutMs(config.getOperationTimeout().toMillis())
+            .defaultSocketReadTimeoutMs(config.getSocketReadTimeout().toMillis())
+            .dnsDebugThresholdNs(
+                confGetter.getGlobalConf(GlobalConfKeys.ybClientDnsDebugThresholdNs))
+            .dnsWarningThresholdNs(
+                confGetter.getGlobalConf(GlobalConfKeys.ybClientDnsWarningThresholdNs));
+    if (config.getClientCertUniverse() != null) {
+      rpcClientCert
+          .getFiles(config.getClientCertUniverse())
+          .ifPresent(files -> builder.sslClientCertFiles(files.cert(), files.key()));
+    }
+    return builder.build();
   }
 
   @Override
-  public Optional<String> getServerVersion(YBClient client, String nodeIp, int port) {
+  public Optional<String> getServerVersion(YBClientApi client, String nodeIp, int port) {
     GetStatusResponse response;
     try {
       response = client.getStatus(nodeIp, port);
@@ -78,7 +100,7 @@ public class LocalYBClientService implements YBClientService {
   }
 
   @Override
-  public Optional<String> getYsqlMajorVersion(YBClient client, String nodeIp, int port) {
+  public Optional<String> getYsqlMajorVersion(YBClientApi client, String nodeIp, int port) {
     GetStatusResponse response;
     try {
       response = client.getStatus(nodeIp, port);

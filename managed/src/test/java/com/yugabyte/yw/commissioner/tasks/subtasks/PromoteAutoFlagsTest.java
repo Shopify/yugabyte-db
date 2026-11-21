@@ -29,7 +29,7 @@ import org.mockito.junit.MockitoJUnitRunner;
 import org.yb.WireProtocol.AppStatusPB;
 import org.yb.WireProtocol.AppStatusPB.ErrorCode;
 import org.yb.client.PromoteAutoFlagsResponse;
-import org.yb.client.YBClient;
+import org.yb.client.YBClientApi;
 import org.yb.master.MasterClusterOuterClass.PromoteAutoFlagsResponsePB;
 import org.yb.master.MasterTypes.MasterErrorPB;
 import org.yb.master.MasterTypes.MasterErrorPB.Code;
@@ -38,7 +38,7 @@ import org.yb.master.MasterTypes.MasterErrorPB.Code;
 public class PromoteAutoFlagsTest extends CommissionerBaseTest {
 
   private Universe defaultUniverse;
-  private YBClient mockClient;
+  private YBClientApi mockClient;
   private NodeDetails node;
 
   @Before
@@ -53,7 +53,7 @@ public class PromoteAutoFlagsTest extends CommissionerBaseTest {
     details.nodeDetailsSet.add(node);
     defaultUniverse.setUniverseDetails(details);
     defaultUniverse.save();
-    mockClient = mock(YBClient.class);
+    mockClient = mock(YBClientApi.class);
     try {
       // TODO: set non-zero sleep time by mocking parent task.
       factory.globalRuntimeConf().setValue("yb.upgrade.auto_flag_update_sleep_time_ms", "0");
@@ -118,6 +118,50 @@ public class PromoteAutoFlagsTest extends CommissionerBaseTest {
     PlatformServiceException exception =
         assertThrows(PlatformServiceException.class, () -> task.run());
     assertEquals(INTERNAL_SERVER_ERROR, exception.getHttpStatus());
+    task.run();
+  }
+
+  @Test
+  public void testPromoteAutoFlagAlreadyPresentSucceeds() throws Exception {
+    PromoteAutoFlags.Params params = new PromoteAutoFlags.Params();
+    params.setUniverseUUID(defaultUniverse.getUniverseUUID());
+    params.maxClass = AutoFlagUtil.EXTERNAL_AUTO_FLAG_CLASS_NAME;
+    params.ignoreErrors = false;
+    when(mockClient.promoteAutoFlags(anyString(), anyBoolean(), anyBoolean()))
+        .thenReturn(
+            promoteAutoFlagsErrorResponse(
+                ErrorCode.ALREADY_PRESENT, "No new AutoFlags eligible to promote"));
+    PromoteAutoFlags task = AbstractTaskBase.createTask(PromoteAutoFlags.class);
+    task.initialize(params);
+    task.run();
+  }
+
+  @Test
+  public void testPromoteAutoFlagManagementDisabledSucceeds() throws Exception {
+    PromoteAutoFlags.Params params = new PromoteAutoFlags.Params();
+    params.setUniverseUUID(defaultUniverse.getUniverseUUID());
+    params.maxClass = AutoFlagUtil.EXTERNAL_AUTO_FLAG_CLASS_NAME;
+    params.ignoreErrors = false;
+    when(mockClient.promoteAutoFlags(anyString(), anyBoolean(), anyBoolean()))
+        .thenReturn(
+            promoteAutoFlagsErrorResponse(
+                ErrorCode.NOT_SUPPORTED, "AutoFlags management is disabled."));
+    PromoteAutoFlags task = AbstractTaskBase.createTask(PromoteAutoFlags.class);
+    task.initialize(params);
+    task.run();
+  }
+
+  @Test
+  public void testPromoteAutoFlagIgnoreErrorsSwallowsMasterRefusal() throws Exception {
+    PromoteAutoFlags.Params params = new PromoteAutoFlags.Params();
+    params.setUniverseUUID(defaultUniverse.getUniverseUUID());
+    params.maxClass = AutoFlagUtil.EXTERNAL_AUTO_FLAG_CLASS_NAME;
+    params.ignoreErrors = true;
+    when(mockClient.promoteAutoFlags(anyString(), anyBoolean(), anyBoolean()))
+        .thenReturn(
+            promoteAutoFlagsErrorResponse(ErrorCode.ILLEGAL_STATE, TSERVERS_NOT_UPGRADED_MESSAGE));
+    PromoteAutoFlags task = AbstractTaskBase.createTask(PromoteAutoFlags.class);
+    task.initialize(params);
     task.run();
   }
 

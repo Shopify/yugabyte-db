@@ -42,6 +42,7 @@ class PgFlushDebugContext {
       uint64_t tuples_processed, const char* table_name);
   [[nodiscard]] static YbcFlushDebugContext YbcSwitchToDbCatalogVersionMode(PgOid db_oid);
   [[nodiscard]] static YbcFlushDebugContext YbcEndOfTopLevelStmt();
+  [[nodiscard]] static YbcFlushDebugContext YbcParallelWorkers();
 
   [[nodiscard]] static PgFlushDebugContext Make(const YbcFlushDebugContext& ybc_context);
   [[nodiscard]] static PgFlushDebugContext CatalogTablePrefetch();
@@ -49,6 +50,7 @@ class PgFlushDebugContext {
   [[nodiscard]] static PgFlushDebugContext CommitTxn(std::optional<PgOid> ddl_db_oid);
   [[nodiscard]] static PgFlushDebugContext ActivateSubTxn(SubTransactionId id);
   [[nodiscard]] static PgFlushDebugContext ChangeTxnSnapshot(uint64_t read_point);
+  [[nodiscard]] static PgFlushDebugContext SwitchToCatalogSnapshot(uint64_t read_point);
   [[nodiscard]] static PgFlushDebugContext ExportSnapshot(
       PgOid oid, std::optional<uint64_t> read_point);
   [[nodiscard]] static PgFlushDebugContext ImportSnapshot(std::string_view snapshot_id);

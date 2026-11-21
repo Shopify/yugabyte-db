@@ -16,7 +16,6 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMultimap;
 import com.google.common.collect.Multimap;
 import com.google.common.collect.Sets;
-import com.yugabyte.yw.common.AppInit;
 import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.common.backuprestore.BackupUtil;
 import com.yugabyte.yw.common.concurrent.KeyLock;
@@ -53,6 +52,8 @@ import jakarta.persistence.Id;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -187,6 +188,9 @@ public class Backup extends Model {
     @EnumValue("GCS")
     GCS,
 
+    @EnumValue("OCI")
+    OCI,
+
     @EnumValue("FILE")
     FILE;
   }
@@ -194,6 +198,12 @@ public class Backup extends Model {
   public static final Set<BackupState> IN_PROGRESS_STATES =
       Sets.immutableEnumSet(
           BackupState.InProgress, BackupState.QueuedForDeletion, BackupState.DeleteInProgress);
+  // Queued for, or in the middle of, deletion by the garbage collector.
+  public static final List<BackupState> DELETION_STATES =
+      Arrays.asList(
+          BackupState.QueuedForDeletion,
+          BackupState.QueuedForForcedDeletion,
+          BackupState.DeleteInProgress);
   public static final List<BackupState> COMPLETED_STATES =
       Arrays.asList(
           BackupState.Completed, BackupState.Failed, BackupState.Stopped, BackupState.Skipped);
@@ -399,6 +409,7 @@ public class Backup extends Model {
       backup.setHasKMSHistory(
           CollectionUtils.isNotEmpty(
               EncryptionAtRestUtil.getAllUniverseKeys(backup.getUniverseUUID())));
+      params.fipsEnabled = universe.getUniverseDetails().fipsEnabled;
     }
     backup.setState(BackupState.InProgress);
     backup.setCategory(category);
@@ -529,6 +540,11 @@ public class Backup extends Model {
 
   public void updateBackupInfo(BackupTableParams params) {
     this.backupInfo = params;
+    // Keep the column in sync: queries filter and group backups by it. Deleting a backup with
+    // another storage config changes the config in backup_info.
+    if (params.storageConfigUUID != null) {
+      this.storageConfigUUID = params.storageConfigUUID;
+    }
     save();
   }
 
@@ -826,6 +842,10 @@ public class Backup extends Model {
       LOG.debug("Skipping state transition as backup is already in the {} state", this.getState());
     } else if (ALLOWED_TRANSITIONS.containsEntry(this.getState(), newState)) {
       LOG.debug("Backup state transitioned from {} to {}", this.getState(), newState);
+      if (this.getState() == BackupState.FailedToDelete) {
+        // A delete asked for again after the last one gave up starts with every attempt.
+        this.setRetryCount(0);
+      }
       this.setState(newState);
       save();
     } else {
@@ -859,16 +879,54 @@ public class Backup extends Model {
     this.backupInfo.backupSizeInBytes = backupSize;
   }
 
-  public static List<Backup> getInProgressAndCompleted(UUID customerUUID) {
+  /**
+   * Universes that have in-progress or completed backups of the customer, grouped by the storage
+   * config the backups use. Selects only the storage config and universe UUID columns, so it does
+   * not load and deserialize backup_info, which gets expensive for customers with many backups.
+   */
+  public static Map<UUID, Set<UUID>> getInProgressAndCompletedUniversesByStorageConfig(
+      UUID customerUUID) {
+    return getInProgressAndCompletedUniversesByStorageConfig(customerUUID, null);
+  }
+
+  /**
+   * Same as {@link #getInProgressAndCompletedUniversesByStorageConfig(UUID)}, limited to the given
+   * storage configs (all of them when null).
+   */
+  public static Map<UUID, Set<UUID>> getInProgressAndCompletedUniversesByStorageConfig(
+      UUID customerUUID, @Nullable Collection<UUID> storageConfigUUIDs) {
+    Map<UUID, Set<UUID>> result = new HashMap<>();
+    if (storageConfigUUIDs != null && storageConfigUUIDs.isEmpty()) {
+      return result;
+    }
+    ExpressionList<Backup> where =
+        find.query()
+            .setDistinct(true)
+            .select("storageConfigUUID, universeUUID")
+            .where()
+            .eq("customerUUID", customerUUID)
+            .in("state", BackupState.InProgress, BackupState.Completed);
+    if (storageConfigUUIDs != null) {
+      where.in("storageConfigUUID", storageConfigUUIDs);
+    }
+    where
+        .findList()
+        .forEach(
+            backup ->
+                result
+                    .computeIfAbsent(backup.getStorageConfigUUID(), k -> new HashSet<>())
+                    .add(backup.getUniverseUUID()));
+    return result;
+  }
+
+  public static boolean existsInProgressOrCompletedWithStorageConfig(
+      UUID customerUUID, UUID storageConfigUUID) {
     return find.query()
         .where()
-        .eq("customer_uuid", customerUUID)
+        .eq("customerUUID", customerUUID)
+        .eq("storageConfigUUID", storageConfigUUID)
         .in("state", BackupState.InProgress, BackupState.Completed)
-        .or()
-        .eq("state", BackupState.Completed)
-        .eq("state", BackupState.InProgress)
-        .endOr()
-        .findList();
+        .exists();
   }
 
   public static List<Backup> findAllBackupsQueuedForDeletion(UUID customerUUID) {
@@ -938,6 +996,13 @@ public class Backup extends Model {
     return backupList.size() != 0;
   }
 
+  /** Whether any of the customer's backups stored with this config is being deleted. */
+  public static boolean findIfBackupsDeletingWithCustomerConfig(
+      UUID customerUUID, UUID customerConfigUUID) {
+    return findAllBackupWithState(customerUUID, DELETION_STATES).stream()
+        .anyMatch(b -> customerConfigUUID.equals(b.getBackupInfo().storageConfigUUID));
+  }
+
   public static Optional<BackupTableParams> findBackupParamsWithStorageLocation(
       String storageLocation) {
     List<Backup> backupList = find.query().findList();
@@ -972,15 +1037,10 @@ public class Backup extends Model {
   }
 
   public static Set<Universe> getAssociatedUniverses(UUID customerUUID, UUID configUUID) {
-    Set<UUID> universeUUIDs = new HashSet<>();
-    List<Backup> backupList = getInProgressAndCompleted(customerUUID);
-    backupList =
-        backupList.stream()
-            .filter(
-                b ->
-                    b.getBackupInfo().storageConfigUUID.equals(configUUID)
-                        && universeUUIDs.add(b.getBackupInfo().getUniverseUUID()))
-            .collect(Collectors.toList());
+    Set<UUID> universeUUIDs =
+        new HashSet<>(
+            getInProgressAndCompletedUniversesByStorageConfig(customerUUID)
+                .getOrDefault(configUUID, Collections.emptySet()));
 
     List<Schedule> scheduleList =
         Schedule.find
@@ -1151,11 +1211,6 @@ public class Backup extends Model {
   }
 
   public static <T> ExpressionList<T> appendActionTypeClause(ExpressionList<T> query) {
-    if (AppInit.isH2Db()) {
-      // H2 does not support PostgreSQL JSON operators used in production queries.
-      return query;
-    }
-
     String rawSql =
         "t0.backup_uuid in "
             + "(select B.backup_uuid from backup B "

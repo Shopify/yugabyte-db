@@ -32,6 +32,7 @@
 #include "yb/cdc/cdc_service.pb.h"
 #include "yb/client/client_fwd.h"
 
+#include "yb/common/entity_ids_types.h"
 #include "yb/common/pg_types.h"
 #include "yb/common/read_hybrid_time.h"
 #include "yb/common/transaction.h"
@@ -55,8 +56,6 @@
 #include "yb/yql/pggate/pg_doc_metrics.h"
 #include "yb/yql/pggate/pg_gate_fwd.h"
 #include "yb/yql/pggate/pg_tools.h"
-#include "yb/yql/pggate/ybc_pg_typedefs.h"
-#include "yb/yql/pggate/ybc_pggate.h"
 
 namespace yb::pggate {
 
@@ -87,6 +86,11 @@ struct PerformResult {
   std::string ToString() const {
     return YB_STRUCT_TO_STRING(status, catalog_read_time, used_in_txn_limit);
   }
+};
+
+struct RemoteExecData {
+  tserver::PgRemoteExecResponsePB resp;
+  RefCntSlice rows_data;
 };
 
 namespace pg_client::internal {
@@ -126,7 +130,7 @@ class ExchangeFuture {
 template <class Data>
 class ResultFuture {
  public:
-  using Result = typename ResultTypeResolver<Data>::ResultType;
+  using ResultTp = typename ResultTypeResolver<Data>::ResultType;
 
   template <class... Args>
   ResultFuture(Args&&... args) : variant_(std::forward<Args>(args)...) {} // NOLINT
@@ -151,16 +155,14 @@ class ResultFuture {
     return std::visit([](const auto& future) { return future.valid(); }, variant_);
   }
 
-  Result Get() {
+  Result<ResultTp> Get() {
     const auto& result = std::visit([](auto& future) { return future.get(); }, variant_);
-
-    // Check for interrupts are waiting on async RPC.
-    YBCCheckForInterrupts();
+    RETURN_NOT_OK(CheckForPgInterrupts());
     return result;
   }
 
  private:
-  using SimpleFuture = std::future<Result>;
+  using SimpleFuture = std::future<ResultTp>;
   std::variant<SimpleFuture, ExchangeFuture<Data>> variant_;
 };
 
@@ -170,7 +172,13 @@ using TableKeyRanges = boost::container::small_vector<RefCntSlice, 2>;
 
 using PerformResultFuture = pg_client::internal::ResultFuture<pg_client::internal::PerformData>;
 
-using WaitEventWatcher = std::function<PgWaitEventWatcher(ash::WaitStateCode, ash::PggateRPC)>;
+using WaitEventWatcher =
+    std::function<PgWaitEventWatcher(ash::WaitStateCode, ash::PggateRPC, uint32_t)>;
+
+// The deadline pggate applies to a request when no tighter timeout is in force -- in particular to
+// an object lock acquisition when postgres' lock_timeout is disabled. A caller that wants to report
+// the expiry itself must arm a timer that fires before this deadline does.
+MonoDelta DefaultRpcTimeout();
 
 class PgClient {
  public:
@@ -195,7 +203,11 @@ class PgClient {
 
   void SetLockTimeout(int lock_timeout_ms);
 
+  void SetOriginationHt(uint64_t origination_ht);
+
   uint64_t SessionID() const;
+
+  void PublishOldestReadPointSerialNo(uint64_t serial_no);
 
   Result<PgTableDescPtr> OpenTable(
       const PgObjectId& table_id, bool reopen, uint64_t min_ysql_catalog_version,
@@ -239,6 +251,8 @@ class PgClient {
   Result<int> WaitForBackendsCatalogVersion(
       tserver::PgWaitForBackendsCatalogVersionRequestPB* req, CoarseTimePoint deadline);
   Status BackfillIndex(tserver::PgBackfillIndexRequestPB* req, CoarseTimePoint deadline);
+  Status StartTableBackfill(
+      tserver::PgStartTableBackfillRequestPB* req, CoarseTimePoint deadline);
 
   Status GetIndexBackfillProgress(const std::vector<PgObjectId>& index_ids,
                                   uint64_t* num_rows_read_from_table,
@@ -265,15 +279,19 @@ class PgClient {
 
   Result<client::TableSizeInfo> GetTableDiskSize(const PgObjectId& table_oid);
 
+  Result<client::TableSizeInfo> GetTableDiskSizeByYbTableId(const TableId& yb_table_id);
+
   Status InsertSequenceTuple(int64_t db_oid,
                              int64_t seq_oid,
                              uint64_t ysql_catalog_version,
+                             bool using_table_locks_globally,
                              int64_t last_val,
                              bool is_called);
 
   Result<bool> UpdateSequenceTuple(int64_t db_oid,
                                    int64_t seq_oid,
                                    uint64_t ysql_catalog_version,
+                                   bool using_table_locks_globally,
                                    int64_t last_val,
                                    bool is_called,
                                    std::optional<int64_t> expected_last_val,
@@ -282,6 +300,7 @@ class PgClient {
   Result<std::pair<int64_t, int64_t>> FetchSequenceTuple(int64_t db_oid,
                                                          int64_t seq_oid,
                                                          uint64_t ysql_catalog_version,
+                                                         bool using_table_locks_globally,
                                                          uint32_t fetch_count,
                                                          int64_t inc_by,
                                                          int64_t min_value,
@@ -290,7 +309,7 @@ class PgClient {
 
   Result<std::pair<int64_t, bool>> ReadSequenceTuple(
       int64_t db_oid, int64_t seq_oid, std::optional<uint64_t> ysql_catalog_version,
-      std::optional<uint64_t> read_time = std::nullopt);
+      bool using_table_locks_globally, std::optional<uint64_t> read_time = std::nullopt);
 
   Status DeleteSequenceTuple(int64_t db_oid, int64_t seq_oid);
 
@@ -302,6 +321,8 @@ class PgClient {
   bool TryAcquireObjectLockInSharedMemory(
       SubTransactionId subtxn_id, const YbcObjectLockId& lock_id,
       docdb::ObjectLockFastpathLockType lock_type);
+
+  bool TryReleaseAllObjectLocksInSharedMemory();
 
   Status AcquireObjectLock(
       tserver::PgPerformOptionsPB* options, const YbcObjectLockId& lock_id, YbcObjectLockMode mode,
@@ -396,7 +417,7 @@ class PgClient {
 
   Result<tserver::PgYCQLStatementStatsResponsePB> YCQLStatementStats();
 
-  Result<tserver::PgRemoteExecResponsePB> RemoteExec(
+  Result<RemoteExecData> RemoteExec(
       std::string_view query, std::string_view database_name, std::string_view tserver_uuid,
       const std::vector<std::optional<std::string>>& params);
 

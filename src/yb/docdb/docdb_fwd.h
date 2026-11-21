@@ -13,6 +13,8 @@
 
 #pragma once
 
+#include <unordered_map>
+
 #include "yb/common/common_fwd.h"
 
 #include "yb/docdb/docdb.fwd.h"
@@ -26,6 +28,12 @@
 #include "yb/util/math_util.h"
 #include "yb/util/ref_cnt_buffer.h"
 #include "yb/util/strongly_typed_bool.h"
+
+namespace yb {
+
+class Uuid;
+
+} // namespace yb
 
 namespace yb::docdb {
 
@@ -54,6 +62,8 @@ class RedisWriteOperation;
 class ScanChoices;
 class SchemaPackingProvider;
 class SharedLockManager;
+class SstStatsAggregator;
+class SstStatsMetrics;
 class StorageSet;
 class TableInfoProvider;
 class TransactionStatusCache;
@@ -83,8 +93,15 @@ using DocReadContextPtr = std::shared_ptr<const DocReadContext>;
 using DocRowwiseIteratorPtr = std::unique_ptr<DocRowwiseIterator>;
 using IntentAwareIteratorPtr = std::unique_ptr<IntentAwareIterator>;
 using IntentAwareIteratorBoundsScopePtr = std::unique_ptr<IntentAwareIteratorBoundsScope>;
-using IntentAwareIteratorWithBounds =
-    std::tuple<IntentAwareIteratorPtr, IntentAwareIteratorBoundsScopePtr>;
+// The bounds scope restores the iterator's previous bounds from its destructor, so it must be torn
+// down while the iterator is still alive. This cannot be a std::tuple: the order in which a tuple
+// destroys its elements is unspecified, and libstdc++ and libc++ pick opposite directions, so a
+// tuple is only correct for one of them. Class members are destroyed in reverse declaration order
+// on every implementation, so `bounds` must stay declared after `iter`.
+struct IntentAwareIteratorWithBounds {
+  IntentAwareIteratorPtr iter;
+  IntentAwareIteratorBoundsScopePtr bounds;
+};
 
 template <typename LockManager>
 using LockBatchEntries = std::vector<LockBatchEntry<LockManager>>;
@@ -97,6 +114,8 @@ using LockState = uint64_t;
 using ScanChoicesPtr = std::unique_ptr<ScanChoices>;
 
 using ConsensusFrontierPtr = clone_ptr<ConsensusFrontier>;
+// Schema version by cotable id, nil for the primary table.
+using CotableSchemaVersionMap = std::unordered_map<Uuid, SchemaVersion>;
 using IndexRequests = std::vector<std::pair<const qlexpr::IndexInfo*, QLWriteRequestMsg*>>;
 using DocVectorIndexPtr = std::shared_ptr<DocVectorIndex>;
 using DocVectorIndexes = std::vector<DocVectorIndexPtr>;
@@ -110,6 +129,14 @@ YB_STRONGLY_TYPED_BOOL(IncludeIntents);
 YB_STRONGLY_TYPED_BOOL(SkipFlush);
 YB_STRONGLY_TYPED_BOOL(SkipSeek);
 YB_STRONGLY_TYPED_BOOL(UpdateFilterKey);
+YB_STRONGLY_TYPED_BOOL(XClusterTargetApplied);
+
+// Flags that alter IntentAwareIterator behavior relative to the defaults. kNoFastNext keeps all
+// reads on the iterator's creation-time snapshot: fast next skips sequence number filtering, so it
+// can observe records written to the regular DB after the iterator was created.
+YB_DEFINE_ENUM(IntentAwareIteratorFlag,
+               (kFastBackwardScan)(kAvoidUselessNextInsteadOfSeek)(kNoFastNext));
+using IntentAwareIteratorFlags = EnumBitSet<IntentAwareIteratorFlag>;
 
 using dockv::IncludeWriteTime;
 

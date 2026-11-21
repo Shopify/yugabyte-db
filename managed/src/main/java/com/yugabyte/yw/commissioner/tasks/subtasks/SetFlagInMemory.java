@@ -24,8 +24,8 @@ import java.util.function.Supplier;
 import javax.annotation.Nullable;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
-import net.logstash.logback.encoder.org.apache.commons.lang3.StringUtils;
-import org.yb.client.YBClient;
+import org.apache.commons.lang3.StringUtils;
+import org.yb.client.YBClientApi;
 
 @Slf4j
 public class SetFlagInMemory extends ServerSubTaskBase {
@@ -90,7 +90,7 @@ public class SetFlagInMemory extends ServerSubTaskBase {
     } else {
       gflags = new HashMap<>(taskParams().gflags);
     }
-    try (YBClient client = getClient()) {
+    try (YBClientApi client = getClient()) {
       Universe universe = Universe.getOrBadRequest(taskParams().getUniverseUUID());
 
       if (!taskParams().updateMasterAddrs) {
@@ -111,6 +111,17 @@ public class SetFlagInMemory extends ServerSubTaskBase {
         String finalYsqlPgConfCsv =
             GFlagsUtil.mergeCSVs(userProvidedYsqlPgConfCsv, queryAndAuditLogYsqlPgConfCsv, true);
         if (StringUtils.isNotBlank(finalYsqlPgConfCsv)) {
+          // Keep the in-memory value matching the server's gflags file, which has the new install
+          // gflags only where they are applied. Merge default values for CSV gflags with user-set
+          // flag values.
+          if (GFlagsUtil.areNewInstallGFlagsApplied(universe)) {
+            String newInstallYsqlPgConfCsv =
+                universe
+                    .getNewInstallGFlags(taskParams().serverType)
+                    .getOrDefault(GFlagsUtil.YSQL_PG_CONF_CSV, "");
+            finalYsqlPgConfCsv =
+                GFlagsUtil.mergeCSVs(finalYsqlPgConfCsv, newInstallYsqlPgConfCsv, true);
+          }
           gflags.put(GFlagsUtil.YSQL_PG_CONF_CSV, finalYsqlPgConfCsv);
         }
       }
@@ -154,9 +165,9 @@ public class SetFlagInMemory extends ServerSubTaskBase {
     }
   }
 
-  private void setFlag(YBClient client, String gflag, String value, HostAndPort hp)
+  private void setFlag(YBClientApi client, String gflag, String value, HostAndPort hp)
       throws Exception {
-    log.debug("Setting gflag {} to {} on node {} via non-restart rpc", gflag, value, hp);
+    log.debug("Setting gflag {} on node {} via non-restart rpc", gflag, hp);
     boolean setSuccess = client.setFlag(hp, gflag, value, taskParams().force);
     if (!setSuccess) {
       throw new RuntimeException(

@@ -320,6 +320,10 @@ class AbstractInstancesMethod(AbstractMethod):
             time.sleep(1)
             host_lookup_count += 1
 
+        if not host_info:
+            raise YBOpsRecoverableError(
+                "Timed out waiting for instance: '{}' (host not found)".format(
+                    args.search_pattern))
         host_port_user = get_host_port_user(self.extra_vars)
         raise YBOpsRecoverableError("Timed out waiting for instance: '{}'. {}@{}:{} using {}"
                                     .format(args.search_pattern, host_port_user["user"],
@@ -406,6 +410,8 @@ class ReplaceRootVolumeMethod(AbstractInstancesMethod):
         self.parser.add_argument("--replacement_disk",
                                  required=True,
                                  help="The new boot disk to attach to the instance")
+        self.parser.add_argument("--capacity_reservation", default=None,
+                                 help="Capacity reservation to use when starting the instance.")
 
     def _is_disk_mounted(self, host_info, volume_id, args):
         disk = self.cloud.get_disk(host_info, volume_id, args)
@@ -517,7 +523,8 @@ class ReplaceRootVolumeMethod(AbstractInstancesMethod):
             if args.boot_script is not None:
                 self.cloud.update_user_data(args)
             server_ports = self.get_server_ports_to_check(args)
-            self.cloud.start_instance(host_info, server_ports)
+            self.cloud.start_instance(
+                host_info, server_ports, getattr(args, "capacity_reservation", None))
 
     def callback(self, args):
         host_info = self.cloud.get_host_info(args)
@@ -954,7 +961,7 @@ class ChangeInstanceTypeMethod(AbstractInstancesMethod):
                     args.search_pattern, args.instance_type)
         except Exception as e:
             raise YBOpsRuntimeError('error executing \"instance.modify_attribute\": {}'
-                                    .format(repr(e)))
+                                    .format(self.cloud.format_sdk_error(e) or repr(e)))
         finally:
             if args.boot_script is not None:
                 self.cloud.update_user_data(args)
@@ -997,7 +1004,7 @@ class ConfigureInstancesMethod(AbstractInstancesMethod):
     VALID_PROCESS_TYPES = ['master', 'tserver']
     CERT_ROTATE_ACTIONS = ['APPEND_NEW_ROOT_CERT', 'ROTATE_CERTS',
                            'REMOVE_OLD_ROOT_CERT', 'UPDATE_CERT_DIRS']
-    SKIP_CERT_VALIDATION_OPTIONS = ['ALL', 'HOSTNAME']
+    SKIP_CERT_VALIDATION_OPTIONS = ['ALL', 'HOSTNAME', 'REQUIRE_SAN']
     # Child files and directories for master.
     MASTER_STATE_DIRS = ['wals', 'data', 'consensus-meta', 'instance',
                          'auto_flags_config', 'tablet-meta']
@@ -1356,25 +1363,8 @@ class ConfigureInstancesMethod(AbstractInstancesMethod):
                 rotate_certs,
                 args.skip_cert_validation)
 
-        # Copying client certs
-        if args.client_cert_path is not None:
-            logging.info("Client Certificate Exists: {}.".format(args.client_cert_path))
-            if args.root_cert_path_client_to_server is not None:
-                self.cloud.copy_client_certs(
-                    self.extra_vars,
-                    args.root_cert_path_client_to_server,
-                    args.client_cert_path,
-                    args.client_key_path,
-                    args.certs_location_client_to_server
-                )
-            else:
-                self.cloud.copy_client_certs(
-                    self.extra_vars,
-                    args.root_cert_path,
-                    args.client_cert_path,
-                    args.client_key_path,
-                    args.certs_location
-                )
+        # Client certs are not deployed to ~/.yugabytedb on DB nodes. On ROTATE_CERTS,
+        # cleanup_client_certs above removes leftovers if present.
 
         if args.local_gflag_files_path is not None and args.remote_gflag_files_path is not None:
             # Copy all the files from local gflags file path to remote

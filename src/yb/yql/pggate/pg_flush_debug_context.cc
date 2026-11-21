@@ -48,7 +48,8 @@ YB_DEFINE_TYPED_ENUM(Reason, uint8_t,
   (kUnbatchableSqlStmtInPlFunc)
   (kCopyBatch)
   (kSwitchToDbCatalogVersionMode)
-  (kEndOfTopLevelStmt));
+  (kEndOfTopLevelStmt)
+  (kParallelWorkers));
 
 struct YbcContextArgs {
   uint64_t uintarg = 0;
@@ -112,6 +113,10 @@ YbcFlushDebugContext PgFlushDebugContext::YbcEndOfTopLevelStmt() {
   return MakeYbc(Reason::kEndOfTopLevelStmt);
 }
 
+YbcFlushDebugContext PgFlushDebugContext::YbcParallelWorkers() {
+  return MakeYbc(Reason::kParallelWorkers);
+}
+
 PgFlushDebugContext PgFlushDebugContext::Make(const YbcFlushDebugContext& ctx) {
   switch (static_cast<Reason>(ctx.reason)) {
     case Reason::kBeginSubTxn:
@@ -145,6 +150,8 @@ PgFlushDebugContext PgFlushDebugContext::Make(const YbcFlushDebugContext& ctx) {
           ctx.oidarg};
     case Reason::kEndOfTopLevelStmt:
       return {"at the end of top-level statement"};
+    case Reason::kParallelWorkers:
+      return {"before launching parallel workers"};
   }
   DCHECK(false);
   return {"for unknown reason"};
@@ -178,6 +185,10 @@ PgFlushDebugContext PgFlushDebugContext::ActivateSubTxn(SubTransactionId id) {
 
 PgFlushDebugContext PgFlushDebugContext::ChangeTxnSnapshot(uint64_t read_point) {
   return {"before restoring transaction snapshot corresponding to read point $0", read_point};
+}
+
+PgFlushDebugContext PgFlushDebugContext::SwitchToCatalogSnapshot(uint64_t read_point) {
+  return {"before switching to catalog snapshot corresponding to read point $0", read_point};
 }
 
 PgFlushDebugContext PgFlushDebugContext::ExportSnapshot(

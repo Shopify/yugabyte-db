@@ -17,7 +17,7 @@ import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.CommonUtils;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
-import org.yb.client.YBClient;
+import org.yb.client.YBClientApi;
 
 @Slf4j
 public class DeleteTableFromUniverse extends AbstractTaskBase {
@@ -49,8 +49,7 @@ public class DeleteTableFromUniverse extends AbstractTaskBase {
   public void run() {
     Params params = taskParams();
     Universe universe = Universe.getOrBadRequest(params.getUniverseUUID());
-    String certificate = universe.getCertificateNodetoNode();
-    try (YBClient client = ybService.getClient(params.masterAddresses, certificate)) {
+    try (YBClientApi client = ybService.getUniverseClient(universe, params.masterAddresses)) {
       client.deleteTable(params.keyspace, params.tableName);
       log.info("Dropped table {}", CommonUtils.logTableName(params.getFullName()));
     } catch (Exception e) {

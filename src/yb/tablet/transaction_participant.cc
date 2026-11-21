@@ -43,13 +43,12 @@
 
 #include "yb/server/clock.h"
 
-#include "yb/tablet/tablet.h"
 #include "yb/tablet/cleanup_aborts_task.h"
 #include "yb/tablet/cleanup_intents_task.h"
 #include "yb/tablet/operations/update_txn_operation.h"
-#include "yb/tablet/remove_intents_task.h"
 #include "yb/tablet/running_transaction.h"
 #include "yb/tablet/running_transaction_context.h"
+#include "yb/tablet/tablet.h"
 #include "yb/tablet/transaction_loader.h"
 #include "yb/tablet/transaction_participant_context.h"
 #include "yb/tablet/transaction_status_resolver.h"
@@ -61,7 +60,6 @@
 #include "yb/util/async_util.h"
 #include "yb/util/callsite_profiling.h"
 #include "yb/util/countdown_latch.h"
-#include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
 #include "yb/util/lru_cache.h"
@@ -137,6 +135,7 @@ DECLARE_uint64(transaction_heartbeat_usec);
 DECLARE_int32(clear_deadlocked_txns_info_older_than_heartbeats);
 
 DECLARE_bool(use_bootstrap_intent_ht_filter);
+DECLARE_bool(consistent_restore);
 
 METRIC_DEFINE_simple_counter(
     tablet, transaction_not_found, "Total number of missing transactions during load",
@@ -146,7 +145,9 @@ METRIC_DEFINE_simple_gauge_uint64(
     yb::MetricUnit::kTransactions);
 METRIC_DEFINE_simple_gauge_uint64(
     tablet, aborted_transactions_pending_cleanup,
-    "Total number of aborted transactions running in participant",
+    "Number of transactions held in memory whose last known status is ABORTED; includes "
+    "transactions the coordinator has forgotten, which it reports as ABORTED and which may "
+    "actually have committed",
     yb::MetricUnit::kTransactions);
 METRIC_DEFINE_simple_gauge_uint64(
     tablet, wal_replayable_applied_transactions,
@@ -211,8 +212,7 @@ DEFINE_test_flag(uint64, wait_inactive_transaction_cleanup_sleep_ms, 0,
                  "The amount of time the thread sleeps while waiting for the transaction to be "
                  "cleaned up");
 
-namespace yb {
-namespace tablet {
+namespace yb::tablet {
 
 namespace {
 
@@ -230,6 +230,11 @@ ash::WaitStateInfoPtr InitMinRunningHybridTimeWaitState(TabletIdView tablet_id) 
     bg_wait_state->UpdateTabletId(tablet_id);
   }
   return bg_wait_state;
+}
+
+bool MustWaitForPendingApply(
+    const RunningTransaction& txn, HybridTime resolve_at, WaitForApply wait_for_apply) {
+  return wait_for_apply && txn.ProcessingApply() && txn.local_commit_time() <= resolve_at;
 }
 
 } // namespace
@@ -268,8 +273,8 @@ class TransactionParticipant::Impl
             CreateMetrics::kFalse)),
         recently_applied_(typename RecentlyAppliedTransactions::allocator_type(mem_tracker_)),
         loader_(this, entity),
-        poller_(log_prefix_, std::bind(&Impl::Poll, this)),
-        wait_queue_poller_(log_prefix_, std::bind(&Impl::PollWaitQueue, this)) {
+        poller_(log_prefix_, [this] { Poll(); }),
+        wait_queue_poller_(log_prefix_, [this] { PollWaitQueue(); }) {
     LOG_WITH_PREFIX(INFO) << "Create";
     metric_transactions_running_ = METRIC_transactions_running.Instantiate(entity, 0);
     metric_transaction_not_found_ = METRIC_transaction_not_found.Instantiate(entity);
@@ -292,7 +297,7 @@ class TransactionParticipant::Impl
         METRIC_current_fast_mode_rr_rc_transactions.Instantiate(entity, 0);
   }
 
-  ~Impl() {
+  ~Impl() override {
     if (StartShutdown()) {
       CompleteShutdown();
     } else {
@@ -434,6 +439,12 @@ class TransactionParticipant::Impl
       RETURN_NOT_OK(GetTransactionDeadlockStatusUnlocked(metadata.transaction_id));
       return CreateAbortedStatus("Transaction was recently aborted: $0", metadata.transaction_id);
     }
+    // Do not (re)create a transaction that started at or before a restore boundary.
+    if (metadata.start_time <= ignore_all_transactions_started_before_) {
+      return CreateAbortedStatus(
+          "Transaction $0 started at $1, which is at or before the restore boundary $2",
+          metadata.transaction_id, metadata.start_time, ignore_all_transactions_started_before_);
+    }
     VLOG_WITH_PREFIX(4) << "Create new transaction: " << metadata.transaction_id;
 
     VLOG_WITH_PREFIX(3) << "Adding a new transaction txn_id: " << metadata.transaction_id
@@ -531,6 +542,11 @@ class TransactionParticipant::Impl
 
   template <class PB>
   Result<TransactionMetadata> PrepareMetadata(const PB& pb) {
+    // If this is a historical read, we don't need to check the transaction status.
+    if (pb.is_read_only_historical_committed_txn()) {
+      return TransactionMetadata::FromPB(pb);
+    }
+
     if (pb.has_isolation()) {
       auto metadata = VERIFY_RESULT(TransactionMetadata::FromPB(pb));
       std::unique_lock<std::mutex> lock(mutex_);
@@ -989,6 +1005,7 @@ class TransactionParticipant::Impl
     }
 
     bool was_previously_committed = false;
+    RunningTransactionPtr applying_txn;
 
     {
       // It is our last chance to load transaction metadata, if missing.
@@ -1020,8 +1037,13 @@ class TransactionParticipant::Impl
         UpdateHistoricalMaxOpId(&historical_max_op_id, data.op_id);
         VLOG_WITH_PREFIX(3) << "Committed a transaction with txn_id: " << data.transaction_id
                             << " with commit_time: " << data.commit_ht.ToUint64();
-        CHECK(transactions_.modify(lock_and_iterator.iterator, [&data](auto& txn) {
+        CHECK(transactions_.modify(lock_and_iterator.iterator, [&data, &applying_txn](auto& txn) {
           txn->SetLocalCommitData(data.commit_ht, data.aborted);
+          // Keeps ResolveIntents waiting until intents are written to regular DB.
+          if (data.apply_to_storages.Any()) {
+            txn->SetProcessingApply(true);
+            applying_txn = txn;
+          }
         }));
         LOG_IF_WITH_PREFIX(DFATAL, data.log_ht < last_safe_time_)
             << "Apply transaction before last safe time " << data.transaction_id << ": "
@@ -1046,7 +1068,7 @@ class TransactionParticipant::Impl
         VLOG_WITH_PREFIX(4) << "TXN: " << data.transaction_id << ": apply state: "
                             << apply_state.ToString();
 
-        RETURN_NOT_OK(UpdateAppliedTransaction(data, apply_state, &operation));
+        RETURN_NOT_OK(UpdateAppliedTransaction(data, apply_state, applying_txn.get(), &operation));
       } else if (!data.sealed) {
         return ProcessCleanup(data, CleanupType::kImmediate);
       }
@@ -1059,6 +1081,7 @@ class TransactionParticipant::Impl
   Status UpdateAppliedTransaction(
        const TransactionApplyData& data,
        const docdb::ApplyTransactionState& apply_state,
+       RunningTransaction* applying_txn,
        ScopedRWOperation* operation) NO_THREAD_SAFETY_ANALYSIS {
     MinRunningNotifier min_running_notifier(&applier_);
     // We are not trying to cleanup intents here because we don't know whether this transaction
@@ -1068,6 +1091,7 @@ class TransactionParticipant::Impl
     if (lock_and_iterator.found()) {
       lock_and_iterator.transaction().SetApplyOpId(data.op_id);
       if (!apply_state.active()) {
+        lock_and_iterator.transaction().SetProcessingApply(false);
         RemoveUnlocked(
             lock_and_iterator.iterator, RemoveReason::kApplied, &min_running_notifier);
       } else if (started_) {
@@ -1084,6 +1108,9 @@ class TransactionParticipant::Impl
           .apply_state = apply_state,
         });
       }
+    } else if (applying_txn) {
+      // E.g. ignored after restore, so its apply does not continue.
+      applying_txn->SetProcessingApply(false);
     }
     return Status::OK();
   }
@@ -1126,7 +1153,7 @@ class TransactionParticipant::Impl
     if (handle != rpcs_.InvalidHandle()) {
       *handle = UpdateTransaction(
           TransactionRpcDeadline(),
-          nullptr /* remote_tablet */,
+          /*tablet=*/nullptr,
           client,
           &req,
           GuardedByWeak(weak_from_this(), [this, handle](
@@ -1333,7 +1360,8 @@ class TransactionParticipant::Impl
     CheckMinRunningHybridTimeSatisfiedUnlocked(&min_running_notifier);
   }
 
-  Status ResolveIntents(HybridTime resolve_at, CoarseTimePoint deadline) {
+  Status ResolveIntents(
+      HybridTime resolve_at, CoarseTimePoint deadline, WaitForApply wait_for_apply) {
     RETURN_NOT_OK(WaitUntil(participant_context_.clock_ptr().get(), resolve_at, deadline));
 
     if (FLAGS_max_transactions_in_status_request == 0) {
@@ -1348,6 +1376,10 @@ class TransactionParticipant::Impl
     // committed/applied, aborted or we realize that transaction was not committed at
     // resolve_at.
     for (;;) {
+      // Committed transactions are no longer applied once shutdown starts, so waiting for them
+      // below would block until the deadline and stall shutdown of the calling RPC handler thread.
+      RETURN_NOT_OK(CheckClosing());
+
       TransactionStatusResolver resolver(
           &participant_context_, &rpcs_, FLAGS_max_transactions_in_status_request,
           [this, resolve_at, &recheck_ids, &committed_ids](
@@ -1401,19 +1433,27 @@ class TransactionParticipant::Impl
           for (const auto& transaction : transactions_) {
             if (!transaction->local_commit_time().is_valid()) {
               resolver.Add(transaction->metadata().status_tablet, transaction->id());
+            } else if (MustWaitForPendingApply(*transaction, resolve_at, wait_for_apply)) {
+              committed_ids.push_back(transaction->id());
             }
           }
         } else {
           for (const auto& id : recheck_ids) {
             auto it = transactions_.find(id);
-            if (it == transactions_.end() || (**it).local_commit_time().is_valid()) {
+            if (it == transactions_.end()) {
               continue;
             }
-            resolver.Add((**it).metadata().status_tablet, id);
+            if (!(**it).local_commit_time().is_valid()) {
+              resolver.Add((**it).metadata().status_tablet, id);
+            } else if (MustWaitForPendingApply(**it, resolve_at, wait_for_apply)) {
+              committed_ids.push_back(id);
+            }
           }
-          auto filter = [this](const TransactionId& id) {
+          auto filter = [this, resolve_at, wait_for_apply](const TransactionId& id) {
             auto it = transactions_.find(id);
-            return it == transactions_.end() || (**it).local_commit_time().is_valid();
+            return it == transactions_.end() ||
+                   ((**it).local_commit_time().is_valid() &&
+                    !MustWaitForPendingApply(**it, resolve_at, wait_for_apply));
           };
           committed_ids.erase(std::remove_if(committed_ids.begin(), committed_ids.end(), filter),
                               committed_ids.end());
@@ -1458,6 +1498,11 @@ class TransactionParticipant::Impl
     VLOG_WITH_PREFIX(4) << "Transactions: " << AsString(transactions_, txn_to_id)
                         << ", requests: " << AsString(running_requests_);
     return transactions_.size();
+  }
+
+  bool AllTransactionsLoaded() const {
+    auto completed = loader_.Completed();
+    return completed.ok() && *completed;
   }
 
   void SetMinReplayTxnFirstWriteTimeUpdateCallback(std::function<void(HybridTime)> callback) {
@@ -1670,7 +1715,7 @@ class TransactionParticipant::Impl
     RETURN_NOT_OK(loader_.WaitAllLoaded());
     std::lock_guard lock(mutex_);
     return DoProcessRecentlyAppliedTransactions(
-        retryable_requests_flushed_op_id, false /* persist */);
+        retryable_requests_flushed_op_id, /*persist=*/false);
   }
 
   void SetRetryableRequestsFlushedOpId(const OpId& flushed_op_id) EXCLUDES(mutex_) {
@@ -1681,7 +1726,7 @@ class TransactionParticipant::Impl
   Status ProcessRecentlyAppliedTransactions() EXCLUDES(mutex_) {
     std::lock_guard lock(mutex_);
     return ResultToStatus(DoProcessRecentlyAppliedTransactions(
-        retryable_requests_flushed_op_id_, true /* persist */));
+        retryable_requests_flushed_op_id_, /*persist=*/true));
   }
 
   std::weak_ptr<void> RetainWeak() override {
@@ -1813,7 +1858,7 @@ class TransactionParticipant::Impl
   class FirstWriteTimeTag;
   class ApplyOpIdTag;
 
-  typedef boost::multi_index_container<RunningTransactionPtr,
+  using Transactions = boost::multi_index_container<RunningTransactionPtr,
       boost::multi_index::indexed_by <
           boost::multi_index::hashed_unique <
               boost::multi_index::const_mem_fun <
@@ -1830,7 +1875,7 @@ class TransactionParticipant::Impl
                   RunningTransaction, HybridTime, &RunningTransaction::abort_check_ht>
           >
       >
-  > Transactions;
+  >;
 
   struct AppliedTransactionState {
     OpId apply_op_id;
@@ -2178,13 +2223,14 @@ class TransactionParticipant::Impl
       UniqueLock<std::mutex> lock(mutex_);
       auto it = transactions_.find(id);
       if (it != transactions_.end()) {
-        if ((**it).start_ht() <= ignore_all_transactions_started_before_) {
+        if (FLAGS_consistent_restore &&
+            (**it).start_ht() <= ignore_all_transactions_started_before_) {
           YB_LOG_WITH_PREFIX_EVERY_N_SECS(INFO, 1)
               << "Ignore transaction for '" << reason << "' because of limit: "
               << ignore_all_transactions_started_before_ << ", txn: " << AsString(**it);
           return LockAndFindResult{};
         }
-        return LockAndFindResult{std::move(GetLockForCondition(lock)), it};
+        return LockAndFindResult{.lock = std::move(GetLockForCondition(lock)), .iterator = it};
       }
       recently_removed = WasTransactionRecentlyRemoved(id);
       deadlock_status = GetTransactionDeadlockStatusUnlocked(id);
@@ -2673,7 +2719,8 @@ class TransactionParticipant::Impl
         << "Adding recently applied transaction: "
         << "first_write_ht=" << first_write_ht << " apply_op_id=" << apply_op_id
         << " (cleaned " << cleaned << ")";
-    recently_applied_.insert(AppliedTransactionState{apply_op_id, first_write_ht});
+    recently_applied_.insert(
+        AppliedTransactionState{.apply_op_id = apply_op_id, .first_write_ht = first_write_ht});
     metric_wal_replayable_applied_transactions_->IncrementBy(1 - static_cast<int64_t>(cleaned));
     UpdateMinReplayTxnFirstWriteTimeIfNeeded();
     TEST_SYNC_POINT_CALLBACK(
@@ -2790,7 +2837,7 @@ class TransactionParticipant::Impl
       } else {
         num_active_rr_rc += inactive ? 0 : 1;
       }
-      LOG(INFO) << "transaction: " << metadata.ToString() << ". inactive:" << inactive;
+      VLOG(1) << "transaction: " << metadata.ToString() << ". inactive:" << inactive;
     }
     CHECK(num_active_rr_rc == 0 || num_active_si == 0)
         << "both Serialiable and RR/RC have active fast mode transactions."
@@ -2823,7 +2870,7 @@ class TransactionParticipant::Impl
   }
 
   Result<bool> TEST_IsTransactionInactive(const TransactionMetadata& metadata) {
-    LOG(INFO) << "Checking transaction: " << metadata;
+    VLOG(1) << "Checking transaction: " << metadata;
     auto it = transactions_.find(metadata.transaction_id);
     if (it != transactions_.end()) {
       auto& txn = **it;
@@ -3182,12 +3229,17 @@ void TransactionParticipant::WaitMinRunningHybridTime(HybridTime ht) {
   impl_->WaitMinRunningHybridTime(ht);
 }
 
-Status TransactionParticipant::ResolveIntents(HybridTime resolve_at, CoarseTimePoint deadline) {
-  return impl_->ResolveIntents(resolve_at, deadline);
+Status TransactionParticipant::ResolveIntents(
+    HybridTime resolve_at, CoarseTimePoint deadline, WaitForApply wait_for_apply) {
+  return impl_->ResolveIntents(resolve_at, deadline, wait_for_apply);
 }
 
 size_t TransactionParticipant::GetNumRunningTransactions() const {
   return impl_->GetNumRunningTransactions();
+}
+
+bool TransactionParticipant::AllTransactionsLoaded() const {
+  return impl_->AllTransactionsLoaded();
 }
 
 OneWayBitmap TransactionParticipant::TEST_TransactionReplicatedBatches(
@@ -3345,5 +3397,4 @@ void FastModeTransactionScope::Reset() {
   participant_ = nullptr;
 }
 
-}  // namespace tablet
-}  // namespace yb
+} // namespace yb::tablet

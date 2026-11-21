@@ -1,34 +1,33 @@
 ---
-title: How to manage clusters
-headerTitle: Manage clusters
+title: How to manage distributed clusters in YugabyteDB Aeon
+headerTitle: Manage distributed clusters
 linkTitle: Manage clusters
-description: Get an overview of how to scale your database clusters, configure backups and maintenance windows, and pause or delete clusters in YugabyteDB Aeon.
+description: Managing distributed clusters in YugabyteDB, and including pausing or deleting clusters.
 headcontent: Scale clusters, configure read replicas, backups, and maintenance, and pause clusters
 menu:
   stable_yugabyte-cloud:
-    parent: yugabytedb-managed
+    parent: distributed-postgres
     identifier: cloud-clusters
-    weight: 100
+    weight: 50
 type: indexpage
 showRightNav: true
 ---
 
-YugabyteDB Aeon provides the following tools to manage clusters:
+YugabyteDB Aeon provides the following tools to manage distributed clusters:
 
 | Feature | Description |
 | :--- | :--- |
 | [Scaling](configure-clusters/) | To ensure the cluster configuration matches its performance requirements, scale the cluster vertically or horizontally as your requirements change. |
+| [Autoscaling](autoscaling/) | Add or remove nodes automatically as CPU and connection load change, between the minimum and maximum size you set. |
 | [Read replicas](managed-read-replica/) | Add read replicas to lower read latencies in regions that are distant from your primary cluster. |
+| [Resource Governance](resource-governance/) | Manage CPU use between databases during contention, while allowing databases to use available capacity when the cluster is underused. |
 | [Backups](backup-clusters/) | Configure a regular backup schedule, run manual backups, restore from backups, and set up remote backup replication. |
-| [Point-in-time recovery](aeon-pitr/) | Branch a database (clone) at a point in time for recovery or testing. |
+| [Clone to a point in time](aeon-pitr/) | Branch a database (clone) at a point in time for recovery or testing. |
 | [Maintenance windows](cloud-maintenance/) | Yugabyte only performs cluster maintenance, including database upgrades, during a weekly maintenance window that you configure. |
 | [Database upgrade](database-upgrade/) | Upgrade the YugabyteDB software on your cluster. |
 | [PostgreSQL&nbsp;extensions](add-extensions/) | Extend the functionality of your cluster using PostgreSQL extensions. |
 | [Change Data Capture](aeon-cdc/) | Capture and stream changes made to data in the database to external processes, applications, or other databases. |
 | [Disaster recovery](disaster-recovery/) | Fail over to a replica cluster in case of unplanned outages. |
-
-<!--| [Resource governance](resource-governance/) | Manage CPU use between databases during contention, while allowing databases to use available capacity when the cluster is underused. |
--->
 
 ### Pause, resume, and delete clusters
 
@@ -75,11 +74,11 @@ Keep in mind the following:
 
 ### Enhanced Postgres Compatibility
 
-If your cluster database version is v2024.1.0 or later, you can enable early access features for PostgreSQL compatibility on the cluster **Settings>Infrastructure** tab. For more information, refer to [Enhanced PostgreSQL Compatibility Mode](../../reference/configuration/postgresql-compatibility/).
+You can enable early access features for PostgreSQL compatibility on the cluster **Settings>Infrastructure** tab. For more information, refer to [Enhanced PostgreSQL Compatibility Mode](../../reference/configuration/postgresql-compatibility/).
 
 ### Connection Pooling
 
-{{<tags/feature/ea>}}If your cluster database version is v2024.2.3 or later, you can enable built-in Connection Pooling on the cluster **Settings>Connection Pooling** tab. For more information and limitations, refer to [Built-in connection pooling](../../additional-features/connection-manager-ysql/).
+You can enable built-in Connection Pooling on the cluster **Settings>Connection Pooling** tab. For more information and limitations, refer to [Built-in connection pooling](../../additional-features/connection-manager-ysql/).
 
 For Connection Pooling metrics, see [YSQL Ops metrics](../cloud-monitor/monitor-metrics/#ysql-ops).
 
@@ -94,10 +93,22 @@ For Connection Pooling metrics, see [YSQL Ops metrics](../cloud-monitor/monitor-
     icon="fa-thin fa-pen">}}
 
   {{<index/item
+    title="Autoscaling"
+    body="Add or remove nodes automatically as load changes."
+    href="autoscaling/"
+    icon="fa-thin fa-chart-line">}}
+
+  {{<index/item
     title="Read replicas"
     body="Serve read requests from remote regions."
     href="managed-read-replica/"
     icon="fa-thin fa-clone">}}
+
+  {{<index/item
+    title="Resource Governance"
+    body="Manage CPU use between databases on a shared cluster."
+    href="resource-governance/"
+    icon="fa-thin fa-gauge-high">}}
 
   {{<index/item
     title="Back up clusters"
@@ -106,7 +117,7 @@ For Connection Pooling metrics, see [YSQL Ops metrics](../cloud-monitor/monitor-
     icon="fa-thin fa-down-to-bracket">}}
 
   {{<index/item
-    title="Point-in-time recovery"
+    title="Clone to a point in time"
     body="Create a database clone at a point in time for recovery or testing."
     href="aeon-pitr/"
     icon="fa-thin fa-timeline-arrow">}}

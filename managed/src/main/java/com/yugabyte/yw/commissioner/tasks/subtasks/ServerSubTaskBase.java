@@ -21,7 +21,7 @@ import com.yugabyte.yw.models.helpers.NodeDetails;
 import java.util.concurrent.TimeUnit;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
-import org.yb.client.YBClient;
+import org.yb.client.YBClientApi;
 
 @Slf4j
 public abstract class ServerSubTaskBase extends AbstractTaskBase {
@@ -69,7 +69,7 @@ public abstract class ServerSubTaskBase extends AbstractTaskBase {
         taskParams().serverType == ServerType.MASTER ? node.masterRpcPort : node.tserverRpcPort);
   }
 
-  public YBClient getClient() {
+  public YBClientApi getClient() {
     Universe universe = Universe.getOrBadRequest(taskParams().getUniverseUUID());
     String masterAddresses = universe.getMasterAddresses();
     String certificate = universe.getCertificateNodetoNode();
@@ -81,12 +81,12 @@ public abstract class ServerSubTaskBase extends AbstractTaskBase {
               TimeUnit.SECONDS.toMillis(VALIDATE_PRECHECK_ADMIN_TIMEOUT_MS),
               TimeUnit.SECONDS.toMillis(VALIDATE_PRECHECK_SOCKET_READ_TIMEOUT_MS),
               TimeUnit.SECONDS.toMillis(VALIDATE_PRECHECK_OPERATION_TIMEOUT_MS));
-      return ybService.getClientWithConfig(ybClientConfig);
+      return ybService.getClientWithConfig(ybClientConfig.withClientCertOf(universe));
     }
-    return ybService.getClient(masterAddresses, certificate);
+    return ybService.getUniverseClient(universe, masterAddresses);
   }
 
-  public YBClient getClient(long adminOperationTimeoutMs) {
+  public YBClientApi getClient(long adminOperationTimeoutMs) {
     Universe universe = Universe.getOrBadRequest(taskParams().getUniverseUUID());
     String masterAddresses = universe.getMasterAddresses();
     String certificate = universe.getCertificateNodetoNode();
@@ -97,7 +97,7 @@ public abstract class ServerSubTaskBase extends AbstractTaskBase {
             adminOperationTimeoutMs,
             TimeUnit.SECONDS.toMillis(VALIDATE_PRECHECK_SOCKET_READ_TIMEOUT_MS),
             TimeUnit.SECONDS.toMillis(VALIDATE_PRECHECK_OPERATION_TIMEOUT_MS));
-    return ybService.getClientWithConfig(ybClientConfig);
+    return ybService.getClientWithConfig(ybClientConfig.withClientCertOf(universe));
   }
 
   public void checkParams() {

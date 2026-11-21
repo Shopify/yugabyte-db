@@ -97,6 +97,12 @@ typedef struct PgBackendGSSStatus
  * catalog (technically, only the cache does, not direct reads/writes to/from
  * system catalog).  The catalog version indicates that snapshot.  has_version
  * is false for backends that are idle (and not in txn) or non-client backends.
+ * catalog_pinned_to_historical_read_time is true while the backend's catalog
+ * is pinned to yb_read_time (YbIsCatalogPinnedToReadTime). Such a backend is
+ * reported as having no version, so DDLs don't wait for it to catch up and the
+ * invalidation messages it never applies don't stay pinned for it. That is
+ * safe because it can't write while yb_read_time is set (pggate rejects write
+ * DML and DDL), so it can't act on a stale catalog.
  */
 typedef struct YbPgBackendCatalogVersionStatus
 {
@@ -104,6 +110,7 @@ typedef struct YbPgBackendCatalogVersionStatus
 								 * version */
 	uint64_t	version;		/* if has_version, catalog version that the
 								 * backend is on */
+	bool		catalog_pinned_to_historical_read_time;
 } YbPgBackendCatalogVersionStatus;
 
 /* ----------
@@ -210,6 +217,28 @@ typedef struct PgBackendStatus
 
 	/* YB (pg_client <--> tserver) Session ID */
 	uint64_t	yb_session_id;
+
+	/*
+	 * YB: Logical client connection info provided by YSQL Connection Manager.
+	 *
+	 * When this backend is a CM worker (backend type YB_YSQL_CONN_MGR),
+	 * st_clientaddr is always an AF_UNIX socket and therefore exposes no real
+	 * client IP/port.  These fields carry the per-attach logical-client values
+	 * that Odyssey forwards via the internal yb_conn_mgr_client_* GUCs.
+	 *
+	 * yb_st_cm_client_addr     - IP address string (NUL-terminated), empty
+	 *                            when no client is attached (Option A reset).
+	 * yb_st_cm_client_port     - TCP port (1-65535), or -1 when none.
+	 * yb_st_cm_client_hostname - reverse-DNS hostname (NUL-terminated), empty
+	 *                            when not available.
+	 *
+	 * These fields are only meaningful when yb_st_cm_client_addr[0] != '\0'.
+	 * They are updated atomically (under st_changecount) by the GUC assign
+	 * hooks via yb_pgstat_set_ycm_client_info().
+	 */
+	char		yb_st_cm_client_addr[NI_MAXHOST];
+	int			yb_st_cm_client_port;
+	char		yb_st_cm_client_hostname[NAMEDATALEN];
 
 } PgBackendStatus;
 
@@ -349,6 +378,8 @@ extern void pgstat_report_query_id(uint64 query_id, bool force);
 extern void pgstat_report_tempfile(size_t filesize);
 extern void pgstat_report_appname(const char *appname);
 extern void pgstat_report_xact_timestamp(TimestampTz tstamp);
+extern void yb_pgstat_set_ycm_client_info(const char *addr, const int *port,
+									   const char *hostname);
 extern const char *pgstat_get_backend_current_activity(int pid, bool checkUser);
 extern const char *pgstat_get_crashed_backend_activity(int pid, char *buffer,
 													   int buflen);

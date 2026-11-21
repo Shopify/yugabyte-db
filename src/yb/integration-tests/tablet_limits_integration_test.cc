@@ -88,7 +88,9 @@ class CreateTableLimitTestRF1 : public CreateTableLimitTestBase {
     options.extra_master_flags = {
         "--enable_load_balancing=false",
         "--initial_tserver_registration_duration_secs=0",
-        "--enforce_tablet_replica_limits=true"};
+        "--enforce_tablet_replica_limits=true",
+        // Split right after a cluster restart needs a leader before failure detection elects one.
+        "--TEST_hinted_leader_election_for_existing_tablets=true"};
     return options;
   }
 };
@@ -168,7 +170,9 @@ TEST_F(CreateTableLimitTestRF1, DeadTServer) {
   ASSERT_OK(conn.Execute("DROP TABLE t"));
   auto* new_tserver = cluster_->tablet_server(1);
   ASSERT_OK(new_tserver->Pause());
-  SleepFor(MonoDelta::FromMilliseconds(4000));
+  // Wait until the master marks the paused tserver dead before probing the limit; a fixed
+  // sleep races with the unresponsive-timeout + catalog-manager sweep on slower builds.
+  ASSERT_OK(cluster_->WaitForMasterToMarkTSDead(1));
   ASSERT_OK(IsTabletLimitErrorStatus(conn.Execute(final_table_ddl)));
   ASSERT_OK(new_tserver->Resume());
 }

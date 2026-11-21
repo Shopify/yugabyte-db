@@ -23,6 +23,7 @@ import com.yugabyte.yw.common.NodeActionType;
 import com.yugabyte.yw.common.NodeManager;
 import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.common.ShellResponse;
+import com.yugabyte.yw.common.TestUtils;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.models.AvailabilityZone;
 import com.yugabyte.yw.models.CustomerTask;
@@ -45,7 +46,7 @@ import org.mockito.junit.MockitoJUnitRunner;
 import org.yb.client.ChangeMasterClusterConfigResponse;
 import org.yb.client.GetMasterClusterConfigResponse;
 import org.yb.client.ListMasterRaftPeersResponse;
-import org.yb.client.YBClient;
+import org.yb.client.YBClientApi;
 import org.yb.master.CatalogEntityInfo;
 import play.libs.Json;
 
@@ -53,7 +54,7 @@ import play.libs.Json;
 public class ReleaseInstanceFromUniverseTest extends CommissionerBaseTest {
 
   private Universe defaultUniverse;
-  private YBClient mockClient;
+  private YBClientApi mockClient;
 
   private static final String DEFAULT_NODE_NAME = "host-n1";
 
@@ -81,11 +82,16 @@ public class ReleaseInstanceFromUniverseTest extends CommissionerBaseTest {
     // create default universe
     userIntent = new UniverseDefinitionTaskParams.UserIntent();
     userIntent.numNodes = 3;
-    userIntent.provider = defaultProvider.getUuid().toString();
     userIntent.ybSoftwareVersion = "yb-version";
-    userIntent.accessKeyCode = "demo-access";
     userIntent.replicationFactor = 3;
     userIntent.regionList = ImmutableList.of(region.getUuid());
+    TestUtils.initUserIntent(
+        userIntent,
+        defaultProvider,
+        ApiUtils.UTIL_INST_TYPE,
+        ApiUtils.getDummyDeviceInfo(1, 100),
+        "demo-access");
+
     defaultUniverse = createUniverse(defaultCustomer.getId());
     Universe.saveDetails(
         defaultUniverse.getUniverseUUID(),
@@ -103,7 +109,7 @@ public class ReleaseInstanceFromUniverseTest extends CommissionerBaseTest {
     ListMasterRaftPeersResponse listMastersResponse = mock(ListMasterRaftPeersResponse.class);
     when(listMastersResponse.getPeersList()).thenReturn(Collections.emptyList());
 
-    mockClient = mock(YBClient.class);
+    mockClient = mock(YBClientApi.class);
     try {
       when(mockClient.listMasterRaftPeers()).thenReturn(listMastersResponse);
       when(mockClient.getMasterClusterConfig()).thenReturn(mockConfigResponse);
@@ -218,6 +224,37 @@ public class ReleaseInstanceFromUniverseTest extends CommissionerBaseTest {
         subTasks.stream().collect(Collectors.groupingBy(TaskInfo::getPosition));
     assertEquals(RELEASE_INSTANCE_TASK_SEQUENCE.size(), subTasksByPosition.size());
     assertReleaseInstanceSequence(subTasksByPosition);
+  }
+
+  /** The node may come back on another machine, so its recorded cloud goes with its IPs. */
+  @Test
+  public void testReleaseInstanceClearsRecordedCloud() {
+    CatalogEntityInfo.SysClusterConfigEntryPB.Builder configBuilder =
+        CatalogEntityInfo.SysClusterConfigEntryPB.newBuilder().setVersion(3);
+    GetMasterClusterConfigResponse mockConfigResponse =
+        new GetMasterClusterConfigResponse(1111, "", configBuilder.build(), null);
+    try {
+      when(mockClient.getMasterClusterConfig()).thenReturn(mockConfigResponse);
+    } catch (Exception e) {
+    }
+    Universe.saveDetails(
+        defaultUniverse.getUniverseUUID(),
+        u -> u.getNode(DEFAULT_NODE_NAME).cloudInfo.physicalCloud = "gcp",
+        false /* incrementVersion */);
+    NodeTaskParams taskParams = new NodeTaskParams();
+    taskParams.setUniverseUUID(defaultUniverse.getUniverseUUID());
+    setDumpEntitiesMock(defaultUniverse, DEFAULT_NODE_NAME, false);
+    NodeDetails node = defaultUniverse.getNode(DEFAULT_NODE_NAME);
+    when(mockClient.getLeaderMasterHostAndPort())
+        .thenReturn(HostAndPort.fromParts(node.cloudInfo.private_ip, node.masterRpcPort));
+    TaskInfo taskInfo = submitTask(taskParams, DEFAULT_NODE_NAME, 3);
+    assertEquals(Success, taskInfo.getTaskState());
+
+    NodeDetails released =
+        Universe.getOrBadRequest(defaultUniverse.getUniverseUUID()).getNode(DEFAULT_NODE_NAME);
+    assertEquals(NodeState.Decommissioned, released.state);
+    assertNull(released.cloudInfo.private_ip);
+    assertNull(released.cloudInfo.physicalCloud);
   }
 
   @Test

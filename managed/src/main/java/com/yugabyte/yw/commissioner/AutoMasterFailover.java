@@ -16,6 +16,7 @@ import com.yugabyte.yw.commissioner.tasks.subtasks.CheckClusterConsistency;
 import com.yugabyte.yw.commissioner.tasks.subtasks.CheckFollowerLag;
 import com.yugabyte.yw.common.CustomerTaskManager;
 import com.yugabyte.yw.common.Util;
+import com.yugabyte.yw.common.config.CustomerConfKeys;
 import com.yugabyte.yw.common.config.UniverseConfKeys;
 import com.yugabyte.yw.common.nodeui.MetricGroup;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
@@ -44,7 +45,7 @@ import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.collections4.MapUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.yb.client.GetMasterHeartbeatDelaysResponse;
-import org.yb.client.YBClient;
+import org.yb.client.YBClientApi;
 import org.yb.util.PeerInfo;
 import play.libs.Json;
 
@@ -57,6 +58,8 @@ public class AutoMasterFailover extends UniverseDefinitionTaskBase {
 
   private static final String FOLLOWER_LAG_URL_FORMAT =
       "http://%s:%d/metrics?metrics=follower_lag_ms";
+
+  private static final Duration MIN_FAILOVER_SCHEDULE_DELAY = Duration.ofSeconds(10);
 
   @Builder
   @Getter
@@ -189,8 +192,8 @@ public class AutoMasterFailover extends UniverseDefinitionTaskBase {
     }
     // Before performing any advanced checks, ensure that the YBA view of masters is the same as the
     // of the db to be conservative.
-    try (YBClient ybClient = ybService.getUniverseClient(universe)) {
-      checkClusterConsistency(universe, ybClient);
+    try (YBClientApi ybClient = ybService.getUniverseClient(universe)) {
+      checkClusterConsistency(customer, universe, ybClient);
       Map<String, Long> maybeFailedMasters = getMaybeFailedMastersForUniverse(universe, ybClient);
       if (MapUtils.isEmpty(maybeFailedMasters)) {
         log.trace(
@@ -232,15 +235,15 @@ public class AutoMasterFailover extends UniverseDefinitionTaskBase {
     }
   }
 
-  private void checkClusterConsistency(Universe universe, YBClient ybClient) {
+  @VisibleForTesting
+  void checkClusterConsistency(Customer customer, Universe universe, YBClientApi ybClient) {
     try {
+      // With cloud enabled, dual-NIC nodes run on their secondary IP (GFlagsUtil.isUseSecondaryIP),
+      // so that is the IP the DB reports for them.
+      boolean cloudEnabled = confGetter.getConfForScope(customer, CustomerConfKeys.cloudEnabled);
       List<String> errors =
           CheckClusterConsistency.checkCurrentServers(
-                  ybClient,
-                  universe,
-                  null /* skip nodes */,
-                  false /* strict */,
-                  false /* cloud enabled */)
+                  ybClient, universe, null /* skip nodes */, false /* strict */, cloudEnabled)
               .getErrors();
       if (!errors.isEmpty()) {
         String errMsg =
@@ -271,7 +274,7 @@ public class AutoMasterFailover extends UniverseDefinitionTaskBase {
    * @return map of node name to current time lag for the soft check that has failed.
    */
   @VisibleForTesting
-  Map<String, Long> getMaybeFailedMastersForUniverse(Universe universe, YBClient ybClient) {
+  Map<String, Long> getMaybeFailedMastersForUniverse(Universe universe, YBClientApi ybClient) {
     Long followerLagSoftThreshold =
         confGetter
             .getConfForScope(universe, UniverseConfKeys.autoMasterFailoverFollowerLagSoftThreshold)
@@ -313,11 +316,14 @@ public class AutoMasterFailover extends UniverseDefinitionTaskBase {
                 maybeFailedMasters.put(node.getNodeName(), heartbeatDelay);
                 return;
               }
-              HostAndPort hp = HostAndPort.fromParts(node.cloudInfo.private_ip, node.masterRpcPort);
+              // The peer may report its secondary IP first on dual-NIC nodes, but YBA reaches the
+              // master's RPC and web server on the private IP, as CheckFollowerLag does.
+              String privateIp = node.cloudInfo.private_ip;
+              HostAndPort hp = HostAndPort.fromParts(privateIp, node.masterRpcPort);
               if (ybClient.waitForServer(hp, 5000)) {
                 Pair<String, Long> maxFollowerLag =
                     CheckFollowerLag.maxFollowerLag(
-                        getFollowerLagMs(ipAddress, node.masterHttpPort));
+                        getFollowerLagMs(privateIp, node.masterHttpPort));
                 if (maxFollowerLag.getRight() > followerLagSoftThreshold) {
                   log.error(
                       "Adding master {} in universe {} as max follower lag {} exceeds soft"
@@ -346,7 +352,7 @@ public class AutoMasterFailover extends UniverseDefinitionTaskBase {
         confGetter.getConfForScope(
             universe, UniverseConfKeys.autoMasterFailoverFollowerLagHardThreshold);
     Duration diff = hardThreshold.minus(followerLagMs, ChronoUnit.MILLIS);
-    return diff.isNegative() ? Duration.ofSeconds(10) : diff;
+    return diff.isNegative() ? MIN_FAILOVER_SCHEDULE_DELAY : diff;
   }
 
   /**
@@ -463,11 +469,18 @@ public class AutoMasterFailover extends UniverseDefinitionTaskBase {
           return Action.builder().actionType(ActionType.NONE).build();
         }
       }
+      // No master looks failed once the failed task has already removed the old master from the
+      // quorum, or the old master has come back. Only the retry releases the universe, so retry
+      // anyway.
+      Duration delay =
+          maybeFailedMaster == null
+              ? MIN_FAILOVER_SCHEDULE_DELAY
+              : getMasterFailoverScheduleDelay(universe, maybeFailedMaster.getValue());
       return Action.builder()
           .actionType(ActionType.RETRY)
           .taskType(TaskType.MasterFailover)
           .retryTaskUuid(universeDetails.placementModificationTaskUuid)
-          .delay(getMasterFailoverScheduleDelay(universe, maybeFailedMaster.getValue()))
+          .delay(delay)
           .build();
     }
     return Action.builder().actionType(ActionType.NONE).build();
@@ -591,7 +604,7 @@ public class AutoMasterFailover extends UniverseDefinitionTaskBase {
    * @param ybClient the yb client to the DB.
    * @return map of master uuid to heartbeat delay, excluding the master leader leader.
    */
-  private Map<String, Long> getMasterHeartbeatDelays(YBClient ybClient) {
+  private Map<String, Long> getMasterHeartbeatDelays(YBClientApi ybClient) {
     try {
       GetMasterHeartbeatDelaysResponse response = ybClient.getMasterHeartbeatDelays();
       if (response.hasError()) {
@@ -609,7 +622,7 @@ public class AutoMasterFailover extends UniverseDefinitionTaskBase {
     }
   }
 
-  private List<PeerInfo> getMasters(YBClient ybClient) {
+  private List<PeerInfo> getMasters(YBClientApi ybClient) {
     try {
       return ybClient.listMasterRaftPeers().getPeersList().stream()
           .filter(p -> p.getMemberType() == PeerInfo.MemberType.VOTER)

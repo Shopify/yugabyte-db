@@ -8,6 +8,8 @@ import static com.yugabyte.yw.models.TaskInfo.State.Failure;
 import static com.yugabyte.yw.models.TaskInfo.State.Success;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
@@ -21,7 +23,10 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.net.HostAndPort;
 import com.yugabyte.yw.common.ApiUtils;
 import com.yugabyte.yw.common.PlacementInfoUtil;
+import com.yugabyte.yw.common.ProviderInitializer;
 import com.yugabyte.yw.common.ShellResponse;
+import com.yugabyte.yw.common.TestUtils;
+import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
@@ -43,7 +48,7 @@ import org.junit.runner.RunWith;
 import org.mockito.junit.MockitoJUnitRunner;
 import org.yb.client.ChangeMasterClusterConfigResponse;
 import org.yb.client.GetMasterClusterConfigResponse;
-import org.yb.client.YBClient;
+import org.yb.client.YBClientApi;
 import org.yb.master.CatalogEntityInfo.SysClusterConfigEntryPB;
 import play.libs.Json;
 
@@ -73,15 +78,19 @@ public class ReadOnlyClusterDeleteTest extends CommissionerBaseTest {
     UserIntent userIntent = new UserIntent();
     userIntent.numNodes = 3;
     userIntent.ybSoftwareVersion = "yb-version";
-    userIntent.accessKeyCode = "demo-access";
-    userIntent.instanceType = ApiUtils.UTIL_INST_TYPE;
     userIntent.regionList = ImmutableList.of(region.getUuid());
-    userIntent.provider = defaultProvider.getUuid().toString();
+    TestUtils.initUserIntent(
+        userIntent,
+        defaultProvider,
+        ApiUtils.UTIL_INST_TYPE,
+        ApiUtils.getDummyDeviceInfo(1, 100),
+        "demo-access");
+
     defaultUniverse = createUniverse(defaultCustomer.getId());
     Universe.saveDetails(
         defaultUniverse.getUniverseUUID(),
         ApiUtils.mockUniverseUpdater(userIntent, true /* setMasters */));
-    YBClient mockClient = mock(YBClient.class);
+    YBClientApi mockClient = mock(YBClientApi.class);
     when(mockYBClient.getUniverseClient(any())).thenReturn(mockClient);
     ShellResponse dummyShellResponse = new ShellResponse();
     dummyShellResponse.message = "true";
@@ -109,13 +118,22 @@ public class ReadOnlyClusterDeleteTest extends CommissionerBaseTest {
     UniverseDefinitionTaskParams.UserIntent userIntent =
         new UniverseDefinitionTaskParams.UserIntent();
     userIntent.numNodes = 3;
+    UUID providerUUID = curIntent.maybeGetSingleProviderUUID().get();
+    ProviderInitializer providerInitializer =
+        Util.newProviderInitializer(
+                userIntent,
+                providerUUID,
+                curIntent.getAllCloudTypes().iterator().next(),
+                confGetter)
+            .setAccessCode(curIntent.getAccessKeyCodeForProvider(providerUUID));
+
+    DeviceInfo deviceInfo = curIntent.getBaseDeviceInfo(providerUUID).clone();
+    deviceInfo.numVolumes = 2;
+    providerInitializer.setDeviceInfo(deviceInfo);
+
     userIntent.ybSoftwareVersion = curIntent.ybSoftwareVersion;
-    userIntent.accessKeyCode = curIntent.accessKeyCode;
     userIntent.regionList = ImmutableList.of(region.getUuid());
-    userIntent.providerType = curIntent.providerType;
-    userIntent.provider = curIntent.provider;
-    userIntent.deviceInfo = new DeviceInfo();
-    userIntent.deviceInfo.numVolumes = 2;
+
     PlacementInfo pi = new PlacementInfo();
     for (AvailabilityZone az : region.getAllZones()) {
       PlacementInfoUtil.addPlacementZone(az.getUuid(), pi, 1, 1, false);
@@ -197,6 +215,57 @@ public class ReadOnlyClusterDeleteTest extends CommissionerBaseTest {
     TaskInfo taskInfo = submitTask(taskParams, TaskType.ReadOnlyClusterDelete, -1);
     assertEquals(Failure, taskInfo.getTaskState());
     assertEquals(6, univUTP.nodeDetailsSet.size());
+  }
+
+  private void freezeWithFailedTask(TaskType failedTaskType) {
+    TaskInfo failed = new TaskInfo(failedTaskType, null);
+    failed.setOwner("test");
+    failed.setTaskState(Failure);
+    failed.setTaskParams(Json.newObject());
+    failed.save();
+    Universe.saveDetails(
+        defaultUniverse.getUniverseUUID(),
+        u -> {
+          UniverseDefinitionTaskParams details = u.getUniverseDetails();
+          details.updatingTaskUUID = failed.getUuid();
+          details.placementModificationTaskUuid = failed.getUuid();
+          details.updateSucceeded = false;
+          u.setUniverseDetails(details);
+        });
+  }
+
+  private ReadOnlyClusterDelete.Params readReplicaDeleteParams() {
+    ReadOnlyClusterDelete.Params taskParams = new ReadOnlyClusterDelete.Params();
+    taskParams.setUniverseUUID(defaultUniverse.getUniverseUUID());
+    taskParams.clusterUUID = readOnlyCluster.uuid;
+    return taskParams;
+  }
+
+  @Test
+  public void testClusterDeleteAfterFailedCreate() {
+    freezeWithFailedTask(TaskType.ReadOnlyClusterCreate);
+    TaskInfo taskInfo = submitTask(readReplicaDeleteParams(), TaskType.ReadOnlyClusterDelete, -1);
+    assertEquals(Success, taskInfo.getTaskState());
+    // The basic prechecks are skipped on a universe broken by the failed create.
+    assertTrue(
+        taskInfo.getSubTasks().stream()
+            .noneMatch(t -> t.getTaskType() == TaskType.CheckLeaderlessTablets));
+    UniverseDefinitionTaskParams details =
+        Universe.getOrBadRequest(defaultUniverse.getUniverseUUID()).getUniverseDetails();
+    assertEquals(1, details.clusters.size());
+    assertEquals(3, details.nodeDetailsSet.size());
+    assertNull(details.placementModificationTaskUuid);
+    assertNull(details.updatingTaskUUID);
+  }
+
+  @Test
+  public void testClusterDeleteRefusedAfterOtherFailedPlacementTask() {
+    freezeWithFailedTask(TaskType.ReplaceNodeInUniverse);
+    RuntimeException e =
+        assertThrows(
+            RuntimeException.class,
+            () -> submitTask(readReplicaDeleteParams(), TaskType.ReadOnlyClusterDelete, -1));
+    assertTrue(e.getMessage().contains("Please retry the previous task first"));
   }
 
   @Test

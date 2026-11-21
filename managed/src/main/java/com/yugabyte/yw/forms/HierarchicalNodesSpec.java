@@ -47,6 +47,8 @@ public class HierarchicalNodesSpec {
   /** Per-process node properties shared across all hierarchy levels. */
   @Data
   @Builder(toBuilder = true)
+  @NoArgsConstructor
+  @AllArgsConstructor
   public static class NodeSpec {
     @Builder.Default @ApiModelProperty private DeviceInfo deviceInfo = null;
     @Builder.Default @ApiModelProperty private String instanceType = null;
@@ -330,6 +332,16 @@ public class HierarchicalNodesSpec {
     public void validate() {
       validateDescendants();
     }
+
+    /**
+     * {@link NodesSpec#isEmpty()} hides {@link WithDescendants#isEmpty()}. A root that only holds
+     * region overrides is not empty.
+     */
+    @Override
+    @JsonIgnore
+    public boolean isEmpty() {
+      return CollectionUtils.isEmpty(getDescendants()) && super.isEmpty();
+    }
   }
 
   /** Region-level node specification, optionally containing per-AZ overrides. */
@@ -387,6 +399,16 @@ public class HierarchicalNodesSpec {
     @Override
     public void validate() {
       validateDescendants();
+    }
+
+    /**
+     * {@link NodesSpec#isEmpty()} hides {@link WithDescendants#isEmpty()}. A region that only holds
+     * AZ overrides is not empty.
+     */
+    @Override
+    @JsonIgnore
+    public boolean isEmpty() {
+      return CollectionUtils.isEmpty(getDescendants()) && super.isEmpty();
     }
   }
 

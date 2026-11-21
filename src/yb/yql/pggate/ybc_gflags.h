@@ -40,7 +40,6 @@ typedef struct {
   const bool*     ysql_enable_profile;
   const bool*     ysql_disable_global_impact_ddl_statements;
   const bool*     ysql_minimal_catalog_caches_preload;
-  const bool*     ysql_enable_colocated_tables_with_tablespaces;
   const bool*     ysql_enable_create_database_oid_collision_retry;
   const char*     ysql_catalog_preload_additional_table_list;
   const bool*     ysql_use_relcache_file;
@@ -53,6 +52,7 @@ typedef struct {
   const char*     TEST_ysql_conn_mgr_dowarmup_all_pools_mode;
   const bool*     TEST_ysql_enable_db_logical_client_version_mode;
   const bool*     ysql_conn_mgr_superuser_sticky;
+  const bool*     ysql_conn_mgr_use_auth_backend;
   const bool*     TEST_ysql_log_perdb_allocated_new_objectid;
   const bool*     ysql_block_dangerous_roles;
   const char*     ysql_sequence_cache_method;
@@ -80,6 +80,14 @@ typedef struct {
   const int64_t*  TEST_delay_after_table_analyze_ms;
   const bool*     TEST_enable_obj_tuple_locks;
   const bool*     TEST_force_use_explicit_row_lock_skip_locked_read_ahead_optimization;
+  const bool*     TEST_ysql_yb_enable_replication_slot_transactional_ddl;
+  const uint32_t* wait_for_ysql_backends_catalog_version_client_master_rpc_timeout_ms;
+  const uint64_t* ysql_catalog_prefetch_row_limit;
+  const uint64_t* ysql_catalog_prefetch_size_limit;
+  const bool*     ysql_catalog_prefetch_minimize_index_scans;
+  const bool*     ysql_enable_startup_client_connection_check;
+  const bool*     ysql_yb_pg_partman_use_native_txn_ddl_and_locks;
+  const uint32_t* pg_cache_response_trust_auth_lifetime_limit_ms;
 } YbcPgGFlagsAccessor;
 
 const YbcPgGFlagsAccessor* YBCGetGFlags();

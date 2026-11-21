@@ -12,10 +12,13 @@ package com.yugabyte.yw.common.ha;
 
 import static com.yugabyte.yw.common.AssertHelper.assertOk;
 import static junit.framework.TestCase.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static play.inject.Bindings.bind;
@@ -25,7 +28,7 @@ import static play.test.Helpers.fakeRequest;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.common.collect.ImmutableMap;
+import com.yugabyte.yw.common.ApiHelper;
 import com.yugabyte.yw.common.AppConfigHelper;
 import com.yugabyte.yw.common.ConfigHelper;
 import com.yugabyte.yw.common.FakeApi;
@@ -136,13 +139,15 @@ public class PlatformTest extends FakeDBApplication {
   // call start in test method instead of setup so that we can test cases where remote app
   // is not running
   FakeApi startRemoteApp() {
-    remoteApp =
-        provideApplication(
-            ImmutableMap.of(
-                "play.allowGlobalApplication",
-                false,
-                AppConfigHelper.YB_STORAGE_PATH,
-                remoteStorage.getRoot().getAbsolutePath()));
+    // The remote app is a fully independent YBA instance and must not share the local instance's
+    // database (otherwise e.g. the singleton HA config row collides). With H2 each application got
+    // its own random in-memory database; on the shared embedded Postgres we request an isolated
+    // one.
+    Map<String, Object> remoteConfig = new java.util.HashMap<>();
+    remoteConfig.put("play.allowGlobalApplication", false);
+    remoteConfig.put(AppConfigHelper.YB_STORAGE_PATH, remoteStorage.getRoot().getAbsolutePath());
+    remoteConfig.putAll(com.yugabyte.yw.common.TestPostgres.newIsolatedDatabaseConfig());
+    remoteApp = provideApplication(remoteConfig);
     Helpers.start(remoteApp);
     mat = remoteApp.getWrappedApplication().materializer();
     Database remoteEBenServer = DB.getDefault();
@@ -246,11 +251,52 @@ public class PlatformTest extends FakeDBApplication {
     return UUID.fromString(haConfigJson.get("uuid").asText());
   }
 
+  @Test
+  public void testFipsModeMismatch() throws IOException {
+    FakeApi remoteFakeApi = startRemoteApp();
+    createHAConfig(remoteFakeApi, clusterKey);
+    // The remote app runs non-FIPS, so a FIPS local instance is the mismatched pair.
+    setupProxyingApiHelper(remoteFakeApi, clusterKey, true /* fipsEnabled */);
+    // The remote instance's actual response: a 400 whose body names the FIPS mismatch.
+    when(mockApiHelper.getHttpRequest(anyString(), anyMap(), isNull(), isNull()))
+        .thenAnswer(
+            invocation -> {
+              String uri = invocation.<String>getArgument(0).replaceFirst(REMOTE_ACME_ORG, "");
+              Http.RequestBuilder requestBuilder = fakeRequest().method("GET").uri(uri);
+              invocation.<Map<String, String>>getArgument(1).forEach(requestBuilder::header);
+              Result result = remoteFakeApi.route(requestBuilder);
+              ApiHelper.HttpResponse response = mock(ApiHelper.HttpResponse.class);
+              when(response.getBody()).thenReturn(Json.parse(contentAsString(result)));
+              return response;
+            });
+    PlatformInstanceClient client =
+        mockPlatformInstanceClientFactory.getClient(clusterKey, REMOTE_ACME_ORG, Map.of());
+
+    PlatformInstanceClient.FipsModeMismatchException e =
+        assertThrows(
+            PlatformInstanceClient.FipsModeMismatchException.class, client::testConnection);
+    assertEquals(
+        "HA requires both YBA instances to have the same FIPS mode: this YBA is FIPS-enabled and "
+            + REMOTE_ACME_ORG
+            + " is not FIPS-enabled",
+        e.getMessage());
+
+    createFakeDump();
+    PlatformReplicationManager replicationManager =
+        app.injector().instanceOf(PlatformReplicationManager.class);
+    assertFalse(replicationManager.sendBackup(remoteInstance));
+  }
+
   private void setupProxyingApiHelper(FakeApi remoteFakeApi, String clusterKey) {
+    setupProxyingApiHelper(remoteFakeApi, clusterKey, false /* fipsEnabled */);
+  }
+
+  private void setupProxyingApiHelper(
+      FakeApi remoteFakeApi, String clusterKey, boolean fipsEnabled) {
     when(mockPlatformInstanceClientFactory.getClient(anyString(), anyString(), anyMap()))
         .thenReturn(
             new PlatformInstanceClient(
-                mockApiHelper, clusterKey, REMOTE_ACME_ORG, mockConfigHelper));
+                mockApiHelper, clusterKey, REMOTE_ACME_ORG, mockConfigHelper, fipsEnabled));
     when(mockApiHelper.multipartRequest(anyString(), anyMap(), anyList()))
         .thenAnswer(
             invocation -> {

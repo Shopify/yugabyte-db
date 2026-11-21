@@ -31,7 +31,9 @@
 #include "yb/tserver/xcluster_ddl_queue_handler.h"
 #include "yb/util/backoff_waiter.h"
 
+DECLARE_bool(enable_load_balancing);
 DECLARE_bool(enable_xcluster_api_v2);
+DECLARE_double(leader_failure_max_missed_heartbeat_periods);
 
 DECLARE_bool(TEST_xcluster_ddl_queue_handler_log_queries);
 
@@ -75,6 +77,32 @@ Status XClusterDDLReplicationTestBase::SetUpClusters(const SetupParams& params) 
   consumer_conn_ = std::make_unique<pgwrapper::PGConn>(
       VERIFY_RESULT(consumer_cluster_.ConnectToDB(namespace_name)));
   return Status::OK();
+}
+
+Status XClusterDDLReplicationTestBase::SetUpClustersAndCheckpointReplicationGroup(
+    const SetupParams& params) {
+  RETURN_NOT_OK(SetUpClusters(params));
+  LOG(INFO) << "SetupClusters done";
+
+  RETURN_NOT_OK(
+      CheckpointReplicationGroup(kReplicationGroupId, /*require_no_bootstrap_needed=*/false));
+  LOG(INFO) << "CheckpointReplicationGroup done";
+  // Bootstrap here would have no effect because the database is empty so we skip it for the test.
+  return Status::OK();
+}
+
+Status XClusterDDLReplicationTestBase::SetUpClustersAndReplication(const SetupParams& params) {
+  RETURN_NOT_OK(SetUpClustersAndCheckpointReplicationGroup(params));
+  LOG(INFO) << "SetUpClustersAndCheckpointReplicationGroup done";
+
+  RETURN_NOT_OK(CreateReplicationFromCheckpoint());
+  LOG(INFO) << "CreateReplicationFromCheckpoint done";
+  return Status::OK();
+}
+
+Result<HybridTime> XClusterDDLReplicationTestBase::GetXClusterSafeTime() {
+  return consumer_client()->GetXClusterSafeTimeForNamespace(
+      VERIFY_RESULT(GetNamespaceId(consumer_client())), master::XClusterSafeTimeFilter::NONE);
 }
 
 Status XClusterDDLReplicationTestBase::CheckpointReplicationGroupOnNamespaces(
@@ -241,7 +269,15 @@ Status XClusterDDLReplicationTestBase::StepDownDdlQueueTablet(Cluster& cluster) 
   return StepDown(leader_peer, /*new_leader_uuid=*/"", ForceStepDown::kTrue);
 }
 
-Status XClusterDDLReplicationTestBase::MoveDdlQueueTabletLeaderToPgProxy(Cluster& cluster) {
+Status XClusterDDLReplicationTestBase::MoveDdlQueueTabletLeaderToPgProxy(
+    Cluster& cluster, bool disable_leader_balancing) {
+  if (disable_leader_balancing) {
+    // Keep the leader where this function puts it.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_load_balancing) = false;
+    // Prevent other leader elections from happening.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_leader_failure_max_missed_heartbeat_periods) = 20;
+  }
+
   auto ddl_queue_table = VERIFY_RESULT(GetYsqlTable(
       &cluster, namespace_name, xcluster::kDDLQueuePgSchemaName, xcluster::kDDLQueueTableName));
   google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
@@ -303,6 +339,41 @@ bool XClusterDDLReplicationTestBase::SetReplicationDirection(
   LOG(INFO) << "Switched replication direction to "
             << (replication_direction_ == ReplicationDirection::AToB ? "A -> B" : "B -> A");
   return true;
+}
+
+void XClusterDDLReplicationSwitchoverTest::SetUp() {
+  TEST_SETUP_SUPER(XClusterDDLReplicationTestBase);
+  // DDLs need to to be processed sequentially, so increase the timeout.
+  propagation_timeout_ *= 2;
+}
+
+bool XClusterDDLReplicationSwitchoverTest::SetReplicationDirection(ReplicationDirection direction) {
+  if (XClusterDDLReplicationTestBase::SetReplicationDirection(direction)) {
+    std::swap(cluster_A_, cluster_B_);
+    return true;
+  }
+  return false;
+}
+
+Status XClusterDDLReplicationSwitchoverTest::Switchover() {
+  LOG(INFO) << "===== Beginning switchover: checkpoint B";
+  SetReplicationDirection(ReplicationDirection::BToA);
+  RETURN_NOT_OK(CheckpointReplicationGroup(
+      kBackwardsReplicationGroupId, /*require_no_bootstrap_needed=*/false));
+  LOG(INFO) << "===== Switchover: set up replication from B to A";
+  SetReplicationDirection(ReplicationDirection::BToA);
+  RETURN_NOT_OK(CreateReplicationFromCheckpoint(
+      cluster_A_->mini_cluster_->GetMasterAddresses(), kBackwardsReplicationGroupId));
+  LOG(INFO) << "===== Continuing switchover: drop replication from A to B";
+  SetReplicationDirection(ReplicationDirection::AToB);
+  RETURN_NOT_OK(DeleteOutboundReplicationGroup());
+  LOG(INFO) << "===== Finishing switchover: wait for B to no longer be in readonly mode";
+  SetReplicationDirection(ReplicationDirection::BToA);
+  RETURN_NOT_OK(WaitForReadOnlyModeOnAllTServers(
+      VERIFY_RESULT(GetNamespaceId(producer_client())), /*is_read_only=*/false, cluster_B_));
+  LOG(INFO) << "===== Switchover done";
+
+  return Status::OK();
 }
 
 }  // namespace yb
