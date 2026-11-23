@@ -46,7 +46,8 @@ subject is a change's identity, and the original landing commit stays reachable.
 replayed landing that had no `(#N)` carries a `Shopify-PR:` trailer naming its PRs,
 written by `sync`. `git log --first-parent <upstream SHA>..master-shopify` lists the
 sync's merge commit and what the fork carries. `.agents/scripts/shopify/upstream.py sync`
-builds the candidate and opens its PR; landing is the fast-forward described above.
+builds the candidate and opens its PR; the result lands by `sync --land`, a fast-forward
+after review.
 
 Submission is developer-forward: the original developer submits under their own `gh`
 login. `.agents/scripts/shopify/upstream.py`, beside `issues.py` and `release.py`, has
