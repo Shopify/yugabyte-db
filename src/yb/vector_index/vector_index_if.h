@@ -17,8 +17,11 @@
 
 #include "yb/rocksdb/cache.h"
 
-#include "yb/util/polymorphic_iterator.h"
+#include "yb/util/kv_util.h"
+#include "yb/util/logging.h"
 #include "yb/util/result.h"
+#include "yb/util/strongly_typed_bool.h"
+#include "yb/util/tostring.h"
 
 #include "yb/vector_index/coordinate_types.h"
 #include "yb/vector_index/distance.h"
@@ -32,10 +35,89 @@ class MemTracker;
 
 namespace yb::vector_index {
 
+// A single vector index entry: the vector itself and an opaque payload attached to it.
+// The payload stores data associated with the vector (currently ybctid of the corresponding row,
+// in future it could also contain other columns for covering indexes). Could be empty.
+template <IndexableVectorType Vector>
+struct VectorIndexEntry {
+  VectorId vector_id;
+  Vector vector;
+  ValueBuffer payload;
+
+  std::string ToString() const {
+    return YB_STRUCT_TO_STRING(vector_id, vector, payload);
+  }
+};
+
+// A single entry produced by vector index iteration.
+// Unlike VectorIndexEntry does not own the attached payload: the slice points into storage owned
+// by the index and is valid only while the iterator it was obtained from is alive.
+template <IndexableVectorType Vector>
+struct VectorIndexIteratorEntry {
+  VectorId vector_id;
+  Vector vector;
+  Slice payload;
+
+  // Converts to VectorIndexEntry that owns a copy of the payload.
+  VectorIndexEntry<Vector> ToOwned() && {
+    return {.vector_id = vector_id, .vector = std::move(vector), .payload = ValueBuffer(payload)};
+  }
+
+  std::string ToString() const {
+    return YB_STRUCT_TO_STRING(vector_id, vector, payload);
+  }
+};
+
+// Iterates over the vectors of an index. A failure ends the iteration and is returned by status(),
+// so status() must be checked once Valid() returns false.
+template <IndexableVectorType Vector>
+class VectorIndexIterator {
+ public:
+  using EntryType = VectorIndexIteratorEntry<Vector>;
+
+  virtual ~VectorIndexIterator() {
+    DCHECK(!status_check_required_) << "Iterator reached the end, but its status was not checked";
+  }
+
+  bool Valid() const {
+    if (DoValid()) {
+      return true;
+    }
+    status_check_required_ = true;
+    return false;
+  }
+
+  // Next and Entry require Valid().
+  virtual void Next() = 0;
+  virtual EntryType Entry() const = 0;
+
+  Status status() const {
+    status_check_required_ = false;
+    return DoStatus();
+  }
+
+ protected:
+  virtual bool DoValid() const = 0;
+
+  virtual Status DoStatus() const {
+    return Status::OK();
+  }
+
+ private:
+  mutable bool status_check_required_ = false;
+};
+
+// Returns the tenant of a vector from its payload. An index with a tenant extractor never links
+// vectors of different tenants, see SearchOptions::tenant.
+using VectorTenantExtractor = std::function<Result<Slice>(Slice payload)>;
+
 struct SearchOptions {
   size_t max_num_results;
   size_t ef;
-  VectorFilter filter = [](const auto&) { return true; };
+  VectorFilter filter = [](const auto&, const auto&) { return true; };
+  // Restricts the search to vectors of the tenant, see VectorTenantExtractor. Empty searches all
+  // tenants. Only indexes whose vectors belong to tenants support a tenant, others reject it.
+  Slice tenant = Slice();
 
   std::string ToString() const {
     return YB_STRUCT_TO_STRING(max_num_results, ef);
@@ -49,8 +131,8 @@ template<IndexableVectorType Vector, ValidDistanceResultType DistanceResult>
 class VectorIndexReaderIf {
  public:
   using SearchResult  = std::vector<VectorWithDistance<DistanceResult>>;
-  using IteratorValue = std::pair<VectorId, Vector>;
-  using Iterator      = PolymorphicIterator<IteratorValue>;
+  using IteratorValue = VectorIndexIteratorEntry<Vector>;
+  using Iterator      = VectorIndexIterator<Vector>;
 
   virtual ~VectorIndexReaderIf() = default;
   virtual DistanceResult Distance(const Vector& lhs, const Vector& rhs) const = 0;
@@ -60,12 +142,8 @@ class VectorIndexReaderIf {
   // Returns the vector with the given id or NotFound error when vector is not found.
   virtual Result<Vector> GetVector(VectorId vector_id) const = 0;
 
-  virtual std::unique_ptr<AbstractIterator<IteratorValue>> BeginImpl() const = 0;
-  virtual std::unique_ptr<AbstractIterator<IteratorValue>> EndImpl()   const = 0;
+  virtual std::unique_ptr<Iterator> CreateIterator() const = 0;
   virtual std::string IndexStatsStr() const { return "N/A"; }
-
-  Iterator begin() const { return Iterator(BeginImpl()); }
-  Iterator end()   const { return Iterator(EndImpl()); }
 };
 
 template<IndexableVectorType Vector>
@@ -91,7 +169,9 @@ class VectorIndexWriterIf {
   // bytes of memory.
   virtual size_t EstimateNumVectorsForBytes(size_t bytes_limit) const = 0;
 
-  virtual Status Insert(VectorId vector_id, const Vector& vector) = 0;
+  // Inserts the vector with the specified id and attached payload (could be empty).
+  // The payload is stored in the index and returned by search together with the vector id.
+  virtual Status Insert(VectorId vector_id, const Vector& vector, Slice payload) = 0;
 };
 
 template<IndexableVectorType Vector, ValidDistanceResultType DistanceResult>
@@ -122,6 +202,12 @@ class VectorIndexIf : public VectorIndexReaderIf<Vector, DistanceResult>,
   // max_concurrent_reads - max number of concurrent reads that could be run against this index.
   virtual Status LoadFromFile(const std::string& path, size_t max_concurrent_reads) = 0;
 
+  // Returns paths of all files that store the index saved at the specified path.
+  // Every returned path starts with the specified path.
+  virtual std::vector<std::string> StoredFiles(const std::string& path) const {
+    return {path};
+  }
+
   // Allows to attach a custom object that will be destroyed when the vector index does. Only one
   // object can be attached. Returns previously attached object or nullptr if nothing was attached.
   // Could be considered as a variation of cleanup paradigm rocskdb::Cleanable.
@@ -132,6 +218,10 @@ class VectorIndexIf : public VectorIndexReaderIf<Vector, DistanceResult>,
 
 YB_DEFINE_ENUM(FactoryMode, (kCreate)(kLoad));
 
+// Whether payloads attached to vectors are stored in the created vector index chunk.
+// When stored, every inserted vector is expected to have a non-empty payload.
+YB_STRONGLY_TYPED_BOOL(StoreVectorPayload);
+
 // Instance independent functionality of a vector index implementation.
 // Also acts as the factory for vector index instances.
 template<IndexableVectorType Vector, ValidDistanceResultType DistanceResult>
@@ -140,7 +230,10 @@ class VectorIndexTraitsIf {
   virtual ~VectorIndexTraitsIf() = default;
 
   // Creates a vector index instance.
-  virtual VectorIndexIfPtr<Vector, DistanceResult> Create(FactoryMode mode) const = 0;
+  // store_vector_payload only applies to newly created chunks (FactoryMode::kCreate), for loaded
+  // chunks it is derived from the stored state.
+  virtual VectorIndexIfPtr<Vector, DistanceResult> Create(
+      FactoryMode mode, StoreVectorPayload store_vector_payload) const = 0;
 
   virtual DistanceResult Distance(const Vector& lhs, const Vector& rhs) const = 0;
 
@@ -148,6 +241,12 @@ class VectorIndexTraitsIf {
   // Always reflects the in-memory representation used to build chunks, see
   // VectorIndexWriterIf::EstimateNumVectorsForBytes.
   virtual size_t EstimateNumVectorsForBytes(size_t bytes_limit) const = 0;
+
+  // Whether the implementation stores attached vector payloads in a separate payload file next
+  // to the index file, because its own format cannot store them. See VectorPayloadMap.
+  virtual bool StoresPayloadInSeparateFile() const {
+    return false;
+  }
 };
 
 template<IndexableVectorType Vector, ValidDistanceResultType DistanceResult>

@@ -92,7 +92,7 @@ To create a large number of client connections, ensure that "SHMMNI" (the maximu
 To enable built-in connection pooling for universes deployed using YugabyteDB Anywhere:
 
 - Turn on the **Connection pooling** option when creating a universe. Refer to [Create a multi-zone universe](../../../yugabyte-platform/create-deployments/create-universe-multi-zone/#advanced-configuration).
-- Edit connection pooling on an existing universe. Refer to [Edit connection pooling](../../../yugabyte-platform/manage-deployments/edit-universe/#edit-connection-pooling).
+- Edit connection pooling on an existing universe. Refer to [Edit connection pooling](../../../yugabyte-platform/scale-deployments/edit-config-flags/#connection-pooling).
 
 Note that when managing universes using YugabyteDB Anywhere, do not set connection pooling flags, `enable_ysql_conn_mgr`, `ysql_conn_mgr_port`, and `pgsql_proxy_bind_address`.
 
@@ -107,7 +107,7 @@ Using the socket directory along with [`-p`](../../../api/ysqlsh/#p-port-port-po
 
 You can enable built-in connection pooling on YugabyteDB Aeon clusters in the following ways:
 
-- When [creating a cluster](../../../yugabyte-cloud/cloud-basics/create-clusters/), turn on the **Connection Pooling** option. (Connection Pooling is enabled by default for [Sandbox clusters](../../../yugabyte-cloud/cloud-basics/create-clusters/create-clusters-free/).)
+- When [creating a cluster](../../../yugabyte-cloud/cloud-basics/create-clusters/), turn on the **Connection Pooling** option.
 - For clusters that are already created, navigate to the cluster **Settings>Connection Pooling** tab.
 
 Enabling connection pooling on an Aeon cluster gives 10 client connections for every server connection by default.

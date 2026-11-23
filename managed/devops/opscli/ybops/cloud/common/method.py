@@ -320,6 +320,10 @@ class AbstractInstancesMethod(AbstractMethod):
             time.sleep(1)
             host_lookup_count += 1
 
+        if not host_info:
+            raise YBOpsRecoverableError(
+                "Timed out waiting for instance: '{}' (host not found)".format(
+                    args.search_pattern))
         host_port_user = get_host_port_user(self.extra_vars)
         raise YBOpsRecoverableError("Timed out waiting for instance: '{}'. {}@{}:{} using {}"
                                     .format(args.search_pattern, host_port_user["user"],
@@ -957,7 +961,7 @@ class ChangeInstanceTypeMethod(AbstractInstancesMethod):
                     args.search_pattern, args.instance_type)
         except Exception as e:
             raise YBOpsRuntimeError('error executing \"instance.modify_attribute\": {}'
-                                    .format(repr(e)))
+                                    .format(self.cloud.format_sdk_error(e) or repr(e)))
         finally:
             if args.boot_script is not None:
                 self.cloud.update_user_data(args)
@@ -1000,7 +1004,7 @@ class ConfigureInstancesMethod(AbstractInstancesMethod):
     VALID_PROCESS_TYPES = ['master', 'tserver']
     CERT_ROTATE_ACTIONS = ['APPEND_NEW_ROOT_CERT', 'ROTATE_CERTS',
                            'REMOVE_OLD_ROOT_CERT', 'UPDATE_CERT_DIRS']
-    SKIP_CERT_VALIDATION_OPTIONS = ['ALL', 'HOSTNAME']
+    SKIP_CERT_VALIDATION_OPTIONS = ['ALL', 'HOSTNAME', 'REQUIRE_SAN']
     # Child files and directories for master.
     MASTER_STATE_DIRS = ['wals', 'data', 'consensus-meta', 'instance',
                          'auto_flags_config', 'tablet-meta']

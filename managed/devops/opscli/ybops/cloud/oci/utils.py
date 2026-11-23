@@ -16,6 +16,7 @@ import requests
 
 from ybops.common.exceptions import YBOpsRuntimeError, YBOpsRecoverableError
 from ybops.cloud.common.utils import request_retry_decorator
+from ybops.cloud.oci.errors import format_oci_error
 from ybops.utils import DNS_RECORD_SET_TTL, MIN_MEM_SIZE_GB, MIN_NUM_CORES
 from ybops.utils.ssh import format_rsa_key, validated_key_file
 from threading import Thread
@@ -27,6 +28,7 @@ from oci.core import (
     BlockstorageClient,
     ComputeManagementClient,
 )
+from oci.dns import DnsClient
 from oci.identity import IdentityClient
 from oci.core.models import (
     CaptureConsoleHistoryDetails,
@@ -44,9 +46,13 @@ from oci.core.models import (
     EgressSecurityRule,
     TcpOptions,
     PortRange,
+    UpdateBootVolumeDetails,
     UpdateInstanceDetails,
-    UpdateInstanceShapeConfigDetails
+    UpdateInstanceShapeConfigDetails,
+    UpdateInstanceSourceViaImageDetails
 )
+from oci.dns.models import RecordDetails, UpdateDomainRecordsDetails
+from oci.work_requests import WorkRequestClient
 
 # Sticky launch fields copied from an Instance Configuration when seeding a
 # plain LaunchInstance. YBA-owned fields (shape, image, subnet, metadata, ...)
@@ -111,6 +117,11 @@ _AVAILABILITY_DOMAIN_DEPENDENT_ATTRIBUTES = frozenset((
     "cluster_placement_group_id",
 ))
 
+
+def is_local_nvme_shape(shape):
+    return bool(shape) and ("DenseIO" in shape or "HPC" in shape)
+
+
 OCI_TENANCY_ID_ENV = "OCI_TENANCY_ID"
 OCI_USER_ID_ENV = "OCI_USER_ID"
 OCI_FINGERPRINT_ENV = "OCI_FINGERPRINT"
@@ -140,6 +151,12 @@ YUGABYTE_SG_PREFIX = "yugabyte-sl-{}"
 
 DEFAULT_BOOT_VOLUME_SIZE_GB = 50
 MIN_BOOT_VOLUME_SIZE_GB = 50
+BOOT_VOLUME_REPLACEMENT_TIMEOUT_SECONDS = 600
+OCI_WORK_REQUEST_TERMINAL_STATES = ("SUCCEEDED", "FAILED", "CANCELED")
+# Instance tags replace_boot_volume copies to the boot volume it keeps.
+NODE_TAG_KEYS = ("universe-uuid", "node-uuid")
+# VPUs/GB OCI gives a boot volume when none is set, as on a replacement.
+OCI_DEFAULT_BOOT_VOLUME_VPUS_PER_GB = 10
 
 AARCH64_ARCHITECTURES = ("aarch64", "arm64")
 
@@ -238,6 +255,7 @@ class OciCloudAdmin:
         self._network_client = None
         self._blockstorage_client = None
         self._identity_client = None
+        self._dns_client = None
         self._compartment_id = None
 
     @property
@@ -251,6 +269,9 @@ class OciCloudAdmin:
             signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
             return client_class(self.config, signer=signer)
         return client_class(self.config)
+
+    def _list_all(self, list_func, *args, **kwargs):
+        return oci.pagination.list_call_get_all_results(list_func, *args, **kwargs).data
 
     @property
     def compartment_id(self):
@@ -281,6 +302,12 @@ class OciCloudAdmin:
         if self._blockstorage_client is None:
             self._blockstorage_client = self._build_client(BlockstorageClient)
         return self._blockstorage_client
+
+    @property
+    def dns_client(self):
+        if self._dns_client is None:
+            self._dns_client = self._build_client(DnsClient)
+        return self._dns_client
 
     @property
     def identity_client(self):
@@ -342,8 +369,8 @@ class OciCloudAdmin:
 
     def get_shapes(self, compartment_id=None, availability_domain=None):
         comp_id = compartment_id or self.compartment_id
-        shapes = self.compute_client.list_shapes(comp_id, availability_domain=availability_domain)
-        return shapes.data
+        return self._list_all(
+            self.compute_client.list_shapes, comp_id, availability_domain=availability_domain)
 
     def get_instance_types(self, region=None):
         if region:
@@ -352,26 +379,33 @@ class OciCloudAdmin:
         shapes = self.get_shapes()
         result = {}
         for shape in shapes:
+            # Flex DenseIO/HPC ListShapes fields are family defaults (1 OCPU / 16 GB), not a
+            # launchable SKU. YAML owns those types.
+            if is_local_nvme_shape(shape.shape) and "Flex" in shape.shape:
+                continue
             ocpus = getattr(shape, 'ocpus', None) or getattr(shape, 'ocpu_count', 0)
             memory_gb = getattr(shape, 'memory_in_gbs', 0)
 
             if ocpus and memory_gb:
+                local_disks = getattr(shape, "local_disks", 0) or 0
+                local_disks_in_gbs = getattr(shape, "local_disks_in_gbs", 0) or 0
                 result[shape.shape] = {
                     "numCores": float(ocpus),
                     "memSizeGb": float(memory_gb),
                     "description": shape.shape,
-                    "isShared": "Flex" in shape.shape or "Micro" in shape.shape
+                    "isShared": "Flex" in shape.shape or "Micro" in shape.shape,
+                    "localDisks": int(local_disks),
+                    "localDisksInGbs": float(local_disks_in_gbs)
                 }
         return result
 
     def get_images(self, compartment_id=None, operating_system=None, shape=None):
         comp_id = compartment_id or self.compartment_id
-        images = self.compute_client.list_images(
+        return self._list_all(
+            self.compute_client.list_images,
             comp_id,
             operating_system=operating_system,
-            shape=shape
-        )
-        return images.data
+            shape=shape)
 
     def get_app_catalog_image(self, region, listing_id, resource_version=None):
         """Resolve a region-independent PIC listing to the region-specific image OCID."""
@@ -457,7 +491,7 @@ class OciCloudAdmin:
         except Exception as e:
             raise YBOpsRuntimeError(
                 "Failed to fetch OCI Instance Configuration {}: {}".format(
-                    instance_configuration_id, e))
+                    instance_configuration_id, format_oci_error(e) or e))
         instance_details = getattr(ic, "instance_details", None)
         launch_details = (
             getattr(instance_details, "launch_details", None) if instance_details else None)
@@ -640,10 +674,21 @@ class OciCloudAdmin:
 
         shape_config = None
         if "Flex" in shape:
-            shape_config = LaunchInstanceShapeConfigDetails(
-                ocpus=float(ocpus) if ocpus else 2.0,
-                memory_in_gbs=float(memory_in_gbs) if memory_in_gbs else 16.0
-            )
+            if is_local_nvme_shape(shape):
+                if not ocpus or not memory_in_gbs:
+                    raise YBOpsRuntimeError(
+                        "DenseIO/HPC Flex shape {} requires --ocpus and --memory_in_gbs".format(
+                            shape))
+                shape_config = LaunchInstanceShapeConfigDetails(
+                    ocpus=float(ocpus),
+                    memory_in_gbs=float(memory_in_gbs),
+                    nvmes=int(num_volumes) if num_volumes else 1
+                )
+            else:
+                shape_config = LaunchInstanceShapeConfigDetails(
+                    ocpus=float(ocpus) if ocpus else 2.0,
+                    memory_in_gbs=float(memory_in_gbs) if memory_in_gbs else 16.0
+                )
 
         actual_boot_size = max(boot_volume_size_gb or DEFAULT_BOOT_VOLUME_SIZE_GB,
                                MIN_BOOT_VOLUME_SIZE_GB)
@@ -716,7 +761,18 @@ class OciCloudAdmin:
             )
 
         logging.info("[app] Creating OCI instance {}".format(instance_name))
-        response = self.compute_client.launch_instance(launch_details)
+        try:
+            response = self.compute_client.launch_instance(launch_details)
+        except oci.exceptions.ServiceError as e:
+            if e.status != 404:
+                raise
+            # OCI rejects a launch from a Marketplace image version the compartment is not
+            # subscribed to with this generic error, which names neither the image nor the cause.
+            raise YBOpsRuntimeError(
+                "OCI could not launch instance {} from image {}: {}. If the image is from the OCI "
+                "Marketplace, subscribe the compartment to that image version first, for example "
+                "by accepting its terms in the OCI Console.".format(
+                    instance_name, image_id, e.message)) from e
 
         instance = response.data
         created_volume_ids = []
@@ -724,7 +780,7 @@ class OciCloudAdmin:
         try:
             instance = self._wait_for_instance_state(instance.id, OCI_INSTANCE_RUNNING)
 
-            if num_volumes and num_volumes > 0:
+            if num_volumes and num_volumes > 0 and not is_local_nvme_shape(shape):
                 volume_tags = dict(freeform_tags) if freeform_tags else {}
                 for i in range(num_volumes):
                     volume = self.create_volume(
@@ -743,17 +799,26 @@ class OciCloudAdmin:
             logging.error(
                 "Instance creation failed partially for {}, cleaning up instance {} "
                 "and {} volume(s)".format(instance_name, instance.id, len(created_volume_ids)))
-            for vol_id in created_volume_ids:
-                try:
-                    self.blockstorage_client.delete_volume(vol_id)
-                except Exception as vol_err:
-                    logging.warning(
-                        "Failed to cleanup volume {}: {}".format(vol_id, vol_err))
             try:
-                self.compute_client.terminate_instance(instance.id)
+                # Detaches and deletes the attached data volumes before terminating.
+                # OCI rejects deleting a volume that is still attached, and instance
+                # termination only detaches data volumes, it does not delete them.
+                self.terminate_instance(instance.id)
             except Exception as term_err:
                 logging.warning(
                     "Failed to cleanup instance {}: {}".format(instance.id, term_err))
+            # Catches volumes that were created but never attached, and any the
+            # termination path could not delete.
+            for vol_id in created_volume_ids:
+                try:
+                    self.delete_volume(vol_id)
+                except oci.exceptions.ServiceError as vol_err:
+                    if vol_err.status != 404:
+                        logging.warning(
+                            "Failed to cleanup volume {}: {}".format(vol_id, vol_err))
+                except Exception as vol_err:
+                    logging.warning(
+                        "Failed to cleanup volume {}: {}".format(vol_id, vol_err))
             raise
 
     def _wait_for_instance_network(self, instance_id, instance_name, region, timeout=120):
@@ -828,11 +893,11 @@ class OciCloudAdmin:
             self.set_region(region)
 
         comp_id = compartment_id or self.compartment_id
-        instances = self.compute_client.list_instances(comp_id)
+        instances = self._list_all(self.compute_client.list_instances, comp_id)
 
         results = []
         subnet_cache = {}
-        for instance in instances.data:
+        for instance in instances:
             if search_pattern and search_pattern not in instance.display_name:
                 continue
 
@@ -949,7 +1014,20 @@ class OciCloudAdmin:
 
     def change_instance_type(self, instance_id, new_shape, ocpus=None, memory_in_gbs=None):
         shape_config = None
-        if "Flex" in new_shape and (ocpus or memory_in_gbs):
+        if "Flex" in new_shape:
+            if ocpus is None or memory_in_gbs is None:
+                current_config = getattr(
+                    self.get_instance(instance_id), "shape_config", None)
+                if current_config:
+                    if ocpus is None:
+                        ocpus = getattr(current_config, "ocpus", None)
+                    if memory_in_gbs is None:
+                        memory_in_gbs = getattr(current_config, "memory_in_gbs", None)
+            if ocpus is None or memory_in_gbs is None:
+                raise YBOpsRuntimeError(
+                    "OCPUs and memory are required to change instance {} to Flex shape {} "
+                    "(ocpus={}, memory_in_gbs={})".format(
+                        instance_id, new_shape, ocpus, memory_in_gbs))
             shape_config = UpdateInstanceShapeConfigDetails(
                 ocpus=ocpus,
                 memory_in_gbs=memory_in_gbs
@@ -964,6 +1042,161 @@ class OciCloudAdmin:
             instance_id,
             OCI_INSTANCE_STOPPED,
             ready_check=lambda instance: instance.shape == new_shape)
+
+    def replace_boot_volume(self, instance_id, image_id, force=False):
+        """Replaces the boot volume of an instance with one OCI generates from image_id.
+
+        The current boot volume is kept, carrying the node's universe-uuid and node-uuid tags, so
+        it can still be recovered if the node fails later in the upgrade, and
+        delete_detached_boot_volumes can find it afterwards.
+        Unless force is set, a boot volume already created from image_id is not replaced again.
+        The instance ends in the state it was in before the call.
+        """
+        instance = self.get_instance(instance_id)
+        work_request_client = self._build_client(WorkRequestClient)
+        # A replacement started by an earlier call may outlive that call's wait. Finish waiting for
+        # it so the checks below see its result.
+        for pending in self._list_all(
+                work_request_client.list_work_requests, instance.compartment_id,
+                resource_id=instance_id):
+            if pending.status not in OCI_WORK_REQUEST_TERMINAL_STATES:
+                logging.info("[app] Waiting for {} work request {} on instance {}".format(
+                    pending.operation_type, pending.id, instance_id))
+                self._wait_for_work_request(work_request_client, pending.id)
+
+        boot_volume = self._get_attached_boot_volume(instance)
+        # The VPUs/GB to keep. A volume from image_id still at OCI's default may come from an
+        # earlier call that failed before setting them. The volume it replaced, kept with the
+        # node's tags, still has them.
+        vpus_per_gb = boot_volume.vpus_per_gb
+        if (boot_volume.image_id == image_id
+                and boot_volume.vpus_per_gb == OCI_DEFAULT_BOOT_VOLUME_VPUS_PER_GB):
+            previous_boot_volume = self._get_previous_boot_volume(instance, boot_volume)
+            if previous_boot_volume:
+                vpus_per_gb = previous_boot_volume.vpus_per_gb
+        if not force and boot_volume.image_id == image_id:
+            logging.info("[app] Boot volume {} of instance {} is already from image {}".format(
+                boot_volume.id, instance_id, image_id))
+            self._set_boot_volume_vpus(boot_volume, vpus_per_gb)
+            return
+
+        tags = dict(boot_volume.freeform_tags or {})
+        instance_tags = instance.freeform_tags or {}
+        for key in NODE_TAG_KEYS:
+            if key in instance_tags:
+                tags[key] = instance_tags[key]
+        # Boot volumes YBA launches already carry these, and OCI rejects an update that changes
+        # nothing.
+        if tags != (boot_volume.freeform_tags or {}):
+            self.blockstorage_client.update_boot_volume(
+                boot_volume.id, UpdateBootVolumeDetails(freeform_tags=tags))
+
+        # Without these OCI sizes the new volume to the image default and drops the
+        # customer-managed key. OCI rejects explicit sizes below MIN_BOOT_VOLUME_SIZE_GB, so boot
+        # volumes left at an image's default of about 47 GB grow to it.
+        details = UpdateInstanceDetails(
+            source_details=UpdateInstanceSourceViaImageDetails(
+                image_id=image_id,
+                boot_volume_size_in_gbs=max(boot_volume.size_in_gbs, MIN_BOOT_VOLUME_SIZE_GB),
+                kms_key_id=boot_volume.kms_key_id,
+                is_preserve_boot_volume_enabled=True))
+        logging.info("[app] Replacing boot volume {} of instance {} with image {}".format(
+            boot_volume.id, instance_id, image_id))
+        response = self.compute_client.update_instance(instance_id, details)
+        work_request_id = response.headers.get("opc-work-request-id")
+        if not work_request_id:
+            raise YBOpsRuntimeError(
+                "OCI returned no work request for the boot volume replacement of "
+                "instance {}".format(instance_id))
+
+        work_request = self._wait_for_work_request(work_request_client, work_request_id)
+        if work_request.status != "SUCCEEDED":
+            errors = self._list_all(
+                work_request_client.list_work_request_errors, work_request_id)
+            raise YBOpsRuntimeError(
+                "Boot volume replacement of instance {} ended {}: {}".format(
+                    instance_id, work_request.status, "; ".join(e.message for e in errors)))
+
+        # The replacement can't set VPUs/GB, so OCI creates the new volume at its default of 10.
+        # Put back the old volume's, which may have been changed in OCI.
+        self._set_boot_volume_vpus(self._get_attached_boot_volume(instance), vpus_per_gb)
+
+    def _set_boot_volume_vpus(self, boot_volume, vpus_per_gb):
+        if vpus_per_gb is None or boot_volume.vpus_per_gb == vpus_per_gb:
+            return
+        logging.info("[app] Setting boot volume {} to {} VPUs/GB".format(
+            boot_volume.id, vpus_per_gb))
+        self.blockstorage_client.update_boot_volume(
+            boot_volume.id, UpdateBootVolumeDetails(vpus_per_gb=vpus_per_gb))
+        # The volume stays AVAILABLE while OCI applies the change.
+        start_time = time.time()
+        while (self.blockstorage_client.get_boot_volume(boot_volume.id).data.vpus_per_gb
+               != vpus_per_gb):
+            if time.time() - start_time >= 300:
+                raise YBOpsRuntimeError(
+                    "Timeout waiting for boot volume {} to reach {} VPUs/GB".format(
+                        boot_volume.id, vpus_per_gb))
+            time.sleep(5)
+
+    def _get_previous_boot_volume(self, instance, boot_volume):
+        """The newest boot volume kept for the node that is older than boot_volume."""
+        instance_tags = instance.freeform_tags or {}
+        # Without both, the tags can match other nodes' boot volumes.
+        if not all(key in instance_tags for key in NODE_TAG_KEYS):
+            return None
+        tags = {key: instance_tags[key] for key in NODE_TAG_KEYS}
+        older = [
+            v for v in self._list_node_boot_volumes(
+                instance.availability_domain, instance.compartment_id, tags)
+            if v.time_created < boot_volume.time_created]
+        return max(older, key=lambda v: v.time_created, default=None)
+
+    def _list_node_boot_volumes(self, availability_domain, compartment_id, tags):
+        """AVAILABLE boot volumes that carry all of tags."""
+        boot_volumes = self._list_all(
+            self.blockstorage_client.list_boot_volumes,
+            availability_domain=availability_domain, compartment_id=compartment_id)
+        return [
+            v for v in boot_volumes
+            if v.lifecycle_state == "AVAILABLE"
+            and all((v.freeform_tags or {}).get(k) == tag for k, tag in tags.items())]
+
+    def _get_attached_boot_volume(self, instance):
+        attachments = self._list_all(
+            self.compute_client.list_boot_volume_attachments,
+            instance.availability_domain, instance.compartment_id, instance_id=instance.id)
+        attached = [a for a in attachments if a.lifecycle_state == "ATTACHED"]
+        if not attached:
+            # OCI does not guarantee its rollback of a failed replacement succeeds.
+            raise YBOpsRuntimeError(
+                "Instance {} has no attached boot volume, possibly left by a failed "
+                "replacement. Reattach its boot volume before retrying.".format(instance.id))
+        return self.blockstorage_client.get_boot_volume(attached[0].boot_volume_id).data
+
+    def delete_detached_boot_volumes(self, availability_domain, tags, volume_ids=None):
+        """Deletes detached boot volumes that match tags, such as those replace_boot_volume kept.
+
+        OCI allows only 10 freeform tags per resource, and YBA nodes can use all of them, so kept
+        boot volumes carry no marker of their own.
+        """
+        if not tags:
+            raise YBOpsRuntimeError("Tags are required to select boot volumes to delete")
+        availability_domain = self.resolve_availability_domain(availability_domain)
+        deleted = []
+        for boot_volume in self._list_node_boot_volumes(
+                availability_domain, self.compartment_id, tags):
+            if volume_ids and boot_volume.id not in volume_ids:
+                continue
+            attachments = self._list_all(
+                self.compute_client.list_boot_volume_attachments,
+                availability_domain, self.compartment_id, boot_volume_id=boot_volume.id)
+            if any(a.lifecycle_state in ("ATTACHING", "ATTACHED") for a in attachments):
+                continue
+            logging.info("[app] Deleting detached boot volume {} ({})".format(
+                boot_volume.display_name, boot_volume.id))
+            self.blockstorage_client.delete_boot_volume(boot_volume.id)
+            deleted.append(boot_volume.id)
+        return deleted
 
     def create_volume(self, availability_domain, size_in_gbs, display_name=None,
                       volume_type=OCI_VOLUME_TYPE_BALANCED, vpus_per_gb=None, tags=None):
@@ -1008,8 +1241,9 @@ class OciCloudAdmin:
 
     def get_volume_attachments(self, instance_id=None, compartment_id=None):
         comp_id = compartment_id or self.compartment_id
-        return self.compute_client.list_volume_attachments(
-            comp_id, instance_id=instance_id).data
+        return self._list_all(
+            self.compute_client.list_volume_attachments,
+            comp_id, instance_id=instance_id)
 
     def update_volume_size(self, volume_id, new_size_in_gbs):
         from oci.core.models import UpdateVolumeDetails
@@ -1018,7 +1252,8 @@ class OciCloudAdmin:
 
     def list_volumes_by_tags(self, tags, compartment_id=None):
         comp_id = compartment_id or self.compartment_id
-        volumes = self.blockstorage_client.list_volumes(compartment_id=comp_id).data
+        volumes = self._list_all(
+            self.blockstorage_client.list_volumes, compartment_id=comp_id)
         matching_volumes = []
         for volume in volumes:
             if volume.lifecycle_state not in ("AVAILABLE", "PROVISIONING"):
@@ -1044,6 +1279,33 @@ class OciCloudAdmin:
 
         update_details = UpdateInstanceDetails(freeform_tags=current_tags)
         self.compute_client.update_instance(instance_id, update_details)
+
+    def get_dns_zone(self, zone_id):
+        return self.dns_client.get_zone(zone_id).data
+
+    def upsert_dns_record_set(self, zone_id, domain_name_prefix, ip_list):
+        fqdn = "{}.{}".format(domain_name_prefix, self.get_dns_zone(zone_id).name)
+        records = [
+            RecordDetails(domain=fqdn, rtype="A", rdata=ip, ttl=DNS_RECORD_SET_TTL)
+            for ip in ip_list
+        ]
+        logging.info("[app] Setting {} A record(s) on {}".format(len(records), fqdn))
+        self.dns_client.update_domain_records(
+            zone_id, fqdn, UpdateDomainRecordsDetails(items=records))
+
+    def delete_dns_record_set(self, zone_id, domain_name_prefix):
+        try:
+            fqdn = "{}.{}".format(domain_name_prefix, self.get_dns_zone(zone_id).name)
+            logging.info("[app] Deleting records on {}".format(fqdn))
+            self.dns_client.delete_domain_records(zone_id, fqdn)
+        except oci.exceptions.ServiceError as e:
+            # A zone or record that is already gone must not wedge universe destroy.
+            if e.status == 404:
+                logging.warning(
+                    "[app] DNS zone {} or its records for {} not found; "
+                    "nothing to delete".format(zone_id, domain_name_prefix))
+                return
+            raise
 
     def get_console_history(self, instance_id):
         details = CaptureConsoleHistoryDetails(instance_id=instance_id)
@@ -1081,6 +1343,17 @@ class OciCloudAdmin:
         raise YBOpsRuntimeError(
             "Timeout waiting for instance {} to reach state {}".format(
                 instance_id, target_state))
+
+    def _wait_for_work_request(self, work_request_client, work_request_id,
+                               timeout=BOOT_VOLUME_REPLACEMENT_TIMEOUT_SECONDS):
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            work_request = work_request_client.get_work_request(work_request_id).data
+            if work_request.status in OCI_WORK_REQUEST_TERMINAL_STATES:
+                return work_request
+            time.sleep(10)
+        raise YBOpsRuntimeError(
+            "Timeout waiting for work request {} to finish".format(work_request_id))
 
     def _wait_for_volume_state(self, volume_id, target_state, timeout=300):
         start_time = time.time()

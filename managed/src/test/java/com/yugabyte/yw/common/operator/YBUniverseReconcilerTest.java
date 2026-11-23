@@ -1,5 +1,6 @@
 package com.yugabyte.yw.common.operator;
 
+import static com.yugabyte.yw.common.RedactingService.SECRET_REPLACEMENT;
 import static com.yugabyte.yw.common.TestHelper.createTempFile;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -19,6 +20,7 @@ import com.yugabyte.yw.common.KubernetesManagerFactory;
 import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.common.ReleaseManager;
 import com.yugabyte.yw.common.TestHelper;
+import com.yugabyte.yw.common.TestUtils;
 import com.yugabyte.yw.common.ValidatingFormFactory;
 import com.yugabyte.yw.common.audit.otel.OtelCollectorUtil;
 import com.yugabyte.yw.common.backuprestore.ybc.YbcManager;
@@ -27,7 +29,10 @@ import com.yugabyte.yw.common.config.GlobalConfKeys;
 import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.common.config.UniverseConfKeys;
 import com.yugabyte.yw.common.export.TelemetryConfig;
+import com.yugabyte.yw.common.gflags.GFlagsUtil;
+import com.yugabyte.yw.common.gflags.SpecificGFlags;
 import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil;
+import com.yugabyte.yw.common.metrics.MetricService;
 import com.yugabyte.yw.common.operator.OperatorStatusUpdater.UniverseState;
 import com.yugabyte.yw.common.operator.utils.KubernetesClientFactory;
 import com.yugabyte.yw.common.operator.utils.KubernetesEnvironmentVariables;
@@ -46,6 +51,7 @@ import com.yugabyte.yw.forms.EncryptionAtRestConfig;
 import com.yugabyte.yw.forms.EncryptionAtRestConfig.OpType;
 import com.yugabyte.yw.forms.EncryptionAtRestKeyParams;
 import com.yugabyte.yw.forms.ExportTelemetryConfigParams;
+import com.yugabyte.yw.forms.GFlagsUpgradeParams;
 import com.yugabyte.yw.forms.KubernetesOverridesUpgradeParams;
 import com.yugabyte.yw.forms.KubernetesProviderFormData;
 import com.yugabyte.yw.forms.KubernetesToggleImmutableYbcParams;
@@ -143,6 +149,7 @@ import play.libs.Json;
 @Slf4j
 public class YBUniverseReconcilerTest extends FakeDBApplication {
   @Mock KubernetesClient client;
+  @Mock MetricService metricService;
 
   @Mock
   MixedOperation<
@@ -244,7 +251,8 @@ public class YBUniverseReconcilerTest extends FakeDBApplication {
             customerTaskManager,
             operatorUtils,
             universeActionsHandler,
-            ybcManager);
+            ybcManager,
+            metricService);
     // reconcilerFactory.getYBUniverseReconciler(client);
 
     // Setup Defaults
@@ -344,6 +352,25 @@ public class YBUniverseReconcilerTest extends FakeDBApplication {
     assertEquals(Long.valueOf(1), rUniverse.getSpec().getNumNodes());
     assertEquals(Long.valueOf(1), rUniverse.getSpec().getReplicationFactor());
     assertTrue(rUniverse.getSpec().getEnableYSQL());
+  }
+
+  @Test
+  public void testCreateTaskParamsUseNodeToNodeClientCerts() throws Exception {
+    YBUniverse ybUniverse = ModelFactory.createYbUniverse("test-universe-mtls", defaultProvider);
+    assertFalse(
+        ybUniverseReconciler
+            .createTaskParams(ybUniverse, defaultCustomer.getUuid())
+            .getPrimaryCluster()
+            .userIntent
+            .useNodeToNodeClientCerts);
+
+    ybUniverse.getSpec().setUseNodeToNodeClientCerts(true);
+    assertTrue(
+        ybUniverseReconciler
+            .createTaskParams(ybUniverse, defaultCustomer.getUuid())
+            .getPrimaryCluster()
+            .userIntent
+            .useNodeToNodeClientCerts);
   }
 
   @Test
@@ -651,6 +678,8 @@ public class YBUniverseReconcilerTest extends FakeDBApplication {
     assertFalse(newSoftwareVersion.equals(oldSoftwareVersion));
     // Verify old universe objct removed
     assertFalse(Universe.maybeGet(oldUniverse.getUniverseUUID()).isPresent());
+    Mockito.verify(metricService)
+        .markSourceRemoved(defaultCustomer.getUuid(), oldUniverse.getUniverseUUID());
   }
 
   @Test
@@ -711,6 +740,33 @@ public class YBUniverseReconcilerTest extends FakeDBApplication {
     assertTrue(uDTCaptor.getValue().universeOverrides.contains("bar"));
     // Verify upgrade handler is not called
     Mockito.verifyNoInteractions(universeCRUDHandler);
+  }
+
+  @Test
+  public void testCreateTaskParamsReadReplicaInheritsGFlags() throws Exception {
+    YBUniverse ybUniverse = ModelFactory.createYbUniverse("test-rr-gflags", defaultProvider);
+    io.yugabyte.operator.v1alpha1.ybuniversespec.GFlags specGFlags =
+        new io.yugabyte.operator.v1alpha1.ybuniversespec.GFlags();
+    specGFlags.setTserverGFlags(new HashMap<>(Map.of("log_min_seconds_to_retain", "3600")));
+    ybUniverse.getSpec().setGFlags(specGFlags);
+    io.yugabyte.operator.v1alpha1.ybuniversespec.ReadReplica readReplica =
+        new io.yugabyte.operator.v1alpha1.ybuniversespec.ReadReplica();
+    readReplica.setNumNodes(1L);
+    readReplica.setReplicationFactor(1L);
+    ybUniverse.getSpec().setReadReplica(readReplica);
+
+    UniverseDefinitionTaskParams taskParams =
+        ybUniverseReconciler.createTaskParams(ybUniverse, defaultCustomer.getUuid());
+
+    Cluster readReplicaCluster = taskParams.getReadOnlyClusters().get(0);
+    assertTrue(readReplicaCluster.userIntent.specificGFlags.isInheritFromPrimary());
+    // The operator's gflags upgrade replaces only the primary's flags.
+    taskParams.getPrimaryCluster().userIntent.specificGFlags =
+        SpecificGFlags.construct(Map.of(), Map.of("log_min_seconds_to_retain", "7200"));
+    assertEquals(
+        "7200",
+        GFlagsUtil.getBaseGFlags(ServerType.TSERVER, readReplicaCluster, taskParams.clusters)
+            .get("log_min_seconds_to_retain"));
   }
 
   @Test
@@ -791,6 +847,84 @@ public class YBUniverseReconcilerTest extends FakeDBApplication {
     Mockito.verify(upgradeUniverseHandler)
         .updateProxyConfig(paramsCaptor.capture(), eq(defaultCustomer), eq(oldUniverse));
     assertNull(paramsCaptor.getValue().getPrimaryCluster().userIntent.getProxyConfig());
+    Mockito.verifyNoInteractions(universeCRUDHandler);
+  }
+
+  @Test
+  public void testOverridesUpgradeHonorsRollMaxBatchSize() throws Exception {
+    String universeName = "test-overrides-roll-batch";
+    YBUniverse ybUniverse = ModelFactory.createYbUniverse(universeName, defaultProvider);
+    UniverseDefinitionTaskParams taskParams =
+        ybUniverseReconciler.createTaskParams(ybUniverse, defaultCustomer.getUuid());
+    Universe oldUniverse = Universe.create(taskParams, defaultCustomer.getId());
+
+    Mockito.when(
+            confGetter.getConfForScope(
+                any(Universe.class), eq(UniverseConfKeys.rollingOpsWaitAfterEachPodMs)))
+        .thenReturn(10000);
+
+    io.yugabyte.operator.v1alpha1.ybuniversespec.RollMaxBatchSize specBatchSize =
+        new io.yugabyte.operator.v1alpha1.ybuniversespec.RollMaxBatchSize();
+    specBatchSize.setPrimaryBatchSize(2L);
+    specBatchSize.setReadReplicaBatchSize(2L);
+    ybUniverse.getSpec().setRollMaxBatchSize(specBatchSize);
+
+    KubernetesOverrides ko = new KubernetesOverrides();
+    Map<String, String> nodeSelectorMap = new HashMap<>();
+    nodeSelectorMap.put("foo", "bar");
+    ko.setNodeSelector(nodeSelectorMap);
+    ybUniverse.getSpec().setKubernetesOverrides(ko);
+
+    ybUniverseReconciler.editUniverse(defaultCustomer, oldUniverse, ybUniverse);
+    ArgumentCaptor<KubernetesOverridesUpgradeParams> uDTCaptor =
+        ArgumentCaptor.forClass(KubernetesOverridesUpgradeParams.class);
+    Mockito.verify(upgradeUniverseHandler, Mockito.times(1))
+        .upgradeKubernetesOverrides(uDTCaptor.capture(), any(Customer.class), any(Universe.class));
+    KubernetesOverridesUpgradeParams captured = uDTCaptor.getValue();
+    assertTrue(captured.universeOverrides.contains("bar"));
+    assertNotNull(captured.rollMaxBatchSize);
+    assertEquals(Integer.valueOf(2), captured.rollMaxBatchSize.getPrimaryBatchSize());
+    assertEquals(Integer.valueOf(2), captured.rollMaxBatchSize.getReadReplicaBatchSize());
+    Mockito.verifyNoInteractions(universeCRUDHandler);
+  }
+
+  @Test
+  public void testGflagsUpgradeHonorsRollMaxBatchSize() throws Exception {
+    String universeName = "test-gflags-roll-batch";
+    YBUniverse ybUniverse = ModelFactory.createYbUniverse(universeName, defaultProvider);
+    UniverseDefinitionTaskParams taskParams =
+        ybUniverseReconciler.createTaskParams(ybUniverse, defaultCustomer.getUuid());
+    Universe oldUniverse = Universe.create(taskParams, defaultCustomer.getId());
+    // checkIfGFlagsChanged diffs per-node gflags, so the universe must have nodes.
+    oldUniverse = ModelFactory.addNodesToUniverse(oldUniverse.getUniverseUUID(), 3);
+
+    Mockito.when(
+            confGetter.getConfForScope(
+                any(Universe.class), eq(UniverseConfKeys.rollingOpsWaitAfterEachPodMs)))
+        .thenReturn(10000);
+
+    io.yugabyte.operator.v1alpha1.ybuniversespec.RollMaxBatchSize specBatchSize =
+        new io.yugabyte.operator.v1alpha1.ybuniversespec.RollMaxBatchSize();
+    specBatchSize.setPrimaryBatchSize(3L);
+    specBatchSize.setReadReplicaBatchSize(2L);
+    ybUniverse.getSpec().setRollMaxBatchSize(specBatchSize);
+
+    io.yugabyte.operator.v1alpha1.ybuniversespec.GFlags gflags =
+        new io.yugabyte.operator.v1alpha1.ybuniversespec.GFlags();
+    Map<String, String> tserverGFlags = new HashMap<>();
+    tserverGFlags.put("ysql_enable_packed_row", "true");
+    gflags.setTserverGFlags(tserverGFlags);
+    ybUniverse.getSpec().setGFlags(gflags);
+
+    ybUniverseReconciler.editUniverse(defaultCustomer, oldUniverse, ybUniverse);
+    ArgumentCaptor<GFlagsUpgradeParams> gflagsCaptor =
+        ArgumentCaptor.forClass(GFlagsUpgradeParams.class);
+    Mockito.verify(upgradeUniverseHandler, Mockito.times(1))
+        .upgradeGFlags(gflagsCaptor.capture(), any(Customer.class), any(Universe.class));
+    GFlagsUpgradeParams captured = gflagsCaptor.getValue();
+    assertNotNull(captured.rollMaxBatchSize);
+    assertEquals(Integer.valueOf(3), captured.rollMaxBatchSize.getPrimaryBatchSize());
+    assertEquals(Integer.valueOf(2), captured.rollMaxBatchSize.getReadReplicaBatchSize());
     Mockito.verifyNoInteractions(universeCRUDHandler);
   }
 
@@ -1401,10 +1535,15 @@ public class YBUniverseReconcilerTest extends FakeDBApplication {
     // Create existing universe with different masterDeviceInfo
     UniverseDefinitionTaskParams taskParams =
         ybUniverseReconciler.createTaskParams(ybUniverse, defaultCustomer.getUuid());
-    taskParams.getPrimaryCluster().userIntent.deviceInfo = new DeviceInfo();
-    taskParams.getPrimaryCluster().userIntent.deviceInfo.volumeSize = 100;
+    DeviceInfo deviceInfo = new DeviceInfo();
+    deviceInfo.volumeSize = 100;
+    TestUtils.existingProviderInitializer(taskParams.getPrimaryCluster().userIntent)
+        .setDeviceInfo(deviceInfo);
+
     // Modify masterDeviceInfo to be different
-    taskParams.getPrimaryCluster().userIntent.masterDeviceInfo.volumeSize = 50;
+    TestUtils.updateDeviceInfo(
+        taskParams.getPrimaryCluster().userIntent, ServerType.MASTER, mdi -> mdi.volumeSize = 50);
+
     Universe existingUniverse = Universe.create(taskParams, defaultCustomer.getId());
     existingUniverse = ModelFactory.addNodesToUniverse(existingUniverse.getUniverseUUID(), 3);
 
@@ -1740,8 +1879,11 @@ public class YBUniverseReconcilerTest extends FakeDBApplication {
     // Create existing universe
     UniverseDefinitionTaskParams taskParams =
         ybUniverseReconciler.createTaskParams(ybUniverse, defaultCustomer.getUuid());
-    taskParams.getPrimaryCluster().userIntent.deviceInfo = new DeviceInfo();
-    taskParams.getPrimaryCluster().userIntent.deviceInfo.volumeSize = 100;
+    DeviceInfo deviceInfo = new DeviceInfo();
+    deviceInfo.volumeSize = 100;
+    TestUtils.existingProviderInitializer(taskParams.getPrimaryCluster().userIntent)
+        .setDeviceInfo(deviceInfo);
+
     Universe existingUniverse = Universe.create(taskParams, defaultCustomer.getId());
     existingUniverse = ModelFactory.addNodesToUniverse(existingUniverse.getUniverseUUID(), 3);
 
@@ -1877,13 +2019,18 @@ public class YBUniverseReconcilerTest extends FakeDBApplication {
     // primary cluster with finalized placementInfo and a userIntent with base deviceInfo.
     UserIntent userIntent = new UserIntent();
     userIntent.universeName = universeName;
-    userIntent.provider = defaultProvider.getUuid().toString();
-    userIntent.deviceInfo = new DeviceInfo();
-    userIntent.deviceInfo.volumeSize = 100;
-    userIntent.deviceInfo.numVolumes = 1;
-    userIntent.masterDeviceInfo = new DeviceInfo();
-    userIntent.masterDeviceInfo.volumeSize = 50;
-    userIntent.masterDeviceInfo.numVolumes = 1;
+
+    DeviceInfo deviceInfo = new DeviceInfo();
+    deviceInfo.volumeSize = 100;
+    deviceInfo.numVolumes = 1;
+
+    DeviceInfo masterDeviceInfo = new DeviceInfo();
+    masterDeviceInfo.volumeSize = 50;
+    masterDeviceInfo.numVolumes = 1;
+
+    TestUtils.initUserIntent(userIntent, defaultProvider, null, deviceInfo, null)
+        .setMasterDeviceInfo(masterDeviceInfo);
+
     UniverseConfigureTaskParams taskParams = buildPrimaryClusterTaskParams(userIntent, az1, az2);
 
     // Create-path: existingUniverse is null.
@@ -1945,14 +2092,19 @@ public class YBUniverseReconcilerTest extends FakeDBApplication {
     // without a perAZ entry will end up using (no override is added for them).
     UserIntent userIntent = new UserIntent();
     userIntent.universeName = universeName;
-    userIntent.provider = defaultProvider.getUuid().toString();
-    userIntent.deviceInfo = new DeviceInfo();
-    userIntent.deviceInfo.volumeSize = 100;
-    userIntent.deviceInfo.numVolumes = 1;
-    userIntent.deviceInfo.storageClass = "base-tserver-sc";
-    userIntent.masterDeviceInfo = new DeviceInfo();
-    userIntent.masterDeviceInfo.volumeSize = 50;
-    userIntent.masterDeviceInfo.numVolumes = 1;
+
+    DeviceInfo deviceInfo = new DeviceInfo();
+    deviceInfo.volumeSize = 100;
+    deviceInfo.numVolumes = 1;
+    deviceInfo.storageClass = "base-tserver-sc";
+
+    DeviceInfo masterDeviceInfo = new DeviceInfo();
+    masterDeviceInfo.volumeSize = 50;
+    masterDeviceInfo.numVolumes = 1;
+
+    TestUtils.initUserIntent(userIntent, defaultProvider, null, deviceInfo, null)
+        .setMasterDeviceInfo(masterDeviceInfo);
+
     UniverseConfigureTaskParams taskParams = buildPrimaryClusterTaskParams(userIntent, az1, az2);
 
     ybUniverseReconciler.applyKubernetesOperatorVolumeOverrides(
@@ -1988,9 +2140,10 @@ public class YBUniverseReconcilerTest extends FakeDBApplication {
 
     // Base tserver deviceInfo on userIntent must remain untouched - that's what AZs without
     // a perAZ entry rely on.
-    assertEquals(100, resultIntent.deviceInfo.volumeSize.intValue());
-    assertEquals(1, resultIntent.deviceInfo.numVolumes.intValue());
-    assertEquals("base-tserver-sc", resultIntent.deviceInfo.storageClass);
+    DeviceInfo di = resultIntent.getBaseDeviceInfo(defaultProvider.getUuid());
+    assertEquals(100, di.volumeSize.intValue());
+    assertEquals(1, di.numVolumes.intValue());
+    assertEquals("base-tserver-sc", di.storageClass);
   }
 
   /*--- Tests for edit-flow applyKubernetesOperatorVolumeOverrides logic ---*/
@@ -2050,11 +2203,13 @@ public class YBUniverseReconcilerTest extends FakeDBApplication {
     // Existing universe has both AZs and previously stored tserver perAZ overrides.
     UserIntent existingUserIntent = new UserIntent();
     existingUserIntent.universeName = universeName;
-    existingUserIntent.provider = defaultProvider.getUuid().toString();
-    existingUserIntent.deviceInfo = new DeviceInfo();
-    existingUserIntent.deviceInfo.volumeSize = 100;
-    existingUserIntent.deviceInfo.numVolumes = 1;
-    existingUserIntent.deviceInfo.storageClass = "base-tserver-sc";
+    DeviceInfo deviceInfo = new DeviceInfo();
+    deviceInfo.volumeSize = 100;
+    deviceInfo.numVolumes = 1;
+    deviceInfo.storageClass = "base-tserver-sc";
+
+    TestUtils.initUserIntent(existingUserIntent, defaultProvider, null, deviceInfo, null);
+
     seedTserverAZOverride(existingUserIntent, az1.getUuid(), 100, "az1-old-sc");
     seedTserverAZOverride(existingUserIntent, az2.getUuid(), 100, "az2-old-sc");
     Universe existingUniverse =
@@ -2087,11 +2242,14 @@ public class YBUniverseReconcilerTest extends FakeDBApplication {
     // (mirrors what the operator passes in on edit).
     UserIntent newUserIntent = new UserIntent();
     newUserIntent.universeName = universeName;
-    newUserIntent.provider = defaultProvider.getUuid().toString();
-    newUserIntent.deviceInfo = new DeviceInfo();
-    newUserIntent.deviceInfo.volumeSize = 100;
-    newUserIntent.deviceInfo.numVolumes = 1;
-    newUserIntent.deviceInfo.storageClass = "base-tserver-sc";
+
+    DeviceInfo newDeviceInfo = new DeviceInfo();
+    newDeviceInfo.volumeSize = 100;
+    newDeviceInfo.numVolumes = 1;
+    newDeviceInfo.storageClass = "base-tserver-sc";
+
+    TestUtils.initUserIntent(newUserIntent, defaultProvider, null, newDeviceInfo, null);
+
     seedTserverAZOverride(newUserIntent, az1.getUuid(), 100, "az1-old-sc");
     seedTserverAZOverride(newUserIntent, az2.getUuid(), 100, "az2-old-sc");
     UniverseConfigureTaskParams taskParams = buildPrimaryClusterTaskParams(newUserIntent, az1, az2);
@@ -2140,14 +2298,19 @@ public class YBUniverseReconcilerTest extends FakeDBApplication {
     // a master override for az1 simulate the post-create / post-prior-edit state.
     UserIntent existingUserIntent = new UserIntent();
     existingUserIntent.universeName = universeName;
-    existingUserIntent.provider = defaultProvider.getUuid().toString();
-    existingUserIntent.deviceInfo = new DeviceInfo();
-    existingUserIntent.deviceInfo.volumeSize = 100;
-    existingUserIntent.deviceInfo.numVolumes = 1;
-    existingUserIntent.deviceInfo.storageClass = "base-tserver-sc";
-    existingUserIntent.masterDeviceInfo = new DeviceInfo();
-    existingUserIntent.masterDeviceInfo.volumeSize = 50;
-    existingUserIntent.masterDeviceInfo.numVolumes = 1;
+
+    DeviceInfo deviceInfo = new DeviceInfo();
+    deviceInfo.volumeSize = 100;
+    deviceInfo.numVolumes = 1;
+    deviceInfo.storageClass = "base-tserver-sc";
+
+    DeviceInfo masterDeviceInfo = new DeviceInfo();
+    masterDeviceInfo.volumeSize = 50;
+    masterDeviceInfo.numVolumes = 1;
+
+    TestUtils.initUserIntent(existingUserIntent, defaultProvider, null, deviceInfo, null)
+        .setMasterDeviceInfo(masterDeviceInfo);
+
     seedTserverAZOverride(existingUserIntent, az1.getUuid(), 200, "az1-tserver-existing");
     // Stash an existing master override for az1 so we can verify it is preserved (skipAZs).
     AZOverrides az1Existing =
@@ -2188,14 +2351,19 @@ public class YBUniverseReconcilerTest extends FakeDBApplication {
     // placement now contains both az1 (retained) and az2 (newly added).
     UserIntent newUserIntent = new UserIntent();
     newUserIntent.universeName = universeName;
-    newUserIntent.provider = defaultProvider.getUuid().toString();
-    newUserIntent.deviceInfo = new DeviceInfo();
-    newUserIntent.deviceInfo.volumeSize = 100;
-    newUserIntent.deviceInfo.numVolumes = 1;
-    newUserIntent.deviceInfo.storageClass = "base-tserver-sc";
-    newUserIntent.masterDeviceInfo = new DeviceInfo();
-    newUserIntent.masterDeviceInfo.volumeSize = 50;
-    newUserIntent.masterDeviceInfo.numVolumes = 1;
+
+    DeviceInfo newDeviceInfo = new DeviceInfo();
+    newDeviceInfo.volumeSize = 100;
+    newDeviceInfo.numVolumes = 1;
+    newDeviceInfo.storageClass = "base-tserver-sc";
+
+    DeviceInfo newMasterDeviceInfo = new DeviceInfo();
+    newMasterDeviceInfo.volumeSize = 50;
+    newMasterDeviceInfo.numVolumes = 1;
+
+    TestUtils.initUserIntent(newUserIntent, defaultProvider, null, newDeviceInfo, null)
+        .setMasterDeviceInfo(newMasterDeviceInfo);
+
     seedTserverAZOverride(newUserIntent, az1.getUuid(), 200, "az1-tserver-existing");
     AZOverrides az1Carried =
         newUserIntent.getUserIntentOverrides().getAzOverrides().get(az1.getUuid());
@@ -3320,8 +3488,9 @@ public class YBUniverseReconcilerTest extends FakeDBApplication {
     UserIntent storedIntent = universe.getUniverseDetails().getPrimaryCluster().userIntent;
     assertTrue("edit must not disable YSQL auth", storedIntent.enableYSQLAuth);
     assertTrue("edit must not disable YCQL auth", storedIntent.enableYCQLAuth);
-    assertEquals("stored-ysql-pass", storedIntent.ysqlPassword);
-    assertEquals("stored-ycql-pass", storedIntent.ycqlPassword);
+    // Stored details always hold the passwords redacted, and null ones are not serialized at all.
+    assertEquals(SECRET_REPLACEMENT, storedIntent.ysqlPassword);
+    assertEquals(SECRET_REPLACEMENT, storedIntent.ycqlPassword);
   }
 
   @Test

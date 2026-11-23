@@ -65,11 +65,17 @@ public class BundleDetails {
     @EnumValue("NodeAgent")
     NodeAgent(ComponentLevel.NodeLevel),
 
+    @EnumValue("NodeHealthLogs")
+    NodeHealthLogs(ComponentLevel.NodeLevel),
+
     @EnumValue("SystemLogs")
     SystemLogs(ComponentLevel.NodeLevel),
 
     @EnumValue("TabletReport")
     TabletReport(ComponentLevel.GlobalLevel),
+
+    @EnumValue("ClusterConfig")
+    ClusterConfig(ComponentLevel.GlobalLevel),
 
     @EnumValue("K8sInfo")
     K8sInfo(ComponentLevel.GlobalLevel),
@@ -117,7 +123,10 @@ public class BundleDetails {
     PROMETHEUS,
     TSERVER_EXPORT,
     CQL_EXPORT,
-    YSQL_EXPORT;
+    YSQL_EXPORT,
+    // Everything scraped for this universe's pods and volume claims - cAdvisor, kubelet and
+    // kube-state-metrics.
+    KUBERNETES;
   }
 
   public enum PrometheusMetricsFormat {
@@ -146,7 +155,7 @@ public class BundleDetails {
     @ApiModelProperty(
         value =
             "Path on the YBA host to the script file to execute on the node (e.g."
-                + " bin/node_utils.sh). May be relative to yb.devops.home.")
+                + " bin/support_bundle_utils.sh). May be relative to yb.devops.home.")
     private String scriptPath;
 
     @ApiModelProperty(
@@ -180,13 +189,13 @@ public class BundleDetails {
     @ApiModelProperty(
         value =
             "Path on the YBA host to the script file to execute on the node (e.g."
-                + " bin/node_utils.sh). May be relative to yb.devops.home.")
+                + " bin/support_bundle_utils.sh). May be relative to yb.devops.home.")
     private String scriptPath;
 
     @ApiModelProperty(
         value =
             "Arguments appended after the script (entrypoint + flags), e.g."
-                + " [collect_top_stats, --remote_tar_path, /tmp/top.tar.gz, ...].")
+                + " [collect_top_ps_pmap_stats, --remote_tar_path, /tmp/top.tar.gz, ...].")
     private List<String> params;
 
     @ApiModelProperty(
@@ -288,8 +297,9 @@ public class BundleDetails {
     @ApiModelProperty(value = "Logical component name; used as output file label.")
     private String componentName;
 
-    @ApiModelProperty(value = "yb-admin subcommand (e.g. list_tables).")
-    private String ybAdminCommand;
+    @ApiModelProperty(
+        value = "yb-admin subcommands to run (each executed separately in one batch).")
+    private List<String> ybAdminCommands;
 
     @ApiModelProperty(value = "Additional arguments after the subcommand.")
     private List<String> ybAdminArgs;

@@ -3097,7 +3097,9 @@ index_update_stats(Relation rel,
 	  * avoid updating statistics if we don't really need to. If auto analyze is enabled, it will keep reltuples
 	  * on the (indexed) main table reasonably accurate, so we can skip updating statistics here.
 	  */
-	update_stats = update_stats && (YBCIsLegacyModeForCatalogOps() || !YBCIsAutoAnalyzeEnabled());
+	update_stats = update_stats &&
+		(!YBCUsingObjectLocksGloballyForCurrentTxn() ||
+		 !YBCIsAutoAnalyzeEnabled());
 	if (update_stats)
 	{
 		if (rd_rel->relpages != (int32) relpages)
@@ -3176,7 +3178,13 @@ index_build(Relation heapRelation,
 	Assert(PointerIsValid(indexRelation->rd_indam->ambuild));
 	Assert(PointerIsValid(indexRelation->rd_indam->ambuildempty));
 
-	if (yb_xcluster_automatic_mode_target_ddl)
+	/*
+	 * YB: on an xCluster automatic-mode target, index rows arrive through
+	 * replication, so the build is skipped.  Copartitioned (ybhnsw)
+	 * indexes are built locally by each cluster and still need the build.
+	 */
+	if (yb_xcluster_automatic_mode_target_ddl &&
+		!indexRelation->rd_indam->yb_amiscopartitioned)
 	{
 		/* Still need to update pg_catalog. */
 		index_update_stats(heapRelation, true, -1);

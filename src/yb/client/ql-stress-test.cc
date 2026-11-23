@@ -573,13 +573,19 @@ TEST_F_EX(QLStressTest, ShortTimeLeaderDoesNotReplicateNoOp, QLStressTestSingleT
   tablet::TabletPeerPtr temp_leader = followers[0];
   tablet::TabletPeerPtr always_follower = followers[1];
 
+  // Both followers must have the leader's last op before they reject updates: temp_leader takes
+  // over below through a non-forced step-down, which a follower that is behind can never accept.
   ASSERT_OK(WaitFor(
-      [old_leader, always_follower]() -> Result<bool> {
+      [old_leader, &followers]() -> Result<bool> {
         auto leader_op_id = VERIFY_RESULT(old_leader->GetConsensus())->GetLastReceivedOpId();
-        auto follower_op_id = VERIFY_RESULT(always_follower->GetConsensus())->GetLastReceivedOpId();
-        return follower_op_id == leader_op_id;
+        for (const auto& follower : followers) {
+          if (VERIFY_RESULT(follower->GetConsensus())->GetLastReceivedOpId() != leader_op_id) {
+            return false;
+          }
+        }
+        return true;
       },
-      5s, "Follower catch up"));
+      5s, "Followers catch up"));
 
   for (const auto& follower : followers) {
     ASSERT_RESULT(follower->GetRaftConsensus())->TEST_RejectMode(consensus::RejectMode::kAll);
@@ -666,7 +672,8 @@ void QLStressTest::VerifyFlushedFrontiers() {
       rocksdb::Options options;
       auto tablet_options = TabletOptions();
       tablet_options.rocksdb_env = db->GetEnv();
-      InitRocksDBOptions(&options, "", "", nullptr, tablet_options);
+      InitRocksDBOptions(
+          &options, "", "", nullptr, tablet_options, docdb::StorageDbType::kRegular);
       std::unique_ptr<rocksdb::DB> checkpoint_db;
       rocksdb::DB* checkpoint_db_raw_ptr = nullptr;
 
@@ -818,10 +825,14 @@ void QLStressTest::AddWriter(
                                    value_prefix = std::move(value_prefix), allow_failures,
                                    txn_manager, transactional_write_probability] {
     auto session = NewSession();
-    session->SetRejectionScoreSource(std::make_shared<RejectionScoreSource>());
     ASSERT_TRUE(txn_manager || transactional_write_probability == 0.0);
 
     while (!stop.load(std::memory_order_acquire)) {
+      // RejectionScoreSource caches one random score per attempt number, so it must be recreated
+      // per write, like the YCQL executor does per statement. A single source shared by the whole
+      // thread pins one score forever, and if none of the writers happens to draw a score above
+      // the SST files soft limit threshold, no write is ever rejected.
+      session->SetRejectionScoreSource(std::make_shared<RejectionScoreSource>());
       YBTransactionPtr txn;
       if (txn_manager && RandomActWithProbability(transactional_write_probability)) {
         txn = std::make_shared<YBTransaction>(txn_manager);

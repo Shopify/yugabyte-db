@@ -119,6 +119,8 @@ struct FsManagerOpts {
 // The current top-level dir layout is <yb.root.dir>/yb-data/<server>/. Subdirs under it are:
 //     logs/
 //     instance
+//     auto_flags_config
+//     ysql_db_history_retention_pins
 //     wals/<table>/<tablet>
 //     tablet-meta/<tablet>
 //     data/rocksdb/<table>/<tablet>/
@@ -132,19 +134,6 @@ class FsManager {
   static const char *kRocksDBDirName;
   static const char *kDataDirName;
 
-  // Storage-tier labels are a fixed, predefined set (see ValidStorageTiers()).
-  // Data roots in --fs_data_dirs that carry no explicit ":tier" suffix fall back
-  // to this default tier, so existing/unlabeled deployments keep working.
-  static const char *kDefaultStorageTier;  // = "ssd"
-
-  // The set of valid storage-tier labels, in a stable order. Any label outside
-  // this set is rejected at FsManager::Init(). kDefaultStorageTier is always a
-  // member.
-  static const std::vector<std::string>& ValidStorageTiers();
-
-  // Whether `tier` is one of ValidStorageTiers().
-  static bool IsValidStorageTier(const std::string& tier);
-
   // Only for unit tests.
   FsManager(Env* env, const std::string& root_path, const std::string& server_type);
 
@@ -153,6 +142,11 @@ class FsManager {
 
   Status ReadAutoFlagsConfig(google::protobuf::Message* msg) EXCLUDES(auto_flag_mutex_);
   Status WriteAutoFlagsConfig(const google::protobuf::Message* msg) EXCLUDES(auto_flag_mutex_);
+
+  // Read/write the persisted cluster-wide per-database history retention pins.
+  // Read returns NotFound when no pins have been persisted yet.
+  Status ReadYsqlDbHistoryRetentionPins(google::protobuf::Message* msg) const;
+  Status WriteYsqlDbHistoryRetentionPins(const google::protobuf::Message* msg) const;
 
   // Initialize and load the basic filesystem metadata.
   // If the file system has not been initialized, returns NotFound.
@@ -191,8 +185,10 @@ class FsManager {
   std::vector<std::string> GetDataRootDirs() const;
 
   // Returns the storage-tier label for a given canonicalized fs root (as
-  // returned by GetFsRootDirs()).  Returns kDefaultStorageTier when the root
-  // is not found in the tier map (e.g. WAL-only roots).
+  // returned by GetFsRootDirs()), or an empty string for a root that is not a
+  // data root (e.g. a WAL-only root): tiers are a property of data roots only,
+  // so reporting the default tier for a WAL root would advertise an ssd data
+  // disk the node does not have.
   const std::string& GetTierForDataRoot(const std::string& canonicalized_fs_root) const;
 
   // Returns all data-root directories (i.e. the paths that GetDataRootDirs()
@@ -355,6 +351,8 @@ class FsManager {
 
   // Checks write to temporary file on root.
   Status CheckWrite(const std::string& path);
+
+  std::string GetYsqlDbHistoryRetentionPinsPath() const;
 
   void CreateAndSetFaultDriveMetric(const std::string& path);
 

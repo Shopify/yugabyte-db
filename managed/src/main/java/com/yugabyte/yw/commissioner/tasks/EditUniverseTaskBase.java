@@ -13,7 +13,6 @@ import com.yugabyte.yw.commissioner.tasks.subtasks.AnsibleConfigureServers;
 import com.yugabyte.yw.commissioner.tasks.subtasks.ChangeMasterConfig;
 import com.yugabyte.yw.commissioner.tasks.subtasks.CheckServiceLiveness;
 import com.yugabyte.yw.commissioner.tasks.subtasks.ConfirmEditRollbackMembership;
-import com.yugabyte.yw.commissioner.tasks.subtasks.RestoreUniverseDetailsFromDelta;
 import com.yugabyte.yw.common.DnsManager;
 import com.yugabyte.yw.common.PlacementInfoUtil;
 import com.yugabyte.yw.common.PlacementInfoUtil.SelectMastersResult;
@@ -23,17 +22,18 @@ import com.yugabyte.yw.common.TableSpaceUtil;
 import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.common.config.GlobalConfKeys;
 import com.yugabyte.yw.common.config.UniverseConfKeys;
+import com.yugabyte.yw.common.gflags.GFlagsUtil;
+import com.yugabyte.yw.common.utils.ManagedLoadBalancerUtil;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.ClusterType;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
 import com.yugabyte.yw.forms.UpgradeTaskParams;
 import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.helpers.ManagedLoadBalancer;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.NodeDetails.MasterState;
 import com.yugabyte.yw.models.helpers.NodeDetails.NodeState;
-import com.yugabyte.yw.models.helpers.StateTransitionDetails;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -52,7 +52,6 @@ import java.util.stream.Stream;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
-import org.yb.client.YBClientApi;
 
 @Slf4j
 public abstract class EditUniverseTaskBase extends UniverseDefinitionTaskBase {
@@ -265,16 +264,24 @@ public abstract class EditUniverseTaskBase extends UniverseDefinitionTaskBase {
 
     // Update any tags on nodes that are not going to be removed and not being added.
     Cluster existingCluster = getUniverse().getCluster(cluster.uuid);
-    if (!cluster.areTagsSame(existingCluster)) {
-      log.info(
-          "Tags changed from '{}' to '{}'.",
-          existingCluster.userIntent.instanceTags,
-          cluster.userIntent.instanceTags);
-      createUpdateInstanceTagsTasks(
-          getNodesInCluster(cluster.uuid, liveNodes),
-          cluster.userIntent.instanceTags,
-          Util.getKeysNotPresent(
-              existingCluster.userIntent.instanceTags, cluster.userIntent.instanceTags));
+    for (UUID providerUUID : existingCluster.userIntent.getAllProviderUUIDs()) {
+      if (!existingCluster.areTagsChanged(cluster, providerUUID)) {
+        continue;
+      }
+      Map<String, String> newTags =
+          nullSafeTags(cluster.userIntent.getInstanceTagsForProvider(providerUUID));
+      Map<String, String> oldTags =
+          nullSafeTags(existingCluster.userIntent.getInstanceTagsForProvider(providerUUID));
+      log.info("Tags changed from '{}' to '{}' for provider {}.", oldTags, newTags, providerUUID);
+      Set<NodeDetails> providerNodes =
+          liveNodes.stream()
+              .filter(n -> n.isInPlacement(cluster.uuid))
+              .filter(n -> providerUUID.equals(cluster.getProviderUUIDForNode(n)))
+              .collect(Collectors.toSet());
+      if (!providerNodes.isEmpty()) {
+        createUpdateInstanceTagsTasks(
+            providerNodes, newTags, Util.getKeysNotPresent(oldTags, newTags));
+      }
     }
 
     boolean ignoreUseCustomImageConfig =
@@ -374,7 +381,14 @@ public abstract class EditUniverseTaskBase extends UniverseDefinitionTaskBase {
       // removal.safe.
       createMarkRollbackUnsafeTaskOnce();
       maybeMoveMasters(
-          universe, clusters, liveNodes, newMasters, newTservers, mastersToStop, removeMasters);
+          universe,
+          clusters,
+          liveNodes,
+          newMasters,
+          existingNodesToStartMaster,
+          newTservers,
+          mastersToStop,
+          removeMasters);
     }
     if (!newTservers.isEmpty() || !tserversToBeRemoved.isEmpty()) {
       // Unblacklisting ADDs can allow tablet placement; end the rollback-safe window first.
@@ -453,7 +467,14 @@ public abstract class EditUniverseTaskBase extends UniverseDefinitionTaskBase {
     if (!moveMastersFirst) {
       // An example task is EditUniverse where multiple nodes are moved including full-move.
       maybeMoveMasters(
-          universe, clusters, liveNodes, newMasters, newTservers, mastersToStop, removeMasters);
+          universe,
+          clusters,
+          liveNodes,
+          newMasters,
+          existingNodesToStartMaster,
+          newTservers,
+          mastersToStop,
+          removeMasters);
     }
     if (!nodesToProvision.isEmpty()) {
       // Set the new nodes' state to live after the processes are running.
@@ -490,6 +511,17 @@ public abstract class EditUniverseTaskBase extends UniverseDefinitionTaskBase {
           .setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
     }
 
+    // Delete the load balancers of the cluster that the new placement does not call for, after
+    // their nodes are gone. This also cleans up a load balancer left by an edit that was rolled
+    // back.
+    List<ManagedLoadBalancer> plannedLbs =
+        ManagedLoadBalancerUtil.planLoadBalancers(
+            cluster, universe.getUniverseDetails().getManagedLoadBalancerState());
+    createDeleteManagedLoadBalancerTasks(
+        lb ->
+            lb.getClusterUuid().equals(cluster.uuid) && plannedLbs.stream().noneMatch(lb::matches),
+        false /* ignoreErrors */);
+
     // Stop scrapping metrics from TServers that is set to be removed
     if (!newTservers.isEmpty()
         || !newMasters.isEmpty()
@@ -501,18 +533,7 @@ public abstract class EditUniverseTaskBase extends UniverseDefinitionTaskBase {
     }
 
     if (!tserversToBeRemoved.isEmpty()) {
-      Duration sleepBeforeStart =
-          confGetter.getConfForScope(
-              universe, UniverseConfKeys.ybEditWaitDurationBeforeBlacklistClear);
-      if (sleepBeforeStart.compareTo(Duration.ZERO) > 0) {
-        createWaitForDurationSubtask(universe, sleepBeforeStart)
-            .setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
-      }
-      createModifyBlackListTask(
-              null /* addNodes */,
-              tserversToBeRemoved /* removeNodes */,
-              false /* isLeaderBlacklist */)
-          .setSubTaskGroupType(SubTaskGroupType.ConfigureUniverse);
+      createClearTserverBlacklistTasks(universe, tserversToBeRemoved);
     }
   }
 
@@ -524,8 +545,6 @@ public abstract class EditUniverseTaskBase extends UniverseDefinitionTaskBase {
             .collect(Collectors.toList());
     UpgradeTaskBase.sortTServersInRestartOrder(universe, tservers);
     removeFromLeaderBlackListIfAvailable(tservers, SubTaskGroupType.UpdatingGFlags);
-    SubTaskGroup subTaskGroup =
-        createSubTaskGroup("AnsibleConfigureServers", SubTaskGroupType.UpdatingGFlags);
     for (NodeDetails nodeDetails : tservers) {
       stopProcessesOnNodes(
           Collections.singletonList(nodeDetails),
@@ -533,6 +552,7 @@ public abstract class EditUniverseTaskBase extends UniverseDefinitionTaskBase {
           false /* remove master from quorum */,
           false /* deconfigure */,
           false /* flushTablets */,
+          false /* ignoreStopError */,
           SubTaskGroupType.UpdatingGFlags);
 
       AnsibleConfigureServers.Params params =
@@ -542,7 +562,12 @@ public abstract class EditUniverseTaskBase extends UniverseDefinitionTaskBase {
               ServerType.TSERVER,
               UpgradeTaskParams.UpgradeTaskType.GFlags,
               UpgradeTaskParams.UpgradeTaskSubType.None);
-      params.gflags = cluster.userIntent.tserverGFlags;
+      // getAnsibleConfigureServerParams reads the DB copy, which does not have this edit's intent.
+      params.gflags =
+          GFlagsUtil.getGFlagsForNode(
+              nodeDetails, ServerType.TSERVER, cluster, universe.getUniverseDetails().clusters);
+      SubTaskGroup subTaskGroup =
+          createSubTaskGroup("AnsibleConfigureServers", SubTaskGroupType.UpdatingGFlags);
       AnsibleConfigureServers task = createTask(AnsibleConfigureServers.class);
       task.initialize(params);
       task.setUserTaskUUID(getUserTaskUUID());
@@ -555,12 +580,7 @@ public abstract class EditUniverseTaskBase extends UniverseDefinitionTaskBase {
           SubTaskGroupType.UpdatingGFlags,
           false,
           true,
-          (serverType) ->
-              serverType == ServerType.MASTER
-                  ? confGetter.getConfForScope(
-                      getUniverse(), UniverseConfKeys.sleepAfterMasterRestartMs)
-                  : confGetter.getConfForScope(
-                      getUniverse(), UniverseConfKeys.sleepAfterTServerRestartMs));
+          true);
     }
   }
 
@@ -626,6 +646,7 @@ public abstract class EditUniverseTaskBase extends UniverseDefinitionTaskBase {
       Collection<Cluster> clusters,
       Set<NodeDetails> liveNodes,
       Set<NodeDetails> newMasters,
+      Set<NodeDetails> existingNodesToStartMaster,
       Set<NodeDetails> newTservers,
       Set<NodeDetails> mastersToStop,
       Set<NodeDetails> removeMasters) {
@@ -649,6 +670,12 @@ public abstract class EditUniverseTaskBase extends UniverseDefinitionTaskBase {
               .collect(Collectors.toSet());
       Set<NodeDetails> currentLiveMasters =
           liveNodes.stream().filter(n -> n.isMaster).collect(Collectors.toSet());
+      // Task params, since a retry can see removed nodes past ToBeRemoved in the DB.
+      Set<String> leavingNodes =
+          PlacementInfoUtil.getNodesToBeRemoved(taskParams().nodeDetailsSet).stream()
+              .map(n -> n.nodeName)
+              .collect(Collectors.toSet());
+      Set<NodeDetails> demotedStayingNodes = new HashSet<>();
       // Now finalize the master quorum change tasks.
       createMoveMastersTasks(
           SubTaskGroupType.ConfigureUniverse,
@@ -671,6 +698,10 @@ public abstract class EditUniverseTaskBase extends UniverseDefinitionTaskBase {
             }
             createMasterAddressUpdateTask(
                 universe, currentLiveMasters, allLiveTservers, false /* ignore error */);
+            if (opType == ChangeMasterConfig.OpType.RemoveMaster
+                && !leavingNodes.contains(node.nodeName)) {
+              demotedStayingNodes.add(node);
+            }
           });
       if (!mastersToStop.isEmpty()) {
         createStopServerTasks(
@@ -684,6 +715,9 @@ public abstract class EditUniverseTaskBase extends UniverseDefinitionTaskBase {
       }
       // Do this once after all the master addresses are frozen as this is expensive.
       createXClusterConfigUpdateMasterAddressesTask();
+      // Existing nodes whose master role changed.
+      queueOtelCollectorConfigRewrite(
+          Sets.union(existingNodesToStartMaster, demotedStayingNodes), false /* ignoreErrors */);
     }
   }
 
@@ -720,54 +754,63 @@ public abstract class EditUniverseTaskBase extends UniverseDefinitionTaskBase {
       if (targetCluster == null) {
         continue;
       }
-      // areTagsSame is true when tags match OR the provider does not support tag modification.
-      if (beforeCluster.areTagsSame(targetCluster)) {
-        continue;
-      }
-
-      Map<String, String> beforeTags = nullSafeTags(beforeCluster);
-      Map<String, String> targetTags = nullSafeTags(targetCluster);
-      Set<NodeDetails> nodesToTag =
-          PlacementInfoUtil.getLiveNodes(getNodesInCluster(beforeCluster.uuid, universe.getNodes()))
-              .stream()
-              .filter(n -> n.getNodeName() != null)
-              .filter(n -> beforeLiveNames.contains(n.getNodeName()))
-              .collect(Collectors.toSet());
-      if (nodesToTag.isEmpty()) {
+      for (UUID providerUUID : beforeCluster.userIntent.getAllProviderUUIDs()) {
+        // areTagsSame is true when tags match OR the provider does not support tag modification.
+        if (!beforeCluster.areTagsChanged(targetCluster, providerUUID)) {
+          continue;
+        }
+        Map<String, String> targetTags =
+            nullSafeTags(targetCluster.userIntent.getInstanceTagsForProvider(providerUUID));
+        Map<String, String> beforeTags =
+            nullSafeTags(beforeCluster.userIntent.getInstanceTagsForProvider(providerUUID));
+        Set<NodeDetails> nodesToTag =
+            PlacementInfoUtil.getLiveNodes(
+                    getNodesInCluster(beforeCluster.uuid, universe.getNodes()))
+                .stream()
+                .filter(n -> n.getNodeName() != null)
+                .filter(n -> beforeLiveNames.contains(n.getNodeName()))
+                .filter(n -> providerUUID.equals(beforeCluster.getProviderUUIDForNode(n)))
+                .collect(Collectors.toSet());
+        if (nodesToTag.isEmpty()) {
+          log.info(
+              "No Live-before/Live-after nodes to revert tags for cluster {}", beforeCluster.uuid);
+          continue;
+        }
         log.info(
-            "No Live-before/Live-after nodes to revert tags for cluster {}", beforeCluster.uuid);
-        continue;
+            "Reverting instance tags on {} node(s) for cluster {}",
+            nodesToTag.size(),
+            beforeCluster.uuid);
+        createUpdateInstanceTagsTasks(
+            nodesToTag, beforeTags, Util.getKeysNotPresent(targetTags, beforeTags));
       }
-      log.info(
-          "Reverting instance tags on {} node(s) for cluster {}",
-          nodesToTag.size(),
-          beforeCluster.uuid);
-      createUpdateInstanceTagsTasks(
-          nodesToTag, beforeTags, Util.getKeysNotPresent(targetTags, beforeTags));
     }
   }
 
-  protected static Map<String, String> nullSafeTags(Cluster cluster) {
-    if (cluster.userIntent == null || cluster.userIntent.instanceTags == null) {
+  protected static Map<String, String> nullSafeTags(Map<String, String> tags) {
+    if (tags == null) {
       return new HashMap<>();
     }
-    return new HashMap<>(cluster.userIntent.instanceTags);
+    return new HashMap<>(tags);
   }
 
   /**
    * Nodes present in the current universe but absent from {@code before} (by name) are the ones the
-   * failed edit added. Always enqueue them for force-delete; missing instances are handled by
-   * {@code isForceDelete}. Universe details converge via restore of {@code before}.
+   * failed edit added. Always enqueue them for destroy. On a cloud a missing instance is fine
+   * because destroy succeeds when it is already gone; onprem destroys are forced. Universe details
+   * converge via restore of {@code before}. A checkpoint with no before nodes is refused, since
+   * every node would then count as added. The precheck calls this, so nothing is destroyed.
    */
   protected Set<NodeDetails> collectAddedNodesToDestroy(
       Universe universe, UniverseDefinitionTaskParams before) {
+    if (before == null || before.nodeDetailsSet == null || before.nodeDetailsSet.isEmpty()) {
+      throw new PlatformServiceException(
+          BAD_REQUEST, "Cannot roll back edit universe: the checkpoint has no before topology");
+    }
     Set<String> beforeNames =
-        before.nodeDetailsSet == null
-            ? Set.of()
-            : before.nodeDetailsSet.stream()
-                .map(NodeDetails::getNodeName)
-                .filter(Objects::nonNull)
-                .collect(Collectors.toSet());
+        before.nodeDetailsSet.stream()
+            .map(NodeDetails::getNodeName)
+            .filter(Objects::nonNull)
+            .collect(Collectors.toSet());
 
     Set<NodeDetails> toDestroy = new HashSet<>();
     for (NodeDetails node : universe.getNodes()) {
@@ -782,49 +825,6 @@ public abstract class EditUniverseTaskBase extends UniverseDefinitionTaskBase {
       toDestroy.add(node);
     }
     return toDestroy;
-  }
-
-  protected SubTaskGroup createRestoreUniverseDetailsFromDeltaTask(
-      StateTransitionDetails stateTransitionDetails) {
-    SubTaskGroup subTaskGroup =
-        createSubTaskGroup("RestoreUniverseDetailsFromDelta", SubTaskGroupType.ConfigureUniverse);
-    RestoreUniverseDetailsFromDelta.Params params = new RestoreUniverseDetailsFromDelta.Params();
-    params.setUniverseUUID(taskParams().getUniverseUUID());
-    params.stateTransitionDetails = stateTransitionDetails;
-    RestoreUniverseDetailsFromDelta task = createTask(RestoreUniverseDetailsFromDelta.class);
-    task.initialize(params);
-    task.setUserTaskUUID(getUserTaskUUID());
-    subTaskGroup.addSubTask(task);
-    getRunnableTask().addSubTaskGroup(subTaskGroup);
-    return subTaskGroup;
-  }
-
-  /**
-   * When {@code rollbackSafe} is true, confirm master cluster config (including server_blacklist)
-   * is reachable. Do not trust the YBA flag alone.
-   */
-  protected void confirmMasterServerBlacklistReadable(Universe universe) {
-    try (YBClientApi client = ybService.getUniverseClient(universe)) {
-      org.yb.client.GetMasterClusterConfigResponse configResponse = client.getMasterClusterConfig();
-      if (configResponse == null || configResponse.getConfig() == null) {
-        throw new PlatformServiceException(
-            BAD_REQUEST,
-            "Cannot roll back edit universe: master cluster config is unavailable to confirm"
-                + " server_blacklist");
-      }
-      int blacklistSize = configResponse.getConfig().getServerBlacklist().getHostsCount();
-      log.info(
-          "Rollback precheck: master server_blacklist has {} host(s) for universe {}",
-          blacklistSize,
-          universe.getUniverseUUID());
-    } catch (PlatformServiceException e) {
-      throw e;
-    } catch (Exception e) {
-      throw new PlatformServiceException(
-          BAD_REQUEST,
-          "Cannot roll back edit universe: failed to read master server_blacklist - "
-              + e.getMessage());
-    }
   }
 
   /**
@@ -943,8 +943,7 @@ public abstract class EditUniverseTaskBase extends UniverseDefinitionTaskBase {
     // Capture ADD IPs before destroy removes nodes from YBA details.
     params.destroyedNodeIps =
         nodesToDestroy.stream()
-            .filter(n -> n.cloudInfo != null && StringUtils.isNotBlank(n.cloudInfo.private_ip))
-            .map(n -> n.cloudInfo.private_ip)
+            .flatMap(n -> Util.getNodeIps(n).stream())
             .collect(Collectors.toSet());
     ConfirmEditRollbackMembership task = createTask(ConfirmEditRollbackMembership.class);
     task.initialize(params);

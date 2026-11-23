@@ -260,6 +260,7 @@ YB_CLIENT_SPECIALIZE_SIMPLE(ListNamespaces);
 YB_CLIENT_SPECIALIZE_SIMPLE(ListTablegroups);
 YB_CLIENT_SPECIALIZE_SIMPLE(ListTables);
 YB_CLIENT_SPECIALIZE_SIMPLE(ListUDTypes);
+YB_CLIENT_SPECIALIZE_SIMPLE(StartTableBackfill);
 YB_CLIENT_SPECIALIZE_SIMPLE(TruncateTable);
 YB_CLIENT_SPECIALIZE_SIMPLE(ValidateReplicationInfo);
 YB_CLIENT_SPECIALIZE_SIMPLE(GetObjectLockStatus);
@@ -331,12 +332,17 @@ YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, IsAlterXClusterReplicationDone);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, DeleteUniverseReplication);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, RepairOutboundXClusterReplicationGroupAddTable);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, RepairOutboundXClusterReplicationGroupRemoveTable);
+YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, DeleteXClusterWalAnchorStreams);
+YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, RecordXClusterStreamBootstrapInfo);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, GetXClusterOutboundReplicationGroups);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, GetXClusterOutboundReplicationGroupInfo);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, GetUniverseReplications);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, GetUniverseReplicationInfo);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, WaitForReplicationDrain);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, XClusterEnsureSequenceUpdatesAreInWal);
+YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, XClusterStopPersisting);
+YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, XClusterStartPersisting);
+YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, XClusterGetPersistenceBlockMap);
 
 #define YB_CLIENT_SPECIALIZE_SIMPLE_EX_EACH(i, data, set) YB_CLIENT_SPECIALIZE_SIMPLE_EX set
 
@@ -386,8 +392,8 @@ Status CheckTabletLocations(
 YBClient::Data::Data()
     : leader_master_rpc_(rpcs_.InvalidHandle()),
       latest_observed_hybrid_time_(YBClient::kNoHybridTime),
-      id_(ClientId::GenerateRandom()),
-      log_prefix_(Format("Client $0: ", id_)) {
+      request_id_allocator_(internal::CreateRequestIdAllocator()),
+      log_prefix_(Format("Client $0: ", request_id_allocator_->client_id())) {
   for(auto& cache : tserver_count_cached_) {
     cache.store(0, std::memory_order_relaxed);
   }
@@ -629,8 +635,12 @@ Status YBClient::Data::IsCreateTableInProgress(
     return STATUS(InternalError, "Cannot query IsCreateTableInProgress without table info");
   }
 
+  // This check is fast, so use the default RPC timeout.  The deadline is for the whole create,
+  // which can be long (e.g., xcluster_automatic_target_create_table_ddl_rpc_timeout_sec).
+  const auto rpc_deadline = std::min(deadline, CoarseMonoClock::Now() + default_rpc_timeout_);
   auto status = SyncLeaderMasterRpc(
-      deadline, req, &resp, "IsCreateTableDone", &master::MasterDdlProxy::IsCreateTableDoneAsync);
+      rpc_deadline, req, &resp, "IsCreateTableDone",
+      &master::MasterDdlProxy::IsCreateTableDoneAsync);
 
   *create_in_progress = !resp.done();
   return status;
@@ -1043,7 +1053,11 @@ Status YBClient::Data::IsBackfillIndexInProgress(YBClient* client,
   *backfill_in_progress = true;
   if (!index_info->backfill_error_message().empty()) {
     *backfill_in_progress = false;
-    return STATUS(Aborted, index_info->backfill_error_message());
+    // backfill_status preserves the error codes (such as the PostgreSQL error code) but may be
+    // stale after a rollback: an old master clears only backfill_error_message on success.
+    return index_info->backfill_status().ok()
+        ? STATUS(Aborted, index_info->backfill_error_message())
+        : index_info->backfill_status().CloneAndReplaceCode(Status::kAborted);
   } else if (index_info->index_permissions() > IndexPermissions::INDEX_PERM_DO_BACKFILL) {
     *backfill_in_progress = false;
   }
@@ -1488,6 +1502,52 @@ class GetTableSchemaRpc
   master::TableIdentifierPB table_identifier_;
   YBTableInfo* info_;
   master::GetTableSchemaResponsePB* resp_copy_;
+};
+
+// Gets a namespace's info from the leader master. See ClientMasterRpc.
+class GetNamespaceInfoRpc
+    : public ClientMasterRpc<master::GetNamespaceInfoRequestPB,
+                             master::GetNamespaceInfoResponsePB> {
+ public:
+  GetNamespaceInfoRpc(YBClient* client,
+                      const NamespaceId& namespace_id,
+                      std::shared_ptr<master::GetNamespaceInfoResponsePB> resp,
+                      StdStatusCallback user_cb,
+                      CoarseTimePoint deadline)
+      : ClientMasterRpc(client, deadline),
+        resp_copy_(std::move(resp)),
+        user_cb_(std::move(user_cb)) {
+    req_.mutable_namespace_()->set_id(namespace_id);
+  }
+
+  std::string ToString() const override {
+    return Format(
+        "GetNamespaceInfoRpc(namespace_id: $0, num_attempts: $1)",
+        req_.namespace_().id(), num_attempts());
+  }
+
+  ~GetNamespaceInfoRpc() override = default;
+
+ private:
+  void CallRemoteMethod() override {
+    master_ddl_proxy()->GetNamespaceInfoAsync(
+        req_, &resp_, mutable_retrier()->mutable_controller(),
+        std::bind(&GetNamespaceInfoRpc::Finished, this, Status::OK()));
+  }
+
+  void ProcessResponse(const Status& status) override {
+    if (status.ok()) {
+      resp_copy_->Swap(&resp_);
+    } else {
+      LOG(WARNING) << ToString() << " failed: " << status.ToString();
+    }
+    user_cb_(status);
+  }
+
+  // Held rather than borrowed so that the response outlives the RPC regardless of what the
+  // caller does after starting it.
+  std::shared_ptr<master::GetNamespaceInfoResponsePB> resp_copy_;
+  StdStatusCallback user_cb_;
 };
 
 // Gets all table schemas for a tablegroup from the leader master. See ClientMasterRpc.
@@ -2043,7 +2103,8 @@ class GetCDCStreamRpc : public ClientMasterRpc<GetCDCStreamRequestPB, GetCDCStre
       ObjectId* object_id,
       std::unordered_map<std::string, std::string>* options,
       CoarseTimePoint deadline,
-      bool* xcluster_use_target_applied_filter);
+      bool* xcluster_use_target_applied_filter,
+      std::vector<TabletId>* xcluster_bootstrap_tablet_ids);
 
   std::string ToString() const override;
 
@@ -2058,6 +2119,7 @@ class GetCDCStreamRpc : public ClientMasterRpc<GetCDCStreamRequestPB, GetCDCStre
   ObjectId* object_id_;
   std::unordered_map<std::string, std::string>* options_;
   bool* xcluster_use_target_applied_filter_;
+  std::vector<TabletId>* xcluster_bootstrap_tablet_ids_;
 };
 
 GetCDCStreamRpc::GetCDCStreamRpc(
@@ -2067,13 +2129,15 @@ GetCDCStreamRpc::GetCDCStreamRpc(
     TableId* object_id,
     std::unordered_map<std::string, std::string>* options,
     CoarseTimePoint deadline,
-    bool* xcluster_use_target_applied_filter)
+    bool* xcluster_use_target_applied_filter,
+    std::vector<TabletId>* xcluster_bootstrap_tablet_ids)
     : ClientMasterRpc(client, deadline),
       user_cb_(std::move(user_cb)),
       stream_id_(stream_id),
       object_id_(DCHECK_NOTNULL(object_id)),
       options_(DCHECK_NOTNULL(options)),
-      xcluster_use_target_applied_filter_(xcluster_use_target_applied_filter) {
+      xcluster_use_target_applied_filter_(xcluster_use_target_applied_filter),
+      xcluster_bootstrap_tablet_ids_(xcluster_bootstrap_tablet_ids) {
   req_.set_stream_id(stream_id_.ToString());
 }
 
@@ -2108,6 +2172,11 @@ void GetCDCStreamRpc::ProcessResponse(const Status& status) {
 
     if (xcluster_use_target_applied_filter_) {
       *xcluster_use_target_applied_filter_ = resp_.stream().xcluster_use_target_applied_filter();
+    }
+
+    if (xcluster_bootstrap_tablet_ids_) {
+      const auto& tablet_ids = resp_.stream().xcluster_bootstrap_info().checkpointed_tablet_ids();
+      xcluster_bootstrap_tablet_ids_->assign(tablet_ids.begin(), tablet_ids.end());
     }
   }
   user_cb_(status);
@@ -2217,6 +2286,71 @@ class GetTableLocationsRpc
   GetTableLocationsCallback user_cb_;
 };
 
+class GetTabletLocationsRpc
+    : public ClientMasterRpc<
+          master::GetTabletLocationsRequestPB, master::GetTabletLocationsResponsePB> {
+ public:
+  GetTabletLocationsRpc(
+      YBClient* client, const std::vector<TabletId>& tablet_ids,
+      master::IncludeHidden include_hidden, GetTabletLocationsCallback user_cb,
+      CoarseTimePoint deadline)
+      : ClientMasterRpc(client, deadline), user_cb_(std::move(user_cb)) {
+    req_.mutable_tablet_ids()->Reserve(narrow_cast<int>(tablet_ids.size()));
+    for (const auto& tablet_id : tablet_ids) {
+      req_.add_tablet_ids(tablet_id);
+    }
+    req_.set_include_hidden(include_hidden);
+  }
+
+  std::string ToString() const override {
+    return Format(
+        "GetTabletLocationsRpc(tablet_ids: $0, include_hidden: $1, num_attempts: $2)",
+        AsString(req_.tablet_ids()), req_.include_hidden(), num_attempts());
+  }
+
+  ~GetTabletLocationsRpc() override = default;
+
+ private:
+  void CallRemoteMethod() override {
+    master_client_proxy()->GetTabletLocationsAsync(
+        req_, &resp_, mutable_retrier()->mutable_controller(),
+        std::bind(&GetTabletLocationsRpc::Finished, this, Status::OK()));
+  }
+
+  bool ShouldRetry(const Status& status) override {
+    if (status.IsShutdownInProgress() || status.IsAborted() || status.IsNotFound() ||
+        status.IsInvalidArgument()) {
+      // Permanent errors.
+      LOG(WARNING) << ToString() << " failed: " << status;
+      return false;
+    }
+    if (!status.ok()) {
+      YB_LOG_EVERY_N_SECS(WARNING, 10)
+          << ToString() << ": error getting tablet locations: " << status << ", retrying.";
+      return true;
+    }
+    for (const auto& error : resp_.errors()) {
+      if (StatusFromPB(error.status()).IsServiceUnavailable()) {
+        YB_LOG_EVERY_N_SECS(WARNING, 10)
+            << ToString() << ": tablet " << error.tablet_id() << " is not running, retrying.";
+        resp_.Clear();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void ProcessResponse(const Status& status) override {
+    if (status.ok()) {
+      user_cb_(&resp_);
+    } else {
+      user_cb_(status);
+    }
+  }
+
+  GetTabletLocationsCallback user_cb_;
+};
+
 // A simple RPC that keeps retrying if resp has not_ready set.
 class GetXClusterStreamsRpc
     : public ClientMasterRpc<
@@ -2248,12 +2382,13 @@ class GetXClusterStreamsRpc
 
   Status Init(
       const xcluster::ReplicationGroupId& replication_group_id, const NamespaceId& namespace_id,
-      const std::vector<TableId>& source_table_ids) {
+      const std::vector<TableId>& source_table_ids, bool create_stream_if_missing) {
     req_.set_replication_group_id(replication_group_id.ToString());
     req_.set_namespace_id(namespace_id);
     for (const auto& table_id : source_table_ids) {
       req_.add_source_table_ids(table_id);
     }
+    req_.set_create_stream_if_missing(create_stream_if_missing);
     return Status::OK();
   }
 
@@ -2577,6 +2712,22 @@ Status YBClient::Data::GetTablegroupSchemaById(
   return Status::OK();
 }
 
+void YBClient::Data::GetNamespaceInfo(
+    YBClient* client,
+    const NamespaceId& namespace_id,
+    CoarseTimePoint deadline,
+    std::shared_ptr<master::GetNamespaceInfoResponsePB> resp,
+    StdStatusCallback callback) {
+  auto rpc = std::make_shared<internal::GetNamespaceInfoRpc>(
+      client, namespace_id, std::move(resp), callback, deadline);
+  // Registration fails once rpcs_ is shutting down, and an rpc rejected there is aborted before
+  // it is sent, so its own callback never runs. Report that to the caller here.
+  auto status = rpcs_.RegisterAndStartStatus(rpc, rpc->RpcHandle());
+  if (!status.ok()) {
+    callback(status);
+  }
+}
+
 Result<IndexPermissions> YBClient::Data::GetIndexPermissions(
     YBClient* client,
     const TableId& table_id,
@@ -2737,7 +2888,8 @@ void YBClient::Data::GetCDCStream(
     std::shared_ptr<std::unordered_map<std::string, std::string>> options,
     CoarseTimePoint deadline,
     StdStatusCallback callback,
-    std::shared_ptr<bool> xcluster_use_target_applied_filter) {
+    std::shared_ptr<bool> xcluster_use_target_applied_filter,
+    std::shared_ptr<std::vector<TabletId>> xcluster_bootstrap_tablet_ids) {
   auto rpc = StartRpc<internal::GetCDCStreamRpc>(
       client,
       callback,
@@ -2745,7 +2897,8 @@ void YBClient::Data::GetCDCStream(
       object_id.get(),
       options.get(),
       deadline,
-      xcluster_use_target_applied_filter.get());
+      xcluster_use_target_applied_filter.get(),
+      xcluster_bootstrap_tablet_ids.get());
 }
 
 void YBClient::Data::DeleteNotServingTablet(
@@ -2782,6 +2935,14 @@ void YBClient::Data::GetTableLocations(
   auto rpc = StartRpc<internal::GetTableLocationsRpc>(
       client, table_id, max_tablets, require_tablets_running, partitions_only,
       callback, deadline);
+}
+
+void YBClient::Data::GetTabletLocations(
+    YBClient* client, const std::vector<TabletId>& tablet_ids,
+    master::IncludeHidden include_hidden, CoarseTimePoint deadline,
+    GetTabletLocationsCallback callback) {
+  auto rpc = StartRpc<internal::GetTabletLocationsRpc>(
+      client, tablet_ids, include_hidden, std::move(callback), deadline);
 }
 
 void YBClient::Data::LeaderMasterDetermined(const Status& status,
@@ -3250,11 +3411,12 @@ Status YBClient::Data::GetXClusterStreams(
 Status YBClient::Data::GetXClusterStreams(
     YBClient* client, CoarseTimePoint deadline,
     const xcluster::ReplicationGroupId& replication_group_id, const NamespaceId& namespace_id,
-    const std::vector<TableId>& source_table_ids,
+    const std::vector<TableId>& source_table_ids, bool create_stream_if_missing,
     std::function<void(Result<master::GetXClusterStreamsResponsePB>)> user_cb) {
   auto rpc =
       std::make_shared<internal::GetXClusterStreamsRpc>(client, std::move(user_cb), deadline);
-  RETURN_NOT_OK(rpc->Init(replication_group_id, namespace_id, source_table_ids));
+  RETURN_NOT_OK(
+      rpc->Init(replication_group_id, namespace_id, source_table_ids, create_stream_if_missing));
   rpcs_.RegisterAndStart(rpc, rpc->RpcHandle());
 
   return Status::OK();

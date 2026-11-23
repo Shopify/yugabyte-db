@@ -61,6 +61,7 @@ target_link_libraries(yb-admin
   ${LINK_LIBS})
 
 add_library(yb-admin_lib
+  xcluster_verify.cc
   yb-admin_client.cc
   yb-admin_util.cc)
 target_link_libraries(yb-admin_lib
@@ -201,6 +202,7 @@ target_link_libraries(yb-admin-test-base integration-tests ql-dml-test-base)
 set(YB_TEST_LINK_LIBS
   admin-test-base
   ysck
+  yb_common_test_util
   yb-admin_lib
   yb_client
   yb_tools_util
@@ -243,6 +245,7 @@ ADD_YB_TEST(yb-backup/yb-backup-cross-feature-test)
 ADD_YB_TEST(yb-backup/yb-backup-during-ddl-test)
 ADD_YB_TEST(yb-admin-snapshot-test)
 ADD_YB_TEST(yb-admin-xcluster-test)
+ADD_YB_TEST(xcluster_verify-test)
 ADD_YB_TEST(yb-admin_client-test)
 ADD_YB_TEST(yb-admin-are-nodes-safe-test)
 ADD_YB_TEST(pbc_tools_test)
@@ -263,8 +266,17 @@ ADD_YB_TEST_LIBRARY(yb-backup-test_base
                     SRCS ${YB_BACKUP_TEST_BASE_SRCS}
                     DEPS ${YB_BACKUP_TEST_BASE_DEPS})
 
-add_executable(hnsw_tool hnsw_tool.cc)
-target_link_libraries(hnsw_tool boost_program_options yb_util yb_docdb vector_index)
+# hnsw_tool bundles its own pgvector backend so that the libpq dependency (pulled in via
+# pq_utils) stays scoped to this tool and does not leak into other consumers of ann_methods.
+add_executable(hnsw_tool hnsw_tool.cc pgvector_wrapper.cc)
+target_link_libraries(hnsw_tool
+                      boost_program_options
+                      ann_methods
+                      pq_utils
+                      yb_util
+                      yb_docdb
+                      vector_index)
+add_dependencies(hnsw_tool postgres)
 
 add_executable(clockbound_dump clockbound_dump.cc)
 target_link_libraries(clockbound_dump

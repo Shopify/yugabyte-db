@@ -42,15 +42,19 @@
 
 #include "yb/master/master.h"
 #include "yb/master/catalog_entity_info.h"
+#include "yb/master/catalog_manager.h"
 #include "yb/master/catalog_manager_if.h"
 #include "yb/master/mini_master.h"
+#include "yb/master/pg_catalog_versions_cache.h"
 #include "yb/master/sys_catalog.h"
 #include "yb/master/sys_catalog_constants.h"
 #include "yb/master/ts_manager.h"
 #include "yb/rocksdb/db.h"
+#include "yb/rocksdb/statistics.h"
 
 #include "yb/server/skewed_clock.h"
 
+#include "yb/tserver/full_compaction_manager.h"
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/pg_client.pb.h"
 #include "yb/tserver/pg_client.proxy.h"
@@ -58,6 +62,7 @@
 #include "yb/tserver/tablet_server.h"
 
 #include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/transaction_participant.h"
 
@@ -65,9 +70,11 @@
 
 #include "yb/util/atomic.h"
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/cgroups.h"
 #include "yb/util/countdown_latch.h"
 #include "yb/util/debug-util.h"
 #include "yb/util/enums.h"
+#include "yb/util/format.h"
 #include "yb/util/logging_test_util.h"
 #include "yb/util/random_util.h"
 #include "yb/util/range.h"
@@ -105,6 +112,7 @@ DECLARE_bool(TEST_tablet_pause_apply_write_ops);
 DECLARE_bool(delete_intents_sst_files);
 DECLARE_bool(enable_automatic_tablet_splitting);
 DECLARE_bool(enable_colocated_table_tombstone_cache);
+DECLARE_bool(enable_schema_packing_gc);
 DECLARE_bool(enable_tracing);
 DECLARE_bool(enable_wait_queues);
 DECLARE_bool(flush_rocksdb_on_shutdown);
@@ -112,18 +120,20 @@ DECLARE_bool(pg_client_use_shared_memory);
 DECLARE_bool(rocksdb_disable_compactions);
 DECLARE_bool(use_bootstrap_intent_ht_filter);
 DECLARE_bool(ysql_allow_duplicating_repeatable_read_queries);
+DECLARE_bool(ysql_disable_index_backfill);
+DECLARE_bool(ysql_enable_packed_row);
 DECLARE_bool(ysql_yb_enable_ash);
 DECLARE_bool(ysql_yb_enable_replica_identity);
 DECLARE_bool(ysql_enable_auto_analyze);
 DECLARE_bool(ysql_yb_ddl_transaction_block_enabled);
-DECLARE_bool(enable_object_locking_for_table_locks);
-DECLARE_bool(ysql_enable_concurrent_ddl);
 
 DECLARE_double(TEST_respond_write_failed_probability);
 DECLARE_double(TEST_transaction_ignore_applying_probability);
+DECLARE_double(auto_compact_percent_obsolete);
 
 DECLARE_int32(TEST_inject_mvcc_delay_add_leader_pending_ms);
 DECLARE_int32(TEST_txn_participant_inject_latency_on_apply_update_txn_ms);
+DECLARE_int32(auto_compact_check_interval_sec);
 DECLARE_int32(catalog_manager_bg_task_wait_ms);
 DECLARE_int32(gzip_stream_compression_level);
 DECLARE_int32(heartbeat_interval_ms);
@@ -140,6 +150,8 @@ DECLARE_int32(txn_max_apply_batch_records);
 DECLARE_int32(yb_num_shards_per_tserver);
 DECLARE_int32(ysql_yb_ash_sample_size);
 DECLARE_int32(ysql_ddl_rpc_timeout_sec);
+DECLARE_uint32(auto_compact_min_obsolete_keys_found);
+DECLARE_uint32(auto_compact_stat_window_seconds);
 DECLARE_uint32(yb_max_recursion_depth);
 
 DECLARE_int64(TEST_inject_random_delay_on_txn_status_response_ms);
@@ -235,12 +247,6 @@ class PgMiniTest : public PgMiniTestBase {
 
 class PgMiniTestSingleNode : public PgMiniTest {
  protected:
-  void SetUp() override {
-    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_object_locking_for_table_locks) = true;
-    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_yb_ddl_transaction_block_enabled) = true;
-    PgMiniTest::SetUp();
-  }
-
   size_t NumTabletServers() override {
     return 1;
   }
@@ -265,6 +271,22 @@ class PgMiniPgClientServiceCleanupTest : public PgMiniTestSingleNode {
   }
 };
 
+// A freshly connected backend's session has recorded the backend's database, although the backend
+// has not yet touched any of the database's relations.
+TEST_F(PgMiniTest, SessionRecordsConnectedDatabase) {
+  auto setup_conn = ASSERT_RESULT(Connect());
+  const auto db_oid = ASSERT_RESULT(setup_conn.FetchRow<PGOid>(
+      "SELECT oid FROM pg_database WHERE datname = current_database()"));
+
+  // This is not the first connection to this database, which makes the test stronger: the first
+  // connection to a database does extra work building the relcache init file via reading catalogs,
+  // which later connections do not do; PG client service could infer the database from those reads
+  // alone, so only a later connection shows it is recorded without them.
+  auto conn = ASSERT_RESULT(Connect());
+  auto* client_service = cluster_->mini_tablet_server(0)->server()->TEST_GetPgClientService();
+  ASSERT_EQ(client_service->TEST_SessionDatabaseOid(conn.BackendPID()), db_oid);
+}
+
 TEST_F_EX(PgMiniTest, VerifyPgClientServiceCleanupQueue, PgMiniPgClientServiceCleanupTest) {
   constexpr size_t kTotalConnections = 30;
   constexpr size_t kAshConnection = 1;
@@ -277,9 +299,8 @@ TEST_F_EX(PgMiniTest, VerifyPgClientServiceCleanupQueue, PgMiniPgClientServiceCl
       cluster_->mini_tablet_server(0)->server()->TEST_GetPgClientService();
   // The first Connect() to a fresh DB spawns an internal libpq backend
   // (TriggerRelcacheInitConnection) whose session lingers in sessions_
-  // for the platform's ListenConnectionShutdown delay (up to 250ms on
-  // macOS, 1s under sanitizers). Poll until it drains instead of
-  // asserting immediately.
+  // for the platform's ListenConnectionShutdown delay.
+  // Poll until it drains instead of asserting immediately.
   ASSERT_OK(WaitFor([client_service, expected_count = connections.size() + kAshConnection]() {
     return client_service->TEST_SessionsCount() == expected_count;
   }, 5s, "relcache-init session cleanup"));
@@ -1696,6 +1717,9 @@ TEST_F_EX(PgMiniTest, VerifyTombstoneTimeCache, PgMiniTestSingleNode) {
   ASSERT_OK(conn.ExecuteFormat("CREATE DATABASE $0 WITH colocated=true", kDbName));
   conn = ASSERT_RESULT(ConnectToDB(kDbName));
 
+  // Keeps the colocation tablet alive when kTableName is dropped.
+  ASSERT_OK(conn.Execute("CREATE TABLE keep_tablet (v int PRIMARY KEY)"));
+
   ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (v int PRIMARY KEY) WITH (colocation_id=$1)",
       kTableName, kColocationId));
   ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 VALUES ($1), ($2), ($3)",
@@ -1836,9 +1860,13 @@ TEST_F_EX(PgMiniTest, TruncateVisibleThroughTombstoneCache, PgMiniTestSingleNode
   // Trigger guard 2: prove the TRUNCATE took the tombstone path. The bytes on disk are
   // correct - this is a read-path bug - so the dump (not a SELECT) is the right probe for
   // this guard; do not "simplify" the wrongness assertions below to use the dump.
+  // The tombstone is a DDL txn intent applied to regular DB asynchronously after commit.
   auto tablet = ASSERT_RESULT(peer->shared_tablet());
-  auto dump = tablet->TEST_DocDBDumpStr();
-  ASSERT_TRUE(DumpHasTableTombstone(dump, kColocationId))
+  std::string dump;
+  ASSERT_TRUE(WaitFor([&] {
+    dump = tablet->TEST_DocDBDumpStr();
+    return DumpHasTableTombstone(dump, kColocationId);
+  }, 30s * kTimeMultiplier, "Table tombstone applied").ok())
       << "TRUNCATE did not write a table-level tombstone (rewrite path taken?). Dump:\n" << dump;
 
   // The stale read, served through the cached pre-truncate tombstone time.
@@ -1936,8 +1964,12 @@ TEST_F_EX(PgMiniTest, TruncateTombstoneCacheHealedByRestart, PgMiniTestSingleNod
     auto peers = ListTableActiveTabletLeadersPeers(cluster_.get(), table_id);
     ASSERT_EQ(peers.size(), 1);
     auto tablet = ASSERT_RESULT(peers.front()->shared_tablet());
-    ASSERT_TRUE(DumpHasTableTombstone(tablet->TEST_DocDBDumpStr(), kColocationId))
-        << "TRUNCATE did not write a table-level tombstone (rewrite path taken?)";
+    std::string dump;
+    ASSERT_TRUE(WaitFor([&] {
+      dump = tablet->TEST_DocDBDumpStr();
+      return DumpHasTableTombstone(dump, kColocationId);
+    }, 30s * kTimeMultiplier, "Table tombstone applied").ok())
+        << "TRUNCATE did not write a table-level tombstone (rewrite path taken?). Dump:\n" << dump;
   }
 
   ASSERT_OK(RestartCluster());
@@ -2212,6 +2244,55 @@ TEST(DocReadContextTombstoneCacheTest, RejectTombstoneAboveWatermark) {
   ASSERT_EQ(*ctx.table_tombstone_time(), DocHybridTime::kInvalid);
 }
 
+// The TableInfo rebuilds that keep the table's data (schema GC, backfill done) carry the
+// tombstone-cache state over, including what a tombstone notify did to the old context before the
+// rebuild. The plain copy, used for same-version rebuilds, still resets it.
+TEST(DocReadContextTombstoneCacheTest, RebuildCarriesCacheState) {
+  SchemaBuilder builder;
+  ASSERT_OK(builder.AddKeyColumn("k", DataType::INT32));
+  auto schema = builder.Build();
+  schema.set_colocation_id(42);
+  auto ctx = docdb::DocReadContext::TEST_Create(schema);
+  ASSERT_EQ(
+      docdb::DocReadContext(ctx, SchemaVersion{0}).tombstone_cache_watermark(), HybridTime::kMax);
+
+  const auto kWatermark = HybridTime::FromMicros(100);
+  const auto kReadHt = HybridTime::FromMicros(150);
+  ctx.AdvanceTombstoneCacheWatermark(kWatermark);
+  ctx.set_table_tombstone_time(DocHybridTime::kInvalid, ctx.tombstone_cache_generation());
+  ASSERT_TRUE(ctx.GetCachedTableTombstoneTime(kReadHt).has_value());
+
+  {
+    const docdb::DocReadContext filtered(ctx, SchemaVersion{0});
+    const docdb::DocReadContext replaced(ctx, ctx.schema());
+    for (const auto* rebuilt : {&filtered, &replaced}) {
+      SCOPED_TRACE(rebuilt == &filtered ? "schema GC rebuild" : "backfill-done rebuild");
+      ASSERT_EQ(rebuilt->tombstone_cache_watermark(), kWatermark);
+      ASSERT_EQ(rebuilt->tombstone_cache_generation(), ctx.tombstone_cache_generation());
+      auto cached = rebuilt->GetCachedTableTombstoneTime(kReadHt);
+      ASSERT_TRUE(cached.has_value());
+      ASSERT_EQ(*cached, DocHybridTime::kInvalid);
+    }
+    ASSERT_EQ(docdb::DocReadContext(ctx).tombstone_cache_watermark(), HybridTime::kMax);
+  }
+
+  // A tombstone applied before the rebuild: the raised watermark and the dropped entry carry over,
+  // and a populate stamped before the notify still misses in the rebuilt context.
+  const auto generation_before_notify = ctx.tombstone_cache_generation();
+  const auto kTombstoneHt = HybridTime::FromMicros(200);
+  ctx.OnTableTombstoneWritten(kTombstoneHt);
+  const docdb::DocReadContext filtered(ctx, SchemaVersion{0});
+  const docdb::DocReadContext replaced(ctx, ctx.schema());
+  for (const auto* rebuilt : {&filtered, &replaced}) {
+    SCOPED_TRACE(rebuilt == &filtered ? "schema GC rebuild" : "backfill-done rebuild");
+    ASSERT_EQ(rebuilt->tombstone_cache_watermark(), kTombstoneHt);
+    ASSERT_FALSE(rebuilt->IsTombstoneCacheEligible(kReadHt));
+    ASSERT_FALSE(rebuilt->table_tombstone_time().has_value());
+    rebuilt->set_table_tombstone_time(DocHybridTime::kInvalid, generation_before_notify);
+    ASSERT_FALSE(rebuilt->table_tombstone_time().has_value());
+  }
+}
+
 // #32724 (f): RF3. A replica that held a warm cache while it was a follower must still see the
 // legacy TRUNCATE. Followers never run ApplyTruncateColocated (leader-side batch assembly), so
 // only the apply-path notify invalidates them; without it, moving leadership onto such a replica
@@ -2232,8 +2313,26 @@ TEST_F(PgMiniTest, TruncateColocatedInvalidatesTombstoneCacheOnFollower) {
       ASSERT_RESULT(conn.FetchRow<int64_t>(Format("SELECT count(*) FROM $0", kTableName))), 3);
 
   auto table_id = ASSERT_RESULT(GetTableIDFromTableName(kTableName));
-  auto peers = ListTableActiveTabletPeers(cluster_.get(), table_id);
-  ASSERT_EQ(peers.size(), NumTabletServers());
+  // CREATE TABLE returns once the leader has applied the colocated ADD_TABLE op; followers apply
+  // it asynchronously and only report the table afterwards, so poll instead of sampling once.
+  std::vector<tablet::TabletPeerPtr> peers;
+  ASSERT_OK(WaitFor(
+      [&] {
+        peers = ListTableActiveTabletPeers(cluster_.get(), table_id);
+        if (peers.size() != NumTabletServers()) {
+          return false;
+        }
+        // Arming happens later in the same apply, so wait for it too.
+        for (const auto& peer : peers) {
+          auto table_info = peer->tablet_metadata()->GetTableInfo(kColocationId);
+          if (!table_info.ok() || !(*table_info)->doc_read_context ||
+              (*table_info)->doc_read_context->tombstone_cache_watermark() == HybridTime::kMax) {
+            return false;
+          }
+        }
+        return true;
+      },
+      30s * kTimeMultiplier, "Every replica of the colocated tablet armed the table"));
   const auto tablet_id = peers.front()->tablet_id();
 
   auto doc_read_context = [&](const tablet::TabletPeerPtr& peer) {
@@ -2309,6 +2408,232 @@ TEST_F(PgMiniTest, TruncateColocatedInvalidatesTombstoneCacheOnFollower) {
   ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 VALUES (4)", kTableName));
   ASSERT_EQ(
       ASSERT_RESULT(conn.FetchRow<int64_t>(Format("SELECT count(*) FROM $0", kTableName))), 1);
+}
+
+// A colocated table's DocReadContext starts unarmed (tombstone-cache watermark kMax: the cache is
+// neither consumed nor populated), so every path that installs a new TableInfo has to arm it or
+// carry over the old context's cache state. A path that does neither leaves the table's cache off
+// until the next ALTER or restart, and every scan of the table then does a full table-tombstone
+// lookup (an IntentAwareIterator plus a seek) that the cache exists to avoid. These tests cover
+// old-schema-version GC, which runs after compactions, and the index backfill-done metadata update.
+YB_STRONGLY_TYPED_BOOL(WithIndex);
+YB_STRONGLY_TYPED_BOOL(IndexAfterRows);
+
+class PgMiniTombstoneCacheRebuildTest : public PgMiniTest {
+ protected:
+  void SetUp() override {
+    // Packed rows default to off in debug builds, and schema GC only sees schema versions recorded
+    // for packed rows.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_packed_row) = true;
+    PgMiniTest::SetUp();
+  }
+
+  size_t NumTabletServers() override {
+    return 1;
+  }
+
+  // PgMiniTestBase turns online index backfill off; production has it on, and the backfill-done
+  // metadata update is one of the rebuild paths under test.
+  void BeforePgProcessStart() override {
+    PgMiniTest::BeforePgProcessStart();
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_disable_index_backfill) = false;
+  }
+
+  static constexpr int kTableColocationId = 30001;
+  static constexpr int kIndexColocationId = 30002;
+  static constexpr int kNumRows = 100;
+  static constexpr int kNumUpdates = 200;
+
+  // Creates colocated table t(k PK, v, w), optionally with an index on v (which bumps t's schema
+  // version) created before or after the rows, and warms t's tombstone-time cache with a
+  // base-table scan.
+  Status SetUpTable(
+      WithIndex with_index, IndexAfterRows index_after_rows = IndexAfterRows::kFalse) {
+    const std::string kDbName = "tombstone_cache_rebuild_db";
+    auto conn = VERIFY_RESULT(Connect());
+    RETURN_NOT_OK(conn.ExecuteFormat("CREATE DATABASE $0 WITH colocated=true", kDbName));
+    conn_.emplace(VERIFY_RESULT(ConnectToDB(kDbName)));
+    RETURN_NOT_OK(conn_->ExecuteFormat(
+        "CREATE TABLE t (k int PRIMARY KEY, v int, w int) WITH (colocation_id=$0)",
+        kTableColocationId));
+    auto create_index_stmt = Format(
+        "CREATE INDEX t_v_idx ON t (v) WITH (colocation_id=$0)", kIndexColocationId);
+    if (with_index && !index_after_rows) {
+      RETURN_NOT_OK(conn_->Execute(create_index_stmt));
+    }
+    RETURN_NOT_OK(conn_->ExecuteFormat(
+        "INSERT INTO t SELECT i, i, 0 FROM generate_series(1, $0) i", kNumRows));
+    if (with_index && index_after_rows) {
+      RETURN_NOT_OK(conn_->Execute(create_index_stmt));
+    }
+    // w is not in the index, so this scans the base table.
+    RETURN_NOT_OK(conn_->FetchRow<int64_t>("SELECT sum(w) FROM t"));
+
+    auto table_id = VERIFY_RESULT(GetTableIDFromTableName("t"));
+    auto peers = ListTableActiveTabletLeadersPeers(cluster_.get(), table_id);
+    SCHECK_EQ(peers.size(), 1U, IllegalState, "Expected one colocated tablet leader");
+    peer_ = peers.front();
+    return Status::OK();
+  }
+
+  Result<tablet::TableInfoPtr> ColocatedTableInfo(ColocationId colocation_id) {
+    auto table_info = VERIFY_RESULT(peer_->tablet_metadata()->GetTableInfo(colocation_id));
+    SCHECK(table_info && table_info->doc_read_context, IllegalState, "No DocReadContext");
+    return table_info;
+  }
+
+  // Regular-DB seeks issued by kNumUpdates single-row primary-key UPDATEs of the non-indexed
+  // column. Each UPDATE reads its row through one DocRowwiseIterator; with the cache off that
+  // iterator also does the table-tombstone lookup, i.e. one more regular-DB seek per UPDATE.
+  Result<uint64_t> RegularDbSeeksForUpdates() {
+    auto tablet = VERIFY_RESULT(peer_->shared_tablet());
+    const auto& stats = tablet->regulardb_statistics();
+    const auto before = stats->getTickerCount(rocksdb::NUMBER_DB_SEEK);
+    for (int i = 0; i < kNumUpdates; ++i) {
+      RETURN_NOT_OK(conn_->ExecuteFormat("UPDATE t SET w = w + 1 WHERE k = $0", i % kNumRows + 1));
+    }
+    return stats->getTickerCount(rocksdb::NUMBER_DB_SEEK) - before;
+  }
+
+  // Compacts and checks that t's TableInfo was not replaced and its warm cache was left alone: same
+  // watermark and generation, entry still cached before any further read could refill it.
+  void CompactAndCheckCacheUntouched(const tablet::TableInfoPtr& before) {
+    const auto& ctx = *before->doc_read_context;
+    const auto watermark_before = ctx.tombstone_cache_watermark();
+    const auto generation_before = ctx.tombstone_cache_generation();
+    ASSERT_NE(watermark_before, HybridTime::kMax);
+    ASSERT_TRUE(ctx.table_tombstone_time().has_value());
+    const auto seeks_before = ASSERT_RESULT(RegularDbSeeksForUpdates());
+
+    FlushAndCompactTablets();
+
+    ASSERT_EQ(ASSERT_RESULT(ColocatedTableInfo(kTableColocationId)), before);
+    ASSERT_EQ(ctx.tombstone_cache_watermark(), watermark_before);
+    ASSERT_EQ(ctx.tombstone_cache_generation(), generation_before);
+    ASSERT_TRUE(ctx.table_tombstone_time().has_value());
+    const auto seeks_after = ASSERT_RESULT(RegularDbSeeksForUpdates());
+    LOG(INFO) << "Regular-DB seeks for " << kNumUpdates << " PK UPDATEs: " << seeks_before
+              << " before compaction, " << seeks_after << " after";
+  }
+
+  std::optional<PGConn> conn_;
+  tablet::TabletPeerPtr peer_;
+};
+
+// CREATE INDEX bumps the indexed table's schema version, so the first compaction afterwards finds
+// t's packing storage holding a version below the minimum in use and rebuilds t's TableInfo. The
+// rebuilt DocReadContext must keep the old one's tombstone-cache state, warm entry included.
+TEST_F_EX(PgMiniTest, TombstoneCacheArmedAfterSchemaGC, PgMiniTombstoneCacheRebuildTest) {
+  ASSERT_OK(SetUpTable(WithIndex::kTrue));
+
+  auto before_gc = ASSERT_RESULT(ColocatedTableInfo(kTableColocationId));
+  // Trigger guard: CREATE INDEX bumped t's schema version, and the old packing is still there for
+  // the GC to drop.
+  ASSERT_GT(before_gc->schema_version, 0U);
+  ASSERT_TRUE(before_gc->doc_read_context->schema_packing_storage.HasVersionBelow(
+      before_gc->schema_version))
+      << before_gc->doc_read_context->schema_packing_storage.VersionsToString();
+  // The AlterSchema that applied the bump armed the cache, and the scan in SetUpTable filled it.
+  const auto watermark_before_gc = before_gc->doc_read_context->tombstone_cache_watermark();
+  const auto generation_before_gc = before_gc->doc_read_context->tombstone_cache_generation();
+  ASSERT_NE(watermark_before_gc, HybridTime::kMax);
+  ASSERT_TRUE(before_gc->doc_read_context->table_tombstone_time().has_value());
+  const auto seeks_before_gc = ASSERT_RESULT(RegularDbSeeksForUpdates());
+
+  FlushAndCompactTablets();
+
+  // Trigger guard: the compaction's old-schema-version GC replaced t's TableInfo and dropped the
+  // old packing.
+  tablet::TableInfoPtr after_gc;
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        after_gc = VERIFY_RESULT(ColocatedTableInfo(kTableColocationId));
+        return after_gc != before_gc;
+      },
+      30s * kTimeMultiplier, "Old-schema-version GC rebuilt the TableInfo"));
+  const auto& ctx = *after_gc->doc_read_context;
+  ASSERT_FALSE(ctx.schema_packing_storage.HasVersionBelow(after_gc->schema_version))
+      << ctx.schema_packing_storage.VersionsToString();
+  // A late AlterSchema would also replace the TableInfo, but with a new schema version.
+  ASSERT_EQ(after_gc->schema_version, before_gc->schema_version);
+
+  // Checked before any further read, which could refill a cache the rebuild dropped.
+  const auto watermark_after_gc = ctx.tombstone_cache_watermark();
+  const auto generation_after_gc = ctx.tombstone_cache_generation();
+  const auto cached_after_gc = ctx.table_tombstone_time().has_value();
+
+  const auto seeks_after_gc = ASSERT_RESULT(RegularDbSeeksForUpdates());
+  LOG(INFO) << "Regular-DB seeks for " << kNumUpdates << " PK UPDATEs: " << seeks_before_gc
+            << " before schema GC, " << seeks_after_gc << " after";
+
+  const auto diag = Format(
+      "TOMBSTONE CACHE STATE LOST: old-schema-version GC rebuilt the table's DocReadContext "
+      "(packings now $0). Watermark $1 -> $2, generation $3 -> $4, cached entry kept: $5. "
+      "Regular-DB seeks for $6 single-row PK UPDATEs: $7 before the GC, $8 after.",
+      ctx.schema_packing_storage.VersionsToString(), watermark_before_gc, watermark_after_gc,
+      generation_before_gc, generation_after_gc, cached_after_gc, kNumUpdates, seeks_before_gc,
+      seeks_after_gc);
+  ASSERT_EQ(watermark_after_gc, watermark_before_gc) << diag;
+  ASSERT_EQ(generation_after_gc, generation_before_gc) << diag;
+  ASSERT_TRUE(cached_after_gc) << diag;
+}
+
+// Control for TombstoneCacheArmedAfterSchemaGC: the same compaction with schema GC disabled does
+// not rebuild t's TableInfo, and the cache stays armed and filled.
+TEST_F_EX(
+    PgMiniTest, TombstoneCacheArmedAfterCompactionWithoutSchemaGC,
+    PgMiniTombstoneCacheRebuildTest) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_schema_packing_gc) = false;
+  ASSERT_OK(SetUpTable(WithIndex::kTrue));
+
+  auto before = ASSERT_RESULT(ColocatedTableInfo(kTableColocationId));
+  ASSERT_TRUE(before->doc_read_context->schema_packing_storage.HasVersionBelow(
+      before->schema_version));
+  ASSERT_NO_FATALS(CompactAndCheckCacheUntouched(before));
+}
+
+// Control for TombstoneCacheArmedAfterSchemaGC: a table with a single schema version has nothing
+// for the GC to drop, so compaction leaves its TableInfo and cache alone.
+TEST_F_EX(
+    PgMiniTest, TombstoneCacheArmedAfterCompactionSingleSchemaVersion,
+    PgMiniTombstoneCacheRebuildTest) {
+  ASSERT_OK(SetUpTable(WithIndex::kFalse));
+
+  auto before = ASSERT_RESULT(ColocatedTableInfo(kTableColocationId));
+  ASSERT_FALSE(before->doc_read_context->schema_packing_storage.HasVersionBelow(
+      before->schema_version));
+  ASSERT_NO_FATALS(CompactAndCheckCacheUntouched(before));
+}
+
+// The index backfill-done metadata update (Tablet::MarkBackfillDone) rebuilds the index's
+// TableInfo to clear retain_delete_markers. The index's DocReadContext must still be able to use
+// the tombstone-time cache afterwards. In a YSQL CREATE INDEX the index-permission AlterSchema that
+// follows also arms every colocated table in the tablet, so this does not isolate the carry-over
+// in the backfill-done rebuild; DocReadContextTombstoneCacheTest.RebuildCarriesCacheState does.
+TEST_F_EX(PgMiniTest, TombstoneCacheArmedAfterIndexBackfill, PgMiniTombstoneCacheRebuildTest) {
+  StringWaiterLogSink backfill_done("Setting backfill as done");
+  ASSERT_OK(SetUpTable(WithIndex::kTrue, IndexAfterRows::kTrue));
+
+  // Trigger guard: the backfill-done op was applied and cleared retain_delete_markers.
+  ASSERT_OK(backfill_done.WaitFor(30s * kTimeMultiplier));
+  tablet::TableInfoPtr index_info;
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        index_info = VERIFY_RESULT(ColocatedTableInfo(kIndexColocationId));
+        return !index_info->schema().table_properties().retain_delete_markers();
+      },
+      30s * kTimeMultiplier, "Backfill done cleared retain_delete_markers on the index"));
+
+  // Read through the index, which would fill an armed index cache.
+  ASSERT_OK(conn_->Execute("SET enable_seqscan = off"));
+  ASSERT_EQ(ASSERT_RESULT(conn_->FetchRow<int32_t>("SELECT v FROM t WHERE v = 5")), 5);
+  index_info = ASSERT_RESULT(ColocatedTableInfo(kIndexColocationId));
+  const auto& ctx = *index_info->doc_read_context;
+  const auto diag = Format(
+      "TOMBSTONE CACHE LEFT OFF: the backfill-done update rebuilt the index's DocReadContext and "
+      "nothing re-armed it (watermark $0)", ctx.tombstone_cache_watermark());
+  ASSERT_NE(ctx.tombstone_cache_watermark(), HybridTime::kMax) << diag;
+  ASSERT_TRUE(ctx.table_tombstone_time().has_value()) << diag;
 }
 
 TEST_F(PgMiniTest, SkipTableTombstoneCheckMetadata) {
@@ -2753,7 +3078,7 @@ void PgMiniTest::RunManyConcurrentReadersTest() {
 
         auto read_start = next_write_start.load();
         auto read_end = read_start + 4;
-        auto fetch_query = strings::Substitute(
+        auto fetch_query = Format(
             "SELECT * FROM $0 WHERE a BETWEEN $1 AND $2 ORDER BY a ASC",
             kTableName, read_start, read_end);
 
@@ -3045,6 +3370,90 @@ TEST_F(PgMiniTest, CompactionAfterDBDrop) {
   uint64_t new_file_size = sys_catalog_tablet->GetCurrentVersionSstFilesUncompressedSize();;
   LOG(INFO) << "Base file size: " << base_file_size << ", new file size: " << new_file_size;
   ASSERT_LE(new_file_size, base_file_size + 100_KB);
+}
+
+class PgSysCatalogFullCompactionTest : public PgMiniTestBase {
+ protected:
+  void SetUp() override {
+    // Disable the background task of the full compaction manager. The test collects the
+    // statistics and schedules the compactions itself.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_compact_check_interval_sec) = 0;
+    PgMiniTestBase::SetUp();
+  }
+};
+
+// Dropped tables leave dead pg_attribute rows in the sys catalog tablet. Scans of pg_attribute
+// read these rows as obsolete keys, which must trigger a full compaction of the sys catalog tablet.
+TEST_F(PgSysCatalogFullCompactionTest, CompactBasedOnStats) {
+  constexpr int kNumColumns = 1000;
+  constexpr int kNumTables = 5;
+  constexpr int kNumDeadRows = kNumColumns * kNumTables;
+  constexpr int kHistoryRetentionSec = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_compact_stat_window_seconds) = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_compact_percent_obsolete) = 50;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_compact_min_obsolete_keys_found) = kNumDeadRows;
+
+  auto& sys_catalog =
+      *ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->catalog_manager().sys_catalog();
+  auto tablet = ASSERT_RESULT(sys_catalog.tablet_peer()->shared_tablet());
+  auto* compact_manager = sys_catalog.full_compaction_manager();
+  // One check interval per stats window: each window holds the stats between two consecutive
+  // ScheduleFullCompactions() calls.
+  compact_manager->TEST_SetCheckIntervalSec(1);
+
+  auto conn = ASSERT_RESULT(Connect());
+  std::string columns;
+  for (int i = 0; i < kNumColumns; ++i) {
+    columns += Format("$0c$1 INT", i == 0 ? "" : ", ", i);
+  }
+  for (int i = 0; i < kNumTables; ++i) {
+    ASSERT_OK(conn.ExecuteFormat("CREATE TABLE t$0 ($1)", i, columns));
+    ASSERT_OK(conn.ExecuteFormat("DROP TABLE t$0", i));
+  }
+  ASSERT_OK(tablet->Flush(tablet::FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
+
+  const auto collect_stats_after_scan = [&]() -> Result<tserver::KeyStatistics> {
+    compact_manager->ScheduleFullCompactions();
+    RETURN_NOT_OK(conn.FetchRow<PGUint64>("SELECT COUNT(*) FROM pg_attribute"));
+    compact_manager->ScheduleFullCompactions();
+    const auto stats = compact_manager->TEST_CurrentWindowStats(master::kSysCatalogTabletId);
+    LOG(INFO) << "Sys catalog key stats: total: " << stats.total
+              << ", obsolete past cutoff: " << stats.obsolete_cutoff;
+    return stats;
+  };
+
+  // The sys catalog tablet still retains the deleted rows for
+  // timestamp_syscatalog_history_retention_interval_sec, so they are not counted as obsolete
+  // past the history cutoff, and no compaction is scheduled.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_history_retention_interval_sec) =
+      kHistoryRetentionSec;
+  SleepFor(2s * kHistoryRetentionSec);
+  auto stats = ASSERT_RESULT(collect_stats_after_scan());
+  ASSERT_GE(stats.total, kNumDeadRows);
+  ASSERT_EQ(stats.obsolete_cutoff, 0);
+  ASSERT_EQ(compact_manager->num_scheduled_last_execution(), 0);
+
+  // Move the history cutoff of the sys catalog tablet past the deletes of the dropped tables.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_syscatalog_history_retention_interval_sec) =
+      kHistoryRetentionSec;
+  SleepFor(2s * kHistoryRetentionSec);
+  const auto before_compaction = tablet->clock()->Now();
+  stats = ASSERT_RESULT(collect_stats_after_scan());
+  ASSERT_GE(stats.obsolete_cutoff, kNumDeadRows);
+  ASSERT_EQ(compact_manager->num_scheduled_last_execution(), 1);
+  ASSERT_OK(LoggedWaitFor(
+      [&tablet, before_compaction] {
+        const auto last_compact_time = HybridTime(tablet->metadata()->last_full_compaction_time());
+        return !last_compact_time.is_special() && last_compact_time >= before_compaction &&
+               !tablet->HasActiveFullCompaction();
+      },
+      30s * kTimeMultiplier, "Waiting for full compaction of the sys catalog tablet"));
+
+  // The compaction removed the dead rows, so the next scan does not trigger another compaction.
+  stats = ASSERT_RESULT(collect_stats_after_scan());
+  ASSERT_GT(stats.total, 0);
+  ASSERT_LT(stats.obsolete_cutoff, kNumColumns);
+  ASSERT_EQ(compact_manager->num_scheduled_last_execution(), 0);
 }
 
 // The test checks that YSQL doesn't wait for sent RPC response in case of process termination.
@@ -3627,6 +4036,12 @@ TEST_F(PgMiniTest, TestAppliedTransactionsStateInFlight) {
   LOG(INFO) << "Creating table";
   ASSERT_OK(conn1.Execute("CREATE TABLE test(a int) SPLIT INTO 1 TABLETS"));
 
+  // The transaction status tablets are created before every tablet server has registered, so the
+  // load balancer is still adding their third replica. Restarting one of the two voters they have
+  // until then costs those tablets their quorum and stalls applies for seconds.
+  ASSERT_OK(WaitAllReplicasReady(cluster_.get(), 120s * kTimeMultiplier, UserTabletsOnly::kFalse));
+  ASSERT_OK(cluster_->WaitForLoadBalancerToStabilize(120s * kTimeMultiplier));
+
   const auto& pg_ts_uuid = cluster_->mini_tablet_server(kPgTsIndex)->server()->permanent_uuid();
   tablet::TabletPeerPtr tablet_peer = nullptr;
   tablet::TabletPtr tablet = nullptr;
@@ -3668,16 +4083,13 @@ TEST_F(PgMiniTest, TestAppliedTransactionsStateInFlight) {
   ASSERT_OK(tablet_server->Restart());
   ASSERT_OK(tablet_server->WaitStarted());
 
-  // The recently applied transactions map only retains a staircase of (first_write_ht,
-  // apply_op_id) pairs, so an apply landing out of first write order subsumes the entry of an
-  // earlier transaction. Applies are asynchronous with respect to commit, so let each transaction
-  // apply, i.e. leave the participant, before committing the next one.
+  // Every peer must report exactly the expected number of transactions: a peer that has not
+  // replicated them yet, or has not loaded them back after the restart, reports none of its own and
+  // would satisfy a check on the total vacuously.
   const auto& tablet_id = tablet_peer->tablet_id();
-  auto commit_and_wait_apply = [this, tablet_id, kApplyWait](
-      PGConn* conn, size_t expected_running) -> Status {
-    RETURN_NOT_OK(conn->CommitTransaction());
+  auto wait_running = [this, &tablet_id, kApplyWait](size_t expected_running) -> Status {
     return WaitFor([this, &tablet_id, expected_running]() -> Result<bool> {
-      size_t running = 0;
+      size_t peers_done = 0;
       for (auto peer : ListTabletPeers(cluster_.get(), ListPeersFilter::kAll)) {
         if (peer->tablet_id() != tablet_id) {
           continue;
@@ -3686,14 +4098,31 @@ TEST_F(PgMiniTest, TestAppliedTransactionsStateInFlight) {
         if (!peer_tablet) {
           return false;
         }
-        running += peer_tablet->transaction_participant()->GetNumRunningTransactions();
+        if (peer_tablet->transaction_participant()->GetNumRunningTransactions() !=
+            expected_running) {
+          return false;
+        }
+        ++peers_done;
       }
-      return running <= expected_running;
-    }, kApplyWait, Format("$0 running transactions left", expected_running));
+      return peers_done == NumTabletServers();
+    }, kApplyWait, Format("$0 running transactions left on every peer", expected_running));
   };
 
-  ASSERT_OK(commit_and_wait_apply(&conn1, 6));
-  ASSERT_OK(commit_and_wait_apply(&conn2, 3));
+  // Catching up with the tablet leader and loading the transactions back from the flushed intents
+  // are both asynchronous with the restart.
+  ASSERT_OK(wait_running(3));
+
+  // The recently applied transactions map only retains a staircase of (first_write_ht,
+  // apply_op_id) pairs, so an apply landing out of first write order subsumes the entry of an
+  // earlier transaction. Applies are asynchronous with respect to commit, so let each transaction
+  // apply, i.e. leave the participant, before committing the next one.
+  auto commit_and_wait_apply = [&wait_running](PGConn* conn, size_t expected_running) -> Status {
+    RETURN_NOT_OK(conn->CommitTransaction());
+    return wait_running(expected_running);
+  };
+
+  ASSERT_OK(commit_and_wait_apply(&conn1, 2));
+  ASSERT_OK(commit_and_wait_apply(&conn2, 1));
   ASSERT_OK(commit_and_wait_apply(&conn3, 0));
 
   std::unordered_map<std::string, uint64_t> metric_values;
@@ -4856,6 +5285,7 @@ class PgMiniKeyRangesTest : public PgMiniTest {
     ASSERT_OK(conn.Execute("ANALYZE test"));
     ASSERT_OK(conn.Execute("SET yb_enable_parallel_scan_range_sharded = true"));
     ASSERT_OK(conn.Execute("SET yb_enable_cbo = on"));
+    ASSERT_OK(conn.Execute("SET enable_sort = off"));
     // Produce more parallel ranges from the small test table.
     ASSERT_OK(conn.Execute("SET yb_parallel_range_rows = 1"));
     ASSERT_OK(conn.Execute("SET yb_parallel_range_size = 1024"));
@@ -4928,6 +5358,861 @@ TEST_F_EX(
   ASSERT_OK(CreateIndexedTableAndFill(" SPLIT AT VALUES ((700), (1400))", kNumRows));
   ASSERT_NO_FATALS(VerifyParallelScanSkipsRegularDbMetadataSection(kNumRows));
   ASSERT_NO_FATALS(VerifyKeyRangesSkipRegularDbMetadataSection(/* expected_num_tablets = */ 3));
+}
+
+// The master's catalog versions cache refresh runs on a pool of its own, so it keeps refreshing
+// while every worker of the catalog manager's shared background pool is busy. Before, its body
+// was submitted to that shared pool and queued behind whatever held the workers.
+TEST_F(PgMiniTest, CatalogVersionsCacheRefreshesWhileBackgroundPoolIsBusy) {
+  auto& catalog_manager = ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->catalog_manager_impl();
+  auto cached_read_time = [&catalog_manager] {
+    master::DbOidToCatalogVersionMap versions;
+    uint64_t fingerprint = 0;
+    HybridTime read_ht;
+    catalog_manager.pg_catalog_versions_cache().GetAll(&versions, &fingerprint, &read_ht);
+    return read_ht;
+  };
+  ASSERT_OK(WaitFor(
+      [&cached_read_time] { return cached_read_time().is_valid(); }, 30s * kTimeMultiplier,
+      "First catalog versions cache refresh"));
+
+  // The shared pool is built with the default worker count, NumEffectiveCPUs(). Hold every worker,
+  // and wait until each holder runs, so nothing queued behind them can be running.
+  //
+  // Each holder shares the latches rather than reaching them on this stack: the test can return
+  // while holders are still running or, after the ASSERT below fails, still queued in the pool,
+  // and the master outlives the test body.
+  struct Holders {
+    explicit Holders(int num_workers) : started(num_workers) {}
+    CountDownLatch started;
+    CountDownLatch release{1};
+  };
+  const auto num_workers = NumEffectiveCPUs();
+  auto holders = std::make_shared<Holders>(num_workers);
+  auto release_workers = ScopeExit([holders] { holders->release.CountDown(); });
+  for (int i = 0; i != num_workers; ++i) {
+    ASSERT_OK(catalog_manager.SubmitBackgroundTask([holders] {
+      holders->started.CountDown();
+      holders->release.Wait();
+    }));
+  }
+  ASSERT_TRUE(holders->started.WaitFor(30s * kTimeMultiplier))
+      << holders->started.count() << " of " << num_workers
+      << " background workers never started";
+
+  // The refresh runs every heartbeat_interval_ms / 2. Allow many periods, so only a refresh that
+  // cannot run at all fails this.
+  const auto before = cached_read_time();
+  ASSERT_OK(WaitFor(
+      [&cached_read_time, before] { return cached_read_time() > before; },
+      MonoDelta::FromMilliseconds(20 * FLAGS_heartbeat_interval_ms) * kTimeMultiplier,
+      "Catalog versions cache refresh while the background pool is busy"));
+}
+
+// ------------------------------------------------------------------------------------------------
+// Online schema change change-capture trigger tests
+// ------------------------------------------------------------------------------------------------
+// The triggers are attached directly, as YbOscCreateTrigger does, to an empty target. A source
+// row inserted before the triggers are attached stands for a row the backfill has not copied yet.
+
+namespace {
+
+Status AttachOnlineSchemaChangeTriggers(
+    PGConn* conn, const std::string& src, const std::string& target,
+    const std::string& transform) {
+  const auto target_oid = VERIFY_RESULT(conn->FetchRow<std::string>(
+      Format("SELECT '$0'::regclass::oid::text", target)));
+  const auto transform_oid = VERIFY_RESULT(conn->FetchRow<std::string>(
+      Format("SELECT '$0'::regproc::oid::text", transform)));
+
+  RETURN_NOT_OK(conn->ExecuteFormat(
+      "CREATE TRIGGER yb_osc_ins AFTER INSERT ON $0 "
+      "REFERENCING NEW TABLE AS yb_osc_new_rows "
+      "FOR EACH STATEMENT EXECUTE FUNCTION "
+      "pg_catalog.yb_online_schema_change_trigger('$1', '$2')",
+      src, target_oid, transform_oid));
+  RETURN_NOT_OK(conn->ExecuteFormat(
+      "CREATE TRIGGER yb_osc_upd AFTER UPDATE ON $0 "
+      "REFERENCING OLD TABLE AS yb_osc_old_rows NEW TABLE AS yb_osc_new_rows "
+      "FOR EACH STATEMENT EXECUTE FUNCTION "
+      "pg_catalog.yb_online_schema_change_trigger('$1', '$2')",
+      src, target_oid, transform_oid));
+  RETURN_NOT_OK(conn->ExecuteFormat(
+      "CREATE TRIGGER yb_osc_del AFTER DELETE ON $0 "
+      "REFERENCING OLD TABLE AS yb_osc_old_rows "
+      "FOR EACH STATEMENT EXECUTE FUNCTION "
+      "pg_catalog.yb_online_schema_change_trigger('$1', '$2')",
+      src, target_oid, transform_oid));
+  return Status::OK();
+}
+
+Result<double> ExplainStorageStat(PGConn* conn, const std::string& dml, const char* key) {
+  auto doc = VERIFY_RESULT(conn->FetchRow<JsonDocument>(
+      Format("EXPLAIN (ANALYZE, DIST, DEBUG, FORMAT JSON) $0", dml)));
+  return doc.Root()[0][key].GetDouble();
+}
+
+Result<double> ExplainFlushes(PGConn* conn, const std::string& dml) {
+  return ExplainStorageStat(conn, dml, "Storage Flush Requests");
+}
+
+// The rows t2 should hold for the current rows of t1, and the rows it holds.
+Result<std::string> ExpectedTargetRows(PGConn* conn) {
+  return conn->FetchAllAsString("SELECT t1_to_t2(t1)::text AS r FROM t1 ORDER BY r");
+}
+
+Result<std::string> TargetRows(PGConn* conn) {
+  return conn->FetchAllAsString("SELECT t2::text AS r FROM t2 ORDER BY r");
+}
+
+constexpr auto kOnlineSchemaChangeReplayOrderError =
+    "this way while an online schema change is copying it";
+
+}  // namespace
+
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerInsertReplay) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT, v2 TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v, src.v || '_x')::t2; END $$"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+
+  ASSERT_OK(conn.Execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, NULL)"));
+
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM t2")), 3);
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>(
+      "SELECT count(*) FROM t2 WHERE id = 3 AND v IS NULL AND v2 IS NULL")), 1);
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>(
+      "SELECT count(*) FROM t2 WHERE v2 IS DISTINCT FROM (v || '_x')")), 0);
+}
+
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerDeletePresent) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT, v2 TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v, src.v || '_x')::t2; END $$"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+
+  ASSERT_OK(conn.Execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b')"));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM t2")), 2);
+
+  ASSERT_OK(conn.Execute("DELETE FROM t1 WHERE id = 1"));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM t2 WHERE id = 1")), 0);
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM t2")), 1);
+}
+
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerDeleteAbsentTarget) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT, v2 TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v, src.v || '_x')::t2; END $$"));
+
+  ASSERT_OK(conn.Execute("INSERT INTO t1 VALUES (1, 'a')"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM t2")), 0);
+
+  ASSERT_OK(conn.Execute("DELETE FROM t1 WHERE id = 1"));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM t2 WHERE id = 1")), 0);
+}
+
+// The tombstone for a row missing from the target is a blind delete; with a vector column on the
+// target, DocDB must not try to read the old vector id of a row it did not find.
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerDeleteAbsentTargetWithVector) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE EXTENSION vector"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, e vector(3), v TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, '[1,2,3]'::vector, src.v)::t2; END $$"));
+
+  ASSERT_OK(conn.Execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b')"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+
+  ASSERT_OK(conn.Execute("DELETE FROM t1 WHERE id = 1"));
+  ASSERT_OK(conn.Execute("UPDATE t1 SET v = 'b2' WHERE id = 2"));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchAllAsString("SELECT id, e::text, v FROM t2 ORDER BY id")),
+            "2, [1,2,3], b2");
+}
+
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerUpdatePresent) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT, v2 TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v, src.v || '_x')::t2; END $$"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+
+  ASSERT_OK(conn.Execute("INSERT INTO t1 VALUES (1, 'a')"));
+  ASSERT_OK(conn.Execute("UPDATE t1 SET v = 'a2' WHERE id = 1"));
+
+  const auto row = ASSERT_RESULT((conn.FetchRow<std::string, std::string>(
+      "SELECT v, v2 FROM t2 WHERE id = 1")));
+  ASSERT_EQ(row, (decltype(row){"a2", "a2_x"}));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM t2")), 1);
+}
+
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerUpdateAbsentTarget) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT, v2 TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v, src.v || '_x')::t2; END $$"));
+
+  ASSERT_OK(conn.Execute("INSERT INTO t1 VALUES (1, 'a')"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+  ASSERT_OK(conn.Execute("UPDATE t1 SET v = 'a2' WHERE id = 1"));
+
+  const auto row = ASSERT_RESULT((conn.FetchRow<std::string, std::string>(
+      "SELECT v, v2 FROM t2 WHERE id = 1")));
+  ASSERT_EQ(row, (decltype(row){"a2", "a2_x"}));
+}
+
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerUpdateChangesPrimaryKey) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT, v2 TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v, src.v || '_x')::t2; END $$"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+
+  ASSERT_OK(conn.Execute("INSERT INTO t1 VALUES (1, 'a')"));
+  ASSERT_OK(conn.Execute("UPDATE t1 SET id = 2 WHERE id = 1"));
+
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM t2 WHERE id = 1")), 0);
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM t2 WHERE id = 2")), 1);
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM t2")), 1);
+}
+
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerEmptyStatement) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT, v2 TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v, src.v || '_x')::t2; END $$"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+
+  ASSERT_OK(conn.Execute("INSERT INTO t1 SELECT i, 'v' FROM generate_series(1, 0) i"));
+  ASSERT_OK(conn.Execute("UPDATE t1 SET v = 'x' WHERE id = 999"));
+  ASSERT_OK(conn.Execute("DELETE FROM t1 WHERE id = 999"));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM t2")), 0);
+}
+
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerDroppedTargetColumn) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, dead INT, v TEXT, v2 TEXT)"));
+  ASSERT_OK(conn.Execute("ALTER TABLE t2 DROP COLUMN dead"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v, src.v || '_x')::t2; END $$"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+
+  ASSERT_OK(conn.Execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b')"));
+  ASSERT_OK(conn.Execute("DELETE FROM t1 WHERE id = 2"));
+
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM t2")), 1);
+  const auto row = ASSERT_RESULT((conn.FetchRow<std::string, std::string>(
+      "SELECT v, v2 FROM t2 WHERE id = 1")));
+  ASSERT_EQ(row, (decltype(row){"a", "a_x"}));
+}
+
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerSecondaryIndexes) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute(
+      "CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT, age INT, city TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE TABLE t2 (id INT PRIMARY KEY, name TEXT, age INT, city TEXT, tag TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE INDEX t2_city_idx ON t2 (city)"));
+  ASSERT_OK(conn.Execute("CREATE UNIQUE INDEX t2_name_idx ON t2 (name)"));
+  ASSERT_OK(conn.Execute("CREATE INDEX t2_city_age_idx ON t2 (city, age)"));
+  ASSERT_OK(conn.Execute("CREATE INDEX t2_lower_name_idx ON t2 (lower(name))"));
+  ASSERT_OK(conn.Execute("CREATE INDEX t2_senior_idx ON t2 (age) WHERE age >= 30"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.name, src.age, src.city, src.city || "
+      "'_' || src.age::text)::t2; END $$"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+
+  ASSERT_OK(conn.Execute(
+      "INSERT INTO t1 VALUES (1,'alice',30,'nyc'), (2,'bob',25,'sfo'), "
+      "(3,'carol',35,'nyc'), (4,'dave',40,'sea')"));
+  ASSERT_OK(conn.Execute("UPDATE t1 SET name = 'robert', age = 26 WHERE id = 2"));
+  ASSERT_OK(conn.Execute("DELETE FROM t1 WHERE id = 3"));
+
+  ASSERT_OK(conn.Execute("SET enable_seqscan = off"));
+
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>(
+      "SELECT count(*) FROM t2 WHERE name = 'carol'")), 0);
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>(
+      "SELECT count(*) FROM t2 WHERE lower(name) = 'carol'")), 0);
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>(
+      "SELECT count(*) FROM t2 WHERE city = 'nyc' AND age = 35")), 0);
+
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int32_t>(
+      "SELECT id FROM t2 WHERE name = 'robert'")), 2);
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>(
+      "SELECT count(*) FROM t2 WHERE name = 'bob'")), 0);
+
+  auto rows = ASSERT_RESULT((conn.FetchRows<int32_t, std::string, int32_t, std::string>(
+      "SELECT id, name, age, city FROM t1 ORDER BY id")));
+  for (const auto& [id, name, age, city] : rows) {
+    ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int32_t>(
+        Format("SELECT id FROM t2 WHERE name = '$0'", name))), id);
+    ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>(
+        Format("SELECT count(*) FROM t2 WHERE city = '$0' AND id = $1", city, id))), 1);
+    ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>(
+        Format("SELECT count(*) FROM t2 WHERE city = '$0' AND age = $1 AND id = $2",
+               city, age, id))), 1);
+    if (age >= 30) {
+      ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>(
+          Format("SELECT count(*) FROM t2 WHERE age = $0 AND id = $1", age, id))), 1);
+    }
+  }
+}
+
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerDataTypes) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute(
+      "CREATE TABLE t1 (id INT PRIMARY KEY, n NUMERIC, b BOOL, ts TIMESTAMPTZ, raw BYTEA)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE TABLE t2 (id INT PRIMARY KEY, n NUMERIC, b BOOL, ts TIMESTAMPTZ, raw BYTEA)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.n, src.b, src.ts, src.raw)::t2; END $$"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+
+  ASSERT_OK(conn.Execute(
+      "INSERT INTO t1 VALUES "
+      "(1, 123.456, true, '2024-01-02 03:04:05+00', '\\xdeadbeef'), "
+      "(2, -0.001, false, '1999-12-31 23:59:59+00', '\\x00')"));
+  ASSERT_OK(conn.Execute("DELETE FROM t1 WHERE id = 2"));
+
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM t2")), 1);
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>(
+      "SELECT count(*) FROM t1 JOIN t2 USING (id, n, b, ts, raw)")), 1);
+}
+
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerWorkloadEquivalence) {
+  constexpr int kKeys = 50;
+  constexpr int kOps = 400;
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT, v2 TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v, src.v || '_x')::t2; END $$"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+
+  for (int i = 0; i < kOps; ++i) {
+    const auto key = RandomUniformInt(1, kKeys);
+    const auto op = RandomUniformInt(0, 2);
+    if (op == 0) {
+      ASSERT_OK(conn.ExecuteFormat(
+          "INSERT INTO t1 VALUES ($0, '$1') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v",
+          key, RandomHumanReadableString(8)));
+    } else if (op == 1) {
+      ASSERT_OK(conn.ExecuteFormat(
+          "UPDATE t1 SET v = '$1' WHERE id = $0", key, RandomHumanReadableString(8)));
+    } else {
+      ASSERT_OK(conn.ExecuteFormat("DELETE FROM t1 WHERE id = $0", key));
+    }
+  }
+
+  auto src = ASSERT_RESULT((conn.FetchRows<int32_t, std::string>(
+      "SELECT id, v FROM t1 ORDER BY id")));
+  auto dst = ASSERT_RESULT((conn.FetchRows<int32_t, std::string>(
+      "SELECT id, v FROM t2 ORDER BY id")));
+  ASSERT_EQ(src, dst);
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>(
+      "SELECT count(*) FROM t2 WHERE v2 IS DISTINCT FROM (v || '_x')")), 0);
+}
+
+// MERGE is the only statement that could fire all three capture triggers, and YB rejects it in the
+// grammar. If MERGE becomes supported this test fails; then check that every tombstone is still
+// written before every insert, that each trigger replays only its own rows, and that an action
+// matching no rows does not hit the "missing old/new transition table" errors.
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerMergeUnsupported) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT, v2 TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v, src.v || '_x')::t2; END $$"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+
+  ASSERT_OK(conn.Execute("INSERT INTO t1 VALUES (1,'keep'), (2,'upd'), (3,'del')"));
+  ASSERT_OK(conn.Execute("CREATE TABLE s (id INT PRIMARY KEY, v TEXT, act TEXT)"));
+  ASSERT_OK(conn.Execute("INSERT INTO s VALUES (2,'upd_new','u'), (3,NULL,'d'), (4,'ins','i')"));
+
+  const auto status = conn.Execute(
+      "MERGE INTO t1 USING s ON t1.id = s.id "
+      "WHEN MATCHED AND s.act = 'd' THEN DELETE "
+      "WHEN MATCHED AND s.act = 'u' THEN UPDATE SET v = s.v "
+      "WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)");
+  ASSERT_NOK(status) << "MERGE now works on YB relations -- verify the capture trigger "
+                        "against it (see the comment above this test)";
+  ASSERT_STR_CONTAINS(status.ToString(), "not supported yet");
+
+  auto src = ASSERT_RESULT((conn.FetchRows<int32_t, std::string>(
+      "SELECT id, v FROM t1 ORDER BY id")));
+  auto dst = ASSERT_RESULT((conn.FetchRows<int32_t, std::string>(
+      "SELECT id, v FROM t2 ORDER BY id")));
+  ASSERT_EQ(src, dst);
+}
+
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerRequiresSuperuser) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE victim (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE ROLE attacker"));
+  ASSERT_OK(conn.Execute("GRANT CREATE ON SCHEMA public TO attacker"));
+
+  ASSERT_OK(conn.Execute("SET ROLE attacker"));
+  ASSERT_OK(conn.Execute("CREATE TABLE mine (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION mine_to_victim(src mine) RETURNS victim LANGUAGE plpgsql IMMUTABLE SET "
+      "search_path FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v)::victim; END $$"));
+  ASSERT_NOK_STR_CONTAINS(
+      AttachOnlineSchemaChangeTriggers(&conn, "mine", "victim", "mine_to_victim"),
+      "permission denied for function pg_catalog.yb_online_schema_change_trigger");
+  ASSERT_OK(conn.Execute("INSERT INTO mine VALUES (1, 'x')"));
+  ASSERT_OK(conn.Execute("RESET ROLE"));
+
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM victim")), 0);
+}
+
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerRunsAsInvoker) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT, who TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v, current_user::text)::t2; END $$"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+  ASSERT_OK(conn.Execute("CREATE ROLE app"));
+  ASSERT_OK(conn.Execute("GRANT SELECT, INSERT, UPDATE ON t1 TO app"));
+
+  ASSERT_OK(conn.Execute("SET ROLE app"));
+  ASSERT_OK(conn.Execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b')"));
+  ASSERT_OK(conn.Execute("UPDATE t1 SET v = 'c' WHERE id = 2"));
+  ASSERT_OK(conn.Execute("RESET ROLE"));
+
+  const auto rows = ASSERT_RESULT((conn.FetchRows<int32_t, std::string, std::string>(
+      "SELECT id, v, who FROM t2 ORDER BY id")));
+  ASSERT_EQ(rows, (decltype(rows){{1, "a", "app"}, {2, "c", "app"}}));
+}
+
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerRejectsSystemTarget) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute(
+      "CREATE TABLE t1 (objoid OID PRIMARY KEY, classoid OID, objsubid INT, description TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_desc(src t1) RETURNS pg_description LANGUAGE plpgsql IMMUTABLE "
+      "SET search_path FROM CURRENT AS $$ BEGIN RETURN ROW(src.objoid, src.classoid, "
+      "src.objsubid, src.description)::pg_description; END $$"));
+  ASSERT_OK(
+      AttachOnlineSchemaChangeTriggers(&conn, "t1", "pg_catalog.pg_description", "t1_to_desc"));
+
+  ASSERT_NOK_STR_CONTAINS(
+      conn.Execute("INSERT INTO t1 VALUES (4000000000, 1259, 0, 'x')"),
+      "permission denied: \"pg_description\" is a system catalog");
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>(
+      "SELECT count(*) FROM pg_description WHERE objoid = 4000000000")), 0);
+}
+
+// The seed rows are inserted before the triggers are attached, so the target does not have them.
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerRejectsUnreplayableOrder) {
+  struct Case {
+    std::vector<std::string> setup;
+    std::string seed;
+    std::string statement;
+  };
+  const std::vector<Case> cases = {
+      // INSERT fires before the DELETE of the WITH query, which LIMIT leaves unfinished.
+      {{},
+       "INSERT INTO t1 VALUES (1, NULL, 'a'), (2, NULL, 'b')",
+       "WITH d AS (DELETE FROM t1 WHERE id = 1 RETURNING id, v) "
+       "INSERT INTO t1 SELECT id, NULL, v || '2' FROM d LIMIT 1"},
+      {{},
+       "INSERT INTO t1 VALUES (1, NULL, 'a'), (2, NULL, 'b')",
+       "WITH u AS (UPDATE t1 SET id = 102 WHERE id = 2 RETURNING v) "
+       "INSERT INTO t1 SELECT 2, NULL, v || '2' FROM u LIMIT 1"},
+      // The cascade's DELETE is queued again after the INSERT.
+      {{"ALTER TABLE t1 ADD FOREIGN KEY (parent) REFERENCES t1 (id) ON DELETE CASCADE"},
+       "INSERT INTO t1 VALUES (1, NULL, 'a'), (2, 1, 'b')",
+       "WITH d AS (DELETE FROM t1 WHERE id = 1 RETURNING id, v) "
+       "INSERT INTO t1 SELECT id, NULL, v || '2' FROM d"},
+      {{"CREATE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+        "IF pg_trigger_depth() = 1 THEN "
+        "UPDATE t1 SET v = NEW.v || '_touched' WHERE id = NEW.id; END IF; "
+        "RETURN NULL; END $$",
+        "CREATE TRIGGER touch AFTER UPDATE ON t1 FOR EACH ROW EXECUTE FUNCTION touch()"},
+       "INSERT INTO t1 VALUES (1, NULL, 'a')",
+       "UPDATE t1 SET v = 'b' WHERE id = 1"},
+      {{"CREATE FUNCTION prune() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+        "DELETE FROM t1 WHERE id <= NEW.id - 2; RETURN NULL; END $$",
+        "CREATE TRIGGER prune AFTER INSERT ON t1 FOR EACH ROW EXECUTE FUNCTION prune()"},
+       "",
+       "INSERT INTO t1 VALUES (11, NULL, 'x'), (12, NULL, 'y'), (13, NULL, 'z')"},
+  };
+
+  auto conn = ASSERT_RESULT(Connect());
+  for (size_t i = 0; i < cases.size(); ++i) {
+    const auto& c = cases[i];
+    SCOPED_TRACE(c.statement);
+    ASSERT_OK(conn.ExecuteFormat("CREATE SCHEMA c$0", i));
+    ASSERT_OK(conn.ExecuteFormat("SET search_path TO c$0", i));
+    ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, parent INT, v TEXT)"));
+    ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, parent INT, v TEXT, v2 TEXT)"));
+    ASSERT_OK(conn.Execute(
+        "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+        "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.parent, src.v, src.v || '_x')::t2; END "
+        "$$"));
+    for (const auto& stmt : c.setup) {
+      ASSERT_OK(conn.Execute(stmt));
+    }
+    if (!c.seed.empty()) {
+      ASSERT_OK(conn.Execute(c.seed));
+    }
+    ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+    const auto source_before = ASSERT_RESULT(conn.FetchAllAsString(
+        "SELECT t1::text AS r FROM t1 ORDER BY r"));
+
+    ASSERT_NOK_STR_CONTAINS(conn.Execute(c.statement), kOnlineSchemaChangeReplayOrderError);
+
+    ASSERT_EQ(ASSERT_RESULT(conn.FetchAllAsString("SELECT t1::text AS r FROM t1 ORDER BY r")),
+              source_before);
+    ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM t2")), 0);
+  }
+}
+
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerReplayableOrders) {
+  struct Case {
+    std::vector<std::string> setup;
+    std::string seed;
+    std::string statement;
+  };
+  const std::vector<Case> cases = {
+      {{},
+       "INSERT INTO t1 VALUES (1, NULL, 'a'), (2, NULL, 'b')",
+       "WITH d AS (DELETE FROM t1 WHERE id = 1 RETURNING id, v) "
+       "INSERT INTO t1 SELECT id, NULL, v || '2' FROM d"},
+      {{},
+       "INSERT INTO t1 VALUES (1, NULL, 'a'), (2, NULL, 'b')",
+       "WITH u AS (UPDATE t1 SET id = 102 WHERE id = 2 RETURNING v) "
+       "INSERT INTO t1 SELECT 2, NULL, v || '2' FROM u"},
+      {{},
+       "INSERT INTO t1 VALUES (1, NULL, 'a'), (2, NULL, 'b')",
+       "INSERT INTO t1 VALUES (1, NULL, 'a2'), (3, NULL, 'c') "
+       "ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v"},
+      {{"ALTER TABLE t1 ADD FOREIGN KEY (parent) REFERENCES t1 (id) ON DELETE SET NULL"},
+       "INSERT INTO t1 VALUES (1, NULL, 'a'), (2, 1, 'b')",
+       "DELETE FROM t1 WHERE id = 1"},
+      // A cascade's rows join the transition table of the statement that caused it.
+      {{"ALTER TABLE t1 ADD FOREIGN KEY (parent) REFERENCES t1 (id) "
+        "ON UPDATE CASCADE ON DELETE CASCADE"},
+       "INSERT INTO t1 VALUES (1, NULL, 'a'), (2, 1, 'b'), (3, 2, 'c'), (4, NULL, 'd')",
+       "DELETE FROM t1 WHERE id = 1"},
+      {{"ALTER TABLE t1 ADD FOREIGN KEY (parent) REFERENCES t1 (id) "
+        "ON UPDATE CASCADE ON DELETE CASCADE"},
+       "INSERT INTO t1 VALUES (1, NULL, 'a'), (2, 1, 'b'), (3, 2, 'c'), (4, NULL, 'd')",
+       "UPDATE t1 SET id = 10 WHERE id = 1"},
+      // A statement trigger that sorts after the capture triggers fires after them.
+      {{"CREATE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+        "UPDATE t1 SET v = v || '_touched' WHERE id = 1; RETURN NULL; END $$",
+        "CREATE TRIGGER zz_touch AFTER INSERT ON t1 FOR EACH STATEMENT "
+        "EXECUTE FUNCTION touch()"},
+       "",
+       "INSERT INTO t1 VALUES (1, NULL, 'a'), (2, NULL, 'b')"},
+  };
+
+  auto conn = ASSERT_RESULT(Connect());
+  for (size_t i = 0; i < cases.size(); ++i) {
+    const auto& c = cases[i];
+    SCOPED_TRACE(c.statement);
+    ASSERT_OK(conn.ExecuteFormat("CREATE SCHEMA c$0", i));
+    ASSERT_OK(conn.ExecuteFormat("SET search_path TO c$0", i));
+    ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, parent INT, v TEXT)"));
+    ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, parent INT, v TEXT, v2 TEXT)"));
+    ASSERT_OK(conn.Execute(
+        "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+        "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.parent, src.v, src.v || '_x')::t2; END "
+        "$$"));
+    for (const auto& stmt : c.setup) {
+      ASSERT_OK(conn.Execute(stmt));
+    }
+    ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+    if (!c.seed.empty()) {
+      ASSERT_OK(conn.Execute(c.seed));
+    }
+
+    ASSERT_OK(conn.Execute(c.statement));
+
+    ASSERT_EQ(ASSERT_RESULT(TargetRows(&conn)), ASSERT_RESULT(ExpectedTargetRows(&conn)));
+  }
+}
+
+// Command IDs restart in every transaction, including after a COMMIT in a DO block, so the first
+// statements of a transaction must not be taken for statements nested in the previous one's. And
+// consecutive statements, whose EStates can share an address, must not be taken for one statement.
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerReplayOrderAcrossStatements) {
+  constexpr int kIters = 30;
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT, v2 TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v, src.v || '_x')::t2; END $$"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+
+  ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+  for (int i = 1; i <= kIters; ++i) {
+    ASSERT_OK(conn.ExecuteFormat("INSERT INTO t1 VALUES ($0, 'a')", i));
+    ASSERT_OK(conn.ExecuteFormat("UPDATE t1 SET v = 'b' WHERE id = $0", i));
+    ASSERT_OK(conn.ExecuteFormat("DELETE FROM t1 WHERE id = $0", i - 1));
+  }
+  ASSERT_OK(conn.CommitTransaction());
+  ASSERT_OK(conn.ExecuteFormat("DELETE FROM t1 WHERE id = $0", kIters));
+
+  ASSERT_OK(conn.ExecuteFormat(
+      "DO $$$$ BEGIN "
+      "FOR i IN 1..$0 LOOP "
+      "INSERT INTO t1 VALUES (i, 'c'); UPDATE t1 SET v = 'd' WHERE id = i; "
+      "END LOOP; "
+      "COMMIT; "
+      "DELETE FROM t1 WHERE id = 1; "
+      "END $$$$",
+      kIters));
+
+  ASSERT_EQ(ASSERT_RESULT(TargetRows(&conn)), ASSERT_RESULT(ExpectedTargetRows(&conn)));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM t2")), kIters - 1);
+}
+
+// YB retries a statement that hits a transaction conflict, and when nothing ran a
+// CommandCounterIncrement since the failed attempt, the retry runs with its command ID. With
+// yb_speculatively_execute_pl_statements the capture trigger does not flush, so the conflict on the
+// shared row 0 can surface after the INSERT firing was replayed. The UPDATE firing of the retry
+// must not be taken for a later firing of the failed attempt.
+TEST_F_EX(PgMiniTest, OnlineSchemaChangeTriggerRetriedStatement, PgMiniTestFailOnConflict) {
+  constexpr int kThreads = 4;
+  constexpr int kIters = 100;
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT, v2 TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v, src.v || '_x')::t2; END $$"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+  ASSERT_OK(conn.Execute("INSERT INTO t1 VALUES (0, 'seed')"));
+
+  std::atomic<int> committed{0};
+  std::atomic<int> failed{0};
+  std::atomic<int> misordered{0};
+  TestThreadHolder thread_holder;
+  for (int t = 1; t <= kThreads; ++t) {
+    thread_holder.AddThreadFunctor([this, t, &committed, &failed, &misordered] {
+      auto thread_conn = ASSERT_RESULT(Connect());
+      ASSERT_OK(thread_conn.Execute("SET yb_speculatively_execute_pl_statements = on"));
+      for (int i = 0; i < kIters; ++i) {
+        // Updates the shared row and inserts a new one, so each attempt fires both triggers.
+        auto status = thread_conn.ExecuteFormat(
+            "INSERT INTO t1 VALUES (0, 'v$0_$1'), ($2, 'n') "
+            "ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v",
+            t, i, 1000 * t + i);
+        if (status.ok()) {
+          ++committed;
+        } else if (
+            status.ToString().find(kOnlineSchemaChangeReplayOrderError) != std::string::npos) {
+          LOG(WARNING) << "Retried upsert rejected: " << status;
+          ++misordered;
+        } else {
+          ++failed;
+        }
+      }
+    });
+  }
+  thread_holder.JoinAll();
+
+  LOG(INFO) << "Upserts: " << committed << " committed, " << failed << " failed, " << misordered
+            << " rejected as misordered";
+  ASSERT_EQ(misordered, 0);
+  ASSERT_GT(committed, 0);
+  ASSERT_EQ(ASSERT_RESULT(TargetRows(&conn)), ASSERT_RESULT(ExpectedTargetRows(&conn)));
+}
+
+// The flush tests compare a statement's storage flushes with and without the capture triggers. The
+// replay must add a constant number of flushes, not one per row. Row counts stay below
+// ysql_session_max_batch_size, past which the buffer flushes on its own.
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerFlushInsert) {
+  constexpr int kNumRows = 500;
+  auto conn = ASSERT_RESULT(Connect());
+
+  ASSERT_OK(conn.Execute("CREATE TABLE base (id INT PRIMARY KEY, v TEXT)"));
+  const auto base_single = ASSERT_RESULT(ExplainFlushes(
+      &conn, "INSERT INTO base VALUES (-1, 'x')"));
+  const auto base_bulk = ASSERT_RESULT(ExplainFlushes(&conn, Format(
+      "INSERT INTO base SELECT i, 'v_' || i FROM generate_series(1, $0) i", kNumRows)));
+
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT, v2 TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v, src.v || '_x')::t2; END $$"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+  const auto osc_single = ASSERT_RESULT(ExplainFlushes(
+      &conn, "INSERT INTO t1 VALUES (-1, 'x')"));
+  const auto osc_bulk = ASSERT_RESULT(ExplainFlushes(&conn, Format(
+      "INSERT INTO t1 SELECT i, 'v_' || i FROM generate_series(1, $0) i", kNumRows)));
+
+  LOG(INFO) << "[FLUSH] INSERT single: baseline=" << base_single << " osc=" << osc_single
+            << " extra=" << (osc_single - base_single);
+  LOG(INFO) << "[FLUSH] INSERT bulk(" << kNumRows << "): baseline=" << base_bulk
+            << " osc=" << osc_bulk << " extra=" << (osc_bulk - base_bulk);
+
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM t2")), kNumRows + 1);
+  ASSERT_LE(osc_bulk, base_bulk + 10) << "INSERT trigger should add O(1) flushes";
+  ASSERT_LE(osc_bulk, 20);
+}
+
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerFlushUpdate) {
+  constexpr int kNumRows = 500;
+  auto conn = ASSERT_RESULT(Connect());
+
+  ASSERT_OK(conn.Execute("CREATE TABLE base (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.ExecuteFormat(
+      "INSERT INTO base SELECT i, 'v_' || i FROM generate_series(1, $0) i", kNumRows));
+  const auto base_bulk = ASSERT_RESULT(ExplainFlushes(
+      &conn, "UPDATE base SET v = 'new_' || v"));
+
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT, v2 TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v, src.v || '_x')::t2; END $$"));
+  ASSERT_OK(conn.ExecuteFormat(
+      "INSERT INTO t1 SELECT i, 'v_' || i FROM generate_series(1, $0) i", kNumRows));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+  const auto osc_bulk = ASSERT_RESULT(ExplainFlushes(
+      &conn, "UPDATE t1 SET v = 'new_' || v"));
+
+  LOG(INFO) << "[FLUSH] UPDATE bulk(" << kNumRows << "): baseline=" << base_bulk
+            << " osc=" << osc_bulk << " extra=" << (osc_bulk - base_bulk);
+
+  ASSERT_LE(osc_bulk, base_bulk + 15) << "UPDATE trigger should add O(1) flushes";
+  ASSERT_LE(osc_bulk, 30);
+}
+
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerFlushDelete) {
+  constexpr int kNumRows = 500;
+  auto conn = ASSERT_RESULT(Connect());
+
+  ASSERT_OK(conn.Execute("CREATE TABLE base (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.ExecuteFormat(
+      "INSERT INTO base SELECT i, 'v_' || i FROM generate_series(1, $0) i", kNumRows));
+  const auto base_bulk = ASSERT_RESULT(ExplainFlushes(&conn, "DELETE FROM base"));
+
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT, v2 TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v, src.v || '_x')::t2; END $$"));
+  ASSERT_OK(conn.ExecuteFormat(
+      "INSERT INTO t1 SELECT i, 'v_' || i FROM generate_series(1, $0) i", kNumRows));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+  const auto osc_bulk = ASSERT_RESULT(ExplainFlushes(&conn, "DELETE FROM t1"));
+
+  LOG(INFO) << "[FLUSH] DELETE bulk(" << kNumRows << "): baseline=" << base_bulk
+            << " osc=" << osc_bulk << " extra=" << (osc_bulk - base_bulk);
+
+  ASSERT_LE(osc_bulk, base_bulk + 10) << "DELETE trigger should add O(1) flushes";
+  ASSERT_LE(osc_bulk, 20);
+}
+
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerFlushSecondaryIndexes) {
+  constexpr int kNumRows = 500;
+  auto conn = ASSERT_RESULT(Connect());
+
+  ASSERT_OK(conn.Execute("CREATE TABLE s0 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE d0 (id INT PRIMARY KEY, v TEXT, v2 TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION s0_to_d0(src s0) RETURNS d0 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v, src.v || '_x')::d0; END $$"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "s0", "d0", "s0_to_d0"));
+  const auto no_idx = ASSERT_RESULT(ExplainFlushes(&conn, Format(
+      "INSERT INTO s0 SELECT i, 'v_' || i FROM generate_series(1, $0) i", kNumRows)));
+
+  ASSERT_OK(conn.Execute("CREATE TABLE s3 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE d3 (id INT PRIMARY KEY, v TEXT, v2 TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE INDEX ON d3 (v)"));
+  ASSERT_OK(conn.Execute("CREATE INDEX ON d3 (v2)"));
+  ASSERT_OK(conn.Execute("CREATE INDEX ON d3 (v2, id)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION s3_to_d3(src s3) RETURNS d3 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v, src.v || '_x')::d3; END $$"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "s3", "d3", "s3_to_d3"));
+  const auto three_idx = ASSERT_RESULT(ExplainFlushes(&conn, Format(
+      "INSERT INTO s3 SELECT i, 'v_' || i FROM generate_series(1, $0) i", kNumRows)));
+
+  LOG(INFO) << "[FLUSH] INSERT bulk(" << kNumRows << ") target indexes: 0=" << no_idx
+            << " 3=" << three_idx << " extra_per_idx=" << ((three_idx - no_idx) / 3.0);
+
+  ASSERT_LE(three_idx, 30) << "secondary indexes add writes, not O(rows) flushes";
+}
+
+// With yb_speculatively_execute_pl_statements on, a PL/pgSQL loop of INSERTs batches into one
+// flush, and the trigger must not turn that back into a flush per iteration.
+TEST_F(PgMiniTestSingleNode, OnlineSchemaChangeTriggerFlushPlpgsqlLoop) {
+  constexpr int kIters = 50;
+  auto conn = ASSERT_RESULT(Connect());
+
+  ASSERT_OK(conn.Execute("CREATE TABLE base (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION ins_base(n INT) RETURNS void LANGUAGE plpgsql AS $$ BEGIN "
+      "FOR i IN 1..n LOOP INSERT INTO base VALUES (i, 'v'); END LOOP; END $$"));
+  const auto base = ASSERT_RESULT(ExplainFlushes(&conn, Format("SELECT ins_base($0)", kIters)));
+
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT, v2 TEXT)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION t1_to_t2(src t1) RETURNS t2 LANGUAGE plpgsql IMMUTABLE SET search_path "
+      "FROM CURRENT AS $$ BEGIN RETURN ROW(src.id, src.v, src.v || '_x')::t2; END $$"));
+  ASSERT_OK(AttachOnlineSchemaChangeTriggers(&conn, "t1", "t2", "t1_to_t2"));
+  ASSERT_OK(conn.Execute(
+      "CREATE FUNCTION ins_t1(n INT) RETURNS void LANGUAGE plpgsql AS $$ BEGIN "
+      "FOR i IN 1..n LOOP INSERT INTO t1 VALUES (i, 'v'); END LOOP; END $$"));
+  const auto osc = ASSERT_RESULT(ExplainFlushes(&conn, Format("SELECT ins_t1($0)", kIters)));
+
+  LOG(INFO) << "[FLUSH] default: plpgsql loop of " << kIters << " single-row INSERTs: baseline="
+            << base << " osc=" << osc << " extra=" << (osc - base);
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM t2")), kIters);
+  // Each firing ends with a flush while the setting is off. The plain loop flushes once per
+  // iteration in release builds but once in total in debug builds, so bound the firings' share.
+  ASSERT_LE(osc, base + kIters + 5) << "trigger should add at most one flush per firing";
+
+  ASSERT_OK(conn.Execute("SET yb_speculatively_execute_pl_statements = on"));
+  ASSERT_OK(conn.Execute("TRUNCATE base"));
+  ASSERT_OK(conn.Execute("TRUNCATE t1"));
+  ASSERT_OK(conn.Execute("TRUNCATE t2"));
+  const auto base_spec =
+      ASSERT_RESULT(ExplainFlushes(&conn, Format("SELECT ins_base($0)", kIters)));
+  const auto osc_spec =
+      ASSERT_RESULT(ExplainFlushes(&conn, Format("SELECT ins_t1($0)", kIters)));
+  LOG(INFO) << "[FLUSH] speculative: plpgsql loop of " << kIters
+            << " single-row INSERTs: baseline=" << base_spec << " osc=" << osc_spec
+            << " extra=" << (osc_spec - base_spec);
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT count(*) FROM t2")), kIters);
+  ASSERT_LE(osc_spec, base_spec + 5)
+      << "trigger flush defeats yb_speculatively_execute_pl_statements";
 }
 
 }  // namespace yb::pgwrapper

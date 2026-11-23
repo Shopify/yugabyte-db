@@ -15,12 +15,15 @@ import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase.AllowedTasks;
 import com.yugabyte.yw.common.CustomerTaskManager;
 import com.yugabyte.yw.common.KubernetesUtil;
 import com.yugabyte.yw.common.PlacementInfoUtil;
+import com.yugabyte.yw.common.ProviderInitializer;
+import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.common.backuprestore.ybc.YbcManager;
 import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.common.config.UniverseConfKeys;
 import com.yugabyte.yw.common.gflags.GFlagsUtil;
 import com.yugabyte.yw.common.gflags.SpecificGFlags;
 import com.yugabyte.yw.common.helm.HelmUtils;
+import com.yugabyte.yw.common.metrics.MetricService;
 import com.yugabyte.yw.common.operator.OperatorStatusUpdater.UniverseState;
 import com.yugabyte.yw.common.operator.helpers.OperatorPlacementInfoHelper;
 import com.yugabyte.yw.common.operator.utils.KubernetesEnvironmentVariables;
@@ -129,6 +132,7 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
   private final CustomerTaskManager customerTaskManager;
   private final UniverseActionsHandler universeActionsHandler;
   private final YbcManager ybcManager;
+  private final MetricService metricService;
   private final Set<UUID> universeReadySet;
   private final Map<String, String> universeDeletionReferenceMap;
   private final Map<String, UUID> universeTaskMap;
@@ -150,7 +154,8 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
       CustomerTaskManager customerTaskManager,
       OperatorUtils operatorUtils,
       UniverseActionsHandler universeActionsHandler,
-      YbcManager ybcManager) {
+      YbcManager ybcManager,
+      MetricService metricService) {
     this(
         client,
         informerFactory,
@@ -165,7 +170,8 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
         customerTaskManager,
         operatorUtils,
         universeActionsHandler,
-        ybcManager);
+        ybcManager,
+        metricService);
   }
 
   @VisibleForTesting
@@ -183,7 +189,8 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
       CustomerTaskManager customerTaskManager,
       OperatorUtils operatorUtils,
       UniverseActionsHandler universeActionsHandler,
-      YbcManager ybcManager) {
+      YbcManager ybcManager,
+      MetricService metricService) {
 
     super(client, informerFactory, YBUniverse.class, operatorUtils, namespace);
     this.releaseInformer = informerFactory.getSharedIndexInformer(Release.class, client);
@@ -200,6 +207,7 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
     this.inProgressAutoProviderCRs = ConcurrentHashMap.newKeySet();
     this.universeActionsHandler = universeActionsHandler;
     this.ybcManager = ybcManager;
+    this.metricService = metricService;
   }
 
   @VisibleForTesting
@@ -362,6 +370,7 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
       if (TaskInfo.ERROR_STATES.contains(createTaskState)) {
         log.debug("Previous attempt to create Universe {} failed, retrying", ybaUniverseName);
         Universe.delete(u.getUniverseUUID());
+        metricService.markSourceRemoved(cust.getUuid(), u.getUniverseUUID());
         UniverseConfigureTaskParams taskParams =
             createTaskParams(ybUniverse, cust.getUuid(), getProvider(ybUniverse, cust.getUuid()));
         createUniverse(cust.getUuid(), taskParams, ybUniverse);
@@ -1192,7 +1201,12 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
     if (ybUniverse.getSpec() == null || ybUniverse.getSpec().getUpgradeOption() == null) {
       return UpgradeOption.ROLLING_UPGRADE;
     }
-    switch (ybUniverse.getSpec().getUpgradeOption().getValue()) {
+    return toUpgradeOption(ybUniverse.getSpec().getUpgradeOption().getValue());
+  }
+
+  /** Maps a CR upgradeOption enum value ("Rolling", "Non-Rolling", "Non-Restart"). */
+  static UpgradeOption toUpgradeOption(String crValue) {
+    switch (crValue) {
       case "Non-Rolling":
         return UpgradeOption.NON_ROLLING_UPGRADE;
       case "Non-Restart":
@@ -1203,8 +1217,15 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
     }
   }
 
-  private static void applyUpgradeOptions(UpgradeTaskParams requestParams, YBUniverse ybUniverse) {
-    requestParams.upgradeOption = getUpgradeOption(ybUniverse);
+  static void applyUpgradeOptions(UpgradeTaskParams requestParams, YBUniverse ybUniverse) {
+    applyUpgradeOptions(requestParams, ybUniverse, getUpgradeOption(ybUniverse));
+  }
+
+  // Rolling batch size and wait times still come from the ybUniverse spec when upgradeOption
+  // overrides the spec's own option.
+  static void applyUpgradeOptions(
+      UpgradeTaskParams requestParams, YBUniverse ybUniverse, UpgradeOption upgradeOption) {
+    requestParams.upgradeOption = upgradeOption;
     if (ybUniverse.getSpec() == null) {
       return;
     }
@@ -1696,8 +1717,10 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
         log.error("Provider {} is not ready", provider.getName());
         throw new RuntimeException("Provider " + provider.getName() + " is not ready");
       }
-      userIntent.provider = provider.getUuid().toString();
-      userIntent.providerType = CloudType.kubernetes;
+      ProviderInitializer providerInitializer =
+          Util.newProviderInitializer(
+              userIntent, provider.getUuid(), CloudType.kubernetes, confGetter);
+
       userIntent.replicationFactor =
           ybUniverse.getSpec().getReplicationFactor() != null
               ? ((int) ybUniverse.getSpec().getReplicationFactor().longValue())
@@ -1744,28 +1767,30 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
               : 0;
       userIntent.ybSoftwareVersion = ybUniverse.getSpec().getYbSoftwareVersion();
       userIntent.setProxyConfig(toProxyConfig(ybUniverse.getSpec().getProxyConfig()));
-      userIntent.accessKeyCode = "";
+      providerInitializer.setAccessCode("");
 
       // Use new volume fields if any are present, otherwise fall back to old deviceInfo fields
       // If tserverVolume or masterVolume is present, use new fields for both (mutual exclusivity)
       if (ybUniverse.getSpec().getTserverVolume() != null
           || ybUniverse.getSpec().getMasterVolume() != null) {
         // Use new volume fields
-        userIntent.deviceInfo =
-            operatorUtils.mapTserverVolume(ybUniverse.getSpec().getTserverVolume());
-        userIntent.masterDeviceInfo =
-            operatorUtils.mapMasterVolume(ybUniverse.getSpec().getMasterVolume());
+        providerInitializer.setDeviceInfo(
+            operatorUtils.mapTserverVolume(ybUniverse.getSpec().getTserverVolume()));
+        providerInitializer.setMasterDeviceInfo(
+            operatorUtils.mapMasterVolume(ybUniverse.getSpec().getMasterVolume()));
       } else {
         // Use old deviceInfo fields
-        userIntent.deviceInfo = operatorUtils.mapDeviceInfo(ybUniverse.getSpec().getDeviceInfo());
-        userIntent.masterDeviceInfo =
-            operatorUtils.mapMasterDeviceInfo(ybUniverse.getSpec().getMasterDeviceInfo());
+        providerInitializer.setDeviceInfo(
+            operatorUtils.mapDeviceInfo(ybUniverse.getSpec().getDeviceInfo()));
+        providerInitializer.setMasterDeviceInfo(
+            operatorUtils.mapMasterDeviceInfo(ybUniverse.getSpec().getMasterDeviceInfo()));
       }
-      if (userIntent.deviceInfo == null) {
-        userIntent.deviceInfo = operatorUtils.defaultDeviceInfo();
+      if (userIntent.getBaseDeviceInfo(provider.getUuid()) == null) {
+        providerInitializer.setDeviceInfo(operatorUtils.defaultDeviceInfo());
       }
-      if (userIntent.masterDeviceInfo == null) {
-        userIntent.masterDeviceInfo = operatorUtils.defaultMasterDeviceInfo();
+      if (userIntent.getBaseDeviceInfo(provider.getUuid(), UniverseTaskBase.ServerType.MASTER)
+          == null) {
+        providerInitializer.setMasterDeviceInfo(operatorUtils.defaultMasterDeviceInfo());
       }
 
       userIntent.enableYSQL = ybUniverse.getSpec().getEnableYSQL();
@@ -1773,6 +1798,8 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
       userIntent.enableYEDIS = false; // Always disable YEDIS
       userIntent.enableNodeToNodeEncrypt = ybUniverse.getSpec().getEnableNodeToNodeEncrypt();
       userIntent.enableClientToNodeEncrypt = ybUniverse.getSpec().getEnableClientToNodeEncrypt();
+      userIntent.useNodeToNodeClientCerts =
+          Boolean.TRUE.equals(ybUniverse.getSpec().getUseNodeToNodeClientCerts());
       userIntent.setUseYbdbInbuiltYbc(
           Boolean.TRUE.equals(ybUniverse.getSpec().getUseYbdbInbuiltYbc()));
       userIntent.kubernetesOperatorVersion = ybUniverse.getMetadata().getGeneration();
@@ -2910,6 +2937,7 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
   private UserIntent getReadReplicaUserIntent(
       UserIntent userIntent, YBUniverse ybUniverse, UUID customerUUID) {
     UserIntent readReplicaUserIntent = userIntent.clone();
+    readReplicaUserIntent.specificGFlags = SpecificGFlags.constructInherited();
     readReplicaUserIntent.numNodes = ybUniverse.getSpec().getReadReplica().getNumNodes().intValue();
     readReplicaUserIntent.replicationFactor =
         ybUniverse.getSpec().getReadReplica().getReplicationFactor().intValue();

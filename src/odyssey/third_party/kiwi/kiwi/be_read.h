@@ -32,6 +32,13 @@ static inline void kiwi_be_startup_init(kiwi_be_startup_t *su)
 	kiwi_var_init(&su->replication, NULL, 0);
 }
 
+static inline void kiwi_be_startup_free(kiwi_be_startup_t *su)
+{
+	kiwi_var_free(&su->user);
+	kiwi_var_free(&su->database);
+	kiwi_var_free(&su->replication);
+}
+
 /*
  * YB: PG limits names to NAMEDATALEN size, which is set to 64 in code. Database
  * and user names longer than that are truncated to first 63 characters followed by
@@ -179,7 +186,8 @@ KIWI_API static inline int kiwi_be_read_password(char *data, uint32_t size,
 		return -1;
 	if (kiwi_unlikely(header->type != KIWI_FE_PASSWORD_MESSAGE))
 		return -1;
-	if (len > KIWI_LONG_MESSAGE_SIZE)
+	/* YB: Check against PG_MAX_AUTH_TOKEN_LENGTH */
+	if (len > PG_MAX_AUTH_TOKEN_LENGTH - sizeof(uint32_t))
 		return -1;
 	pw->password_len = len;
 	pw->password = malloc(len);
@@ -258,14 +266,17 @@ static inline int yb_prepared_statement_alloc(kiwi_prepared_statement_t *stmt,
 					void *description, size_t description_len)
 {
 	stmt->operator_name = malloc(operator_name_len);
-	if (stmt->operator_name == NULL)
+	if (stmt->operator_name == NULL) {
+		yb_prepared_statement_init(stmt);
 		return -1;
+	}
 	memcpy(stmt->operator_name, operator_name, operator_name_len);
 	stmt->operator_name_len = operator_name_len;
 
 	stmt->description = malloc(description_len);
 	if (stmt->description == NULL) {
 		free(stmt->operator_name);
+		yb_prepared_statement_init(stmt);
 		return -1;
 	}
 	memcpy(stmt->description, description, description_len);

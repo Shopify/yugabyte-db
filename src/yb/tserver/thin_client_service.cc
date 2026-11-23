@@ -47,17 +47,25 @@
 #include "yb/tserver/session_registry.h"
 #include "yb/tserver/pg_mutation_counter.h"
 #include "yb/tserver/pg_table_cache.h"
+#include "yb/tserver/tserver_error.h"
 
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/status_format.h"
 #include "yb/util/std_util.h"
-#include "yb/util/thread.h"
 
 using namespace std::literals;
 
+DECLARE_uint64(max_clock_skew_usec);
 DECLARE_uint64(rpc_max_message_size);
+
+DEFINE_test_flag(uint64, thin_client_perform_delay_ms, 0,
+                 "Delay between a thin client Perform finding its session and being applied.");
+
+DEFINE_test_flag(bool, thin_client_omit_session_lost_code, false,
+                 "Send a lost thin client session's status without its error code, as older "
+                 "tservers do.");
 
 namespace yb::tserver {
 
@@ -66,21 +74,28 @@ namespace {
 // Thin clients only need the schema info of an opened table.
 using ThinOpenTableQuery = OpenTableQueryBase<ThinOpenTableRequestPB, ThinOpenTableResponsePB>;
 
+// The status for a session this tserver no longer serves. The thin client reopens on its code.
+Status SessionLostStatus(const Status& status) {
+  if (PREDICT_FALSE(FLAGS_TEST_thin_client_omit_session_lost_code)) {
+    return status;
+  }
+  return status.CloneAndAddErrorCode(TabletServerError(TabletServerErrorPB::SESSION_LOST));
+}
+
 class ThinSession;
 using ThinSessionPtr = std::shared_ptr<ThinSession>;
 
 // One Perform call: holds the rpc context with its request/response, the table lookup result and
 // the prepared operations.
 class ThinPerformQuery : public std::enable_shared_from_this<ThinPerformQuery>,
-                         public rpc::ThreadPoolTask,
                          public PgTablesQueryListener {
  public:
   using ContextHolder = rpc::TypedPBRpcContextHolder<
       LWThinPerformRequestPB, LWThinPerformResponsePB, rpc::RpcCallLWParamsImpl>;
 
-  ThinPerformQuery(ThinSessionPtr&& session, ContextHolder&& context, rpc::Messenger& messenger)
-      : session_(std::move(session)), context_(std::move(context)), messenger_(messenger),
-        tid_(Thread::UniqueThreadId()), wait_state_ptr_(ash::WaitStateInfo::CurrentWaitState()) {}
+  ThinPerformQuery(ThinSessionPtr&& session, ContextHolder&& context)
+      : session_(std::move(session)), context_(std::move(context)),
+        wait_state_ptr_(ash::WaitStateInfo::CurrentWaitState()) {}
 
   LWThinPerformRequestPB& req() { return context_.req(); }
   LWThinPerformResponsePB& resp() { return context_.resp(); }
@@ -91,17 +106,9 @@ class ThinPerformQuery : public std::enable_shared_from_this<ThinPerformQuery>,
     return SharedField(context().shared_params(), &resp().arena());
   }
 
-  const PgTablesQueryResult& tables() const { return *tables_; }
+  const PgTablesQueryResult& tables() const { return tables_; }
 
-  void Ready(const PgTablesQueryResult& tables) override {
-    tables_ = tables;
-    if (Thread::UniqueThreadId() == tid_) {
-      Run();
-    } else {
-      retained_self_ = shared_from_this();
-      messenger_.ThreadPool().Enqueue(this);
-    }
-  }
+  void Ready(PgTablesQueryResult&& tables) override;
 
   void RespondFailure(const Status& status) {
     DCHECK(!status.ok());
@@ -115,18 +122,9 @@ class ThinPerformQuery : public std::enable_shared_from_this<ThinPerformQuery>,
   std::vector<std::shared_ptr<client::YBPgsqlOp>> ops;
 
  private:
-  void Run() override;
-
-  void Done(const Status& status) override {
-    retained_self_ = nullptr;
-  }
-
   const ThinSessionPtr session_;
   ContextHolder context_;
-  rpc::Messenger& messenger_;
-  const int64_t tid_;
-  std::optional<PgTablesQueryResult> tables_;
-  std::shared_ptr<ThinPerformQuery> retained_self_;
+  PgTablesQueryResult tables_;
 
   // kept here in case the task is scheduled in another thread.
   const ash::WaitStateInfoPtr wait_state_ptr_;
@@ -156,7 +154,8 @@ class ThinSession : public ClientSessionBase,
     {
       std::lock_guard lock(mutex_);
       if (shutting_down_) {
-        query->RespondFailure(STATUS(ShutdownInProgress, "Session is shutting down"));
+        query->RespondFailure(
+            SessionLostStatus(STATUS(ShutdownInProgress, "Session is shutting down")));
         return;
       }
     }
@@ -187,6 +186,38 @@ class ThinSession : public ClientSessionBase,
       (op.has_read() ? has_read : has_write) = true;
     }
     SCHECK(!(has_read && has_write), InvalidArgument, "Mixed read/write Perform batch");
+    const auto& read_time_options = req.read_time_options();
+    const bool has_read_time =
+        read_time_options.has_read_time() && read_time_options.read_time().read_ht();
+    const bool has_staleness = read_time_options.has_follower_read_staleness_ms();
+    SCHECK(
+        !(has_write && has_staleness), InvalidArgument,
+        "follower_read_staleness_ms is not allowed on a write batch");
+    // Without read_from_followers the leader would serve the batch at now - staleness, a
+    // historical snapshot the caller did not ask for.
+    SCHECK(
+        !(has_staleness && !read_time_options.read_from_followers()), InvalidArgument,
+        "follower_read_staleness_ms needs read_from_followers");
+    // A zero staleness reads at now, which no follower can serve. Below twice the clock skew bound
+    // a follower usually cannot serve it either, so the read would move to another replica and the
+    // local one stay marked failed. YSQL refuses the same range (is_staleness_acceptable).
+    SCHECK(
+        !(has_staleness && read_time_options.follower_read_staleness_ms() == 0),
+        InvalidArgument, "follower_read_staleness_ms must be positive");
+    SCHECK(
+        !(has_staleness && read_time_options.follower_read_staleness_ms() * 1000ULL <
+                               2 * FLAGS_max_clock_skew_usec),
+        InvalidArgument,
+        "follower_read_staleness_ms must be at least 2 * max_clock_skew_usec ($0 ms)",
+        2 * FLAGS_max_clock_skew_usec / 1000);
+    // A follower read needs a read time it can judge against its safe time: the pinned one of a
+    // continuation, or one derived from the staleness. Without either, a follower would serve
+    // whatever its safe time is, however far behind.
+    SCHECK(
+        !(has_read && read_time_options.read_from_followers() && !has_read_time &&
+          !has_staleness),
+        InvalidArgument,
+        "read_from_followers needs a read_time or a follower_read_staleness_ms");
     VLOG_WITH_PREFIX(2) << "Perform: " << req.ops().size() << (has_read ? " read" : " write")
                         << " op(s)";
 
@@ -201,11 +232,17 @@ class ThinSession : public ClientSessionBase,
     session->set_allow_local_calls_in_curr_thread(false);
     CancelableScopeExit abort_se{[&session] { session->Abort(); }};
 
-    const auto& read_time_options = req.read_time_options();
-    if (has_read && read_time_options.has_read_time() && read_time_options.read_time().read_ht()) {
+    if (has_read && has_read_time) {
       // The client pins the snapshot: a paged scan echoes the time its first page was served at, so
       // every page reads at that one snapshot without the server tracking anything.
       session->SetReadPoint(ReadHybridTime::FromPB(read_time_options.read_time()));
+    } else if (has_read && has_staleness) {
+      // The read time is computed here, not by the client, so the only clock skew that matters is
+      // the cluster's own, as for YSQL follower reads. Being explicit, a follower that has not
+      // reached it hands the read to another replica (ReadQuery::WaitForSafeTime) rather than
+      // waiting for its safe time to catch up.
+      SetFollowerReadTime(
+          *session->read_point(), read_time_options.follower_read_staleness_ms());
     } else {
       // No read time: leave it unset so the tablet serving the op reads at its own safe time,
       // instead of this node stamping its current time and leaving the read to wait for safe time
@@ -225,8 +262,12 @@ class ThinSession : public ClientSessionBase,
       if (op.has_read()) {
         auto& read = *op.mutable_read();
         RETURN_NOT_OK(GetTable(read.table_id(), tables, &table));
-        query->ops.push_back(std::make_shared<client::YBPgsqlReadOp>(
-            table, query->arena(), query->sidecars(), &read));
+        auto read_op = std::make_shared<client::YBPgsqlReadOp>(
+            table, query->arena(), query->sidecars(), &read);
+        if (read_time_options.read_from_followers()) {
+          read_op->set_yb_consistency_level(YBConsistencyLevel::CONSISTENT_PREFIX);
+        }
+        query->ops.push_back(std::move(read_op));
       } else {
         auto& write = *op.mutable_write();
         RETURN_NOT_OK(GetTable(write.table_id(), tables, &table));
@@ -240,15 +281,18 @@ class ThinSession : public ClientSessionBase,
     session_ptr->FlushAsync(
         [shared_this = shared_from_this(), query, session = std::move(session)](
             client::FlushStatus* flush_status) {
-          shared_this->FlushDone(query, flush_status);
+          shared_this->FlushDone(query, flush_status, session->read_point()->GetReadTime());
         });
     return Status::OK();
   }
 
-  void FlushDone(const ThinPerformQueryPtr& query, client::FlushStatus* flush_status) {
+  // `read_time` is the batch's read point after the flush: empty when each tablet picked its own.
+  void FlushDone(
+      const ThinPerformQueryPtr& query, client::FlushStatus* flush_status,
+      const ReadHybridTime& read_time) {
     auto status = CombineErrorsToStatus(flush_status->errors, flush_status->status);
     if (status.ok()) {
-      status = ProcessResponse(query);
+      status = ProcessResponse(query, read_time);
     }
     VLOG_WITH_PREFIX_AND_FUNC(2) << "status: " << status;
     if (status.ok()) {
@@ -267,7 +311,7 @@ class ThinSession : public ClientSessionBase,
     query->RespondSuccess();
   }
 
-  Status ProcessResponse(const ThinPerformQueryPtr& query) {
+  Status ProcessResponse(const ThinPerformQueryPtr& query, const ReadHybridTime& read_time) {
     int idx = -1;
     for (const auto& op : query->ops) {
       ++idx;
@@ -291,8 +335,14 @@ class ThinSession : public ClientSessionBase,
       if (const auto sidecar_index = op->sidecar_index(); sidecar_index) {
         op_resp.set_rows_data_sidecar(narrow_cast<int>(*sidecar_index));
       }
-      // The paging state keeps its read time: that is how the client learns which snapshot its scan
-      // was served at, to echo back on continuations.
+      // The paging state's read time is how the client learns which snapshot its scan was served
+      // at, to echo back on continuations. DocDB binds it only when it stops inside a tablet
+      // (PgsqlReadOperation::SetPagingState): one that moves the scan to the next tablet carries
+      // none (Tablet::CreatePagingStateForRead), so stamp the batch's own. Without it, a follower
+      // scan whose first page ends at a tablet boundary would lose its snapshot.
+      if (read_time && op_resp.has_paging_state() && !op_resp.paging_state().has_read_time()) {
+        read_time.ToPB(op_resp.mutable_paging_state()->mutable_read_time());
+      }
       op_resp.set_partition_list_version(op->table()->GetPartitionListVersion());
     }
     return Status::OK();
@@ -308,7 +358,8 @@ class ThinSession : public ClientSessionBase,
   bool shutting_down_ GUARDED_BY(mutex_) = false;
 };
 
-void ThinPerformQuery::Run() {
+void ThinPerformQuery::Ready(PgTablesQueryResult&& tables) {
+  tables_ = std::move(tables);
   ADOPT_WAIT_STATE(wait_state_ptr_);
   SCOPED_WAIT_STATUS(OnCpu_Active);
   session_->Perform(shared_from_this());
@@ -323,11 +374,16 @@ class ThinClientServiceImpl::Impl : public SessionRegistryContext {
       const scoped_refptr<ClockBase>& clock, rpc::Messenger* messenger,
       PgMutationCounter* mutation_counter)
       : client_future_(client_future), clock_(clock), messenger_(*messenger),
-        mutation_counter_(mutation_counter), table_cache_(client_future),
+        mutation_counter_(mutation_counter), table_cache_(client_future, messenger_.ThreadPool()),
         session_registry_(&messenger->scheduler(), this) {}
 
   virtual ~Impl() {
     Shutdown();
+  }
+
+  // Keeps the base text, which older thin clients match.
+  Status UnknownSessionStatus(uint64_t session_id) override {
+    return SessionLostStatus(SessionRegistryContext::UnknownSessionStatus(session_id));
   }
 
   Status Heartbeat(const ThinHeartbeatRequestPB& req, ThinHeartbeatResponsePB* resp) {
@@ -359,13 +415,34 @@ class ThinClientServiceImpl::Impl : public SessionRegistryContext {
       Respond(session.status(), resp, context);
       return;
     }
+    if (const auto delay_ms = FLAGS_TEST_thin_client_perform_delay_ms;
+        PREDICT_FALSE(delay_ms > 0)) {
+      // The context keeps the request and response alive while the Perform waits.
+      auto delayed_context = std::make_shared<rpc::RpcContext>(std::move(*context));
+      messenger_.scheduler().Schedule(
+          [this, thin_session = std::move(*session), req, resp, delayed_context](
+              const Status& status) {
+            if (!status.ok()) {
+              delayed_context->RespondFailure(status);
+              return;
+            }
+            DoPerform(thin_session, req, resp, delayed_context.get());
+          },
+          delay_ms * 1ms);
+      return;
+    }
+    DoPerform(std::move(*session), req, resp, context);
+  }
+
+  void DoPerform(
+      ThinSessionPtr session, LWThinPerformRequestPB* req, LWThinPerformResponsePB* resp,
+      rpc::RpcContext* context) {
     boost::container::small_vector<TableId, 4> table_ids;
     for (const auto& op : req->ops()) {
       AddIfMissing(table_ids, op.has_read() ? op.read().table_id() : op.write().table_id());
     }
     auto query = std::make_shared<ThinPerformQuery>(
-        std::move(*session), MakeTypedPBRpcContextHolder(*req, resp, std::move(*context)),
-        messenger_);
+        std::move(session), MakeTypedPBRpcContextHolder(*req, resp, std::move(*context)));
     table_cache_.GetTables(table_ids, query);
   }
 

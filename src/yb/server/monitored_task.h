@@ -63,6 +63,8 @@ YB_DEFINE_ENUM(MonitoredTaskType,
   (kBackendsCatalogVersion)
   (kBackendsCatalogVersionTs)
   (kBackfillDone)
+  (kOnlineSchemaChange)
+  (kTableBackfillChunk)
   (kBackfillTable)
   (kBackfillTabletChunk)
   (kChangeConfig)
@@ -91,6 +93,7 @@ YB_DEFINE_ENUM(MonitoredTaskType,
   (kTruncateTablet)
   (kTryStepDown)
   (kUpdateTransactionTablesVersion)
+  (kApplyXClusterGuardedInfoIfNewer)
   (kAddTableToXClusterTarget)
   (kMarkTableAsRunning)
   (kAddTableToXClusterSource)
@@ -101,7 +104,8 @@ YB_DEFINE_ENUM(MonitoredTaskType,
   (kXClusterHandleNewSchema)
   (kXClusterInboundReplicationGroupSetup)
   (kXClusterTableSetup)
-  (kXClusterFailover));
+  (kXClusterFailover)
+  (kXClusterWalAnchorDeletion));
 
 class MonitoredTask : public std::enable_shared_from_this<MonitoredTask> {
  public:

@@ -12,6 +12,7 @@ import {
   type QueryPageParams
 } from '@yugabytedb/perf-advisor-ui';
 
+import { PaRegistrationMode } from '@app/redesign/features/PerfAdvisor/api';
 import { AppName } from '@app/redesign/helpers/dtos';
 import { YBPanelItem } from '../../panels';
 
@@ -23,6 +24,7 @@ interface PerfAdvisorOverviewDashboardProps {
   timezone: string;
   apiUrl: string;
   registrationStatus: boolean;
+  registrationMode?: PaRegistrationMode;
   // When true, the dashboard renders the standalone anomalies view.
   showStandaloneAnomalies?: boolean;
 }
@@ -32,10 +34,15 @@ export const PerfAdvisorOverviewDashboard = ({
   timezone,
   apiUrl,
   registrationStatus,
+  registrationMode,
   showStandaloneAnomalies = false
 }: PerfAdvisorOverviewDashboardProps) => {
   const { t } = useTranslation();
-  const runtimeConfigs = usePerfAdvisorRuntimeConfigs();
+  const baseRuntimeConfigs = usePerfAdvisorRuntimeConfigs();
+  const runtimeConfigs = {
+    ...baseRuntimeConfigs,
+    showAdvancedDatabaseStats: registrationMode === PaRegistrationMode.ADVANCED
+  };
 
   const [troubleshootUuid, setTroubleshootUuid] = useState<string | null>(
     getTroubleshootUuidFromUrl
@@ -55,11 +62,12 @@ export const PerfAdvisorOverviewDashboard = ({
   const onSelectedQuery = (selectedQueryId: string | null, params?: QueryPageParams) => {
     if (!selectedQueryId) {
       setQueryId(null);
-      const urlParams = new URLSearchParams(window.location.search);
-      urlParams.delete('queryId');
+      // Leave queryId in the URL: the library navigates next and, without it, drops the last path
+      // segment instead - which after a tab switch is the Performance tab itself.
       const cleanedPath = window.location.pathname.replace(/\/queries\/[^/]+$/, '');
-      const qs = urlParams.toString();
-      browserHistory.replace(qs ? `${cleanedPath}?${qs}` : cleanedPath);
+      if (cleanedPath !== window.location.pathname) {
+        browserHistory.replace(`${cleanedPath}${window.location.search}`);
+      }
       return;
     }
 

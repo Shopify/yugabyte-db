@@ -9,6 +9,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.Common.CloudType;
+import com.yugabyte.yw.commissioner.ITask.Abortable;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
 import com.yugabyte.yw.common.NodeAgentClient;
@@ -22,6 +23,7 @@ import com.yugabyte.yw.models.NodeAgent;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.NodeDetails.NodeState;
+import java.util.Collection;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -32,6 +34,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections4.CollectionUtils;
 
 @Slf4j
+@Abortable
 public class UpgradeNodeAgent extends UniverseDefinitionTaskBase {
   @Inject
   protected UpgradeNodeAgent(BaseTaskDependencies baseTaskDependencies) {
@@ -54,9 +57,7 @@ public class UpgradeNodeAgent extends UniverseDefinitionTaskBase {
     getCertificateInfoIfSpecified();
   }
 
-  @Override
-  protected void createPrecheckTasks(Universe universe) {
-    List<NodeDetails> eligibleNodes = getEligibleNodesForUpgrade(universe);
+  private void validateCerts(Universe universe, Collection<NodeDetails> eligibleNodes) {
     CertificateInfo certificateInfo = getCertificateInfoIfSpecified();
     if (certificateInfo != null) {
       for (NodeDetails node : eligibleNodes) {
@@ -91,8 +92,10 @@ public class UpgradeNodeAgent extends UniverseDefinitionTaskBase {
           && certificateInfo.getCertType() != CertConfigType.SelfSigned) {
         throw new PlatformServiceException(
             BAD_REQUEST,
-            "Only CustomCertHostPath or SelfSigned type certificate is supported for node"
-                + " agent upgrade");
+            String.format(
+                "Certificate %s is of type %s, but only CustomCertHostPath or SelfSigned type"
+                    + " certificate is supported for node agent upgrade",
+                certificateInfo.getLabel(), certificateInfo.getCertType()));
       }
     }
     return certificateInfo;
@@ -149,6 +152,7 @@ public class UpgradeNodeAgent extends UniverseDefinitionTaskBase {
       Integer parallelism =
           confGetter.getConfForScope(universe, UniverseConfKeys.nodeAgentReinstallParallelism);
       List<NodeDetails> eligibleNodes = getEligibleNodesForUpgrade(universe);
+      validateCerts(universe, eligibleNodes);
       Set<String> eligibleNodeNames =
           eligibleNodes.stream().map(NodeDetails::getNodeName).collect(Collectors.toSet());
       Lists.partition(eligibleNodes, parallelism)
@@ -177,7 +181,9 @@ public class UpgradeNodeAgent extends UniverseDefinitionTaskBase {
                 // Fail only if the ping fails for the targeted nodes.
                 if (!pendingTargetNodeNames.isEmpty()) {
                   throw new RuntimeException(
-                      String.format("Nodes %s did not respond to ping", pendingTargetNodeNames));
+                      String.format(
+                          "Node agents on %s did not respond to ping. Check their service status",
+                          pendingTargetNodeNames));
                 }
               });
       createMarkUniverseUpdateSuccessTasks()

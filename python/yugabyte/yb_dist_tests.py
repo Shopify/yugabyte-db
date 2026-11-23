@@ -40,9 +40,12 @@ from yugabyte.test_descriptor import TestDescriptor
 import dataclasses
 
 
-# Name of the worker archive inside a build root. The .spark-no-extract suffix keeps Spark's
+# Names of the worker archive inside a build root. The .spark-no-extract suffix keeps Spark's
 # addFile from unpacking it for us - the untar step on the worker controls where the tree lands.
+# We use separate names to avoid conflicts when running tests on the same worker for both this
+# build and baseline build.
 ARCHIVE_FOR_WORKERS_NAME = 'archive_for_tests_on_spark.tar.gz.spark-no-extract'
+BASELINE_ARCHIVE_FOR_WORKERS_NAME = 'archive_for_tests_on_spark_baseline.tar.gz.spark-no-extract'
 
 CLOCK_SYNC_WAIT_LOGGING_INTERVAL_SEC = 10
 
@@ -57,6 +60,10 @@ class TestConfig:
     rel_build_root: str
     archive_sha256sum: Optional[str]
     compiler_type: str
+    # gs:// URL of archive_for_workers when the workers download it from GCS instead of receiving
+    # it through Spark. Set by the driver once the archive is there (uploaded, or found from an
+    # earlier run); None otherwise.
+    archive_gcs_url: Optional[str]
 
     def __init__(
             self,
@@ -74,6 +81,7 @@ class TestConfig:
         self.rel_build_root = rel_build_root
         self.archive_sha256sum = archive_sha256sum
         self.compiler_type = compiler_type
+        self.archive_gcs_url = None
 
     def get_run_test_script_path(self) -> str:
         return os.path.join(self.yb_src_root, 'build-support', 'run-test.sh')
@@ -104,6 +112,10 @@ class TestResult:
 
     artifact_copy_result: Optional[artifact_upload.FileTransferResult]
     spark_error_copy_result: Optional[artifact_upload.FileTransferResult]
+
+    # The test exited 0 but its report says it skipped itself (GTEST_SKIP, a platform gate), and
+    # was reported to CSI as skipped. Not a pass, for anything that would repeat a pass.
+    skipped: bool = False
 
     def log_artifact_upload_errors(self) -> None:
         for copy_result in [self.artifact_copy_result, self.spark_error_copy_result]:
@@ -269,7 +281,7 @@ def validate_mvn_local_repo(mvn_local_repo: str) -> None:
         logging.info(f"All Maven plugin patterns were found in local repo {mvn_local_repo}")
 
 
-# Packs the worker archive for the build tree described by conf, including mvn_local_repo as that
+# Packs the worker archive for the tree described by conf, including mvn_local_repo as that
 # tree's Maven repository. Java tests run `mvn --offline` on the worker, so the repo has to be
 # included into the archive. Raises an error if mvn_local_repo is outside of build subdirectory.
 def create_archive_for_workers(conf: TestConfig, mvn_local_repo: str) -> None:

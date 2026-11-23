@@ -2,6 +2,7 @@
 
 package com.yugabyte.yw.commissioner.tasks;
 
+import com.google.common.collect.ImmutableMap;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.TaskExecutor.SubTaskGroup;
 import com.yugabyte.yw.commissioner.UpgradeTaskBase;
@@ -103,6 +104,18 @@ public abstract class KubernetesTaskBase extends UniverseDefinitionTaskBase {
     return ExportTelemetryConfig.getForUniverse(taskParams().getUniverseUUID())
         .map(ExportTelemetryConfig::getTelemetryConfig)
         .orElse(null);
+  }
+
+  /**
+   * A read-replica-only edit carries no primary cluster, and the primary is not edited by it. Adds
+   * a copy of the pre-edit primary to {@code target} when it has none.
+   */
+  protected static void addPrimaryClusterIfMissing(
+      UniverseDefinitionTaskParams target, UniverseDefinitionTaskParams before) {
+    Cluster beforePrimary = before.getPrimaryCluster();
+    if (target.getPrimaryCluster() == null && beforePrimary != null) {
+      target.clusters.add(Json.fromJson(Json.toJson(beforePrimary), Cluster.class));
+    }
   }
 
   public static class KubernetesPlacement {
@@ -273,6 +286,22 @@ public abstract class KubernetesTaskBase extends UniverseDefinitionTaskBase {
     }
 
     getRunnableTask().addSubTaskGroup(pauseGroup);
+  }
+
+  /**
+   * Records whether the node_exporter sidecars serve TLS, as rendered for this DB version. Target
+   * writes scrape the sidecars by this record, so only a task whose pods all came back on a newly
+   * rendered template adds it.
+   */
+  protected void createRecordNodeExporterTlsTask(String softwareVersion) {
+    createUpdateUniverseFieldsTask(
+        u ->
+            u.updateConfig(
+                ImmutableMap.of(
+                    Universe.NODE_EXPORTER_HTTPS,
+                    String.valueOf(
+                        KubernetesUtil.isNodeExporterSidecarTlsEnabled(
+                            softwareVersion, u, confGetter)))));
   }
 
   public void createResumeKubernetesUniverseTasks() {
@@ -2941,6 +2970,9 @@ public abstract class KubernetesTaskBase extends UniverseDefinitionTaskBase {
           paramsDeviceCluster.userIntent.masterK8SNodeResourceSpec =
               taskDeviceCluster.userIntent.masterK8SNodeResourceSpec;
         }
+        // Every release renders the primary cluster's expose service setting.
+        params.universeDetails.getPrimaryCluster().userIntent.enableExposingService =
+            primaryCluster.userIntent.enableExposingService;
         if (useNewTserverDeviceInfo) {
           if (isReadOnlyCluster) {
             params.universeDetails.getReadOnlyClusters().get(0).userIntent.deviceInfo =
@@ -3390,9 +3422,9 @@ public abstract class KubernetesTaskBase extends UniverseDefinitionTaskBase {
       boolean masterVolumeChanged = false, tserverVolumeChanged = false;
       for (Entry<UUID, Map<String, String>> entry : newPlacement.configs.entrySet()) {
         DeviceInfo taskDeviceInfo =
-            newCluster.userIntent.getDeviceInfoForAz(entry.getKey(), ServerType.TSERVER);
+            newCluster.userIntent.evaluateDeviceInfoForAz(entry.getKey(), ServerType.TSERVER);
         DeviceInfo existingDeviceInfo =
-            currCluster.userIntent.getDeviceInfoForAz(entry.getKey(), ServerType.TSERVER);
+            currCluster.userIntent.evaluateDeviceInfoForAz(entry.getKey(), ServerType.TSERVER);
         if (taskDeviceInfo != null
             && existingDeviceInfo != null
             && !(Objects.equals(taskDeviceInfo.numVolumes, existingDeviceInfo.numVolumes)
@@ -3401,9 +3433,9 @@ public abstract class KubernetesTaskBase extends UniverseDefinitionTaskBase {
           tserverVolumeChanged = true;
         }
         DeviceInfo taskMasterDeviceInfo =
-            newCluster.userIntent.getDeviceInfoForAz(entry.getKey(), ServerType.MASTER);
+            newCluster.userIntent.evaluateDeviceInfoForAz(entry.getKey(), ServerType.MASTER);
         DeviceInfo existingMasterDeviceInfo =
-            currCluster.userIntent.getDeviceInfoForAz(entry.getKey(), ServerType.MASTER);
+            currCluster.userIntent.evaluateDeviceInfoForAz(entry.getKey(), ServerType.MASTER);
         if (taskMasterDeviceInfo != null
             && existingMasterDeviceInfo != null
             && !(Objects.equals(
@@ -3465,7 +3497,7 @@ public abstract class KubernetesTaskBase extends UniverseDefinitionTaskBase {
         Map<String, String> azConfig = entry.getValue();
 
         for (ServerType serverType : new ServerType[] {ServerType.TSERVER, ServerType.MASTER}) {
-          DeviceInfo deviceInfo = newCluster.userIntent.getDeviceInfoForAz(azUUID, serverType);
+          DeviceInfo deviceInfo = newCluster.userIntent.evaluateDeviceInfoForAz(azUUID, serverType);
           if (deviceInfo == null || StringUtils.isBlank(deviceInfo.storageClass)) {
             continue;
           }

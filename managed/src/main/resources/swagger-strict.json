@@ -17,6 +17,21 @@
         "awsHostedZoneName" : {
           "type" : "string"
         },
+        "crossCloudFederationTargets" : {
+          "description" : "WARNING: This is a preview API that could change. Storage clouds this provider's DB nodes can be given federated access to, at most one entry per cloud. A node uses the entry for a cloud it is not itself running on.",
+          "items" : {
+            "$ref" : "#/definitions/CrossCloudFederationTarget"
+          },
+          "type" : "array"
+        },
+        "enableFederatedIam" : {
+          "description" : "Enable GCS-on-AWS cross-cloud federated IAM on this provider's DB nodes (GCP Workload Identity Federation). Requires the federated IAM audience below.",
+          "type" : "boolean"
+        },
+        "federatedIamAudience" : {
+          "description" : "Deprecated: use crossCloudFederationTargets. GCP Workload Identity Federation audience (//iam.googleapis.com/projects/.../providers/...), used when federated IAM is enabled. The DB node renders the external_account credential from it.",
+          "type" : "string"
+        },
         "hostVpcId" : {
           "readOnly" : true,
           "type" : "string"
@@ -984,7 +999,13 @@
             "YBA_K8S_CPU_USAGE",
             "YBA_K8S_MEMORY_USAGE",
             "YBA_K8S_DISK_USAGE",
-            "OTEL_COLLECTOR_RESTART"
+            "OTEL_COLLECTOR_RESTART",
+            "NODE_EXPORTER_TLS_ROOT_NODES",
+            "NODE_EXPORTER_ROOT_NON_UNIVERSE",
+            "DB_K8S_CPU_USAGE",
+            "DB_K8S_MEMORY_USAGE",
+            "DB_K8S_DATA_VOLUME_USAGE",
+            "NODE_METRICS_COLLECTION_FAILURE"
           ],
           "type" : "string"
         },
@@ -1186,7 +1207,13 @@
             "YBA_K8S_CPU_USAGE",
             "YBA_K8S_MEMORY_USAGE",
             "YBA_K8S_DISK_USAGE",
-            "OTEL_COLLECTOR_RESTART"
+            "OTEL_COLLECTOR_RESTART",
+            "NODE_EXPORTER_TLS_ROOT_NODES",
+            "NODE_EXPORTER_ROOT_NON_UNIVERSE",
+            "DB_K8S_CPU_USAGE",
+            "DB_K8S_MEMORY_USAGE",
+            "DB_K8S_DATA_VOLUME_USAGE",
+            "NODE_METRICS_COLLECTION_FAILURE"
           ],
           "type" : "string"
         },
@@ -1484,7 +1511,13 @@
             "YBA_K8S_CPU_USAGE",
             "YBA_K8S_MEMORY_USAGE",
             "YBA_K8S_DISK_USAGE",
-            "OTEL_COLLECTOR_RESTART"
+            "OTEL_COLLECTOR_RESTART",
+            "NODE_EXPORTER_TLS_ROOT_NODES",
+            "NODE_EXPORTER_ROOT_NON_UNIVERSE",
+            "DB_K8S_CPU_USAGE",
+            "DB_K8S_MEMORY_USAGE",
+            "DB_K8S_DATA_VOLUME_USAGE",
+            "NODE_METRICS_COLLECTION_FAILURE"
           ],
           "type" : "string"
         },
@@ -2185,6 +2218,7 @@
             "UpdateAdditionalServicesState",
             "KubernetesToggleImmutableYbc",
             "OperatorImportUniverse",
+            "ManageCrossCloudFederation",
             "RunScript",
             "CreateFileCollection",
             "DownloadFileCollection",
@@ -2292,6 +2326,11 @@
           "description" : "Target ID",
           "readOnly" : true,
           "type" : "string"
+        },
+        "taskDiff" : {
+          "description" : "Task Diff",
+          "readOnly" : true,
+          "type" : "object"
         },
         "taskUUID" : {
           "description" : "Task UUID",
@@ -2630,6 +2669,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -2655,6 +2695,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -2691,7 +2732,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -2736,6 +2779,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -2883,6 +2927,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -2922,6 +2967,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -2934,6 +2980,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -2982,6 +3030,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -2996,7 +3046,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -4362,6 +4414,14 @@
           "description" : "Cron expression for a recurring backup",
           "type" : "string"
         },
+        "crossCloudFederationAudience" : {
+          "description" : "Cross-cloud federation audience captured at backup time",
+          "type" : "string"
+        },
+        "crossCloudFederationRoleArn" : {
+          "description" : "Cross-cloud federation AWS role ARN captured at backup time",
+          "type" : "string"
+        },
         "customerUuid" : {
           "description" : "Customer UUID",
           "format" : "uuid",
@@ -4667,7 +4727,7 @@
           "type" : "string"
         },
         "params" : {
-          "description" : "Arguments appended after the script (entrypoint + flags), e.g. [collect_top_stats, --remote_tar_path, /tmp/top.tar.gz, ...].",
+          "description" : "Arguments appended after the script (entrypoint + flags), e.g. [collect_top_ps_pmap_stats, --remote_tar_path, /tmp/top.tar.gz, ...].",
           "items" : {
             "type" : "string"
           },
@@ -4678,7 +4738,7 @@
           "type" : "string"
         },
         "scriptPath" : {
-          "description" : "Path on the YBA host to the script file to execute on the node (e.g. bin/node_utils.sh). May be relative to yb.devops.home.",
+          "description" : "Path on the YBA host to the script file to execute on the node (e.g. bin/support_bundle_utils.sh). May be relative to yb.devops.home.",
           "type" : "string"
         },
         "timeoutSecs" : {
@@ -4953,8 +5013,10 @@
               "TabletMeta",
               "YbcLogs",
               "NodeAgent",
+              "NodeHealthLogs",
               "SystemLogs",
               "TabletReport",
+              "ClusterConfig",
               "K8sInfo",
               "YbaMetadata",
               "PrometheusMetrics",
@@ -5045,7 +5107,8 @@
               "PROMETHEUS",
               "TSERVER_EXPORT",
               "CQL_EXPORT",
-              "YSQL_EXPORT"
+              "YSQL_EXPORT",
+              "KUBERNETES"
             ],
             "type" : "string"
           },
@@ -5087,6 +5150,11 @@
     },
     "BundleInfo" : {
       "properties" : {
+        "isImageMarketplaceBased" : {
+          "description" : "WARNING: This is a preview API that could change. Whether ybImage is an OCI Marketplace image or a custom image built from one. Set by YBA for OCI bundles, and left unset when YBA cannot tell; any value in a request is ignored.",
+          "readOnly" : true,
+          "type" : "boolean"
+        },
         "ybImage" : {
           "type" : "string"
         }
@@ -5647,6 +5715,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -5672,6 +5741,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -5708,7 +5778,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -5753,6 +5825,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -5900,6 +5973,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -5939,6 +6013,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -5951,6 +6026,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -5999,6 +6076,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -6013,7 +6092,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -6277,6 +6358,10 @@
         },
         "mount_roots" : {
           "description" : "Mount roots",
+          "type" : "string"
+        },
+        "physicalCloud" : {
+          "description" : "For an on-prem node, the cloud the node physically runs on",
           "type" : "string"
         },
         "private_dns" : {
@@ -7053,6 +7138,39 @@
       ],
       "type" : "object"
     },
+    "CrossCloudFederationTarget" : {
+      "properties" : {
+        "audience" : {
+          "description" : "Token audience. For a gcp target this is the GCP Workload Identity Federation audience (//iam.googleapis.com/projects/.../providers/...); for an aws target it is the audience requested for the node's web-identity token.",
+          "type" : "string"
+        },
+        "roleArn" : {
+          "description" : "AWS role assumed via AssumeRoleWithWebIdentity. Required when targetCloud is aws, unused otherwise: reaching GCS binds the node's identity to the bucket directly, with no intermediate role.",
+          "type" : "string"
+        },
+        "targetCloud" : {
+          "description" : "Storage cloud this entry grants access to. Only aws (S3) and gcp (GCS) are supported today.",
+          "enum" : [
+            "unknown",
+            "aws",
+            "gcp",
+            "azu",
+            "oci",
+            "docker",
+            "onprem",
+            "kubernetes",
+            "local",
+            "other"
+          ],
+          "type" : "string"
+        }
+      },
+      "required" : [
+        "audience",
+        "targetCloud"
+      ],
+      "type" : "object"
+    },
     "Current admin notification messages" : {
       "properties" : {
         "messages" : {
@@ -7316,10 +7434,11 @@
           "type" : "string"
         },
         "state" : {
-          "description" : "state of the customerConfig. Possible values are Active, QueuedForDeletion.",
+          "description" : "state of the customerConfig. Possible values are Active, QueuedForDeletion, Validating.",
           "enum" : [
             "Active",
-            "QueuedForDeletion"
+            "QueuedForDeletion",
+            "Validating"
           ],
           "readOnly" : true,
           "type" : "string"
@@ -7392,10 +7511,11 @@
           "type" : "string"
         },
         "state" : {
-          "description" : "state of the customerConfig. Possible values are Active, QueuedForDeletion.",
+          "description" : "state of the customerConfig. Possible values are Active, QueuedForDeletion, Validating.",
           "enum" : [
             "Active",
-            "QueuedForDeletion"
+            "QueuedForDeletion",
+            "Validating"
           ],
           "readOnly" : true,
           "type" : "string"
@@ -8580,7 +8700,7 @@
           "type" : "string"
         },
         "scriptPath" : {
-          "description" : "Path on the YBA host to the script file to execute on the node (e.g. bin/node_utils.sh). May be relative to yb.devops.home.",
+          "description" : "Path on the YBA host to the script file to execute on the node (e.g. bin/support_bundle_utils.sh). May be relative to yb.devops.home.",
           "type" : "string"
         },
         "timeoutSecs" : {
@@ -8876,6 +8996,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -8901,6 +9022,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -8937,7 +9059,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -8982,6 +9106,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -9129,6 +9254,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -9168,6 +9294,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -9180,6 +9307,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -9228,6 +9357,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -9242,7 +9373,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -9297,7 +9430,26 @@
     },
     "GCPCloudInfo" : {
       "properties" : {
+        "crossCloudFederationTargets" : {
+          "description" : "WARNING: This is a preview API that could change. Storage clouds this provider's DB nodes can be given federated access to, at most one entry per cloud. A node uses the entry for a cloud it is not itself running on.",
+          "items" : {
+            "$ref" : "#/definitions/CrossCloudFederationTarget"
+          },
+          "type" : "array"
+        },
         "destVpcId" : {
+          "type" : "string"
+        },
+        "enableFederatedIam" : {
+          "description" : "Enable S3-on-GCP cross-cloud federated IAM on this provider's DB nodes (AWS AssumeRoleWithWebIdentity). Requires the federated IAM role ARN and audience below.",
+          "type" : "boolean"
+        },
+        "federatedIamAudience" : {
+          "description" : "Deprecated: use crossCloudFederationTargets. Audience requested from GCP for the web-identity token, used when federated IAM is enabled.",
+          "type" : "string"
+        },
+        "federatedIamRoleArn" : {
+          "description" : "AWS role ARN assumed via AssumeRoleWithWebIdentity when federated IAM is enabled (GCP DB node -> S3).",
           "type" : "string"
         },
         "gceApplicationCredentials" : {
@@ -9719,6 +9871,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -9744,6 +9897,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -9780,7 +9934,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -9825,6 +9981,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -9972,6 +10129,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -10011,6 +10169,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -10023,6 +10182,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -10071,6 +10232,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -10085,7 +10248,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -10494,11 +10659,16 @@
         "imageBundleUuid" : {
           "format" : "uuid",
           "type" : "string"
+        },
+        "providerUuid" : {
+          "format" : "uuid",
+          "type" : "string"
         }
       },
       "required" : [
         "clusterUuid",
-        "imageBundleUuid"
+        "imageBundleUuid",
+        "providerUuid"
       ],
       "type" : "object"
     },
@@ -11269,6 +11439,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -11294,6 +11465,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -11330,7 +11502,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -11375,6 +11549,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -11522,6 +11697,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -11561,6 +11737,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -11573,6 +11750,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -11621,6 +11800,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -11635,7 +11816,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -12025,6 +12208,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -12050,6 +12234,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -12086,7 +12271,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -12131,6 +12318,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -12278,6 +12466,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -12317,6 +12506,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -12329,6 +12519,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -12377,6 +12569,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -12391,7 +12585,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -12842,6 +13038,20 @@
       ],
       "type" : "object"
     },
+    "ManagedLoadBalancerConfig" : {
+      "description" : "Load balancers that YBA creates and manages for a cluster",
+      "properties" : {
+        "enablePrivate" : {
+          "description" : "Create a private L4 load balancer in each region of the cluster",
+          "type" : "boolean"
+        },
+        "enablePublic" : {
+          "description" : "Create a public L4 load balancer in each region of the cluster. Not supported yet. Must be false.",
+          "type" : "boolean"
+        }
+      },
+      "type" : "object"
+    },
     "MasterInfo" : {
       "description" : "Information about master",
       "properties" : {
@@ -13145,6 +13355,14 @@
         },
         "cronExpression" : {
           "description" : "Cron expression for a recurring backup",
+          "type" : "string"
+        },
+        "crossCloudFederationAudience" : {
+          "description" : "Cross-cloud federation audience captured at backup time",
+          "type" : "string"
+        },
+        "crossCloudFederationRoleArn" : {
+          "description" : "Cross-cloud federation AWS role ARN captured at backup time",
           "type" : "string"
         },
         "customerUuid" : {
@@ -14825,9 +15043,24 @@
     },
     "OnPremCloudInfo" : {
       "properties" : {
+        "crossCloudFederationTargets" : {
+          "description" : "WARNING: This is a preview API that could change. Storage clouds this provider's DB nodes can reach with federated IAM, at most one entry per cloud. A node uses the entry for a cloud it is not itself running on, and is left alone when there is none - so add an entry per storage cloud the nodes must actually reach.",
+          "items" : {
+            "$ref" : "#/definitions/CrossCloudFederationTarget"
+          },
+          "type" : "array"
+        },
+        "enableFederatedIam" : {
+          "description" : "WARNING: This is a preview API that could change. Enable cross-cloud federated IAM on this provider's DB nodes. Each node is given access to the storage clouds it is not running on, per crossCloudFederationTargets.",
+          "type" : "boolean"
+        },
         "enableMultiTenancy" : {
           "description" : "WARNING: This is a preview API that could change.",
           "type" : "boolean"
+        },
+        "federatedIamAudience" : {
+          "description" : "WARNING: This is a preview API that could change. Deprecated: use crossCloudFederationTargets. GCP Workload Identity Federation audience used when federated IAM is enabled.",
+          "type" : "string"
         },
         "useClockbound" : {
           "description" : "WARNING: This is a preview API that could change.",
@@ -16063,6 +16296,12 @@
           "minimum" : 1,
           "type" : "integer"
         },
+        "max_num_replicas" : {
+          "description" : "Maximum replicas",
+          "format" : "int32",
+          "minimum" : 1,
+          "type" : "integer"
+        },
         "min_num_replicas" : {
           "description" : "Minimum replicas",
           "format" : "int32",
@@ -16190,6 +16429,9 @@
           "format" : "date-time",
           "type" : "string"
         },
+        "local" : {
+          "type" : "boolean"
+        },
         "state" : {
           "enum" : [
             "LEADER",
@@ -16209,6 +16451,7 @@
         "address",
         "instance_state",
         "is_leader",
+        "local",
         "state",
         "uuid",
         "ybaVersion"
@@ -16255,12 +16498,22 @@
           ],
           "type" : "string"
         },
+        "maxFileSize" : {
+          "description" : "WARNING: This is a preview API that could change. Maximum size of the active application log file before it is rolled over, for example \"1024MB\" or \"1GB\". Minimum 256MB.",
+          "example" : "1024MB",
+          "type" : "string"
+        },
         "maxHistory" : {
           "format" : "int32",
           "minimum" : 0,
           "type" : "integer"
         },
         "rolloverPattern" : {
+          "type" : "string"
+        },
+        "totalSizeCap" : {
+          "description" : "WARNING: This is a preview API that could change. Total size of retained application log archives, for example \"20GB\". Archives are deleted oldest first once this is exceeded, so on a high volume node this binds before maxHistory and retains fewer days than maxHistory allows. Minimum 5GB.",
+          "example" : "20GB",
           "type" : "string"
         }
       },
@@ -16870,6 +17123,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -16895,6 +17149,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -16931,7 +17186,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -16976,6 +17233,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -17123,6 +17381,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -17162,6 +17421,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -17174,6 +17434,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -17222,6 +17484,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -17236,7 +17500,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -17580,6 +17846,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -17605,6 +17872,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -17641,7 +17909,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -17686,6 +17956,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -17833,6 +18104,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -17872,6 +18144,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -17884,6 +18157,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -17932,6 +18207,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -17946,7 +18223,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -18675,6 +18954,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -18700,6 +18980,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -18736,7 +19017,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -18781,6 +19064,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -18928,6 +19212,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -18967,6 +19252,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -18979,6 +19265,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -19027,6 +19315,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -19041,7 +19331,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -19541,6 +19833,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -19566,6 +19859,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -19602,7 +19896,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -19647,6 +19943,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -19794,6 +20091,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -19833,6 +20131,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -19845,6 +20144,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -19893,6 +20194,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -19907,7 +20210,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -21115,6 +21420,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -21140,6 +21446,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -21176,7 +21483,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -21221,6 +21530,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -21368,6 +21678,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -21407,6 +21718,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -21419,6 +21731,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -21467,6 +21781,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -21481,7 +21797,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -21812,6 +22130,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -21837,6 +22156,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -21873,7 +22193,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -21918,6 +22240,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -22065,6 +22388,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -22104,6 +22428,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -22116,6 +22441,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -22164,6 +22491,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -22178,7 +22507,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -22247,6 +22578,7 @@
               "EditUniverse",
               "RollbackEditUniverse",
               "EditKubernetesUniverse",
+              "RollbackEditKubernetesUniverse",
               "ExternalScript",
               "ImportIntoTable",
               "RunApiTriggeredHooks",
@@ -22272,6 +22604,7 @@
               "StopNodeInUniverse",
               "StartNodeInUniverse",
               "AddNodeToUniverse",
+              "RollbackAddNodeToUniverse",
               "RemoveNodeFromUniverse",
               "RebootNodeInUniverse",
               "ReleaseInstanceFromUniverse",
@@ -22308,7 +22641,9 @@
               "ProvisionUniverseNodes",
               "DeleteCustomerConfig",
               "DeleteCustomerStorageConfig",
+              "ValidateStorageConfig",
               "ResizeNode",
+              "RollbackResizeNode",
               "CreateTableSpacesInUniverse",
               "ThirdpartySoftwareUpgrade",
               "ModifyAuditLoggingConfig",
@@ -22353,6 +22688,7 @@
               "RestoreYbaBackup",
               "RestoreContinuousBackup",
               "EnableNodeAgentInUniverse",
+              "ManageCrossCloudFederationUniverse",
               "DecommissionNode",
               "CloneNamespace",
               "TlsToggleKubernetes",
@@ -22500,6 +22836,7 @@
               "SetRestoreHiddenState",
               "RestorePreflightValidate",
               "BackupPreflightValidate",
+              "BackupStorageConfigValidate",
               "WaitForLeadersOnPreferredOnly",
               "EnableEncryptionAtRest",
               "DisableEncryptionAtRest",
@@ -22539,6 +22876,7 @@
               "CheckShellConnectivity",
               "CheckGlibc",
               "CheckCpuCgroup",
+              "CheckOCIImageEligibility",
               "CheckOpentelemetryOperator",
               "PGUpgradeTServerCheck",
               "CleanUpPGUpgradeDataDir",
@@ -22551,6 +22889,8 @@
               "TransferXClusterCerts",
               "CreateTableSpaces",
               "ManageOtelCollector",
+              "ManageCloudFederation",
+              "ConfigureNodeExporterTls",
               "UpdateAndPersistAuditLoggingConfig",
               "UpdateAndPersistQueryLoggingConfig",
               "UpdateAndPersistMetricsExportConfig",
@@ -22599,6 +22939,8 @@
               "FetchServerConf",
               "DoCapacityReservation",
               "DeleteCapacityReservation",
+              "EnsureManagedLoadBalancer",
+              "DeleteManagedLoadBalancer",
               "DisablePitrConfig",
               "EnablePitrConfig",
               "UpdateAndPersistKubernetesImmutableYbc",
@@ -22613,7 +22955,9 @@
               "UpdateParentTaskParams",
               "SaveSoftwareUpgradeProgress",
               "CheckDuplicateInstance",
-              "RunUpgradeNodeAgent"
+              "RunUpgradeNodeAgent",
+              "CreateYbStorageDatabase",
+              "WaitForRpcClientCert"
             ],
             "type" : "string"
           },
@@ -22836,6 +23180,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -22861,6 +23206,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -22897,7 +23243,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -22942,6 +23290,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -23089,6 +23438,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -23128,6 +23478,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -23140,6 +23491,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -23188,6 +23541,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -23202,7 +23557,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -23638,6 +23995,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -23663,6 +24021,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -23699,7 +24058,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -23744,6 +24105,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -23891,6 +24253,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -23930,6 +24293,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -23942,6 +24306,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -23990,6 +24356,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -24004,7 +24372,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -24394,8 +24764,10 @@
               "TabletMeta",
               "YbcLogs",
               "NodeAgent",
+              "NodeHealthLogs",
               "SystemLogs",
               "TabletReport",
+              "ClusterConfig",
               "K8sInfo",
               "YbaMetadata",
               "PrometheusMetrics",
@@ -24496,7 +24868,8 @@
               "PROMETHEUS",
               "TSERVER_EXPORT",
               "CQL_EXPORT",
-              "YSQL_EXPORT"
+              "YSQL_EXPORT",
+              "KUBERNETES"
             ],
             "type" : "string"
           },
@@ -24826,6 +25199,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -24851,6 +25225,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -24887,7 +25262,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -24932,6 +25309,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -25079,6 +25457,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -25118,6 +25497,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -25130,6 +25510,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -25178,6 +25560,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -25192,7 +25576,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -25579,14 +25965,26 @@
     },
     "TaskApiFilter" : {
       "properties" : {
+        "completionDateRangeEnd" : {
+          "description" : "Include tasks completed on or before this time (completion_time). May be set alone or with completion_date_range_start. Tasks with null completion_time (still in progress) are excluded when either completion bound is set.",
+          "example" : "2022-12-12T13:07:18Z",
+          "format" : "date-time",
+          "type" : "string"
+        },
+        "completionDateRangeStart" : {
+          "description" : "Include tasks completed on or after this time (completion_time). May be set alone or with completion_date_range_end. Tasks with null completion_time (still in progress) are excluded when either completion bound is set.",
+          "example" : "2022-12-12T13:07:18Z",
+          "format" : "date-time",
+          "type" : "string"
+        },
         "dateRangeEnd" : {
-          "description" : "The end date to filter paged query.",
+          "description" : "Include tasks created on or before this time (create_time). May be set alone or with date_range_start.",
           "example" : "2022-12-12T13:07:18Z",
           "format" : "date-time",
           "type" : "string"
         },
         "dateRangeStart" : {
-          "description" : "The start date to filter paged query.",
+          "description" : "Include tasks created on or after this time (create_time). May be set alone or with date_range_end.",
           "example" : "2022-12-12T13:07:18Z",
           "format" : "date-time",
           "type" : "string"
@@ -25668,9 +26066,11 @@
               "FinalizeUpgrade",
               "RollbackUpgrade",
               "RollbackEditUniverse",
+              "RollbackAddNodeToUniverse",
               "GFlagsUpgrade",
               "KubernetesOverridesUpgrade",
               "EditKubernetesUniverse",
+              "RollbackEditKubernetesUniverse",
               "CertsRotate",
               "TlsToggle",
               "VMImageUpgrade",
@@ -25679,6 +26079,7 @@
               "UpgradeSoftware",
               "UpgradeVMImage",
               "ResizeNode",
+              "RollbackResizeNode",
               "UpdateCert",
               "UpdateDiskSize",
               "UpgradeGflags",
@@ -25740,6 +26141,7 @@
               "RestoreYbaBackup",
               "RestoreContinuousBackup",
               "EnableNodeAgent",
+              "ManageCrossCloudFederation",
               "Decommission",
               "CloneNamespace",
               "UpdateOOMServiceState",
@@ -25750,6 +26152,7 @@
               "OperatorImport",
               "RegisterWithPACollector",
               "UnregisterFromPACollector",
+              "Validate",
               "Unknown"
             ],
             "type" : "string"
@@ -26190,6 +26593,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -26215,6 +26619,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -26251,7 +26656,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -26296,6 +26703,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -26443,6 +26851,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -26482,6 +26891,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -26494,6 +26904,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -26542,6 +26954,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -26556,7 +26970,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -26899,6 +27315,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -26924,6 +27341,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -26960,7 +27378,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -27005,6 +27425,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -27152,6 +27573,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -27191,6 +27613,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -27203,6 +27626,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -27251,6 +27676,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -27265,7 +27692,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -27754,6 +28183,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -27779,6 +28209,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -27815,7 +28246,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -27860,6 +28293,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -28007,6 +28441,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -28046,6 +28481,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -28058,6 +28494,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -28106,6 +28544,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -28120,7 +28560,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -28428,6 +28870,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -28453,6 +28896,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -28489,7 +28933,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -28534,6 +28980,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -28681,6 +29128,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -28720,6 +29168,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -28732,6 +29181,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -28780,6 +29231,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -28794,7 +29247,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -29102,6 +29557,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -29127,6 +29583,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -29163,7 +29620,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -29208,6 +29667,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -29355,6 +29815,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -29394,6 +29855,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -29406,6 +29868,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -29454,6 +29918,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -29468,7 +29934,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -29842,35 +30310,6 @@
           "type" : "string"
         }
       },
-      "type" : "object"
-    },
-    "UpdateLoadBalancerConfig" : {
-      "properties" : {
-        "firstTry" : {
-          "type" : "boolean"
-        },
-        "name" : {
-          "type" : "string"
-        },
-        "retryLimit" : {
-          "format" : "int32",
-          "type" : "integer"
-        },
-        "sleepMultiplier" : {
-          "format" : "int32",
-          "type" : "integer"
-        },
-        "taskInfo" : {
-          "type" : "string"
-        }
-      },
-      "required" : [
-        "firstTry",
-        "name",
-        "retryLimit",
-        "sleepMultiplier",
-        "taskInfo"
-      ],
       "type" : "object"
     },
     "UpdatePitrConfigParams" : {
@@ -30297,6 +30736,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -30322,6 +30762,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -30358,7 +30799,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -30403,6 +30846,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -30550,6 +30994,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -30589,6 +31034,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -30601,6 +31047,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -30649,6 +31097,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -30663,7 +31113,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -30800,6 +31252,10 @@
           "format" : "int64",
           "type" : "integer"
         },
+        "managedLoadBalancer" : {
+          "$ref" : "#/definitions/ManagedLoadBalancerConfig",
+          "description" : "WARNING: This is a preview API that could change. Load balancers that YBA creates, manages and deletes. Set when the universe is created. An edit can turn it on or off. When it turns it on, YBA takes over the load balancer that the zones of a region name with lbName. At create, it must enable at least one load balancer; in an edit, one that enables none turns it off and leaving it out keeps it."
+        },
         "masterDeviceInfo" : {
           "$ref" : "#/definitions/DeviceInfo",
           "description" : "Device specification that is used for master nodes in current cluster (in dedicated masters mode)"
@@ -30880,6 +31336,10 @@
           "type" : "string"
         },
         "useHostname" : {
+          "type" : "boolean"
+        },
+        "useNodeToNodeClientCerts" : {
+          "description" : "WARNING: This is a preview API that could change. Servers require a client cert on RPC (node_to_node_encryption_use_client_certificates). Supported only on Kubernetes universes whose node-to-node encryption uses a cert-manager (K8SCertManager) root CA; VM universes and Kubernetes universes with other root CA types are not supported. Can only be set at universe creation.",
           "type" : "boolean"
         },
         "useSpotInstance" : {
@@ -31468,6 +31928,7 @@
             "EditUniverse",
             "RollbackEditUniverse",
             "EditKubernetesUniverse",
+            "RollbackEditKubernetesUniverse",
             "ExternalScript",
             "ImportIntoTable",
             "RunApiTriggeredHooks",
@@ -31493,6 +31954,7 @@
             "StopNodeInUniverse",
             "StartNodeInUniverse",
             "AddNodeToUniverse",
+            "RollbackAddNodeToUniverse",
             "RemoveNodeFromUniverse",
             "RebootNodeInUniverse",
             "ReleaseInstanceFromUniverse",
@@ -31529,7 +31991,9 @@
             "ProvisionUniverseNodes",
             "DeleteCustomerConfig",
             "DeleteCustomerStorageConfig",
+            "ValidateStorageConfig",
             "ResizeNode",
+            "RollbackResizeNode",
             "CreateTableSpacesInUniverse",
             "ThirdpartySoftwareUpgrade",
             "ModifyAuditLoggingConfig",
@@ -31574,6 +32038,7 @@
             "RestoreYbaBackup",
             "RestoreContinuousBackup",
             "EnableNodeAgentInUniverse",
+            "ManageCrossCloudFederationUniverse",
             "DecommissionNode",
             "CloneNamespace",
             "TlsToggleKubernetes",
@@ -31721,6 +32186,7 @@
             "SetRestoreHiddenState",
             "RestorePreflightValidate",
             "BackupPreflightValidate",
+            "BackupStorageConfigValidate",
             "WaitForLeadersOnPreferredOnly",
             "EnableEncryptionAtRest",
             "DisableEncryptionAtRest",
@@ -31760,6 +32226,7 @@
             "CheckShellConnectivity",
             "CheckGlibc",
             "CheckCpuCgroup",
+            "CheckOCIImageEligibility",
             "CheckOpentelemetryOperator",
             "PGUpgradeTServerCheck",
             "CleanUpPGUpgradeDataDir",
@@ -31772,6 +32239,8 @@
             "TransferXClusterCerts",
             "CreateTableSpaces",
             "ManageOtelCollector",
+            "ManageCloudFederation",
+            "ConfigureNodeExporterTls",
             "UpdateAndPersistAuditLoggingConfig",
             "UpdateAndPersistQueryLoggingConfig",
             "UpdateAndPersistMetricsExportConfig",
@@ -31820,6 +32289,8 @@
             "FetchServerConf",
             "DoCapacityReservation",
             "DeleteCapacityReservation",
+            "EnsureManagedLoadBalancer",
+            "DeleteManagedLoadBalancer",
             "DisablePitrConfig",
             "EnablePitrConfig",
             "UpdateAndPersistKubernetesImmutableYbc",
@@ -31834,7 +32305,9 @@
             "UpdateParentTaskParams",
             "SaveSoftwareUpgradeProgress",
             "CheckDuplicateInstance",
-            "RunUpgradeNodeAgent"
+            "RunUpgradeNodeAgent",
+            "CreateYbStorageDatabase",
+            "WaitForRpcClientCert"
           ],
           "type" : "string"
         },
@@ -32003,7 +32476,6 @@
       "description" : "xcluster config object",
       "properties" : {
         "automaticDdlMode" : {
-          "readOnly" : true,
           "type" : "boolean"
         },
         "createTime" : {
@@ -32299,7 +32771,6 @@
       "description" : "xcluster get response",
       "properties" : {
         "automaticDdlMode" : {
-          "readOnly" : true,
           "type" : "boolean"
         },
         "createTime" : {
@@ -33112,9 +33583,12 @@
           },
           "type" : "array"
         },
-        "ybAdminCommand" : {
-          "description" : "yb-admin subcommand (e.g. list_tables).",
-          "type" : "string"
+        "ybAdminCommands" : {
+          "description" : "yb-admin subcommands to run (each executed separately in one batch).",
+          "items" : {
+            "type" : "string"
+          },
+          "type" : "array"
         }
       },
       "type" : "object"
@@ -42559,8 +43033,10 @@
                   "TabletMeta",
                   "YbcLogs",
                   "NodeAgent",
+                  "NodeHealthLogs",
                   "SystemLogs",
                   "TabletReport",
+                  "ClusterConfig",
                   "K8sInfo",
                   "YbaMetadata",
                   "PrometheusMetrics",
@@ -42595,8 +43071,10 @@
                   "TabletMeta",
                   "YbcLogs",
                   "NodeAgent",
+                  "NodeHealthLogs",
                   "SystemLogs",
                   "TabletReport",
+                  "ClusterConfig",
                   "K8sInfo",
                   "YbaMetadata",
                   "PrometheusMetrics",
@@ -43445,7 +43923,7 @@
         ]
       },
       "get" : {
-        "description" : "Available since YBA version 2.2.0.0.",
+        "description" : "Available since YBA version 2.2.0.0. Early access: when the runtime flag yb.api.conditional_get.enabled is set, this endpoint supports conditional requests. Send a previously returned ETag in If-None-Match to get 304 Not Modified if the universe is unchanged. Fields derived from related resources (for example DR configs or pricing) may be stale in that case.",
         "operationId" : "getUniverse",
         "parameters" : [
           {
@@ -45746,6 +46224,13 @@
             "name" : "xClusterSupportedOnly",
             "required" : false,
             "type" : "boolean"
+          },
+          {
+            "default" : false,
+            "in" : "query",
+            "name" : "includeMatviewTables",
+            "required" : false,
+            "type" : "boolean"
           }
         ],
         "responses" : {
@@ -46042,7 +46527,7 @@
     },
     "/api/v1/customers/{cUUID}/universes/{uniUUID}/update_lb_config" : {
       "put" : {
-        "description" : "WARNING: This is a preview API that could change.",
+        "description" : "WARNING: This is a preview API that could change. Queues a task that updates the load balancers a universe uses. YBA does not create these load balancers. Send the current universe definition with `universeUUID` set to the universe in the path. For each existing cluster, YBA saves `userIntent.enableLB`, each region's `lbFQDN` and each zone's `lbName`. YBA registers the nodes in `nodeDetailsSet` on those load balancers and removes them from load balancers no longer named.",
         "operationId" : "updateLoadBalancerConfig",
         "parameters" : [
           {
@@ -46063,13 +46548,21 @@
             "in" : "query",
             "name" : "request",
             "required" : false
+          },
+          {
+            "in" : "body",
+            "name" : "UpdateLoadBalancerConfigRequest",
+            "required" : true,
+            "schema" : {
+              "$ref" : "#/definitions/UniverseDefinitionTaskParams"
+            }
           }
         ],
         "responses" : {
           "200" : {
             "description" : "successful operation",
             "schema" : {
-              "$ref" : "#/definitions/UpdateLoadBalancerConfig"
+              "$ref" : "#/definitions/YBPTask"
             }
           }
         },
@@ -46077,7 +46570,7 @@
           "200" : {
             "description" : "successful operation",
             "schema" : {
-              "$ref" : "#/definitions/UpdateLoadBalancerConfig"
+              "$ref" : "#/definitions/YBPTask"
             }
           }
         },

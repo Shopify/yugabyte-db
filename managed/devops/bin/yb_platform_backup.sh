@@ -35,6 +35,9 @@ PA_DUMP_FNAME="pa_ts_dump.sql"
 # Marker file included in the tar for --include_pa_config_only backups. Presence of this file on
 # restore switches PA restore to the data-only, whitelisted-tables code path.
 INCLUDE_PA_CONFIG_ONLY_MARKER_FNAME="pa_ts_config_only.marker"
+# Holds "true" or "false": whether the YBA that took the backup ran in FIPS mode. Restore refuses
+# a mismatch; backups taken before this marker existed are not checked.
+FIPS_MARKER_FNAME="yba_fips_enabled.marker"
 PA_DATA_DIR="perf-advisor"
 PA_DB_NAME="ts"
 # Whitelisted PA "configuration" tables for --include_pa_config_only mode. All other PA tables
@@ -323,8 +326,10 @@ db_exists() {
     probe="$(dirname "${pg_helper_path}")/psql"
   fi
 
-  local probe_cmd="${probe} -h ${db_host} -p ${db_port} -U ${db_username} -tAc \
-\"SELECT 1 FROM pg_database WHERE datname='${db_name}'\""
+  # Without -d, psql connects to a database named after the user, which an external
+  # Postgres may not have. The platform DB always exists by the time this runs.
+  local probe_cmd="${probe} -h ${db_host} -p ${db_port} -U ${db_username} \
+-d ${PLATFORM_DB_NAME} -tAc \"SELECT 1 FROM pg_database WHERE datname='${db_name}'\""
   local probe_out
   probe_out=$(docker_aware_cmd "postgres" "${probe_cmd}" 2>/dev/null) || return 1
   [[ "${probe_out}" = "1" ]]
@@ -771,6 +776,9 @@ create_backup() {
     if [[ "$include_pa_config_only" = true ]]; then
       exclude_flags+=" --include_pa_config_only"
     fi
+    if [[ "$fips" = true ]]; then
+      exclude_flags+=" --fips"
+    fi
     kubectl -n "${k8s_namespace}" exec -it "${k8s_pod}" -c yugaware -- /bin/bash -c \
       "${backup_script} create ${verbose_flag} ${exclude_flags} --output ${K8S_BACKUP_DIR}"
     # Determine backup archive filename.
@@ -807,6 +815,7 @@ create_backup() {
   # EXIT as well as RETURN: several of the steps below exit outright on bad input, and a leaked
   # staging directory would sit in the data directory holding a dump-sized file forever.
   trap 'run_sudo_cmd "rm -rf ${staging_dir}"' RETURN EXIT
+  echo "${fips}" > "${staging_dir}/${FIPS_MARKER_FNAME}"
 
   if [ "$disable_version_check" != true ]; then
 
@@ -956,7 +965,8 @@ create_backup() {
   # './' prefix that find produced.
   staged_entries=()
   for staged in "${PLATFORM_DUMP_FNAME}" "${VERSION_METADATA_BACKUP}" "${PA_DUMP_FNAME}" \
-                "${INCLUDE_PA_CONFIG_ONLY_MARKER_FNAME}" "${PROMETHEUS_SNAPSHOT_DIR}"; do
+                "${INCLUDE_PA_CONFIG_ONLY_MARKER_FNAME}" "${FIPS_MARKER_FNAME}" \
+                "${PROMETHEUS_SNAPSHOT_DIR}"; do
     if [[ -e "${staging_dir}/${staged}" ]]; then
       staged_entries+=( "./${staged}" )
     fi
@@ -1039,6 +1049,9 @@ restore_backup() {
     if [[ "$exclude_pa_files" = true ]]; then
       restore_args+=( --exclude_pa_files )
     fi
+    if [[ "$fips" = true ]]; then
+      restore_args+=( --fips )
+    fi
     cmd=("$backup_script" restore "${restore_args[@]}")
     kubectl -n "${k8s_namespace}" exec -it "${k8s_pod}" -c yugaware -- /bin/bash -c \
         "$(printf '%q ' "${cmd[@]}")"
@@ -1120,6 +1133,16 @@ restore_backup() {
       command line argument --disable_version_check true"
       exit 1
     fi
+  fi
+
+  # Not covered by --disable_version_check, which HA sync always passes.
+  backup_fips=$(tar -xzOf "${input_path}" "./${FIPS_MARKER_FNAME}" 2>/dev/null || true)
+  if [[ -n "${backup_fips}" ]] && [[ "${backup_fips}" != "${fips}" ]]; then
+    # stderr: yba-ctl reports only the restore script's stderr when it fails.
+    echo "This backup was taken on a YugabyteDB Anywhere with FIPS mode $(fips_mode_str \
+      "${backup_fips}") and cannot be restored on one with FIPS mode $(fips_mode_str \
+      "${fips}")." >&2
+    exit 1
   fi
 
   modify_service yb-platform stop
@@ -1399,6 +1422,7 @@ print_backup_usage() {
   echo "                                 (whitelisted subset); mutually exclusive with"
   echo "                                 --exclude_pa_database (default: false)"
   echo "  --disable_version_check        disable the backup version check (default: false)"
+  echo "  --fips                         YugabyteDB Anywhere runs in FIPS mode (default: false)"
   echo "  -?, --help                     show create help, then exit"
   echo
   echo "NOTE: If prometheus authentication is enabled, PROMETHEUS_USERNAME and PROMETHEUS_PASSWORD environment variables must be set"
@@ -1435,6 +1459,7 @@ print_restore_usage() {
   echo "  --skip_dump_file_delete            skip deleting dump file extracted from backup archive (default: false)"
   echo "  --exclude_pa_database              exclude Performance Advisor database from restore (default: false)"
   echo "  --exclude_pa_files                 exclude Performance Advisor collected data files from restore (default: false)"
+  echo "  --fips                             YugabyteDB Anywhere runs in FIPS mode (default: false)"
   echo "  -?, --help                         show restore help, then exit"
   echo
   echo "NOTE: If prometheus authentication is enabled, PROMETHEUS_USERNAME and PROMETHEUS_PASSWORD environment variables must be set"
@@ -1456,6 +1481,10 @@ print_help() {
 
 cleanup () {
   rm -f "$1"
+}
+
+fips_mode_str() {
+  if [[ "$1" = true ]]; then echo "on"; else echo "off"; fi
 }
 
 if [[ $# -eq 0 ]]; then
@@ -1493,6 +1522,7 @@ ybai_data_dir=/opt/yugabyte/data/yb-platform
 yba_user=yugabyte
 skip_old_files=""
 skip_dump_check=false
+fips=false
 
 case $command in
   -?|--help)
@@ -1611,6 +1641,10 @@ case $command in
           ;;
         --exclude_pa_files)
           exclude_pa_files=true
+          shift
+          ;;
+        --fips)
+          fips=true
           shift
           ;;
         --include_pa_config_only)
@@ -1795,6 +1829,10 @@ case $command in
           ;;
         --exclude_pa_files)
           exclude_pa_files=true
+          shift
+          ;;
+        --fips)
+          fips=true
           shift
           ;;
         -?|--help)

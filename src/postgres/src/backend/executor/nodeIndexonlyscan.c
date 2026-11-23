@@ -93,7 +93,7 @@ IndexOnlyNext(IndexOnlyScanState *node)
 
 	/*
 	 * YB relation scans are optimized for the "Don't care about order"
-	 * direction.
+	 * direction (see create_index_path).
 	 */
 	if (IsYBRelation(node->ss.ss_currentRelation) &&
 		ScanDirectionIsNoMovement(((IndexOnlyScan *) node->ss.ps.plan)->indexorderdir))
@@ -880,8 +880,10 @@ yb_init_indexonly_scandesc(IndexOnlyScanState *node)
 
 		scandesc->yb_exec_params = &estate->yb_exec_params;
 		scandesc->yb_scan_plan = (Scan *) plan;
+		YbResetScanPushdownCxt(node->yb_ioss_pushdown_cxt);
 		scandesc->yb_rel_pushdown =
-			YbInstantiatePushdownExprs(&plan->yb_pushdown, estate);
+			YbInstantiateScanPushdownExprs(&node->yb_ioss_pushdown_cxt, estate,
+										   &plan->yb_pushdown);
 		scandesc->yb_aggrefs = node->yb_ioss_aggrefs;
 		scandesc->yb_distinct_prefixlen = plan->yb_distinct_prefixlen;
 		scandesc->fetch_ybctids_only = false;

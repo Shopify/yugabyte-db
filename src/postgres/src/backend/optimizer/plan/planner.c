@@ -65,9 +65,10 @@
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
 #include "utils/syscache.h"
-
 /* YB includes */
 #include "catalog/namespace.h"
+#include "commands/defrem.h"
+#include "optimizer/yb_merge_scan.h"
 #include "pg_yb_utils.h"
 #include "utils/varlena.h"
 #include "utils/yb_jumblefuncs.h"
@@ -777,6 +778,8 @@ subquery_planner(PlannerGlobal *glob, Query *parse,
 		parent_root ? parent_root->yb_cur_batched_relids : NULL;
 	root->yb_cur_unbatched_relids =
 		parent_root ? parent_root->yb_cur_unbatched_relids : NULL;
+	root->yb_cur_batched_groups =
+		parent_root ? parent_root->yb_cur_batched_groups : NIL;
 	root->yb_availBatchedRelids =
 		parent_root ? parent_root->yb_availBatchedRelids : NULL;
 	root->yb_cur_batch_no = -1;
@@ -1637,6 +1640,9 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 		if (count_est > 0 && offset_est >= 0)
 			limit_tuples = (double) count_est + (double) offset_est;
 	}
+
+	/* YB: keep the bound for the scan first-fetch trim; see PlannerInfo */
+	root->yb_limit_tuples = limit_tuples;
 
 	/* Make tuple_fraction accessible to lower-level routines */
 	root->tuple_fraction = tuple_fraction;
@@ -6484,7 +6490,7 @@ plan_cluster_use_sort(Oid tableOid, Oid indexOid)
 									  NIL, NIL, NIL, NIL, NIL,
 									  ForwardScanDirection, false,
 									  NULL, 1.0, false,
-									  NULL);	/* yb_merge_scan_saop_cols */
+									  NULL);	/* yb_merge_scan_info */
 
 	return (seqScanAndSortPath.total_cost < indexScanPath->path.total_cost);
 }
@@ -7963,6 +7969,82 @@ group_by_has_partkey(RelOptInfo *input_rel,
 	return true;
 }
 
+static void
+ybGenerateHintStringMergeOption(StringInfo buf, List *optionsList,
+								YbMergeScanInfo *yb_merge_scan_info)
+{
+	bool		opened = false;
+
+	if (optionsList != NIL)
+	{
+		appendStringInfoSpaces(buf, 1);
+		appendStringInfoChar(buf, '(');
+		ybGenerateHintStringOptions(buf, optionsList, false);
+		opened = true;
+	}
+
+	if (yb_merge_scan_info != NULL &&
+		ybGetValueForOption(optionsList, YB_MERGE_OPTION_NAME) == NULL)
+	{
+		if (opened)
+		{
+			appendStringInfoString(buf, ", ");
+			appendStringInfoString(buf, "merge = on");
+		}
+		else
+			appendStringInfo(buf, " (merge = on");
+
+		opened = true;
+	}
+
+	if (opened)
+		appendStringInfoChar(buf, ')');
+}
+
+static int
+ybGetBoolValueForOption(List *optionsList, char *optionName)
+{
+	int optionValueAsBool = -1;
+
+	char *optionValue = ybGetValueForOption(optionsList, optionName);
+
+	if (optionValue != NULL)
+	{
+		if (strcmp(optionValue, "true") == 0 || strcmp(optionValue, "on") == 0)
+			optionValueAsBool = 1;
+		else if (strcmp(optionValue, "false") == 0 || strcmp(optionValue, "off") == 0)
+			optionValueAsBool = 0;
+	}
+
+	return optionValueAsBool;
+}
+
+int
+ybGetValueForMergeOption(List *optionsList)
+{
+	return ybGetBoolValueForOption(optionsList, YB_MERGE_OPTION_NAME);
+}
+
+char *
+ybGetValueForOption(List *optionsList, char *name)
+{
+	char *optionValue = NULL;
+	ListCell *lc;
+	foreach(lc, optionsList)
+	{
+		DefElem *elem = (DefElem *) lfirst(lc);
+		char *optionName  = elem->defname;
+
+		if (strcmp(optionName, name) == 0)
+		{
+			optionValue = defGetString(elem);
+			break;
+		}
+	}
+
+	return optionValue;
+}
+
 /*
  * Generate a hint string from a plan.
  */
@@ -8058,6 +8140,7 @@ ybGenerateHintString(PlannedStmt *plannedStmt)
 			appendStringInfo(&hintBuf, " Set(yb_fetch_row_limit %d)", yb_fetch_row_limit);
 			appendStringInfo(&hintBuf, " Set(from_collapse_limit %d)", fromCollapseLimit);
 			appendStringInfo(&hintBuf, " Set(join_collapse_limit %d)", joinCollapseLimit);
+			appendStringInfo(&hintBuf, " Set(yb_max_merge_scan_streams %d)", yb_max_merge_scan_streams);
 			appendStringInfoString(&hintBuf, " Set(geqo false)");
 
 			appendStringInfoString(&hintBuf, " */");
@@ -8071,6 +8154,34 @@ ybGenerateHintString(PlannedStmt *plannedStmt)
 	}
 
 	return hintStr;
+}
+
+void
+ybGenerateHintStringOptions(StringInfo buf, List *optionsList, bool addParens)
+{
+	bool first = true;
+	ListCell *lc;
+	foreach (lc, optionsList)
+	{
+		DefElem *elem = (DefElem *) lfirst(lc);
+		char *optionName  = elem->defname;
+		char *optionValue = defGetString(elem);
+		if (!first)
+		{
+			appendStringInfoString(buf, ", ");
+		}
+		else if (addParens)
+		{
+			appendStringInfoChar(buf, '(');
+		}
+
+		appendStringInfo(buf, "%s = %s", optionName, optionValue);
+
+		first = false;
+	}
+
+	if (addParens && !first)
+		appendStringInfoChar(buf, ')');
 }
 
 /*
@@ -8142,7 +8253,6 @@ ybGenerateHintStringBlock(PlannedStmt *plannedStmt, Plan *plan, int *maxBlockSca
 
 				char	   *subPlanHintStr = (char *) lfirst(lc);
 
-				appendStringInfoSpaces(&leadingBuf, 1);
 				appendStringInfoString(&leadingBuf, subPlanHintStr);
 				first = false;
 			}
@@ -8377,8 +8487,13 @@ ybGenerateHintStringNode(PlannedStmt *plannedStmt, Plan *plan, StringInfoData *l
 
 							appendStringInfoString(methodBuf, "IndexScan(");
 							ybAppendHintNameDisplayText(ybHintAlias, methodBuf);
+
 							appendStringInfoSpaces(methodBuf, 1);
 							ybAppendHintNameDisplayText(indexName, methodBuf);
+
+							ybGenerateHintStringMergeOption(methodBuf, indexscan->scan.ybOptions,
+															indexscan->yb_merge_scan_info);
+
 							appendStringInfoChar(methodBuf, ')');
 
 							if (plan->parallel_aware)
@@ -8417,6 +8532,11 @@ ybGenerateHintStringNode(PlannedStmt *plannedStmt, Plan *plan, StringInfoData *l
 							ybAppendHintNameDisplayText(ybHintAlias, methodBuf);
 							appendStringInfoSpaces(methodBuf, 1);
 							ybAppendHintNameDisplayText(indexName, methodBuf);
+
+							ybGenerateHintStringMergeOption(methodBuf,
+															indexonlyscan->scan.ybOptions,
+															indexonlyscan->yb_merge_scan_info);
+
 							appendStringInfoChar(methodBuf, ')');
 
 							if (plan->parallel_aware)
@@ -8919,6 +9039,10 @@ ybComparePlanShapesAndMethods(PlannedStmt *plannedStmt1, Plan *plan1, PlannedStm
 
 											plansAreEqual = (strcmp(indexName1, indexName2) == 0);
 
+											if (plansAreEqual)
+												plansAreEqual = equal(indexscan1->yb_merge_scan_info,
+																	  indexscan2->yb_merge_scan_info);
+
 											if (trace && !plansAreEqual)
 											{
 												ereport(INFO,
@@ -8942,6 +9066,10 @@ ybComparePlanShapesAndMethods(PlannedStmt *plannedStmt1, Plan *plan1, PlannedStm
 											Assert(indexName2 != NULL);
 
 											plansAreEqual = (strcmp(indexName1, indexName2) == 0);
+
+											if (plansAreEqual)
+												plansAreEqual = equal(indexonlyscan1->yb_merge_scan_info,
+																	  indexonlyscan2->yb_merge_scan_info);
 
 											if (trace && !plansAreEqual)
 											{

@@ -23,8 +23,10 @@ import api.v2.models.UniverseValidateKubernetesOverrides;
 import api.v2.models.YBAValidationResponse;
 import com.yugabyte.yba.v2.client.ApiException;
 import com.yugabyte.yba.v2.client.api.UniverseApi;
+import com.yugabyte.yba.v2.client.models.AvailabilityZoneGFlags;
 import com.yugabyte.yba.v2.client.models.ClusterAddSpec;
 import com.yugabyte.yba.v2.client.models.ClusterEditSpec;
+import com.yugabyte.yba.v2.client.models.ClusterGFlags;
 import com.yugabyte.yba.v2.client.models.ClusterNetworkingEditSpec;
 import com.yugabyte.yba.v2.client.models.ClusterNodeSpec;
 import com.yugabyte.yba.v2.client.models.ClusterPartitionSpec;
@@ -57,7 +59,10 @@ import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.KubernetesManager;
 import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.common.PlacementInfoUtil;
+import com.yugabyte.yw.common.TestUtils;
 import com.yugabyte.yw.common.config.GlobalConfKeys;
+import com.yugabyte.yw.common.gflags.GFlagsUtil;
+import com.yugabyte.yw.common.gflags.SpecificGFlags;
 import com.yugabyte.yw.forms.UniverseConfigureTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
@@ -83,6 +88,7 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.collections4.MapUtils;
 import org.junit.Before;
 import org.junit.Test;
 import org.mockito.ArgumentCaptor;
@@ -178,7 +184,7 @@ public class UniverseApiControllerEditTest extends UniverseTestBase {
         universeUuid,
         univ -> {
           UserIntent intent = univ.getUniverseDetails().getPrimaryCluster().userIntent;
-          intent.instanceType = "c5.4xlarge";
+          TestUtils.existingProviderInitializer(intent).setInstanceType("c5.4xlarge");
           for (NodeDetails n : univ.getUniverseDetails().nodeDetailsSet) {
             n.state = NodeState.Live;
             if (n.cloudInfo != null) {
@@ -215,7 +221,7 @@ public class UniverseApiControllerEditTest extends UniverseTestBase {
         universeUuid,
         univ -> {
           UserIntent intent = univ.getUniverseDetails().getPrimaryCluster().userIntent;
-          intent.instanceType = "c5.4xlarge";
+          TestUtils.existingProviderInitializer(intent).setInstanceType("c5.4xlarge");
           List<NodeDetails> nodes =
               univ.getUniverseDetails().nodeDetailsSet.stream().collect(Collectors.toList());
           for (int i = 0; i < nodes.size(); i++) {
@@ -440,6 +446,32 @@ public class UniverseApiControllerEditTest extends UniverseTestBase {
           intent.dedicatedNodes = true;
           intent.masterInstanceType = "m5.large";
           intent.masterDeviceInfo = ApiUtils.getDummyDeviceInfo(1, 100);
+
+          UUID azUUID =
+              univ.getUniverseDetails()
+                  .getPrimaryCluster()
+                  .getOverallPlacement()
+                  .azStream()
+                  .map(az -> az.uuid)
+                  .findFirst()
+                  .get();
+          UniverseDefinitionTaskParams.UserIntentOverrides o =
+              new UniverseDefinitionTaskParams.UserIntentOverrides();
+          UniverseDefinitionTaskParams.AZOverrides az =
+              new UniverseDefinitionTaskParams.AZOverrides();
+          az.updatePerProcess(ServerType.TSERVER, ppd -> ppd.setInstanceType("overriden"));
+          o.setAzOverrides(Map.of(azUUID, az));
+
+          UniverseDefinitionTaskParams.PerProcessDetails ppd =
+              new UniverseDefinitionTaskParams.PerProcessDetails();
+          ppd.setDeviceInfo(intent.masterDeviceInfo);
+          o.setPerProcess(
+              Map.of(
+                  ServerType.TSERVER,
+                  new UniverseDefinitionTaskParams.PerProcessDetails(),
+                  ServerType.MASTER,
+                  ppd));
+          intent.setUserIntentOverrides(o);
           univ.setUniverseDetails(univ.getUniverseDetails());
         },
         false);
@@ -473,6 +505,8 @@ public class UniverseApiControllerEditTest extends UniverseTestBase {
     assertThat(primaryCluster.userIntent.dedicatedNodes, is(false));
     assertThat(primaryCluster.userIntent.masterInstanceType, is(nullValue()));
     assertThat(primaryCluster.userIntent.masterDeviceInfo, is(nullValue()));
+    assertTrue(
+        MapUtils.isEmpty(primaryCluster.userIntent.getUserIntentOverrides().getPerProcess()));
   }
 
   @Test
@@ -677,6 +711,118 @@ public class UniverseApiControllerEditTest extends UniverseTestBase {
     validateClusterAddSpec(clusterAddSpec, newV1Cluster, v2PrimaryCluster);
   }
 
+  private static final String YCQL_LDAP_SECRET = "ycql-ldap-lr23812";
+  private static final String HBA_WITH_SECRET =
+      "host all all 0.0.0.0/0 ldap ldapserver=ldap.example.com ldapbindpasswd=hba-lr23812";
+
+  private UniverseApi apiWithPrimaryLdapGFlags() {
+    when(mockRuntimeConfig.getBoolean(
+            GlobalConfKeys.enableGFlagsSensitiveDataApiRedaction.getKey()))
+        .thenReturn(true);
+    Universe.saveDetails(
+        universeUuid,
+        u ->
+            u.getUniverseDetails().getPrimaryCluster().userIntent.specificGFlags =
+                SpecificGFlags.construct(
+                    Map.of(),
+                    Map.of(
+                        "ycql_ldap_bind_passwd",
+                        YCQL_LDAP_SECRET,
+                        GFlagsUtil.YSQL_HBA_CONF_CSV,
+                        HBA_WITH_SECRET)));
+    UUID fakeTaskUUID = FakeDBApplication.buildTaskInfo(null, TaskType.EditUniverse);
+    when(mockCommissioner.submit(any(TaskType.class), any(UniverseConfigureTaskParams.class)))
+        .thenReturn(fakeTaskUUID);
+    return new UniverseApi();
+  }
+
+  @Test
+  public void testAddReadReplicaRestoresRedactedGFlagsFromPrimary() throws ApiException {
+    UniverseApi api = apiWithPrimaryLdapGFlags();
+    // The UI sends the primary's gflags from GET as the read replica's own.
+    Map<String, String> primaryTserverGFlags =
+        api.getUniverse(customer.getUuid(), universeUuid).getSpec().getClusters().stream()
+            .filter(c -> c.getClusterType().equals(ClusterTypeEnum.PRIMARY))
+            .findAny()
+            .get()
+            .getGflags()
+            .getTserver();
+    assertThat(primaryTserverGFlags.get("ycql_ldap_bind_passwd"), is("REDACTED"));
+    ClusterAddSpec clusterAddSpec = getReadReplicaClusterAddSpec();
+    clusterAddSpec.setGflags(new ClusterGFlags().master(Map.of()).tserver(primaryTserverGFlags));
+
+    YBATask addTask = api.addCluster(customer.getUuid(), universeUuid, clusterAddSpec);
+    ArgumentCaptor<UniverseConfigureTaskParams> paramsCapture =
+        ArgumentCaptor.forClass(UniverseConfigureTaskParams.class);
+    verify(mockCommissioner).submit(eq(TaskType.ReadOnlyClusterCreate), paramsCapture.capture());
+    Map<String, String> readReplicaTserverGFlags =
+        paramsCapture
+            .getValue()
+            .getClusterByUuid(addTask.getResourceUuid())
+            .userIntent
+            .specificGFlags
+            .getPerProcessFlags()
+            .value
+            .get(ServerType.TSERVER);
+    assertThat(readReplicaTserverGFlags.get("ycql_ldap_bind_passwd"), is(YCQL_LDAP_SECRET));
+    assertThat(readReplicaTserverGFlags.get(GFlagsUtil.YSQL_HBA_CONF_CSV), is(HBA_WITH_SECRET));
+  }
+
+  @Test
+  public void testAddReadReplicaWithTserverGFlagsOnly() throws ApiException {
+    UniverseApi api = apiWithPrimaryLdapGFlags();
+    UUID azUuid =
+        AvailabilityZone.getAZsForRegion(Region.getByProvider(providerUuid).get(0).getUuid())
+            .get(0)
+            .getUuid();
+    ClusterAddSpec clusterAddSpec = getReadReplicaClusterAddSpec();
+    clusterAddSpec.setGflags(
+        new ClusterGFlags()
+            .tserver(Map.of("tflag", "tval"))
+            .putAzGflagsItem(
+                azUuid.toString(),
+                new AvailabilityZoneGFlags().tserver(Map.of("azflag", "azval"))));
+
+    YBATask addTask = api.addCluster(customer.getUuid(), universeUuid, clusterAddSpec);
+    ArgumentCaptor<UniverseConfigureTaskParams> paramsCapture =
+        ArgumentCaptor.forClass(UniverseConfigureTaskParams.class);
+    verify(mockCommissioner).submit(eq(TaskType.ReadOnlyClusterCreate), paramsCapture.capture());
+    SpecificGFlags readReplicaGFlags =
+        paramsCapture
+            .getValue()
+            .getClusterByUuid(addTask.getResourceUuid())
+            .userIntent
+            .specificGFlags;
+    assertThat(
+        readReplicaGFlags.getPerProcessFlags().value.get(ServerType.TSERVER),
+        is(Map.of("tflag", "tval")));
+    assertThat(
+        readReplicaGFlags.getPerAZ().get(azUuid).value.get(ServerType.TSERVER),
+        is(Map.of("azflag", "azval")));
+  }
+
+  @Test
+  public void testAddReadReplicaRejectsRedactedHbaThatDiffersFromPrimary() {
+    UniverseApi api = apiWithPrimaryLdapGFlags();
+    ClusterAddSpec clusterAddSpec = getReadReplicaClusterAddSpec();
+    clusterAddSpec.setGflags(
+        new ClusterGFlags()
+            .master(Map.of())
+            .tserver(
+                Map.of(
+                    GFlagsUtil.YSQL_HBA_CONF_CSV,
+                    "host all all 192.0.2.0/24 ldap ldapserver=ldap.example.com"
+                        + " ldapbindpasswd=REDACTED")));
+
+    ApiException e =
+        assertThrows(
+            ApiException.class,
+            () -> api.addCluster(customer.getUuid(), universeUuid, clusterAddSpec));
+    assertEquals(400, e.getCode());
+    verify(mockCommissioner, never())
+        .submit(eq(TaskType.ReadOnlyClusterCreate), any(UniverseConfigureTaskParams.class));
+  }
+
   @Test
   public void testEditUniverseV2DedicatedAddReadReplica() throws ApiException {
     when(mockCommissioner.submit(any(TaskType.class), any(UniverseConfigureTaskParams.class)))
@@ -783,7 +929,8 @@ public class UniverseApiControllerEditTest extends UniverseTestBase {
     UniverseDefinitionTaskParams.UserIntent userIntent = curIntent.clone();
     userIntent.numNodes = 3;
     userIntent.replicationFactor = 3;
-    userIntent.deviceInfo.numVolumes = 1;
+    TestUtils.updateDeviceInfo(
+        userIntent, ServerType.TSERVER, deviceInfo -> deviceInfo.numVolumes = 1);
     PlacementInfo pi = rf3Placement(region);
     universe =
         Universe.saveDetails(

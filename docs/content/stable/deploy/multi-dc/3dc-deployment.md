@@ -147,7 +147,7 @@ replication_info {
 
 ### Set a preferred location
 
-One additional option to consider is to set a preferred location for all the tablet leaders using the [yb-admin set_preferred_zones](../../../admin/yb-admin#set-preferred-zones) command.
+One additional option to consider is to set a preferred location for all the tablet leaders using the [yb-admin set_preferred_zones](../../../admin/yb-admin/#set-preferred-zones) command.
 
 For multi-row or multi-table transactional operations, colocating the leaders in a single zone or region can help reduce the number of cross-region network hops involved in executing a transaction and, as a result, improve performance.
 
@@ -160,7 +160,7 @@ $ ./bin/yb-admin \
     aws.us-west.us-west-2a
 ```
 
-Looking again at the cluster configuration, you should see `affinitized_leaders` added:
+Looking again at the cluster configuration, you should see `multi_affinitized_leaders` added:
 
 ```json
 replication_info {
@@ -190,7 +190,9 @@ replication_info {
       }
       min_num_replicas: 1
     }
-    affinitized_leaders {
+  }
+  multi_affinitized_leaders {
+    zones {
       placement_cloud: "aws"
       placement_region: "us-west"
       placement_zone: "us-west-2a"

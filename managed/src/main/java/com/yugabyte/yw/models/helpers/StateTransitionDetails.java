@@ -7,6 +7,7 @@ import static play.mvc.Http.Status.BAD_REQUEST;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.yugabyte.yw.common.DeltaEvaluator;
+import com.yugabyte.yw.common.NodeDetailsArrayComparator;
 import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
@@ -30,19 +31,17 @@ public class StateTransitionDetails {
   public void requireRollbackable() {
     if (delta == null || delta.isNull()) {
       throw new PlatformServiceException(
-          BAD_REQUEST, "Cannot roll back edit universe: state_transition_details.delta is missing");
+          BAD_REQUEST, "Cannot roll back: state_transition_details.delta is missing");
     }
     if (!rollbackSafe) {
       throw new PlatformServiceException(
-          BAD_REQUEST,
-          "Cannot roll back edit universe: rollback checkpoint was crossed"
-              + " (rollbackSafe=false)");
+          BAD_REQUEST, "Cannot roll back: rollback checkpoint was crossed (rollbackSafe=false)");
     }
     if (isDedicatedNodesChanged()) {
       throw new PlatformServiceException(
           BAD_REQUEST,
-          "Cannot roll back edit universe: dedicatedNodes changed (Live tserver gflags were"
-              + " rewritten before the rollback checkpoint)");
+          "Cannot roll back: dedicatedNodes changed (Live tserver gflags were rewritten before"
+              + " the rollback checkpoint)");
     }
   }
 
@@ -72,7 +71,7 @@ public class StateTransitionDetails {
     JsonNode beforeJson = DeltaEvaluator.generateOldValue(requireDelta());
     if (beforeJson == null || beforeJson.isNull()) {
       throw new PlatformServiceException(
-          BAD_REQUEST, "Cannot roll back edit universe: generateOldValue returned null");
+          BAD_REQUEST, "Cannot roll back: generateOldValue returned null");
     }
     return Json.fromJson(beforeJson, UniverseDefinitionTaskParams.class);
   }
@@ -83,35 +82,29 @@ public class StateTransitionDetails {
     JsonNode targetJson = DeltaEvaluator.generateNewValue(requireDelta());
     if (targetJson == null || targetJson.isNull()) {
       throw new PlatformServiceException(
-          BAD_REQUEST, "Cannot roll back edit universe: generateNewValue returned null");
+          BAD_REQUEST, "Cannot roll back: generateNewValue returned null");
     }
     return Json.fromJson(targetJson, UniverseDefinitionTaskParams.class);
   }
 
   /**
-   * Builds restored pre-task details (edit-owned topology) while preserving lock fields owned by
-   * the current rollback task so {@code unlockUniverseForUpdate} still works, YBC fields that may
-   * have been updated by a YBC upgrade outside this edit, and {@code sequenceNumber} advanced by
-   * {@code UpdateConsistencyCheck} after freeze (must not be restored from the checkpoint).
+   * Builds restored pre-task details (edit-owned topology) while keeping the current values of the
+   * fields annotated with {@link DeltaEvaluator.DeltaRetainLatest}: the lock fields owned by the
+   * current rollback task so {@code unlockUniverseForUpdate} still works, {@code sequenceNumber}
+   * advanced by {@code UpdateConsistencyCheck} after freeze, and the fields other tasks write while
+   * the failed task waits (YBC version and throttle flags, node agent flags, Perf Advisor
+   * registration). Clusters are matched by uuid; a cluster missing in current keeps its own values.
    */
   public UniverseDefinitionTaskParams applyBeforeTo(UniverseDefinitionTaskParams current) {
     UniverseDefinitionTaskParams before = getBeforeUniverseDetails();
-    before.updateInProgress = current.updateInProgress;
-    before.updatingTask = current.updatingTask;
-    before.updatingTaskUUID = current.updatingTaskUUID;
-    before.placementModificationTaskUuid = current.placementModificationTaskUuid;
-    before.updateSucceeded = current.updateSucceeded;
-    before.setYbcSoftwareVersion(current.getYbcSoftwareVersion());
-    before.setEnableYbc(current.isEnableYbc());
-    before.setYbcInstalled(current.isYbcInstalled());
-    before.sequenceNumber = current.sequenceNumber;
+    DeltaEvaluator.mergeWithLatest(before, current, new NodeDetailsArrayComparator());
     return before;
   }
 
   private JsonNode requireDelta() {
     if (delta == null || delta.isNull()) {
       throw new PlatformServiceException(
-          BAD_REQUEST, "Cannot roll back edit universe: state_transition_details.delta is missing");
+          BAD_REQUEST, "Cannot roll back: state_transition_details.delta is missing");
     }
     return delta;
   }

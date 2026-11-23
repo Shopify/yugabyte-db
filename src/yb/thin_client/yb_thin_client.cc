@@ -29,6 +29,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -71,6 +72,7 @@
 
 #include "yb/util/env.h"
 #include "yb/util/faststring.h"
+#include "yb/util/logging.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/ref_cnt_buffer.h"
@@ -78,6 +80,10 @@
 #include "yb/util/slice.h"
 #include "yb/util/status.h"
 #include "yb/util/status_format.h"
+#include "yb/util/strongly_typed_bool.h"
+#include "yb/util/tsan_util.h"
+
+DECLARE_bool(use_libunwind_for_stack_trace_collection);
 
 using yb::DataType;
 using yb::faststring;
@@ -101,17 +107,24 @@ static constexpr uint16_t kDefaultTserverRpcPort = 9100;
 static constexpr int kKeepaliveIntervalMs = 10000;
 static constexpr int kDefaultRpcTimeoutMs = 60000;
 static constexpr int kDefaultNumReactors = 4;
-// Concurrency comes from multiple sessions, packed 4 per connection so a small pool opens one.
+// Sessions are packed 4 per connection, so a small pool opens one.
 static constexpr uint32_t kDefaultReadSessions = 4;
 static constexpr uint32_t kDefaultWriteSessions = 1;
 static constexpr uint32_t kDefaultSessionsPerConn = 4;
 // One connection to a tserver. Its own messenger, hence its own socket, so N connections spread
-// across tserver nodes behind a ClusterIP VIP. Sessions are packed onto connections.
+// across tserver nodes behind a ClusterIP VIP. Sessions are packed onto connections. A connection
+// whose tserver stops answering moves on to the next configured one.
 struct ybthin_connection {
   std::unique_ptr<rpc::Messenger> messenger;
   std::unique_ptr<rpc::ProxyCache> proxy_cache;
-  std::unique_ptr<tserver::ThinClientServiceProxy> proxy;
-  HostPort host;
+  // One per configured host, indexed like ybthin_client::hosts. Kept until destroy, so a call in
+  // flight keeps its proxy after the connection moves.
+  std::vector<std::unique_ptr<tserver::ThinClientServiceProxy>> proxies;
+  // The host new sessions open on.
+  std::atomic<size_t> host_index{0};
+  // Bumped when a session on this connection is lost, since the next socket may reach another
+  // tserver. Sessions opened at an older epoch reopen before their next use.
+  std::atomic<uint64_t> epoch{0};
 };
 
 // One ThinClientService session. The server keeps no per-session state, so Performs need no
@@ -121,6 +134,9 @@ struct ybthin_session {
   size_t conn_index = 0;
   std::mutex mutex;
   bool open GUARDED_BY(mutex) = false;
+  // Session ids are local to a tserver, so a session lives on the host it was opened on.
+  size_t host_index GUARDED_BY(mutex) = 0;
+  uint64_t conn_epoch GUARDED_BY(mutex) = 0;  // the connection's epoch it was opened at
   uint32_t generation GUARDED_BY(mutex) = 0;
   uint64_t session_id GUARDED_BY(mutex) = 0;
   uint64_t stmt_id GUARDED_BY(mutex) = 1;
@@ -129,6 +145,8 @@ struct ybthin_session {
 struct ybthin_client {
   std::unique_ptr<rpc::SecureContext> secure_context;  // null for plaintext; shared by all conns
   std::vector<std::unique_ptr<ybthin_connection>> connections;
+  // Fixed at create. A dead session keeps its slot and is reopened in place, since paging states
+  // and calls in flight refer to it.
   std::vector<std::unique_ptr<ybthin_session>> read_sessions;
   std::vector<std::unique_ptr<ybthin_session>> write_sessions;
   // Round-robin cursors for picking the next session out of each pool.
@@ -142,7 +160,8 @@ struct ybthin_client {
   std::thread keepalive_thread;  // NOLINT(build/std_thread)
   std::mutex mutex;
   std::condition_variable cv;
-  bool stop = false;
+  // Set under `mutex`; the keepalive also reads it between sessions without the mutex.
+  std::atomic<bool> stop{false};
 };
 
 struct ybthin_table {
@@ -225,20 +244,25 @@ bool IsAlreadyReplicatedWrite(const Status& status) {
   return status.IsAlreadyPresent() && !yb::PgsqlError::ValueFromStatus(status);
 }
 
+// The tserver does not know the session or is shutting it down (ThinClientService's
+// SessionLostStatus). Tservers older than SESSION_LOST send these statuses without the code.
+bool IsSessionLost(const Status& status) {
+  if (const auto ts_error = tserver::TabletServerError::ValueFromStatus(status)) {
+    return *ts_error == tserver::TabletServerErrorPB::SESSION_LOST;
+  }
+  if (status.IsInvalidArgument()) {
+    return status.message().starts_with(Slice("Unknown session"));
+  }
+  return status.IsShutdownInProgress() && status.message() == Slice("Session is shutting down");
+}
+
 ybthin_status FromStatus(const Status& status) {
   if (status.ok()) {
     return OkStatus();
   }
-  auto code = ClassifyStatus(status);
-  const auto msg = status.ToString();
-  // A dropped/expired session surfaces as an app error; steer the caller to reconnect.
-  if (code == YBTHIN_OTHER || code == YBTHIN_INVALID) {
-    if (msg.find("ession") != std::string::npos &&
-        (msg.find("nknown") != std::string::npos || msg.find("xpired") != std::string::npos)) {
-      code = YBTHIN_NETWORK;
-    }
-  }
-  return MakeStatus(code, msg);
+  // A lost session surfaces as an app error; steer the caller to reconnect.
+  const auto code = IsSessionLost(status) ? YBTHIN_NETWORK : ClassifyStatus(status);
+  return MakeStatus(code, status.ToString());
 }
 
 Status BindToQLValue(const ybthin_bind& bind, yb::QLValuePB* out) {
@@ -256,6 +280,12 @@ Status BindToQLValue(const ybthin_bind& bind, yb::QLValuePB* out) {
       return Status::OK();
     case YBTHIN_BIND_I64:
       out->set_int64_value(bind.int_value);
+      return Status::OK();
+    case YBTHIN_BIND_U32:
+      if (bind.int_value < 0 || bind.int_value > std::numeric_limits<uint32_t>::max()) {
+        return STATUS_FORMAT(InvalidArgument, "U32 bind $0 is out of range", bind.int_value);
+      }
+      out->set_uint32_value(static_cast<uint32_t>(bind.int_value));
       return Status::OK();
     case YBTHIN_BIND_TEXT:
       out->set_string_value(bind.bytes, bind.bytes_len);
@@ -291,6 +321,7 @@ Result<ybthin_value_type> MapDataType(DataType dt) {
     case DataType::INT16: return YBTHIN_T_I16;
     case DataType::INT32: return YBTHIN_T_I32;
     case DataType::INT64: return YBTHIN_T_I64;
+    case DataType::UINT32: return YBTHIN_T_U32;
     case DataType::STRING: return YBTHIN_T_TEXT;
     case DataType::BINARY: return YBTHIN_T_BYTEA;
     default:
@@ -304,10 +335,25 @@ Result<std::string> ReadFile(const char* path) {
   return data.ToString();
 }
 
-// `create` opens a new session and returns its assigned id; otherwise `session_id` is kept alive.
+// Our socket to the connection's host broke, or the tserver lost the session: the next socket
+// may reach a tserver that never issued the connection's session ids, so drop them all. A
+// NetworkError the tserver returns is about its own work. Only the first loss seen at `epoch` bumps
+// it, and a call to a host the connection has moved off bumps nothing.
+void MaybeDropConnectionSessions(
+    ybthin_connection& conn, size_t host, uint64_t epoch, const Status& status, bool from_tserver) {
+  if (host != conn.host_index.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (from_tserver ? IsSessionLost(status) : status.IsNetworkError()) {
+    conn.epoch.compare_exchange_strong(epoch, epoch + 1, std::memory_order_acq_rel);
+  }
+}
+
+// `create` opens a new session on `host` and returns its id; otherwise `session_id` is kept alive.
+// `conn_epoch` is the connection's epoch the call is sent at.
 Result<uint64_t> DoHeartbeat(
-    const tserver::ThinClientServiceProxy& proxy, const MonoDelta& timeout, bool create,
-    uint64_t session_id) {
+    ybthin_connection& conn, size_t host, uint64_t conn_epoch, const MonoDelta& timeout,
+    bool create, uint64_t session_id) {
   tserver::ThinHeartbeatRequestPB req;
   if (!create) {
     req.set_session_id(session_id);
@@ -315,31 +361,123 @@ Result<uint64_t> DoHeartbeat(
   tserver::ThinHeartbeatResponsePB resp;
   rpc::RpcController controller;
   controller.set_timeout(timeout);
-  RETURN_NOT_OK(proxy.Heartbeat(req, &resp, &controller));
+  Status rpc_status = conn.proxies[host]->Heartbeat(req, &resp, &controller);
+  if (!rpc_status.ok()) {
+    MaybeDropConnectionSessions(conn, host, conn_epoch, rpc_status, /* from_tserver= */ false);
+    return rpc_status;
+  }
+  // A failed reply is about the one session, so the caller, which knows its generation, decides.
   RETURN_NOT_OK(yb::ResponseStatus(resp));
   return resp.session_id();
 }
 
-Status OpenSession(ybthin_client& client, ybthin_session& session) REQUIRES(session.mutex) {
-  auto& conn = *client.connections[session.conn_index];
-  session.session_id = VERIFY_RESULT(
-      DoHeartbeat(*conn.proxy, client.timeout, /* create= */ true, /* session_id= */ 0));
+ybthin_connection& ConnectionOf(const ybthin_client& client, const ybthin_session& session) {
+  return *client.connections[session.conn_index];
+}
+
+// A broken connection means the host is down, and so does a timeout if `timeout_means_down`. A
+// Heartbeat is served by the host alone; a Perform or OpenTable may be waiting on another server.
+bool IsHostUp(const Status& status, bool timeout_means_down) {
+  return !status.IsNetworkError() && !(timeout_means_down && status.IsTimedOut());
+}
+
+// Moves `conn` off `host` to the next one, if there is one. A burst of failures from one host moves
+// it once.
+void MoveOffHost(
+    const ybthin_client& client, ybthin_connection& conn, size_t host, const Status& status) {
+  if (client.hosts.size() < 2) {
+    return;
+  }
+  const size_t next = (host + 1) % client.hosts.size();
+  if (conn.host_index.compare_exchange_strong(host, next, std::memory_order_acq_rel)) {
+    LOG(WARNING) << "Thin client connection moving from " << client.hosts[host] << " to "
+                 << client.hosts[next] << " after: " << status;
+  }
+}
+
+// Runs `rpc` on the connection's host, then on each next host after any failure, up to `max_hosts`
+// hosts. Returns the host it succeeded on; the connection moves only off hosts that are down.
+template <class Rpc>
+Result<size_t> RunOnHosts(
+    const ybthin_client& client, ybthin_connection& conn, size_t max_hosts,
+    bool timeout_means_down, const Rpc& rpc) {
+  const size_t first = conn.host_index.load(std::memory_order_acquire);
+  Status status;
+  for (size_t attempt = 0; attempt < max_hosts; ++attempt) {
+    const size_t host = (first + attempt) % client.hosts.size();
+    Status rpc_status = rpc(host);
+    if (rpc_status.ok()) {
+      return host;
+    }
+    status = std::move(rpc_status);
+    if (!IsHostUp(status, timeout_means_down)) {
+      MoveOffHost(client, conn, host, status);
+    }
+  }
+  return status;
+}
+
+// With `try_every_host`, each host is tried in turn. Otherwise only the connection's is, so the
+// reopen takes at most one RPC timeout. A caller also waits out any reopen ahead of it on the
+// session's mutex.
+Status OpenSession(
+    ybthin_client& client, ybthin_session& session, const MonoDelta& timeout, bool try_every_host)
+    REQUIRES(session.mutex) {
+  auto& conn = ConnectionOf(client, session);
+  session.open = false;
+  uint64_t session_id = 0;
+  uint64_t epoch = 0;
+  const size_t opened_host = VERIFY_RESULT(RunOnHosts(
+      client, conn, try_every_host ? client.hosts.size() : 1, /* timeout_means_down= */ true,
+      [&](size_t host) -> Status {
+        epoch = conn.epoch.load(std::memory_order_acquire);
+        session_id =
+            VERIFY_RESULT(DoHeartbeat(conn, host, epoch, timeout, /* create= */ true, 0));
+        return Status::OK();
+      }));
+  // A session lives on the host it opened on, so at create the connection follows it there.
+  if (try_every_host) {
+    const size_t from = conn.host_index.exchange(opened_host, std::memory_order_acq_rel);
+    if (from != opened_host) {
+      LOG(WARNING) << "Thin client connection moving from " << client.hosts[from] << " to "
+                   << client.hosts[opened_host] << ", where its session opened";
+    }
+  }
+  session.host_index = opened_host;
+  // The replaced id is left for its tserver to expire, since a reopen follows a failure there.
+  session.session_id = session_id;
+  session.conn_epoch = epoch;
   ++session.generation;
   session.open = true;
   return Status::OK();
 }
 
+// False for a dropped session, for one stranded on a host its connection has moved off, and for one
+// opened before its connection last lost a session.
+bool IsSessionUsable(const ybthin_client& client, const ybthin_session& session)
+    REQUIRES(session.mutex) {
+  const auto& conn = ConnectionOf(client, session);
+  return session.open && session.host_index == conn.host_index.load(std::memory_order_acquire) &&
+         session.conn_epoch == conn.epoch.load(std::memory_order_acquire);
+}
+
 Status EnsureSessionOpen(ybthin_client& client, ybthin_session& session)
     REQUIRES(session.mutex) {
-  return session.open ? Status::OK() : OpenSession(client, session);
+  if (IsSessionUsable(client, session)) {
+    return Status::OK();
+  }
+  return OpenSession(client, session, client.timeout, /* try_every_host= */ false);
 }
 
 // A network-class failure means the server may have dropped the session, so drop ours too and let
-// the next use reopen it.
-void MaybeMarkSessionDead(ybthin_session& session, const ybthin_status& status) {
+// the next use reopen it, unless it was reopened after the failed call went out.
+void MaybeMarkSessionDead(
+    ybthin_session& session, uint32_t generation, const ybthin_status& status) {
   if (status.code == YBTHIN_NETWORK) {
     std::lock_guard<std::mutex> lock(session.mutex);
-    session.open = false;
+    if (session.generation == generation) {
+      session.open = false;
+    }
   }
 }
 
@@ -355,19 +493,21 @@ ybthin_session& NextWriteSession(ybthin_client& client) {
 }
 
 // The shim's own envelope around the server's paging state, handed back to the caller opaquely:
-//   [magic][version][u32 read-session index][u32 generation][u64 read_ht]
+//   [magic][version][u32 read-session index][u32 generation][u64 read_ht][u8 flags]
 //   + the server's paging state.
 // A continuation routes back to the same session (generation-checked) and replays the read time its
 // scan was served at, so every page reads at one snapshot without the server tracking read points.
-// Nothing in YugabyteDB defines this format -- pggate keeps the equivalent state in process memory
-// and never serializes it. Version 3 replaced the read serial with the read time itself; bump the
-// version for any further layout change.
+// The flags carry the scan's read_from_followers, so every page of a follower scan asks for a
+// follower. Nothing in YugabyteDB defines this format -- pggate keeps the equivalent state in
+// process memory and never serializes it. Version 3 replaced the read serial with the read time
+// itself, version 4 added the flags; bump the version for any further layout change.
 constexpr uint8_t kPagingMagic = 0xB1;
-constexpr uint8_t kPagingVersion = 3;
+constexpr uint8_t kPagingVersion = 4;
 constexpr size_t kPagingPrefixLen = 2;  // magic + version
+constexpr uint8_t kPagingFlagReadFromFollowers = 0x01;
 // Derived from the layout above so the writer, the reader and the length cannot drift apart.
 constexpr size_t kPagingHeaderLen =
-    kPagingPrefixLen + 2 * sizeof(uint32_t) + sizeof(uint64_t);
+    kPagingPrefixLen + 2 * sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint8_t);
 
 void AppendU32LE(std::string* out, uint32_t value) {
   char buf[sizeof(value)];
@@ -393,9 +533,11 @@ uint64_t ReadU64LE(const uint8_t** cursor) {
   return value;
 }
 
+YB_STRONGLY_TYPED_BOOL(ReadFromFollowers);
+
 std::string WrapPagingState(
     uint32_t session_index, uint32_t generation, uint64_t read_ht,
-    const std::string& server_paging_state) {
+    ReadFromFollowers read_from_followers, const std::string& server_paging_state) {
   std::string out;
   out.reserve(kPagingHeaderLen + server_paging_state.size());
   out.push_back(static_cast<char>(kPagingMagic));
@@ -403,6 +545,7 @@ std::string WrapPagingState(
   AppendU32LE(&out, session_index);
   AppendU32LE(&out, generation);
   AppendU64LE(&out, read_ht);
+  out.push_back(static_cast<char>(read_from_followers ? kPagingFlagReadFromFollowers : 0));
   out.append(server_paging_state);
   return out;
 }
@@ -412,6 +555,8 @@ struct PinInfo {
   uint32_t generation;
   // Replayed by a continuation so the server restores the scan's read point.
   uint64_t read_ht;
+  // Replayed alongside it, so the continuation is served by a follower like its first page.
+  ReadFromFollowers read_from_followers = ReadFromFollowers::kFalse;
   Slice server_paging_state;
 };
 
@@ -424,6 +569,7 @@ Result<PinInfo> UnwrapPagingState(const uint8_t* data, size_t len) {
   pin.session_index = ReadU32LE(&cursor);
   pin.generation = ReadU32LE(&cursor);
   pin.read_ht = ReadU64LE(&cursor);
+  pin.read_from_followers = ReadFromFollowers((*cursor++ & kPagingFlagReadFromFollowers) != 0);
   pin.server_paging_state = Slice(cursor, data + len);
   return pin;
 }
@@ -487,10 +633,39 @@ ybthin_status PgsqlResponseError(const yb::PgsqlResponsePB& resp) {
   }
 }
 
-struct ReadCall {
-  ybthin_session* session;  // the one session this batch runs on
+// The session a Perform runs on.
+struct SessionCall {
+  ybthin_client* client;
+  ybthin_session* session;
+  size_t host_index;    // the host the session lives on, which the Perform was sent to
+  uint64_t conn_epoch;  // the connection epoch the session was opened at
+  uint32_t generation;  // session incarnation the Perform ran at
+};
+
+bool IsCurrentGeneration(ybthin_session& session, uint32_t generation) {
+  std::lock_guard<std::mutex> lock(session.mutex);
+  return session.generation == generation;
+}
+
+// The caller's status for a Perform that failed with `status`, from the RPC or, if `from_tserver`,
+// from the tserver's reply. A Perform with no reply moves its connection off a host that is down,
+// and drops its session.
+ybthin_status PerformFailed(const SessionCall& call, const Status& status, bool from_tserver) {
+  auto& conn = ConnectionOf(*call.client, *call.session);
+  // A reply about a session that has since been reopened says nothing about the connection.
+  if (!from_tserver || IsCurrentGeneration(*call.session, call.generation)) {
+    MaybeDropConnectionSessions(conn, call.host_index, call.conn_epoch, status, from_tserver);
+  }
+  if (!from_tserver && !IsHostUp(status, /* timeout_means_down= */ false)) {
+    MoveOffHost(*call.client, conn, call.host_index, status);
+  }
+  auto st = FromStatus(status);
+  MaybeMarkSessionDead(*call.session, call.generation, st);
+  return st;
+}
+
+struct ReadCall : SessionCall {
   uint32_t session_index;   // its index into client->read_sessions
-  uint32_t generation;      // session incarnation this batch ran at
   bool has_continuation;    // if set, the pinned session must still match
   // What the continuation ops were pinned to, and what this Perform actually ran at. The latter is
   // wrapped into the response paging state for the next page to replay.
@@ -499,6 +674,9 @@ struct ReadCall {
   // The read time this batch was pinned to, either by the caller or, for a continuation, by the
   // scan. 0 means the server picked one, which FinishRead reads out of the response paging state.
   uint64_t read_ht;
+  // Whether the batch asks for followers: the caller's choice for a fresh batch, the scan's own
+  // for a continuation. Wrapped into the response paging state so the next page asks again.
+  ReadFromFollowers read_from_followers = ReadFromFollowers::kFalse;
   tserver::ThinPerformRequestPB req;
   tserver::ThinPerformResponsePB resp;
   rpc::RpcController controller;
@@ -509,8 +687,7 @@ struct ReadCall {
   std::vector<std::vector<ybthin_value_type>> op_target_types;
 };
 
-struct WriteCall {
-  ybthin_session* session;
+struct WriteCall : SessionCall {
   tserver::ThinPerformRequestPB req;
   tserver::ThinPerformResponsePB resp;
   rpc::RpcController controller;
@@ -563,6 +740,10 @@ Status DecodeReadRows(
         case YBTHIN_T_I64:
           cell.tag = YBTHIN_BIND_I64;
           cell.int_value = VERIFY_RESULT(pggate::PgWire::CheckedReadNumber<int64_t>(&cursor));
+          break;
+        case YBTHIN_T_U32:
+          cell.tag = YBTHIN_BIND_U32;
+          cell.int_value = VERIFY_RESULT(pggate::PgWire::CheckedReadNumber<uint32_t>(&cursor));
           break;
         case YBTHIN_T_TEXT: {
           // Length-prefixed and NUL-terminated: len counts the trailing NUL.
@@ -626,16 +807,12 @@ void FinishRead(ReadCall* read_call) {
 
   Status rpc_status = call->controller.status();
   if (!rpc_status.ok()) {
-    auto st = FromStatus(rpc_status);
-    MaybeMarkSessionDead(*call->session, st);
-    call->cb(call->ctx, st, nullptr);
+    call->cb(call->ctx, PerformFailed(*call, rpc_status, /* from_tserver= */ false), nullptr);
     return;
   }
   Status app_status = yb::ResponseStatus(call->resp);
   if (!app_status.ok()) {
-    auto st = FromStatus(app_status);
-    MaybeMarkSessionDead(*call->session, st);
-    call->cb(call->ctx, st, nullptr);
+    call->cb(call->ctx, PerformFailed(*call, app_status, /* from_tserver= */ true), nullptr);
     return;
   }
   const size_t n_ops = call->op_target_types.size();
@@ -697,7 +874,7 @@ void FinishRead(ReadCall* read_call) {
       std::string srv;
       op.paging_state().SerializeToString(&srv);
       std::string wrapped = WrapPagingState(
-          call->session_index, call->generation, scan_read_ht, srv);
+          call->session_index, call->generation, scan_read_ht, call->read_from_followers, srv);
       op_result.paging_state = DupBytes(wrapped.data(), wrapped.size());
       op_result.paging_state_len = wrapped.size();
     }
@@ -712,9 +889,7 @@ void FinishWrite(WriteCall* write_call) {
 
   Status rpc_status = call->controller.status();
   if (!rpc_status.ok()) {
-    auto st = FromStatus(rpc_status);
-    MaybeMarkSessionDead(*call->session, st);
-    call->cb(call->ctx, st);
+    call->cb(call->ctx, PerformFailed(*call, rpc_status, /* from_tserver= */ false));
     return;
   }
   Status app_status = yb::ResponseStatus(call->resp);
@@ -726,9 +901,7 @@ void FinishWrite(WriteCall* write_call) {
       call->cb(call->ctx, OkStatus());
       return;
     }
-    auto st = FromStatus(app_status);
-    MaybeMarkSessionDead(*call->session, st);
-    call->cb(call->ctx, st);
+    call->cb(call->ctx, PerformFailed(*call, app_status, /* from_tserver= */ true));
     return;
   }
   // A dropped row is an error, never a silent short write.
@@ -753,6 +926,20 @@ ybthin_status ybthin_client_create(
     const char* const* tserver_addrs, size_t n_addrs, const ybthin_tls_opts* tls,
     const ybthin_pool_opts* pool, uint32_t rpc_timeout_ms, uint32_t num_reactors,
     ybthin_client** out) {
+  // Collect stack traces through libunwind rather than glibc backtrace(), before any thread is
+  // created (Thread::Create warms up the stack trace library on first use).
+  //
+  // glibc's unwinder is unsafe for a .so in a foreign process: our .eh_frame is registered with the
+  // HOST's libgcc, which sorts its FDEs lazily inside a malloc held under object_mutex. A host
+  // allocator that unwinds from inside that malloc deadlocks against itself, and
+  // ybthin_client_create never returns (#33916). libunwind has its own FDE cache.
+  //
+  // The trade: libunwind can SIGSEGV collecting a trace in a BOLT-ed binary, so this gives up BOLT
+  // for this .so. yb_release does not pass --bolt. Sanitizer builds keep the default.
+  if (!yb::IsSanitizer()) {
+    FLAGS_use_libunwind_for_stack_trace_collection = true;
+  }
+
   if (!tserver_addrs || n_addrs == 0 || !out) {
     return MakeStatus(YBTHIN_INVALID, "tserver_addrs and out are required");
   }
@@ -822,6 +1009,9 @@ ybthin_status ybthin_client_create(
     auto conn = std::make_unique<ybthin_connection>();
     rpc::MessengerBuilder builder("yb_thin_client");
     builder.set_num_reactors(client->num_reactors);
+    // A load balancer may pick a tserver per socket, so a connection's calls share one socket to
+    // reach the tserver that issued its session ids.
+    builder.set_num_connections_to_server(1);
     builder.UseDefaultConnectionContextFactory();
     if (client->secure_context) {
       rpc::ApplySecureContext(client->secure_context.get(), &builder);
@@ -833,19 +1023,23 @@ ybthin_status ybthin_client_create(
     }
     conn->messenger = std::move(*messenger);
     conn->proxy_cache = std::make_unique<rpc::ProxyCache>(conn->messenger.get());
-    conn->host = client->hosts[conn_idx % client->hosts.size()];
-    conn->proxy =
-        std::make_unique<tserver::ThinClientServiceProxy>(conn->proxy_cache.get(), conn->host);
+    for (const auto& host : client->hosts) {
+      conn->proxies.push_back(
+          std::make_unique<tserver::ThinClientServiceProxy>(conn->proxy_cache.get(), host));
+    }
+    conn->host_index.store(conn_idx % client->hosts.size(), std::memory_order_relaxed);
     client->connections.push_back(std::move(conn));
   }
 
   // Pack sessions_per_conn sessions per connection: session N lands on connection N / per_conn.
+  // A host that is not answering is skipped, so the pool opens while any host is up.
   uint32_t session_index = 0;
   auto add_session = [&](std::vector<std::unique_ptr<ybthin_session>>* dst) -> Status {
     auto session = std::make_unique<ybthin_session>();
     session->conn_index = session_index / per_conn;
     std::lock_guard<std::mutex> lock(session->mutex);
-    RETURN_NOT_OK(OpenSession(*client, *session));
+    RETURN_NOT_OK(
+        OpenSession(*client, *session, client->timeout, /* try_every_host= */ true));
     dst->push_back(std::move(session));
     ++session_index;
     return Status::OK();
@@ -865,27 +1059,63 @@ ybthin_status ybthin_client_create(
     }
   }
 
-  // A failed heartbeat drops the session, so the next use reopens it.
+  // A failed heartbeat drops the session. A dropped or stranded session is reopened here, so a call
+  // rarely has to reopen it inline. A live session is pinged outside its mutex, so a slow ping
+  // cannot stall its calls; a reopen holds the mutex, as a call's own reopen would.
   ybthin_client* client_ptr = client.get();
   client_ptr->keepalive_thread = std::thread([client_ptr] {  // NOLINT(build/std_thread)
     std::unique_lock<std::mutex> lock(client_ptr->mutex);
     while (!client_ptr->stop) {
       if (client_ptr->cv.wait_for(lock, std::chrono::milliseconds(kKeepaliveIntervalMs),
-                           [client_ptr] { return client_ptr->stop; })) {
+                           [client_ptr] { return client_ptr->stop.load(); })) {
         break;
       }
       lock.unlock();
       const auto heartbeat_timeout = std::min(client_ptr->timeout, MonoDelta::FromSeconds(5));
-      auto ping = [client_ptr, heartbeat_timeout](ybthin_session& session) {
-        std::lock_guard<std::mutex> session_lock(session.mutex);
-        if (!session.open) {
+      // After a failed reopen, the connection's other sessions wait for the next round.
+      std::vector<bool> reopen_failed(client_ptr->connections.size());
+      auto ping = [client_ptr, heartbeat_timeout, &reopen_failed](ybthin_session& session) {
+        if (client_ptr->stop) {
           return;
         }
+        auto& conn = ConnectionOf(*client_ptr, session);
+        uint64_t session_id;
+        size_t host;
+        uint64_t conn_epoch;
+        uint32_t generation;
+        {
+          std::lock_guard<std::mutex> session_lock(session.mutex);
+          if (!IsSessionUsable(*client_ptr, session)) {
+            if (reopen_failed[session.conn_index]) {
+              return;
+            }
+            auto status =
+                OpenSession(*client_ptr, session, heartbeat_timeout, /* try_every_host= */ false);
+            if (!status.ok()) {
+              reopen_failed[session.conn_index] = true;
+              YB_LOG_EVERY_N_SECS(WARNING, 60)
+                  << "Thin client keepalive could not reopen a session: " << status;
+            }
+            return;
+          }
+          session_id = session.session_id;
+          host = session.host_index;
+          conn_epoch = session.conn_epoch;
+          generation = session.generation;
+        }
         auto result = DoHeartbeat(
-            *client_ptr->connections[session.conn_index]->proxy, heartbeat_timeout,
-            /* create= */ false, session.session_id);
+            conn, host, conn_epoch, heartbeat_timeout, /* create= */ false, session_id);
         if (!result.ok()) {
-          session.open = false;
+          if (!IsHostUp(result.status(), /* timeout_means_down= */ true)) {
+            MoveOffHost(*client_ptr, conn, host, result.status());
+          }
+          std::lock_guard<std::mutex> session_lock(session.mutex);
+          // A reply about a session that has since been reopened says nothing about the connection.
+          if (session.generation == generation) {
+            MaybeDropConnectionSessions(
+                conn, host, conn_epoch, result.status(), /* from_tserver= */ true);
+            session.open = false;
+          }
         }
       };
       for (auto& session : client_ptr->read_sessions) {
@@ -934,11 +1164,18 @@ ybthin_status ybthin_table_open(
   tserver::ThinOpenTableRequestPB req;
   req.set_table_id(table->table_id);
   tserver::ThinOpenTableResponsePB resp;
-  rpc::RpcController controller;
-  controller.set_timeout(client->timeout);
 
-  // OpenTable is session-less; any connection serves it.
-  Status status = client->connections.front()->proxy->OpenTable(req, &resp, &controller);
+  // OpenTable is session-less, so any host serves it.
+  auto& conn = *client->connections.front();
+  Status status = yb::ResultToStatus(RunOnHosts(
+      *client, conn, client->hosts.size(), /* timeout_means_down= */ false, [&](size_t host) {
+        rpc::RpcController controller;
+        controller.set_timeout(client->timeout);
+        const auto epoch = conn.epoch.load(std::memory_order_acquire);
+        Status rpc_status = conn.proxies[host]->OpenTable(req, &resp, &controller);
+        MaybeDropConnectionSessions(conn, host, epoch, rpc_status, /* from_tserver= */ false);
+        return rpc_status;
+      }));
   if (!status.ok()) {
     return FromStatus(status);
   }
@@ -996,16 +1233,22 @@ void ybthin_columns_free(ybthin_column* columns, size_t /* n */) {
 }
 
 void ybthin_read_async(
-    ybthin_client* client, const ybthin_read_op* ops, size_t n_ops, uint64_t read_time_ht,
-    ybthin_read_cb cb, void* ctx) {
+    ybthin_client* client, const ybthin_read_op* ops, size_t n_ops,
+    const ybthin_read_options* options, ybthin_read_cb cb, void* ctx) {
   if (n_ops == 0) {
     cb(ctx, MakeStatus(YBTHIN_INVALID, "read batch has no ops"), nullptr);
     return;
   }
+  const ybthin_read_options no_options = {};
+  if (!options) {
+    options = &no_options;
+  }
+  const uint64_t read_time_ht = options->read_time_ht;
   auto call = std::make_unique<ReadCall>();
   call->cb = cb;
   call->ctx = ctx;
   call->read_ht = read_time_ht;
+  call->read_from_followers = ReadFromFollowers(options->read_from_followers != 0);
 
   // A continuation must return to the session that issued it, so every one in a batch has to pin
   // the same session. A batch with no continuations round-robins the read pool.
@@ -1013,6 +1256,7 @@ void ybthin_read_async(
   size_t session_index = 0;
   uint32_t pinned_generation = 0;
   uint64_t pinned_read_ht = 0;
+  ReadFromFollowers pinned_read_from_followers = ReadFromFollowers::kFalse;
   std::vector<Slice> server_paging_states(n_ops);  // empty entry => fresh op
   for (size_t op_idx = 0; op_idx < n_ops; ++op_idx) {
     const auto& op = ops[op_idx];
@@ -1033,9 +1277,11 @@ void ybthin_read_async(
       session_index = pin->session_index;
       pinned_generation = pin->generation;
       pinned_read_ht = pin->read_ht;
+      pinned_read_from_followers = pin->read_from_followers;
     } else if (pin->session_index != session_index || pin->generation != pinned_generation ||
-               pin->read_ht != pinned_read_ht) {
-      // One Perform carries one read time, hence one snapshot.
+               pin->read_ht != pinned_read_ht ||
+               pin->read_from_followers != pinned_read_from_followers) {
+      // One Perform carries one read time, hence one snapshot, and one replica choice.
       cb(ctx, MakeStatus(
              YBTHIN_INVALID, "all continuation ops in a batch must share the paging session"),
          nullptr);
@@ -1046,11 +1292,29 @@ void ybthin_read_async(
   if (!have_pinned) {
     session_index = NextReadIndex(*client);
   }
+  call->client = client;
   call->session = client->read_sessions[session_index].get();
   call->session_index = static_cast<uint32_t>(session_index);
   call->has_continuation = have_pinned;
   call->pinned_generation = pinned_generation;
   call->pinned_read_ht = pinned_read_ht;
+  // A continuation keeps its scan's replica choice over the options. Without a read time in its
+  // paging state it reads at the leader, since a follower read needs one. A follower scan's
+  // paging state has no read time only if an older tserver served its first page.
+  if (have_pinned) {
+    call->read_from_followers =
+        ReadFromFollowers(pinned_read_from_followers && pinned_read_ht != 0);
+  }
+  // A fresh follower batch reads at now - staleness, so a zero staleness would read at now, which
+  // no follower can serve: refuse it here rather than hand every such read to the leader.
+  if (call->read_from_followers && read_time_ht == 0 && !have_pinned &&
+      options->follower_read_staleness_ms == 0) {
+    cb(ctx, MakeStatus(
+           YBTHIN_INVALID,
+           "read_from_followers needs a positive follower_read_staleness_ms or a read_time_ht"),
+       nullptr);
+    return;
+  }
 
   // One Perform with n_ops read requests, in caller order -- results map back by index.
   auto& req = call->req;
@@ -1214,21 +1478,36 @@ void ybthin_read_async(
     rt->set_read_ht(read_time_ht);
     rt->set_global_limit_ht(read_time_ht);
   }
+  if (call->read_from_followers) {
+    rto->set_read_from_followers(true);
+    // The staleness only applies to a fresh, unpinned batch. A pinned one reads at its snapshot,
+    // and a follower continuation at the one in its paging state, set below (one without a read
+    // time is not a follower read, see above). Sending both a read time and a staleness would
+    // leave the server to pick, so the request carries at most one.
+    if (read_time_ht == 0 && !call->has_continuation) {
+      rto->set_follower_read_staleness_ms(options->follower_read_staleness_ms);
+    }
+  }
 
-  // A continuation whose session was reopened can no longer be served, so report READ_RESTART.
+  // A continuation whose session was dropped or reopened can no longer be served, so report
+  // READ_RESTART without reopening it.
   ReadCall* read_call = call.release();
   auto& session = *read_call->session;
   ybthin_status early = OkStatus();
   bool dispatch = false;
   {
     std::lock_guard<std::mutex> lock(session.mutex);
-    Status open = EnsureSessionOpen(*client, session);
-    if (!open.ok()) {
-      early = FromStatus(open);
-    } else if (read_call->has_continuation && session.generation != read_call->pinned_generation) {
+    if (read_call->has_continuation && !IsSessionUsable(*client, session)) {
+      early = MakeStatus(YBTHIN_READ_RESTART, "pinned read session is no longer open");
+    } else if (read_call->has_continuation &&
+               session.generation != read_call->pinned_generation) {
       early = MakeStatus(YBTHIN_READ_RESTART, "pinned read session was reopened");
+    } else if (Status open = EnsureSessionOpen(*client, session); !open.ok()) {
+      early = FromStatus(open);
     } else {
       read_call->generation = session.generation;
+      read_call->host_index = session.host_index;
+      read_call->conn_epoch = session.conn_epoch;
       // A continuation replays the read time its scan was served at, so every page reads at that
       // one snapshot. A fresh scan sends no read time and the server picks one, which it reports
       // back in the paging state. Either way the server keeps no read state of its own.
@@ -1252,7 +1531,7 @@ void ybthin_read_async(
     return;
   }
   read_call->controller.set_timeout(client->timeout);
-  client->connections[session.conn_index]->proxy->PerformAsync(
+  ConnectionOf(*client, session).proxies[read_call->host_index]->PerformAsync(
       read_call->req, &read_call->resp, &read_call->controller,
       [read_call] { FinishRead(read_call); });
 }
@@ -1282,6 +1561,7 @@ void ybthin_upsert_batch_async(
   auto call = std::make_unique<WriteCall>();
   call->cb = cb;
   call->ctx = ctx;
+  call->client = client;
   call->session = &NextWriteSession(*client);
 
   auto& req = call->req;
@@ -1337,6 +1617,9 @@ void ybthin_upsert_batch_async(
     if (!open.ok()) {
       early = FromStatus(open);
     } else {
+      write_call->generation = session.generation;
+      write_call->host_index = session.host_index;
+      write_call->conn_epoch = session.conn_epoch;
       for (auto& op : *write_call->req.mutable_ops()) {
         op.mutable_write()->set_stmt_id(session.stmt_id++);
       }
@@ -1350,7 +1633,7 @@ void ybthin_upsert_batch_async(
     return;
   }
   write_call->controller.set_timeout(client->timeout);
-  client->connections[session.conn_index]->proxy->PerformAsync(
+  ConnectionOf(*client, session).proxies[write_call->host_index]->PerformAsync(
       write_call->req, &write_call->resp, &write_call->controller,
       [write_call] { FinishWrite(write_call); });
 }

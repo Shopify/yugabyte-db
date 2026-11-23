@@ -64,18 +64,28 @@ namespace log {
 // are read and parsed, but entries are not.
 // This class is thread safe.
 class LogReader {
+ private:
+  class PrivateTag {};
+
  public:
   ~LogReader();
 
-  // Opens a LogReader on a specific log directory, and sets 'reader' to the newly created
-  // LogReader.
+  LogReader(
+      Env* env, const scoped_refptr<LogIndex>& index, std::string log_prefix,
+      const scoped_refptr<MetricEntity>& table_metric_entity,
+      const scoped_refptr<MetricEntity>& tablet_metric_entity,
+      std::shared_ptr<MemTracker> read_wal_mem_tracker, PrivateTag);
+
+  // Opens a LogReader on a specific log directory.
   //
   // 'index' may be nullptr, but if it is, ReadReplicatesInRange() may not be used.
-  static Status Open(
+  // 'wal_dir_files' is the listing of 'tablet_wal_path', if the caller has one.
+  static Result<LogReaderPtr> Open(
       Env* env, const scoped_refptr<LogIndex>& index, std::string log_prefix,
       const std::string& tablet_wal_path, const scoped_refptr<MetricEntity>& table_metric_entity,
       const scoped_refptr<MetricEntity>& tablet_metric_entity,
-      std::shared_ptr<MemTracker> read_wal_mem_tracker, std::unique_ptr<LogReader>* reader);
+      std::shared_ptr<MemTracker> read_wal_mem_tracker,
+      const std::vector<std::string>* wal_dir_files = nullptr);
 
   // Returns the biggest prefix of segments, from the current sequence, guaranteed
   // not to include any replicate messages with indexes >= 'index'.
@@ -177,7 +187,7 @@ class LogReader {
   Status AppendSegment(const scoped_refptr<ReadableLogSegment>& segment);
 
   // Same as above but for segments without any entries.
-  // Used by the Log to add "empty" segments.
+  // Used by the Log to add "empty" segments. The first such segment becomes the min indexed one.
   Status AppendEmptySegment(const scoped_refptr<ReadableLogSegment>& segment);
 
   // Removes segments with sequence numbers less than or equal to 'seg_seqno' from this reader.
@@ -217,14 +227,8 @@ class LogReader {
   Result<std::shared_ptr<LWLogEntryBatchPB>> ReadBatchUsingIndexEntry(
       const LogIndexEntry& index_entry, ObeyMemoryLimit obey_memory_limit) const;
 
-  LogReader(
-      Env* env, const scoped_refptr<LogIndex>& index, std::string log_prefix,
-      const scoped_refptr<MetricEntity>& table_metric_entity,
-      const scoped_refptr<MetricEntity>& tablet_metric_entity,
-      std::shared_ptr<MemTracker> read_wal_mem_tracker);
-
   // Reads the headers of all segments in 'path_'.
-  Status Init(const std::string& path);
+  Status Init(const std::string& path, const std::vector<std::string>* wal_dir_files);
 
   // Initializes an 'empty' reader for tests, i.e. does not scan a path looking for segments.
   Status InitEmptyReaderForTests();

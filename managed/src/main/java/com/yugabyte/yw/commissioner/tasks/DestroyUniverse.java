@@ -10,6 +10,7 @@
 
 package com.yugabyte.yw.commissioner.tasks;
 
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.commissioner.TaskExecutor.SubTaskGroup;
@@ -63,6 +64,7 @@ public class DestroyUniverse extends UniverseDefinitionTaskBase {
     this.supportBundleUtil = supportBundleUtil;
   }
 
+  @JsonDeserialize(converter = Params.Converter.class)
   public static class Params extends UniverseDefinitionTaskParams {
     public UUID customerUUID;
     public Boolean isForceDelete;
@@ -73,6 +75,8 @@ public class DestroyUniverse extends UniverseDefinitionTaskBase {
     @Getter
     @Setter
     KubernetesResourceDetails kubernetesResourceDetails;
+
+    public static class Converter extends BaseConverter<Params> {}
   }
 
   public Params params() {
@@ -196,6 +200,9 @@ public class DestroyUniverse extends UniverseDefinitionTaskBase {
                 true /* skipDestroyPrecheck */)
             .setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
       }
+
+      // After node teardown. A force delete removes the universe even if a delete fails.
+      createDeleteManagedLoadBalancerTasks(lb -> true, params().isForceDelete /* ignoreErrors */);
 
       // Create tasks to remove the universe entry from the Universe table.
       createRemoveUniverseEntryTask().setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);

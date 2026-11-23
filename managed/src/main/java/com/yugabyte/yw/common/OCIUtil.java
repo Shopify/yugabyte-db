@@ -2,6 +2,8 @@
 
 package com.yugabyte.yw.common;
 
+import static com.yugabyte.yw.common.Util.HTTPS_SCHEME;
+import static com.yugabyte.yw.common.Util.HTTP_SCHEME;
 import static play.mvc.Http.Status.BAD_REQUEST;
 import static play.mvc.Http.Status.PRECONDITION_FAILED;
 
@@ -20,6 +22,7 @@ import com.oracle.bmc.objectstorage.requests.ListObjectsRequest;
 import com.oracle.bmc.objectstorage.responses.BatchDeleteObjectsResponse;
 import com.oracle.bmc.objectstorage.responses.GetObjectResponse;
 import com.oracle.bmc.objectstorage.responses.ListObjectsResponse;
+import com.yugabyte.yw.cloud.oci.OCIErrorFormatter;
 import com.yugabyte.yw.common.backuprestore.BackupUtil;
 import com.yugabyte.yw.common.backuprestore.ybc.YbcBackupUtil;
 import com.yugabyte.yw.common.backuprestore.ybc.YbcBackupUtil.YbcBackupResponse;
@@ -193,7 +196,7 @@ public class OCIUtil implements CloudUtil {
     s3Data.immutableStorage = ociData.immutableStorage;
     s3Data.awsAccessKeyId = ociData.ociS3AccessKeyId;
     s3Data.awsSecretAccessKey = ociData.ociS3SecretAccessKey;
-    s3Data.awsHostBase = ociData.ociS3HostBase;
+    s3Data.awsHostBase = normalizeOciS3HostBase(ociData.ociS3HostBase);
     s3Data.fallbackRegion = ociData.ociRegion;
     s3Data.isPathStyleAccess = OCI_S3_COMPAT_USE_PATH_STYLE_ACCESS;
     s3Data.useChunkedEncoding = OCI_S3_COMPAT_USE_CHUNKED_ENCODING;
@@ -206,7 +209,7 @@ public class OCIUtil implements CloudUtil {
             new CustomerConfigStorageS3Data.RegionLocations();
         s3RegionLocation.region = regionLocation.region;
         s3RegionLocation.location = toS3StyleLocation(regionLocation.location);
-        s3RegionLocation.awsHostBase = regionLocation.ociS3HostBase;
+        s3RegionLocation.awsHostBase = normalizeOciS3HostBase(regionLocation.ociS3HostBase);
         // Signing region must match the regional Object Storage endpoint (not the default
         // OCI_REGION).
         s3RegionLocation.fallbackRegion =
@@ -354,6 +357,17 @@ public class OCIUtil implements CloudUtil {
     return regionLocationsMap;
   }
 
+  // If host base is blank or already has "http://" or "https://", leave as is.
+  // Else, inject "https://"
+  public static String normalizeOciS3HostBase(String hostBase) {
+    if (StringUtils.isBlank(hostBase)
+        || hostBase.startsWith(HTTP_SCHEME)
+        || hostBase.startsWith(HTTPS_SCHEME)) {
+      return hostBase;
+    }
+    return HTTPS_SCHEME + hostBase;
+  }
+
   /** Region-specific OCI S3-compatible host base, falling back to the default host base. */
   public String getS3HostBase(CustomerConfigStorageOCIData ociData, String region) {
     if (CollectionUtils.isNotEmpty(ociData.regionLocations)
@@ -401,7 +415,8 @@ public class OCIUtil implements CloudUtil {
       }
       ociCredsMap.put(YBC_AWS_ACCESS_KEY_ID_FIELDNAME, ociData.ociS3AccessKeyId);
       ociCredsMap.put(YBC_AWS_SECRET_ACCESS_KEY_FIELDNAME, ociData.ociS3SecretAccessKey);
-      ociCredsMap.put(YBC_AWS_ENDPOINT_FIELDNAME, getS3HostBase(ociData, region));
+      ociCredsMap.put(
+          YBC_AWS_ENDPOINT_FIELDNAME, normalizeOciS3HostBase(getS3HostBase(ociData, region)));
       ociCredsMap.put(YBC_AWS_DEFAULT_REGION_FIELDNAME, effectiveRegion);
       ociCredsMap.put(
           YBC_PATH_STYLE_ACCESS_FIELDNAME, String.valueOf(OCI_S3_COMPAT_USE_PATH_STYLE_ACCESS));
@@ -480,11 +495,14 @@ public class OCIUtil implements CloudUtil {
       } catch (PlatformServiceException e) {
         throw e;
       } catch (Exception e) {
-        throw new PlatformServiceException(
-            BAD_REQUEST,
-            String.format(
-                "OCI IAM credentials cannot access location %s: %s",
-                entry.getValue(), e.getMessage()));
+        PlatformServiceException error =
+            new PlatformServiceException(
+                BAD_REQUEST,
+                OCIErrorFormatter.logAndShorten(
+                    "OCI IAM credentials cannot access location " + entry.getValue(), e));
+        // Lets the v2 storage config API tell an OCI error from an invalid field.
+        error.initCause(e);
+        throw error;
       }
     }
   }
@@ -566,8 +584,8 @@ public class OCIUtil implements CloudUtil {
       closeQuietly(client);
       throw new PlatformServiceException(
           BAD_REQUEST,
-          "Failed to create OCI Object Storage client with instance principal credentials: "
-              + e.getMessage());
+          OCIErrorFormatter.logAndShorten(
+              "Failed to create OCI Object Storage client with instance principal credentials", e));
     }
   }
 
@@ -696,7 +714,10 @@ public class OCIUtil implements CloudUtil {
                 locationInfo.bucket, prefix);
         log.error(msg, e);
         throw new PlatformServiceException(
-            PRECONDITION_FAILED, msg + ": " + e.getLocalizedMessage());
+            PRECONDITION_FAILED,
+            OCIErrorFormatter.isOciError(e)
+                ? OCIErrorFormatter.userMessage(msg, e)
+                : msg + ": " + e.getLocalizedMessage());
       }
     }
   }
@@ -889,7 +910,8 @@ public class OCIUtil implements CloudUtil {
         throw e;
       }
       throw new PlatformServiceException(
-          BAD_REQUEST, "Failed to get OCI cloud file input stream: " + e.getMessage());
+          BAD_REQUEST,
+          OCIErrorFormatter.logAndShorten("Failed to get OCI cloud file input stream", e));
     }
   }
 

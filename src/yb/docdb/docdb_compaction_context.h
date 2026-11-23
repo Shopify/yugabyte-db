@@ -119,6 +119,7 @@ struct CompactionSchemaInfo {
   ColumnIds deleted_cols;
   std::optional<dockv::PackedRowVersion> packed_row_version;
   bool table_owns_vector_reverse_mapping = false;
+  bool table_writes_vector_reverse_mapping = true;
 
   size_t pack_limit() const; // As usual, when not specified size is in bytes.
 
@@ -180,6 +181,12 @@ class DocVectorMetadataIteratorProvider {
   virtual ~DocVectorMetadataIteratorProvider() = default;
   virtual Result<docdb::IntentAwareIteratorWithBounds> CreateVectorMetadataIterator(
       const ReadHybridTime& read_ht, docdb::DocDBStatistics* statistics) const = 0;
+
+  // Start time of the oldest transaction running in this tablet (see
+  // TransactionParticipant::MinRunningHybridTime()), or kMin if it is not known yet. Read before
+  // CreateVectorMetadataIterator(), so the iterator sees the records of the transactions which are
+  // not running anymore.
+  virtual HybridTime MinRunningHybridTime() const = 0;
 };
 
 struct CompactionHybridTimeConstraints {

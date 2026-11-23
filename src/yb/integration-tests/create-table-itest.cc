@@ -32,10 +32,13 @@
 
 #include "yb/client/namespace_info.h"
 
+#include "yb/common/common_flags.h"
 #include "yb/integration-tests/create-table-itest-base.h"
 
 #include "yb/common/colocated_util.h"
+#include "yb/common/ddl_mode-test-util.h"
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/format.h"
 #include "yb/yql/pgwrapper/pg_wrapper.h"
 #include "yb/yql/pgwrapper/libpq_utils.h"
 
@@ -78,9 +81,9 @@ TEST_F(CreateTableITest, DISABLED_TestCreateRedisTable) {
   const string zone = "a";
 
   const int kNumReplicas = 3;
-  vector<string> flags = {Substitute("--placement_cloud=$0", cloud),
-                          Substitute("--placement_region=$0", region),
-                          Substitute("--placement_zone=$0", zone)};
+  vector<string> flags = {Format("--placement_cloud=$0", cloud),
+                          Format("--placement_region=$0", region),
+                          Format("--placement_zone=$0", zone)};
   ASSERT_NO_FATALS(StartCluster(flags, flags, kNumReplicas));
 
   ReplicationInfoPB replication_info;
@@ -104,9 +107,9 @@ TEST_F(CreateTableITest, DISABLED_TestCreateWithPlacement) {
   const string zone = "a";
 
   const int kNumReplicas = 3;
-  vector<string> flags = {Substitute("--placement_cloud=$0", cloud),
-                          Substitute("--placement_region=$0", region),
-                          Substitute("--placement_zone=$0", zone)};
+  vector<string> flags = {Format("--placement_cloud=$0", cloud),
+                          Format("--placement_region=$0", region),
+                          Format("--placement_zone=$0", zone)};
   ASSERT_NO_FATALS(StartCluster(flags, flags, kNumReplicas));
 
   ReplicationInfoPB replication_info;
@@ -223,6 +226,48 @@ TEST_F(CreateTableITest, TestCreateWhenMajorityOfReplicasFailCreation) {
   ASSERT_EQ(tablets.size(), kNumTablets) << "Tablets on TS0: " << tablets;
 }
 
+// Regression test for #33869. Tablets that time out in CREATING state get replaced by the bg task,
+// which locks the old tablet before the new one. DeleteTable locks both in tablet id order, so
+// TSAN reports a lock-order inversion when the replacement id sorts first.
+TEST_F(CreateTableITest, TestDeleteTableAfterTabletReplacement) {
+  const int kNumReplicas = 3;
+  const int kNumTablets = 4;
+  const int kMinReplacementRounds = 3;
+  ASSERT_NO_FATALS(StartCluster({}, {"--tablet_creation_timeout_ms=1000"}, kNumReplicas));
+
+  // Without a majority the tablets never leave CREATING state, so every timeout replaces them.
+  cluster_->tablet_server(1)->Shutdown();
+  cluster_->tablet_server(2)->Shutdown();
+
+  ASSERT_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name(),
+                                                kTableName.namespace_type()));
+  std::unique_ptr<client::YBTableCreator> table_creator(client_->NewTableCreator());
+  client::YBSchema client_schema(client::YBSchemaFromSchema(GetSimpleTestSchema()));
+  ASSERT_OK(table_creator->table_name(kTableName)
+            .schema(&client_schema)
+            .num_tablets(kNumTablets)
+            .wait(false)
+            .Create());
+
+  // Each replacement round sends a CreateTablet RPC per tablet to the live server.
+  ASSERT_OK(LoggedWaitFor(
+      [&]() -> Result<bool> {
+        auto num_create_attempts = VERIFY_RESULT(cluster_->tablet_server(0)->GetMetric<int64>(
+            &METRIC_ENTITY_server,
+            "yb.tabletserver",
+            &METRIC_handler_latency_yb_tserver_TabletServerAdminService_CreateTablet,
+            "total_count"));
+        return num_create_attempts >= kNumTablets * (kMinReplacementRounds + 1);
+      },
+      60s * kTimeMultiplier, "Wait for tablet replacements"));
+
+  ASSERT_OK(cluster_->tablet_server(1)->Restart());
+  ASSERT_OK(cluster_->tablet_server(2)->Restart());
+  ASSERT_OK(client_->WaitForCreateTableToFinish(kTableName));
+
+  ASSERT_OK(client_->DeleteTable(kTableName));
+}
+
 // Ensure that, when a table is created,
 // both the tablets and leaders are well spread out across the machines in the cluster.
 TEST_F(CreateTableITest, TestSpreadReplicasEvenly) {
@@ -257,6 +302,77 @@ TEST_F(CreateTableITest, TestSpreadReplicasEvenly) {
     }
     return true;
   }, 30s * kTimeMultiplier, "Are tablets running", 1s));
+}
+
+// Global replica load breaks ties between tservers with equal load for the table being created.
+TEST_F(CreateTableITest, GlobalLoadBreaksTies) {
+  const int kNumServers = 3;
+  vector<string> ts_flags = {"--never_fsync", "--heartbeat_interval_ms=100"};
+  vector<string> master_flags = {"--enable_load_balancing=false", "--replication_factor=1"};
+  ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags, kNumServers));
+
+  ASSERT_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name(),
+                                                kTableName.namespace_type()));
+  client::YBSchema client_schema(client::YBSchemaFromSchema(GetSimpleTestSchema()));
+
+  auto running_tablets = [&](int idx, const YBTableName& table) -> Result<int> {
+    int count = 0;
+    for (const auto& tablet : VERIFY_RESULT(cluster_->GetTablets(cluster_->tablet_server(idx)))) {
+      if (tablet.table_name() == table.table_name() &&
+          tablet.state() == tablet::RaftGroupStatePB::RUNNING) {
+        count++;
+      }
+    }
+    return count;
+  };
+
+  // Two single-replica tablets land on two of the three tservers. Wait until the master has
+  // their replicas in its tablet locations; that is where it counts the global load from.
+  std::unique_ptr<client::YBTableCreator> table_creator(client_->NewTableCreator());
+  ASSERT_OK(table_creator->table_name(kTableName)
+            .schema(&client_schema)
+            .num_tablets(2)
+            .Create());
+  int idle_ts = -1;
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+    RETURN_NOT_OK(client_->GetTablets(
+        kTableName, -1, &tablets, /* partition_list_version = */ nullptr,
+        RequireTabletsRunning::kFalse));
+    std::set<std::string> hosting;
+    for (const auto& tablet : tablets) {
+      for (const auto& replica : tablet.replicas()) {
+        hosting.insert(replica.ts_info().permanent_uuid());
+      }
+    }
+    if (tablets.size() != 2 || hosting.size() != 2) {
+      return false;
+    }
+    idle_ts = -1;
+    for (int i = 0; i < kNumServers; i++) {
+      if (!hosting.contains(cluster_->tablet_server(i)->uuid())) {
+        idle_ts = i;
+      }
+    }
+    return idle_ts >= 0;
+  }, 30s * kTimeMultiplier, "First table placed"));
+
+  // The new table's tablet has equal (zero) table load everywhere, so it goes to the tserver
+  // with the fewest replicas overall.
+  const YBTableName kSecondTable(YQL_DATABASE_CQL, kTableName.namespace_name(), "second-table");
+  std::unique_ptr<client::YBTableCreator> second_creator(client_->NewTableCreator());
+  ASSERT_OK(second_creator->table_name(kSecondTable)
+            .schema(&client_schema)
+            .num_tablets(1)
+            .Create());
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    int placed = 0;
+    for (int i = 0; i < kNumServers; i++) {
+      placed += VERIFY_RESULT(running_tablets(i, kSecondTable));
+    }
+    return placed == 1;
+  }, 30s * kTimeMultiplier, "Second table running"));
+  ASSERT_EQ(1, ASSERT_RESULT(running_tablets(idle_ts, kSecondTable)));
 }
 
 TEST_F(CreateTableITest, CreateTableWithoutQuorum) {
@@ -671,14 +787,11 @@ TEST_F(CreateTableITest, TestTransactionStatusTableCreation) {
   vector<string> master_flags = {
       "--txn_table_wait_min_ts_count=3"
   };
-  vector<string> tserver_flags = {
-      // TODO(#27854): We get stuck with object locking when there is no system.transactions
-      // table. Disabling it for now until we fix the underlying issue.
-      "--enable_object_locking_for_table_locks=false",
-      // Concurrent DDL requires object locking, so keep the two flags consistent.
-      "--ysql_enable_concurrent_ddl=false",
-  };
-  AppendFlagToAllowedPreviewFlagsCsv(tserver_flags, "ysql_enable_concurrent_ddl");
+  vector<string> tserver_flags;
+  // TODO(#27854): We get stuck with object locking when there is no system.transactions table.
+  // Disabling it for now until we fix the underlying issue.
+  ToggleDDLMode(tserver_flags, /* use_legacy = */ true);
+  ToggleDDLMode(master_flags, /* use_legacy = */ true);
   // We also need to enable ysql.
   ASSERT_NO_FATALS(StartCluster(tserver_flags, master_flags, 1, 1, true));
 

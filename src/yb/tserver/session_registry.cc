@@ -14,6 +14,8 @@
 #include "yb/tserver/session_registry.h"
 
 #include <algorithm>
+#include <ranges>
+#include <thread>
 
 #include "yb/util/atomic.h"
 #include "yb/util/flags.h"
@@ -121,20 +123,33 @@ bool SessionRegistryBase::Shutdown() {
       return false;
     }
     shutting_down_ = true;
-    sessions.reserve(sessions_.size());
-    for (const auto& [_, session] : sessions_) {
-      sessions.push_back(session);
-    }
+    sessions.insert_range(sessions.end(), std::views::values(sessions_));
     sessions_.clear();
   }
   for (const auto& session : sessions) {
     session->StartShutdown(/* service_shutting_down= */ true);
   }
+  // A running CheckExpiredSessions could still park expired sessions in stopping_sessions_, so it
+  // is collected only after the task is done.
+  check_expired_sessions_.StartShutdown();
+  check_expired_sessions_.CompleteShutdown();
+  {
+    std::lock_guard lock(mutex_);
+    sessions.insert_range(sessions.end(), stopping_sessions_);
+    stopping_sessions_.clear();
+  }
   for (const auto& session : sessions) {
     session->CompleteShutdown();
   }
-  check_expired_sessions_.StartShutdown();
-  check_expired_sessions_.CompleteShutdown();
+  // A session destructor waits for the session's in-flight requests, so the last reference must
+  // not be released by one of them.
+  for (const auto& session : sessions) {
+    while (!session->ReadyToShutdown()) {
+      YB_LOG_EVERY_N_SECS(WARNING, 10)
+          << "Waiting for session " << session->id() << " to be ready to shutdown";
+      std::this_thread::sleep_for(10ms);
+    }
+  }
   return true;
 }
 

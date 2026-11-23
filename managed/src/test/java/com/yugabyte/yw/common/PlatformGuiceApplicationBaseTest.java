@@ -11,7 +11,6 @@ import com.yugabyte.yw.commissioner.HealthChecker;
 import com.yugabyte.yw.common.alerts.AlertConfigurationWriter;
 import com.yugabyte.yw.common.alerts.AlertsGarbageCollector;
 import com.yugabyte.yw.common.alerts.QueryAlerts;
-import com.yugabyte.yw.common.config.RuntimeConfigCache;
 import com.yugabyte.yw.common.config.impl.SettableRuntimeConfigFactory;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
@@ -380,11 +379,6 @@ public abstract class PlatformGuiceApplicationBaseTest {
       // Runtime config factory not bound for this app - nothing to clear.
     }
     try {
-      app.injector().instanceOf(RuntimeConfigCache.class).invalidateCache();
-    } catch (RuntimeException ignore) {
-      // Runtime config cache not bound for this app - nothing to clear.
-    }
-    try {
       app.injector().instanceOf(com.yugabyte.yw.common.metrics.MetricStorage.class).clear();
     } catch (RuntimeException ignore) {
       // Metric storage not bound for this app - nothing to clear.
@@ -393,10 +387,6 @@ public abstract class PlatformGuiceApplicationBaseTest {
 
   public Result doRequest(String method, String url) {
     return FakeApiHelper.doRequest(app, method, url);
-  }
-
-  public Result doGetRequestNoAuth(String url) {
-    return FakeApiHelper.doGetRequestNoAuth(app, url);
   }
 
   public Result doRequestWithAuthToken(String method, String url, String authToken) {
@@ -409,6 +399,11 @@ public abstract class PlatformGuiceApplicationBaseTest {
 
   public Result doRequestWithCustomHeaders(String method, String url, Map<String, String> headers) {
     return FakeApiHelper.doRequestWithCustomHeaders(app, method, url, headers);
+  }
+
+  public Result doRequestWithAuthTokenAndHeaders(
+      String method, String url, String authToken, Map<String, String> headers) {
+    return FakeApiHelper.doRequestWithAuthTokenAndHeaders(app, method, url, authToken, headers);
   }
 
   public Result doRequestWithHAToken(String method, String url, String haToken) {

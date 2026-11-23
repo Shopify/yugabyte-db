@@ -150,13 +150,15 @@ add_dependencies(
   gen_src_yb_cdc_xcluster_producer_proto)
 
 ADD_YB_TEST_LIBRARY(yb_common_test_util
-                    SRCS transaction-test-util.cc wire_protocol-test-util.cc
+                    SRCS ddl_mode-test-util.cc transaction-test-util.cc
+                         wire_protocol-test-util.cc
                     DEPS yb_common yb_docdb)
 
 set(YB_TEST_LINK_LIBS yb_common yb_common_test_util ${YB_MIN_TEST_LIBS})
 ADD_YB_TEST(common_net-test)
 ADD_YB_TEST(id_mapping-test)
 ADD_YB_TEST(jsonb-test)
+ADD_YB_TEST(ql_value-test)
 ADD_YB_TEST(schema-test)
 ADD_YB_TEST(subtxn_set_and_pb-test)
 ADD_YB_TEST(tablespace_parser-test)

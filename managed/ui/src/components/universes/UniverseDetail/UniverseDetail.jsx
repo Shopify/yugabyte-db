@@ -50,6 +50,7 @@ import { UniverseLevelBackup } from '../../backupv2/Universe/UniverseLevelBackup
 import { UniverseSupportBundleModal } from '../UniverseSupportBundle/UniverseSupportBundleModal';
 import { XClusterReplication } from '../../xcluster/XClusterReplication';
 import { EnablePerfAdvisorModal } from '../../../redesign/features/universe/universe-actions/enable-perf-advisor/EnablePerfAdvisorModal';
+import { PaRegistrationMode } from '../../../redesign/features/PerfAdvisor/api';
 import { EncryptionAtRest } from '../../../redesign/features/universe/universe-actions/encryption-at-rest/EncryptionAtRest';
 import { EncryptionInTransit } from '../../../redesign/features/universe/universe-actions/encryption-in-transit/EncryptionInTransit';
 import { EnableYSQLModal } from '../../../redesign/features/universe/universe-actions/edit-ysql-ycql/EnableYSQLModal';
@@ -57,6 +58,8 @@ import { EnableYCQLModal } from '../../../redesign/features/universe/universe-ac
 import { EditPGCompatibilityModal } from '../../../redesign/features/universe/universe-actions/edit-pg-compatibility/EditPGCompatibilityModal';
 import { EditConnectionPoolModal } from '../../../redesign/features/universe/universe-actions/edit-connection-pool/EditConnectionPoolModal';
 import { EditMultiTenancyModal } from '../../../redesign/features/universe/universe-actions/edit-multi-tenancy/EditMultiTenancyModal';
+import { CrossCloudFederationModal } from '../../../redesign/features/universe/universe-actions/cross-cloud-federation/CrossCloudFederationModal';
+import { isCrossCloudFederatedIamEnabled } from '../../backupv2/common/BackupUtils';
 import { EditGflagsModal } from '../../../redesign/features/universe/universe-actions/edit-gflags/EditGflags';
 import { EditUniverse } from '@app/redesign/features-v2/universe/edit-universe';
 import { EditUniverseTabs } from '@app/redesign/features-v2/universe/edit-universe/EditUniverseContext';
@@ -78,9 +81,11 @@ import {
 } from '../../configRedesign/providerRedesign/components/linuxVersionCatalog/LinuxVersionUtils';
 import { DrConfigList } from '../../xcluster/disasterRecovery/DrConfigList';
 import { InstallNodeAgentModal } from '../../../redesign/features/universe/universe-actions/install-node-agent/InstallNodeAgentModal';
+import { UpdateNodeAgentModal } from '../../../redesign/features/universe/universe-actions/update-node-agent/UpdateNodeAgentModal';
 import { ReprovisionNodesWithYnpModal } from '../../../redesign/features/universe/universe-actions/reprovision-nodes-with-ynp/ReprovisionNodesWithYnpModal';
 import { YBMenuItemLabel } from '../../../redesign/components/YBDropdownMenu/YBMenuItemLabel';
 import {
+  EDIT_ROLLBACK_TASK_TYPES,
   PerfAdvisorModalIntention,
   PERF_ADVISOR_PATH,
   RuntimeConfigKey,
@@ -165,6 +170,20 @@ const withDisabledActionTooltip = (title, children) =>
   ) : (
     children
   );
+
+const runtimeConfigEnabled = (runtimeConfigs, key) =>
+  runtimeConfigs?.data?.configEntries?.find((entry) => entry.key === key)?.value === 'true';
+
+const isEmbeddedPerfAdvisorUiEnabled = (runtimeConfigs) =>
+  runtimeConfigEnabled(runtimeConfigs, RuntimeConfigKey.ENABLE_PA_COLLECTOR) &&
+  runtimeConfigEnabled(runtimeConfigs, RuntimeConfigKey.ENABLE_NEW_PERF_ADVISOR_UI);
+
+// Basic and advanced both store data locally. Online forwards everything elsewhere, so it has no
+// local data behind the Performance tab.
+const isPerformanceTabEnabled = (runtimeConfigs, paStatus) =>
+  isEmbeddedPerfAdvisorUiEnabled(runtimeConfigs) &&
+  !!paStatus?.data?.success &&
+  paStatus?.data?.mode !== PaRegistrationMode.ONLINE;
 
 class UniverseDetail extends Component {
   constructor(props) {
@@ -264,9 +283,14 @@ class UniverseDetail extends Component {
       universeTables
     } = this.props;
     // Always refresh universe info on Overview tab or when universe uuid in the route changes.
-    if (
-      (prevProps.params.tab !== this.props.params.tab && this.props.params.tab === 'overview') ||
-      prevProps.params.uuid !== this.props.params.uuid
+    if (prevProps.params.uuid !== this.props.params.uuid) {
+      // Clear stale universe so we never paint the previous universe under a new route.
+      this.props.resetUniverseInfo();
+      this.props.getUniverseInfo(this.props.params.uuid);
+      this.props.getUniverseLbState(this.props.params.uuid);
+    } else if (
+      prevProps.params.tab !== this.props.params.tab &&
+      this.props.params.tab === 'overview'
     ) {
       this.props.getUniverseInfo(this.props.params.uuid);
       const isUpdateInProgress = currentUniverse?.data?.universeDetails?.updateInProgress;
@@ -322,18 +346,24 @@ class UniverseDetail extends Component {
       this.props.getUniversePaRegistrationStatus(currentUniverse.data.universeUUID);
     }
 
-    // Redirect to Overview when on Performance tab but it should no longer be shown
-    // (perf advisor collector or advanced observability disabled for the universe)
+    // Redirect to Overview when the Performance tab should no longer be shown. Wait until both
+    // requests settle so a loading flag does not bounce a local registration to Overview.
     const isOnPerfAdvisorTab = this.props.location?.pathname?.includes(PERF_ADVISOR_PATH);
     const { universePaRegistrationStatus: paStatus } = this.props.universe;
+    const runtimeConfigs = this.props.customer?.runtimeConfigs;
     const paPromiseState = getPromiseState(paStatus);
+    // Runtime configs arrive after the first universe update. getPromiseState reads `.data`.
+    const runtimeConfigsState = runtimeConfigs ? getPromiseState(runtimeConfigs) : undefined;
     const shouldShowPerformanceTab =
-      paStatus?.data?.success && paStatus?.data?.advancedObservability;
+      !!runtimeConfigsState?.isSuccess() && isPerformanceTabEnabled(runtimeConfigs, paStatus);
     const paStatusResolved = paPromiseState.isError() || paPromiseState.isSuccess();
+    const runtimeConfigsResolved =
+      !!runtimeConfigsState?.isError() || !!runtimeConfigsState?.isSuccess();
     if (
       isOnPerfAdvisorTab &&
       paStatusResolved &&
-      (paPromiseState.isError() || !shouldShowPerformanceTab)
+      runtimeConfigsResolved &&
+      !shouldShowPerformanceTab
     ) {
       this.props.router.push(`/universes/${this.props.params.uuid}/overview`);
     }
@@ -442,6 +472,7 @@ class UniverseDetail extends Component {
       showTLSConfigurationModal,
       showRollingRestartModal,
       showInstallNodeAgentModal,
+      showUpdateNodeAgentModal,
       showReprovisionNodesWithYnpModal,
       showUpgradeSystemdModal,
       showThirdpartyUpgradeModal,
@@ -462,6 +493,7 @@ class UniverseDetail extends Component {
       showEnableYCQLModal,
       showPGCompatibilityModal,
       showConnectionPoolModal,
+      showCrossCloudFederationModal,
       showMultiTenancyModal,
       updateBackupState,
       closeModal,
@@ -513,6 +545,11 @@ class UniverseDetail extends Component {
     const providerUUID = primaryCluster?.userIntent?.provider;
     const provider = providers.data.find((provider) => provider.uuid === providerUUID);
     const isProviderNodeAgentEnabled = provider?.details?.enableNodeAgent;
+    // Shown even when the provider has federation off: the modal then explains that the provider
+    // must be configured first, and a configured universe can still be disabled.
+    const isCrossCloudFederationAvailable =
+      isCrossCloudFederatedIamEnabled(runtimeConfigs?.data) &&
+      ['aws', 'gcp', 'onprem'].includes(provider?.code);
     const isNodeAgentMissing = universe?.currentUniverse?.data?.universeDetails?.nodeAgentMissing;
 
     const onPremWithoutSudoAccess =
@@ -572,31 +609,19 @@ class UniverseDetail extends Component {
     - Integrations -> Perf Advisor (to attach a customer to Perf Advisor service)
     - Under Universe Actions -> Show options to enable/disable Performance Monitoring for the universe (Perf Advisor Service)
     */
-    const isPACollectorEnabled =
-      runtimeConfigs?.data?.configEntries?.find(
-        (c) => c.key === RuntimeConfigKey.ENABLE_PA_COLLECTOR
-      )?.value === 'true';
+    const isPACollectorEnabled = runtimeConfigEnabled(
+      runtimeConfigs,
+      RuntimeConfigKey.ENABLE_PA_COLLECTOR
+    );
 
-    const isEmbeddedPAEnabled =
-      isPACollectorEnabled &&
-      runtimeConfigs?.data?.configEntries?.find(
-        (c) => c.key === RuntimeConfigKey.ENABLE_NEW_PERF_ADVISOR_UI
-      )?.value === 'true';
+    const isEmbeddedPAEnabled = isEmbeddedPerfAdvisorUiEnabled(runtimeConfigs);
 
-    // Online mode is gated by its own flag. enable_new_perf_advisor_ui covers advanced
-    // observability and the Performance tab, which online mode is neither part of - a universe
-    // forwarding everything to an external Perf Advisor has no local data behind that tab.
+    // Online mode is gated by its own flag, separate from enable_new_perf_advisor_ui.
     const isPaOnlineModeEnabled =
       isPACollectorEnabled &&
-      runtimeConfigs?.data?.configEntries?.find(
-        (c) => c.key === RuntimeConfigKey.ENABLE_PA_ONLINE_MODE
-      )?.value === 'true';
+      runtimeConfigEnabled(runtimeConfigs, RuntimeConfigKey.ENABLE_PA_ONLINE_MODE);
 
-    // Performance Tab should be shown only if Perf Advisor is enabled for the universe with advanced observability
-    const isPATabEnabled =
-      isEmbeddedPAEnabled &&
-      universePaRegistrationStatus?.data?.success &&
-      universePaRegistrationStatus?.data?.advancedObservability;
+    const isPATabEnabled = isPerformanceTabEnabled(runtimeConfigs, universePaRegistrationStatus);
 
     const isAuditLogEnabled =
       runtimeConfigs?.data?.configEntries?.find(
@@ -625,8 +650,7 @@ class UniverseDetail extends Component {
 
     const isV2EditUniverseUIEnabled = isUniverseRevampExperienceEnabled(
       runtimeConfigs?.data,
-      currentUser?.data?.role,
-      this.state.isOnboardingExperienceEnabled
+      currentUser?.data?.role
     );
 
     if (
@@ -638,6 +662,16 @@ class UniverseDetail extends Component {
       return <YBLoading />;
     } else if (isEmptyObject(currentUniverse.data)) {
       return <span />;
+    }
+
+    const routeUuid = this.props.params?.uuid ?? this.props.uuid;
+    if (
+      getPromiseState(currentUniverse).isSuccess() &&
+      currentUniverse.data?.universeUUID &&
+      routeUuid &&
+      currentUniverse.data.universeUUID !== routeUuid
+    ) {
+      return <YBLoading />;
     }
 
     if (getPromiseState(currentUniverse).isError()) {
@@ -735,6 +769,8 @@ class UniverseDetail extends Component {
     isUniverseStatusPending || isActionFrozen(allowedTasks, UNIVERSE_TASKS.INSTALL);
     const isInstallNodeAgentDisabled =
       isUniverseStatusPending || isActionFrozen(allowedTasks, UNIVERSE_TASKS.INSTALL_NODE_AGENT);
+    const isUpdateNodeAgentCertDisabled =
+      isUniverseStatusPending || isActionFrozen(allowedTasks, UNIVERSE_TASKS.UPDATE_NODE_AGENT);
     const isReprovisionNodesWithYnpDisabled =
       isUniverseStatusPending ||
       isActionFrozen(allowedTasks, UNIVERSE_TASKS.REPROVISION_NODES_WITH_YNP);
@@ -757,10 +793,28 @@ class UniverseDetail extends Component {
     const isSampleAppsDisabled = isUniverseStatusPending && !backupRestoreInProgress;
     const isSupportBundleDisabled =
       this.isUniverseDeleting() || isActionFrozen(allowedTasks, UNIVERSE_TASKS.SUPPORT_BUNDLES);
-    const isBackupsDisabled = isUniverseStatusPending || isK8ActionsDisabled;
+    // Disable Backup only flips a universe flag (update_backup_state). It is not a task, so
+    // allowedTasks cannot express it; mirror the failed-rollback lock here instead.
+    const isLockedByFailedRollback =
+      !!allowedTasks?.restricted &&
+      EDIT_ROLLBACK_TASK_TYPES.includes(universeInfo.universeDetails?.updatingTask);
+    const isBackupsDisabled =
+      isUniverseStatusPending || isLockedByFailedRollback || isK8ActionsDisabled;
     const isUniverseRegisteredToPa =
       universePaRegistrationStatus?.data?.success && isNonEmptyArray(ybaToPaServiceDetails?.data);
-    const isPerfAdvisorActionDisabled = isUniverseStatusPending;
+    // Enable Performance Monitoring registers the universe and Disable unregisters it. The
+    // Advanced Observability toggles re-register it in another mode.
+    const isPerfMonitoringDisabled =
+      isUniverseStatusPending ||
+      isActionFrozen(
+        allowedTasks,
+        isUniverseRegisteredToPa
+          ? UNIVERSE_TASKS.UNREGISTER_UNIVERSE_FROM_PERF_ADVISOR
+          : UNIVERSE_TASKS.REGISTER_UNIVERSE_TO_PERF_ADVISOR
+      );
+    const isAdvancedObservabilityDisabled =
+      isUniverseStatusPending ||
+      isActionFrozen(allowedTasks, UNIVERSE_TASKS.REGISTER_UNIVERSE_TO_PERF_ADVISOR);
     const isPauseUniverseDisabled =
       (universePaused && isUniverseStatusPending) ||
       this.isUniverseDeleting() ||
@@ -956,6 +1010,7 @@ class UniverseDetail extends Component {
                 universeUuid={currentUniverse.data.universeUUID}
                 timezone={currentUser.data.timezone}
                 appName={AppName.YBA}
+                registrationMode={universePaRegistrationStatus?.data?.mode}
               />
             </Tab.Pane>
           )
@@ -1094,6 +1149,7 @@ class UniverseDetail extends Component {
           >
             <MenuItemsContainer
               parentDropdownOpen={this.state.actionsDropdownOpen}
+              fitSubmenuToContent
               mainMenu={(setActiveSubmenu) => (
                 <>
                   {!universePaused && !isRollBackFeatureEnabled && (
@@ -1783,6 +1839,27 @@ class UniverseDetail extends Component {
                           )}
                         </RbacValidator>
                       )}
+                    {!universePaused && isCrossCloudFederationAvailable && (
+                      <RbacValidator
+                        accessRequiredOn={{
+                          onResource: uuid,
+                          ...ApiPermissionMap.MANAGE_CROSS_CLOUD_FEDERATION
+                        }}
+                        isControl
+                      >
+                        {withDisabledActionTooltip(
+                          k8OperatorTooltipTitle,
+                          <YBMenuItem
+                            disabled={isUniverseStatusPending || isK8ActionsDisabled}
+                            onClick={showCrossCloudFederationModal}
+                          >
+                            <YBLabelWithIcon icon="fa fa-cloud fa-fw">
+                              {i18n.t('universeActions.crossCloudFederation.menuLabel')}
+                            </YBLabelWithIcon>
+                          </YBMenuItem>
+                        )}
+                      </RbacValidator>
+                    )}
                     {!universePaused && (
                       <RbacValidator
                         isControl
@@ -1827,6 +1904,27 @@ class UniverseDetail extends Component {
                         </YBMenuItem>
                       </RbacValidator>
                     )}
+                    {!isReadOnlyUniverse &&
+                      !universePaused &&
+                      !isKubernetesUniverse &&
+                      !isNodeAgentMissing && (
+                        <RbacValidator
+                          isControl
+                          accessRequiredOn={{
+                            onResource: uuid,
+                            ...ApiPermissionMap.UPGRADE_NODE_AGENT
+                          }}
+                        >
+                          <YBMenuItem
+                            disabled={isUpdateNodeAgentCertDisabled}
+                            onClick={showUpdateNodeAgentModal}
+                          >
+                            <YBLabelWithIcon icon="fa fa-refresh">
+                              Update Node Agent Certificate
+                            </YBLabelWithIcon>
+                          </YBMenuItem>
+                        </RbacValidator>
+                      )}
                     {!isReadOnlyUniverse &&
                       !universePaused &&
                       !isKubernetesUniverse &&
@@ -1895,13 +1993,19 @@ class UniverseDetail extends Component {
                           }}
                         >
                           <YBMenuItem
-                            disabled={isPerfAdvisorActionDisabled}
+                            disabled={isPerfMonitoringDisabled}
                             onClick={showEnablePerfAdvisorModal}
                           >
-                            <YBLabelWithIcon icon="fa fa-trash-o fa-fw">
+                            <YBLabelWithIcon
+                              icon={
+                                isUniverseRegisteredToPa
+                                  ? 'fa fa-trash-o fa-fw'
+                                  : 'fa fa-plus fa-fw'
+                              }
+                            >
                               {isUniverseRegisteredToPa
-                                ? 'Disable Perf Advisor Collector'
-                                : 'Enable Perf Advisor Collector'}
+                                ? 'Disable Performance Monitoring'
+                                : 'Enable Performance Monitoring'}
                             </YBLabelWithIcon>
                           </YBMenuItem>
                         </RbacValidator>
@@ -1918,7 +2022,7 @@ class UniverseDetail extends Component {
                           }}
                         >
                           <YBMenuItem
-                            disabled={isPerfAdvisorActionDisabled}
+                            disabled={isAdvancedObservabilityDisabled}
                             onClick={showEnableAdvancedObservabilityModal}
                           >
                             <YBLabelWithIcon icon="fa fa-line-chart fa-fw">
@@ -1939,7 +2043,7 @@ class UniverseDetail extends Component {
                           }}
                         >
                           <YBMenuItem
-                            disabled={isPerfAdvisorActionDisabled}
+                            disabled={isAdvancedObservabilityDisabled}
                             onClick={showDisableAdvancedObservabilityModal}
                           >
                             <YBLabelWithIcon icon="fa fa-line-chart fa-fw">
@@ -2246,6 +2350,20 @@ class UniverseDetail extends Component {
           universeData={currentUniverse.data}
         />
 
+        {/* Mounted only while open so the toggle re-reads federationConfigured each time. */}
+        {showModal && visibleModal === 'crossCloudFederationModal' && (
+          <CrossCloudFederationModal
+            open
+            onClose={() => {
+              closeModal();
+              this.props.fetchCustomerTasks();
+              this.props.getUniverseInfo(currentUniverse.data.universeUUID);
+            }}
+            universeData={currentUniverse.data}
+            provider={provider}
+          />
+        )}
+
         <InstallNodeAgentModal
           modalProps={{
             open: showModal && visibleModal === 'installNodeAgentModal',
@@ -2260,6 +2378,19 @@ class UniverseDetail extends Component {
           isReinstall={!isNodeAgentMissing}
         />
 
+        <UpdateNodeAgentModal
+          modalProps={{
+            open: showModal && visibleModal === 'updateNodeAgentModal',
+            onClose: () => {
+              closeModal();
+              this.props.fetchCustomerTasks();
+              this.props.getUniverseInfo(currentUniverse.data.universeUUID);
+            }
+          }}
+          universeUuid={currentUniverse.data.universeUUID}
+          isUniverseAction={true}
+        />
+
         <ReprovisionNodesWithYnpModal
           modalProps={{
             open: showModal && visibleModal === 'reprovisionNodesWithYnpModal',
@@ -2272,11 +2403,12 @@ class UniverseDetail extends Component {
           universeUuid={currentUniverse.data.universeUUID}
         />
 
-        <UniverseSupportBundleModal
-          currentUniverse={currentUniverse.data}
-          modal={modal}
-          closeModal={closeModal}
-        />
+        {showModal && visibleModal === 'supportBundleModal' && (
+          <UniverseSupportBundleModal
+            currentUniverse={currentUniverse.data}
+            closeModal={closeModal}
+          />
+        )}
 
         <Measure onMeasure={this.onResize.bind(this)}>
           <YBTabsWithLinksPanel

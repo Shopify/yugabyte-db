@@ -34,6 +34,7 @@ import api.v2.models.RunScriptRequest;
 import api.v2.models.RunScriptResponse;
 import api.v2.models.ScriptOptions;
 import api.v2.models.UniverseCreateSpec;
+import api.v2.models.UniverseCrossCloudFederationSpec;
 import api.v2.models.UniverseDeleteSpec;
 import api.v2.models.UniverseEditSpec;
 import api.v2.models.UniverseOperatorImportReq;
@@ -51,8 +52,8 @@ import com.google.inject.Inject;
 import com.yugabyte.yw.cloud.UniverseResourceDetails;
 import com.yugabyte.yw.commissioner.Commissioner;
 import com.yugabyte.yw.commissioner.Common;
+import com.yugabyte.yw.commissioner.tasks.ManageCrossCloudFederationUniverse;
 import com.yugabyte.yw.commissioner.tasks.OperatorImportUniverse;
-import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase.ServerType;
 import com.yugabyte.yw.common.AppConfigHelper;
 import com.yugabyte.yw.common.ConfigHelper;
 import com.yugabyte.yw.common.CustomerTaskManager;
@@ -62,6 +63,7 @@ import com.yugabyte.yw.common.NodeFileCollector;
 import com.yugabyte.yw.common.NodeScriptRunner;
 import com.yugabyte.yw.common.PlacementInfoUtil;
 import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.RedactingService;
 import com.yugabyte.yw.common.ReleaseContainer;
 import com.yugabyte.yw.common.ReleaseManager;
 import com.yugabyte.yw.common.SwamperHelper;
@@ -72,7 +74,10 @@ import com.yugabyte.yw.common.config.GlobalConfKeys;
 import com.yugabyte.yw.common.config.ProviderConfKeys;
 import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.common.config.UniverseConfKeys;
+import com.yugabyte.yw.common.gflags.GFlagsUtil;
+import com.yugabyte.yw.common.gflags.GFlagsValidation;
 import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil;
+import com.yugabyte.yw.common.metrics.MetricService;
 import com.yugabyte.yw.common.operator.utils.KubernetesEnvironmentVariables;
 import com.yugabyte.yw.common.operator.utils.OperatorUtils;
 import com.yugabyte.yw.common.rbac.PermissionInfo.Action;
@@ -112,6 +117,7 @@ import com.yugabyte.yw.models.YugawareProperty;
 import com.yugabyte.yw.models.configs.CustomerConfig;
 import com.yugabyte.yw.models.helpers.CloudInfoInterface;
 import com.yugabyte.yw.models.helpers.CommonUtils;
+import com.yugabyte.yw.models.helpers.CrossCloudFederationTarget;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.PlacementInfo;
 import com.yugabyte.yw.models.helpers.TaskType;
@@ -155,6 +161,8 @@ public class UniverseManagementHandler extends ApiControllerUtils {
   private final LocalhostAccessChecker localhostChecker;
   private final RoleBindingUtil roleBindingUtil;
   private final KubernetesOverridesHandler kubernetesOverridesHandler;
+  private final MetricService metricService;
+  private final GFlagsValidation gFlagsValidation;
 
   @Inject
   public UniverseManagementHandler(
@@ -172,8 +180,12 @@ public class UniverseManagementHandler extends ApiControllerUtils {
       FileCollectionDownloader fileCollectionDownloader,
       LocalhostAccessChecker localhostChecker,
       RoleBindingUtil roleBindingUtil,
-      KubernetesOverridesHandler kubernetesOverridesHandler) {
+      KubernetesOverridesHandler kubernetesOverridesHandler,
+      MetricService metricService,
+      GFlagsValidation gFlagsValidation) {
     super(auditService);
+    this.metricService = metricService;
+    this.gFlagsValidation = gFlagsValidation;
     this.confGetter = confGetter;
     this.releaseManager = releaseManager;
     this.swamperHelper = swamperHelper;
@@ -199,7 +211,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
 
   public api.v2.models.Universe getUniverse(UUID cUUID, UUID uniUUID)
       throws JsonProcessingException {
-    Customer customer = Customer.getOrBadRequest(cUUID);
+    Customer customer = Customer.getOrNotFound(cUUID);
     Universe universe = Universe.getOrBadRequest(uniUUID, customer);
     // When new UI is turned on, initializing single partition if needed.
     if (isNewUI()) {
@@ -265,7 +277,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
   }
 
   public YBATask createUniverse(Request request, UUID cUUID, UniverseCreateSpec universeSpec) {
-    Customer customer = Customer.getOrBadRequest(cUUID);
+    Customer customer = Customer.getOrNotFound(cUUID);
     log.info("Create Universe with v2 spec: {}", prettyPrint(universeSpec));
     // map universeSpec to v1 universe details
     UniverseDefinitionTaskParams v1DefnParams =
@@ -305,7 +317,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
         continue;
       }
       ClusterEditSpec merged = new ClusterEditSpec();
-      ClusterMapper.INSTANCE.deepCopyClusterEditSpecWithoutPlacementSpec(primaryCluster, merged);
+      ClusterMapper.INSTANCE.deepCopyInheritableClusterEditSpec(primaryCluster, merged);
       ClusterMapper.INSTANCE.deepCopyClusterEditSpec(cluster, merged);
       clusters.add(merged);
     }
@@ -316,9 +328,9 @@ public class UniverseManagementHandler extends ApiControllerUtils {
   public YBATask editUniverse(
       Request request, UUID cUUID, UUID uniUUID, UniverseEditSpec universeEditSpec) {
     boolean isNewUI = isNewUI();
-    Customer customer = Customer.getOrBadRequest(cUUID);
-    Universe dbUniverse = Universe.getOrBadRequest(uniUUID);
-    JsonNode dbUniverseJson = Json.toJson(dbUniverse);
+    Customer customer = Customer.getOrNotFound(cUUID);
+    Universe dbUniverse = Universe.getOrBadRequest(uniUUID, customer);
+    JsonNode dbUniverseDetailsJson = Json.toJson(dbUniverse.getUniverseDetails());
     // Must be captured here, before the edit spec is mapped below: that mapping uses
     // dbUniverse.getUniverseDetails() as its @MappingTarget, i.e. it overwrites the in-memory
     // persisted placement with the requested one. Anything read from dbUniverse after that point
@@ -326,7 +338,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
     Map<UUID, Map<UUID, K8sStsIndices>> savedK8sStsIndices = captureK8sStsIndices(dbUniverse);
     UniverseCRUDHandler.checkInstanceTypeConsistency(dbUniverse);
     log.info("Edit Universe with v2 spec: {}", prettyPrint(universeEditSpec));
-    // inherit RR cluster properties from primary cluster in given edit spec
+    // Inherit unset RR properties from primary (excludes placement, partitions, nodeSpec).
     UniverseSpec v2Universe =
         UniverseDefinitionTaskParamsMapper.INSTANCE.toV2UniverseSpec(
             dbUniverse.getUniverseDetails());
@@ -357,7 +369,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
       // Since in V2 API is based on partial updates,
       // we cannot detect the case when these fields are removed (during dedicated mode switch)
       // Keeping these fields will lead to error in validation.
-      clearMasterFieldsIfNotDedicated(cluster.userIntent);
+      clearNonDedicatedFields(cluster.userIntent);
     }
     log.debug("Edit Universe translated to v1 spec: {}", prettyPrint(v1Params));
 
@@ -429,7 +441,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
             Audit.ActionType.Update,
             Json.toJson(v1Params),
             taskUUID,
-            dbUniverseJson);
+            dbUniverseDetailsJson);
     return new YBATask().resourceUuid(uniUUID).taskUuid(taskUUID);
   }
 
@@ -557,8 +569,8 @@ public class UniverseManagementHandler extends ApiControllerUtils {
 
   public YBATask addCluster(
       Request request, UUID cUUID, UUID uniUUID, ClusterAddSpec clusterAddSpec) {
-    Customer customer = Customer.getOrBadRequest(cUUID);
-    Universe dbUniverse = Universe.getOrBadRequest(uniUUID);
+    Customer customer = Customer.getOrNotFound(cUUID);
+    Universe dbUniverse = Universe.getOrBadRequest(uniUUID, customer);
     log.info("Add cluster to Universe with v2 spec: {}", prettyPrint(clusterAddSpec));
 
     UniverseConfigureTaskParams v1Params =
@@ -572,6 +584,16 @@ public class UniverseManagementHandler extends ApiControllerUtils {
     // overwrite the copy of primary cluster with user provided spec for read replica
     newReadReplica.setUuid(UUID.randomUUID());
     newReadReplica = ClusterMapper.INSTANCE.overwriteClusterAddSpec(clusterAddSpec, newReadReplica);
+    // The UI fills the read replica's gflags from the primary's GET response, which redacts the
+    // sensitive ones, so restore them from the primary the way a gflags upgrade does.
+    if (RedactingService.isGFlagsSensitiveDataApiRedactionEnabled()) {
+      newReadReplica.userIntent.specificGFlags =
+          GFlagsUtil.mergeSensitiveSpecificGFlags(
+              primaryCluster.userIntent.specificGFlags,
+              newReadReplica.userIntent.specificGFlags,
+              gFlagsValidation,
+              primaryCluster.userIntent.ybSoftwareVersion);
+    }
     // Intent is cloned from primary. Omitted dedicated_nodes must default to false (schema),
     // not inherit dedicated mode from the primary cluster.
     if (clusterAddSpec.getDedicatedNodes() == null
@@ -579,8 +601,8 @@ public class UniverseManagementHandler extends ApiControllerUtils {
             || clusterAddSpec.getNodeSpec().getDedicatedNodes() == null)) {
       newReadReplica.userIntent.dedicatedNodes = false;
     }
-    // Copied from a dedicated primary; clear master fields for non-dedicated RR.
-    clearMasterFieldsIfNotDedicated(newReadReplica.userIntent);
+    // Copied from a dedicated primary; clear fields for non-dedicated RR.
+    clearNonDedicatedFields(newReadReplica.userIntent);
     // prepare the v1Params with only the read replica cluster in the payload
     v1Params.clusters.clear();
     v1Params.clusters.add(newReadReplica);
@@ -599,22 +621,34 @@ public class UniverseManagementHandler extends ApiControllerUtils {
     return new YBATask().resourceUuid(newReadReplica.uuid).taskUuid(taskUUID);
   }
 
-  // Drop master settings cloned from a dedicated primary onto a non-dedicated cluster.
-  private static void clearMasterFieldsIfNotDedicated(UserIntent userIntent) {
+  // Drop settings cloned from a dedicated primary onto a non-dedicated cluster.
+  private static void clearNonDedicatedFields(UserIntent userIntent) {
     if (userIntent == null || userIntent.dedicatedNodes) {
       return;
     }
+    // Legacy fields are what configure() rejects. The specification initializer only updates
+    // provider specs, and there is no provider UUID to iterate before one is chosen.
     userIntent.masterInstanceType = null;
     userIntent.masterDeviceInfo = null;
+    userIntent
+        .getAllProviderUUIDs()
+        .forEach(
+            providerUUID -> {
+              Util.providerInitializerForExistingIntent(userIntent, providerUUID)
+                  .setMasterInstanceType(null)
+                  .setMasterDeviceInfo(null);
+            });
     UserIntentOverrides overrides = userIntent.getUserIntentOverrides();
     if (overrides != null && overrides.getPerProcess() != null) {
-      overrides.getPerProcess().remove(ServerType.MASTER);
+      // Otherwise after dedicated->non-dedicated switch, any tserver overrides that remain will
+      // take precedence over the main field (which the UI uses for non-dedicated configuration).
+      overrides.getPerProcess().clear();
     }
   }
 
   public YBATask deleteReadReplicaCluster(
       UUID cUUID, UUID uniUUID, UUID clsUUID, Boolean forceDelete) {
-    Customer customer = Customer.getOrBadRequest(cUUID);
+    Customer customer = Customer.getOrNotFound(cUUID);
     Universe universe = Universe.getOrBadRequest(uniUUID, customer);
 
     UUID taskUUID = universeCRUDHandler.clusterDelete(customer, universe, clsUUID, forceDelete);
@@ -630,7 +664,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
     boolean isDeleteAssociatedCerts =
         universeDeleteSpec != null ? universeDeleteSpec.getIsDeleteAssociatedCerts() : false;
     log.info("Starting v2 delete universe with UUID: {}", uniUUID);
-    Customer customer = Customer.getOrBadRequest(cUUID);
+    Customer customer = Customer.getOrNotFound(cUUID);
     Universe universe = Universe.getOrBadRequest(uniUUID, customer);
     UUID taskUuid =
         universeCRUDHandler.destroy(
@@ -649,7 +683,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
     log.debug(
         "Attach Detach Universe spec will include releases: {}",
         !detachUniverseSpec.getSkipReleases());
-    Customer customer = Customer.getOrBadRequest(customerUUID);
+    Customer customer = Customer.getOrNotFound(customerUUID);
     Universe universe = Universe.getOrBadRequest(universeUUID, customer);
     Util.validateUniverseOwnershipAndNotDetached(
         universe, configHelper, ysqlQueryExecutor, confGetter);
@@ -702,8 +736,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
       Map<UUID, ImageBundle> imageBundles = new HashMap<>();
       UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
       for (UniverseDefinitionTaskParams.Cluster cluster : universeDetails.clusters) {
-        UUID imageBundleUUID = cluster.userIntent.imageBundleUUID;
-        if (imageBundleUUID != null) {
+        for (UUID imageBundleUUID : cluster.userIntent.getAllImageBundles()) {
           ImageBundle imageBundle = ImageBundle.get(imageBundleUUID);
           if (imageBundle != null && !imageBundles.containsKey(imageBundleUUID)) {
             imageBundles.put(imageBundleUUID, imageBundle);
@@ -711,11 +744,12 @@ public class UniverseManagementHandler extends ApiControllerUtils {
         }
       }
       if (imageBundles.isEmpty()) {
-        UUID providerUUID =
-            UUID.fromString(universeDetails.getPrimaryCluster().userIntent.provider);
-        List<ImageBundle> defaultBundles = ImageBundle.getDefaultForProvider(providerUUID);
-        for (ImageBundle defaultBundle : defaultBundles) {
-          imageBundles.put(defaultBundle.getUuid(), defaultBundle);
+        for (UUID providerUUID :
+            universeDetails.getPrimaryCluster().userIntent.getAllProviderUUIDs()) {
+          List<ImageBundle> defaultBundles = ImageBundle.getDefaultForProvider(providerUUID);
+          for (ImageBundle defaultBundle : defaultBundles) {
+            imageBundles.put(defaultBundle.getUuid(), defaultBundle);
+          }
         }
       }
 
@@ -800,7 +834,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
       Request request, UUID customerUUID, UUID universeUUID, AttachUniverseSpec attachUniverseSpec)
       throws IOException {
     checkAttachDetachEnabled();
-    Customer customer = Customer.getOrBadRequest(customerUUID);
+    Customer customer = Customer.getOrNotFound(customerUUID);
 
     if (attachUniverseSpec == null || attachUniverseSpec.getDownloadedSpecFile() == null) {
       throw new PlatformServiceException(BAD_REQUEST, "Failed to get downloaded spec file");
@@ -863,7 +897,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
   public void deleteAttachDetachMetadata(Request request, UUID customerUUID, UUID universeUUID)
       throws IOException {
     checkAttachDetachEnabled();
-    Customer customer = Customer.getOrBadRequest(customerUUID);
+    Customer customer = Customer.getOrNotFound(customerUUID);
     Universe universe = Universe.getOrBadRequest(universeUUID, customer);
 
     // Validate DB version supports attach/detach
@@ -890,6 +924,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
         nodeInstance.delete();
       }
       Universe.delete(universe.getUniverseUUID());
+      metricService.markSourceRemoved(customer.getUuid(), universe.getUniverseUUID());
     } else {
       throw new PlatformServiceException(
           BAD_REQUEST,
@@ -904,7 +939,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
       Request request, UUID customerUUID, UUID universeUUID, Boolean isForceRollback)
       throws IOException {
     checkAttachDetachEnabled();
-    Customer customer = Customer.getOrBadRequest(customerUUID);
+    Customer customer = Customer.getOrNotFound(customerUUID);
     Universe universe = Universe.getOrBadRequest(universeUUID, customer);
 
     String dbVersion =
@@ -1104,7 +1139,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
 
   public api.v2.models.UniverseResourceDetails getUniverseResources(
       Request request, UUID cUUID, UniverseCreateSpec universeSpec) throws JsonProcessingException {
-    Customer customer = Customer.getOrBadRequest(cUUID);
+    Customer customer = Customer.getOrNotFound(cUUID);
     log.info("Get Universe resource details with v2 spec: {}", prettyPrint(universeSpec));
     // map universeSpec to v1 universe details
     UniverseDefinitionTaskParams v1DefnParams =
@@ -1142,7 +1177,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
 
   public void precheckOperatorImportUniverse(
       Request request, UUID cUUID, UUID uniUUID, UniverseOperatorImportReq req) {
-    Customer customer = Customer.getOrBadRequest(cUUID);
+    Customer customer = Customer.getOrNotFound(cUUID);
     Universe universe = Universe.getOrBadRequest(uniUUID, customer);
 
     // validate the universe is kubernetes
@@ -1216,7 +1251,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
 
   public YBATask operatorImportUniverse(
       Request request, UUID cUUID, UUID uniUUID, UniverseOperatorImportReq req) {
-    Customer customer = Customer.getOrBadRequest(cUUID);
+    Customer customer = Customer.getOrNotFound(cUUID);
     Universe universe = Universe.getOrBadRequest(uniUUID, customer);
     precheckOperatorImportUniverse(request, cUUID, uniUUID, req);
     OperatorImportUniverse.Params params = new OperatorImportUniverse.Params();
@@ -1235,6 +1270,50 @@ public class UniverseManagementHandler extends ApiControllerUtils {
   }
 
   /**
+   * Enables (or disables) cross-cloud federated IAM on an existing universe, retroactively
+   * configuring all current nodes. On enable, prechecks that the universe's provider has federated
+   * IAM enabled with an audience set.
+   */
+  public YBATask manageCrossCloudFederation(
+      Request request, UUID cUUID, UUID uniUUID, UniverseCrossCloudFederationSpec spec) {
+    Customer customer = Customer.getOrNotFound(cUUID);
+    Universe universe = Universe.getOrBadRequest(uniUUID, customer);
+    boolean enabled = spec != null && Boolean.TRUE.equals(spec.getEnabled());
+    if (enabled) {
+      UniverseDefinitionTaskParams.Cluster primary =
+          universe.getUniverseDetails().getPrimaryCluster();
+      Provider provider =
+          (primary != null && primary.userIntent != null)
+              ? Provider.getOrBadRequest(UUID.fromString(primary.userIntent.provider))
+              : null;
+      if (provider == null
+          || CloudInfoInterface.getCrossCloudFederationTargets(provider).isEmpty()) {
+        throw new PlatformServiceException(
+            BAD_REQUEST,
+            "Enable federated IAM and set the audience on this universe's provider before enabling"
+                + " it on the universe.");
+      }
+      if (primary.userIntent.isMulticloudSupport()) {
+        throw new PlatformServiceException(
+            BAD_REQUEST, CrossCloudFederationTarget.MULTICLOUD_UNSUPPORTED_ERROR);
+      }
+    }
+    ManageCrossCloudFederationUniverse.Params params =
+        new ManageCrossCloudFederationUniverse.Params();
+    params.setUniverseUUID(uniUUID);
+    params.enabled = enabled;
+    UUID taskUuid = commissioner.submit(TaskType.ManageCrossCloudFederationUniverse, params);
+    CustomerTask.create(
+        customer,
+        uniUUID,
+        taskUuid,
+        CustomerTask.TargetType.Universe,
+        CustomerTask.TaskType.ManageCrossCloudFederation,
+        universe.getName());
+    return new YBATask().taskUuid(taskUuid).resourceUuid(universe.getUniverseUUID());
+  }
+
+  /**
    * Runs a script on selected nodes in a universe and returns the results.
    *
    * @param request The HTTP request
@@ -1246,7 +1325,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
   public RunScriptResponse runScript(
       Request request, UUID cUUID, UUID uniUUID, RunScriptRequest runScriptRequest) {
     localhostChecker.checkLocalhost(request);
-    Customer customer = Customer.getOrBadRequest(cUUID);
+    Customer customer = Customer.getOrNotFound(cUUID);
     Universe universe = Universe.getOrBadRequest(uniUUID, customer);
 
     // Check if the feature is enabled
@@ -1389,7 +1468,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
   public CollectFilesResponse createFileCollection(
       Request request, UUID cUUID, UUID uniUUID, CollectFilesRequest collectFilesRequest) {
     localhostChecker.checkLocalhost(request);
-    Customer customer = Customer.getOrBadRequest(cUUID);
+    Customer customer = Customer.getOrNotFound(cUUID);
     Universe universe = Universe.getOrBadRequest(uniUUID, customer);
 
     // Check if node script feature is enabled for this universe
@@ -1513,7 +1592,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
    */
   public InputStream downloadFileCollection(
       Request request, UUID cUUID, UUID uniUUID, UUID collectionUuid, Boolean cleanupDbNodesAfter) {
-    Customer customer = Customer.getOrBadRequest(cUUID);
+    Customer customer = Customer.getOrNotFound(cUUID);
     Universe universe = Universe.getOrBadRequest(uniUUID, customer);
 
     // If cleanup is requested, enforce localhost restriction
@@ -1565,7 +1644,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
       UUID collectionUuid,
       boolean deleteFromDbNodes,
       boolean deleteFromYba) {
-    Customer customer = Customer.getOrBadRequest(cUUID);
+    Customer customer = Customer.getOrNotFound(cUUID);
     Universe universe = Universe.getOrBadRequest(uniUUID, customer);
 
     // Localhost restriction - same as collect-files
@@ -1736,7 +1815,7 @@ public class UniverseManagementHandler extends ApiControllerUtils {
 
   public CheckResizeOptionsResp checkResizeOptions(
       UUID cUUID, UUID uniUUID, CheckResizeOptionsSpec spec) {
-    Customer customer = Customer.getOrBadRequest(cUUID);
+    Customer customer = Customer.getOrNotFound(cUUID);
     UniverseDefinitionTaskParams taskParams =
         Universe.getOrBadRequest(uniUUID, customer).getUniverseDetails();
 

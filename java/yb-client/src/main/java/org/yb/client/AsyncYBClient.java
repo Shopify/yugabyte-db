@@ -107,6 +107,10 @@ import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.TrustManagerFactory;
+import org.bouncycastle.asn1.ASN1ObjectIdentifier;
+import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
+import org.bouncycastle.asn1.pkcs.PrivateKeyInfo;
+import org.bouncycastle.asn1.x9.X9ObjectIdentifiers;
 import org.bouncycastle.util.io.pem.PemObject;
 import org.bouncycastle.util.io.pem.PemReader;
 import org.slf4j.Logger;
@@ -1012,6 +1016,30 @@ public class AsyncYBClient implements AutoCloseable {
     ListTabletsRequest rpc = new ListTabletsRequest();
     rpc.setTimeoutMillis(DEFAULT_OPERATION_TIMEOUT_MS);
     Deferred<ListTabletsResponse> d = rpc.getDeferred();
+    client.sendRpc(rpc);
+    return d;
+  }
+
+  /**
+   * Replace the active table list a TServer uses to filter table-level Prometheus metrics.
+   *
+   * @param hp host and port of the TServer.
+   * @param tableIds the complete list of DocDB table IDs; it replaces the previous list.
+   * @param listVersion the caller's version of the list, zero if none.
+   * @return a deferred that yields the response, which carries the TServer's filtering state and
+   *     any rejection.
+   */
+  public Deferred<SetActiveTableIdsForMetricsResponse> setActiveTableIdsForMetrics(
+      final HostAndPort hp, Collection<String> tableIds, int listVersion) {
+    checkIsClosed();
+    TabletClient client = newSimpleClient(hp);
+    if (client == null) {
+      throw new IllegalStateException("Could not create a client to " + hp.toString());
+    }
+    SetActiveTableIdsForMetricsRequest rpc =
+        new SetActiveTableIdsForMetricsRequest(tableIds, listVersion);
+    rpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    Deferred<SetActiveTableIdsForMetricsResponse> d = rpc.getDeferred();
     client.sendRpc(rpc);
     return d;
   }
@@ -3110,6 +3138,12 @@ public class AsyncYBClient implements AutoCloseable {
     }
   }
 
+  /** Whether {@code client} still has an entry in the disconnect-tracking map. */
+  @VisibleForTesting
+  boolean isClientInClient2Tablets(TabletClient client) {
+    return client2tablets.containsKey(client);
+  }
+
   /**
    * This method first clears tabletsCache and then tablet2client without any regards for calls to
    * {@link #discoverTablets}. Call only when AsyncYBClient is in a steady state.
@@ -3735,8 +3769,13 @@ public class AsyncYBClient implements AutoCloseable {
                           .addListener(f -> AsyncYBClient.this.handleClose(newClient, channel));
                     }
                   });
-
-      ip2client.put(hostport, newClient); // This is guaranteed to return null.
+      // Client is guaranteed to be put if it is not already in the cache irrespective of whether
+      // the connection is established or not. Clean-up must be performed irrespective.
+      // client2tablets must be registered under the same lock and before connect starts, otherwise
+      // a fast connect failure can remove from both maps and this put would re-insert a stale
+      // entry for a dead client.
+      ip2client.put(hostport, newClient);
+      client2tablets.put(newClient, new ArrayList<RemoteTablet>());
       LOG.debug("Created client for {}", hostport);
     }
     InetSocketAddress remoteAddress = new InetSocketAddress(host, port);
@@ -3757,7 +3796,6 @@ public class AsyncYBClient implements AutoCloseable {
                 LOG.debug("Client {} connected", hostport);
               }
             });
-    this.client2tablets.put(newClient, new ArrayList<RemoteTablet>());
     return newClient;
   }
 
@@ -3927,35 +3965,48 @@ public class AsyncYBClient implements AutoCloseable {
    * Removes all the cache entries referred to the given client.
    *
    * @param client The client for which we must invalidate everything.
-   * @param remote The address of the remote peer, if known, or null.
+   * @param remote The address of the remote peer, if known, or {@code null} to look up the cache
+   *     key by object identity (used when there is no Channel / connect never completed).
    */
-  private void removeClientFromCache(final TabletClient client, final SocketAddress remote) {
-
-    if (remote == null) {
-      return; // Can't continue without knowing the remote address.
-    }
-
-    String hostport;
+  void removeClientFromCache(final TabletClient client, final SocketAddress remote) {
+    String hostport = null;
     if (remote instanceof InetSocketAddress) {
       final InetSocketAddress sock = (InetSocketAddress) remote;
       final InetAddress addr = sock.getAddress();
       if (addr == null) {
         LOG.error("Unresolved IP for " + remote + ". This shouldn't happen.");
-        return;
       } else {
         hostport = addr.getHostAddress() + ':' + sock.getPort();
       }
-    } else {
+    } else if (remote != null) {
       LOG.error("Found a non-InetSocketAddress remote: " + remote + ". This shouldn't happen.");
-      return;
     }
-
-    TabletClient old;
+    TabletClient existingClient = null;
     synchronized (ip2client) {
-      old = ip2client.remove(hostport);
+      // SocketAddress hostport can be null if the connection was not established successfully.
+      if (hostport != null && ip2client.get(hostport) == client) {
+        existingClient = ip2client.remove(hostport);
+      }
+      // Fall back to identity when remote is unknown, or when the address-derived hostport does
+      // not match the key used at newClient insert time (e.g. hostname vs resolved IP).
+      if (existingClient == null) {
+        String identityHostport = null;
+        for (final Map.Entry<String, TabletClient> e : ip2client.entrySet()) {
+          // Reference check to find the same instance in the cache.
+          if (e.getValue() == client) {
+            identityHostport = e.getKey();
+            break;
+          }
+        }
+        if (identityHostport != null) {
+          hostport = identityHostport;
+          existingClient = ip2client.remove(hostport);
+        }
+      }
     }
-    LOG.debug("Removed from IP cache: {" + hostport + "} -> {" + client + "}");
-    if (old == null) {
+    if (existingClient != null) {
+      LOG.debug("Removed from IP cache: {" + hostport + "} -> {" + client + "}");
+    } else if (remote != null) {
       // Currently we're seeing this message when masters are disconnected and the hostport we got
       // above is different than the one the user passes (that we use to populate ip2client). At
       // worst this doubles the entries for masters, which has an insignificant impact.
@@ -3971,6 +4022,9 @@ public class AsyncYBClient implements AutoCloseable {
               + ".  This shouldn't happen.");
     }
 
+    // Safe outside the ip2client lock: newClient registers this client in client2tablets under
+    // that lock before connect, so a remover that has already dropped the ip2client entry cannot
+    // race ahead of the put. ConcurrentHashMap handles the remove itself.
     ArrayList<RemoteTablet> tablets = client2tablets.remove(client);
     if (tablets != null) {
       // Make a copy so we don't need to synchronize on it while iterating.
@@ -4095,23 +4149,43 @@ public class AsyncYBClient implements AutoCloseable {
     }
   }
 
-  private PrivateKey getPrivateKey(String keyFile) {
+  @VisibleForTesting
+  static PrivateKey getPrivateKey(String keyFile) {
     try {
       PemReader pemReader = new PemReader(new FileReader(keyFile));
       PemObject pemObject = pemReader.readPemObject();
       pemReader.close();
       byte[] bytes = pemObject.getContent();
       PKCS8EncodedKeySpec spec = new PKCS8EncodedKeySpec(bytes);
-      KeyFactory kf = KeyFactory.getInstance("RSA");
+      KeyFactory kf = KeyFactory.getInstance(getPrivateKeyAlgorithm(bytes));
       PrivateKey pk = kf.generatePrivate(spec);
       return pk;
     } catch (InvalidKeySpecException e) {
       LOG.error("Could not read the private key file.", e);
-      throw new RuntimeException("InvalidKeySpecException while reading key: " + keyFile);
+      throw new RuntimeException(
+          "InvalidKeySpecException while reading key: " + keyFile + ": " + e.getMessage(), e);
     } catch (Exception e) {
       LOG.error("Issue reading pem file.", e);
-      throw new RuntimeException("IOException reading key: " + keyFile);
+      throw new RuntimeException("IOException reading key: " + keyFile + ": " + e, e);
     }
+  }
+
+  // KeyFactory needs the algorithm named up front, so take it from the PKCS#8 AlgorithmIdentifier.
+  // EC is needed for ECDSA keys, e.g. from cert-manager.
+  private static String getPrivateKeyAlgorithm(byte[] pkcs8Bytes) throws InvalidKeySpecException {
+    ASN1ObjectIdentifier oid;
+    try {
+      oid = PrivateKeyInfo.getInstance(pkcs8Bytes).getPrivateKeyAlgorithm().getAlgorithm();
+    } catch (IllegalArgumentException e) {
+      throw new InvalidKeySpecException("Not a PKCS#8 private key", e);
+    }
+    if (PKCSObjectIdentifiers.rsaEncryption.equals(oid)) {
+      return "RSA";
+    }
+    if (X9ObjectIdentifiers.id_ecPublicKey.equals(oid)) {
+      return "EC";
+    }
+    throw new InvalidKeySpecException("Unsupported private key algorithm: " + oid);
   }
 
   /**

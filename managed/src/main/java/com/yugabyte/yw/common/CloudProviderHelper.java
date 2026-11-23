@@ -26,11 +26,14 @@ import com.yugabyte.yw.models.ImageBundleDetails.BundleInfo;
 import com.yugabyte.yw.models.InstanceType;
 import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Region;
+import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.CloudInfoInterface;
 import com.yugabyte.yw.models.helpers.provider.AWSCloudInfo;
 import com.yugabyte.yw.models.helpers.provider.AzureCloudInfo;
 import com.yugabyte.yw.models.helpers.provider.GCPCloudInfo;
 import com.yugabyte.yw.models.helpers.provider.KubernetesInfo;
+import com.yugabyte.yw.models.helpers.provider.OCICloudInfo;
+import com.yugabyte.yw.models.helpers.provider.OnPremCloudInfo;
 import com.yugabyte.yw.models.helpers.provider.ProviderValidator;
 import com.yugabyte.yw.models.helpers.provider.region.KubernetesRegionInfo;
 import io.fabric8.kubernetes.api.model.Config;
@@ -47,6 +50,7 @@ import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.HashSet;
@@ -423,7 +427,8 @@ public class CloudProviderHelper {
     }
     switch (provider.getCloudCode()) {
       case aws:
-      case azu: // Fall through to the common code.
+      case azu:
+      case oci: // Fall through to the common code.
         // TODO: Add this validation. But there is a bad test.
         //  if (anyProviderRegion == null || anyProviderRegion.isEmpty()) {
         //    throw new YWServiceException(BAD_REQUEST, "Must have at least one region");
@@ -467,6 +472,10 @@ public class CloudProviderHelper {
       AzureCloudInfo azuCloudInfo = CloudInfoInterface.get(provider);
       azuCloudInfo.setAzuHostedZoneId(hostedZoneId);
       azuCloudInfo.setAzuHostedZoneName(hostedZoneData.asText());
+    } else if (provider.getCloudCode().equals(CloudType.oci)) {
+      OCICloudInfo ociCloudInfo = CloudInfoInterface.get(provider);
+      ociCloudInfo.setOciHostedZoneId(hostedZoneId);
+      ociCloudInfo.setOciHostedZoneName(hostedZoneData.asText());
     }
   }
 
@@ -860,6 +869,7 @@ public class CloudProviderHelper {
       }
     }
     checkCloudInfoFieldsInUseProvider(providerCloudInfo, editProviderCloudInfo);
+    checkFederatedIamNotInUse(provider, editProviderReq);
 
     // Collect existing and current regions into maps
     Map<String, Region> existingRegions =
@@ -1006,8 +1016,16 @@ public class CloudProviderHelper {
     }
     if (provider.getCloudCode() == CloudType.onprem) {
       editProviderReq.validateInstanceTypeMountPoints(provider.getInstanceTypes());
+      // ynpManaged is internal - it is set once by YNP when it creates the provider and an edit
+      // can never turn it on or off, whoever makes the edit.
+      OnPremCloudInfo editOnPremCloudInfo = CloudInfoInterface.get(editProviderReq);
+      editOnPremCloudInfo.ynpManaged = provider.isYnpManaged();
     }
     CloudInfoInterface.mergeSensitiveFields(provider, editProviderReq);
+    if (editProviderReq.getCloudCode() == CloudType.gcp) {
+      maybeUpdateGCPProject(editProviderReq);
+    }
+    maybeUpdateVPC(editProviderReq);
     // Validate the provider request so as to ensure we only allow editing of fields
     // that does not impact the existing running universes.
     long universeCount = provider.getUniverseCount();
@@ -1050,10 +1068,6 @@ public class CloudProviderHelper {
         }
       }
     }
-    if (editProviderReq.getCode().equalsIgnoreCase("gcp")) {
-      maybeUpdateGCPProject(editProviderReq);
-    }
-    maybeUpdateVPC(editProviderReq);
     // TODO: Remove this code once the validators are added for all cloud provider.
     CloudAPI cloudAPI = cloudAPIFactory.get(provider.getCode());
     if (cloudAPI != null && !cloudAPI.isValidCreds(editProviderReq)) {
@@ -1193,6 +1207,60 @@ public class CloudProviderHelper {
       ((ObjectNode) kubernetesInfo).remove(KUBE_CONFIG_FIELDS);
     }
     return detailsJson;
+  }
+
+  /**
+   * Nodes of a universe with federated IAM configured were set up from the provider's federation
+   * settings, so those settings cannot change while any universe is marked configured: not turned
+   * off, not pointed elsewhere, and not turned back on at all for a universe still marked from
+   * before, whose old targets are no longer known. The universe-level disable clears the mark
+   * without needing the targets.
+   */
+  private void checkFederatedIamNotInUse(Provider provider, Provider editProviderReq) {
+    if (federationSettingsNodesUse(provider).equals(federationSettingsNodesUse(editProviderReq))) {
+      return;
+    }
+    UUID providerUUID = provider.getUuid();
+    List<String> federatedUniverses =
+        Customer.get(provider.getCustomerUUID()).getUniversesForProvider(providerUUID).stream()
+            .filter(
+                u ->
+                    u.getUniverseDetails().clusters.stream()
+                        .anyMatch(
+                            c ->
+                                c.userIntent.isFederationConfigured()
+                                    && c.userIntent.getAllProviderUUIDs().contains(providerUUID)))
+            .map(Universe::getName)
+            .sorted()
+            .collect(Collectors.toList());
+    if (!federatedUniverses.isEmpty()) {
+      throw new PlatformServiceException(
+          BAD_REQUEST,
+          String.format(
+              "Federated IAM settings cannot be modified while universes use them: %s. Disable"
+                  + " cross cloud federated IAM on those universes first.",
+              String.join(", ", federatedUniverses)));
+    }
+  }
+
+  /**
+   * The federation settings a node is configured from: the audience, and the role ARN for S3. A
+   * node never federates to the cloud it runs on, so on an AWS or GCP provider the target for its
+   * own cloud is not read by any node.
+   *
+   * <p>Returns one entry per target, each {@code [targetCloud (CloudType), audience (String),
+   * roleArn (String, or null)]}. roleArn is kept only for an S3 ({@code aws}) target and is null
+   * for any other, since no node reads it there.
+   */
+  private static Set<List<Object>> federationSettingsNodesUse(Provider provider) {
+    CloudType providerCloud = provider.getCloudCode();
+    return CloudInfoInterface.getCrossCloudFederationTargets(provider).stream()
+        .filter(t -> providerCloud == CloudType.onprem || t.targetCloud != providerCloud)
+        .map(
+            t ->
+                Arrays.<Object>asList(
+                    t.targetCloud, t.audience, t.targetCloud == CloudType.aws ? t.roleArn : null))
+        .collect(Collectors.toSet());
   }
 
   private void checkCloudInfoFieldsInUseProvider(

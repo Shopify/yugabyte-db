@@ -83,6 +83,7 @@ YRPC_GENERATE(
   PROTO_FILES remote_bootstrap.proto)
 set(REMOTE_BOOTSTRAP_YRPC_LIBS
   consensus_proto
+  log_proto
   yrpc
   protobuf
   rpc_header_proto
@@ -260,12 +261,14 @@ set(TSERVER_SRCS
   heartbeater_factory.cc
   master_leader_poller.cc
   metrics_snapshotter.cc
+  pg_cache_util.cc
   pg_client_service.cc
   pg_client_session.cc
   pg_client_session_util.cc
   pg_create_table.cc
   pg_db_cache.cc
   pg_mutation_counter.cc
+  pg_request_sequencer.cc
   pg_response_cache.cc
   pg_session_guard.cc
   pg_sequence_cache.cc
@@ -273,6 +276,7 @@ set(TSERVER_SRCS
   pg_table_cache.cc
   pg_table_mutation_count_sender.cc
   pg_txn_snapshot_manager.cc
+  tier_migration_reconciler.cc
   tserver_xcluster_context.cc
   read_query.cc
   remote_bootstrap_anchor_client.cc
@@ -286,6 +290,8 @@ set(TSERVER_SRCS
   remote_snapshot_transfer_client.cc
   service_util.cc
   session_registry.cc
+  snapshot_preflush.cc
+  tablet_flusher.cc
   tablet_limits.cc
   tablet_memory_manager.cc
   tablet_server.cc
@@ -440,16 +446,19 @@ ADD_YB_LIBRARY(tserver_mock
 set(YB_TEST_LINK_LIBS
   rpc_test_util
   tserver
+  yb_common_test_util
   tserver_mock
   tserver_test_util
   yb_client # yb::client::YBTableName
   yb-tserver_util
   tablet_test_util
   ${YB_MIN_TEST_LIBS})
+ADD_YB_TEST(pg_response_cache-test)
 ADD_YB_TEST(remote_bootstrap_file_downloader-test)
 ADD_YB_TEST(remote_bootstrap_rocksdb_client-test)
 ADD_YB_TEST(remote_bootstrap_rocksdb_session-test)
 ADD_YB_TEST(remote_bootstrap_service-test)
+ADD_YB_TEST(session_registry-test)
 ADD_YB_TEST(tablet_server-test)
 ADD_YB_TEST(tablet_server-stress-test RUN_SERIAL true)
 ADD_YB_TEST(ts_local_lock_manager-test)
@@ -459,7 +468,6 @@ if (NOT APPLE)
   ADD_YB_TEST(tserver_cgroup_manager-test)
 endif()
 ADD_YB_TEST(header_manager_impl-test)
-ADD_YB_TEST(pg_response_cache-test)
 ADD_YB_TEST(backup_service-test)
 ADD_YB_TEST(clone_operation-test)
 
@@ -473,3 +481,5 @@ ADD_YB_TEST(remote_bootstrap_rocksdb_client-test_ent)
 ADD_YB_TEST(xcluster_consumer_replication_error-test)
 ADD_YB_TEST(xcluster_consumer_auto_flags_info-test)
 ADD_YB_TEST(xcluster_ddl_queue_handler-test)
+
+ADD_YB_TEST(pg_request_sequencer-test)
