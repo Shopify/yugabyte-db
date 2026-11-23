@@ -44,6 +44,23 @@ def ybLog(s: String): Unit = {
   println("[Yugabyte sbt log] " + s)
 }
 
+// Buffer the child output so a failure can quote the actual error, not just the exit code.
+def runCapturingOutput(command: String, cwd: java.io.File): (Int, Seq[String]) = {
+  val output = scala.collection.mutable.ListBuffer.empty[String]
+  def record(line: String): Unit = output.synchronized {
+    println(line)
+    output += line
+  }
+  val status = Process(command, cwd).!(ProcessLogger(record, record))
+  (status, output.toList)
+}
+
+def buildError(what: String, status: Int, output: Seq[String]): String = {
+  val tail = output.takeRight(30)
+  s"$what failed with exit code $status." +
+    (if (tail.isEmpty) "" else s" Last ${tail.size} line(s) of output:\n" + tail.mkString("\n"))
+}
+
 def getEnvVar(envVarName: String): String = {
   val envVarValue = System.getenv(envVarName)
   val strValue = normalizeEnvVarValue(envVarValue)
@@ -147,11 +164,17 @@ javacOptions ++= Seq("-source", "17", "-target", "17")
 
 // This is for dev-mode server. In dev-mode, the play server is started before the files are compiled.
 // Hence, the application files are not available in the path. For prod, It is in reference.conf file.
+PlayKeys.devSettings += "play.pekko.dev-mode.pekko.coordinated-shutdown.phases.before-service-unbind.timeout" -> "150s"
 PlayKeys.devSettings += "play.pekko.dev-mode.pekko.coordinated-shutdown.phases.service-requests-done.timeout" -> "150s"
 
 Compile / managedClasspath += baseDirectory.value / "target/scala-2.13/"
 version := sys.process.Process("cat version.txt").lineStream_!.head
 Global / onChangedBuildSource := ReloadOnSourceChanges
+
+// Flyway 10+ ships database support as separate modules; the postgresql one is required.
+val flywayVersion = "13.8.0"
+val bouncyCastleFipsVersion = "2.1.1"
+val bouncyCastleUtilFipsVersion = "2.1.8"
 
 libraryDependencies ++= Seq(
   javaJdbc,
@@ -159,27 +182,36 @@ libraryDependencies ++= Seq(
   javaWs,
   filters,
   guice,
-  "org.postgresql" % "postgresql" % "42.7.11",
-  "net.logstash.logback" % "logstash-logback-encoder" % "6.2",
-  "ch.qos.logback" % "logback-classic" % "1.5.32",
+  "org.postgresql" % "postgresql" % "42.7.14",
+  "net.logstash.logback" % "logstash-logback-encoder" % "8.1",
+  "ch.qos.logback" % "logback-classic" % "1.6.3",
   "org.codehaus.janino" % "janino" % "3.1.9",
   "org.apache.commons" % "commons-lang3" % "3.20.0",
   "org.apache.commons" % "commons-collections4" % "4.4",
   "org.apache.commons" % "commons-compress" % "1.27.1",
   "org.apache.commons" % "commons-csv" % "1.13.0",
-  "org.apache.httpcomponents.core5" % "httpcore5" % "5.2.4",
-  "org.apache.httpcomponents.core5" % "httpcore5-h2" % "5.2.4",
-  "org.apache.httpcomponents.client5" % "httpclient5" % "5.2.3",
-  "org.apache.mina" % "mina-core" % "2.2.7",
-  "org.flywaydb" %% "flyway-play" % "9.0.0",
+  "org.apache.httpcomponents.core5" % "httpcore5" % "5.4.3",
+  "org.apache.httpcomponents.core5" % "httpcore5-h2" % "5.4.3",
+  "org.apache.httpcomponents.client5" % "httpclient5" % "5.6.4",
+  "org.apache.mina" % "mina-core" % "2.2.9",
+  "org.flywaydb" % "flyway-core" % flywayVersion,
+  "org.flywaydb" % "flyway-database-postgresql" % flywayVersion,
   // https://github.com/YugaByte/cassandra-java-driver/releases
   "com.yugabyte" % "java-driver-core" % "4.15.0-yb-3",
   "org.yaml" % "snakeyaml" % "2.1",
-  "org.bouncycastle" % "bc-fips" % "2.1.0",
-  "org.bouncycastle" % "bcpkix-fips" % "2.1.9",
-  "org.bouncycastle" % "bctls-fips" % "2.1.20",
+  // bc-fips is the FIPS 140-3 validated module itself, so it tracks the newest *certified*
+  // build rather than the newest published one: 2.1.1 is CMVP certificate #4943 (17 Jan 2025),
+  // while 2.1.2 and 2.1.3 carry no certificate of their own. The rest are outside the validated
+  // boundary and track latest. See the dependencyOverrides below - declaring them is not enough.
+  "org.bouncycastle" % "bc-fips" % bouncyCastleFipsVersion,
+  "org.bouncycastle" % "bcutil-fips" % bouncyCastleUtilFipsVersion,
+  "org.bouncycastle" % "bcpkix-fips" % "2.1.12",
+  "org.bouncycastle" % "bctls-fips" % "2.1.24",
   "org.mindrot" % "jbcrypt" % "0.4",
-  "org.springframework.security" % "spring-security-core" % "5.8.16",
+  // Only the crypto module is used (Encryptors, BCrypt). It has no Spring dependencies, so taking
+  // it alone keeps spring-security-core and spring-expression out of the image. Ciphertext and
+  // bcrypt hashes written by 5.8.x read back unchanged on 6.5.x.
+  "org.springframework.security" % "spring-security-crypto" % "6.5.11",
   // AWS SDK 2.x dependencies
   "software.amazon.awssdk" % "bom" % "2.29.52" pomOnly(),
   "software.amazon.awssdk" % "core" % "2.29.52",
@@ -212,11 +244,11 @@ libraryDependencies ++= Seq(
   "io.prometheus" % "prometheus-metrics-exporter-httpserver" % "1.4.3",
   "org.glassfish.jaxb" % "jaxb-runtime" % "2.3.2",
   // pac4j and nimbusds libraries need to be upgraded together.
-  "org.pac4j" %% "play-pac4j" % "11.0.0-PLAY2.8",
-  "org.pac4j" % "pac4j-oauth" % "5.7.10" exclude("commons-io" , "commons-io"),
-  "org.pac4j" % "pac4j-oidc" % "5.7.10"  exclude("commons-io" , "commons-io"),
-  "com.nimbusds" % "nimbus-jose-jwt" % "10.8",
-  "com.nimbusds" % "oauth2-oidc-sdk" % "11.34",
+  "org.pac4j" %% "play-pac4j" % "13.0.3-PLAY3.0",
+  "org.pac4j" % "pac4j-oauth" % "6.5.9" exclude("commons-io" , "commons-io"),
+  "org.pac4j" % "pac4j-oidc" % "6.5.9"  exclude("commons-io" , "commons-io"),
+  "com.nimbusds" % "nimbus-jose-jwt" % "10.9.1",
+  "com.nimbusds" % "oauth2-oidc-sdk" % "11.38.2",
   "commons-validator" % "commons-validator" % "1.10.0",
   "org.apache.velocity" % "velocity-engine-core" % "2.4.1",
   "com.fasterxml.woodstox" % "woodstox-core" % "6.4.0",
@@ -231,19 +263,21 @@ libraryDependencies ++= Seq(
   "com.google.cloud" % "google-cloud-resourcemanager" % "1.80.0",
   "com.google.cloud" % "google-cloud-logging" % "3.23.7",
   "com.google.oauth-client" % "google-oauth-client" % "1.35.0",
-  "com.oracle.oci.sdk" % "oci-java-sdk-common" % "3.57.2",
-  "com.oracle.oci.sdk" % "oci-java-sdk-core" % "3.57.2",
-  "com.oracle.oci.sdk" % "oci-java-sdk-identity" % "3.57.2",
-  "com.oracle.oci.sdk" % "oci-java-sdk-keymanagement" % "3.57.2",
-  "com.oracle.oci.sdk" % "oci-java-sdk-vault" % "3.57.2",
-  "com.oracle.oci.sdk" % "oci-java-sdk-common-httpclient-jersey" % "3.57.2",
-  "org.projectlombok" % "lombok" % "1.18.26",
+  "com.oracle.oci.sdk" % "oci-java-sdk-common" % "3.77.2",
+  "com.oracle.oci.sdk" % "oci-java-sdk-core" % "3.77.2",
+  "com.oracle.oci.sdk" % "oci-java-sdk-dns" % "3.77.2",
+  "com.oracle.oci.sdk" % "oci-java-sdk-identity" % "3.77.2",
+  "com.oracle.oci.sdk" % "oci-java-sdk-keymanagement" % "3.77.2",
+  "com.oracle.oci.sdk" % "oci-java-sdk-vault" % "3.77.2",
+  "com.oracle.oci.sdk" % "oci-java-sdk-common-httpclient-jersey" % "3.77.2",
+  "com.oracle.oci.sdk" % "oci-java-sdk-objectstorage" % "3.77.2",
+  "org.projectlombok" % "lombok" % "1.18.48",
   "com.squareup.okhttp3" % "okhttp" % "4.12.0",
   "com.fasterxml.jackson.dataformat" % "jackson-dataformat-xml" % "3.1.0",
   // Compatible with protoc 33.0 https://protobuf.dev/support/version-support/
   "com.google.protobuf" % "protobuf-java" % "4.33.0",
   "com.google.protobuf" % "protobuf-java-util" % "4.33.0",
-  "org.xerial.snappy" % "snappy-java" % "1.1.10.7",
+  "org.xerial.snappy" % "snappy-java" % "1.1.10.12",
   "io.kamon" %% "kamon-bundle" % "2.7.5",
   "io.kamon" %% "kamon-prometheus" % "2.7.5",
   "org.unix4j" % "unix4j-command" % "0.6",
@@ -254,7 +288,8 @@ libraryDependencies ++= Seq(
   "io.fabric8" % "kubernetes-client-api" % "6.14.0",
   "io.fabric8" % "kubernetes-model-core" % "6.14.0",
   "org.modelmapper" % "modelmapper" % "2.4.4",
-  "com.datadoghq" % "datadog-api-client" % "2.25.0" classifier "shaded-jar",
+  // Used by the generated v2 server models (JsonNullable); was only pulled in transitively before.
+  "org.openapitools" % "jackson-databind-nullable" % "0.2.3",
   "javax.xml.bind" % "jaxb-api" % "2.3.1",
   "io.jsonwebtoken" % "jjwt-api" % "0.11.5",
   "io.jsonwebtoken" % "jjwt-impl" % "0.11.5",
@@ -273,7 +308,6 @@ libraryDependencies ++= Seq(
   "org.mockito" % "mockito-core" % "5.3.1" % Test,
   "org.mockito" % "mockito-inline" % "5.2.0" % Test,
   "org.mindrot" % "jbcrypt" % "0.4" % Test,
-  "com.h2database" % "h2" % "2.1.212" % Test,
   "org.hamcrest" % "hamcrest-core" % "2.2" % Test,
   "pl.pragmatists" % "JUnitParams" % "1.1.1" % Test,
   "com.icegreen" % "greenmail" % "2.0.1" % Test,
@@ -282,8 +316,15 @@ libraryDependencies ++= Seq(
   "io.grpc" % "grpc-testing" % "1.67.1" % Test,
   "io.grpc" % "grpc-inprocess" % "1.67.1" % Test,
   "io.zonky.test" % "embedded-postgres" % "2.0.1" % Test,
+  // embedded-postgres only pulls the darwin-amd64 binaries by default, which forces Apple Silicon
+  // machines to run Postgres under Rosetta (very slow initdb/startup, and flaky). Add the native
+  // aarch64 binaries (same PG 14.5) so the embedded server starts natively there.
+  "io.zonky.test.postgres" % "embedded-postgres-binaries-darwin-arm64v8" % "14.5.0" % Test,
   "org.springframework" % "spring-test" % "5.3.9" % Test,
-  "com.yugabyte" % "yba-client-v2" % "1.7.0" % Test,
+  "com.yugabyte" % "yba-client-v2" % "1.8.18" % Test,
+  // yba-client-v2's ApiClient registers MultiPartFeature. The POM it installs is the shade
+  // plugin's dependency-reduced one, which drops all compile deps, so declare this one here.
+  "org.glassfish.jersey.media" % "jersey-media-multipart" % "2.41" % Test,
   "io.fabric8" % "kubernetes-server-mock" % "6.14.0" % Test
 )
 
@@ -368,7 +409,25 @@ externalResolvers := {
 }
 
 (Compile / compile) := (Compile / compile).dependsOn(buildDependentArtifacts).value
-(Test / test) := (Test / test).dependsOn(testDependentArtifacts).value
+// The support bundle Go helpers aren't Maven modules, so mvn test never reaches them. Their tests
+// run after the Java tests, and a failure fails `sbt test`. testDependentArtifacts can't carry
+// this: sbt ignores its exit status.
+(Test / test) := {
+  val javaTests = (Test / test).dependsOn(testDependentArtifacts).result.value
+  ybLog("Testing support bundle Go helpers...")
+  val goStatus = Process("bash devops/supportbundle/run_go_tests.sh", baseDirectory.value).!
+  javaTests.toEither.left.foreach(incomplete => throw incomplete)
+  goStatus match {
+    case 0 =>
+    case 2 =>
+      sys.error(
+        "Support bundle Go tests could not run: go is missing, a Go download failed, or the" +
+          " report folders could not be cleared or created; see the log above. This is a" +
+          " tooling failure, not a test failure.")
+    case _ =>
+      sys.error("Support bundle Go tests failed: see devops/supportbundle/*/target/test-reports")
+  }
+}
 
 (Compile / compilePlatform) := {
   Def.sequential(
@@ -584,7 +643,7 @@ cleanV2ServerStubs := {
   ybLog("Cleaning Openapi v2 server stubs...")
   Process("rm -rf openapi", target.value) !
   val openapiDir = baseDirectory.value / "src/main/resources/openapi"
-  Process("rm -f ../openapi.yaml ../openapi_public.yaml", openapiDir) !
+  Process("rm -f ../openapi.yaml", openapiDir) !
 }
 
 lazy val cleanClients = taskKey[Int]("Clean generated clients")
@@ -619,17 +678,34 @@ openApiFormat := {
       throw new RuntimeException("openapi format installation failed!!!")
     }
   }
-  def formatFile(file: Path): Unit = {
-    ybLog(s"formatting api file $file")
-    val rc = Process(s"./openapi_format.sh $file", baseDirectory.value / "scripts").!
+  // Format all changed fragments in a single Node process instead of spawning the openapi-format
+  // CLI once per file. Node/npx startup (~1-2s) previously dominated since the formatting itself is
+  // milliseconds; batching collapses hundreds of spawns into one. See scripts/openapi_format_batch.js.
+  def formatFiles(files: Seq[Path]): Unit = {
+    val resourcesDir = baseDirectory.value / "src/main/resources"
+    val sortFile = (resourcesDir / "openapi_sort_format.json").getAbsolutePath
+    val sortComponentsFile = (resourcesDir / "openapi_sort_components.json").getAbsolutePath
+    val listFile = target.value / "openapi-format-files.txt"
+    IO.write(listFile, files.map(_.toAbsolutePath.toString).mkString("\n"))
+    ybLog(s"formatting ${files.size} openapi file(s)")
+    val rc = Process(
+        Seq(
+          "node",
+          "openapi_format_batch.js",
+          sortFile,
+          sortComponentsFile,
+          listFile.getAbsolutePath),
+        baseDirectory.value / "scripts").!
     if (rc != 0) {
       throw new RuntimeException("openapi format failed!!!")
     }
   }
   val changes = openApiFormat.inputFileChanges
-  val changedFiles = (changes.created ++ changes.modified).toSet
+  val changedFiles = (changes.created ++ changes.modified).toSeq
   installOpenapiFormat()
-  changedFiles.par.foreach(formatFile)
+  if (changedFiles.nonEmpty) {
+    formatFiles(changedFiles)
+  }
 }
 
 lazy val openApiLint = taskKey[Unit]("Running lint on openapi spec")
@@ -699,7 +775,8 @@ lazy val javagen = project.in(file("client/java"))
     openApiGenerateApiTests := SettingDisabled,
     openApiValidateSpec := SettingDisabled,
     openApiConfigFile := "client/java/openapi-java-config.json",
-    version := "1.0.0",
+    version := "1.0.5",
+    openApiHttpUserAgent := s"yba-java-client/${version.value}",
     target := file("client/java/target/v1"),
   )
 
@@ -715,40 +792,45 @@ lazy val javaGenV2Client = project.in(file("client/java"))
     openApiConfigFile := "client/java/openapi-java-config-v2.json",
     openApiGlobalProperties += ("skipFormModel" -> "false"),
     openApiTemplateDir := (baseDirectory.value / resDir / "openapi_templates/clients/v2").absolutePath,
-    version := "1.7.0",
+    version := "1.8.18",
+    openApiHttpUserAgent := s"yba-java-client/${version.value}",
     target := file("client/java/target/v2"),
   )
 
 // Compile generated java v1 and v2 clients
-lazy val compileJavaGenV1Client = taskKey[Int]("Compile generated v1 Java client code")
+lazy val compileJavaGenV1Client =
+  taskKey[(Int, Seq[String])]("Compile generated v1 Java client code")
 compileJavaGenV1Client / fileInputs += baseDirectory.value.toGlob /
   "client/java/v1/" / ** / "*"
 compileJavaGenV1Client := {
   if (compileJavaGenV1Client.inputFileChanges.hasChanges) {
     val localMavenRepo = getEnvVar(ybMvnLocalRepoEnvVarName)
     val cmdOpt = if (isDefined(localMavenRepo)) "-Dmaven.repo.local=" + localMavenRepo else ""
-    val status = Process("mvn clean install -pl v1 -am " + cmdOpt, new File(baseDirectory.value + "/client/java")).!
-    status
+    runCapturingOutput(
+      "mvn clean install -pl v1 -am " + cmdOpt,
+      new File(baseDirectory.value + "/client/java"))
   } else {
     ybLog("OpenApi java client stubs for v1 are already generated." +
       " Run 'cleanClients' to force regeneration.")
-    0
+    (0, Seq.empty[String])
   }
 }
 
-lazy val compileJavaGenV2Client = taskKey[Int]("Compile generated v2 Java client code")
+lazy val compileJavaGenV2Client =
+  taskKey[(Int, Seq[String])]("Compile generated v2 Java client code")
 compileJavaGenV2Client / fileInputs += baseDirectory.value.toGlob /
   "client/java/v2/" / ** / "*"
 compileJavaGenV2Client := {
   if (compileJavaGenV2Client.inputFileChanges.hasChanges) {
     val localMavenRepo = getEnvVar(ybMvnLocalRepoEnvVarName)
     val cmdOpt = if (isDefined(localMavenRepo)) "-Dmaven.repo.local=" + localMavenRepo else ""
-    val status = Process("mvn clean install -pl v2 -am " + cmdOpt, new File(baseDirectory.value + "/client/java")).!
-    status
+    runCapturingOutput(
+      "mvn clean install -pl v2 -am " + cmdOpt,
+      new File(baseDirectory.value + "/client/java"))
   } else {
     ybLog("OpenApi java client stubs for v2 are already generated." +
       " Run 'cleanClients' to force regeneration.")
-    0
+    (0, Seq.empty[String])
   }
 }
 
@@ -762,6 +844,9 @@ lazy val pythongen = project.in(file("client/python"))
     openApiGenerateApiTests := SettingDisabled,
     openApiValidateSpec := SettingDisabled,
     openApiConfigFile := "client/python/openapi-python-config.json",
+    version := "2.7.3.0",
+    openApiAdditionalProperties += ("packageVersion" -> version.value),
+    openApiHttpUserAgent := s"yba-python-client/${version.value}",
     target := file("client/python/target/v1"),
   )
 
@@ -775,6 +860,9 @@ lazy val pythonGenV2Client = project.in(file("client/python"))
     openApiGenerateApiTests := SettingDisabled,
     openApiValidateSpec := SettingDisabled,
     openApiConfigFile := "client/python/openapi-python-config-v2.json",
+    version := "2.0.0",
+    openApiAdditionalProperties += ("packageVersion" -> version.value),
+    openApiHttpUserAgent := s"yba-python-client/${version.value}",
     target := file("client/python/target/v2"),
   )
 
@@ -788,6 +876,9 @@ lazy val gogen = project.in(file("client/go"))
     openApiGenerateApiTests := SettingDisabled,
     openApiValidateSpec := SettingDisabled,
     openApiConfigFile := "client/go/openapi-go-config.json",
+    version := "2.0.0",
+    openApiAdditionalProperties += ("packageVersion" -> version.value),
+    openApiHttpUserAgent := s"yba-go-client/${version.value}",
     openApiTemplateDir := "client/go/templates",
     target := file("client/go/target/v1"),
   )
@@ -802,67 +893,54 @@ lazy val goGenV2Client = project.in(file("client/go"))
     openApiGenerateApiTests := SettingDisabled,
     openApiValidateSpec := SettingDisabled,
     openApiConfigFile := "client/go/openapi-go-config-v2.json",
+    version := "2.0.0",
+    openApiAdditionalProperties += ("packageVersion" -> version.value),
+    openApiHttpUserAgent := s"yba-go-client/${version.value}",
     openApiTemplateDir := "client/go/templates",
     target := file("client/go/target/v2"),
     openApiGlobalProperties += ("skipFormModel" -> "false"),
   )
 
 // Compile generated go v1 and v2 clients
-lazy val compileGoGenV1Client = taskKey[Int]("Compile generated v1 Go clients")
+lazy val compileGoGenV1Client = taskKey[(Int, Seq[String])]("Compile generated v1 Go clients")
 compileGoGenV1Client := {
-  val status = Process("make testv1", new File(baseDirectory.value + "/client/go/")).!
-  status
+  runCapturingOutput("make testv1", new File(baseDirectory.value + "/client/go/"))
 }
-lazy val compileGoGenV2Client = taskKey[Int]("Compile generated v2 Go clients")
+lazy val compileGoGenV2Client = taskKey[(Int, Seq[String])]("Compile generated v2 Go clients")
 compileGoGenV2Client := {
-  val status = Process("make testv2", new File(baseDirectory.value + "/client/go/")).!
-  status
+  runCapturingOutput("make testv2", new File(baseDirectory.value + "/client/go/"))
 }
 
 // Compile the YBA CLI binary
-lazy val compileYbaCliBinary = taskKey[(Int, Seq[String])]("Compile YBA CLI Binary")
+lazy val compileYbaCliBinary = taskKey[Seq[String]]("Compile YBA CLI Binary")
 compileYbaCliBinary := {
-  var status = 0
-  var completeFileList = Seq.empty[String]
-  var fileList = Seq.empty[String]
-
   ybLog("Generating YBA CLI go binary.")
-
-  val (status1, fileList1) = makeYbaCliPackage("linux", baseDirectory.value)
-  completeFileList = fileList1
-  status = status1
-
-  val (status2, fileList2) = makeYbaCliPackage("darwin", baseDirectory.value)
-  completeFileList = completeFileList ++ fileList2
-  status = status max status2
-
-
-  (status, completeFileList)
+  makeYbaCliPackage("linux", baseDirectory.value) ++
+    makeYbaCliPackage("darwin", baseDirectory.value)
 }
 
 compileYbaCliBinary := ((compileYbaCliBinary) dependsOn versionGenerate).value
 
-def makeYbaCliPackage(goos: String, directory: java.io.File): (Int, Seq[String]) = {
-
-  var status = 0
-  var output = Seq.empty[String]
-  var fileList = Seq.empty[String]
-
-  val processLogger = ProcessLogger(
-    line => output :+= line,
-    line => println(s"Error: $line")
-  )
-  val env = Seq("GOOS" -> goos)
-  val process = Process("make package", new File(directory + "/yba-cli/"), env: _*)
-  status = process.!(processLogger)
-  if (status == 0) {
-    val fileListIndex = output.indexWhere(_.startsWith("Folder path for"))
-    fileList = if (fileListIndex != -1) output.drop(fileListIndex + 1) else Seq.empty[String]
-  } else {
-    fileList = Seq.empty[String]
+def makeYbaCliPackage(goos: String, directory: java.io.File): Seq[String] = {
+  val output = scala.collection.mutable.ListBuffer.empty[String]
+  def record(line: String, isError: Boolean): Unit = output.synchronized {
+    if (isError) {
+      println(s"Error: $line")
+    }
+    output += line
   }
 
-  (status, fileList)
+  val processLogger = ProcessLogger(record(_, false), record(_, true))
+  val env = Seq("GOOS" -> goos)
+  val process = Process("make package", new File(directory + "/yba-cli/"), env: _*)
+  val status = process.!(processLogger)
+  if (status != 0) {
+    throw new RuntimeException(
+      buildError(s"YBA CLI binary build for $goos", status, output.toList))
+  }
+
+  val fileListIndex = output.indexWhere(_.startsWith("Folder path for"))
+  if (fileListIndex != -1) output.drop(fileListIndex + 1).toList else Seq.empty[String]
 }
 
 // Clean the YBA CLI binary
@@ -912,8 +990,15 @@ openApiGenClients := openApiGenClients.dependsOn(Compile/openApiProcessServer).v
 
 lazy val openApiCompileClients = taskKey[Unit]("Compiling openapi v2 clients")
 openApiCompileClients := {
-  compileJavaGenV2Client.value
-  compileGoGenV2Client.value
+  val (javaStatus, javaOutput) = compileJavaGenV2Client.value
+  if (javaStatus != 0) {
+    throw new RuntimeException(
+      buildError("Java v2 client compilation", javaStatus, javaOutput))
+  }
+  val (goStatus, goOutput) = compileGoGenV2Client.value
+  if (goStatus != 0) {
+    throw new RuntimeException(buildError("Go v2 client compilation", goStatus, goOutput))
+  }
   // no compilation or running tests for python client
 }
 
@@ -926,8 +1011,15 @@ swaggerGenClients := {
 
 lazy val swaggerCompileClients = taskKey[Unit]("Compiling swagger v1 clients")
 swaggerCompileClients := {
-  compileJavaGenV1Client.value
-  compileGoGenV1Client.value
+  val (javaStatus, javaOutput) = compileJavaGenV1Client.value
+  if (javaStatus != 0) {
+    throw new RuntimeException(
+      buildError("Java v1 client compilation", javaStatus, javaOutput))
+  }
+  val (goStatus, goOutput) = compileGoGenV1Client.value
+  if (goStatus != 0) {
+    throw new RuntimeException(buildError("Go v1 client compilation", goStatus, goOutput))
+  }
   // no compilation or running tests for python client
 }
 
@@ -977,23 +1069,22 @@ Universal / javaOptions += "-J-XX:+PreserveFramePointer"
 // Disable shutdown hook of ebean to let play manage its lifecycle.
 Universal / javaOptions += "-Debean.registerShutdownHook=false"
 
+// Turn off HotSpot's Base64 encode and decode intrinsics on every CPU. The AVX-512 decode one can
+// write out of bounds on malformed input (CVE-2026-114938). Base64 then runs the bounds-checked
+// Java code, with the same results.
+Universal / javaOptions += "-J-XX:-UseBASE64Intrinsics"
+
 Universal / mappings ++= {
-  val (status, cliFolders) = compileYbaCliBinary.value
-  if (status == 0) {
-    cliFolders.flatMap { folderPath =>
-      val folder = file(folderPath)
-      if (folder.isDirectory) {
-        val targetPath = s"yba-cli/${folder.getName}"
-        val folderMappings = (folder ** "*") pair Path.rebase(folder, targetPath)
-        folderMappings
-      } else {
-        println(s"Warning: $folderPath is not a directory and will not be included in the package.")
-        Nil
-      }
+  compileYbaCliBinary.value.flatMap { folderPath =>
+    val folder = file(folderPath)
+    if (folder.isDirectory) {
+      val targetPath = s"yba-cli/${folder.getName}"
+      val folderMappings = (folder ** "*") pair Path.rebase(folder, targetPath)
+      folderMappings
+    } else {
+      println(s"Warning: $folderPath is not a directory and will not be included in the package.")
+      Nil
     }
-  } else {
-    ybLog("Error generating YBA CLI binary.")
-    Seq.empty
   }
 }
 
@@ -1022,37 +1113,74 @@ runPlatform := {
   Project.extract(newState).runTask(runPlatformTask, newState)
 }
 
-libraryDependencies += "org.yb" % "yb-client" % "0.8.121-SNAPSHOT"
-libraryDependencies += "org.yb" % "ybc-client" % "2.2.0.4-b10"
+// bcpkix-fips and bctls-fips depend on bcutil-fips by version range, and bcutil-fips depends on
+// bc-fips by range, so a plain declaration loses to the range: a build declaring bc-fips 2.1.0
+// was resolving 2.1.3, an uncertified module. Only an override fixes the FIPS module version.
+dependencyOverrides += "org.bouncycastle" % "bc-fips" % bouncyCastleFipsVersion
+dependencyOverrides += "org.bouncycastle" % "bcutil-fips" % bouncyCastleUtilFipsVersion
+
+libraryDependencies += "org.yb" % "yb-client" % "0.8.125-SNAPSHOT"
+libraryDependencies += "org.yb" % "ybc-client" % "2.2.0.4-b13"
 libraryDependencies += "org.yb" % "yb-perf-advisor" % "1.0.0-b35"
+libraryDependencies += "com.yugabyte.troubleshoot" % "perf-advisor-client" % "0.2.0"
 
 libraryDependencies ++= Seq(
   "io.netty" % "netty-tcnative-boringssl-static" % "2.0.54.Final",
-  "io.netty" % "netty-codec-haproxy" % "4.1.135.Final",
+  "io.netty" % "netty-codec-haproxy" % "4.1.139.Final",
   "io.projectreactor.netty" % "reactor-netty-http" % "1.0.39",
   "org.slf4j" % "slf4j-ext" % "1.7.26",
 )
 
 
 dependencyOverrides += "org.reflections" % "reflections" % "0.10.2"
-dependencyOverrides += "io.netty" % "netty-all" % "4.1.135.Final"
-dependencyOverrides += "io.netty" % "netty-codec-http" % "4.1.135.Final"
-dependencyOverrides += "io.netty" % "netty-codec-http2" % "4.1.135.Final"
+dependencyOverrides += "io.netty" % "netty-all" % "4.1.139.Final"
+dependencyOverrides += "io.netty" % "netty-codec-http" % "4.1.139.Final"
+dependencyOverrides += "io.netty" % "netty-codec-http2" % "4.1.139.Final"
 // netty-all does not force these core modules, so they stay at the next-highest
-// requested version (4.1.130) and must be pinned explicitly to reach 4.1.135.
-dependencyOverrides += "io.netty" % "netty-buffer" % "4.1.135.Final"
-dependencyOverrides += "io.netty" % "netty-codec" % "4.1.135.Final"
-dependencyOverrides += "io.netty" % "netty-common" % "4.1.135.Final"
-dependencyOverrides += "io.netty" % "netty-handler" % "4.1.135.Final"
-dependencyOverrides += "io.netty" % "netty-transport" % "4.1.135.Final"
+// requested version (4.1.130) and must be pinned explicitly to reach 4.1.139.
+dependencyOverrides += "io.netty" % "netty-buffer" % "4.1.139.Final"
+dependencyOverrides += "io.netty" % "netty-codec" % "4.1.139.Final"
+dependencyOverrides += "io.netty" % "netty-common" % "4.1.139.Final"
+dependencyOverrides += "io.netty" % "netty-handler" % "4.1.139.Final"
+dependencyOverrides += "io.netty" % "netty-transport" % "4.1.139.Final"
+dependencyOverrides += "io.netty" % "netty-transport-sctp" % "4.1.139.Final"
+
+// Play pulls the at.yawk fork of lz4-java transitively; pinned for CVE-2026-59949,
+// CVE-2026-106451 and GHSA-48mj-8f7c-7qfm.
+dependencyOverrides += "at.yawk.lz4" % "lz4-java" % "1.12.1"
+
+// Google Cloud libraries pull Guava and the OpenTelemetry API/SDK transitively. The OpenTelemetry
+// core modules are released in lockstep and must stay on one version.
+dependencyOverrides += "com.google.guava" % "guava" % "33.7.2-jre"
+val openTelemetryVersion = "1.67.0"
+dependencyOverrides ++= Seq(
+  "io.opentelemetry" % "opentelemetry-api",
+  "io.opentelemetry" % "opentelemetry-context",
+  "io.opentelemetry" % "opentelemetry-common",
+  "io.opentelemetry" % "opentelemetry-sdk",
+  "io.opentelemetry" % "opentelemetry-sdk-common",
+  "io.opentelemetry" % "opentelemetry-sdk-trace",
+  "io.opentelemetry" % "opentelemetry-sdk-metrics",
+  "io.opentelemetry" % "opentelemetry-sdk-logs",
+  "io.opentelemetry" % "opentelemetry-sdk-extension-autoconfigure-spi",
+).map(_ % openTelemetryVersion)
+
+// pac4j 6 pulls spring-core 6.x, but Play forms and spring-security use Spring 5.3 modules.
+// pac4j only needs the core.io resources, which 5.3 has.
+dependencyOverrides += "org.springframework" % "spring-core" % "5.3.39"
+dependencyOverrides += "org.springframework" % "spring-jcl" % "5.3.39"
+
+// cron-utils pulls org.glassfish:javax.el 3.0.0 (CVE-2021-28170), which has no fixed release.
+// The fix shipped as org.glassfish:jakarta.el 3.0.4, which keeps the javax.el package.
+// Hibernate Validator needs an EL implementation at runtime, so swap the artifact.
+excludeDependencies += "org.glassfish" % "javax.el"
+libraryDependencies += "org.glassfish" % "jakarta.el" % "3.0.4"
 
 dependencyOverrides += "junit" % "junit" % "4.13.2" % Test
 
 // Following library versions for jersey, jakarta glassfish, jakarta ws.rs and
-// jackson-module-jaxb-annotations are needed by the openapi java client. The
-// datadog-api-client library also needs them, but the newer versions
-// pulled by datadog-api-client are not compatible with the openapi java client. So
-// fixing these to older versions.
+// jackson-module-jaxb-annotations are needed by the openapi java client, which is not
+// compatible with newer versions. So fixing these to older versions.
 val jerseyVersion = "2.41"
 dependencyOverrides += "org.glassfish.jersey.connectors" % "jersey-apache-connector" % jerseyVersion % Test
 dependencyOverrides += "org.glassfish.jersey.core" % "jersey-client" % jerseyVersion % Test
@@ -1088,11 +1216,13 @@ val pekkoOverrides = pekkoLibs.map(_ % pekkoVersion)
 
 dependencyOverrides ++= pekkoOverrides
 
-val jacksonVersion         = "2.18.6"
+val jacksonVersion         = "2.22.4"
+// jackson-annotations dropped the patch component from 2.20 onward: it publishes 2.20, 2.21,
+// 2.22, so it cannot follow jacksonVersion.
+val jacksonAnnotationsVersion = "2.22"
 
 val jacksonLibs = Seq(
   "com.fasterxml.jackson.core"       % "jackson-core",
-  "com.fasterxml.jackson.core"       % "jackson-annotations",
   "com.fasterxml.jackson.core"       % "jackson-databind",
   "com.fasterxml.jackson.datatype"   % "jackson-datatype-jdk8",
   "com.fasterxml.jackson.datatype"   % "jackson-datatype-jsr310",
@@ -1104,7 +1234,8 @@ val jacksonLibs = Seq(
   "com.fasterxml.jackson.module"     %% "jackson-module-scala",
 )
 
-val jacksonOverrides = jacksonLibs.map(_ % jacksonVersion)
+val jacksonOverrides = jacksonLibs.map(_ % jacksonVersion) :+
+  ("com.fasterxml.jackson.core" % "jackson-annotations" % jacksonAnnotationsVersion)
 
 dependencyOverrides ++= jacksonOverrides
 
@@ -1123,9 +1254,17 @@ val testParallelForks = SettingKey[Int]("testParallelForks",
   "Number of parallel forked JVMs, running tests")
 // Include some CPU headroom in the divisor.
 // Max depends on the IP range.
-def defaultTestParallelForks: Int =
-  math.min(7,
-    math.max(1, (java.lang.Runtime.getRuntime.availableProcessors().toDouble / 1.5).toInt))
+// Also bound by the physical memory: a local provider fork takes ~4GB (3GB heap plus the processes
+// of its universe), and running more forks than the memory fits makes the OOM killer and the
+// thrashing without swap fail tests at random.
+val testForkMemoryGb = 6
+def defaultTestParallelForks: Int = {
+  val memoryGb = java.lang.management.ManagementFactory.getOperatingSystemMXBean
+    .asInstanceOf[com.sun.management.OperatingSystemMXBean]
+    .getTotalMemorySize / (1L << 30)
+  val cpuForks = (java.lang.Runtime.getRuntime.availableProcessors().toDouble / 1.5).toInt
+  math.min(7, math.max(1, math.min(cpuForks, (memoryGb / testForkMemoryGb).toInt)))
+}
 testParallelForks := defaultTestParallelForks
 val testShardSize = SettingKey[Int]("testShardSize",
   "Number of test classes, executed by each forked JVM")
@@ -1133,7 +1272,7 @@ testShardSize := 30
 
 val testLocalShardSize = SettingKey[Int]("testLocalShardSize",
   "Number of local test classes, executed by each forked JVM")
-testLocalShardSize := 2
+testLocalShardSize := 1
 
 val testLocalIpRangeStart = SettingKey[Int]("testLocalIpRangeStart",
   "First loopback IP index for local provider tests (127.0.x.y encoding)")
@@ -1145,23 +1284,56 @@ testLocalIpRangeSize := 35
 
 Global / concurrentRestrictions += Tags.limit(Tags.ForkedTestGroup, testParallelForks.value)
 
-def partitionTests(tests: Seq[TestDefinition], shardSize: Int) =
+def partitionTests(tests: Seq[TestDefinition], shardSize: Int, extraJvmOptions: Seq[String]) =
   tests.sortWith(_.name.hashCode() < _.name.hashCode()).grouped(shardSize).zipWithIndex map {
     case (tests, index) =>
       val options = ForkOptions().withRunJVMOptions(Vector(
         "-Xmx2g", "-XX:MaxMetaspaceSize=600m", "-XX:MetaspaceSize=200m",
         "-Dconfig.resource=application.test.conf"
-      ))
+      ) ++ extraJvmOptions)
       Group("testGroup" + index, tests, SubProcess(options))
   } toSeq
+
+// Per-class wall-clock weights (seconds), from a full 7-fork run on a 16-core/32-thread box where
+// the machine was no longer saturated (average load 8 of 32), so they are close to the intrinsic
+// cost. Used only to order forks longest-first (LPT); unknown classes get a mid default so new
+// tests still schedule fine. Re-profile periodically and refresh when the suite shape changes.
+val localTestDurationWeight: Map[String, Int] = Map(
+  "EditUniverseLocalTest" -> 2282,
+  "SoftwareUpgradeLocalTest" -> 2146,
+  "DRDbScopedLocalTest" -> 1768,
+  "GFlagsUpgradeLocalTest" -> 1704,
+  "SoftwareUpgradeRetryPg15LocalTest" -> 1683,
+  "SoftwareUpgradeRetryLocalTest" -> 1470,
+  "DRDbScopedSwitchoverLocalTest" -> 1275,
+  "NodeOperationsLocalTest" -> 1257,
+  "XClusterLocalTest" -> 1099,
+  "BackupLocalTest" -> 734,
+  "ConfigureDBApiLocalTest" -> 316,
+  "DRLocalTest" -> 302,
+  "AutoMasterFailoverLocalTest" -> 275,
+  "CertRotationLocalTest" -> 170,
+  "TLSToggleTest" -> 71,
+  "UpdateConsistencyLocalTest" -> 62,
+  "RetryableLocalTests" -> 1
+)
+
+def localTestWeight(name: String): Int = {
+  val simple = name.substring(name.lastIndexOf('.') + 1)
+  localTestDurationWeight.getOrElse(simple, 500)
+}
 
 def partitionLocalTests(
     tests: Seq[TestDefinition],
     shardSize: Int,
     ipRangeStart: Int,
-    ipRangeSize: Int) =
-  tests.sortWith(_.name.hashCode() < _.name.hashCode()).grouped(shardSize).zipWithIndex map {
-    case (tests, index) =>
+    ipRangeSize: Int,
+    extraJvmOptions: Seq[String]) = {
+  // Longest-first so the concurrent-fork limit fills with the heaviest work up front (LPT),
+  // instead of hashCode order which previously paired the two slowest classes onto one JVM.
+  val ordered = tests.sortBy(t => -localTestWeight(t.name))
+  ordered.grouped(shardSize).zipWithIndex.map {
+    case (groupTests, index) =>
       val rangeStart = ipRangeStart + index * ipRangeSize
       val rangeEnd = rangeStart + ipRangeSize
       val options = ForkOptions().withRunJVMOptions(Vector(
@@ -1169,17 +1341,48 @@ def partitionLocalTests(
         "-Dconfig.resource=application.test.conf",
         s"-Dyb.local.test.ipRangeStart=$rangeStart",
         s"-Dyb.local.test.ipRangeEnd=$rangeEnd"
-      ))
-      Group("testGroup" + index, tests, SubProcess(options))
-  } toSeq
+      ) ++ extraJvmOptions)
+      Group("testGroup" + index, groupTests, SubProcess(options))
+  }.toSeq
+}
+
+// Path of the file describing the single shared embedded postgres started for the whole run (see
+// SharedEmbeddedPostgres / TestPostgres). Handed to every forked test JVM via a system property.
+def sharedPgConfPath(base: File): String =
+  (base / "shared-embedded-pg.properties").getAbsolutePath
+
+// The shared-server optimization (one embedded postgres + one migration for the whole run, cloned
+// per fork) is on by default. Set YB_SHARED_PG=false to fall back to the old per-fork embedded
+// postgres (each fork starts its own server and migrates it) - useful for debugging or A/B timing.
+val sharedPgEnabled: Boolean = sys.env.getOrElse("YB_SHARED_PG", "true").toBoolean
+
+// JVM options handed to every fork so it can find the shared server; empty when disabled so forks
+// transparently use the embedded fallback.
+def sharedPgJvmOpts(base: File): Seq[String] =
+  if (sharedPgEnabled) Seq(s"-Dyb.test.sharedPgConf=${sharedPgConfPath(base)}") else Seq.empty
+
+// Starts / stops the one shared embedded postgres in the (long-lived) sbt JVM around a test task.
+// The test classpath (which carries the compiled test classes + zonky) is captured at the call
+// site because the ClassLoader sbt passes to forked Setup/Cleanup lacks the test classes.
+def startSharedPg(classpath: Seq[File], confPath: String): Tests.Setup =
+  Tests.Setup(() => SharedPgControl.start(classpath, confPath))
+
+def stopSharedPg(confPath: String): Tests.Cleanup =
+  Tests.Cleanup(() => SharedPgControl.stop(confPath))
 
 Test / parallelExecution := true
 Test / fork := true
 Test / testGrouping := partitionTests(
   (Test / definedTests).value
     .filter(t => !localTestSuiteFilter(t.name)),
-  testShardSize.value
+  testShardSize.value,
+  sharedPgJvmOpts(target.value)
 )
+
+// Where local provider test forks keep the logs of failed tests (the YBA log of the fork and the
+// DB/YB-Controller logs of the failed test's universe), so that CI can archive them.
+def localTestLogDirJvmOpts(base: File): Seq[String] =
+  Seq(s"-Dyb.local.test.logDir=${(base / "local-test-logs").getAbsolutePath}")
 
 // Add local tests only grouping to avoid multiple local tests falling into one bucket.
 TestLocalProviderSuite / parallelExecution := true
@@ -1188,8 +1391,21 @@ TestLocalProviderSuite / testGrouping := partitionLocalTests(
     .filter(t => localTestSuiteFilter(t.name)),
   testLocalShardSize.value,
   testLocalIpRangeStart.value,
-  testLocalIpRangeSize.value
+  testLocalIpRangeSize.value,
+  sharedPgJvmOpts(target.value) ++ localTestLogDirJvmOpts(target.value)
 )
+
+// Start one embedded postgres for the whole test run (shared by every fork) and stop it after.
+// TestQuickSuite/TestRetrySuite reuse Test's (delegated) testGrouping, so their forks receive the
+// same -Dyb.test.sharedPgConf; each suite still needs its own Setup/Cleanup because their
+// testOptions are set with ":=" and do not inherit Test's. Those three suites therefore get theirs
+// further down, *after* the ":=" that would otherwise discard it.
+Test / testOptions ++=
+  (if (sharedPgEnabled)
+     Seq(
+       startSharedPg((Test / fullClasspath).value.map(_.data), sharedPgConfPath(target.value)),
+       stopSharedPg(sharedPgConfPath(target.value)))
+   else Seq.empty)
 
 Test / javaOptions += "-Dconfig.resource=application.test.conf"
 testOptions += Tests.Argument(TestFrameworks.JUnit, "-v", "-q", "-a")
@@ -1210,16 +1426,36 @@ def upgradeRetryTestSuiteFilter(name: String): Boolean = (name startsWith "com.y
 TestLocalProviderSuite / javaOptions += "-Dconfig.resource=application.test.conf"
 TestLocalProviderSuite / testOptions := Seq(Tests.Filter(localTestSuiteFilter))
 TestLocalProviderSuite / testOptions += Tests.Argument(TestFrameworks.JUnit, "-v", "-q", "-a")
+TestLocalProviderSuite / testOptions ++=
+  (if (sharedPgEnabled)
+     Seq(
+       startSharedPg(
+         (TestLocalProviderSuite / fullClasspath).value.map(_.data),
+         sharedPgConfPath(target.value)),
+       stopSharedPg(sharedPgConfPath(target.value)))
+   else Seq.empty)
 testLocal := (TestLocalProviderSuite / test).value
 
 TestQuickSuite / javaOptions += "-Dconfig.resource=application.test.conf"
 TestQuickSuite / testOptions := Seq(Tests.Filter(quickTestSuiteFilter))
 TestQuickSuite / testOptions += Tests.Argument(TestFrameworks.JUnit, "-v", "-q", "-a")
+TestQuickSuite / testOptions ++=
+  (if (sharedPgEnabled)
+     Seq(
+       startSharedPg((TestQuickSuite / fullClasspath).value.map(_.data), sharedPgConfPath(target.value)),
+       stopSharedPg(sharedPgConfPath(target.value)))
+   else Seq.empty)
 testFast := (TestQuickSuite / test).value
 
 TestRetrySuite / javaOptions += "-Dconfig.resource=application.test.conf"
 TestRetrySuite / testOptions := Seq(Tests.Filter(upgradeRetryTestSuiteFilter))
 TestRetrySuite / testOptions += Tests.Argument(TestFrameworks.JUnit, "-v", "-q", "-a")
+TestRetrySuite / testOptions ++=
+  (if (sharedPgEnabled)
+     Seq(
+       startSharedPg((TestRetrySuite / fullClasspath).value.map(_.data), sharedPgConfPath(target.value)),
+       stopSharedPg(sharedPgConfPath(target.value)))
+   else Seq.empty)
 testUpgradeRetry := (TestRetrySuite / test).value
 
 // Skip packaging javadoc for now

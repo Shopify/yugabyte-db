@@ -41,6 +41,7 @@ DECLARE_int32(load_balancer_max_concurrent_moves);
 DECLARE_int32(load_balancer_max_concurrent_moves_per_table);
 DECLARE_int32(load_balancer_min_inbound_remote_bootstraps_per_tserver);
 DECLARE_int64(remote_bootstrap_rate_limit_bytes_per_sec);
+DECLARE_uint32(load_balancer_min_free_disk_space_pct);
 
 namespace yb {
 namespace master {
@@ -57,6 +58,8 @@ struct CBTabletMetadata {
   bool has_badly_placed_leader() {
     return !leader_blacklisted_tablet_servers.empty();
   }
+
+  bool has_over_max_placements() { return !over_max_placements.empty(); }
 
   // Can the TS be added to any of the placements that lack a replica for this tablet.
   bool CanAddTSToMissingPlacements(const std::shared_ptr<TSDescriptor> ts_descriptor) const;
@@ -75,8 +78,23 @@ struct CBTabletMetadata {
   // Set of placement ids that have less replicas available than the configured minimums.
   std::unordered_set<CloudInfoPB, cloud_hash, cloud_equal_to> under_replicated_placements;
 
+  // Set of placement ids that have more replicas than the configured maximums. This is
+  // independent of over-replication: a tablet with exactly num_replicas replicas can still have a
+  // placement block above its maximum (e.g. after the placement policy is changed).
+  std::unordered_set<CloudInfoPB, cloud_hash, cloud_equal_to> over_max_placements;
+
+  // Current running and starting replica counts per placement block.
+  std::unordered_map<CloudInfoPB, size_t, cloud_hash, cloud_equal_to> placement_replica_counts;
+
   // If this tablet has more replicas than the configured number in the PlacementInfoPB.
   bool is_over_replicated;
+
+  // A split parent with at least one running child, so it is about to be deleted. Its replicas
+  // are not counted as load (see PerTableLoadState::GetLoad) and are never moved, but they are
+  // still tracked for under-replication, placement and blacklist handling. Not set for a hidden
+  // parent (PITR, xCluster or CDC retains it, so it is not about to be deleted) or before any
+  // child runs (nothing is counted in the parent's place yet).
+  bool is_split_parent = false;
 
   // Set of tablet server ids that can be candidates for removal, due to tablet being
   // over-replicated. For tablets with placement information, this will be all tablet servers
@@ -92,6 +110,11 @@ struct CBTabletMetadata {
   // table's PlacementInfoPB. This will happen when we change the configuration for the table or
   // the cluster.
   std::set<TabletServerId> wrong_placement_tablet_servers;
+
+  // Set of tablet server ids with a remove of this tablet's replica still in flight. They are
+  // dropped from the load state by RemoveReplica but still host the replica until the remove task
+  // completes, so they must not be picked as a destination for this tablet.
+  std::set<TabletServerId> removal_pending_tablet_servers;
 
   // Set of tablet server ids that have been blacklisted and as such, should not get any more load
   // assigned to them and should be prioritized for removing load.
@@ -123,6 +146,7 @@ struct CBTabletServerMetadata {
     out << Format("Descriptor: $0, ", descriptor->ToString());
     out << Format("running_tablets: $0, ", running_tablets);
     out << Format("starting_tablets: $0, ", starting_tablets);
+    out << Format("split_parent_tablets: $0, ", split_parent_tablets);
     out << Format("leaders: $0, ", leaders);
     out << Format("disabled_by_ts_tablets: $0, ", disabled_by_ts_tablets);
     out << Format("sorted_path_load: $0, ", sorted_path_load_by_tablets_count);
@@ -152,6 +176,10 @@ struct CBTabletServerMetadata {
   // The set of tablet ids that this tablet server is currently starting.
   std::set<TabletId> starting_tablets;
 
+  // The subset of running_tablets and starting_tablets that are split parents about to be
+  // deleted (CBTabletMetadata::is_split_parent). Not counted in this tablet server's load.
+  std::set<TabletId> split_parent_tablets;
+
   // The set of tablet leader ids that this tablet server is currently running.
   std::set<TabletId> leaders;
 
@@ -166,15 +194,22 @@ struct CBTabletServerMetadata {
 struct CBTabletServerGlobalMetadata {
   std::string ToString() {
     return YB_STRUCT_TO_STRING(
-        running_tablets_count, starting_tablets_count, leaders_count, starting_tablets_size);
+        running_tablets_count, starting_tablets_count, split_parents_count, leaders_count,
+        starting_tablets_size, disk_used_bytes, disk_capacity_bytes);
   }
   // Stores global load counts for a tablet server.
   // See definitions of these counts in CBTabletServerMetadata.
   int running_tablets_count = 0;
   int starting_tablets_count = 0;
+  // Replicas of split parents about to be deleted. Included in the two counts above but not in
+  // the global load.
+  int split_parents_count = 0;
   int leaders_count = 0;
   // Size of all starting tablets on this TS, in bytes.
   size_t starting_tablets_size = 0;
+  // Disk usage and capacity summed over the data paths this TS reported in its last heartbeat.
+  uint64_t disk_used_bytes = 0;
+  uint64_t disk_capacity_bytes = 0;
 };
 
 struct Options {
@@ -299,6 +334,16 @@ class GlobalLoadState {
   // Get global leader load for a certain TS.
   int GetGlobalLeaderLoad(const TabletServerId& ts_uuid) const;
 
+  // Heartbeat-reported usage plus the size of the starting replicas.
+  uint64_t GetEstimatedDiskUsedBytes(const TabletServerId& ts_uuid) const;
+
+  // Whether the TS can take additional_bytes and still leave
+  // FLAGS_load_balancer_min_free_disk_space_pct of its capacity free.
+  bool HasFreeDiskSpaceFor(const TabletServerId& ts_uuid, uint64_t additional_bytes) const;
+
+  // For logging: TSs already below FLAGS_load_balancer_min_free_disk_space_pct.
+  std::vector<std::string> DescribeTabletServersLowOnDiskSpace() const;
+
   std::string ToString() {
     std::string out = "{ drive_aware: " + std::to_string(drive_aware_) + ", ts_info: {[";
     for (const auto& ts_info : ts_descs_) {
@@ -307,12 +352,19 @@ class GlobalLoadState {
         out += ", global_load_count: " + per_ts_global_meta_[ts_info->permanent_uuid()].ToString();
       }
     }
-    out += "]}, total_starting_tablets: " + std::to_string(total_starting_tablets_) + " }";
+    out += "]}, total_starting_tablets: " + std::to_string(total_starting_tablets_) +
+           ", num_tablets_in_skipped_tables: " + std::to_string(num_tablets_in_skipped_tables_) +
+           " }";
     return out;
   }
 
   // Used to determine how many tablets are being remote bootstrapped across the cluster.
   int total_starting_tablets_ = 0;
+
+  // Number of tablets in tables this run skipped with a kSkipTableLoadBalancing warning. They are
+  // not in per_ts_global_meta_, so a tserver's global load or leader count can be low by up to
+  // this many. Widens the minimum variance for global tablet moves only.
+  size_t num_tablets_in_skipped_tables_ = 0;
 
   TSDescriptorVector ts_descs_;
 
@@ -371,7 +423,8 @@ class PerTableLoadState {
     GlobalLoadState* global_state_;
   };
 
-  // Get the load for a certain TS.
+  // Get the load for a certain TS: its running and starting replicas, minus the split parents
+  // about to be deleted.
   size_t GetLoad(const TabletServerId& ts_uuid) const;
   size_t GetTabletDriveLoad(const TabletServerId& ts_uuid, const TabletId& tablet_id) const;
   size_t GetPossiblyTransientLoad(const TabletServerId& ts_uuid) const;
@@ -388,6 +441,10 @@ class PerTableLoadState {
   // updating the internal state.
   Status UpdateTablet(TabletInfo* tablet);
 
+  // Flags the tablet as a split parent about to be deleted (CBTabletMetadata::is_split_parent)
+  // and stops counting its replicas in the per tablet server and global load.
+  void MarkAsSplitParent(const TabletId& tablet_id);
+
   virtual void UpdateTabletServer(std::shared_ptr<TSDescriptor> ts_desc);
 
   void SetInitialized() {
@@ -395,7 +452,23 @@ class PerTableLoadState {
     initialized_ = true;
   }
 
-  Result<bool> CanAddTabletToTabletServer(const TabletId& tablet_id, const TabletServerId& to_ts);
+  // Checks whether a replica of tablet_id can be added to to_ts. from_ts is the tserver the
+  // replica is moving from, or empty if this add has no source. Placement block maximums are
+  // enforced here, with one exemption: if from_ts is in the same placement block as to_ts, the
+  // move is allowed even if the block is at its maximum, since the remove that follows restores
+  // the block to its cap (this keeps e.g. blacklist-driven same-block moves from deadlocking).
+  // The exemption does not apply to under-replicated tablets, as no remove follows the add.
+  // Callers must pass from_ts explicitly (empty if none) to make that decision conscious.
+  Result<bool> CanAddTabletToTabletServer(
+      const TabletId& tablet_id, const TabletServerId& to_ts, const TabletServerId& from_ts);
+
+  // Caches the per-block effective maximums from placement_. Must be called once placement_ is
+  // final for the run (see ClusterLoadBalancer::PopulateReplicationInfo).
+  void CachePlacementBlockMaxReplicas();
+
+  // Effective maximum number of replicas for the placement block matching cloud_info (as returned
+  // by GetValidPlacement). Blocks without an explicit maximum are bounded by num_replicas.
+  size_t PlacementBlockMaxReplicas(const CloudInfoPB& cloud_info) const;
 
   // For a TS specified by ts_uuid, this function checks if there is a placement
   // block in placement_info where this TS can be placed. If there doesn't exist
@@ -486,6 +559,7 @@ class PerTableLoadState {
     }
     out << " ] }";
     out << ", num_running_tablets: " << num_running_tablets_;
+    out << ", num_split_parents: " << num_split_parents_;
     out << ", average_tablet_size: " << average_tablet_size_;
     return out.str();
   }
@@ -502,6 +576,11 @@ class PerTableLoadState {
   // determining over-replication, by checking num_replicas, but also for az awareness, by keeping
   // track of the placement block policies between cluster and table level.
   PlacementInfoPB placement_;
+
+  // Effective maximum replicas per placement block of placement_, see
+  // CachePlacementBlockMaxReplicas.
+  std::unordered_map<CloudInfoPB, size_t, cloud_hash, cloud_equal_to>
+      placement_block_max_replicas_;
 
   // Total number of running tablet replicas in the cluster.
   int total_running_ = 0;
@@ -522,6 +601,13 @@ class PerTableLoadState {
   // to potentially bring back down to their proper configured size, if there are more running than
   // expected.
   std::set<TabletId> tablets_over_replicated_;
+
+  // Tablets with a placement block above its maximum that, at analysis time, are neither missing
+  // replicas nor over-replicated, so the maximum violation is repaired by an add-before-remove
+  // move (HandleAddIfOverMaxPlacement). Missing replicas and over-replication are handled first by
+  // their own paths, and the removal path steers over-replicated removals to the offending block.
+  // Membership is not updated as adds happen within a run; tablets_added_ guards re-handling.
+  std::set<TabletId> tablets_over_max_placements_;
 
   // Set of tablet ids that have been determined to have replicas in incorrect placements.
   std::set<TabletId> tablets_wrong_placement_;
@@ -583,6 +669,10 @@ class PerTableLoadState {
 
   int num_running_tablets_ = 0;
 
+  // Running split parents about to be deleted, which are left out of the load (see
+  // MarkAsSplitParent). Included in num_running_tablets_.
+  int num_split_parents_ = 0;
+
   // Average size of a running tablet in the table.
   uint64_t average_tablet_size_ = 0;
 
@@ -600,7 +690,8 @@ class PerTableLoadState {
   DISALLOW_COPY_AND_ASSIGN(PerTableLoadState);
 }; // PerTableLoadState
 
-// Valid tservers should not include blacklisted tservers.
+// Valid tservers should not include blacklisted tservers. Disk space is not considered, so the
+// distribution returned here is not necessarily one the cluster balancer is able to reach.
 using TsTableLoadMap = std::unordered_map<TabletServerId, size_t>;
 Result<TsTableLoadMap> CalculateOptimalLoadDistribution(
     const TSDescriptorVector& valid_tservers, const PlacementInfoPB& placement_info,

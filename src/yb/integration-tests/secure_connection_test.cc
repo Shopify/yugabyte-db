@@ -192,6 +192,16 @@ TEST_F_EX(SecureConnectionTest, ClientCertificates, SecureConnectionWithClientCe
   ASSERT_NOK(CreateBadClient());
 }
 
+// A context cannot present a client certificate when it was given no node name to load one by.
+// The cross-universe xCluster clients pass an empty name deliberately, so this combination is
+// reachable from --node_to_node_encryption_use_client_certificates, not just from miswiring.
+TEST(SecureContextTest, ClientCertificatesRequireNodeName) {
+  auto context =
+      rpc::CreateSecureContext(GetCertsDir(), rpc::UseClientCerts::kTrue, /*node_name=*/"");
+  ASSERT_NOK(context);
+  ASSERT_STR_CONTAINS(context.status().ToString(), "without a node name");
+}
+
 class SecureConnectionVerifyNameOnlyTest : public SecureConnectionTest {
   void SetUp() override {
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_nodes_per_cloud) = 100;
@@ -246,6 +256,11 @@ TEST_F_EX(SecureConnectionTest, Compression, SecureConnectionCompressionTest) {
 class SecureFIPSTest : public SecureConnectionTest {
   void SetUp() override {
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_openssl_require_fips) = true;
+    // Load the FIPS config before YBTest::SetUp() runs curl_global_init(). Since curl 8.23.0
+    // that draws random bytes from OpenSSL, and any fetch before the FIPS config is loaded
+    // activates the non-FIPS "default" provider as a fallback. Servers are unaffected: they
+    // call InitOpenSSL() in Init(), before anything uses curl.
+    rpc::InitOpenSSL();
     SecureConnectionTest::SetUp();
   }
 };

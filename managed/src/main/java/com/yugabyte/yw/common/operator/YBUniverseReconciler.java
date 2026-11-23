@@ -15,13 +15,15 @@ import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase.AllowedTasks;
 import com.yugabyte.yw.common.CustomerTaskManager;
 import com.yugabyte.yw.common.KubernetesUtil;
 import com.yugabyte.yw.common.PlacementInfoUtil;
+import com.yugabyte.yw.common.ProviderInitializer;
+import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.common.backuprestore.ybc.YbcManager;
 import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.common.config.UniverseConfKeys;
 import com.yugabyte.yw.common.gflags.GFlagsUtil;
 import com.yugabyte.yw.common.gflags.SpecificGFlags;
 import com.yugabyte.yw.common.helm.HelmUtils;
-import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil;
+import com.yugabyte.yw.common.metrics.MetricService;
 import com.yugabyte.yw.common.operator.OperatorStatusUpdater.UniverseState;
 import com.yugabyte.yw.common.operator.helpers.OperatorPlacementInfoHelper;
 import com.yugabyte.yw.common.operator.utils.KubernetesEnvironmentVariables;
@@ -36,11 +38,13 @@ import com.yugabyte.yw.forms.CertsRotateParams;
 import com.yugabyte.yw.forms.EncryptionAtRestConfig;
 import com.yugabyte.yw.forms.EncryptionAtRestConfig.OpType;
 import com.yugabyte.yw.forms.EncryptionAtRestKeyParams;
+import com.yugabyte.yw.forms.ExportTelemetryConfigParams;
 import com.yugabyte.yw.forms.KubernetesGFlagsUpgradeParams;
 import com.yugabyte.yw.forms.KubernetesOverridesUpgradeParams;
 import com.yugabyte.yw.forms.KubernetesProviderFormData;
 import com.yugabyte.yw.forms.KubernetesToggleImmutableYbcParams;
 import com.yugabyte.yw.forms.PlatformResults.YBPTask;
+import com.yugabyte.yw.forms.ProxyConfigUpdateParams;
 import com.yugabyte.yw.forms.RollMaxBatchSize;
 import com.yugabyte.yw.forms.SoftwareUpgradeParams;
 import com.yugabyte.yw.forms.TlsToggleParams;
@@ -62,7 +66,6 @@ import com.yugabyte.yw.models.CertificateInfo;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.CustomerTask;
 import com.yugabyte.yw.models.CustomerTask.TargetType;
-import com.yugabyte.yw.models.KmsHistory;
 import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Provider.UsabilityState;
 import com.yugabyte.yw.models.TaskInfo;
@@ -71,6 +74,7 @@ import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.Users;
 import com.yugabyte.yw.models.helpers.DeviceInfo;
 import com.yugabyte.yw.models.helpers.PlacementInfo;
+import com.yugabyte.yw.models.helpers.ProxyConfig;
 import com.yugabyte.yw.models.helpers.TaskType;
 import io.fabric8.kubernetes.api.model.ObjectMeta;
 import io.fabric8.kubernetes.api.model.Secret;
@@ -89,7 +93,6 @@ import io.yugabyte.operator.v1alpha1.ybuniversespec.YcqlPassword;
 import io.yugabyte.operator.v1alpha1.ybuniversespec.YsqlPassword;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
@@ -97,6 +100,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -128,12 +132,12 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
   private final CustomerTaskManager customerTaskManager;
   private final UniverseActionsHandler universeActionsHandler;
   private final YbcManager ybcManager;
+  private final MetricService metricService;
   private final Set<UUID> universeReadySet;
   private final Map<String, String> universeDeletionReferenceMap;
   private final Map<String, UUID> universeTaskMap;
   // Track auto-provider CRs that are currently being created to avoid duplicate creation calls
   private final Set<String> inProgressAutoProviderCRs;
-  private Customer customer;
 
   KubernetesOperatorStatusUpdater kubernetesStatusUpdater;
 
@@ -150,7 +154,8 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
       CustomerTaskManager customerTaskManager,
       OperatorUtils operatorUtils,
       UniverseActionsHandler universeActionsHandler,
-      YbcManager ybcManager) {
+      YbcManager ybcManager,
+      MetricService metricService) {
     this(
         client,
         informerFactory,
@@ -165,7 +170,8 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
         customerTaskManager,
         operatorUtils,
         universeActionsHandler,
-        ybcManager);
+        ybcManager,
+        metricService);
   }
 
   @VisibleForTesting
@@ -183,7 +189,8 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
       CustomerTaskManager customerTaskManager,
       OperatorUtils operatorUtils,
       UniverseActionsHandler universeActionsHandler,
-      YbcManager ybcManager) {
+      YbcManager ybcManager,
+      MetricService metricService) {
 
     super(client, informerFactory, YBUniverse.class, operatorUtils, namespace);
     this.releaseInformer = informerFactory.getSharedIndexInformer(Release.class, client);
@@ -200,6 +207,7 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
     this.inProgressAutoProviderCRs = ConcurrentHashMap.newKeySet();
     this.universeActionsHandler = universeActionsHandler;
     this.ybcManager = ybcManager;
+    this.metricService = metricService;
   }
 
   @VisibleForTesting
@@ -362,6 +370,7 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
       if (TaskInfo.ERROR_STATES.contains(createTaskState)) {
         log.debug("Previous attempt to create Universe {} failed, retrying", ybaUniverseName);
         Universe.delete(u.getUniverseUUID());
+        metricService.markSourceRemoved(cust.getUuid(), u.getUniverseUUID());
         UniverseConfigureTaskParams taskParams =
             createTaskParams(ybUniverse, cust.getUuid(), getProvider(ybUniverse, cust.getUuid()));
         createUniverse(cust.getUuid(), taskParams, ybUniverse);
@@ -818,6 +827,18 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
                     incomingIntent.specificGFlags,
                     true /* isRerun */);
             break;
+          case UpdateProxyConfig:
+            if (checkAndHandleUniverseLock(
+                ybUniverse, universe, OperatorWorkQueue.ResourceAction.NO_OP)) {
+              return;
+            }
+            log.info("Re-running proxy configuration update");
+            kubernetesStatusUpdater.createYBUniverseEventStatus(
+                universe, k8ResourceDetails, TaskType.UpdateProxyConfig.name());
+            taskUUID =
+                updateProxyConfigYbUniverse(
+                    universeDetails, cust, ybUniverse, incomingIntent.getProxyConfig());
+            break;
           case CertsRotateKubernetesUpgrade:
             if (checkAndHandleUniverseLock(
                 ybUniverse, universe, OperatorWorkQueue.ResourceAction.NO_OP)) {
@@ -923,6 +944,19 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
           taskUUID =
               toggleYbcYbUniverse(
                   universeDetails, cust, ybUniverse, ybUniverse.getSpec().getUseYbdbInbuiltYbc());
+        } else if (!Objects.equals(
+            currentUserIntent.getProxyConfig(), incomingIntent.getProxyConfig())) {
+          log.info("Updating proxy configuration");
+          kubernetesStatusUpdater.createYBUniverseEventStatus(
+              universe, k8ResourceDetails, TaskType.UpdateProxyConfig.name());
+          if (checkAndHandleUniverseLock(
+              ybUniverse, universe, OperatorWorkQueue.ResourceAction.NO_OP)) {
+            return;
+          }
+          kubernetesStatusUpdater.updateUniverseState(k8ResourceDetails, UniverseState.EDITING);
+          taskUUID =
+              updateProxyConfigYbUniverse(
+                  universeDetails, cust, ybUniverse, incomingIntent.getProxyConfig());
           // Case with new edits
         } else if (!HelmUtils.equal(
             incomingIntent.universeOverrides, currentUserIntent.universeOverrides)) {
@@ -958,6 +992,22 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
                   ybUniverse,
                   incomingIntent.specificGFlags,
                   false /* isRerun */);
+          // Handle telemetry export config. Placed next to gflags because telemetry is
+          // gflag-adjacent: audit and query log settings are delivered as ysql_pg_conf_csv entries.
+          // The chain applies one operation per pass, so a manifest that changes both gflags and
+          // telemetry performs two sequential rolling operations.
+        } else if (operatorUtils.shouldUpdateTelemetry(universe, ybUniverse)) {
+          log.info("Updating telemetry export config");
+          kubernetesStatusUpdater.createYBUniverseEventStatus(
+              universe,
+              k8ResourceDetails,
+              TaskType.KubernetesConfigureExportTelemetryConfig.name());
+          if (checkAndHandleUniverseLock(
+              ybUniverse, universe, OperatorWorkQueue.ResourceAction.NO_OP)) {
+            return;
+          }
+          kubernetesStatusUpdater.updateUniverseState(k8ResourceDetails, UniverseState.EDITING);
+          taskUUID = updateTelemetryYbUniverse(universeDetails, cust, ybUniverse);
         } else if (!currentUserIntent.ybSoftwareVersion.equals(incomingIntent.ybSoftwareVersion)) {
           log.info("Upgrading software");
           kubernetesStatusUpdater.createYBUniverseEventStatus(
@@ -1081,63 +1131,56 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
       Universe universe,
       YBUniverse ybUniverse,
       KubernetesResourceDetails k8ResourceDetails) {
-    EncryptionAtRest ear = ybUniverse.getSpec().getEncryptionAtRest();
-    if (ear == null) {
-      // No EAR block: leave the universe's EAR state unchanged (disable is via enabled=false).
-      return false;
-    }
-
-    UniverseDefinitionTaskParams details = universe.getUniverseDetails();
-    boolean currentlyEnabled =
-        details.encryptionAtRestConfig != null
-            && details.encryptionAtRestConfig.encryptionAtRestEnabled;
-    KmsHistory activeKey = EncryptionAtRestUtil.getActiveKey(universe.getUniverseUUID());
-    UUID currentConfigUUID = activeKey == null ? null : activeKey.getConfigUuid();
-
-    boolean desiredEnabled = StringUtils.isNotBlank(ear.getKmsConfig()) && earEnabled(ear);
-
-    EncryptionAtRestConfig config = new EncryptionAtRestConfig();
+    OperatorUtils.EarChange change = operatorUtils.getEncryptionAtRestChange(universe, ybUniverse);
+    EncryptionAtRestConfig config;
     String eventTaskName;
-    if (desiredEnabled) {
-      UUID desiredConfigUUID;
-      try {
-        desiredConfigUUID = resolveReadyKmsConfigUuid(ybUniverse, ear.getKmsConfig());
-      } catch (Exception e) {
-        // Never disrupt a running universe with an unusable KMS config. Surface an error and
-        // requeue so it self-heals once the KMS config becomes Ready.
-        log.error(
-            "Cannot resolve KMS config '{}' for EAR change on universe {}: {}",
-            ear.getKmsConfig(),
-            universe.getName(),
-            e.getMessage());
-        kubernetesStatusUpdater.updateUniverseState(
-            k8ResourceDetails, UniverseState.ERROR_UPDATING);
-        workqueue.requeue(
-            OperatorWorkQueue.getWorkQueueKey(ybUniverse.getMetadata()),
-            OperatorWorkQueue.ResourceAction.NO_OP,
-            false);
-        return true;
-      }
-      if (currentlyEnabled && desiredConfigUUID.equals(currentConfigUUID)) {
-        // Already enabled with the same config: nothing to do.
+    switch (change.getType()) {
+      case NONE:
         return false;
-      }
-      config.opType = OpType.ENABLE;
-      config.kmsConfigUUID = desiredConfigUUID;
-      config.encryptionAtRestEnabled = true;
-      eventTaskName = currentlyEnabled ? "MasterKeyRotation" : "EnableEncryptionAtRest";
-    } else {
-      if (!currentlyEnabled) {
-        // Desired disabled and already disabled: nothing to do.
-        return false;
-      }
-      config.opType = OpType.DISABLE;
-      config.encryptionAtRestEnabled = false;
-      config.kmsConfigUUID = currentConfigUUID;
-      eventTaskName = "DisableEncryptionAtRest";
+      case KMS_CONFIG_NOT_READY:
+        {
+          // Never disrupt a running universe with an unusable KMS config. Surface the reason on
+          // the CR and requeue so it self-heals once the KMS config becomes Ready.
+          String errorMessage =
+              String.format(
+                  "Cannot apply encryption at rest change to universe %s: KMS config '%s' is not"
+                      + " usable: %s",
+                  universe.getName(),
+                  ybUniverse.getSpec().getEncryptionAtRest().getKmsConfig(),
+                  change.getKmsConfigError());
+          log.error(errorMessage);
+          kubernetesStatusUpdater.updateUniverseState(
+              k8ResourceDetails, UniverseState.ERROR_UPDATING);
+          kubernetesStatusUpdater.doKubernetesEventUpdate(k8ResourceDetails, errorMessage);
+          workqueue.requeue(
+              OperatorWorkQueue.getWorkQueueKey(ybUniverse.getMetadata()),
+              OperatorWorkQueue.ResourceAction.NO_OP,
+              false);
+          return true;
+        }
+      case ENABLE:
+        config = new EncryptionAtRestConfig();
+        config.opType = OpType.ENABLE;
+        config.kmsConfigUUID = change.getDesiredConfigUUID();
+        config.encryptionAtRestEnabled = true;
+        // An active universe key held under a KMS config other than the desired one gets
+        // re-encrypted under the desired one: name the event accordingly.
+        eventTaskName = change.rotatesMasterKey() ? "MasterKeyRotation" : "EnableEncryptionAtRest";
+        break;
+      case DISABLE:
+        config = new EncryptionAtRestConfig();
+        config.opType = OpType.DISABLE;
+        config.encryptionAtRestEnabled = false;
+        config.kmsConfigUUID = change.getCurrentConfigUUID();
+        eventTaskName = "DisableEncryptionAtRest";
+        break;
+      default:
+        throw new IllegalStateException(
+            "Unhandled encryption at rest change type " + change.getType());
     }
 
-    kubernetesStatusUpdater.createYBUniverseEventStatus(universe, k8ResourceDetails, eventTaskName);
+    kubernetesStatusUpdater.createYBUniverseEventStatus(
+        universe, k8ResourceDetails, TaskType.SetUniverseKey.name());
     if (checkAndHandleUniverseLock(ybUniverse, universe, OperatorWorkQueue.ResourceAction.NO_OP)) {
       return true;
     }
@@ -1145,6 +1188,9 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
     EncryptionAtRestKeyParams keyParams = new EncryptionAtRestKeyParams();
     keyParams.setUniverseUUID(universe.getUniverseUUID());
     keyParams.encryptionAtRestConfig = config;
+    // SetUniverseKey closes the action above and moves the universe out of EDITING when it
+    // finishes; it keys off these resource details being set.
+    keyParams.setKubernetesResourceDetails(k8ResourceDetails);
     UUID taskUUID = universeActionsHandler.setUniverseKey(cust, universe, keyParams);
     log.info("Submitted {} for universe {}, task {}", eventTaskName, universe.getName(), taskUUID);
     universeTaskMap.put(OperatorWorkQueue.getWorkQueueKey(ybUniverse.getMetadata()), taskUUID);
@@ -1155,7 +1201,12 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
     if (ybUniverse.getSpec() == null || ybUniverse.getSpec().getUpgradeOption() == null) {
       return UpgradeOption.ROLLING_UPGRADE;
     }
-    switch (ybUniverse.getSpec().getUpgradeOption().getValue()) {
+    return toUpgradeOption(ybUniverse.getSpec().getUpgradeOption().getValue());
+  }
+
+  /** Maps a CR upgradeOption enum value ("Rolling", "Non-Rolling", "Non-Restart"). */
+  static UpgradeOption toUpgradeOption(String crValue) {
+    switch (crValue) {
       case "Non-Rolling":
         return UpgradeOption.NON_ROLLING_UPGRADE;
       case "Non-Restart":
@@ -1166,8 +1217,15 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
     }
   }
 
-  private static void applyUpgradeOptions(UpgradeTaskParams requestParams, YBUniverse ybUniverse) {
-    requestParams.upgradeOption = getUpgradeOption(ybUniverse);
+  static void applyUpgradeOptions(UpgradeTaskParams requestParams, YBUniverse ybUniverse) {
+    applyUpgradeOptions(requestParams, ybUniverse, getUpgradeOption(ybUniverse));
+  }
+
+  // Rolling batch size and wait times still come from the ybUniverse spec when upgradeOption
+  // overrides the spec's own option.
+  static void applyUpgradeOptions(
+      UpgradeTaskParams requestParams, YBUniverse ybUniverse, UpgradeOption upgradeOption) {
+    requestParams.upgradeOption = upgradeOption;
     if (ybUniverse.getSpec() == null) {
       return;
     }
@@ -1252,6 +1310,30 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
     return upgradeUniverseHandler.upgradeKubernetesOverrides(requestParams, cust, oldUniverse);
   }
 
+  private UUID updateProxyConfigYbUniverse(
+      UniverseDefinitionTaskParams taskParams,
+      Customer cust,
+      YBUniverse ybUniverse,
+      ProxyConfig proxyConfig) {
+    ObjectMapper mapper =
+        Json.mapper()
+            .copy()
+            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+            .configure(SerializationFeature.FAIL_ON_EMPTY_BEANS, false);
+    ProxyConfigUpdateParams requestParams =
+        mapper.convertValue(taskParams, ProxyConfigUpdateParams.class);
+    requestParams.getPrimaryCluster().userIntent.setProxyConfig(proxyConfig);
+    applyUpgradeOptions(requestParams, ybUniverse);
+
+    Universe oldUniverse = resolveExistingUniverseQuietly(cust, ybUniverse).orElse(null);
+    if (oldUniverse == null) {
+      throw new RuntimeException("Universe not found: " + getUniverseName(ybUniverse));
+    }
+
+    requestParams.setUniverseUUID(oldUniverse.getUniverseUUID());
+    return upgradeUniverseHandler.updateProxyConfig(requestParams, cust, oldUniverse);
+  }
+
   private UUID updateGflagsYbUniverse(
       UniverseDefinitionTaskParams taskParams,
       Customer cust,
@@ -1280,6 +1362,43 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
 
     log.info("Upgrade universe with new GFlags");
     return upgradeUniverseHandler.upgradeGFlags(requestParams, cust, oldUniverse);
+  }
+
+  private UUID updateTelemetryYbUniverse(
+      UniverseDefinitionTaskParams taskParams, Customer cust, YBUniverse ybUniverse) {
+    ObjectMapper mapper =
+        Json.mapper()
+            .copy()
+            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+            .configure(SerializationFeature.FAIL_ON_EMPTY_BEANS, false);
+    ExportTelemetryConfigParams requestParams = new ExportTelemetryConfigParams();
+    try {
+      requestParams =
+          mapper.readValue(
+              mapper.writeValueAsString(taskParams), ExportTelemetryConfigParams.class);
+    } catch (Exception e) {
+      log.error("Failed at creating export telemetry config params", e);
+      throw new RuntimeException("Failed to create export telemetry config params", e);
+    }
+    // The full desired state for every export type, with each exporter's TelemetryProvider CR name
+    // resolved to a YBA UUID. modifiedExportTypes is deliberately left alone: the handler computes
+    // it by diffing this against the universe's currently stored config.
+    try {
+      requestParams.setTelemetryConfig(operatorUtils.getDesiredTelemetryConfig(ybUniverse));
+    } catch (Exception e) {
+      log.error("Failed to resolve the desired telemetry config from the universe CR", e);
+      throw new RuntimeException(
+          "Failed to resolve the desired telemetry config: " + e.getMessage(), e);
+    }
+
+    Universe oldUniverse = resolveExistingUniverseQuietly(cust, ybUniverse).orElse(null);
+    if (oldUniverse == null) {
+      throw new RuntimeException("Universe not found: " + getUniverseName(ybUniverse));
+    }
+
+    requestParams.setUniverseUUID(oldUniverse.getUniverseUUID());
+    log.info("Configuring telemetry export for universe {}", oldUniverse.getName());
+    return upgradeUniverseHandler.submitExportTelemetryConfigs(requestParams, cust, oldUniverse);
   }
 
   private UUID upgradeYBUniverse(
@@ -1516,7 +1635,9 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
     // yet resolvable (Creating/Error/missing), we throw so the create is retried until it is Ready
     // rather than silently creating an unencrypted universe.
     EncryptionAtRest ear = ybUniverse.getSpec().getEncryptionAtRest();
-    if (ear != null && StringUtils.isNotBlank(ear.getKmsConfig()) && earEnabled(ear)) {
+    if (ear != null
+        && StringUtils.isNotBlank(ear.getKmsConfig())
+        && OperatorUtils.earEnabled(ear)) {
       try {
         UUID kmsConfigUUID = resolveReadyKmsConfigUuid(ybUniverse, ear.getKmsConfig());
         taskParams.encryptionAtRestConfig = new EncryptionAtRestConfig();
@@ -1537,11 +1658,6 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
     }
 
     return taskParams;
-  }
-
-  private static boolean earEnabled(EncryptionAtRest ear) {
-    // Defaults to true when unset, matching the CRD default.
-    return ear.getEnabled() == null || ear.getEnabled();
   }
 
   // Resolves a KMSConfig CR (by name, in the ybUniverse's namespace) to its YBA config UUID. Throws
@@ -1576,7 +1692,8 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
     return createTaskParams(ybUniverse, customerUUID, provider);
   }
 
-  private UserIntent createUserIntent(
+  @VisibleForTesting
+  protected UserIntent createUserIntent(
       YBUniverse ybUniverse, UUID customerUUID, boolean isCreate, Provider provider) {
     Optional<Universe> optUniverse = Optional.empty();
     if (!isCreate) {
@@ -1600,8 +1717,10 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
         log.error("Provider {} is not ready", provider.getName());
         throw new RuntimeException("Provider " + provider.getName() + " is not ready");
       }
-      userIntent.provider = provider.getUuid().toString();
-      userIntent.providerType = CloudType.kubernetes;
+      ProviderInitializer providerInitializer =
+          Util.newProviderInitializer(
+              userIntent, provider.getUuid(), CloudType.kubernetes, confGetter);
+
       userIntent.replicationFactor =
           ybUniverse.getSpec().getReplicationFactor() != null
               ? ((int) ybUniverse.getSpec().getReplicationFactor().longValue())
@@ -1647,28 +1766,31 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
               ? ((int) ybUniverse.getSpec().getNumNodes().longValue())
               : 0;
       userIntent.ybSoftwareVersion = ybUniverse.getSpec().getYbSoftwareVersion();
-      userIntent.accessKeyCode = "";
+      userIntent.setProxyConfig(toProxyConfig(ybUniverse.getSpec().getProxyConfig()));
+      providerInitializer.setAccessCode("");
 
       // Use new volume fields if any are present, otherwise fall back to old deviceInfo fields
       // If tserverVolume or masterVolume is present, use new fields for both (mutual exclusivity)
       if (ybUniverse.getSpec().getTserverVolume() != null
           || ybUniverse.getSpec().getMasterVolume() != null) {
         // Use new volume fields
-        userIntent.deviceInfo =
-            operatorUtils.mapTserverVolume(ybUniverse.getSpec().getTserverVolume());
-        userIntent.masterDeviceInfo =
-            operatorUtils.mapMasterVolume(ybUniverse.getSpec().getMasterVolume());
+        providerInitializer.setDeviceInfo(
+            operatorUtils.mapTserverVolume(ybUniverse.getSpec().getTserverVolume()));
+        providerInitializer.setMasterDeviceInfo(
+            operatorUtils.mapMasterVolume(ybUniverse.getSpec().getMasterVolume()));
       } else {
         // Use old deviceInfo fields
-        userIntent.deviceInfo = operatorUtils.mapDeviceInfo(ybUniverse.getSpec().getDeviceInfo());
-        userIntent.masterDeviceInfo =
-            operatorUtils.mapMasterDeviceInfo(ybUniverse.getSpec().getMasterDeviceInfo());
+        providerInitializer.setDeviceInfo(
+            operatorUtils.mapDeviceInfo(ybUniverse.getSpec().getDeviceInfo()));
+        providerInitializer.setMasterDeviceInfo(
+            operatorUtils.mapMasterDeviceInfo(ybUniverse.getSpec().getMasterDeviceInfo()));
       }
-      if (userIntent.deviceInfo == null) {
-        userIntent.deviceInfo = operatorUtils.defaultDeviceInfo();
+      if (userIntent.getBaseDeviceInfo(provider.getUuid()) == null) {
+        providerInitializer.setDeviceInfo(operatorUtils.defaultDeviceInfo());
       }
-      if (userIntent.masterDeviceInfo == null) {
-        userIntent.masterDeviceInfo = operatorUtils.defaultMasterDeviceInfo();
+      if (userIntent.getBaseDeviceInfo(provider.getUuid(), UniverseTaskBase.ServerType.MASTER)
+          == null) {
+        providerInitializer.setMasterDeviceInfo(operatorUtils.defaultMasterDeviceInfo());
       }
 
       userIntent.enableYSQL = ybUniverse.getSpec().getEnableYSQL();
@@ -1676,6 +1798,8 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
       userIntent.enableYEDIS = false; // Always disable YEDIS
       userIntent.enableNodeToNodeEncrypt = ybUniverse.getSpec().getEnableNodeToNodeEncrypt();
       userIntent.enableClientToNodeEncrypt = ybUniverse.getSpec().getEnableClientToNodeEncrypt();
+      userIntent.useNodeToNodeClientCerts =
+          Boolean.TRUE.equals(ybUniverse.getSpec().getUseNodeToNodeClientCerts());
       userIntent.setUseYbdbInbuiltYbc(
           Boolean.TRUE.equals(ybUniverse.getSpec().getUseYbdbInbuiltYbc()));
       userIntent.kubernetesOperatorVersion = ybUniverse.getMetadata().getGeneration();
@@ -1686,41 +1810,40 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
       }
 
       // Handle Passwords
+      // enableYSQLAuth/enableYCQLAuth in the spec decide whether auth is enabled - the password
+      // secret only carries the password itself. On create the two must agree, and the secret must
+      // hold a password. On edit the secret is not read at all, so dropping the password from the
+      // spec, or pointing it at a secret that is empty or deleted, is a no-op rather than a silent
+      // change to the stored intent or a failed reconcile of everything else in the spec.
       YsqlPassword ysqlPassword = ybUniverse.getSpec().getYsqlPassword();
-      if (ysqlPassword != null) {
-        Secret ysqlSecret = getSecret(ysqlPassword.getSecretName());
-        resourceTracker.trackDependency(
-            currentReconcileResource, ysqlSecret, currentLocalInstanceUuid);
-        log.trace(
-            "Tracking secret {} as dependency of {}",
-            ysqlSecret.getMetadata().getName(),
-            currentReconcileResource);
-        String password = parseSecretForKey(ysqlSecret, YSQL_PASSWORD_SECRET_KEY);
-        if (password == null) {
-          log.error("could not find ysqlPassword in secret {}", ysqlPassword.getSecretName());
-          throw new RuntimeException(
-              "could not find ysqlPassword in secret " + ysqlPassword.getSecretName());
-        }
-        userIntent.enableYSQLAuth = true;
-        userIntent.ysqlPassword = password;
-      }
       YcqlPassword ycqlPassword = ybUniverse.getSpec().getYcqlPassword();
-      if (ycqlPassword != null) {
-        Secret ycqlSecret = getSecret(ycqlPassword.getSecretName());
-        resourceTracker.trackDependency(
-            currentReconcileResource, ycqlSecret, currentLocalInstanceUuid);
-        log.trace(
-            "Tracking secret {} as dependency of {}",
-            ycqlSecret.getMetadata().getName(),
-            currentReconcileResource);
-        String password = parseSecretForKey(ycqlSecret, YCQL_PASSWORD_SECRET_KEY);
-        if (password == null) {
-          log.error("could not find ycqlPassword in secret {}", ycqlPassword.getSecretName());
-          throw new RuntimeException(
-              "could not find ycqlPassword in secret " + ycqlPassword.getSecretName());
+      String ysqlSecretName = ysqlPassword != null ? ysqlPassword.getSecretName() : null;
+      String ycqlSecretName = ycqlPassword != null ? ycqlPassword.getSecretName() : null;
+      if (isCreate) {
+        userIntent.enableYSQLAuth = ybUniverse.getSpec().getEnableYSQLAuth();
+        validateAuthSpec(userIntent.enableYSQLAuth, ysqlSecretName != null, "YSQL", "ysqlPassword");
+        if (ysqlSecretName != null) {
+          userIntent.ysqlPassword =
+              getPasswordFromSecret(ybUniverse, ysqlSecretName, YSQL_PASSWORD_SECRET_KEY);
         }
-        userIntent.enableYCQLAuth = true;
-        userIntent.ycqlPassword = password;
+        userIntent.enableYCQLAuth = ybUniverse.getSpec().getEnableYCQLAuth();
+        validateAuthSpec(userIntent.enableYCQLAuth, ycqlSecretName != null, "YCQL", "ycqlPassword");
+        if (ycqlSecretName != null) {
+          userIntent.ycqlPassword =
+              getPasswordFromSecret(ybUniverse, ycqlSecretName, YCQL_PASSWORD_SECRET_KEY);
+        }
+      } else {
+        // TODO: PLAT-22298 to actually add support for password rotation.
+        // This will need to call into UniverseYbDbAdminController.setDatabaseCredentials ONLY when
+        // the password is actually being changed, and should happen directly in the edit call
+        // when a new secret is provided.
+        userIntent.enableYSQLAuth = ybUniverse.getSpec().getEnableYSQLAuth();
+        userIntent.enableYCQLAuth = ybUniverse.getSpec().getEnableYCQLAuth();
+        // The password itself is not read here, but the secrets stay registered as dependencies:
+        // this is the only pass that registers them for universes whose CRs predate
+        // operator_resource, and the rows drive HA restore and orphan cleanup.
+        trackPasswordSecret(ybUniverse, ysqlSecretName);
+        trackPasswordSecret(ybUniverse, ycqlSecretName);
       }
       userIntent.specificGFlags = operatorUtils.getGFlagsFromSpec(ybUniverse, provider);
 
@@ -1744,6 +1867,18 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
           isCreate ? UniverseState.ERROR_CREATING : UniverseState.ERROR_UPDATING);
       throw e;
     }
+  }
+
+  private static ProxyConfig toProxyConfig(
+      io.yugabyte.operator.v1alpha1.ybuniversespec.ProxyConfig specProxyConfig) {
+    if (specProxyConfig == null) {
+      return null;
+    }
+    ProxyConfig proxyConfig = new ProxyConfig();
+    proxyConfig.setHttpProxy(specProxyConfig.getHttpProxy());
+    proxyConfig.setHttpsProxy(specProxyConfig.getHttpsProxy());
+    proxyConfig.setNoProxyList(specProxyConfig.getNoProxyList());
+    return proxyConfig;
   }
 
   private PlacementInfo createPlacementInfo(
@@ -2413,17 +2548,58 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
     return client.secrets().inNamespace("default").withName(name).get();
   }
 
-  // parseSecretForKey checks secret data for the key. If not found, it will then check stringData.
-  // Returns null if the key is not found at all.
-  // Also handles null secret.
-  private String parseSecretForKey(Secret secret, String key) {
-    if (secret == null) {
+  // trackPasswordSecret registers the named secret as a dependency of the universe in
+  // operator_resource and returns it, without reading anything out of it. The dependency row is
+  // what HA failover restores the secret from and what marks it orphaned when the CR is deleted,
+  // so it has to be refreshed on every reconcile, including the ones that never read the password.
+  // A reference to a secret that does not exist is logged and ignored - it must not fail the
+  // reconcile of the rest of the spec.
+  private Secret trackPasswordSecret(YBUniverse ybUniverse, @Nullable String secretName) {
+    if (secretName == null) {
       return null;
     }
-    if (secret.getData().get(key) != null) {
-      return new String(Base64.getDecoder().decode(secret.getData().get(key)));
+    Secret secret = getSecret(secretName);
+    if (secret == null) {
+      log.warn(
+          "secret {} referenced by universe {} not found",
+          secretName,
+          ybUniverse.getMetadata().getName());
+      return null;
     }
-    return secret.getStringData().get(key);
+    trackDependency(ybUniverse, secret);
+    return secret;
+  }
+
+  // getPasswordFromSecret returns the password held by the named secret, failing if the secret is
+  // missing or holds no password. Only used when creating a universe - on edit a secret that cannot
+  // be read is ignored, see the note on passwords in createUserIntent.
+  private String getPasswordFromSecret(
+      YBUniverse ybUniverse, String secretName, String passwordKey) {
+    String password =
+        operatorUtils.parseSecretForKey(trackPasswordSecret(ybUniverse, secretName), passwordKey);
+    if (StringUtils.isBlank(password)) {
+      log.error("could not find {} in secret {}", passwordKey, secretName);
+      throw new RuntimeException(
+          String.format("could not find %s in secret %s", passwordKey, secretName));
+    }
+    return password;
+  }
+
+  // validateAuthSpec fails if the spec's auth flag and its password secret reference disagree.
+  // Auth cannot be turned on without a password to set it to, and a password is meaningless
+  // without auth. Only enforced when creating a universe: a universe imported into the operator
+  // by OperatorUtils.createUniverseCr has auth enabled with no secret to reference, because the
+  // import writes no Secret, so enforcing this on the edit path would break that flow.
+  private void validateAuthSpec(
+      boolean authEnabled, boolean passwordSet, String apiName, String specFieldName) {
+    if (authEnabled && !passwordSet) {
+      throw new RuntimeException(
+          String.format("%s must be set when enable%sAuth is true", specFieldName, apiName));
+    }
+    if (!authEnabled && passwordSet) {
+      throw new RuntimeException(
+          String.format("enable%sAuth must be true when %s is set", apiName, specFieldName));
+    }
   }
 
   private void createAutoProviderCR(YBUniverse ybUniverse, String providerName, UUID customerUUID) {
@@ -2761,6 +2937,7 @@ public class YBUniverseReconciler extends AbstractReconciler<YBUniverse> {
   private UserIntent getReadReplicaUserIntent(
       UserIntent userIntent, YBUniverse ybUniverse, UUID customerUUID) {
     UserIntent readReplicaUserIntent = userIntent.clone();
+    readReplicaUserIntent.specificGFlags = SpecificGFlags.constructInherited();
     readReplicaUserIntent.numNodes = ybUniverse.getSpec().getReadReplica().getNumNodes().intValue();
     readReplicaUserIntent.replicationFactor =
         ybUniverse.getSpec().getReadReplica().getReplicationFactor().intValue();

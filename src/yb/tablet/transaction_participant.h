@@ -75,6 +75,10 @@ struct TransactionApplyData {
   HybridTime log_ht = {};
   bool sealed = false;
   TabletId status_tablet = {};
+
+  // TODO(vector_index): May need a rework once large transactions are supported for vector indexes:
+  // the deferred apply of the later chunks would carry this set across vector index list changes,
+  // and StorageSet addresses vector indexes by position. See the TODO in docdb::StorageSet.
   docdb::StorageSet apply_to_storages = docdb::StorageSet::All();
 
   // Owned by running transaction if non-null.
@@ -108,6 +112,7 @@ struct TransactionalBatchData {
 class FastModeTransactionScope;
 
 YB_STRONGLY_TYPED_BOOL(OnlyAbortTxnsNotUsingTableLocks);
+YB_STRONGLY_TYPED_BOOL(WaitForApply);
 
 // TransactionParticipant manages running transactions, i.e. transactions that have intents in
 // appropriate tablet. Since this class manages transactions of tablet there is separate class
@@ -207,9 +212,11 @@ class TransactionParticipant : public TransactionStatusManager {
 
   // Resolve all transactions that were committed or aborted at resolve_at.
   // After this function returns with success:
-  // - All intents of committed transactions will have been applied.
+  // - All committed transactions have local commit time, i.e. their APPLY records are applied.
+  //   With wait_for_apply, their intents are also written to regular DB.
   // - No transactions can be committed with commit time <= resolve_at from that point on..
-  Status ResolveIntents(HybridTime resolve_at, CoarseTimePoint deadline);
+  Status ResolveIntents(
+      HybridTime resolve_at, CoarseTimePoint deadline, WaitForApply wait_for_apply);
 
   // Attempts to abort all transactions that started prior to cutoff time.
   // Waits until deadline, for txns to abort. If not, it returns a TimedOut.
@@ -248,6 +255,9 @@ class TransactionParticipant : public TransactionStatusManager {
   void RecordConflictResolutionScanLatency(MonoDelta latency) override;
 
   size_t GetNumRunningTransactions() const;
+
+  // Whether the transactions in the intents DB were loaded after start.
+  bool AllTransactionsLoaded() const;
 
   void SetMinReplayTxnFirstWriteTimeUpdateCallback(std::function<void(HybridTime)> callback);
 

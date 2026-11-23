@@ -10,9 +10,14 @@
 
 package com.yugabyte.yw.commissioner.tasks;
 
+import static play.mvc.Http.Status.BAD_REQUEST;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.collect.Sets;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.ITask.Abortable;
+import com.yugabyte.yw.commissioner.ITask.CanRollback;
 import com.yugabyte.yw.commissioner.ITask.Retryable;
 import com.yugabyte.yw.commissioner.TaskExecutor.SubTaskGroup;
 import com.yugabyte.yw.commissioner.UserTaskDetails;
@@ -29,6 +34,8 @@ import com.yugabyte.yw.common.KubernetesFullMoveReplicas.KubernetesFullMoveRepli
 import com.yugabyte.yw.common.KubernetesManagerFactory;
 import com.yugabyte.yw.common.KubernetesUtil;
 import com.yugabyte.yw.common.PlacementInfoUtil;
+import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.RedactingService;
 import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.common.backuprestore.ybc.YbcManager;
 import com.yugabyte.yw.common.config.GlobalConfKeys;
@@ -37,10 +44,12 @@ import com.yugabyte.yw.common.helm.HelmUtils;
 import com.yugabyte.yw.common.operator.OperatorStatusUpdater;
 import com.yugabyte.yw.common.operator.OperatorStatusUpdater.UniverseState;
 import com.yugabyte.yw.common.operator.OperatorStatusUpdaterFactory;
+import com.yugabyte.yw.common.utils.ManagedLoadBalancerUtil;
 import com.yugabyte.yw.common.utils.Pair;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.ClusterType;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.ExposingServiceState;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
 import com.yugabyte.yw.models.AvailabilityZone;
 import com.yugabyte.yw.models.Provider;
@@ -51,7 +60,6 @@ import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.PlacementInfo;
 import com.yugabyte.yw.models.helpers.PlacementInfo.PlacementAZ;
 import com.yugabyte.yw.models.helpers.TaskType;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -61,6 +69,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.BiFunction;
@@ -79,16 +88,23 @@ import play.libs.Json;
 @Slf4j
 @Abortable
 @Retryable
-// TODO(PLAT-21484): add @CanRollback here once RollbackEditKubernetesUniverse (PLAT-21484), the
-// state_transition_details safe-window gate (PLAT-21387 / PLAT-21483) and the runtime flag
-// (PLAT-21488) are in place. The TaskRollbackComputer registry already has a placeholder
-// (EditUniverseRollbackComputer) that rejects until those land. Annotating before they exist
-// would surface canRollback=true in the UI/API while the rollback action is not yet implemented.
+@CanRollback
 public class EditKubernetesUniverse extends KubernetesTaskBase {
 
   static final int DEFAULT_WAIT_TIME_MS = 10000;
   private final OperatorStatusUpdater kubernetesStatus;
   private final YbcManager ybcManager;
+
+  /** Task runtime info, inherited by a retry of this task. */
+  public static class RuntimeInfo {
+    /**
+     * Whether the primary cluster edit changes the master addresses. A retry that runs after the
+     * primary cluster is saved sees no placement change, but the read replica still needs the new
+     * addresses.
+     */
+    @JsonProperty("masterAddressesChanged")
+    boolean masterAddressesChanged = false;
+  }
 
   @Inject
   protected EditKubernetesUniverse(
@@ -107,6 +123,14 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
     if (isFirstTry) {
       // Verify the task params.
       verifyParams(UniverseOpType.EDIT);
+      Universe universe = getUniverse();
+      for (Cluster cluster : taskParams().clusters) {
+        Cluster current = universe.getCluster(cluster.uuid);
+        if (current != null && ManagedLoadBalancerUtil.isTurnedOnOrOff(current, cluster)) {
+          throw new PlatformServiceException(
+              BAD_REQUEST, "Managed load balancers are not supported for Kubernetes universes");
+        }
+      }
     }
   }
 
@@ -124,6 +148,19 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
     }
   }
 
+  /**
+   * A read-replica-only edit carries no primary cluster, and run() copies it into the task params
+   * only after the freeze. Complete the checkpoint's target, or a rollback cannot rebuild it.
+   */
+  @Override
+  protected void captureStateTransitionDelta(
+      Universe universe,
+      UniverseDefinitionTaskParams beforeUDTP,
+      UniverseDefinitionTaskParams targetUDTP) {
+    addPrimaryClusterIfMissing(targetUDTP, beforeUDTP);
+    super.captureStateTransitionDelta(universe, beforeUDTP, targetUDTP);
+  }
+
   @Override
   public void run() {
     Throwable th = null;
@@ -138,6 +175,9 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
           lockAndFreezeUniverseForUpdate(
               taskParams().expectedUniverseVersion,
               u -> setCommunicationPortsForNodes(false) /* Txn callback */);
+      // A YBC throttle update may run while this edit is failed, and a retry reuses the first
+      // params, so take the universe's ybcFlags on every run.
+      taskParams().copyYbcFlagsFrom(universe.getUniverseDetails());
 
       kubernetesStatus.startYBUniverseEventStatus(
           universe,
@@ -238,6 +278,11 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
               universeDetails.getPrimaryCluster(),
               masterAddresses,
               existingMasterAddresses);
+      if (mastersAddrChanged) {
+        updateRuntimeInfo(RuntimeInfo.class, info -> info.masterAddressesChanged = true);
+      } else {
+        mastersAddrChanged = getRuntimeInfo(RuntimeInfo.class).masterAddressesChanged;
+      }
       // Updating cluster in DB
       createUpdateUniverseIntentTask(taskParams().getPrimaryCluster());
 
@@ -265,7 +310,32 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
               : (CollectionUtils.isNotEmpty(universe.getUniverseDetails().getReadOnlyClusters())
                   ? universe.getUniverseDetails().getReadOnlyClusters().get(0)
                   : null);
-      if (taskParamsAsyncCluster != null || (asyncCluster != null && mastersAddrChanged)) {
+      ExposingServiceState exposingService =
+          taskParams().getPrimaryCluster().userIntent.enableExposingService;
+      boolean asyncExposingServiceChanged =
+          asyncCluster != null
+              && universeDetails.getClusterByUuid(asyncCluster.uuid)
+                      .userIntent
+                      .enableExposingService
+                  != exposingService;
+      if (taskParamsAsyncCluster != null
+          || (asyncCluster != null && (mastersAddrChanged || asyncExposingServiceChanged))) {
+        // The client does not have to pass the read cluster either, but the tasks that update
+        // its pods read it from taskParams.
+        Cluster taskAsyncCluster =
+            taskParamsAsyncCluster != null
+                ? taskParamsAsyncCluster
+                : taskParams()
+                    .upsertCluster(
+                        asyncCluster.userIntent,
+                        asyncCluster.getPartitions(),
+                        asyncCluster.placementInfo,
+                        asyncCluster.uuid,
+                        asyncCluster.clusterType);
+        if (asyncExposingServiceChanged) {
+          taskAsyncCluster.userIntent = taskAsyncCluster.userIntent.clone();
+          taskAsyncCluster.userIntent.enableExposingService = exposingService;
+        }
         // Use new master addresses for editing read cluster.
         editCluster(
             universe,
@@ -274,9 +344,9 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
             masterAddresses,
             masterAddresses /* existingMasterAddresses */,
             mastersAddrChanged);
-        if (taskParamsAsyncCluster != null) {
+        if (taskParamsAsyncCluster != null || asyncExposingServiceChanged) {
           // Updating cluster in DB
-          createUpdateUniverseIntentTask(asyncCluster);
+          createUpdateUniverseIntentTask(taskAsyncCluster);
         }
       }
 
@@ -389,6 +459,8 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
         canResizeDisk(
             curPlacement, newPlacement, newIntent, curIntent, taskParams().nodeDetailsSet);
     if (!azToDiskSizeChangeMap.isEmpty()) {
+      // Rollback checkpoint: resizing existing pods' disks mutates running servers.
+      createMarkRollbackUnsafeTaskOnce();
       createResizeDiskTask(
           universe.getName(),
           curPlacement,
@@ -409,11 +481,15 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
     boolean instanceTypeChanged = false;
     // TODO Support overriden instance types
     if (!confGetter.getGlobalConf(GlobalConfKeys.usek8sCustomResources)) {
-      if (!curIntent.instanceType.equals(newIntent.instanceType)) {
+      if (!Objects.equals(
+          curIntent.getBaseInstanceType(provider.getUuid()),
+          newIntent.getBaseInstanceType(provider.getUuid()))) {
         List<String> masterResourceChangeInstances = Arrays.asList("dev", "xsmall");
         // If the instance type changed from dev/xsmall to anything else,
         // master resources will also change.
-        if (!isReadOnlyCluster && masterResourceChangeInstances.contains(curIntent.instanceType)) {
+        if (!isReadOnlyCluster
+            && masterResourceChangeInstances.contains(
+                curIntent.getBaseInstanceType(provider.getUuid()))) {
           restartAllPods = true;
         }
         instanceTypeChanged = true;
@@ -519,11 +595,15 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
 
       // Update master addresses to the latest required ones,
       // We use the original unfiltered mastersToAdd which is determined from pi.
+      // Rollback checkpoint: moving masters mutates the existing master quorum.
+      createMarkRollbackUnsafeTaskOnce();
       createMoveMasterTasks(new ArrayList<>(mastersToAdd), new ArrayList<>(mastersToRemove));
     }
 
     if (CollectionUtils.isNotEmpty(fullMoveMasterAZs)
         || CollectionUtils.isNotEmpty(fullMoveTserverAZs)) {
+      // Rollback checkpoint: a full move replaces existing pods and deletes their PVCs.
+      createMarkRollbackUnsafeTaskOnce();
       if (CollectionUtils.isNotEmpty(fullMoveMasterAZs)) {
         // Ybc is not present on master-only nodes currently
         createFullMoveTasks(
@@ -633,6 +713,10 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
       }
     }
 
+    // Rollback checkpoint: the placement update on the master leader starts data migration /
+    // blacklisting of existing tservers (mirrors the VM EditUniverse checkpoint before
+    // createPlacementInfoTask). New-pod scale-up above stays in the safe window.
+    createMarkRollbackUnsafeTaskOnce();
     // Update the blacklist servers on master leader.
     createPlacementInfoTask(tserversToRemove, taskParams().clusters)
         .setSubTaskGroupType(SubTaskGroupType.WaitForDataMigration);
@@ -674,6 +758,13 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
 
     // Now roll all the old pods that haven't been removed and aren't newly added.
     // This will update the master addresses as well as the instance type changes.
+    // A HELM_UPGRADE re-renders the whole per-AZ release (both the master and tserver
+    // StatefulSets), so the storage stanza it generates must reflect the target device info -
+    // which is what the cluster has already converged to after the disk-resize / move steps above.
+    // If we let it render the still-stale persisted intent, Kubernetes rejects the resulting
+    // immutable volumeClaimTemplates update on the (master) StatefulSet. Passing the "use new
+    // device info" flags keeps the rendered storage in sync with the live StatefulSets. Full-move
+    // AZs are excluded via skipAZs, so this only affects the in-place edited AZs.
     if (restartAllPods) {
       upgradePodsTask(
           universe.getName(),
@@ -692,7 +783,9 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
           PodUpgradeParams.DEFAULT,
           null /* ysqlMajorVersionUpgradeState */,
           null /* rootCAUUID */,
-          fullMoveMasterAZs);
+          fullMoveMasterAZs,
+          true /* useNewMasterDeviceInfo */,
+          true /* useNewTserverDeviceInfo */);
 
       upgradePodsTask(
           universe.getName(),
@@ -711,7 +804,9 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
           PodUpgradeParams.DEFAULT,
           null /* ysqlMajorVersionUpgradeState */,
           null /* rootCAUUID */,
-          fullMoveTserverAZs);
+          fullMoveTserverAZs,
+          true /* useNewMasterDeviceInfo */,
+          true /* useNewTserverDeviceInfo */);
     } else if (instanceTypeChanged) {
       upgradePodsTask(
           universe.getName(),
@@ -730,7 +825,9 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
           PodUpgradeParams.DEFAULT,
           null /* ysqlMajorVersionUpgradeState */,
           null /* rootCAUUID */,
-          fullMoveTserverAZs);
+          fullMoveTserverAZs,
+          true /* useNewMasterDeviceInfo */,
+          true /* useNewTserverDeviceInfo */);
     } else if (masterAddressesChanged) {
       // Update master_addresses flag on Master
       // and tserver_master_addrs flag on tserver without restart.
@@ -756,6 +853,25 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
           fullMoveMasterAZs,
           fullMoveTserverAZs,
           true /* includeUniverseNodes */);
+    } else if (primaryCluster.userIntent.enableExposingService != curIntent.enableExposingService) {
+      // Every release renders the primary cluster's expose service setting. This creates or
+      // deletes the LoadBalancer services without restarting pods.
+      upgradePodsNonRestart(
+          universe.getName(),
+          newPlacement,
+          masterAddresses,
+          isReadOnlyCluster ? ServerType.TSERVER : ServerType.EITHER,
+          newIntent.ybSoftwareVersion,
+          universeOverrides,
+          azOverrides,
+          newNamingStyle,
+          isReadOnlyCluster,
+          universe.isYbcEnabled(),
+          ybcManager.getStableYbcVersion(),
+          null /* ysqlMajorVersionUpgradeState */,
+          null /* rootCAUUID */,
+          fullMoveMasterAZs,
+          fullMoveTserverAZs);
     }
 
     // If tservers have been removed, check if some deployments need to be completely
@@ -782,22 +898,10 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
 
     // Clear blacklist
     if (!tserversToRemove.isEmpty() || CollectionUtils.isNotEmpty(fullMoveTserverAZs)) {
-      Duration sleepBeforeStart =
-          confGetter.getConfForScope(
-              universe, UniverseConfKeys.ybEditWaitDurationBeforeBlacklistClear);
-      if (sleepBeforeStart.compareTo(Duration.ZERO) > 0) {
-        createWaitForDurationSubtask(universe, sleepBeforeStart)
-            .setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
-      }
       // Clear blacklist for all pods
       Set<NodeDetails> removedTservers =
           nonFullMoveAZsPodsBiFunction.apply(tserversToRemoveAzMap, null /* fullMoveAZs */);
-
-      createModifyBlackListTask(
-              null /* addNodes */,
-              new ArrayList<>(removedTservers) /* removeNodes */,
-              false /* isLeaderBlacklist */)
-          .setSubTaskGroupType(SubTaskGroupType.ConfigureUniverse);
+      createClearTserverBlacklistTasks(universe, new ArrayList<>(removedTservers));
     }
 
     // Update the universe to the new state.
@@ -1111,11 +1215,10 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
     }
     UUID clusterUUID =
         isReadOnlyCluster ? taskParams().getReadOnlyClusters().get(0).uuid : primaryCluster.uuid;
-    String providerStr =
+    Provider provider =
         isReadOnlyCluster
-            ? taskParams().getReadOnlyClusters().get(0).userIntent.provider
-            : primaryCluster.userIntent.provider;
-    Provider provider = Provider.getOrBadRequest(UUID.fromString(providerStr));
+            ? Util.getSingleProvider(taskParams().getReadOnlyClusters().get(0))
+            : Util.getSingleProvider(primaryCluster);
     boolean isMultiAz = PlacementInfoUtil.isMultiAZ(provider);
     String nodePrefix = taskParams().nodePrefix;
 
@@ -1675,8 +1778,8 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
       if (!newAzUUIDs.contains(az.uuid)) {
         continue;
       }
-      oldDeviceInfo = curIntent.getDeviceInfoForAz(az.uuid, ServerType.TSERVER);
-      newDeviceInfo = newIntent.getDeviceInfoForAz(az.uuid, ServerType.TSERVER);
+      oldDeviceInfo = curIntent.evaluateDeviceInfoForAz(az.uuid, ServerType.TSERVER);
+      newDeviceInfo = newIntent.evaluateDeviceInfoForAz(az.uuid, ServerType.TSERVER);
       if (oldDeviceInfo.onlyVolumeSizeChanged(newDeviceInfo)) {
         tserverDiskSizeChanged = true;
         log.info(
@@ -1685,8 +1788,8 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
             newDeviceInfo.volumeSize,
             az.name);
       }
-      oldDeviceInfo = curIntent.getDeviceInfoForAz(az.uuid, ServerType.MASTER);
-      newDeviceInfo = newIntent.getDeviceInfoForAz(az.uuid, ServerType.MASTER);
+      oldDeviceInfo = curIntent.evaluateDeviceInfoForAz(az.uuid, ServerType.MASTER);
+      newDeviceInfo = newIntent.evaluateDeviceInfoForAz(az.uuid, ServerType.MASTER);
       if (oldDeviceInfo.onlyVolumeSizeChanged(newDeviceInfo)) {
         masterDiskSizeChanged = true;
         log.info(
@@ -1713,7 +1816,7 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
           } else {
             taskParams().getClusterByUuid(clusterUUID).setCurrentMasterFullMoveBatchIndex(index);
           }
-          tf.setTaskParams(Json.toJson(taskParams()));
+          tf.setTaskParams(taskParamsForStorage());
         };
     return getUpdateParentTaskParamsTask(taskInfoConsumer);
   }
@@ -1836,7 +1939,7 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
         continue;
       }
       String newDiskSizeGi =
-          String.format("%dGi", userIntent.getDeviceInfoForAz(azUUID, serverType).volumeSize);
+          String.format("%dGi", userIntent.evaluateDeviceInfoForAz(azUUID, serverType).volumeSize);
 
       // Subtask groups( ignore Errors is false by default )
       SubTaskGroup validateExpansion =
@@ -2125,6 +2228,10 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
     return task;
   }
 
+  private JsonNode taskParamsForStorage() {
+    return RedactingService.filterSecretFieldsForStorage(Json.toJson(taskParams()));
+  }
+
   protected void persistGflagsChecksumInTaskParams(String universeName) {
     if (MapUtils.isNotEmpty(
         taskParams().getPrimaryCluster().getPerAZServerTypeGflagsChecksumMap())) {
@@ -2141,7 +2248,7 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
         log.debug("Persisting gflags checksum");
       }
     }
-    TaskInfo.updateInTxn(getUserTaskUUID(), tf -> tf.setTaskParams(Json.toJson(taskParams())));
+    TaskInfo.updateInTxn(getUserTaskUUID(), tf -> tf.setTaskParams(taskParamsForStorage()));
   }
 
   protected void persistCertChecksumInTaskParams(String universeName) {
@@ -2156,7 +2263,7 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
     for (Cluster newCluster : taskParams().clusters) {
       newCluster.setCertChecksum(certChecksum);
     }
-    TaskInfo.updateInTxn(getUserTaskUUID(), tf -> tf.setTaskParams(Json.toJson(taskParams())));
+    TaskInfo.updateInTxn(getUserTaskUUID(), tf -> tf.setTaskParams(taskParamsForStorage()));
   }
 
   protected void persistOriginalDiskSizeInTaskParams(UUID clusterUUID) {
@@ -2172,14 +2279,15 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
               Map<ServerType, Integer> diskSizes = new HashMap<>();
               diskSizes.put(
                   ServerType.MASTER,
-                  cluster.userIntent.getDeviceInfoForAz(azUUID, ServerType.MASTER).volumeSize);
+                  cluster.userIntent.evaluateDeviceInfoForAz(azUUID, ServerType.MASTER).volumeSize);
               diskSizes.put(
                   ServerType.TSERVER,
-                  cluster.userIntent.getDeviceInfoForAz(azUUID, ServerType.TSERVER).volumeSize);
+                  cluster.userIntent.evaluateDeviceInfoForAz(azUUID, ServerType.TSERVER)
+                      .volumeSize);
               originalDiskSizeMap.put(azUUID, diskSizes);
             });
     taskParams().getClusterByUuid(cluster.uuid).setOriginalDiskSize(originalDiskSizeMap);
-    TaskInfo.updateInTxn(getUserTaskUUID(), tf -> tf.setTaskParams(Json.toJson(taskParams())));
+    TaskInfo.updateInTxn(getUserTaskUUID(), tf -> tf.setTaskParams(taskParamsForStorage()));
   }
 
   private void createCheckNodeSafeToDeleteTasks(
@@ -2241,9 +2349,9 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
             newCluster.placementInfo, newCluster.clusterType == ClusterType.ASYNC);
     for (Entry<UUID, Map<String, String>> entry : newPlacement.configs.entrySet()) {
       DeviceInfo taskDeviceInfo =
-          newCluster.userIntent.getDeviceInfoForAz(entry.getKey(), ServerType.TSERVER);
+          newCluster.userIntent.evaluateDeviceInfoForAz(entry.getKey(), ServerType.TSERVER);
       DeviceInfo existingDeviceInfo =
-          currCluster.userIntent.getDeviceInfoForAz(entry.getKey(), ServerType.TSERVER);
+          currCluster.userIntent.evaluateDeviceInfoForAz(entry.getKey(), ServerType.TSERVER);
       if (taskDeviceInfo != null
           && existingDeviceInfo != null
           && !taskDeviceInfo.equals(existingDeviceInfo)) {
@@ -2251,9 +2359,9 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
         tserverVolumeChanged = true;
       }
       DeviceInfo taskMasterDeviceInfo =
-          newCluster.userIntent.getDeviceInfoForAz(entry.getKey(), ServerType.MASTER);
+          newCluster.userIntent.evaluateDeviceInfoForAz(entry.getKey(), ServerType.MASTER);
       DeviceInfo existingMasterDeviceInfo =
-          currCluster.userIntent.getDeviceInfoForAz(entry.getKey(), ServerType.MASTER);
+          currCluster.userIntent.evaluateDeviceInfoForAz(entry.getKey(), ServerType.MASTER);
       if (taskMasterDeviceInfo != null
           && existingMasterDeviceInfo != null
           && !taskMasterDeviceInfo.equals(existingMasterDeviceInfo)) {

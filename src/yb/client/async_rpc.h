@@ -68,11 +68,15 @@ struct AsyncRpcData {
   bool allow_local_calls_in_curr_thread = false;
   bool need_consistent_read = false;
   bool skip_intents = false;
+  // Read this RPC's ops at in_txn_limit instead of the transaction read time.
+  bool read_at_in_txn_limit = false;
+  // Serve this RPC's reads as snapshot reads even in a SERIALIZABLE transaction.
+  bool force_snapshot_read = false;
   ThreadSafeArenaPtr arena;
   InFlightOps ops;
   bool need_metadata = false;
   bool use_async_write = false;
-  OpId pending_async_write_op_id = OpId::Invalid();
+  OpIds pending_async_write_op_ids = {};
 };
 
 struct FlushExtraResult {
@@ -104,7 +108,13 @@ class AsyncRpc : public rpc::Rpc, public TabletRpc {
   const RemoteTablet& tablet() const { return *tablet_invoker_.tablet(); }
   const InFlightOps& ops() const { return ops_; }
 
+  const ash::WaitStateInfoPtr& wait_state() const { return wait_state_; }
+
   std::shared_ptr<tserver::TabletServerServiceProxy> ts_proxy() const { return ts_proxy_; }
+
+  // Whether the call got a response. If not, the response must not be read: the handler of a timed
+  // out local call could still be filling it.
+  bool HasResponse() const;
 
  protected:
   void Finished(const Status& status) override;
@@ -128,6 +138,8 @@ class AsyncRpc : public rpc::Rpc, public TabletRpc {
 
   // Is this a local call?
   bool IsLocalCall() const;
+
+  rpc::RpcController* PrepareController() override;
 
   Status CheckResponseCount(
       const char* op, const char* name, size_t found, size_t expected);
@@ -168,6 +180,8 @@ class AsyncRpcBase : public AsyncRpc {
   bool RefreshMetaCacheWithResponse() override;
 
   void SetRequestRaftConfigOpidIndex(int64_t opid_index) override;
+
+  bool AppliedBeforeReplication() const override { return req_.use_async_write(); }
 
   virtual std::string GetRpcName() = 0;
 
@@ -215,6 +229,8 @@ class ReadRpc : public AsyncRpcBase<tserver::LWReadRequestPB, tserver::LWReadRes
 
   std::string GetRpcName() override { return "Read"; }
 
+  bool AppliedBeforeReplication() const override;
+
  private:
   Status SwapResponses(RefCntBuffer data_holder) override;
   void CallRemoteMethod() override;
@@ -227,7 +243,8 @@ class WaitForAsyncWriteRpc : public rpc::Rpc, public TabletRpc {
   // original parent for tracking purposes.
   WaitForAsyncWriteRpc(
       const BatcherPtr& batcher, TabletId tracking_tablet_id, PartitionKey partition_key,
-      const std::shared_ptr<const YBTable>& table, const OpId& op_id);
+      const std::shared_ptr<const YBTable>& table, const OpId& op_id,
+      const ash::WaitStateInfoPtr& issuing_wait_state);
 
   ~WaitForAsyncWriteRpc() = default;
 
@@ -247,7 +264,7 @@ class WaitForAsyncWriteRpc : public rpc::Rpc, public TabletRpc {
 
  private:
   void OnKeyLookup(const Result<internal::RemoteTabletPtr>& result);
-  void FinishOrRetry(Status&& status);
+  void FinishOrRetry(Status&& status, bool allow_retry = true);
 
   const TabletId tracking_tablet_id_;
   const PartitionKey partition_key_;
@@ -257,6 +274,9 @@ class WaitForAsyncWriteRpc : public rpc::Rpc, public TabletRpc {
   TabletInvoker tablet_invoker_;
   tserver::WaitForAsyncWriteRequestPB req_;
   tserver::WaitForAsyncWriteResponsePB resp_;
+
+  // Owns a copy of the issuing statement's ASH metadata, so we can adopt it when we send this RPC.
+  ash::WaitStateInfoPtr wait_state_;
 
   rpc::RpcCommandPtr retained_self_;
 };

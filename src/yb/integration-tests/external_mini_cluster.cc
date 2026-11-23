@@ -32,6 +32,8 @@
 
 #include "yb/integration-tests/external_mini_cluster.h"
 
+#include <stdlib.h>
+
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -567,7 +569,10 @@ Result<ExternalMasterPtr> ExternalMiniCluster::StartMaster(
       Format("--transaction_table_num_tablets=$0", NumTabletsPerTransactionTable(opts_)));
   // For sanitizer builds, it is easy to overload the master, leading to quorum changes.
   // This could end up breaking ever trivial DDLs like creating an initial table in the cluster.
-  if (IsSanitizer()) {
+  // Don't override a value explicitly set by the test.
+  if (IsSanitizer() && std::none_of(flags.begin(), flags.end(), [](const auto& flag) {
+        return flag.starts_with("--leader_failure_max_missed_heartbeat_periods=");
+      })) {
     flags.push_back("--leader_failure_max_missed_heartbeat_periods=10");
   }
   if (opts_.enable_ysql) {
@@ -1312,10 +1317,14 @@ Status ExternalMiniCluster::StartMasters() {
   // TEST_master_min_live_tservers_before_initdb does not deadlock against tservers that
   // haven't been started yet. See the comment block in Start() for details.
 
-  // Trigger an election to avoid an unnecessary 3s wait on every cluster startup.
+  // Trigger an election to avoid an unnecessary 3s wait on every cluster startup. Masters that
+  // already elected a leader on their own (quick_leader_election_on_create) skip it, so it does
+  // not depose that leader.
   if (!masters_.empty()) {
     WARN_NOT_OK(WaitForMastersToCommitUpTo(0), "Masters did not commit opid 0 in time");
-    WARN_NOT_OK(StartElection(RandomElement(masters_).get()), "Could not start election");
+    WARN_NOT_OK(
+        StartElection(RandomElement(masters_).get(), /* initial_election = */ true),
+        "Could not start election");
   }
 
   return Status::OK();
@@ -1387,14 +1396,14 @@ Result<bool> ExternalMiniCluster::is_ts_stale(int ts_idx, MonoDelta deadline) {
   bool is_stale = false, is_ts_found = false;
   for (int i = 0; i < resp.servers_size(); i++) {
     if (!resp.servers(i).has_instance_id()) {
-      return STATUS_SUBSTITUTE(
+      return STATUS_FORMAT(
         Uninitialized,
         "ListTabletServers RPC returned a TS with uninitialized instance id."
       );
     }
 
     if (!resp.servers(i).instance_id().has_permanent_uuid()) {
-      return STATUS_SUBSTITUTE(
+      return STATUS_FORMAT(
         Uninitialized,
         "ListTabletServers RPC returned a TS with uninitialized UUIDs."
       );
@@ -1407,7 +1416,7 @@ Result<bool> ExternalMiniCluster::is_ts_stale(int ts_idx, MonoDelta deadline) {
   }
 
   if (!is_ts_found) {
-    return STATUS_SUBSTITUTE(
+    return STATUS_FORMAT(
         NotFound,
         "Given TS not found in ListTabletServers RPC."
     );
@@ -1439,7 +1448,8 @@ string ExternalMiniCluster::GetBindIpForTabletServer(size_t index) const {
     return Format("127.0.0.$0", index + 1); // Use default 127.0.0.x IPs.
 #else
     const pid_t p = getpid();
-    return Format("127.$0.$1.$2", (p >> 8) & 0xff, p & 0xff, index);
+    // Start the last octet at 1: 127.0.0.0 is unusable and is produced when pid % 65536 == 0.
+    return Format("127.$0.$1.$2", (p >> 8) & 0xff, p & 0xff, index + 1);
 #endif
   } else {
     return "127.0.0.1";
@@ -2291,13 +2301,14 @@ uint16_t ExternalMiniCluster::AllocateFreePort() {
   return GetFreePort(&free_port_file_locks_.back());
 }
 
-Status ExternalMiniCluster::StartElection(ExternalMaster* master) {
+Status ExternalMiniCluster::StartElection(ExternalMaster* master, bool initial_election) {
   auto master_sock = master->bound_rpc_addr();
   auto master_proxy = std::make_shared<ConsensusServiceProxy>(proxy_cache_.get(), master_sock);
 
   RunLeaderElectionRequestPB req;
   req.set_dest_uuid(master->uuid());
   req.set_tablet_id(yb::master::kSysCatalogTabletId);
+  req.set_initial_election(initial_election);
   RunLeaderElectionResponsePB resp;
   RpcController rpc;
   rpc.set_timeout(opts_.timeout);
@@ -2664,7 +2675,15 @@ Status ExternalTabletServer::Launch(
     flags.Add(flag_value.first, flag_value.second);
   }
 
-  return StartProcess(flags.value());
+  // The standalone backends that initdb runs get no explicit port, so pre-PG12 servers derive
+  // their System V shared memory key from the compiled in default port. All tablet servers of
+  // the cluster run initdb at the same time and would then share a single key, which can make
+  // initdb fail with "pre-existing shared memory block is still in use". The child process
+  // inherits this environment, giving each of them its own key.
+  setenv("PGPORT", std::to_string(pgsql_rpc_port_).c_str(), /* overwrite */ 1);
+  auto status = StartProcess(flags.value());
+  unsetenv("PGPORT");
+  return status;
 }
 
 Status ExternalTabletServer::BuildServerStateFromInfoPath() {
@@ -2732,6 +2751,26 @@ Status ExternalTabletServer::SetNumDrives(uint16_t num_drives) {
   num_drives_ = num_drives;
   data_dirs_ = FsDataDirs(root_dir_, "tserver", num_drives_);
   return Status::OK();
+}
+
+void ExternalTabletServer::Shutdown(
+    SafeShutdown safe_shutdown, RequireExitCode0 require_exit_code_0) {
+  auto postmaster_pid = PostmasterPid();
+  ExternalDaemon::Shutdown(safe_shutdown, require_exit_code_0);
+  if (!postmaster_pid.ok()) {
+    return;
+  }
+  // Killing the tablet server does not reap postgres: it gets reparented and only exits
+  // asynchronously in response to its parent death signal. Wait for it, otherwise a following
+  // Restart() races with an orphan postmaster that still holds the YSQL port and keeps writing to
+  // the pg_data directory.
+  const auto pid = *postmaster_pid;
+  const auto pid_file = JoinPathSegments(GetRootDir(), "pg_data", "postmaster.pid");
+  WARN_NOT_OK(
+      WaitFor(
+          [pid, &pid_file] { return kill(pid, 0) != 0 || !Env::Default()->FileExists(pid_file); },
+          30s * kTimeMultiplier, Format("Waiting for postmaster $0 to exit", pid)),
+      LogPrefix() + "Postmaster did not exit");
 }
 
 Result<pid_t> ExternalTabletServer::PostmasterPid() {

@@ -249,14 +249,14 @@ class Messenger : public ProxyContext {
 
   void UnregisterAllServices();
 
-  void ShutdownThreadPools();
-
   // Queue a call for transmission. This will pick the appropriate reactor, and enqueue a task on
   // that reactor to assign and send the call.
   void QueueOutboundCall(OutboundCallPtr call) override;
 
   // Invoke the RpcService to handle a call directly.
-  void Handle(InboundCallPtr call, Queue queue) override;
+  void Handle(InboundCallPtr call, Queue queue);
+
+  void HandleLocal(LocalYBInboundCallPtr call, Queue queue) override;
 
   const Protocol& DefaultProtocol() override { return listen_protocol_; }
   const Protocol& UncompressedProtocol() override { return uncompressed_protocol_; }
@@ -379,6 +379,8 @@ class Messenger : public ProxyContext {
   Reactor* RemoteToReactor(const Endpoint& remote, uint32_t idx = 0);
   Status Init(const MessengerBuilder &bld);
 
+  void ShutdownThreadPools();
+
   void BreakConnectivity(const IpAddress& address, bool incoming, bool outgoing);
   void RestoreConnectivity(const IpAddress& address, bool incoming, bool outgoing);
 
@@ -416,7 +418,6 @@ class Messenger : public ProxyContext {
   RpcEndpointMap rpc_endpoints_;
 
   std::vector<std::unique_ptr<Reactor>> reactors_;
-  LocalYBInboundCallTracker local_call_tracker_;
 
   const scoped_refptr<MetricEntity> metric_entity_;
   const scoped_refptr<Histogram> outgoing_queue_time_;
@@ -447,6 +448,7 @@ class Messenger : public ProxyContext {
 
   IoThreadPool io_thread_pool_;
   Scheduler scheduler_;
+  LocalYBInboundCallTracker local_call_tracker_;
 
   size_t thread_pool_workers_limit_;
 
