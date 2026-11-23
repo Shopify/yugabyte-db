@@ -246,13 +246,13 @@ never squashed.
 
 ## Upstream tooling
 
-`upstream.py` has two commands: `status`, which shows where each change `master-shopify`
-carries stands upstream, and `submit <fork-pr>`, which performs the shopify-upstream-pr
-skill's steps under the developer's own `gh` login. `sync`, which will rebuild
-`master-shopify` on a newer upstream commit as AGENTS.md describes, does not exist yet; until
-it does, no sync runs. Exit codes for both commands: 0, 2 for usage errors, 1 otherwise;
-`submit` also exits 4 when it stops for the developer. `test_upstream.py` and
-`test_upstream_submit.py` run under the same `unittest discover` command as above.
+`upstream.py` has three commands: `status`, which shows where each change `master-shopify`
+carries stands upstream; `submit <fork-pr>`, which performs the shopify-upstream-pr skill's
+steps under the developer's own `gh` login; and `sync`, which rebuilds `master-shopify` on a
+newer upstream commit as AGENTS.md describes and opens the result as a PR. Exit codes: 0, 2 for
+usage errors, 1 otherwise; `submit` and `sync` also exit 4 when they stop for the developer.
+`test_upstream.py`, `test_upstream_submit.py` and `test_upstream_sync.py` run under the same
+`unittest discover` command as above.
 
 ### status
 
@@ -275,7 +275,7 @@ earlier syncs adopted come from the `Dropped: #N (upstream #M)` trailers of ever
 reachable from `origin/master-shopify` but not from the upstream ref, since a sync's merge
 falls behind the merge base once the next sync lands. Every other commit is a
 landing: the fork PR its `(#N)` subject names; else the merged fork PRs its
-`Shopify-PR: #55 #58` trailer names, which `sync` will write when it replays a landing that had
+`Shopify-PR: #55 #58` trailer names, which `sync` writes when it replays a landing that had
 no `(#N)`, such as a merge landing replayed with `cherry-pick -m 1`; else every merged fork
 PR whose `mergeCommit` it is (a stack merge); else unidentified. A PR is fork-only with the
 `upstream: skip` label, which decides: a `[shopify-only]` title without the label counts as
@@ -421,6 +421,98 @@ closed one is refused; an existing PR with no known upstream issue is refused, s
 one would duplicate the issue it cites; an existing `Upstream issue:` comment or private link
 is not written again, and a newest `Upstream:` comment naming an open or landed PR ends the
 run before anything is written.
+
+### sync
+
+```bash
+python3 .agents/scripts/shopify/upstream.py sync
+python3 .agents/scripts/shopify/upstream.py sync --to <upstream sha> --yes
+python3 .agents/scripts/shopify/upstream.py sync --continue --to <upstream sha>
+python3 .agents/scripts/shopify/upstream.py sync --abort
+```
+
+`sync` runs in a full fork checkout: `--repo-path` (default: the checkout containing the
+script) must have `origin` pointing at `Shopify/yugabyte-db`, must not be sparse
+(`core.sparseCheckout`), and `gh auth status` must succeed. Unless `--no-fetch`, it fetches
+as `status` does. `--to <ref>` names the upstream commit to sync to (default: the tip of
+`refs/shopify/upstream-master`); it must be on upstream master. When `origin/master-shopify`
+already contains it, there is nothing to sync and the run exits 0.
+
+It derives the plan as `status` does, against that commit. Any commit on the first-parent line
+that no merged fork PR accounts for, a merge commit that is neither a sync point nor a landing
+included, refuses the run until it is attributed. A landing all of whose PRs have landed
+upstream is dropped; every other landing is carried: not submitted, open, closed,
+restructured, fork-only, and those whose upstream PR cannot be read, each of which is a warning.
+
+The developer's branch and tree are never touched. The candidate is the branch
+`shopify-sync/<sha>` (the upstream commit's first 12 characters) in a new worktree,
+`<checkout>/../yugabyte-db-sync-<sha>`. It starts at the upstream commit, then `git merge -s
+ours --no-ff` merges the old `master-shopify` with the message `Sync master-shopify to upstream
+<sha>` and the trailers `Old-master-shopify: <sha>` and one `Dropped: #<fork PR> (upstream
+#<upstream PR>)` per drop; the run checks that `status` classifies that merge as a sync. It
+then replays the carried landings oldest first with their messages, authors and author dates
+unchanged and no `-x`: `git cherry-pick` for a squash landing, and `git cherry-pick -m 1` for a
+merge landing (a stack merge). GitHub's `mergeCommit` names only the original landing, so a
+replay whose subject has no `(#N)` naming its PR, and whose message has no `Shopify-PR:`
+trailer naming all its PRs, gets a `Shopify-PR: #a #b` trailer; a conflict resolution the
+developer committed gets it on `--continue`. Without it the next sync would find the replay
+unidentified. A candidate that already exists, in a worktree, as a local branch or on `origin`,
+is refused without `--continue`.
+
+A conflict stops the run with exit 4, the conflicting paths and the steps: resolve them in the
+worktree, `git add`, `git cherry-pick --continue`, then rerun with `--continue`. When
+upstream's version should win instead, run `git cherry-pick --abort` in the worktree and rerun
+with `--continue --skip '#<fork PR>'` (repeatable; `70` and `#70` both work): the landing is
+recorded as skipped after a conflict, and the PR body's warnings say it conflicted on upstream
+and was skipped. `--skip` names only the conflicting pick the run stopped on, after its pick is
+aborted; any other PR is a usage error. A landing that applies empty, because upstream already
+has the change, also stops: when upstream took an equivalent fix, run `git cherry-pick --skip`
+in the worktree and rerun with `--continue`; the landing is then neither carried nor dropped,
+so `status` reports its PR as neither carried nor adopted until it has a disposition.
+`--continue` derives the plan again for the same upstream commit (every rerun command it prints
+names it with `--to`), refuses when `master-shopify` or the drops changed since the candidate
+was built, matches the commits after the sync merge to the planned landings in order, treating
+the ones in between as skipped, and replays the rest. A commit pairs with the landing whose
+replay the tool recorded as that commit; a pick the developer committed (a resolved conflict)
+pairs by subject and author date, and for a landing that needs one its `Shopify-PR:` trailer.
+Every rerun and recovery command names the script and the checkout (`--repo-path`) by absolute
+path, so it works from the candidate worktree the conflict steps `cd` into. A conflicted pick
+that was aborted rather than resolved is picked again unless `--skip` names it; an empty pick
+is skipped. The replays, the picks that conflicted and those skipped are kept in
+`shopify-sync.json` in the worktree's git directory; a worktree added again from the branch
+reports earlier conflicts as unknown. A candidate checked out in the developer's own checkout
+is refused. `--abort` removes the worktree and the local branch, and deletes the branch on
+`origin` when it was pushed only after asking (`--yes` deletes it; without a terminal it prints
+the `git push origin --delete` command); without `--to` it aborts the only local candidate.
+
+The run then shows the upstream commit, the old `master-shopify`, each carried landing (old and
+new SHA), each drop, the conflicts resolved and the warnings, and asks `Push shopify-sync/<sha>
+and open its PR against master-shopify? [y/N]`. `--yes` skips the question; without a terminal
+or `--yes` it exits 4 with the `--continue --yes` rerun command. After the answer it checks
+that the branch still points at the commit it showed, refusing when the candidate changed while
+the question was open, and pushes that commit explicitly (`git push origin
+<sha>:refs/heads/shopify-sync/<sha>`), never forcing: when `origin` has a version that is not
+an ancestor of the candidate, it refuses. It creates the `sync` label when the fork lacks it
+and opens a draft PR against `master-shopify` titled `[shopify-only] Build: Sync master-shopify
+to upstream <sha>`, labelled `upstream: skip` and `sync`; when the branch already has an open
+PR against `master-shopify` whose head is in `Shopify/yugabyte-db` itself, it updates that PR's
+body instead, so a rerun with `--continue` pushes and refreshes it. Same-named branches in
+other forks and PRs against other bases are ignored. The body has a summary, the upstream
+commit, tables of the dropped and carried PRs (with whether each pick conflicted), a `git
+range-diff` of each replay against its original landing (capped at 200 lines each), the
+warnings, and the landing rule. The body stays under 60,000 characters: each range-diff first
+gets a placeholder with the command that shows it, failed ones included, and outputs replace
+placeholders in order while they fit; when even the placeholders do not fit, the range-diffs
+left out are named in one "Omitted" block. A body still over the cap, with every range-diff
+omitted, is refused before anything is pushed. A merge landing's range-diff uses
+`--diff-merges=first-parent`, which needs git 2.48 or later; a range-diff that fails is
+replaced by its command and a warning, and the run goes on. It prints the PR's URL, the `devx
+binks review run` command and the worktree's path.
+
+The PR is never merged with a GitHub button: squash, merge-commit and rebase all undo the sync.
+Once Binks and a `Shopify/yugabyte-code-reviewers` member have approved it, it lands by
+fast-forwarding `master-shopify` to its head, `git push origin <head sha>:master-shopify`.
+`sync --land`, which will do that with checks, does not exist yet.
 
 ## PR title cases
 

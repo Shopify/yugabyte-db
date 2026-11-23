@@ -4,8 +4,9 @@
 `status` derives everything from git and GitHub and stores nothing: the landings on
 master-shopify's first-parent line since its merge base with upstream master, the fork PR each
 belongs to, and that PR's `Upstream:` record; its only writes are its fetches unless --no-fetch.
-`submit` submits one merged fork PR upstream (upstream_submit.py). Uses git and gh; requires
-Python 3.10+. Importing has no side effects.
+`submit` submits one merged fork PR upstream (upstream_submit.py). `sync` rebuilds master-shopify
+on a newer upstream commit as a candidate branch and opens its PR (upstream_sync.py). Uses git
+and gh; requires Python 3.10+. Importing has no side effects.
 """
 
 from __future__ import annotations
@@ -96,6 +97,14 @@ class Status:
     adopted: list = field(default_factory=list)
     unidentified: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
+
+
+def fork_pr_number(text):
+    """A fork PR number given as `70` or `#70`."""
+    match = re.fullmatch(r"#?(\d+)", text.strip())
+    if match is None:
+        raise argparse.ArgumentTypeError(f"{text} is not a fork PR number such as #70")
+    return int(match[1])
 
 
 def parse_time(text):
@@ -467,26 +476,57 @@ def parser():
                         help="reuse the refs an earlier run fetched")
     submit.add_argument("-h", "--help", action="store_true", default=argparse.SUPPRESS,
                         help="print this help")
-    result.commands = {"status": status, "submit": submit}
+    sync = commands.add_parser(
+        "sync", add_help=False, help="rebuild master-shopify on a newer upstream commit",
+        description="Rebuild master-shopify on a newer upstream commit as AGENTS.md describes: "
+                    "the candidate branch shopify-sync/<sha> in a worktree beside the checkout, "
+                    "then, after one confirmation, its draft PR against master-shopify. Landing "
+                    "the PR is a fast-forward of master-shopify that this command does not do. "
+                    "Exit codes: 0 done or nothing to sync, 1 refused or failed, 2 usage, 4 "
+                    "stopped for your input.")
+    sync.add_argument("--to", metavar="ref",
+                      help=f"the upstream commit to sync to, on upstream master (default: "
+                           f"{UPSTREAM_REF})")
+    sync.add_argument("--continue", dest="resume", action="store_true",
+                      help="resume the candidate after a stop, or push and update it again")
+    sync.add_argument("--skip", metavar="fork-pr", type=fork_pr_number, action="append",
+                      help="with --continue: drop the landing whose pick conflicted, keeping "
+                           "upstream's version (repeatable)")
+    sync.add_argument("--abort", action="store_true",
+                      help="remove the candidate's worktree and branch; asks before deleting it "
+                           "on origin")
+    sync.add_argument("--repo-path", metavar="dir",
+                      help="the full (not sparse) Shopify/yugabyte-db checkout "
+                           "(default: the checkout containing this script)")
+    sync.add_argument("--no-fetch", dest="fetch", action="store_false",
+                      help="do not fetch origin master-shopify and upstream master first")
+    sync.add_argument("--upstream-url", metavar="url", default=UPSTREAM_URL,
+                      help=f"where to fetch upstream master from (default: {UPSTREAM_URL})")
+    sync.add_argument("--yes", action="store_true",
+                      help="push and open the PR without asking; with --abort, also delete the "
+                           "candidate on origin")
+    sync.add_argument("-h", "--help", action="store_true", default=argparse.SUPPRESS,
+                      help="print this help")
+    result.commands = {"status": status, "submit": submit, "sync": sync}
     return result
 
 
 class Cli:
-    def __init__(self, github, out, err, now, submit_options):
+    def __init__(self, github, out, err, now, options):
         self.github = github  # None until a command needs one
         self.out = out
         self.err = err
         self.now = now
-        self.submit_options = submit_options
+        self.options = options
 
     @classmethod
-    def run(cls, argv, github=None, out=None, err=None, now=None, **submit_options):
-        """`submit_options` (tool, stdin, interactive, cwd, program, workdir) replace what
-        `submit` would take from the process; tests pass them."""
+    def run(cls, argv, github=None, out=None, err=None, now=None, **options):
+        """`options` (tool, stdin, interactive, cwd, program, workdir) replace what `submit`
+        and `sync` would take from the process; tests pass them."""
         return cls(github, sys.stdout if out is None else out,
                    sys.stderr if err is None else err,
                    datetime.now(timezone.utc) if now is None else now,
-                   submit_options).main(argv)
+                   options).main(argv)
 
     def main(self, argv):
         try:
@@ -496,9 +536,11 @@ class Cli:
                 self.out.write(options.commands.get(args.command, options).format_help())
                 return 0
             if args.command is None:
-                raise UsageError("A command is required: status or submit")
+                raise UsageError("A command is required: status, submit or sync")
             if args.command == "submit":
                 return self.submit(args)
+            if args.command == "sync":
+                return self.sync(args)
             self.status(args)
             return 0
         except UsageError as error:
@@ -529,7 +571,14 @@ class Cli:
 
         github = upstream_submit.GitHub() if self.github is None else self.github
         return upstream_submit.Submit(args, github, self.out, self.err, self.say,
-                                      **self.submit_options).run()
+                                      **self.options).run()
+
+    def sync(self, args):
+        import upstream_sync  # imports this module; importing it here avoids a cycle
+
+        github = upstream_sync.GitHub() if self.github is None else self.github
+        return upstream_sync.Sync(args, github, self.out, self.err, self.say, self.now,
+                                  **self.options).run()
 
     def say(self, *lines, stream=None):
         stream = self.out if stream is None else stream
