@@ -5,8 +5,9 @@
 master-shopify's first-parent line since its merge base with upstream master, the fork PR each
 belongs to, and that PR's `Upstream:` record; its only writes are its fetches unless --no-fetch.
 `submit` submits one merged fork PR upstream (upstream_submit.py). `sync` rebuilds master-shopify
-on a newer upstream commit as a candidate branch and opens its PR (upstream_sync.py). Uses git
-and gh; requires Python 3.10+. Importing has no side effects.
+on a newer upstream commit as a candidate branch and opens its PR (upstream_sync.py), and `sync
+--land` lands that PR by fast-forwarding master-shopify (upstream_land.py). Uses git and gh;
+requires Python 3.10+. Importing has no side effects.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ UPSTREAM_URL = "https://github.com/yugabyte/yugabyte-db.git"
 FORK_URL = "https://github.com/Shopify/yugabyte-db.git"
 UPSTREAM_REF = "refs/shopify/upstream-master"  # owned by this tool; no other fetch moves it
 SKIP_LABEL = "upstream: skip"
+SYNC_LABEL = "sync"  # a sync PR: a rebuild of master-shopify, never a contribution
 SHOPIFY_ONLY = "[shopify-only]"
 PR_LIMIT = 5000
 PR_SUFFIX = re.compile(r"\(#(\d+)\)$")
@@ -39,6 +41,7 @@ UPSTREAM_PR_URL = re.compile(r"https://github\.com/yugabyte/yugabyte-db/pull/(\d
 DROPPED = re.compile(r"^Dropped:[ \t]*#(\d+)[ \t]+\(upstream #(\d+)\)[ \t]*$", re.MULTILINE)
 DROPPED_GREP = "^Dropped:[[:blank:]]*#"  # git log --extended-regexp --grep preselecting DROPPED
 REVERTS = re.compile(r"^[ \t]*This reverts commit ([0-9a-f]{7,40})\b", re.MULTILINE)
+SYNC_TITLE = re.compile(r"Sync master-shopify to upstream ([0-9a-f]{7,40})")
 
 
 class GitHub(_GitHub):
@@ -210,6 +213,33 @@ def revert_pairs(landings, landed, pull_requests=()):
     return reverted_by, reverts
 
 
+def sync_pull_request(pr):
+    """Whether a merged fork PR is a landed sync, whose mergeCommit is its candidate's head."""
+    return any(label.get("name") == SYNC_LABEL for label in pr.get("labels") or [])
+
+
+def button_merged_syncs(line, kinds, pull_requests):
+    """Warnings for merged sync PRs whose mergeCommit is on the first-parent `line` (oldest first)
+    without their sync merge beneath it. A fast-forward lands the candidate whole, so walking back
+    from its head through single-parent replays reaches the sync merge of the upstream commit its
+    title names; a squash, merge-commit or rebase button does not."""
+    index = {commit["sha"]: k for k, commit in enumerate(line)}
+    warnings = []
+    for pr in pull_requests:
+        k = index.get((pr.get("mergeCommit") or {}).get("oid"))
+        if not sync_pull_request(pr) or k is None:
+            continue
+        while k > 0 and kinds[line[k]["sha"]] != "sync" and len(line[k]["parents"]) == 1:
+            k -= 1
+        title = SYNC_TITLE.search(pr.get("title") or "")
+        commit = line[k]
+        if not (title and kinds[commit["sha"]] == "sync" and
+                commit["parents"][0].startswith(title[1])):
+            warnings.append(f"sync PR #{pr['number']} was merged with a GitHub button, undoing "
+                            "the sync; see the Landing section of its body")
+    return warnings
+
+
 def fork_only(pr):
     """(whether the PR is fork-only work, which its `upstream: skip` label alone decides, and a
     warning when its `[shopify-only]` title tag disagrees)."""
@@ -332,9 +362,9 @@ def derive(repo, github, fork_ref, upstream_ref, now, hint=""):
     base = repo.merge_base(upstream, fork)
     base_date = datetime.fromtimestamp(repo.commit_timestamp(base), timezone.utc).isoformat()
     status = Status(fork, upstream, base, base_date)
-    landings = []
-    for commit in repo.first_parent_commits(status.base, fork):
-        kind = sync_kind(repo, commit, upstream)
+    landings, line, kinds = [], repo.first_parent_commits(status.base, fork), {}
+    for commit in line:
+        kind = kinds[commit["sha"]] = sync_kind(repo, commit, upstream)
         if kind is None:
             landings.append(commit)
             continue
@@ -347,7 +377,11 @@ def derive(repo, github, fork_ref, upstream_ref, now, hint=""):
                             "sync": merge["sha"], "date": date}
                            for fork_pr, upstream_pr in dropped(merge["message"])]
     status.adopted.sort(key=lambda entry: entry["number"])
-    pull_requests = {pr["number"]: pr for pr in github.merged_pull_requests()}
+    # A landed sync PR carries nothing of its own: its mergeCommit is the candidate's last
+    # replay, which belongs to that replay's PR.
+    merged = github.merged_pull_requests()
+    status.warnings += button_merged_syncs(line, kinds, merged)
+    pull_requests = {pr["number"]: pr for pr in merged if not sync_pull_request(pr)}
     landed, status.unidentified = attribute(landings, pull_requests.values())
     reverted_by, reverts = revert_pairs(landings, landed, pull_requests.values())
     status.contributions = [contribution(pull_requests[number], landed[number], github,
@@ -480,10 +514,10 @@ def parser():
         "sync", add_help=False, help="rebuild master-shopify on a newer upstream commit",
         description="Rebuild master-shopify on a newer upstream commit as AGENTS.md describes: "
                     "the candidate branch shopify-sync/<sha> in a worktree beside the checkout, "
-                    "then, after one confirmation, its draft PR against master-shopify. Landing "
-                    "the PR is a fast-forward of master-shopify that this command does not do. "
-                    "Exit codes: 0 done or nothing to sync, 1 refused or failed, 2 usage, 4 "
-                    "stopped for your input.")
+                    "then, after one confirmation, its draft PR against master-shopify. --land "
+                    "lands a reviewed sync PR by fast-forwarding master-shopify once its checks "
+                    "pass. Exit codes: 0 done or nothing to sync, 1 refused or failed, 2 usage, "
+                    "4 stopped for your input.")
     sync.add_argument("--to", metavar="ref",
                       help=f"the upstream commit to sync to, on upstream master (default: "
                            f"{UPSTREAM_REF})")
@@ -495,6 +529,15 @@ def parser():
     sync.add_argument("--abort", action="store_true",
                       help="remove the candidate's worktree and branch; asks before deleting it "
                            "on origin")
+    sync.add_argument("--land", metavar="pr", type=fork_pr_number,
+                      help="land the sync PR: check its approval, Binks review, CI and the "
+                           "fast-forward, then fast-forward master-shopify to its head")
+    sync.add_argument("--findings-answered", action="store_true",
+                      help="with --land: every finding of the newest Binks review is fixed or "
+                           "answered")
+    sync.add_argument("--confirm-land", metavar="sha",
+                      help="with --land: the head's first 12 characters, confirming the push "
+                           "without a terminal")
     sync.add_argument("--repo-path", metavar="dir",
                       help="the full (not sparse) Shopify/yugabyte-db checkout "
                            "(default: the checkout containing this script)")
@@ -521,8 +564,9 @@ class Cli:
 
     @classmethod
     def run(cls, argv, github=None, out=None, err=None, now=None, **options):
-        """`options` (tool, stdin, interactive, cwd, program, workdir) replace what `submit`
-        and `sync` would take from the process; tests pass them."""
+        """`options` (tool, stdin, interactive, cwd, program, workdir, and sleep for `sync
+        --land`) replace what `submit` and `sync` would take from the process; tests pass
+        them."""
         return cls(github, sys.stdout if out is None else out,
                    sys.stderr if err is None else err,
                    datetime.now(timezone.utc) if now is None else now,
@@ -577,6 +621,11 @@ class Cli:
         import upstream_sync  # imports this module; importing it here avoids a cycle
 
         github = upstream_sync.GitHub() if self.github is None else self.github
+        if args.land is not None:
+            import upstream_land
+
+            return upstream_land.Land(args, github, self.out, self.err, self.say, self.now,
+                                      **self.options).run()
         return upstream_sync.Sync(args, github, self.out, self.err, self.say, self.now,
                                   **self.options).run()
 

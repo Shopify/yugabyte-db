@@ -37,11 +37,12 @@ PR_URL = FORK_PULL + "200"
 SCRIPT = str(Path(__file__).resolve().with_name("upstream.py"))
 OPEN_PR_FIELDS = "number,url,baseRefName,headRepository,headRepositoryOwner"
 PROMPT = "Push shopify-sync/{short} and open its PR against master-shopify? [y/N] "
-LANDING = ("Do not use the merge button: squash, merge-commit and rebase all undo the sync. Land "
-           "it by fast-forwarding master-shopify to this head once Binks and a "
-           "yugabyte-code-reviewers member have approved it: "
-           "`git push origin {head}:master-shopify` (sync --land will do this with checks; it "
-           "does not exist yet).")
+LANDING = ("Do not use the merge button: squash, merge-commit and rebase all undo the sync. It "
+           "lands by fast-forwarding master-shopify to this head once Binks and a "
+           "yugabyte-code-reviewers member have approved it. Land it with "
+           "`python3 .agents/scripts/shopify/upstream.py sync --land <pr>`, which checks approval, "
+           "Binks, CI and the fast-forward first. Break-glass, skipping those checks: "
+           "`git push origin {head}:master-shopify`.")
 SECTIONS = ["## Summary", "## Upstream", "## Dropped", "## Carried", "## Range-diff",
             "## Warnings", "## Landing"]
 # The [shopify-only] form of the title grammar in .github/workflows/pr-title.yml.

@@ -4,8 +4,8 @@ The candidate `shopify-sync/<short sha>` starts at the upstream commit, merges t
 master-shopify with `-s ours` (its `Dropped:` trailers record the PRs upstream has landed), and
 replays every other landing on top, in a worktree beside the developer's checkout, which is never
 touched. After one confirmation it pushes the branch and opens or updates its draft PR against
-master-shopify. Landing that PR, a fast-forward of master-shopify, is not part of this command.
-Uses git and gh; requires Python 3.10+. Importing has no side effects.
+master-shopify. Landing that PR, a fast-forward of master-shopify, is `sync --land`
+(upstream_land.py). Uses git and gh; requires Python 3.10+. Importing has no side effects.
 """
 
 from __future__ import annotations
@@ -19,15 +19,14 @@ import shlex
 
 from interaction import UPSTREAM_SCRIPT, Interaction, Stop
 from scm import Error, GitError, Repository, UsageError, last_url, remote_pattern
-from upstream import (FORK_BRANCH, FORK_REPO, PR_SUFFIX, SKIP_LABEL, UPSTREAM_REF, UPSTREAM_REPO,
-                      UPSTREAM_URL, derive, resolve, shopify_prs, sync_kind)
+from upstream import (FORK_BRANCH, FORK_REPO, PR_SUFFIX, SKIP_LABEL, SYNC_LABEL, UPSTREAM_REF,
+                      UPSTREAM_REPO, UPSTREAM_URL, derive, resolve, shopify_prs, sync_kind)
 import upstream_submit
 
 
 BRANCH_PREFIX = "shopify-sync/"
 SHORT = 12
 OLD_REF = f"refs/remotes/origin/{FORK_BRANCH}"
-SYNC_LABEL = "sync"
 SYNC_LABEL_DESCRIPTION = "Rebuild of master-shopify on a newer upstream commit"
 SYNC_LABEL_COLOR = "0E8A16"
 STATE_FILE = "shopify-sync.json"  # per-worktree: what this tool saw while replaying
@@ -48,11 +47,14 @@ SUMMARY = ("This draft PR rebuilds `master-shopify` on upstream commit `{short}`
            "changes since the last sync, not the fork's: review the lists below instead, the PRs "
            "dropped because upstream landed them, the carried landings with the range-diff of "
            "each replay against its original, and the warnings.")
-LANDING = ("Do not use the merge button: squash, merge-commit and rebase all undo the sync. Land "
-           "it by fast-forwarding master-shopify to this head once Binks and a "
-           "yugabyte-code-reviewers member have approved it: "
-           "`git push origin {head}:master-shopify` (sync --land will do this with checks; it "
-           "does not exist yet).")
+LANDING = ("Do not use the merge button: squash, merge-commit and rebase all undo the sync. It "
+           "lands by fast-forwarding master-shopify to this head once Binks and a "
+           "yugabyte-code-reviewers member have approved it. Land it with "
+           "`python3 .agents/scripts/shopify/upstream.py sync --land <pr>`, which checks approval, "
+           "Binks, CI and the fast-forward first. Break-glass, skipping those checks: "
+           "`git push origin {head}:master-shopify`.")
+LAND_FIELDS = ("number,state,isDraft,baseRefName,headRefName,headRefOid,headRepository,"
+               "headRepositoryOwner,labels,reviews,reviewDecision,statusCheckRollup,url")
 
 
 class GitHub(upstream_submit.GitHub):
@@ -82,6 +84,19 @@ class GitHub(upstream_submit.GitHub):
     def edit_pull_request(self, number, body_file):
         self.run("pr", "edit", str(number), "--repo", FORK_REPO, "--body-file", body_file)
 
+    # `sync --land` reads these; it writes nothing through gh.
+
+    def landing_pull_request(self, number):
+        return self.json("pr", "view", str(number), "--repo", FORK_REPO, "--json", LAND_FIELDS)
+
+    def pull_request_state(self, number):
+        return self.json("pr", "view", str(number), "--repo", FORK_REPO, "--json",
+                         "state,mergedAt")
+
+    def branch_rules(self, branch):
+        """The active ruleset rules that apply to `branch` in the fork."""
+        return self.json("api", f"repos/{FORK_REPO}/rules/branches/{branch}")
+
 
 class Checkout(Repository):
     """The git commands `sync` needs beyond the shared ones."""
@@ -108,8 +123,8 @@ class Checkout(Repository):
         args = ["--no-track", "-b", new_branch] if new_branch else []
         self._run("worktree", "add", "--quiet", *args, path, start)
 
-    def remove_worktree(self, path):
-        self._run("worktree", "remove", "--force", path)
+    def remove_worktree(self, path, force=True):
+        self._run("worktree", "remove", *(["--force"] if force else []), path)
 
     def delete_branch(self, name):
         self._run("branch", "--quiet", "-D", name)
@@ -125,6 +140,11 @@ class Checkout(Repository):
     def push(self, remote, sha, branch):
         """Pushes the commit `sha`, not whatever `branch` points at by then."""
         self._run("push", "--quiet", remote, f"{sha}:refs/heads/{branch}")
+
+    def fast_forward(self, remote, sha, branch, expected):
+        """Pushes the commit `sha` to `branch` only while `remote` still has it at `expected`."""
+        self._run("push", "--quiet", f"--force-with-lease=refs/heads/{branch}:{expected}", remote,
+                  f"{sha}:refs/heads/{branch}")
 
     def delete_remote_branch(self, remote, branch):
         self._run("push", "--quiet", remote, "--delete", f"refs/heads/{branch}")
@@ -307,6 +327,7 @@ def range_diff_section(entries, budget):
 
 class Sync(Interaction):
     workdir_prefix = "upstream-sync-"
+    full_checkout = True  # replaying needs every path checked out
 
     def __init__(self, args, github, out, err, say, now, **options):
         super().__init__(args, out, err, say, **options)
@@ -326,6 +347,8 @@ class Sync(Interaction):
             raise UsageError("Pass --continue or --abort, not both")
         if args.skip and not args.resume:
             raise UsageError("--skip needs --continue")
+        if args.findings_answered or args.confirm_land is not None:
+            raise UsageError("--findings-answered and --confirm-land need --land")
         repo = self.checkout()
         if args.abort:
             return self.abort(repo)
@@ -381,7 +404,7 @@ class Sync(Interaction):
             raise Error(f"origin of {repo.path} is {url}, not {FORK_REPO}; sync runs in a fork "
                         "checkout")
         sparse = (repo.config("core.sparseCheckout") or "").lower()
-        if sparse in ("true", "yes", "on", "1"):
+        if self.full_checkout and sparse in ("true", "yes", "on", "1"):
             raise Error(f"sync needs a full checkout; {repo.path} is sparse "
                         f"(core.sparseCheckout is {sparse})")
         return repo

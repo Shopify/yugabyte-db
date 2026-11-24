@@ -255,7 +255,8 @@ is not a single squash commit, stops after Step 3 for the test plan from the run
 upstream branch, and shows what it will write and asks once before any public write. It is
 rerun after a failure or a stop. The steps by hand above remain the reference;
 `.agents/scripts/shopify/README.md` § Upstream tooling describes its options. `upstream.py`,
-beside `issues.py` and `release.py`, also has `status`; `sync` does not exist yet.
+beside `issues.py` and `release.py`, also has `status`. `sync` rebuilds `master-shopify` on a
+newer upstream commit as a reviewed candidate, and `sync --land` fast-forwards it after review.
 
 ## Commands
 

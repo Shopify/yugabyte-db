@@ -249,10 +249,11 @@ never squashed.
 `upstream.py` has three commands: `status`, which shows where each change `master-shopify`
 carries stands upstream; `submit <fork-pr>`, which performs the shopify-upstream-pr skill's
 steps under the developer's own `gh` login; and `sync`, which rebuilds `master-shopify` on a
-newer upstream commit as AGENTS.md describes and opens the result as a PR. Exit codes: 0, 2 for
-usage errors, 1 otherwise; `submit` and `sync` also exit 4 when they stop for the developer.
-`test_upstream.py`, `test_upstream_submit.py` and `test_upstream_sync.py` run under the same
-`unittest discover` command as above.
+newer upstream commit as AGENTS.md describes, opens the result as a PR and, with `--land`,
+lands it. Exit codes: 0, 2 for usage errors, 1 otherwise; `submit` and `sync` also exit 4 when
+they stop for the developer. `test_upstream.py`, `test_upstream_submit.py`,
+`test_upstream_sync.py` and `test_upstream_land.py` run under the same `unittest discover`
+command as above.
 
 ### status
 
@@ -429,6 +430,7 @@ python3 .agents/scripts/shopify/upstream.py sync
 python3 .agents/scripts/shopify/upstream.py sync --to <upstream sha> --yes
 python3 .agents/scripts/shopify/upstream.py sync --continue --to <upstream sha>
 python3 .agents/scripts/shopify/upstream.py sync --abort
+python3 .agents/scripts/shopify/upstream.py sync --land <pr>
 ```
 
 `sync` runs in a full fork checkout: `--repo-path` (default: the checkout containing the
@@ -510,9 +512,47 @@ replaced by its command and a warning, and the run goes on. It prints the PR's U
 binks review run` command and the worktree's path.
 
 The PR is never merged with a GitHub button: squash, merge-commit and rebase all undo the sync.
-Once Binks and a `Shopify/yugabyte-code-reviewers` member have approved it, it lands by
-fast-forwarding `master-shopify` to its head, `git push origin <head sha>:master-shopify`.
-`sync --land`, which will do that with checks, does not exist yet.
+Once Binks and a `Shopify/yugabyte-code-reviewers` member have approved it, `sync --land <pr>`
+lands it by fast-forwarding `master-shopify` to its head; `--land` takes `--repo-path`,
+`--no-fetch` and `--upstream-url` and no other `sync` mode, and works in a sparse checkout.
+Before any write it fetches `master-shopify`, the candidate and upstream master, and refuses
+(exit 1) unless: the PR is open, not a draft, against `master-shopify`, from
+`shopify-sync/<sha>` in the fork and labelled `sync`; origin's branch is the PR's head; walking
+first-parent back from the head finds only single-parent commits down to the sync merge, which
+`status` classifies as a sync of that upstream commit and whose `Old-master-shopify:` is the
+current `master-shopify` (when `master-shopify` is already at the head, it says the PR is landed
+and exits 0); each commit above the merge is one replay of a landing the sync plan carries, the
+plan being `status`'s derivation from the merge's `Old-master-shopify:` against its upstream
+commit less the PRs its `Dropped:` trailers name, and each replay attributed as `status` does,
+so a commit no merged fork PR accounts for, a replay of a PR outside the plan and a second
+replay of a landing are refused (planned landings the candidate lacks were skipped, and the
+summary lists them); no reviewer's latest opinion (APPROVED or CHANGES_REQUESTED, by submission
+time) requests changes, on whatever head; a team member's latest opinion approves that head; the
+review decision is not `CHANGES_REQUESTED` or `REVIEW_REQUIRED` (none, as GitHub often reports,
+is a warning); `pr-title` and `pr-lint`, where they ran, succeeded; the newest Binks review
+(`devx binks --json review list`, or its `control_plane_reviews` when `review_owner` is
+`control_plane`) is `ready` on that head, its findings printed and confirmed fixed or answered
+(`--findings-answered`, or `y` on a terminal), while a review still `running`, `queued` or
+`pending` is waited for and any other is requested again; and the push is a fast-forward. An
+active `pull_request` rule on `master-shopify` is only a warning: the push is attempted, and a
+rejected push prints git's message and the options (a scoped bypass identity for syncs, or
+disabling that ruleset for the push), changes nothing and exits 1 without the break-glass
+command, which the same rule would reject. It then shows the old tip and the head, the replays,
+the skipped landings, the drops and the upstream commit, and asks for the typed phrase `land
+<12-char head>`; without a terminal it exits 4 with the rerun command carrying `--confirm-land
+<12-char head>`, and a phrase or `--confirm-land` that does not match is a usage error. It
+pushes `git push --force-with-lease=refs/heads/master-shopify:<old tip> origin
+<head>:refs/heads/master-shopify`, waits up to 30 seconds for GitHub to mark the PR merged (it
+does once the head is on the base), removes the candidate's worktree and local branch, and keeps
+`shopify-sync/<sha>` on `origin` as the sync's record. A refusal of a sync PR ends with the
+break-glass command that skips the checks, `git push origin <head sha>:master-shopify`, except
+when `master-shopify` moved or the push would not fast-forward; a PR that is not a sync PR (closed,
+draft, another base or head, no `sync` label) gets no such command, since that push would land an
+unreviewed branch. `status` treats a merged PR labelled `sync` as a landed
+sync, not a contribution: it is never listed as a contribution or as neither carried nor
+adopted, and its `mergeCommit`, the candidate's head, does not attribute the last replay to it.
+A sync PR whose `mergeCommit` is on the first-parent line without its own sync merge beneath it,
+reached through single-parent replays, was merged with a GitHub button and is a warning.
 
 ## PR title cases
 
