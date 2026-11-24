@@ -30,8 +30,9 @@ before merging; shopify-create-pr has the steps.
 
 Every fork PR merges into `master-shopify` before it is submitted upstream, stack
 layers included. Fork PRs squash-merge, so each lands as one `(#N)` commit, except a
-release PR from a `-candidate` branch: it lands with a merge commit, so every
-cherry-pick keeps its own trailer for `release.py` to reuse. A feature stack whose
+release PR from a `-candidate` branch, which lands with a merge commit so every
+cherry-pick keeps its own trailer for `release.py` to reuse, and a sync PR from a
+`shopify-sync/<sha>` branch, which lands only by `sync --land`'s fast-forward. A feature stack whose
 layers are useless apart lands whole with `gh stack merge <top-pr> --yes --squash`;
 independent fixes land on their own.
 
