@@ -50,11 +50,10 @@ will do this; nothing does it yet.
 
 Submission is developer-forward: the original developer submits under their own `gh`
 login. `.agents/scripts/shopify/upstream.py`, beside `issues.py` and `release.py`, has
-`status`, which shows where each carried change stands upstream; `submit <fork-pr>`,
-which will perform shopify-upstream-pr's steps, and `sync` do not exist yet. Until
-`submit` exists, developers submit by hand following the skills. To submit a merged
-contribution upstream, including its upstream issue, stack placement, and the
-`Upstream:` record, use
+`status`, which shows where each carried change stands upstream, and `submit <fork-pr>`,
+which performs shopify-upstream-pr's steps under the developer's own `gh` login; `sync`
+does not exist yet. To submit a merged contribution upstream, including its upstream
+issue, stack placement, and the `Upstream:` record, use
 [shopify-upstream-pr](.claude/skills/shopify-upstream-pr/SKILL.md). To open a PR in
 `Shopify/yugabyte-db`, use
 [shopify-create-pr](.claude/skills/shopify-create-pr/SKILL.md), not the inherited

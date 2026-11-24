@@ -1,4 +1,4 @@
-"""Shared git and gh plumbing for the Shopify contribution tools.
+"""Shared git, gh and other command plumbing for the Shopify contribution tools.
 
 Every command runs as an argv list, never via a shell. Requires Python 3.10+; importing has no
 side effects.
@@ -103,6 +103,10 @@ class Repository:
     def commits_between(self, from_rev, to_rev):
         return self._log_shas(f"{from_rev}..{to_rev}")
 
+    def commits_excluding(self, rev, *excluded):
+        """Newest first, the commits reachable from `rev` but from none of `excluded`."""
+        return self._log_shas(rev, *(f"^{ref}" for ref in excluded))
+
     def grep_commits_on_branch(self, branch, pattern):
         return self._log_shas("--grep", pattern, branch)
 
@@ -146,6 +150,111 @@ class Repository:
     def fetch_all_with_tags(self):
         return self._run("fetch", "--all", "--tags")
 
+    def current_branch(self):
+        """The checked-out branch's short name, or None when HEAD is detached."""
+        result = self._git("symbolic-ref", "--quiet", "--short", "HEAD")
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    def clean(self):
+        """Whether tracked files have no staged or unstaged changes; untracked files are fine."""
+        return self._run("status", "--porcelain", "--untracked-files=no") == ""
+
+    def worktree_root(self):
+        return self._run("rev-parse", "--show-toplevel").strip()
+
+    def remotes(self):
+        return self._lines("remote")
+
+    def remote_url(self, name):
+        return self._run("remote", "get-url", name).strip()
+
+    def config(self, key):
+        """The value of a git config key, or None when it is unset."""
+        result = self._git("config", "--get", key)
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    def set_config(self, key, value):
+        self._run("config", key, value)
+
+    def checkout(self, ref):
+        self._run("checkout", "--quiet", ref)
+
+    def create_branch(self, name, start):
+        """Creates branch `name` at `start` without an upstream, as gh stack expects."""
+        self._run("branch", "--quiet", "--no-track", name, start)
+
+    def cherry_pick(self, commit):
+        """Cherry-picks one commit with a `(cherry picked from commit …)` line."""
+        self._run("cherry-pick", "-x", commit)
+
+    def cherry_pick_abort(self):
+        self._run("cherry-pick", "--abort")
+
+    def amend_message(self, path):
+        """Replaces HEAD's message with the contents of the file at `path`, nothing else."""
+        # --only with no paths leaves the index out: the commit keeps its tree.
+        self._run("commit", "--amend", "--only", "--quiet", "--allow-empty",
+                  "--cleanup=verbatim", "-F", path)
+
+    def changed_paths(self, from_rev, to_rev):
+        """Sorted paths that differ between two revisions, renames as delete and add."""
+        output = self._run("diff", "--name-only", "--no-renames", "-z", from_rev, to_rev)
+        return sorted(path for path in output.split("\0") if path)
+
+    def patch_id(self, commit):
+        """`git patch-id --stable` of a commit's change, or None for an empty change."""
+        patch = self._run("show", "--format=", "--no-color", "--no-ext-diff", commit)
+        try:
+            result = subprocess.run(["git", "-C", self.path, "patch-id", "--stable"], input=patch,
+                                    capture_output=True, encoding="utf-8", errors="replace")
+        except FileNotFoundError as error:
+            raise GitError("git was not found; install git") from error
+        if result.returncode:
+            raise GitError(f"Failed to run `git patch-id --stable` in {self.path}\n"
+                           f"{result.stderr}")
+        fields = result.stdout.split()
+        return fields[0] if fields else None
+
+
+class Tool:
+    """Runs a command other than git or a gh query, as an argv list, never via a shell."""
+
+    def run(self, argv, cwd=None, echo=None, check=True):
+        """Returns a CompletedProcess with stdout and stderr as text. With `echo`, a writable
+        stream, stdout is also copied there line by line as it arrives and stderr goes to this
+        process's stderr. With `check`, a non-zero exit raises Error."""
+        argv = [str(arg) for arg in argv]
+        try:
+            if echo is None:
+                result = subprocess.run(argv, cwd=cwd, capture_output=True, encoding="utf-8",
+                                        errors="replace")
+            else:
+                result = self._echo(argv, cwd, echo)
+        except FileNotFoundError as error:
+            raise Error(f"{argv[0]} was not found") from error
+        if check and result.returncode:
+            raise Error(f"Failed to run `{' '.join(argv)}`\n{result.stderr}")
+        return result
+
+    @staticmethod
+    def _echo(argv, cwd, echo):
+        lines = []
+        with subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, encoding="utf-8",
+                              errors="replace") as process:
+            for line in process.stdout:
+                lines.append(line)
+                echo.write(line)
+                echo.flush()
+        return subprocess.CompletedProcess(argv, process.returncode, "".join(lines), "")
+
+    def interactive(self, argv, cwd=None):
+        """Runs a command on this terminal, such as an editor, and returns its exit code."""
+        argv = [str(arg) for arg in argv]
+        try:
+            return subprocess.run(argv, cwd=cwd).returncode
+        except FileNotFoundError as error:
+            raise Error(f"{argv[0]} was not found") from error
+
 
 class GitHub:
     """Runs the gh CLI as argv lists, never via a shell."""
@@ -153,11 +262,11 @@ class GitHub:
     def __init__(self, executable="gh"):
         self.executable = executable
 
-    def run(self, *args):
-        """Returns the command's stdout."""
+    def run(self, *args, cwd=None):
+        """Returns the command's stdout; `cwd` is the directory gh runs in."""
         command = [self.executable, *args]
         try:
-            result = subprocess.run(command, capture_output=True, encoding="utf-8")
+            result = subprocess.run(command, capture_output=True, encoding="utf-8", cwd=cwd)
         except FileNotFoundError as error:
             raise Error(f"The gh CLI was not found ({self.executable}); "
                         "install gh and run `gh auth login`") from error
@@ -165,9 +274,9 @@ class GitHub:
             raise Error(f"Failed to run `{' '.join(command)}`\n{result.stderr}")
         return result.stdout
 
-    def json(self, *args):
+    def json(self, *args, cwd=None):
         """Returns the command's stdout parsed as JSON."""
-        output = self.run(*args)
+        output = self.run(*args, cwd=cwd)
         try:
             return json.loads(output)
         except json.JSONDecodeError as error:
