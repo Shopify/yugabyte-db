@@ -34,6 +34,7 @@ class FakeGitHub(GitHub):
         self.comments_by_pr = comments or {}
         self.upstream = upstream or {}
         self.comment_requests = []
+        self.upstream_requests = []
 
     def merged_pull_requests(self):
         return self.pull_requests
@@ -43,6 +44,7 @@ class FakeGitHub(GitHub):
         return self.comments_by_pr.get(number, [])
 
     def upstream_pull_request(self, number):
+        self.upstream_requests.append(number)
         if number not in self.upstream:
             raise Error(f"Failed to run `gh pr view {number} --repo yugabyte/yugabyte-db`\n"
                         "no pull requests found\n")
@@ -159,6 +161,7 @@ class LandingStateTest(StatusTestCase):
             "Restructured upstream, awaiting a replacement Upstream: comment (0)",
             "Closed upstream without merging, needs a disposition (0)",
             "Fork-only (0)",
+            "Reverted in the fork (0)",
             "Adopted by earlier syncs (0)",
             "Unidentified commits (0)",
         ], self.lines(github))
@@ -288,18 +291,25 @@ class ForkOnlyTest(StatusTestCase):
         self.assertEqual([], github.comment_requests)
         self.assertNotIn("Warnings", lines)
 
-    def test_a_shopify_only_title_without_the_label_is_fork_only_with_a_warning(self):
-        _, lines = self.fork_only("[shopify-only] Build: Share helpers")
+    def test_a_shopify_only_title_without_the_label_is_upstream_bound_with_a_warning(self):
+        github, lines = self.fork_only("[shopify-only] Build: Share helpers")
 
-        self.assertEqual(["Fork-only (1)", "  #58"], self.section(lines, "Fork-only"))
+        self.assertEqual(["Not submitted (1)",
+                          f"  #58  18d   {'[shopify-only] Build: Share helpers':<60} priya"],
+                         self.section(lines, "Not submitted"))
+        self.assertEqual(["Fork-only (0)"], self.section(lines, "Fork-only"))
+        self.assertEqual([58], github.comment_requests)
         self.assertEqual(["Warnings",
-                          "  #58 is titled [shopify-only] but has no upstream: skip label"],
+                          "  #58 is titled [shopify-only] but has no upstream: skip label: the "
+                          "label decides, so it counts as upstream-bound"],
                          self.section(lines, "Warnings"))
 
     def test_the_label_without_a_shopify_only_title_is_fork_only_with_a_warning(self):
-        _, lines = self.fork_only("[#45] Build: Share helpers", "upstream: skip")
+        github, lines = self.fork_only("[#45] Build: Share helpers", "upstream: skip")
 
+        self.assertEqual(["Not submitted (0)"], self.section(lines, "Not submitted"))
         self.assertEqual(["Fork-only (1)", "  #58"], self.section(lines, "Fork-only"))
+        self.assertEqual([], github.comment_requests)
         self.assertEqual(["Warnings",
                           "  #58 is labelled upstream: skip but its title has no [shopify-only]"],
                          self.section(lines, "Warnings"))
@@ -544,6 +554,143 @@ class SyncPointTest(StatusTestCase):
                          self.section(lines, "Warnings"))
 
 
+class RevertTest(StatusTestCase):
+    def revert(self, number, at, *targets, subject="Revert the fix"):
+        """`git revert` of `targets` landed as fork PR `number`, with one `This reverts commit`
+        line per target; a target may be given as (sha, the text the line names it by)."""
+        targets = [target if isinstance(target, tuple) else (target, target)
+                   for target in targets]
+        for sha, _ in targets:
+            self.fixture.git("revert", "--no-commit", sha)
+        lines = "\n".join(f"This reverts commit {text}." for _, text in targets)
+        self.fixture.git("commit", "--quiet", "-m", f"{subject} (#{number})\n\n{lines}",
+                         env=dates(at))
+        return self.rev("HEAD")
+
+    def pair(self, length=40, comments=None):
+        """#12 lands a fix and #15 reverts it, naming the fix by its first `length` hex digits."""
+        fixed = self.squash(12, "Fix thing")
+        reverting = self.revert(15, T0 + 2 * DAY, (fixed, fixed[:length]))
+        github = FakeGitHub([fork_pr(12, "Fix thing", fixed),
+                             fork_pr(15, 'Revert "Fix thing"', reverting)], comments)
+        return github, fixed, reverting
+
+    @staticmethod
+    def states(report):
+        return {c["number"]: (c["state"], c["reverted_by"], c["reverts"])
+                for c in report["contributions"]}
+
+    def test_a_revert_of_a_carried_landing_marks_both_without_asking_upstream(self):
+        github, _, _ = self.pair()
+
+        lines = self.lines(github)
+
+        self.assertEqual(["Not submitted (0)"], self.section(lines, "Not submitted"))
+        self.assertEqual(["Fork-only (0)"], self.section(lines, "Fork-only"))
+        self.assertEqual(["Reverted in the fork (1)", "  #12  reverted by #15"],
+                         self.section(lines, "Reverted in the fork"))
+        self.assertNotIn("Warnings", lines)
+        self.assertEqual(([12], []), (github.comment_requests, github.upstream_requests))
+
+    def test_a_revert_naming_the_original_squash_pairs_after_a_sync_replayed_it(self):
+        # A sync replays #12 under a new sha; the revert text still names the squash commit,
+        # which GitHub records as #12's mergeCommit.
+        original = "b" * 40
+        replayed = self.squash(12, "Fix thing")
+        reverting = self.revert(15, T0 + 2 * DAY, (replayed, original[:12]))
+        github = FakeGitHub([fork_pr(12, "Fix thing", original),
+                             fork_pr(15, 'Revert "Fix thing"', reverting)])
+
+        report = self.json(github)
+
+        self.assertEqual({12: ("reverted", 15, None), 15: ("revert", None, 12)},
+                         self.states(report))
+
+    def test_json_carries_the_revert_pair(self):
+        github, fixed, reverting = self.pair()
+
+        report = self.json(github)
+
+        self.assertEqual({12: ("reverted", 15, None), 15: ("revert", None, 12)},
+                         self.states(report))
+        self.assertEqual({12: [fixed], 15: [reverting]},
+                         {c["number"]: c["landings"] for c in report["contributions"]})
+        self.assertEqual([], report["warnings"])
+
+    def test_a_seven_character_abbreviated_sha_names_the_reverted_landing(self):
+        github, _, _ = self.pair(7)
+
+        self.assertEqual({12: ("reverted", 15, None), 15: ("revert", None, 12)},
+                         self.states(self.json(github)))
+
+    def test_a_sha_shorter_than_seven_characters_names_nothing(self):
+        github, _, _ = self.pair(6)
+
+        self.assertEqual({12: ("not-submitted", None, None), 15: ("not-submitted", None, None)},
+                         self.states(self.json(github)))
+
+    def test_every_this_reverts_commit_line_is_read(self):
+        fixed = self.squash(12, "Fix thing")
+        other = self.squash(13, "Fix another thing", T0 + 2 * DAY)
+        reverting = self.revert(15, T0 + 3 * DAY, self.base, (fixed, fixed[:9]), other)
+        github = FakeGitHub([fork_pr(12, "Fix thing", fixed),
+                             fork_pr(13, "Fix another thing", other),
+                             fork_pr(15, "Revert both fixes", reverting)])
+
+        report = self.json(github)
+        lines = self.lines(github)
+
+        self.assertEqual({12: ("reverted", 15, None), 13: ("reverted", 15, None),
+                          15: ("revert", None, 12)}, self.states(report))
+        self.assertEqual(["Reverted in the fork (2)", "  #12  reverted by #15",
+                          "  #13  reverted by #15"], self.section(lines, "Reverted in the fork"))
+        self.assertEqual(["Not submitted (0)"], self.section(lines, "Not submitted"))
+
+    def test_a_revert_of_a_commit_the_fork_does_not_carry_is_an_ordinary_contribution(self):
+        reverting = self.revert(15, T0 + DAY, self.base, subject="Revert an upstream change")
+        github = FakeGitHub([fork_pr(15, "Revert an upstream change", reverting)])
+
+        lines = self.lines(github)
+
+        self.assertEqual(["Not submitted (1)",
+                          f"  #15  18d   {'Revert an upstream change':<60} priya"],
+                         self.section(lines, "Not submitted"))
+        self.assertEqual(["Reverted in the fork (0)"],
+                         self.section(lines, "Reverted in the fork"))
+        self.assertEqual([15], github.comment_requests)
+
+    def test_a_revert_of_a_revert_reapplies_the_change(self):
+        github, _, reverting = self.pair()
+        reapplied = self.revert(18, T0 + 3 * DAY, reverting, subject="Reapply the fix")
+        github.pull_requests.append(fork_pr(18, "Reapply the fix", reapplied))
+
+        report = self.json(github)
+
+        self.assertEqual({12: ("reverted", 15, None), 15: ("revert", None, 12),
+                          18: ("not-submitted", None, None)}, self.states(report))
+
+    def test_a_pr_reverted_after_it_was_submitted_upstream_is_a_warning(self):
+        url = f"{UPSTREAM_PR}38131"
+        github, _, _ = self.pair(comments={12: [comment(f"Upstream: {url}")]})
+
+        lines = self.lines(github)
+
+        self.assertEqual(["Reverted in the fork (1)", "  #12  reverted by #15"],
+                         self.section(lines, "Reverted in the fork"))
+        self.assertEqual(["Open upstream (0)"], self.section(lines, "Open upstream"))
+        self.assertEqual(["Warnings", f"  #12 was reverted by #15 after it was submitted upstream "
+                          f"({url}); close or revert the upstream PR"],
+                         self.section(lines, "Warnings"))
+        self.assertEqual([], github.upstream_requests)
+
+    def test_a_revert_pair_is_accounted_for_in_coverage(self):
+        github, _, _ = self.pair()
+        github.pull_requests.append(fork_pr(72, "Lost on the way", MISSING))
+
+        self.assertEqual(["merged PR #72 is neither carried nor adopted"],
+                         self.json(github)["warnings"])
+
+
 class CoverageTest(StatusTestCase):
     def test_a_merged_master_shopify_pr_that_is_neither_carried_nor_adopted_is_a_warning(self):
         squash = self.squash(70, "Cap the batch")
@@ -582,7 +729,8 @@ class JsonTest(StatusTestCase):
                 "merged_at": "2026-11-01T12:00:00Z", "landings": [squash], "state": "open",
                 "upstream_number": 38131, "upstream_url": UPSTREAM_PR + "38131",
                 "upstream_state": "OPEN", "upstream_title": "Expose the refresh batch metric",
-                "upstream_merged_at": None, "age_days": 18}],
+                "upstream_merged_at": None, "age_days": 18, "reverted_by": None,
+                "reverts": None}],
             "adopted": [],
             "unidentified": [{"sha": typo, "subject": "Fix a typo"}],
             "warnings": [],

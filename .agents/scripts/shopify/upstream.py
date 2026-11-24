@@ -35,6 +35,7 @@ UPSTREAM_LINE = re.compile(r"^(?:\*\*)?Upstream:(?:\*\*)?[ \t]*(\S+)", re.MULTIL
 UPSTREAM_PR_URL = re.compile(r"https://github\.com/yugabyte/yugabyte-db/pull/(\d+)(?:[/?#]\S*)?")
 DROPPED = re.compile(r"^Dropped:[ \t]*#(\d+)[ \t]+\(upstream #(\d+)\)[ \t]*$", re.MULTILINE)
 DROPPED_GREP = "^Dropped:[[:blank:]]*#"  # git log --extended-regexp --grep preselecting DROPPED
+REVERTS = re.compile(r"^[ \t]*This reverts commit ([0-9a-f]{7,40})\b", re.MULTILINE)
 
 
 class GitHub(_GitHub):
@@ -78,6 +79,8 @@ class Contribution:
     upstream_title: str | None = None
     upstream_merged_at: str | None = None
     age_days: int | None = None
+    reverted_by: int | None = None  # set when state is reverted
+    reverts: int | None = None  # set when state is revert
 
 
 @dataclass
@@ -157,16 +160,57 @@ def attribute(landings, pull_requests):
     return landed, unidentified
 
 
+def revert_pairs(landings, landed, pull_requests=()):
+    """(reverted PR -> reverting PR, reverting PR -> the first PR it reverts).
+
+    A landing with a `This reverts commit <sha>` line, git's revert text with a full sha or one
+    of at least 7 characters, that names exactly one earlier landing pairs their PRs. The sha
+    may also be an earlier landing's original `mergeCommit`: a sync replays landings under new
+    shas, but the revert text keeps naming the squash commit. A revert of a commit the fork
+    does not carry, of an unattributed landing or of another revert (a reapply) pairs nothing.
+    """
+    owners, original = {}, {}
+    for number, shas in landed.items():
+        for sha in shas:
+            owners.setdefault(sha, []).append(number)
+    for pr in pull_requests:
+        oid = (pr.get("mergeCommit") or {}).get("oid")
+        if oid and pr["number"] in landed:
+            original.setdefault(oid, []).append(pr["number"])
+    reverted_by, reverts, earlier, reverting = {}, {}, [], set()
+    for commit in landings:
+        for prefix in REVERTS.findall(commit.get("message", "")):
+            targets = [sha for sha in earlier if sha.startswith(prefix)]
+            if len(targets) == 1 and targets[0] not in reverting:
+                target_prs = owners.get(targets[0], [])
+            elif not targets:
+                # The replayed landing's original sha, from the PR GitHub attributes it to.
+                named = [oid for oid in original if oid.startswith(prefix)]
+                target_prs = original[named[0]] if len(named) == 1 else []
+            else:
+                continue
+            for number in owners.get(commit["sha"], []):
+                for target in target_prs:
+                    if target != number:
+                        reverted_by[target] = number
+                        reverts.setdefault(number, target)
+                        reverting.add(commit["sha"])
+        earlier.append(commit["sha"])
+    return reverted_by, reverts
+
+
 def fork_only(pr):
-    """(whether the PR is fork-only work, a warning when its label and title disagree)."""
+    """(whether the PR is fork-only work, which its `upstream: skip` label alone decides, and a
+    warning when its `[shopify-only]` title tag disagrees)."""
     labelled = any(label.get("name") == SKIP_LABEL for label in pr.get("labels") or [])
     titled = SHOPIFY_ONLY in (pr.get("title") or "")
     warning = None
     if titled and not labelled:
-        warning = f"#{pr['number']} is titled {SHOPIFY_ONLY} but has no {SKIP_LABEL} label"
+        warning = (f"#{pr['number']} is titled {SHOPIFY_ONLY} but has no {SKIP_LABEL} label: "
+                   "the label decides, so it counts as upstream-bound")
     elif labelled and not titled:
         warning = f"#{pr['number']} is labelled {SKIP_LABEL} but its title has no {SHOPIFY_ONLY}"
-    return labelled or titled, warning
+    return labelled, warning
 
 
 def upstream_link(comments):
@@ -204,13 +248,25 @@ def upstream_state(view, is_landed):
         else "restructured"
 
 
-def contribution(pr, landings, github, is_landed, now, warnings):
+def contribution(pr, landings, github, is_landed, now, warnings, reverted_by=None, reverts=None):
+    """The PR's state. A revert asks GitHub nothing; a reverted PR has its comments read only to
+    warn when it had been submitted upstream."""
     author = (pr.get("author") or {}).get("login")
     result = Contribution(pr["number"], pr.get("title") or "", author, pr.get("url"),
                           pr.get("mergedAt"), landings, age_days=age_days(pr.get("mergedAt"), now))
     only, warning = fork_only(pr)
     if warning:
         warnings.append(warning)
+    if reverts is not None:
+        result.state, result.reverts = "revert", reverts
+        return result
+    if reverted_by is not None:
+        result.state, result.reverted_by = "reverted", reverted_by
+        link = upstream_link(github.comments(result.number))
+        if link is not None:
+            warnings.append(f"#{result.number} was reverted by #{reverted_by} after it was "
+                            f"submitted upstream ({link}); close or revert the upstream PR")
+        return result
     if only:
         result.state = "fork-only"
         return result
@@ -282,9 +338,11 @@ def derive(repo, github, fork_ref, upstream_ref, now, hint=""):
     status.adopted.sort(key=lambda entry: entry["number"])
     pull_requests = {pr["number"]: pr for pr in github.merged_pull_requests()}
     landed, status.unidentified = attribute(landings, pull_requests.values())
+    reverted_by, reverts = revert_pairs(landings, landed, pull_requests.values())
     status.contributions = [contribution(pull_requests[number], landed[number], github,
                                          lambda sha: repo.ancestor(sha, upstream), now,
-                                         status.warnings) for number in sorted(landed)]
+                                         status.warnings, reverted_by.get(number),
+                                         reverts.get(number)) for number in sorted(landed)]
     status.warnings += coverage_warnings(status, landings, landed, pull_requests)
     return status
 
@@ -328,6 +386,9 @@ def render(status, fork_name):
     lines.append(f"Fork-only ({len(fork_only_prs)})")
     if fork_only_prs:
         lines.append("  " + " ".join(fork_only_prs))
+    reverted = [c for c in status.contributions if c.state == "reverted"]
+    lines.append(f"Reverted in the fork ({len(reverted)})")
+    lines += [f"  {'#' + str(c.number):<4} reverted by #{c.reverted_by}" for c in reverted]
     lines.append(f"Adopted by earlier syncs ({len(status.adopted)})")
     lines += [f"  {'#' + str(a['number']):<4} yugabyte#{a['upstream_number']}  "
               f"dropped {a['date'][:10]}" for a in status.adopted]

@@ -274,14 +274,29 @@ landing: the fork PR its `(#N)` subject names; else the merged fork PRs its
 `Shopify-PR: #55 #58` trailer names, which `sync` will write when it replays a landing that had
 no `(#N)`, such as a merge landing replayed with `cherry-pick -m 1`; else every merged fork
 PR whose `mergeCommit` it is (a stack merge); else unidentified. A PR is fork-only with the
-`upstream: skip` label or a `[shopify-only]` title; otherwise the newest comment with an
+`upstream: skip` label, which decides: a `[shopify-only]` title without the label counts as
+upstream-bound, with a warning. Otherwise the newest comment with an
 `Upstream:` line names the upstream PR, which is open, closed, landed (merged, and its merge
 commit is an ancestor of the upstream ref) or restructured (merged, and its merge commit is
 not, or is not in the checkout). The line accepts browser-copied URLs: angle brackets, a
 trailing `.` or `,`, a suffix such as `/files` or `#issuecomment-1`, and `**Upstream:**`.
 Without a readable `Upstream:` comment the PR is not submitted.
 
-Warnings cover what the derivation cannot settle: a label and title that disagree; an
+A landing whose message has a `This reverts commit <sha>` line, git's revert text with the
+full sha or at least 7 characters of it, naming an earlier landing or an earlier landing's
+original `mergeCommit` (a sync replays landings under new shas; the revert text keeps naming
+the squash commit) pairs the two PRs: the
+reverted one is `reverted` (`reverted_by` in `--json`) and the revert is `revert` (`reverts`,
+the first PR it reverts). The fork carries nothing from the pair, so neither is listed as not
+submitted; both appear under "Reverted in the fork" as `#12  reverted by #15`, and the revert
+asks GitHub nothing. Several such lines may revert several PRs. A revert of a commit the fork
+does not carry, such as an upstream one, of an unattributed landing or of another revert (a
+reapply) is an ordinary contribution. `submit` will refuse both PRs of a pair; `sync` will
+replay both, which cancels.
+
+Warnings cover what the derivation cannot settle: a label and title that disagree; a PR
+reverted in the fork after its `Upstream:` comment was posted, whose upstream PR needs closing
+or reverting; an
 `Upstream:` line that is not an upstream PR URL, or an upstream PR it cannot read; a merged
 PR based on `master-shopify` that is neither carried nor adopted; a PR a sync dropped that is
 carried again; first-parent merge commits that are neither sync points nor attributed, which
