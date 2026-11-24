@@ -16,6 +16,18 @@ import subprocess
 OID = re.compile(r"[0-9a-f]{40}")
 
 
+def remote_pattern(repository):
+    """Matches a remote URL, SSH or HTTPS, of the GitHub repository `owner/name`."""
+    return re.compile(rf"[:/]{re.escape(repository)}(?:\.git)?/?$", re.IGNORECASE)
+
+
+def last_url(output, pattern):
+    """The first match of `pattern` on the last non-blank line of `output`, or None."""
+    lines = output.strip().splitlines()
+    match = pattern.search(lines[-1]) if lines else None
+    return match[0] if match else None
+
+
 class Error(Exception):
     pass
 
@@ -273,6 +285,11 @@ class GitHub:
         if result.returncode:
             raise Error(f"Failed to run `{' '.join(command)}`\n{result.stderr}")
         return result.stdout
+
+    def labels(self, repository):
+        """The names of the labels in the GitHub repository `owner/name`."""
+        return {label["name"] for label in self.json("label", "list", "--repo", repository,
+                                                     "--limit", "1000", "--json", "name")}
 
     def json(self, *args, cwd=None):
         """Returns the command's stdout parsed as JSON."""
