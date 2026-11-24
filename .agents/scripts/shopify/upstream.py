@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Report where each change master-shopify carries stands upstream.
+"""Track the changes master-shopify carries upstream.
 
 `status` derives everything from git and GitHub and stores nothing: the landings on
 master-shopify's first-parent line since its merge base with upstream master, the fork PR each
-belongs to, and that PR's `Upstream:` record. Uses git and gh; requires Python 3.10+. Importing
-has no side effects, and the only writes are the fetches `status` runs unless --no-fetch.
+belongs to, and that PR's `Upstream:` record; its only writes are its fetches unless --no-fetch.
+`submit` submits one merged fork PR upstream (upstream_submit.py). Uses git and gh; requires
+Python 3.10+. Importing has no side effects.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ FORK_REPO = "Shopify/yugabyte-db"
 FORK_BRANCH = "master-shopify"
 UPSTREAM_REPO = "yugabyte/yugabyte-db"
 UPSTREAM_URL = "https://github.com/yugabyte/yugabyte-db.git"
+FORK_URL = "https://github.com/Shopify/yugabyte-db.git"
 UPSTREAM_REF = "refs/shopify/upstream-master"  # owned by this tool; no other fetch moves it
 SKIP_LABEL = "upstream: skip"
 SHOPIFY_ONLY = "[shopify-only]"
@@ -54,7 +56,7 @@ class GitHub(_GitHub):
 
     def upstream_pull_request(self, number):
         return self.json("pr", "view", str(number), "--repo", UPSTREAM_REPO,
-                         "--json", "number,state,mergedAt,mergeCommit,url,title")
+                         "--json", "number,state,mergedAt,mergeCommit,url,title,headRefName")
 
 
 @dataclass
@@ -425,23 +427,66 @@ def parser():
     status.add_argument("--json", action="store_true", help="print one JSON object")
     status.add_argument("-h", "--help", action="store_true", default=argparse.SUPPRESS,
                         help="print this help")
-    result.commands = {"status": status}
+    submit = commands.add_parser(
+        "submit", add_help=False, help="submit a merged fork PR to yugabyte/yugabyte-db",
+        description="Submit a fork PR merged into master-shopify to yugabyte/yugabyte-db under "
+                    "your own gh login, as the shopify-upstream-pr skill's Steps 1-6 describe. "
+                    "Phase A builds feature-stack/Shopify/<change> in your upstream checkout and "
+                    "stops for the test plan; phase B publishes after one confirmation. Exit "
+                    "codes: 0 done, 1 refused or failed, 2 usage, 4 stopped for your input.")
+    submit.add_argument("fork_pr", metavar="fork-pr", type=int, nargs="?",
+                        help="the merged Shopify/yugabyte-db PR number")
+    submit.add_argument("--repo-path", metavar="dir",
+                        help="your yugabyte/yugabyte-db checkout (default: the current directory "
+                             "when it is one, else asked)")
+    submit.add_argument("--clone-to", metavar="dir",
+                        help="clone yugabyte/yugabyte-db into dir and use it")
+    submit.add_argument("--parent", metavar="fork-pr", type=int, action="append",
+                        help="the fork PR this change depends on (default: the fork stack's "
+                             "layer below)")
+    submit.add_argument("--upstream-issue", metavar="N", type=int,
+                        help="the upstream issue to cite when the title cites a fork issue")
+    submit.add_argument("--private-issue", metavar="url",
+                        help="the private tracker issue, read and linked with issues.py")
+    submit.add_argument("--test-plan", metavar="file",
+                        help="what ran on the upstream branch; the PR's ## Test plan")
+    submit.add_argument("--upgrade", metavar="file",
+                        help="upgrade and rollback notes; required when .proto files change")
+    submit.add_argument("--branch", metavar="name",
+                        help="the <change> of feature-stack/Shopify/<change> (default: from the "
+                             "title)")
+    submit.add_argument("--draft", action="store_true", help="open the upstream PR as a draft")
+    submit.add_argument("--yes", action="store_true",
+                        help="publish without asking; needs --test-plan unless the branch's PR "
+                             "already exists")
+    submit.add_argument("--fork-url", metavar="url", default=FORK_URL,
+                        help=f"where to fetch master-shopify from (default: {FORK_URL})")
+    submit.add_argument("--upstream-url", metavar="url", default=UPSTREAM_URL,
+                        help=f"where to fetch and clone upstream from (default: {UPSTREAM_URL})")
+    submit.add_argument("--no-fetch", dest="fetch", action="store_false",
+                        help="reuse the refs an earlier run fetched")
+    submit.add_argument("-h", "--help", action="store_true", default=argparse.SUPPRESS,
+                        help="print this help")
+    result.commands = {"status": status, "submit": submit}
     return result
 
 
 class Cli:
-    def __init__(self, github, out, err, now):
-        self.github = github
+    def __init__(self, github, out, err, now, submit_options):
+        self.github = github  # None until a command needs one
         self.out = out
         self.err = err
         self.now = now
+        self.submit_options = submit_options
 
     @classmethod
-    def run(cls, argv, github=None, out=None, err=None, now=None):
-        return cls(GitHub() if github is None else github,
-                   sys.stdout if out is None else out,
+    def run(cls, argv, github=None, out=None, err=None, now=None, **submit_options):
+        """`submit_options` (tool, stdin, interactive, cwd, program, workdir) replace what
+        `submit` would take from the process; tests pass them."""
+        return cls(github, sys.stdout if out is None else out,
                    sys.stderr if err is None else err,
-                   datetime.now(timezone.utc) if now is None else now).main(argv)
+                   datetime.now(timezone.utc) if now is None else now,
+                   submit_options).main(argv)
 
     def main(self, argv):
         try:
@@ -451,7 +496,9 @@ class Cli:
                 self.out.write(options.commands.get(args.command, options).format_help())
                 return 0
             if args.command is None:
-                raise UsageError("A command is required: status")
+                raise UsageError("A command is required: status or submit")
+            if args.command == "submit":
+                return self.submit(args)
             self.status(args)
             return 0
         except UsageError as error:
@@ -470,11 +517,19 @@ class Cli:
         hint = ""
         if not args.fetch and args.upstream_ref == UPSTREAM_REF:
             hint = "; run once without --no-fetch to fetch upstream master"
-        status = derive(repo, self.github, args.fork_ref, args.upstream_ref, self.now, hint)
+        github = GitHub() if self.github is None else self.github
+        status = derive(repo, github, args.fork_ref, args.upstream_ref, self.now, hint)
         if args.json:
             self.say(json.dumps(asdict(status), indent=2))
         else:
             self.say(*render(status, args.fork_ref.removeprefix("origin/")))
+
+    def submit(self, args):
+        import upstream_submit  # imports this module; importing it here avoids a cycle
+
+        github = upstream_submit.GitHub() if self.github is None else self.github
+        return upstream_submit.Submit(args, github, self.out, self.err, self.say,
+                                      **self.submit_options).run()
 
     def say(self, *lines, stream=None):
         stream = self.out if stream is None else stream
