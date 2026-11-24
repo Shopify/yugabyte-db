@@ -42,17 +42,19 @@ carried commits on top with their messages unchanged. It drops each one whose
 ancestor of it, and records the drops as `Dropped:` trailers on the sync's merge commit.
 The result lands after review by fast-forwarding `master-shopify`, not through GitHub's
 merge buttons. Carried commits therefore get new SHAs at every sync; `(#N)` in the
-subject is a change's identity, and the original landing commit stays reachable.
-`git log --first-parent <upstream SHA>..master-shopify` lists the sync's merge commit
-and what the fork carries. `.agents/scripts/shopify/upstream.py sync` will do this;
-nothing does it yet.
+subject is a change's identity, and the original landing commit stays reachable. A
+replayed landing that had no `(#N)` carries a `Shopify-PR:` trailer naming its PRs,
+written by `sync`. `git log --first-parent <upstream SHA>..master-shopify` lists the
+sync's merge commit and what the fork carries. `.agents/scripts/shopify/upstream.py sync`
+will do this; nothing does it yet.
 
 Submission is developer-forward: the original developer submits under their own `gh`
-login. `python3 .agents/scripts/shopify/upstream.py submit <n>` will perform
-shopify-upstream-pr's steps; the script, beside `issues.py` and `release.py`, will have
-three commands: `submit <fork-pr>`, `status`, and `sync`. Until it exists, developers
-do these steps by hand following the skills. To submit a merged contribution upstream,
-including its upstream issue, stack placement, and the `Upstream:` record, use
+login. `.agents/scripts/shopify/upstream.py`, beside `issues.py` and `release.py`, has
+`status`, which shows where each carried change stands upstream; `submit <fork-pr>`,
+which will perform shopify-upstream-pr's steps, and `sync` do not exist yet. Until
+`submit` exists, developers submit by hand following the skills. To submit a merged
+contribution upstream, including its upstream issue, stack placement, and the
+`Upstream:` record, use
 [shopify-upstream-pr](.claude/skills/shopify-upstream-pr/SKILL.md). To open a PR in
 `Shopify/yugabyte-db`, use
 [shopify-create-pr](.claude/skills/shopify-create-pr/SKILL.md), not the inherited

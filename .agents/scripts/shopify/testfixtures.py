@@ -54,7 +54,11 @@ class GitFixture:
         self.git("branch", name, ref)
 
     def remote_branch(self, name, ref="HEAD"):
-        self.git("update-ref", f"refs/remotes/origin/{name}", self.git("rev-parse", ref))
+        self.ref(f"refs/remotes/origin/{name}", self.git("rev-parse", ref))
+
+    def ref(self, name, sha):
+        """Points the full ref `name` (such as refs/remotes/upstream/master) at `sha`."""
+        self.git("update-ref", name, sha)
 
     def init_bare(self, bare_path):
         self.git("init", "--quiet", "--bare", bare_path)
