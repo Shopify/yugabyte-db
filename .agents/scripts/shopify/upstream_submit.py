@@ -17,9 +17,9 @@ from pathlib import Path
 import re
 import shlex
 import sys
-import tempfile
 
-from scm import Error, GitError, Repository, Tool, UsageError
+from interaction import Interaction, Stop
+from scm import Error, GitError, Repository, UsageError, last_url, remote_pattern
 import upstream
 from upstream import (FORK_BRANCH, FORK_REPO, FORK_URL, PR_SUFFIX, SHOPIFY_ONLY, SKIP_LABEL,
                       UPSTREAM_REF, UPSTREAM_REPO, UPSTREAM_URL, attribute, fork_only, resolve,
@@ -47,7 +47,7 @@ UPSTREAM_ISSUE = re.compile(r"https://github\.com/yugabyte/yugabyte-db/issues/(\
 UPSTREAM_ISSUE_LINE = re.compile(r"^(?:\*\*)?Upstream issue:(?:\*\*)?[ \t]*<?(https://github\.com/"
                                  r"yugabyte/yugabyte-db/issues/\d+)", re.MULTILINE | re.IGNORECASE)
 UPSTREAM_PULL = re.compile(r"https://github\.com/yugabyte/yugabyte-db/pull/(\d+)")
-UPSTREAM_REMOTE_URL = re.compile(r"[:/]yugabyte/yugabyte-db(?:\.git)?/?$", re.IGNORECASE)
+UPSTREAM_REMOTE_URL = remote_pattern(UPSTREAM_REPO)
 FORK_REFERENCE = re.compile(r"(?:\b(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?):?[ \t]+)?"
                             r"(?<![\w/#&])#(\d+)\b", re.IGNORECASE)
 PUBLICATION = re.compile(r"<!-- shopify-yb-publication:.*-->")
@@ -166,20 +166,16 @@ class GitHub(upstream.GitHub):
         return with_normal_body(self.json("issue", "view", str(number), "--repo", FORK_REPO,
                                           "--json", "title,body,labels"))
 
-    def upstream_labels(self):
-        return {label["name"] for label in self.json("label", "list", "--repo", UPSTREAM_REPO,
-                                                     "--limit", "1000", "--json", "name")}
-
     def create_issue(self, title, body_file, labels):
         args = ["issue", "create", "--repo", UPSTREAM_REPO, "--title", title,
                 "--body-file", body_file]
         if labels:
             args += ["--label", ",".join(labels)]
         output = self.run(*args)
-        match = UPSTREAM_ISSUE.search(output.strip().splitlines()[-1] if output.strip() else "")
-        if match is None:
+        url = last_url(output, UPSTREAM_ISSUE)
+        if url is None:
             raise Error(f"gh issue create printed no {UPSTREAM_REPO} issue URL:\n{output}")
-        return match[0]
+        return url
 
     def comment_on_issue(self, number, body):
         self.run("issue", "comment", str(number), "--repo", FORK_REPO, "--body", body)
@@ -192,14 +188,6 @@ class GitHub(upstream.GitHub):
 
     def comment_on_pull_request(self, number, body):
         self.run("pr", "comment", str(number), "--repo", FORK_REPO, "--body", body)
-
-
-class Stop(Exception):
-    """Stops for developer input (exit 4); `lines` say how to continue."""
-
-    def __init__(self, *lines):
-        super().__init__("\n".join(lines))
-        self.lines = lines
 
 
 @dataclass
@@ -233,11 +221,16 @@ class Base:
         return self.branch != "master"
 
 
-def on_upstream(pr):
-    """Whether a `gh pr list` entry's head branch is in yugabyte/yugabyte-db itself."""
+def head_repository(pr):
+    """The `owner/name`, lowercased, of a `gh pr list` entry's head repository."""
     owner = ((pr.get("headRepositoryOwner") or {}).get("login") or "").lower()
     name = ((pr.get("headRepository") or {}).get("name") or "").lower()
-    return f"{owner}/{name}" == UPSTREAM_REPO
+    return f"{owner}/{name}"
+
+
+def on_upstream(pr):
+    """Whether a `gh pr list` entry's head branch is in yugabyte/yugabyte-db itself."""
+    return head_repository(pr) == UPSTREAM_REPO
 
 
 def associated(comments, number):
@@ -253,45 +246,20 @@ def readable(path, what):
     return path
 
 
-class Submit:
-    def __init__(self, args, github, out, err, say, tool=None, stdin=None, interactive=None,
-                 cwd=None, program=None, workdir=None):
-        self.args = args
+class Submit(Interaction):
+    workdir_prefix = "upstream-submit-"
+
+    def __init__(self, args, github, out, err, say, **options):
+        super().__init__(args, out, err, say, **options)
         self.github = github
-        self.out = out
-        self.err = err
-        self.say = say
-        self.tool = Tool() if tool is None else tool
-        self.stdin = sys.stdin if stdin is None else stdin
-        if interactive is None:
-            interactive = sys.stdin.isatty() and sys.stdout.isatty()
-        self.interactive = interactive and not args.yes
-        self.cwd = os.getcwd() if cwd is None else cwd
-        self.program = self.default_program() if program is None else program
-        self.workdir_path = workdir
         self.number = args.fork_pr
         self.comments = []
         self.restructured = False  # the fork PR's upstream PR was merged without landing
         self.planned = None  # (branch, sha) the preview showed
 
-    def default_program(self):
-        script = Path(upstream.__file__).resolve()
-        try:
-            shown = str(script.relative_to(Path(self.cwd).resolve()))
-        except ValueError:
-            shown = str(script)
-        return f"python3 {shlex.quote(shown)}"
-
-    def run(self):
-        try:
-            return self.submit()
-        except Stop as stop:
-            self.say(*stop.lines)
-            return 4
-
     # Phase A: local only.
 
-    def submit(self):
+    def main(self):
         args = self.args
         if self.number is None:
             raise UsageError("submit needs the fork PR number")
@@ -461,7 +429,7 @@ class Submit:
                 return IssuePlan(numbers[0], "recorded in the private tracker", number,
                                  associate=not associated(fork_comments, numbers[0]))
         source = self.github.fork_issue(number)
-        upstream_labels = self.github.upstream_labels()
+        upstream_labels = self.github.labels(UPSTREAM_REPO)
         labels = [label["name"] for label in source.get("labels") or []
                   if label.get("name") in upstream_labels]
         return IssuePlan(None, "create", number, source.get("title") or "",
@@ -946,7 +914,7 @@ class Submit:
         rerun = "  " + self.command(repo_path=repo.path, test_plan=test_plan, yes=True)
         if not self.interactive:
             raise Stop("To publish, rerun:", rerun)
-        if (self.ask("Publish? [y/N] ") or "").lower() not in ("y", "yes"):
+        if not self.agree("Publish? [y/N] "):
             raise Stop("Not published. To publish later:", rerun)
 
     def confirm_records(self, issue, existing):
@@ -967,7 +935,7 @@ class Submit:
         lines = [f"  {command}" for command in commands]
         if not self.interactive:
             raise Stop("To record it, run:", *lines)
-        if (self.ask("Publish? [y/N] ") or "").lower() not in ("y", "yes"):
+        if not self.agree("Publish? [y/N] "):
             raise Stop("Not recorded. To record it, run:", *lines)
 
     def require_planned(self, repo, sha):
@@ -1077,11 +1045,10 @@ class Submit:
         if result.returncode:
             raise Error(CREATE_PR_FAILURES.get(
                 result.returncode, f"create-pr.sh failed with exit {result.returncode}"))
-        lines = [line for line in result.stdout.splitlines() if line.strip()]
-        match = UPSTREAM_PULL.search(lines[-1]) if lines else None
-        if match is None:
+        url = last_url(result.stdout, UPSTREAM_PULL)
+        if url is None:
             raise Error("create-pr.sh succeeded but printed no pull request URL last")
-        return match[0]
+        return url
 
     def pick_commit(self, repo, landing):
         """The commit on HEAD, above upstream master, that cherry-picked `landing`."""
@@ -1125,23 +1092,3 @@ class Submit:
         if yes:
             argv.append("--yes")
         return shlex.join(argv)
-
-    def workdir(self):
-        if self.workdir_path is None:
-            self.workdir_path = tempfile.mkdtemp(prefix="upstream-submit-")
-        os.makedirs(self.workdir_path, exist_ok=True)
-        return self.workdir_path
-
-    def write(self, name, text):
-        path = os.path.join(self.workdir(), name)
-        Path(path).write_text(text, encoding="utf-8")
-        return path
-
-    def ask(self, prompt):
-        self.out.write(prompt)
-        self.out.flush()
-        line = self.stdin.readline()
-        return line.strip() if line else None
-
-    def warn(self, line):
-        self.say(line, stream=self.err)

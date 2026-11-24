@@ -46,14 +46,15 @@ subject is a change's identity, and the original landing commit stays reachable.
 replayed landing that had no `(#N)` carries a `Shopify-PR:` trailer naming its PRs,
 written by `sync`. `git log --first-parent <upstream SHA>..master-shopify` lists the
 sync's merge commit and what the fork carries. `.agents/scripts/shopify/upstream.py sync`
-will do this; nothing does it yet.
+builds the candidate and opens its PR; landing is the fast-forward described above.
 
 Submission is developer-forward: the original developer submits under their own `gh`
 login. `.agents/scripts/shopify/upstream.py`, beside `issues.py` and `release.py`, has
-`status`, which shows where each carried change stands upstream, and `submit <fork-pr>`,
-which performs shopify-upstream-pr's steps under the developer's own `gh` login; `sync`
-does not exist yet. To submit a merged contribution upstream, including its upstream
-issue, stack placement, and the `Upstream:` record, use
+`status`, which shows where each carried change stands upstream, `submit <fork-pr>`,
+which performs shopify-upstream-pr's steps under the developer's own `gh` login, and
+`sync`, which builds a sync's candidate and opens its PR. To submit a merged
+contribution upstream, including its upstream issue, stack placement, and the
+`Upstream:` record, use
 [shopify-upstream-pr](.claude/skills/shopify-upstream-pr/SKILL.md). To open a PR in
 `Shopify/yugabyte-db`, use
 [shopify-create-pr](.claude/skills/shopify-create-pr/SKILL.md), not the inherited

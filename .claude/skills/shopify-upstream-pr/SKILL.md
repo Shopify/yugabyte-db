@@ -226,10 +226,10 @@ labels on upstream PRs.
   it merges, cherry-pick it onto this branch as a new commit with its subject rewritten
   per Step 3 (no fork `#N` upstream), push per stack-prs § Updating a layer, and comment
   `Upstream: <this upstream PR url>` on the follow-up fork PR (Step 6) so it is not
-  submitted again. Otherwise change only the upstream PR: the first sync to an upstream
-  commit that contains it drops the fork's commit, and the fork takes upstream's version
-  from the new base. Yugabyte Infrastructure decides whether a follow-up needs
-  backporting.
+  submitted again. Otherwise change only the upstream PR: the first `upstream.py sync` to
+  an upstream commit that contains it drops the fork's commit, and the fork takes
+  upstream's version from the new base. Yugabyte Infrastructure decides whether a
+  follow-up needs backporting.
 - A merged PR has landed only when its merge commit is on upstream `master` (the Step 2
   check); the base GitHub records does not decide it. A stack merge records upper
   layers against their parent branch although they land on `master`. A force-push that
