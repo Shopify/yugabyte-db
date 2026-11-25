@@ -98,6 +98,42 @@ target_link_libraries(rocksdb_dump
   rocksdb_tools
   yb_docdb)
 
+add_executable(yb-local-storage-probe EXCLUDE_FROM_ALL local_runtime/storage_probe.cc)
+target_link_libraries(yb-local-storage-probe yb_docdb)
+
+add_library(yb_local_pg_store EXCLUDE_FROM_ALL local_runtime/pg_local_store.cc)
+target_link_libraries(yb_local_pg_store yb_docdb)
+
+PROTOBUF_GENERATE_CPP(
+  LOCAL_METADATA_SRCS LOCAL_METADATA_HDRS LOCAL_METADATA_TGTS
+  SOURCE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  BINARY_ROOT ${CMAKE_CURRENT_BINARY_DIR}/../..
+  PROTO_FILES local_runtime/pg_local_metadata.proto)
+add_library(yb_local_metadata_proto EXCLUDE_FROM_ALL ${LOCAL_METADATA_SRCS})
+target_link_libraries(yb_local_metadata_proto protobuf tablet_proto)
+add_dependencies(yb_local_metadata_proto ${LOCAL_METADATA_TGTS})
+
+add_library(yb_local_storage EXCLUDE_FROM_ALL local_runtime/pg_local_storage.cc)
+target_link_libraries(yb_local_storage yb_docdb)
+
+add_library(yb_local_catalog_transaction EXCLUDE_FROM_ALL
+  local_runtime/pg_catalog_transaction.cc local_runtime/pg_local_table.cc)
+target_link_libraries(yb_local_catalog_transaction
+  yb_client yb_docdb pg_client_proto yb_pgwrapper
+  yb_local_metadata_proto yb_local_storage yb_local_txn_store)
+
+add_library(yb_local_txn_store EXCLUDE_FROM_ALL local_runtime/pg_local_txn_store.cc)
+target_link_libraries(yb_local_txn_store yb_docdb yb_local_metadata_proto tablet yb_local_storage)
+
+add_library(yb_local_readonly EXCLUDE_FROM_ALL local_runtime/pg_local_readonly.cc)
+target_link_libraries(yb_local_readonly
+  yb_docdb pg_client_proto tserver_shared tserver server_process yb_pgwrapper
+  yb_local_catalog_transaction)
+
+add_executable(yb-local-readonly EXCLUDE_FROM_ALL local_runtime/pg_local_readonly_main.cc)
+# PgWrapper references flags defined in tserver; the local runtime constructs no TabletServer.
+target_link_libraries(yb-local-readonly yb_local_readonly pq_utils tserver)
+
 add_executable(sst_dump sst_dump.cc)
 target_link_libraries(sst_dump
   rocksdb_tools
@@ -218,6 +254,18 @@ set(YB_TEST_LINK_LIBS
   yb-admin-test-base
   ${YB_MIN_TEST_LIBS})
 ADD_YB_TEST(ysck-test)
+ADD_YB_TEST(local_runtime/pg_local_store-test)
+YB_TEST_TARGET_LINK_LIBRARIES(local_runtime/pg_local_store-test yb_local_pg_store)
+ADD_YB_TEST(local_runtime/pg_local_txn_store-test)
+YB_TEST_TARGET_LINK_LIBRARIES(local_runtime/pg_local_txn_store-test yb_local_txn_store)
+ADD_YB_TEST(local_runtime/pg_local_shared_commit-test)
+YB_TEST_TARGET_LINK_LIBRARIES(local_runtime/pg_local_shared_commit-test
+  yb_local_readonly yb_local_txn_store)
+ADD_YB_TEST(local_runtime/pg_local_ysql-test)
+YB_TEST_TARGET_LINK_LIBRARIES(local_runtime/pg_local_ysql-test yb_local_pg_store yb_local_readonly)
+ADD_YB_TEST(local_runtime/pg_local_readonly-test)
+YB_TEST_TARGET_LINK_LIBRARIES(local_runtime/pg_local_readonly-test yb_local_readonly)
+ADD_YB_TEST_DEPENDENCIES(local_runtime/pg_local_readonly-test yb-local-readonly)
 ADD_YB_TEST(yb-bulk_load-test)
 ADD_YB_TEST_DEPENDENCIES(yb-bulk_load-test
   yb-generate_partitions_main

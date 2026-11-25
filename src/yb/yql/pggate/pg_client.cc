@@ -854,6 +854,7 @@ class PgClient::Impl : public BigDataFetcher {
       master::IncludeHidden include_hidden) {
     tserver::PgOpenTableRequestPB req;
     req.set_table_id(table_id.GetYbTableId());
+    req.set_session_id(session_id_);
     req.set_reopen(reopen);
     if (min_ysql_catalog_version > 0) {
       req.set_ysql_catalog_version(min_ysql_catalog_version);
@@ -874,6 +875,7 @@ class PgClient::Impl : public BigDataFetcher {
   Result<client::VersionedTablePartitionList> GetTablePartitionList(const PgObjectId& table_id) {
     tserver::PgGetTablePartitionListRequestPB req;
     req.set_table_id(table_id.GetYbTableId());
+    req.set_session_id(session_id_);
 
     tserver::PgGetTablePartitionListResponsePB resp;
     RETURN_NOT_OK(DoSyncRPC(&PgClientServiceProxy::GetTablePartitionList,
@@ -953,6 +955,7 @@ class PgClient::Impl : public BigDataFetcher {
   Result<master::GetNamespaceInfoResponsePB> GetDatabaseInfo(uint32_t oid) {
     tserver::PgGetDatabaseInfoRequestPB req;
     req.set_oid(oid);
+    req.set_session_id(session_id_);
 
     tserver::PgGetDatabaseInfoResponsePB resp;
 
