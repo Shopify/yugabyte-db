@@ -2252,8 +2252,12 @@ class ReadonlyService : public UnsupportedPgClientService,
       Session& session, const tserver::PgPerformRequestMsg& req,
       tserver::PgPerformResponseMsg* resp, Responder& responder, PerformState& state) {
     RETURN_NOT_OK(Status(catalog_.failure_));
-    // Catalog mutations must be DDL, so DDL mode alone selects the catalog transaction.
-    const bool catalog = req.options().ddl_mode();
+    // Catalog mutations must be DDL, but only a DDL's catalog operations join the catalog
+    // transaction. PostgreSQL keeps a transaction block in DDL mode after any DDL statement, even
+    // one that changes nothing (CREATE TABLE IF NOT EXISTS for an existing table), and the data
+    // operations after it stay a native transaction, concurrent with other backends, until a
+    // catalog change adopts it.
+    const bool ddl = req.options().ddl_mode();
     if (!std::exchange(state.started, true)) RETURN_NOT_OK(StartPerform(session, req, resp, state));
     auto* const wait = FLAGS_local_runtime_wait_on_conflict ? &state.wait : nullptr;
     const auto waiting = [&state, wait](const Status& status, size_t op_index) {
@@ -2271,11 +2275,9 @@ class ReadonlyService : public UnsupportedPgClientService,
       auto* slot = std::exchange(state.resume, false) ? &resp->mutable_responses()->back()
                                                       : resp->add_responses();
       if (op.has_write()) {
-        RETURN_NOT_OK(EnsureTransaction(session, req.options(), false, catalog));
         const auto& table = VERIFY_RESULT_REF(catalog_.Find(op.write().table_id().ToBuffer()));
-        SCHECK(
-            table.application || req.options().ddl_mode(), NotSupported,
-            "Catalog mutations must be part of DDL");
+        RETURN_NOT_OK(EnsureTransaction(session, req.options(), false, ddl && !table.application));
+        SCHECK(table.application || ddl, NotSupported, "Catalog mutations must be part of DDL");
         if (table.application) {
           const auto status = catalog_.transaction_->NativeTransactions().WriteSql(
               *session.native_txn, op.write(), slot, &responder.sidecars(),
@@ -2339,13 +2341,15 @@ class ReadonlyService : public UnsupportedPgClientService,
         "Historical reads are not available on a frozen catalog");
     // Start before selecting the statement limit, including read-only SQL transactions.
     // The native table-lock path guarantees a FinishTransaction even without data writes.
-    const bool catalog = req.options().ddl_mode();
+    // As in PerformReads, only catalog operations join the catalog transaction.
+    const bool ddl = req.options().ddl_mode();
     for (const auto& op : req.ops()) {
       if (op.has_write()) {
-        RETURN_NOT_OK(EnsureTransaction(session, req.options(), false, catalog));
+        const auto& table = VERIFY_RESULT_REF(catalog_.Find(op.write().table_id().ToBuffer()));
+        RETURN_NOT_OK(EnsureTransaction(session, req.options(), false, ddl && !table.application));
       } else if (op.has_read() && catalog_.transaction_) {
         if (VERIFY_RESULT_REF(catalog_.Find(op.read().table_id().ToBuffer())).application) {
-          RETURN_NOT_OK(EnsureTransaction(session, req.options(), true, catalog));
+          RETURN_NOT_OK(EnsureTransaction(session, req.options(), true, /* catalog= */ false));
         } else if (
             op.read().has_row_mark_type() && op.read().row_mark_type() != ROW_MARK_ABSENT) {
           // Catalog row locks are not resolved against other backends; exclude them instead.

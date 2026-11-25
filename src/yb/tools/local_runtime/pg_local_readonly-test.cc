@@ -1298,6 +1298,29 @@ TEST_F(ReadonlyPgServerTest, ConcurrentSqlSessions) {
     ASSERT_EQ(ASSERT_RESULT(read(first)), 30);
     ASSERT_EQ(ASSERT_RESULT(keys("k<=4")), "1,2,3,4");
   }
+
+  // PostgreSQL keeps a transaction block in DDL mode after a DDL that changes nothing. Its data
+  // reads and writes leave other backends free to read the catalog and write.
+  constexpr auto kNoOpDdl = "CREATE TABLE IF NOT EXISTS lease_rows(k bigint PRIMARY KEY,v bigint)";
+  ASSERT_OK(first.Execute("BEGIN"));
+  ASSERT_OK(first.Execute(kNoOpDdl));
+  ASSERT_OK(first.Execute("INSERT INTO lease_rows VALUES(31,3100),(32,3200)"));
+  ASSERT_OK(first.Execute("DELETE FROM lease_rows WHERE k=32"));
+  ASSERT_EQ(ASSERT_RESULT(read(first)), 30);
+  ASSERT_TRUE(ASSERT_RESULT(second.FetchRow<bool>("SELECT to_regclass('lease_rows') IS NOT NULL")));
+  ASSERT_OK(second.Execute("INSERT INTO lease_rows VALUES(33,3300)"));
+  ASSERT_OK(first.Execute("COMMIT"));
+  ASSERT_EQ(ASSERT_RESULT(keys("k>30")), "31,33");
+
+  // A catalog change after them still adopts the data writes, so both roll back together.
+  ASSERT_OK(first.Execute("BEGIN"));
+  ASSERT_OK(first.Execute(kNoOpDdl));
+  ASSERT_OK(first.Execute("INSERT INTO lease_rows VALUES(34,3400)"));
+  ASSERT_OK(first.Execute("CREATE TABLE after_noop_rows(k bigint PRIMARY KEY)"));
+  ASSERT_OK(first.Execute("ROLLBACK"));
+  ASSERT_EQ(ASSERT_RESULT(keys("k>30")), "31,33");
+  ASSERT_TRUE(
+      ASSERT_RESULT(second.FetchRow<bool>("SELECT to_regclass('after_noop_rows') IS NULL")));
 }
 
 TEST_F(ReadonlyPgServerTest, RowLocks) {
