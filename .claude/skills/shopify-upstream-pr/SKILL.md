@@ -66,11 +66,16 @@ Otherwise derive one. Write the fork issue body to a file
 (`gh issue view <N> --repo Shopify/yugabyte-db --json body -q .body > <file>`) and
 remove two things: the trailing `<!-- shopify-yb-publication:… -->` line, and the
 `## Shopify context` section, from that heading up to the next `###` heading. Keep the
-title verbatim. The body already follows the upstream form headings. Pass no labels:
-triage is upstream's.
+title verbatim. The body already follows the upstream form headings. Pass the fork
+issue's labels that exist upstream: its template's, such as `area/docdb` and
+`status/awaiting-triage`, so upstream triage sees the issue as it would one filed with
+create-issue. A label a maintainer added in the fork is dropped, since `gh issue create`
+fails on a label the repository lacks.
 
 ```bash
-gh issue create --repo yugabyte/yugabyte-db --title "<fork issue title>" --body-file <file>
+labels=$(comm -12 <(gh issue view <N> --repo Shopify/yugabyte-db --json labels -q '.labels[].name' | sort) \
+  <(gh label list --repo yugabyte/yugabyte-db --limit 1000 --json name -q '.[].name' | sort) | paste -sd, -)
+gh issue create --repo yugabyte/yugabyte-db --title "<fork issue title>" --body-file <file> ${labels:+--label "$labels"}
 ```
 
 Record it: when a private tracker exists,
@@ -261,7 +266,8 @@ newer upstream commit as a reviewed candidate, and `sync --land` fast-forwards i
 ## Commands
 
 ```bash
-gh issue create --repo yugabyte/yugabyte-db --title "<fork issue title>" --body-file <file>   # 1, title cites a fork issue
+labels=$(comm -12 <(gh issue view <N> --repo Shopify/yugabyte-db --json labels -q '.labels[].name' | sort) <(gh label list --repo yugabyte/yugabyte-db --limit 1000 --json name -q '.[].name' | sort) | paste -sd, -)   # 1, title cites a fork issue
+gh issue create --repo yugabyte/yugabyte-db --title "<fork issue title>" --body-file <file> ${labels:+--label "$labels"}
 python3 .agents/scripts/shopify/issues.py link --issue <private-issue-url> --public-issue <upstream-issue-url>
 gh issue comment <N> --repo Shopify/yugabyte-db --body "Upstream issue: <upstream-issue-url>"
 gh pr view <n> --repo Shopify/yugabyte-db --json baseRefName                                  # 2: fork stack parent

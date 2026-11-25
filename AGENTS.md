@@ -10,8 +10,9 @@ issue linking, use
 publication target is `Shopify/yugabyte-db`. Source evidence stays in the configured
 private tracker; normal sanitized publication does not require a separate approval.
 Use the Shopify tool for publication and recovery rather than the inherited
-upstream `create-issue` workflow. Existing public upstream issues are reused as the
-public record, and the fork PR cites them directly.
+upstream `create-issue` workflow, which opens upstream issues for problems that carry
+no private context. Existing public upstream issues are reused as the public record,
+and the fork PR cites them directly.
 
 A Shopify contribution is a reviewed PR merged into `master-shopify` with an
 approving review from `Shopify/yugabyte-code-reviewers`. Series and maintenance
@@ -73,13 +74,17 @@ records: a stack merge records upper layers against their parent branch, and a s
 reorder can mark a PR merged without landing it, which is a restructure. After a
 parent squash-merges, the developer rebases and force-pushes their branch.
 
-Fork-only work needs no issue. Its PR title carries `[shopify-only]` in place of or
-after the issue ID, paired with the `upstream: skip` label; CI checks the title, and
-the pairing is a convention. Upstream requires an issue reference on every PR, a
-GitHub issue or a YB Jira ID, and Shopify cannot create YB Jira tickets. An
-upstream-bound fork PR cites an upstream issue, the number its upstream PR will
-carry: an existing one, or one the developer opens upstream when the problem carries
-no private context. Work that starts from private evidence goes through
+Fork-only work cites a fork issue, opened in `Shopify/yugabyte-db`; Shopify-only
+tooling outside the database needs none. Its PR title carries `[shopify-only]` after
+the issue ID, or in place of it for that tooling, paired with the `upstream: skip`
+label; CI checks the title, and the pairing is a convention. Upstream requires an
+issue reference on every PR, a GitHub issue or a YB Jira ID, and Shopify cannot
+create YB Jira tickets. An upstream-bound fork PR cites an upstream issue, the number
+its upstream PR will carry: an existing one, or one the developer opens upstream with
+the inherited `create-issue` skill when the problem carries no private context; when
+that skill finds the problem cannot be described without private detail, its JIRA path
+does not apply to Shopify, and the work goes through shopify-create-issue instead. Work
+that starts from private evidence goes through
 shopify-create-issue; when no upstream issue covers the problem, that skill publishes
 a sanitized fork issue, the fork PR cites it, and the upstream issue is derived from
 it at submission. The body's first line is `Refs <full issue URL>`, because a bare
