@@ -43,8 +43,10 @@ LANDING = ("Do not use the merge button: squash, merge-commit and rebase all und
            "`python3 .agents/scripts/shopify/upstream.py sync --land <pr>`, which checks approval, "
            "Binks, CI and the fast-forward first. Break-glass, skipping those checks: "
            "`git push origin {head}:master-shopify`.")
-SECTIONS = ["## Summary", "## Upstream", "## Dropped", "## Carried", "## Range-diff",
-            "## Warnings", "## Landing"]
+SECTIONS = ["## Summary", "## Upgrade/Rollback safety", "## Upstream", "## Dropped", "## Carried",
+            "## Range-diff", "## Warnings", "## Landing"]
+# upstream's .github/workflows/pr-upgrade.yml, run on the lower-cased body.
+UPGRADE_CHECK = re.compile(r"upgrade.*(downgrade|rollback)\ssafety")
 # The [shopify-only] form of the title grammar in .github/workflows/pr-title.yml.
 TITLE = re.compile(r"\[shopify-only\] [a-zA-Z0-9_-]+(,[a-zA-Z0-9_-]+)*: \S.{8,98}\S")
 
@@ -540,6 +542,107 @@ class HappyPathTest(SyncTestCase):
         landed, unidentified = attribute(commits[1:], self.merged)
         self.assertEqual(([replayed], [commits[2]["sha"]], []),
                          (landed[76], landed[41], unidentified))
+
+    def upgrade(self):
+        body = self.body()
+        self.assertRegex(body.lower(), UPGRADE_CHECK)
+        return self.section(body, "## Upgrade/Rollback safety")
+
+    def tail(self, old):
+        return (f"The previous `master-shopify` tip `{old[:12]}` stays reachable as the sync "
+                "merge's second parent, named by its `Old-master-shopify:` trailer.")
+
+    def test_the_body_answers_upstreams_upgrade_check_without_proto_changes(self):
+        self.published()
+
+        self.assertEqual("No `.proto` file changes in this diff. " + self.tail(self.old),
+                         self.upgrade())
+
+    def test_the_upgrade_section_names_upstreams_proto_changes_and_a_clean_proto_replay(self):
+        self.upstream_commit({"src/yb/common/common.proto": "message A {}\n",
+                              "src/yb/master/master_ddl.proto": "message B {}\n"},
+                             "Upstream proto change")
+        meta = self.add_landing({"src/yb/meta.proto": "message Meta {}\n"},
+                                "Add the meta message", 77)
+
+        self.published()
+
+        self.assertEqual(
+            "2 `.proto` files change in this diff: 2 in upstream's commits "
+            f"`{self.u1[:12]}..{self.to[:12]}`, reviewed and merged in yugabyte/yugabyte-db, "
+            "which this sync takes as they are (`src/yb/common/common.proto`, "
+            "`src/yb/master/master_ddl.proto`). #77 replays its original landing without "
+            "conflict (range-diff below), so that fork PR's upgrade and rollback notes still "
+            "apply. " + self.tail(meta), self.upgrade())
+
+    def test_the_upgrade_section_qualifies_a_proto_replay_adapted_in_a_conflict(self):
+        meta = self.add_landing({"src/yb/meta.proto": "message Meta {}\n"},
+                                "Add the meta message", 77)
+        self.upstream_commit({"src/yb/meta.proto": "message Upstream {}\n"}, "Upstream meta")
+        code, out, err = self.sync()
+        self.assertEqual((4, ""), (code, err), out)
+        self.resolve_in_worktree("src/yb/meta.proto", "message Meta {}\nmessage Upstream {}\n")
+
+        self.published("--continue")
+
+        self.assertEqual(
+            "1 `.proto` file changes in this diff: 1 changed both in upstream's commits "
+            f"`{self.u1[:12]}..{self.to[:12]}` and by a replayed landing, accounted for below "
+            "(`src/yb/meta.proto`). #77 was replayed "
+            "with a conflict resolution; its original notes may not describe the resolved "
+            "schema: review its range-diff and add notes here before landing. "
+            + self.tail(meta), self.upgrade())
+
+    def test_a_proto_conflict_resolved_in_upstreams_favour_is_reported_as_adapted(self):
+        meta = self.add_landing({"src/yb/meta.proto": "message Meta {}\n",
+                                 "src/yb/meta.cc": "meta\n"}, "Add the meta message", 77)
+        self.upstream_commit({"src/yb/meta.proto": "message Upstream {}\n"}, "Upstream meta")
+        code, out, err = self.sync()
+        self.assertEqual((4, ""), (code, err), out)
+        self.resolve_in_worktree("src/yb/meta.proto", "message Upstream {}\n")
+
+        self.published("--continue")
+
+        self.assertEqual(
+            "1 `.proto` file changes in this diff: 1 in upstream's commits "
+            f"`{self.u1[:12]}..{self.to[:12]}`, reviewed and merged in yugabyte/yugabyte-db, "
+            "which this sync takes as they are (`src/yb/meta.proto`). #77 was replayed with a "
+            "conflict resolution and its own `.proto` changes were resolved away in favour of "
+            "upstream's; its original notes may not describe the resolved schema: review its "
+            "range-diff and add notes here before landing. " + self.tail(meta), self.upgrade())
+
+    def test_an_empty_proto_pick_is_reported_as_already_upstream(self):
+        meta = self.add_landing({"src/yb/meta.proto": "message Meta {}\n"},
+                                "Add the meta message", 77)
+        self.upstream_commit({"src/yb/meta.proto": "message Meta {}\n"}, "Upstream meta")
+        code, out, err = self.sync()
+        self.assertEqual((4, ""), (code, err), out)
+        git(self.worktree, "cherry-pick", "--skip")
+
+        self.published("--continue")
+
+        self.assertEqual(
+            "No `.proto` file changes in this diff. #77, which changed `.proto` files, applied "
+            "empty on upstream: upstream already contains its schema changes, and this sync "
+            "carries nothing of it. " + self.tail(meta), self.upgrade())
+
+    def test_the_upgrade_section_reports_a_dropped_proto_landing(self):
+        meta = self.add_landing({"src/yb/meta.proto": "message Meta {}\n"},
+                                "Add the meta message", 77)
+        self.upstream_commit({"src/yb/meta.proto": "message Upstream {}\n"}, "Upstream meta")
+        code, out, err = self.sync()
+        self.assertEqual((4, ""), (code, err), out)
+        git(self.worktree, "cherry-pick", "--abort")
+
+        self.published("--continue", "--skip", "77")
+
+        self.assertEqual(
+            "1 `.proto` file changes in this diff: 1 in upstream's commits "
+            f"`{self.u1[:12]}..{self.to[:12]}`, reviewed and merged in yugabyte/yugabyte-db, "
+            "which this sync takes as they are (`src/yb/meta.proto`). #77, which changed "
+            "`.proto` files, is dropped from the fork by this sync (it conflicted and was "
+            "skipped), so the diff removes its schema changes. " + self.tail(meta),
+            self.upgrade())
 
     def test_a_same_named_pr_from_another_fork_is_not_reused(self):
         self.answer_open_prs([open_pr(300, owner="someone"), open_pr(301, base="main")])

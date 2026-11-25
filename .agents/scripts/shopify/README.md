@@ -489,27 +489,34 @@ the `git push origin --delete` command); without `--to` it aborts the only local
 
 The run then shows the upstream commit, the old `master-shopify`, each carried landing (old and
 new SHA), each drop, the conflicts resolved and the warnings, and asks `Push shopify-sync/<sha>
-and open its PR against master-shopify? [y/N]`. `--yes` skips the question; without a terminal
-or `--yes` it exits 4 with the `--continue --yes` rerun command. After the answer it checks
-that the branch still points at the commit it showed, refusing when the candidate changed while
-the question was open, and pushes that commit explicitly (`git push origin
-<sha>:refs/heads/shopify-sync/<sha>`), never forcing: when `origin` has a version that is not
-an ancestor of the candidate, it refuses. It creates the `sync` label when the fork lacks it
-and opens a draft PR against `master-shopify` titled `[shopify-only] Build: Sync master-shopify
-to upstream <sha>`, labelled `upstream: skip` and `sync`; when the branch already has an open
-PR against `master-shopify` whose head is in `Shopify/yugabyte-db` itself, it updates that PR's
-body instead, so a rerun with `--continue` pushes and refreshes it. Same-named branches in
-other forks and PRs against other bases are ignored. The body has a summary, the upstream
-commit, tables of the dropped and carried PRs (with whether each pick conflicted), a `git
-range-diff` of each replay against its original landing (capped at 200 lines each), the
-warnings, and the landing rule. The body stays under 60,000 characters: each range-diff first
-gets a placeholder with the command that shows it, failed ones included, and outputs replace
-placeholders in order while they fit; when even the placeholders do not fit, the range-diffs
-left out are named in one "Omitted" block. A body still over the cap, with every range-diff
-omitted, is refused before anything is pushed. A merge landing's range-diff uses
-`--diff-merges=first-parent`, which needs git 2.48 or later; a range-diff that fails is
-replaced by its command and a warning, and the run goes on. It prints the PR's URL, the `devx
-binks review run` command and the worktree's path.
+and open its PR against master-shopify? [y/N]`. `--yes` skips the question; without a terminal or
+`--yes` it exits 4 with the `--continue --yes` rerun command. After the answer it checks that the
+branch still points at the commit it showed, refusing when the candidate changed while the
+question was open, and pushes that commit explicitly (`git push origin
+<sha>:refs/heads/shopify-sync/<sha>`), never forcing: when `origin` has a version that is not an
+ancestor of the candidate, it refuses. It creates the `sync` label when the fork lacks it and
+opens a draft PR against `master-shopify` titled `[shopify-only] Build: Sync master-shopify to
+upstream <sha>`, labelled `upstream: skip` and `sync`; when the branch already has an open PR
+against `master-shopify` whose head is in `Shopify/yugabyte-db` itself, it updates that PR's body
+instead, so a rerun with `--continue` pushes and refreshes it. Same-named branches in other forks
+and PRs against other bases are ignored. The body has a summary, an `## Upgrade/Rollback safety`
+section (upstream's `pr-upgrade` check wants one on any PR whose diff touches a `.proto` file;
+the section inventories the `.proto` files the candidate changes against the old `master-shopify`
+and says whose each change is: upstream's commits between the previous base and the new one, both
+upstream's and a replayed landing's, or the sync's own through its carried landings; a replay
+whose original or replay touches one is called unchanged only when it replayed without conflict,
+an adapted one is flagged for notes before landing (and whether its own `.proto` edits were
+resolved away), a dropped landing that touched one is named, and one that applied empty is
+reported as already upstream; then how the old tip stays reachable), the upstream commit, tables
+of the dropped and carried PRs (with whether each pick conflicted), a `git range-diff` of each
+replay against its original landing (capped at 200 lines each), the warnings, and the landing
+rule. The body stays under 60,000 characters: each range-diff first gets a placeholder with the
+command that shows it, failed ones included, and outputs replace placeholders in order while they
+fit; when even the placeholders do not fit, the range-diffs left out are named in one "Omitted"
+block. A body still over the cap, with every range-diff omitted, is refused before anything is
+pushed. A merge landing's range-diff uses `--diff-merges=first-parent`, which needs git 2.48 or
+later; a range-diff that fails is replaced by its command and a warning, and the run goes on. It
+prints the PR's URL, the `devx binks review run` command and the worktree's path.
 
 The PR is never merged with a GitHub button: squash, merge-commit and rebase all undo the sync.
 Once Binks and a `Shopify/yugabyte-code-reviewers` member have approved it, `sync --land <pr>`
