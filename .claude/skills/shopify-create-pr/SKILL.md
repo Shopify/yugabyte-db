@@ -59,7 +59,8 @@ The base is `master-shopify`. A stacked layer's base is its parent's branch, set
 release-specific changes, with the release tag in the title; backports are
 [shopify-backport](../shopify-backport/SKILL.md)'s. The fork's `master` mirrors upstream
 and is never a base. A `<version>-shopify-N` branch takes only its release PR
-([Release PRs](#release-prs)).
+([Release PRs](#release-prs)). A `shopify-sync/<sha>` branch is `upstream.py sync`'s
+candidate, not this skill's.
 
 Name the branch for the change, in any shape; it need not match the upstream branch. Keep
 it outside `feature-stack/`, the upstream submission namespace. A single PR is a
@@ -193,8 +194,10 @@ git range-diff <head_sha>~1..<head_sha> <branch>~1..<branch>                    
 
 `bld-db` stays queued (the fork has no build runner) and `bld-none` is skipped; neither is
 a gate, and there is no Jenkins to trigger. Squash every PR except a release PR
-([Release PRs](#release-prs)): a squash commit is one PR's, where a merge commit is shared
-by every PR merged with it.
+([Release PRs](#release-prs)) and a sync PR: a squash commit is one PR's, where a merge
+commit is shared by every PR merged with it. A sync PR, from a `shopify-sync/<sha>` branch
+and labelled `sync`, is opened by `upstream.py sync` and lands only through
+`upstream.py sync --land`; every merge button undoes the sync.
 
 Every fork PR merges before it is submitted upstream, stack layers included. A feature
 stack whose layers are useless apart lands whole once every layer is approved; an
