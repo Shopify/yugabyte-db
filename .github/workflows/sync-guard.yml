@@ -1,0 +1,30 @@
+# A sync PR (upstream.py sync: branch shopify-sync/<sha>, label "sync") lands only through
+# `upstream.py sync --land`, which fast-forwards master-shopify. Squash, merge-commit and
+# rebase merges all undo the sync, so this check fails on every sync PR and passes on every
+# other PR. The master-shopify ruleset requires it, which keeps GitHub's merge button
+# disabled on sync PRs. `sync --land` does not read this check.
+name: sync-guard
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled, ready_for_review]
+
+permissions: {}
+
+jobs:
+  sync-guard:
+    name: sync-guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail on a sync PR
+        env:
+          HAS_SYNC_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'sync') }}
+          FROM_SYNC_BRANCH: ${{ startsWith(github.head_ref, 'shopify-sync/') }}
+        run: |
+          if [[ "$HAS_SYNC_LABEL" == "true" || "$FROM_SYNC_BRANCH" == "true" ]]; then
+            echo "::error ::This is a sync PR: land it with 'upstream.py sync --land <pr>',"
+            echo "::error ::which fast-forwards master-shopify. Every merge button undoes the"
+            echo "::error ::sync, so this check stays red on purpose."
+            exit 1
+          fi
+          echo "Not a sync PR; nothing to guard."

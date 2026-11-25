@@ -512,6 +512,9 @@ replaced by its command and a warning, and the run goes on. It prints the PR's U
 binks review run` command and the worktree's path.
 
 The PR is never merged with a GitHub button: squash, merge-commit and rebase all undo the sync.
+The `sync-guard` workflow (`.github/workflows/sync-guard.yml`) fails on every PR labelled
+`sync` or from `shopify-sync/*`, and the `master-shopify` ruleset requires it, so the button
+stays disabled; `--land` does not read that check.
 Once Binks and a `Shopify/yugabyte-code-reviewers` member have approved it, `sync --land <pr>`
 lands it by fast-forwarding `master-shopify` to its head; `--land` takes `--repo-path`,
 `--no-fetch` and `--upstream-url` and no other `sync` mode, and works in a sparse checkout.
