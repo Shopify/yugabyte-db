@@ -6,8 +6,9 @@ master-shopify's first-parent line since its merge base with upstream master, th
 belongs to, and that PR's `Upstream:` record; its only writes are its fetches unless --no-fetch.
 `submit` submits one merged fork PR upstream (upstream_submit.py). `sync` rebuilds master-shopify
 on a newer upstream commit as a candidate branch and opens its PR (upstream_sync.py), and `sync
---land` lands that PR by fast-forwarding master-shopify (upstream_land.py). Uses git and gh;
-requires Python 3.10+. Importing has no side effects.
+--land` lands that PR by fast-forwarding master-shopify (upstream_land.py). `rebase-open-prs`
+rebases the open PRs onto master-shopify after a sync lands (upstream_rebase.py). Uses git and
+gh; requires Python 3.10+. Importing has no side effects.
 """
 
 from __future__ import annotations
@@ -550,7 +551,30 @@ def parser():
                            "candidate on origin")
     sync.add_argument("-h", "--help", action="store_true", default=argparse.SUPPRESS,
                       help="print this help")
-    result.commands = {"status": status, "submit": submit, "sync": sync}
+    rebase = commands.add_parser(
+        "rebase-open-prs", add_help=False,
+        help="rebase the open PRs onto master-shopify after a sync lands",
+        description="Rebase every open PR into master-shopify, and the stack layers above them, "
+                    "onto origin/master-shopify in scratch worktrees beside the checkout. A dry "
+                    "run unless --push: then it pushes each rebased branch whose patch is "
+                    "unchanged with a lease, and comments on every PR it touched. PRs labelled "
+                    "no-auto-rebase or sync are skipped. Exit codes: 0 the run completed "
+                    "(conflicts included), 1 refused or failed, 2 usage.")
+    rebase.add_argument("--push", action="store_true",
+                        help="push the rebased branches and comment on their PRs (default: "
+                             "report only)")
+    rebase.add_argument("--pr", metavar="n", type=fork_pr_number, action="append",
+                        help="only this PR's chain: the layers below and above it (repeatable)")
+    rebase.add_argument("--repo-path", metavar="dir",
+                        help="the full (not sparse) Shopify/yugabyte-db checkout "
+                             "(default: the checkout containing this script)")
+    rebase.add_argument("--no-fetch", dest="fetch", action="store_false",
+                        help="do not fetch origin master-shopify and the PR branches first")
+    rebase.add_argument("--json", action="store_true", help="print one JSON object")
+    rebase.add_argument("-h", "--help", action="store_true", default=argparse.SUPPRESS,
+                        help="print this help")
+    result.commands = {"status": status, "submit": submit, "sync": sync,
+                       "rebase-open-prs": rebase}
     return result
 
 
@@ -580,11 +604,14 @@ class Cli:
                 self.out.write(options.commands.get(args.command, options).format_help())
                 return 0
             if args.command is None:
-                raise UsageError("A command is required: status, submit or sync")
+                raise UsageError("A command is required: status, submit, sync or "
+                                 "rebase-open-prs")
             if args.command == "submit":
                 return self.submit(args)
             if args.command == "sync":
                 return self.sync(args)
+            if args.command == "rebase-open-prs":
+                return self.rebase_open_prs(args)
             self.status(args)
             return 0
         except UsageError as error:
@@ -628,6 +655,13 @@ class Cli:
                                       **self.options).run()
         return upstream_sync.Sync(args, github, self.out, self.err, self.say, self.now,
                                   **self.options).run()
+
+    def rebase_open_prs(self, args):
+        import upstream_rebase  # imports this module; importing it here avoids a cycle
+
+        github = upstream_rebase.GitHub() if self.github is None else self.github
+        return upstream_rebase.Rebase(args, github, self.out, self.err, self.say, self.now,
+                                      **self.options).run()
 
     def say(self, *lines, stream=None):
         stream = self.out if stream is None else stream

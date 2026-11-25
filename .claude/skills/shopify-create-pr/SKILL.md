@@ -176,6 +176,15 @@ every fork PR is a gh stack layer), then `gh stack rebase --upstack --remote <fo
 Step 5 lint, `gh stack push --remote <fork>`, and Step 6 for each layer whose diff
 changed.
 
+- After a sync lands, `upstream.py rebase-open-prs --push` rebases every open PR onto the
+  new `master-shopify` and comments on it. After that comment says it was rebased, run
+  `git fetch <fork> && git reset --hard <fork>/<branch>` before working on the branch when
+  there are no local changes, or `gh stack sync --remote <fork>` when there are (it
+  re-pushes the branch under a new sha). A conflict comment lists the steps and needs a
+  new Binks review once resolved.
+- To keep a PR out of those rebases, label it:
+  `gh pr edit <n> --repo Shopify/yugabyte-db --add-label no-auto-rebase`.
+
 The author merges after an approving review from a `Shopify/yugabyte-code-reviewers`
 member, with `pr-title` and `pr-lint` passing where they run (both skip a PR that
 changes only the root `README.md`, `docs/**`, or `.github/vale-styles/**`) and Step 6's

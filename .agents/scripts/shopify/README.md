@@ -246,14 +246,15 @@ never squashed.
 
 ## Upstream tooling
 
-`upstream.py` has three commands: `status`, which shows where each change `master-shopify`
+`upstream.py` has four commands: `status`, which shows where each change `master-shopify`
 carries stands upstream; `submit <fork-pr>`, which performs the shopify-upstream-pr skill's
-steps under the developer's own `gh` login; and `sync`, which rebuilds `master-shopify` on a
+steps under the developer's own `gh` login; `sync`, which rebuilds `master-shopify` on a
 newer upstream commit as AGENTS.md describes, opens the result as a PR and, with `--land`,
-lands it. Exit codes: 0, 2 for usage errors, 1 otherwise; `submit` and `sync` also exit 4 when
+lands it; and `rebase-open-prs`, which rebases the open PRs onto `master-shopify` once a sync
+has landed. Exit codes: 0, 2 for usage errors, 1 otherwise; `submit` and `sync` also exit 4 when
 they stop for the developer. `test_upstream.py`, `test_upstream_submit.py`,
-`test_upstream_sync.py` and `test_upstream_land.py` run under the same `unittest discover`
-command as above.
+`test_upstream_sync.py`, `test_upstream_land.py` and `test_upstream_rebase.py` run under the
+same `unittest discover` command as above.
 
 ### status
 
@@ -550,8 +551,9 @@ the skipped landings, the drops and the upstream commit, and asks for the typed 
 <12-char head>`, and a phrase or `--confirm-land` that does not match is a usage error. It
 pushes `git push --force-with-lease=refs/heads/master-shopify:<old tip> origin
 <head>:refs/heads/master-shopify`, waits up to 30 seconds for GitHub to mark the PR merged (it
-does once the head is on the base), removes the candidate's worktree and local branch, and keeps
-`shopify-sync/<sha>` on `origin` as the sync's record. A refusal of a sync PR ends with the
+does once the head is on the base), removes the candidate's worktree and local branch, keeps
+`shopify-sync/<sha>` on `origin` as the sync's record, and prints the next command,
+`upstream.py rebase-open-prs --push`. A refusal of a sync PR ends with the
 break-glass command that skips the checks, `git push origin <head sha>:master-shopify`, except
 when `master-shopify` moved or the push would not fast-forward; a PR that is not a sync PR (closed,
 draft, another base or head, no `sync` label) gets no such command, since that push would land an
@@ -560,6 +562,76 @@ sync, not a contribution: it is never listed as a contribution or as neither car
 adopted, and its `mergeCommit`, the candidate's head, does not attribute the last replay to it.
 A sync PR whose `mergeCommit` is on the first-parent line without its own sync merge beneath it,
 reached through single-parent replays, was merged with a GitHub button and is a warning.
+
+### rebase-open-prs
+
+```bash
+python3 .agents/scripts/shopify/upstream.py rebase-open-prs            # dry run: report only
+python3 .agents/scripts/shopify/upstream.py rebase-open-prs --push
+python3 .agents/scripts/shopify/upstream.py rebase-open-prs --pr 141 --push --json
+```
+
+A landed sync leaves every open PR into `master-shopify` behind by the upstream delta. GitHub
+still squash-merges such a PR, but its test plan predates that delta, some PRs conflict with it,
+and a PR that never pushes again never reports a check added since. This rebases them all in
+one step, pushes the clean ones and tells the authors of the rest what to do. It never merges.
+
+Preconditions are `sync`'s (a full checkout whose `origin` is `Shopify/yugabyte-db`, `gh auth
+status`) plus no tracked changes in the checkout, which is never touched: rebases run in one
+detached scratch worktree, `<checkout>/../yugabyte-db-rebase-<random>`, removed on exit, after
+a conflict or a failure too. Unless `--no-fetch`, it fetches `origin master-shopify` and each
+PR's head branch by explicit refspec. Discovery is `gh pr list --state open`: the PRs into
+`master-shopify`, and transitively the PRs whose base is one of their head branches (stack
+layers), grouped into chains bottom-up by `baseRefName`, each PR once under one parent; a PR
+whose head is `master-shopify` is skipped and never walked through. `--pr <n>` (repeatable) keeps
+only the chains holding those PRs, the layers below and above them included; a PR in no chain is
+refused. Skipped and reported: a PR labelled `sync`; one whose head is in another repository;
+one labelled `no-auto-rebase`, the opt-out (with `--push`, the label is created in the fork when
+missing); any PR whose head branch a `no-auto-rebase` or `sync` PR in the fork also has, since a
+push rewrites the branch for both (taken from every open PR, before `--pr`); a head branch
+another PR already took; an unfetched head under `--no-fetch`; and every layer above a skipped
+one.
+
+Each chain is rebased bottom first: `git rebase --onto origin/master-shopify <merge base>
+<head>`, then each layer `--onto <rebased lower> <old lower head> <head>`, with
+`rebase.updateRefs=false` so no other branch moves and `rebase.rebaseMerges=false`; author
+identities and dates are kept. A layer is up to date when nothing below it moved. A layer whose
+own commits include a merge is not rebased ("holds a merge commit"), like a patch change for the
+author, with the layers above it: a replay would drop or recreate the merge, and a merge's
+combined diff has no patch-id to compare. A layer not stacked on its lower layer's current head
+(the lower moved without it) is not rebased: which commits are its own is unclear. The first
+conflict ends its chain: the rebase is aborted, the conflicting paths are recorded with the
+newest non-merge commit on `master-shopify` since the chain's merge base that touched each, and
+every layer above is reported as not rebased. A rebase that stops without conflicting paths (a
+failing commit signature or hook) is aborted and fails the run (exit 1) before anything is
+pushed or commented. A clean rebase is pushed only when every rebased commit's `git patch-id
+--stable` equals its original's, in order, and none lacks one (an empty commit): otherwise it
+is reported as "patch changed, not pushed", like a conflict for the author, with the layers
+above it.
+
+`--push` pushes bottom first with `git push --force-with-lease=refs/heads/<branch>:<old head>
+origin <new head>:refs/heads/<branch>`, never a plain force. A lease that fails (the author moved
+the branch since the fetch) is reported; any other rejected push fails the run (exit 1) after
+the report; either way no layer above it is pushed. Branches only: GitHub stacks are
+branch-based, so nothing is linked. It then comments once on each PR it touched: rebased (with
+`git fetch origin && git reset --hard origin/<branch>` to adopt the pushed head when there
+are no local changes, or `gh stack sync --remote origin` when there are, which re-pushes the
+branch under a new sha; to run before working on the branch); conflicted (the files, what last
+changed each, the `gh stack rebase --remote origin`, resolve, `gh stack rebase --continue`,
+lint, `gh stack push --remote origin` steps, and a new Binks review); patch changed, merge
+commit, lease failed, not stacked, blocked by a layer below, or opted out (one line on why
+nothing was pushed). Each comment carries
+`<!-- upstream.py rebase-open-prs <master-shopify sha> -->`, and a PR that already has one for
+this tip gets no other, except a branch this run pushed, which is always told: it is up to date
+on every later run for the tip, so that comment cannot repeat.
+The rebased comment names the upstream commit of the newest `Sync master-shopify to upstream
+<sha>` merge on `master-shopify`'s first-parent line, when there is one. A failed comment is a
+warning and fails the run (exit 1) after the report.
+
+The report groups the PRs as rebased, conflicted, not pushed, up to date and skipped, with old
+and new SHAs; `--json` prints the same groups as one object. A dry run fetches but pushes,
+comments and labels nothing. Exit codes: 0 when the run completed, conflicts included; 1 refused
+or failed; 2 usage.
 
 ## PR title cases
 

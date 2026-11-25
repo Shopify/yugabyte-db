@@ -160,7 +160,9 @@ class HappyPathTest(LandTestCase):
             f"Removed the worktree {self.worktree}.",
             f"Deleted the branch {self.branch}.",
             f"Kept {self.branch} on origin: it is the record of this sync.",
-        ], out.splitlines()[-10:])
+            "Next, rebase the open PRs onto it: "
+            "python3 .agents/scripts/shopify/upstream.py rebase-open-prs --push",
+        ], out.splitlines()[-11:])
         self.assertEqual([["devx", "binks", "--json", "review", "list", "--pr", PR_URL]],
                          self.binks.calls)
 

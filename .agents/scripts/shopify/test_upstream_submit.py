@@ -1793,7 +1793,8 @@ class CliTest(testfixtures.RepoTestCase):
         err = io.StringIO()
 
         self.assertEqual(2, Cli.run([], out=io.StringIO(), err=err))
-        self.assertEqual("A command is required: status, submit or sync\n", err.getvalue())
+        self.assertEqual("A command is required: status, submit, sync or rebase-open-prs\n",
+                         err.getvalue())
 
 
 if __name__ == "__main__":

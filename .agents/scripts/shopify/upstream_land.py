@@ -30,6 +30,7 @@ POLLS, POLL_SECONDS = 10, 3  # how long to wait for GitHub to mark the PR merged
 BLOCKING_DECISIONS = ("CHANGES_REQUESTED", "REVIEW_REQUIRED")  # GitHub often reports none
 WAITING = ("running", "queued", "pending")  # Binks review statuses that finish by themselves
 RULE_OPTIONS = "a scoped bypass identity for syncs, or disabling that ruleset for the push"
+REBASE_COMMAND = "python3 .agents/scripts/shopify/upstream.py rebase-open-prs --push"
 
 
 def entries(data, key):
@@ -115,6 +116,7 @@ class Land(Sync):
         self.say(f"Pushed {self.head[:SHORT]} to {FORK_BRANCH}.")
         self.report_merged()
         self.clean_up(repo, branch)
+        self.say(f"Next, rebase the open PRs onto it: {REBASE_COMMAND}")
         return 0
 
     def refuse(self, message, break_glass=True):

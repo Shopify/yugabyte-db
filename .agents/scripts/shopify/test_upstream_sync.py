@@ -42,7 +42,9 @@ LANDING = ("Do not use the merge button: squash, merge-commit and rebase all und
            "yugabyte-code-reviewers member have approved it. Land it with "
            "`python3 .agents/scripts/shopify/upstream.py sync --land <pr>`, which checks approval, "
            "Binks, CI and the fast-forward first. Break-glass, skipping those checks: "
-           "`git push origin {head}:master-shopify`.")
+           "`git push origin {head}:master-shopify`. After landing, run "
+           "`python3 .agents/scripts/shopify/upstream.py rebase-open-prs --push` to rebase the "
+           "open PRs onto the new master-shopify.")
 SECTIONS = ["## Summary", "## Upgrade/Rollback safety", "## Upstream", "## Dropped", "## Carried",
             "## Range-diff", "## Warnings", "## Landing"]
 # upstream's .github/workflows/pr-upgrade.yml, run on the lower-cased body.
