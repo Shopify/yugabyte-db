@@ -53,6 +53,29 @@ LANDING = ("Do not use the merge button: squash, merge-commit and rebase all und
            "`python3 .agents/scripts/shopify/upstream.py sync --land <pr>`, which checks approval, "
            "Binks, CI and the fast-forward first. Break-glass, skipping those checks: "
            "`git push origin {head}:master-shopify`.")
+# upstream's pr-upgrade check wants this section on any PR whose diff touches a .proto file.
+# A sync PR's diff against master-shopify is mostly upstream's, but a dropped landing or a
+# replay adapted in a conflict changes the diff too, so the inventory comes from the candidate.
+UPGRADE_NONE = "No `.proto` file changes in this diff."
+UPGRADE_UPSTREAM = ("{count} in upstream's commits `{base}..{to}`, reviewed and merged in "
+                    "yugabyte/yugabyte-db, which this sync takes as they are{paths}")
+UPGRADE_BOTH = ("{count} changed both in upstream's commits `{base}..{to}` and by a replayed "
+                "landing, accounted for below{paths}")
+UPGRADE_FORK = ("{count} from this sync's own changes to the fork's carried landings, "
+                "accounted for below{paths}")
+UPGRADE_CLEAN = ("{label} replays its original landing without conflict (range-diff below), so "
+                 "that fork PR's upgrade and rollback notes still apply")
+UPGRADE_ADAPTED = ("{label} was replayed {how}{resolved}; its original notes may not describe "
+                   "the resolved schema: review its range-diff and add notes here before landing")
+UPGRADE_RESOLVED_AWAY = " and its own `.proto` changes were resolved away in favour of upstream's"
+UPGRADE_DROPPED = ("{label}, which changed `.proto` files, is dropped from the fork by this "
+                   "sync ({reason}), so the diff removes its schema changes")
+UPGRADE_EMPTY = ("{label}, which changed `.proto` files, applied empty on upstream: upstream "
+                 "already contains its schema changes, and this sync carries nothing of it")
+DROP_REASONS = {"conflict": "it conflicted and was skipped",
+                "missing": "it was removed from the candidate"}
+UPGRADE_TAIL = ("The previous `master-shopify` tip `{old}` stays reachable as the sync merge's "
+                "second parent, named by its `Old-master-shopify:` trailer.")
 LAND_FIELDS = ("number,state,isDraft,baseRefName,headRefName,headRefOid,headRepository,"
                "headRepositoryOwner,labels,reviews,reviewDecision,statusCheckRollup,url")
 
@@ -229,6 +252,7 @@ class Landing:
 class Plan:
     to: str
     old: str
+    base: str  # the upstream commit the old master-shopify was built on
     carried: list
     drops: list  # dicts: number, url, upstream_number, upstream_url
     warnings: list
@@ -274,6 +298,75 @@ def omitted_block(labels):
             "characters. See each with `git range-diff <old>^..<old> <new>^..<new>`, the old and "
             "new SHAs from the Carried table (for a merge landing, `--diff-merges=first-parent "
             "--right-only <old>^1..<old>`).")
+
+
+def protos(work, old, new):
+    return [path for path in work.changed_paths(old, new) if path.endswith(".proto")]
+
+
+def first_parent(landing):
+    return f"{landing.sha}^1" if landing.merge else f"{landing.sha}^"
+
+
+def name_paths(paths, limit=8):
+    named = ", ".join(f"`{path}`" for path in paths[:limit])
+    if len(paths) > limit:
+        named += f" and {len(paths) - limit} more"
+    return f" ({named})" if paths else ""
+
+
+def upgrade_section(work, plan, carried, head):
+    """The `## Upgrade/Rollback safety` paragraph of a sync PR, from the candidate's own diff
+    against the old master-shopify: which `.proto` files change, whose each change is, which
+    replays or dropped landings touch a `.proto` file, and how the old tip stays reachable."""
+    changed = protos(work, plan.old, head)
+    upstream = set(protos(work, plan.base, plan.to))
+    replayed = {path for landing in carried
+                for path in protos(work, f"{landing.new}^", landing.new)}
+    theirs = [path for path in changed if path in upstream and path not in replayed]
+    both = [path for path in changed if path in upstream and path in replayed]
+    ours = [path for path in changed if path not in upstream]
+    sentences = []
+    if not changed:
+        sentences.append(UPGRADE_NONE)
+    else:
+        parts = []
+        if theirs:
+            parts.append(UPGRADE_UPSTREAM.format(count=len(theirs), base=plan.base[:SHORT],
+                                                 to=plan.short, paths=name_paths(theirs)))
+        if both:
+            parts.append(UPGRADE_BOTH.format(count=len(both), base=plan.base[:SHORT],
+                                             to=plan.short, paths=name_paths(both)))
+        if ours:
+            parts.append(UPGRADE_FORK.format(count=len(ours), paths=name_paths(ours)))
+        count = f"{len(changed)} `.proto` file{'s' * (len(changed) != 1)}"
+        sentences.append(f"{count} change{'s' * (len(changed) == 1)} in this diff: "
+                         + "; ".join(parts) + ".")
+    for landing in carried:
+        # The original's .proto edits count too: a conflict resolved in upstream's favour leaves
+        # the replay without a .proto delta while the diff drops the fork's schema edits.
+        original = protos(work, first_parent(landing), landing.sha)
+        replay = protos(work, f"{landing.new}^", landing.new)
+        if not original and not replay:
+            continue
+        if landing.conflict is False:
+            sentences.append(UPGRADE_CLEAN.format(label=landing.label) + ".")
+        else:
+            how = ("with a conflict resolution" if landing.conflict
+                   else "before this worktree recorded whether it conflicted")
+            resolved = UPGRADE_RESOLVED_AWAY if original and not replay else ""
+            sentences.append(UPGRADE_ADAPTED.format(label=landing.label, how=how,
+                                                    resolved=resolved) + ".")
+    for landing, reason in plan.skipped:
+        if not protos(work, first_parent(landing), landing.sha):
+            continue
+        if reason == "empty":
+            sentences.append(UPGRADE_EMPTY.format(label=landing.label) + ".")
+        else:
+            sentences.append(UPGRADE_DROPPED.format(
+                label=landing.label, reason=DROP_REASONS.get(reason, reason)) + ".")
+    sentences.append(UPGRADE_TAIL.format(old=plan.old[:SHORT]))
+    return " ".join(sentences)
 
 
 def range_diff_section(entries, budget):
@@ -469,7 +562,7 @@ class Sync(Interaction):
                          "landing is carried" for pr in prs if pr.state == "landed"]
             carried.append(Landing(commit["sha"], commit["subject"], len(commit["parents"]) > 1,
                                    [pr.number for pr in prs], commit["message"]))
-        return Plan(to, old, carried, list(drops.values()), warnings)
+        return Plan(to, old, status.base, carried, list(drops.values()), warnings)
 
     # The candidate.
 
@@ -771,6 +864,7 @@ class Sync(Interaction):
         warnings = self.all_warnings(plan)
         sections = [
             ("Summary", SUMMARY.format(short=plan.short)),
+            ("Upgrade/Rollback safety", upgrade_section(work, plan, carried, head)),
             ("Upstream", f"[`{plan.to}`]({UPSTREAM_COMMIT_URL}{plan.to}) ({date[:10]}): "
                          f"{subject}\n\nOld `{FORK_BRANCH}`: `{plan.old}`"),
             ("Dropped", drops),
