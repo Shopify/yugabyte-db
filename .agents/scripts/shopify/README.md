@@ -462,7 +462,8 @@ unidentified. A candidate that already exists, in a worktree, as a local branch 
 is refused without `--continue`.
 
 A conflict stops the run with exit 4, the conflicting paths and the steps: resolve them in the
-worktree, `git add`, `git cherry-pick --continue`, then rerun with `--continue`. When
+worktree, `git add`, `git cherry-pick --continue`, then rerun with `--continue`. The
+shopify-sync-resolve skill covers reading both sides, verifying, and what to post on the PR. When
 upstream's version should win instead, run `git cherry-pick --abort` in the worktree and rerun
 with `--continue --skip '#<fork PR>'` (repeatable; `70` and `#70` both work): the landing is
 recorded as skipped after a conflict, and the PR body's warnings say it conflicted on upstream
