@@ -21,6 +21,7 @@
 #include "yb/util/countdown_latch.h"
 #include "yb/util/mem_tracker.h"
 #include "yb/util/metrics.h"
+#include "yb/util/size_literals.h"
 #include "yb/util/strongly_typed_bool.h"
 #include "yb/util/test_thread_holder.h"
 #include "yb/util/test_util.h"
@@ -909,6 +910,36 @@ TEST_F(PgResponseCacheTest, TheClaimOutlivesThePublish) {
       << "the claim was already gone while the round that completes the prefetch was still "
       << "publishing, so a connection arriving then reads the whole catalog itself";
   ASSERT_TRUE(sent_away_while_publishing.IsIncomplete()) << sent_away_while_publishing;
+}
+
+// Entry memory (key bytes and the copied response) must be reflected in the cache's MemTracker
+// and released when the entry is destroyed.
+TEST_F(PgResponseCacheTest, EntryMemoryIsTracked) {
+  constexpr size_t kKeySize = 1_MB;
+  const std::string key(kKeySize, 'k');
+  ThreadSafeArena arena;
+  auto& filler_info = MakeCachingInfo(arena, key, SendAway::kFalse,
+                                      PartOfConnectionPrefetch::kFalse);
+  auto& reader_info = MakeCachingInfo(arena, key, SendAway::kFalse,
+                                      PartOfConnectionPrefetch::kFalse);
+  const auto deadline = CoarseMonoClock::Now() + 60s;
+
+  auto waiter = std::make_shared<CountingWaiter>();
+  auto setter = ASSERT_RESULT(cache_->Get(&filler_info, deadline, waiter, nullptr));
+  ASSERT_TRUE(setter);
+  setter(MakeResponse());
+  setter = {};
+
+  auto cache_tracker = mem_tracker_->FindChild("PgResponseCache");
+  ASSERT_TRUE(cache_tracker);
+  ASSERT_GE(cache_tracker->consumption(), static_cast<int64_t>(kKeySize));
+
+  auto reader_setter = ASSERT_RESULT(cache_->Get(&reader_info, deadline, waiter, nullptr));
+  ASSERT_FALSE(reader_setter);
+  ASSERT_EQ(waiter->applied(), 1);
+
+  cache_.reset();
+  ASSERT_EQ(cache_tracker->consumption(), 0);
 }
 
 } // namespace
