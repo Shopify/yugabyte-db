@@ -387,6 +387,19 @@ EXPLAIN (costs off) SELECT count(*), max(a), min(a) FROM pctest3 WHERE a > 123;
 /*+ IndexOnlyScan(pctest3) Parallel(pctest3 3 hard) */
 SELECT count(*), max(a), min(a) FROM pctest3 WHERE a > 123;
 
+-- GHI #18004: a parallel plan must not scan only one arm of a range disjunction.
+CREATE TABLE pctest_or(a int, b int, id int, PRIMARY KEY (a ASC, b ASC, id ASC))
+    WITH (colocation = true);
+INSERT INTO pctest_or
+    SELECT a, b, 1 FROM generate_series(1, 100) a, generate_series(1, 100) b;
+ANALYZE pctest_or;
+-- Aggregates disable the two-scan plan, so count the rows with EXPLAIN ANALYZE.
+EXPLAIN (analyze, costs off, summary off, timing off)
+SELECT a, b FROM pctest_or WHERE a < 3 OR b > 98;
+/*+ Parallel(pctest_or 2 hard) */
+EXPLAIN (costs off) SELECT a, b FROM pctest_or WHERE a < 3 OR b > 98;
+
 DROP TABLE pctest1;
 DROP TABLE pctest2;
 DROP TABLE pctest3;
+DROP TABLE pctest_or;

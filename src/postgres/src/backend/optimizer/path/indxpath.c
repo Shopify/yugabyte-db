@@ -247,6 +247,9 @@ static IndexClause *yb_match_rowcompare_to_index(PlannerInfo *root,
 												 RestrictInfo *rinfo,
 												 IndexOptInfo *index);
 
+static void yb_add_range_or_append_path(PlannerInfo *root, RelOptInfo *rel,
+										IndexOptInfo *index);
+
 bool yb_enable_derived_equalities;
 
 /*
@@ -336,6 +339,8 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 		get_index_paths(root, rel, index, &rclauseset,
 						NIL /* yb_bitmap_idx_pushdowns */ ,
 						&bitindexpaths);
+
+		yb_add_range_or_append_path(root, rel, index);
 
 		/*
 		 * Identify the join clauses that can match the index.  For the moment
@@ -1335,6 +1340,154 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 									   NULL);
 		*bitindexpaths = list_concat(*bitindexpaths, indexpaths);
 	}
+}
+
+static void
+yb_add_range_or_append_path(PlannerInfo *root, RelOptInfo *rel,
+							IndexOptInfo *index)
+{
+	RangeTblEntry *rte;
+	RestrictInfo *or_rinfo;
+	OpExpr	   *arms[2];
+	int			armcols[2] = {-1, -1};
+	IndexClause *armclauses[2] = {NULL, NULL};
+	ListCell   *lc;
+	Relation	relation;
+	OpExpr	   *not_a;
+	RestrictInfo *not_a_rinfo;
+	IndexClause *not_a_clause;
+	IndexClauseSet a_clauses = {0};
+	IndexClauseSet b_clauses = {0};
+	List	   *paths;
+	Path	   *a_path;
+	Path	   *b_path;
+	double		base_rows = rel->rows;
+	bool		consider_parallel = rel->consider_parallel;
+	bool		notnull;
+
+	if (list_length(rel->baserestrictinfo) != 1 || index->relam != LSM_AM_OID)
+		return;
+	or_rinfo = linitial_node(RestrictInfo, rel->baserestrictinfo);
+	if (!restriction_is_or_clause(or_rinfo) || or_rinfo->security_level != 0 ||
+		list_length(castNode(BoolExpr, or_rinfo->orclause)->args) != 2)
+		return;
+
+	if (!IsYugaByteEnabled() || root->parent_root || root->parse->hasModifyingCTE ||
+		root->parse->commandType != CMD_SELECT ||
+		root->parse->hasAggs || root->parse->hasWindowFuncs ||
+		root->parse->hasDistinctOn || root->parse->hasTargetSRFs ||
+		root->parse->groupClause != NIL ||
+		root->parse->groupingSets != NIL || root->parse->havingQual != NULL ||
+		root->parse->setOperations != NULL || root->parse->hasRowSecurity ||
+		root->parse->rowMarks != NIL || rel->reloptkind != RELOPT_BASEREL ||
+		rel->rtekind != RTE_RELATION ||
+		rel->lateral_relids != NULL ||
+		!bms_equal(rel->relids, root->all_baserels) ||
+		contain_volatile_functions((Node *) root->processed_tlist) ||
+		!index->amhasgettuple ||
+		index->indpred != NIL || index->nhashcolumns != 0 ||
+		index->nkeycolumns < 2)
+		return;
+
+	rte = planner_rt_fetch(rel->relid, root);
+	if (rte->inh || rte->tablesample || rte->relkind != RELKIND_RELATION)
+		return;
+
+	foreach(lc, castNode(BoolExpr, or_rinfo->orclause)->args)
+	{
+		RestrictInfo *arm;
+		OpExpr	   *op;
+		Var		   *var;
+		int			col;
+		int			slot;
+		int			strategy;
+
+		if (!IsA(lfirst(lc), RestrictInfo))
+			return;
+		arm = lfirst_node(RestrictInfo, lc);
+		if (!is_opclause(arm->clause))
+			return;
+		op = castNode(OpExpr, arm->clause);
+		if (list_length(op->args) != 2 || !IsA(linitial(op->args), Var) ||
+			!IsA(lsecond(op->args), Const) || lsecond_node(Const, op->args)->constisnull ||
+			!op_strict(op->opno) || op_volatile(op->opno) != PROVOLATILE_IMMUTABLE)
+			return;
+		var = linitial_node(Var, op->args);
+		if (var->varno != rel->relid || var->varattno <= 0)
+			return;
+		for (col = 0; col < index->nkeycolumns; col++)
+			if (index->indexkeys[col] == var->varattno)
+				break;
+		if (col == index->nkeycolumns)
+			return;
+		slot = (col == 0) ? 0 : 1;
+		strategy = get_op_opfamily_strategy(op->opno, index->opfamily[col]);
+		if (armclauses[slot] || strategy < BTLessStrategyNumber ||
+			strategy > BTGreaterStrategyNumber || strategy == BTEqualStrategyNumber)
+			return;
+		/*
+		 * Legacy costing prices an inequality on a key like a point lookup.
+		 * Don't introduce two scans unless statistics identify both arms as
+		 * more selective than the no-statistics inequality estimate.
+		 */
+		if (!yb_enable_base_scans_cost_model && !yb_enable_optimizer_statistics &&
+			clause_selectivity(root, (Node *) arm, rel->relid, JOIN_INNER, NULL) >=
+			DEFAULT_INEQ_SEL)
+			return;
+		armclauses[slot] = match_opclause_to_indexcol(root, arm, col, index);
+		if (!armclauses[slot] || armclauses[slot]->lossy)
+			return;
+		armcols[slot] = col;
+		arms[slot] = op;
+	}
+
+	/* Orient A to the leading key, whose NOT NULL property makes NOT A exact. */
+	Assert(armclauses[0] && armclauses[1]);
+	relation = table_open(rte->relid, NoLock);
+	notnull = TupleDescAttr(RelationGetDescr(relation),
+							linitial_node(Var, arms[0]->args)->varattno - 1)->attnotnull;
+	table_close(relation, NoLock);
+	if (!notnull)
+		return;
+
+	not_a = copyObject(arms[0]);
+	not_a->opno = get_negator(not_a->opno);
+	if (!OidIsValid(not_a->opno))
+		return;
+	not_a->opfuncid = get_opcode(not_a->opno);
+	not_a_rinfo = make_restrictinfo(root, (Expr *) not_a, or_rinfo->is_pushed_down,
+									or_rinfo->outerjoin_delayed, false,
+									or_rinfo->security_level, or_rinfo->required_relids,
+									or_rinfo->outer_relids, or_rinfo->nullable_relids);
+	not_a_clause = match_opclause_to_indexcol(root, not_a_rinfo, 0, index);
+	if (!not_a_clause || not_a_clause->lossy)
+		return;
+
+	a_clauses.indexclauses[0] = lappend(a_clauses.indexclauses[0], armclauses[0]);
+	a_clauses.nonempty = true;
+	b_clauses.indexclauses[0] = lappend(b_clauses.indexclauses[0], not_a_clause);
+	b_clauses.indexclauses[armcols[1]] =
+		lappend(b_clauses.indexclauses[armcols[1]], armclauses[1]);
+	b_clauses.nonempty = true;
+
+	/*
+	 * A partial path for one arm would let a parallel plan drop the other
+	 * arm's rows.  Legacy index costing can also lower rel->rows for an arm.
+	 */
+	rel->consider_parallel = false;
+	paths = build_index_paths(root, rel, index, &a_clauses, NIL, false,
+							  ST_INDEXSCAN, NULL, NULL);
+	a_path = get_cheapest_path_for_pathkeys(paths, NIL, NULL, TOTAL_COST, false);
+	rel->rows = base_rows;
+	paths = build_index_paths(root, rel, index, &b_clauses, NIL, false,
+							  ST_INDEXSCAN, NULL, NULL);
+	b_path = get_cheapest_path_for_pathkeys(paths, NIL, NULL, TOTAL_COST, false);
+	rel->rows = base_rows;
+	rel->consider_parallel = consider_parallel;
+	if (a_path && b_path)
+		add_path(rel, (Path *) create_append_path(root, rel,
+												  list_make2(a_path, b_path),
+												  NIL, NIL, NULL, 0, false, -1));
 }
 
 /*
