@@ -777,7 +777,8 @@ class CliTest(StatusTestCase):
         return result, home, cwd
 
     def test_a_command_is_required(self):
-        self.assertEqual((2, "", "A command is required: status, submit or sync\n"), self.cli())
+        self.assertEqual(
+            (2, "", "A command is required: status, submit, sync or rebase-open-prs\n"), self.cli())
 
     def test_a_missing_upstream_ref_without_fetching_says_to_fetch_once(self):
         self.publish(upstream=None)

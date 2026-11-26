@@ -52,7 +52,9 @@ LANDING = ("Do not use the merge button: squash, merge-commit and rebase all und
            "yugabyte-code-reviewers member have approved it. Land it with "
            "`python3 .agents/scripts/shopify/upstream.py sync --land <pr>`, which checks approval, "
            "Binks, CI and the fast-forward first. Break-glass, skipping those checks: "
-           "`git push origin {head}:master-shopify`.")
+           "`git push origin {head}:master-shopify`. After landing, run "
+           "`python3 .agents/scripts/shopify/upstream.py rebase-open-prs --push` to rebase the "
+           "open PRs onto the new master-shopify.")
 # upstream's pr-upgrade check wants this section on any PR whose diff touches a .proto file.
 # A sync PR's diff against master-shopify is mostly upstream's, but a dropped landing or a
 # replay adapted in a conflict changes the diff too, so the inventory comes from the candidate.
@@ -421,6 +423,7 @@ def range_diff_section(entries, budget):
 class Sync(Interaction):
     workdir_prefix = "upstream-sync-"
     full_checkout = True  # replaying needs every path checked out
+    name = "sync"  # the command the checkout's refusals name
 
     def __init__(self, args, github, out, err, say, now, **options):
         super().__init__(args, out, err, say, **options)
@@ -491,14 +494,14 @@ class Sync(Interaction):
         repo = Checkout(path)
         self.repo_path = repo.path
         if "origin" not in repo.remotes():
-            raise Error(f"{repo.path} has no origin remote; sync runs in a fork checkout")
+            raise Error(f"{repo.path} has no origin remote; {self.name} runs in a fork checkout")
         url = repo.remote_url("origin")
         if not FORK_REMOTE_URL.search(url):
-            raise Error(f"origin of {repo.path} is {url}, not {FORK_REPO}; sync runs in a fork "
-                        "checkout")
+            raise Error(f"origin of {repo.path} is {url}, not {FORK_REPO}; {self.name} runs in a "
+                        "fork checkout")
         sparse = (repo.config("core.sparseCheckout") or "").lower()
         if self.full_checkout and sparse in ("true", "yes", "on", "1"):
-            raise Error(f"sync needs a full checkout; {repo.path} is sparse "
+            raise Error(f"{self.name} needs a full checkout; {repo.path} is sparse "
                         f"(core.sparseCheckout is {sparse})")
         return repo
 
