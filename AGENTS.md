@@ -48,7 +48,13 @@ replayed landing that had no `(#N)` carries a `Shopify-PR:` trailer naming its P
 written by `sync`. `git log --first-parent <upstream SHA>..master-shopify` lists the
 sync's merge commit and what the fork carries. `.agents/scripts/shopify/upstream.py sync`
 builds the candidate and opens its PR; the result lands by `sync --land`, a fast-forward
-after review.
+after review. A replay that conflicts or applies empty stops the run; resolve it with
+[shopify-sync-resolve](.claude/skills/shopify-sync-resolve/SKILL.md), which keeps both
+the fork's change and upstream's. Before review is requested, the resolver builds the
+candidate, runs the tests named by every carried landing that touches `src/`, `java/` or
+`managed/`, and posts the result and a resolution note on the sync PR. A sync PR is
+reviewed from its body (dropped and carried tables, the range-diff of each conflicted
+replay) and those notes, not from Files changed, which is upstream's diff.
 
 Submission is developer-forward: the original developer submits under their own `gh`
 login. `.agents/scripts/shopify/upstream.py`, beside `issues.py` and `release.py`, has
