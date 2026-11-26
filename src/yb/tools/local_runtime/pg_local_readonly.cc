@@ -2880,7 +2880,12 @@ class ReadonlyPgServer::Impl : public pgwrapper::PgWrapperContext {
     // PgSupervisor normally disables these when no connection manager owns a stats segment.
     FLAGS_enable_ysql_conn_mgr = false;
     FLAGS_enable_ysql_conn_mgr_stats = false;
-    FLAGS_ysql_pg_conf_csv = std::string("default_transaction_read_only=") +
+    // The caller's --ysql_pg_conf_csv comes first, so the runtime's settings below win where
+    // they overlap, and the rest apply as given: shared_preload_libraries for extensions and
+    // their settings, for example. Read once: this process may start more than one runtime.
+    static const std::string caller_pg_conf = FLAGS_ysql_pg_conf_csv;
+    FLAGS_ysql_pg_conf_csv = (caller_pg_conf.empty() ? "" : caller_pg_conf + ",") +
+                             "default_transaction_read_only=" +
                              (mode == CatalogMode::kFrozen ? "on" : "off") +
                              ",autovacuum=off,yb_enable_ash=off,"
                              "yb_enable_pg_stat_statements_docdb_metrics=off";

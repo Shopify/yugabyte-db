@@ -926,6 +926,42 @@ TEST_F(ReadonlyPgServerTest, CommandCatalogTransactionsWithoutAutoFlagPromotion)
   CheckCommand(true, /* promote_auto_flags= */ false);
 }
 
+// The caller's --ysql_pg_conf_csv reaches PostgreSQL behind the runtime's own settings, so a
+// preloaded extension and its settings apply but a runtime setting cannot be turned back.
+TEST_F(ReadonlyPgServerTest, CommandAppliesCallerPgConf) {
+  const auto port = AllocateFreePort();
+  const auto binary = env_util::GetRootDir("bin") + "/bin/yb-local-readonly";
+  Subprocess process(
+      binary, {binary, "--data_dir=" + GetTestPath("caller-conf"),
+               "--sql_port=" + std::to_string(port), "--experimental_catalog_writes=true",
+               "--ysql_pg_conf_csv=statement_timeout=4321,autovacuum=on,"
+               "\"shared_preload_libraries='auto_explain'\",auto_explain.log_min_duration=250"});
+  process.PipeParentStdout();
+  ASSERT_OK(process.Start());
+  auto stop = ScopeExit([&process] {
+    WARN_NOT_OK(process.KillNoCheckIfRunning(SIGTERM), "Stopping local command");
+    WARN_NOT_OK(process.Wait(), "Reaping local command");
+  });
+  pgwrapper::PGConnSettings settings{
+      .host = "127.0.0.1", .port = port, .dbname = "yugabyte", .user = "yugabyte"};
+  std::optional<pgwrapper::PGConn> connection;
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        auto attempt = pgwrapper::PGConnBuilder(settings).Connect();
+        if (!attempt.ok()) return false;
+        connection.emplace(std::move(*attempt));
+        return true;
+      },
+      60s, "waiting for the local command to accept connections"));
+  const auto show = [&connection](const std::string& name) {
+    return connection->FetchRow<std::string>("SHOW " + name);
+  };
+  ASSERT_EQ(ASSERT_RESULT(show("statement_timeout")), "4321ms");
+  ASSERT_EQ(ASSERT_RESULT(show("autovacuum")), "off");
+  ASSERT_STR_CONTAINS(ASSERT_RESULT(show("shared_preload_libraries")), "auto_explain");
+  ASSERT_EQ(ASSERT_RESULT(show("auto_explain.log_min_duration")), "250ms");
+}
+
 TEST_F(ReadonlyPgServerTest, OidReservationsSurviveRestartAndFailure) {
   const auto path = GetTestPath("oid-reservations");
   auto store = ASSERT_RESULT(PgCatalogTransaction::Open(path, Snapshot() + "/rocksdb"));
