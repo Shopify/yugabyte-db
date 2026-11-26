@@ -7286,7 +7286,7 @@ replace_nestloop_params_mutator(Node *node, PlannerInfo *root)
 	{
 		RowCompareExpr *rcexpr = (RowCompareExpr *) node;
 
-		if (rcexpr->rctype == ROWCOMPARE_EQ)
+		if (rcexpr->rctype == ROWCOMPARE_EQ && IsA(rcexpr->rargs, YbBatchedExpr))
 		{
 			RowCompareExpr *rcexpr_new = copyObject(rcexpr);
 			ArrayExpr  *arrexpr = makeNode(ArrayExpr);

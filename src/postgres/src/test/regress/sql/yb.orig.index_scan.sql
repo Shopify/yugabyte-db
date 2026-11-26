@@ -65,6 +65,26 @@ INSERT INTO or_collate VALUES ('A'), ('a'), ('b');
 \i :run_query
 DROP TABLE or_collate;
 
+-- Complete equality tuples use correlated row-array bounds, not a Cartesian product.
+CREATE TABLE tuple_or(k int PRIMARY KEY, r1 int, r2 int);
+CREATE INDEX tuple_or_idx ON tuple_or(r1 ASC, r2 ASC);
+INSERT INTO tuple_or VALUES
+  (1, 3, 5), (2, 5, 3), (3, 3, 3), (4, 5, 5), (5, 3, NULL), (6, NULL, 5);
+\set query ':P /*+IndexScan(tuple_or tuple_or_idx)*/ SELECT k, r1, r2 FROM tuple_or WHERE (r1 = 3 AND r2 = 5) OR (r2 = 3 AND r1 = 5) ORDER BY k;'
+\i :run_query
+
+-- An overlapping scan key disables the tuple bound without changing results.
+SELECT array_agg(k ORDER BY k) AS matches FROM tuple_or
+ WHERE ((r1 = 3 AND r2 = 5) OR (r2 = 3 AND r1 = 5)) AND r1 >= 3;
+\set query ':P /*+IndexScan(tuple_or tuple_or_idx)*/ SELECT k FROM tuple_or WHERE ((r1 = 3 AND r2 = 5) OR (r2 = 3 AND r1 = 5)) AND r2 < 5 ORDER BY k;'
+\i :run_query
+
+-- An unsupported NULL arm must retain the complete OR filter.
+SELECT array_agg(k ORDER BY k) AS matches FROM tuple_or
+ WHERE (r1 = 3 AND r2 = 5) OR (r1 = 3 AND r2 IS NULL);
+
+DROP TABLE tuple_or;
+
 \set query ':P SELECT * FROM pk_multi WHERE yb_hash_code(h) = yb_hash_code(1);'
 \i :run_query
 

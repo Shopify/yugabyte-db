@@ -399,7 +399,25 @@ ybcIndexCostEstimate(struct PlannerInfo *root, IndexPath *path,
 			Expr	   *clause = rinfo->clause;
 			int			bms_idx = YBAttnumToBmsIndex(scan_plan.target_relation, attnum);
 
-			if (IsA(clause, NullTest))
+			if (IsA(clause, RowCompareExpr) &&
+				castNode(RowCompareExpr, clause)->rctype == ROWCOMPARE_EQ &&
+				IsA(castNode(RowCompareExpr, clause)->rargs, ArrayExpr))
+			{
+				/*
+				 * Tuple lookups constrain every member, not just the leading
+				 * key.
+				 */
+				ListCell   *lc3;
+
+				foreach(lc3, iclause->indexcols)
+				{
+					int			col = lfirst_int(lc3);
+					AttrNumber	member = is_primary ? indexinfo->indexkeys[col] : col + 1;
+
+					ybcAddAttributeColumn(&scan_plan, member);
+				}
+			}
+			else if (IsA(clause, NullTest))
 			{
 				const_quals = bms_add_member(const_quals, bms_idx);
 				ybcAddAttributeColumn(&scan_plan, attnum);

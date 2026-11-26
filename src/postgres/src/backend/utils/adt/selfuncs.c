@@ -2223,6 +2223,35 @@ rowcomparesel(PlannerInfo *root,
 	List	   *opargs;
 	bool		is_join_clause;
 
+	/* YB row-array equality uses the first column's IN selectivity. */
+	if (clause->rctype == ROWCOMPARE_EQ && IsA(clause->rargs, ArrayExpr))
+	{
+		ArrayExpr  *row_array = castNode(ArrayExpr, clause->rargs);
+		ArrayExpr  *scalar_array = makeNode(ArrayExpr);
+		ScalarArrayOpExpr *saop = makeNode(ScalarArrayOpExpr);
+		ListCell   *lc;
+
+		scalar_array->array_typeid = get_array_type(exprType(linitial(clause->largs)));
+		scalar_array->element_typeid = exprType(linitial(clause->largs));
+		scalar_array->array_collid = inputcollid;
+		scalar_array->location = -1;
+		foreach(lc, row_array->elements)
+		{
+			RowExpr    *row = lfirst_node(RowExpr, lc);
+
+			scalar_array->elements =
+				lappend(scalar_array->elements, linitial(row->args));
+		}
+
+		saop->opno = opno;
+		saop->opfuncid = get_opcode(opno);
+		saop->useOr = true;
+		saop->inputcollid = inputcollid;
+		saop->args = list_make2(linitial(clause->largs), scalar_array);
+		saop->location = -1;
+		return scalararraysel(root, saop, false, varRelid, jointype, sjinfo);
+	}
+
 	/* Build equivalent arg list for single operator */
 	opargs = list_make2(linitial(clause->largs),
 						linitial(castNode(List, clause->rargs)));
