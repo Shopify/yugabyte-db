@@ -31,6 +31,7 @@
 //
 
 #include <algorithm>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,7 @@
 #include "yb/util/random.h"
 #include "yb/util/random_util.h"
 #include "yb/util/status_log.h"
+#include "yb/util/test_thread_holder.h"
 #include "yb/util/test_util.h"
 #include "yb/util/thread.h"
 
@@ -99,11 +101,77 @@ TEST(MockHybridClockTest, TestMockedSystemClock) {
             HybridTime::FromMicrosecondsAndLogicalValue(time.time_point, 1).ToUint64());
 }
 
+// The logical part carries into the microseconds, as it did when the two were separate fields.
+TEST(MockHybridClockTest, LogicalOverflowCarries) {
+  MockClock mock_clock;
+  scoped_refptr<HybridClock> clock(new HybridClock(mock_clock.AsClock()));
+  ASSERT_OK(clock->Init());
+  mock_clock.Set({5000, 0});
+  HybridTime prev = clock->Now();
+  ASSERT_EQ(prev, HybridTime::FromMicros(5000));
+  for (uint64_t i = 1; i <= 2 * HybridTime::kLogicalBitMask + 5; ++i) {
+    auto now = clock->Now();
+    ASSERT_EQ(now.ToUint64(), prev.ToUint64() + 1);
+    prev = now;
+  }
+  ASSERT_EQ(prev.GetPhysicalValueMicros(), 5002);
+  // The physical clock catches up to a microsecond the logical part already carried into.
+  mock_clock.Set({5001, 0});
+  ASSERT_GT(clock->Now(), prev);
+}
+
 // Test that two subsequent time reads are monotonically increasing.
 TEST_F(HybridClockTest, TestNow_ValuesIncreaseMonotonically) {
   const HybridTime now1 = clock_->Now();
   const HybridTime now2 = clock_->Now();
   ASSERT_LT(now1.value(), now2.value());
+}
+
+// Concurrent readers never get the same hybrid time, and each reader's values only increase.
+TEST_F(HybridClockTest, TestNow_ConcurrentValuesAreUniqueAndIncreasePerThread) {
+  constexpr int kThreads = 8;
+  constexpr int kReadsPerThread = 200000;
+  std::vector<std::vector<uint64_t>> values(kThreads);
+  TestThreadHolder threads;
+  for (int i = 0; i != kThreads; ++i) {
+    threads.AddThread([this, &out = values[i]] {
+      out.reserve(kReadsPerThread);
+      for (int n = 0; n != kReadsPerThread; ++n) {
+        out.push_back(clock_->Now().ToUint64());
+      }
+    });
+  }
+  threads.JoinAll();
+  std::vector<uint64_t> all;
+  all.reserve(kThreads * kReadsPerThread);
+  for (const auto& thread_values : values) {
+    ASSERT_TRUE(std::adjacent_find(
+        thread_values.begin(), thread_values.end(), std::greater_equal<uint64_t>()) ==
+            thread_values.end()) << "A reader saw a value that did not increase";
+    all.insert(all.end(), thread_values.begin(), thread_values.end());
+  }
+  std::sort(all.begin(), all.end());
+  ASSERT_TRUE(std::adjacent_find(all.begin(), all.end()) == all.end())
+      << "Two readers got the same hybrid time";
+}
+
+// An update to a later time is never undone by concurrent readers: after Update(t) returns, every
+// Now() is above t.
+TEST_F(HybridClockTest, TestUpdate_HoldsAgainstConcurrentReaders) {
+  TestThreadHolder readers;
+  for (int i = 0; i != 4; ++i) {
+    readers.AddThread([this, &stop = readers.stop_flag()] {
+      while (!stop.load(std::memory_order_acquire)) {
+        clock_->Now();
+      }
+    });
+  }
+  for (int n = 0; n != 20000; ++n) {
+    auto target = clock_->Now().AddMicroseconds(50);
+    clock_->Update(target);
+    ASSERT_GT(clock_->Now().ToUint64(), target.ToUint64());
+  }
+  readers.Stop();
 }
 
 // Tests the clock updates with the incoming value if it is higher.
