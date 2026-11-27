@@ -1566,6 +1566,66 @@ TEST_F(ReadonlyPgServerTest, RolesAndGrants) {
       0);
 }
 
+// Enum types: labels added before existing ones keep sort order in scans and range indexes,
+// other backends see added and renamed labels, and a rolled-back CREATE TYPE leaves no labels.
+TEST_F(ReadonlyPgServerTest, EnumTypes) {
+  const auto path = GetTestPath("enums");
+  auto server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          path, Snapshot(), AllocateFreePort(), CatalogMode::kSerializedTransactions));
+  constexpr auto kOrder = "SELECT string_agg(k::text, ',' ORDER BY s, k) FROM jobs";
+  {
+    auto c = ASSERT_RESULT(Connect(*server));
+    for (const auto* statement : {
+             "CREATE TYPE job_state AS ENUM ('pending', 'done')",
+             "CREATE TABLE jobs(k int PRIMARY KEY, s job_state)",
+             "CREATE INDEX jobs_state ON jobs(s ASC)",
+             "INSERT INTO jobs VALUES (1, 'done'), (2, 'pending')"}) {
+      ASSERT_OK(c.Execute(statement));
+    }
+    auto other = ASSERT_RESULT(Connect(*server));
+    ASSERT_EQ(ASSERT_RESULT(other.FetchRow<std::string>(kOrder)), "2,1");
+    for (const auto* statement : {
+             "ALTER TYPE job_state ADD VALUE 'running' BEFORE 'done'",
+             "ALTER TYPE job_state ADD VALUE 'queued' BEFORE 'pending'",
+             "ALTER TYPE job_state ADD VALUE IF NOT EXISTS 'failed' AFTER 'done'",
+             "ALTER TYPE job_state RENAME VALUE 'failed' TO 'errored'"}) {
+      ASSERT_OK(c.Execute(statement));
+    }
+    ASSERT_OK(
+        other.Execute("INSERT INTO jobs VALUES (3, 'running'), (4, 'queued'), (5, 'errored')"));
+    ASSERT_EQ(ASSERT_RESULT(other.FetchRow<std::string>(kOrder)), "4,2,3,1,5");
+    ASSERT_OK(c.Execute("SET enable_seqscan = off"));
+    constexpr auto kRange = "SELECT k FROM jobs WHERE s > 'pending' ORDER BY s";
+    ASSERT_TRUE(ASSERT_RESULT(c.HasIndexScan(kRange)));
+    ASSERT_EQ(
+        ASSERT_RESULT(c.FetchAllAsString(kRange, ",", ",")), "3,1,5");
+    ASSERT_NOK(c.Execute("INSERT INTO jobs VALUES (6, 'unknown')"));
+    ASSERT_OK(c.Execute("BEGIN"));
+    ASSERT_OK(c.Execute("CREATE TYPE discarded_state AS ENUM ('a', 'b')"));
+    ASSERT_OK(c.Execute("ROLLBACK"));
+    ASSERT_EQ(
+        ASSERT_RESULT(c.FetchRow<int64_t>(
+            "SELECT count(*) FROM pg_enum e LEFT JOIN pg_type t ON t.oid = e.enumtypid "
+            "WHERE t.oid IS NULL")),
+        0);
+  }
+  server.reset();
+  server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          path, Snapshot(), AllocateFreePort(), CatalogMode::kSerializedTransactions));
+  auto c = ASSERT_RESULT(Connect(*server));
+  ASSERT_EQ(
+      ASSERT_RESULT(c.FetchRow<std::string>(
+          "SELECT string_agg(enumlabel::text, ',' ORDER BY enumsortorder) FROM pg_enum "
+          "WHERE enumtypid = 'job_state'::regtype")),
+      "queued,pending,running,done,errored");
+  ASSERT_EQ(ASSERT_RESULT(c.FetchRow<std::string>(kOrder)), "4,2,3,1,5");
+  ASSERT_OK(c.Execute("DROP TABLE jobs"));
+  ASSERT_OK(c.Execute("DROP TYPE job_state"));
+  ASSERT_EQ(ASSERT_RESULT(c.FetchRow<int64_t>("SELECT count(*) FROM pg_enum")), 0);
+}
+
 // Conflicts with pending transactions wait as in tablet wait queues, and lock status reports the
 // wait to a probe that joins yb_lock_status with pg_stat_activity.yb_backend_xid.
 TEST_F(ReadonlyPgServerTest, WaitsOnConflicts) {
