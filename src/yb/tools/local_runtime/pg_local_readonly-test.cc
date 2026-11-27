@@ -1451,6 +1451,121 @@ TEST_F(ReadonlyPgServerTest, RowLocks) {
   ASSERT_EQ(ASSERT_RESULT(locker.FetchRow<int64_t>("SELECT v FROM locked_rows WHERE k=1")), 13);
 }
 
+// Statistics restored with pg_restore_relation_stats and pg_restore_attribute_stats reach every
+// backend's plans, roll back with their transaction, and survive a restart.
+TEST_F(ReadonlyPgServerTest, RestoresPlannerStatistics) {
+  const auto path = GetTestPath("restored-stats");
+  auto server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          path, Snapshot(), AllocateFreePort(), CatalogMode::kSerializedTransactions));
+  {
+    auto c = ASSERT_RESULT(Connect(*server));
+    ASSERT_OK(c.Execute("CREATE TABLE stats_rows(k bigint PRIMARY KEY, v int)"));
+    ASSERT_OK(c.Execute("CREATE INDEX stats_value ON stats_rows(v)"));
+    ASSERT_OK(c.Execute("BEGIN"));
+    ASSERT_OK(c.Fetch(
+        "SELECT pg_restore_relation_stats('schemaname', 'public', 'relname', 'stats_rows', "
+        "'relpages', 5000::integer, 'reltuples', 2000000::real)"));
+    ASSERT_OK(c.Fetch(
+        "SELECT pg_restore_relation_stats('schemaname', 'public', 'relname', 'stats_value', "
+        "'relpages', 900::integer, 'reltuples', 2000000::real)"));
+    ASSERT_OK(c.Fetch(
+        "SELECT pg_restore_attribute_stats('schemaname', 'public', 'relname', 'stats_rows', "
+        "'attname', 'v', 'inherited', false, 'null_frac', 0.25::real, 'avg_width', 4::integer, "
+        "'n_distinct', 10::real, 'most_common_vals', '{1,2}'::text, "
+        "'most_common_freqs', '{0.5,0.25}'::real[])"));
+    ASSERT_OK(c.Execute("COMMIT"));
+    ASSERT_OK(c.Execute("BEGIN"));
+    ASSERT_OK(c.Fetch(
+        "SELECT pg_restore_attribute_stats('schemaname', 'public', 'relname', 'stats_rows', "
+        "'attname', 'k', 'inherited', false, 'null_frac', 0.5::real, 'avg_width', 8::integer, "
+        "'n_distinct', -1::real)"));
+    ASSERT_OK(c.Execute("ROLLBACK"));
+    auto other = ASSERT_RESULT(Connect(*server));
+    ASSERT_STR_CONTAINS(
+        ASSERT_RESULT(other.FetchRow<std::string>("EXPLAIN SELECT * FROM stats_rows")),
+        "rows=2000000");
+    ASSERT_EQ(
+        ASSERT_RESULT(other.FetchRow<int64_t>(
+            "SELECT count(*) FROM pg_stats WHERE tablename = 'stats_rows'")),
+        1);
+  }
+  server.reset();
+  server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          path, Snapshot(), AllocateFreePort(), CatalogMode::kSerializedTransactions));
+  auto c = ASSERT_RESULT(Connect(*server));
+  ASSERT_EQ(
+      ASSERT_RESULT(c.FetchRow<std::string>(
+          "SELECT n_distinct::text || ' ' || most_common_vals::text FROM pg_stats "
+          "WHERE tablename = 'stats_rows' AND attname = 'v'")),
+      "10 {1,2}");
+  ASSERT_EQ(
+      ASSERT_RESULT(
+          c.FetchRow<int32_t>("SELECT relpages FROM pg_class WHERE relname = 'stats_value'")),
+      900);
+}
+
+// Roles, role membership, grants, per-role settings and default privileges, and a non-superuser
+// login that reads through them, in this database and another.
+TEST_F(ReadonlyPgServerTest, RolesAndGrants) {
+  auto server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          GetTestPath("roles"), Snapshot(), AllocateFreePort(),
+          CatalogMode::kSerializedTransactions));
+  auto admin = ASSERT_RESULT(Connect(*server));
+  for (const auto* statement : {
+           "CREATE TABLE granted_rows(k int PRIMARY KEY)",
+           "INSERT INTO granted_rows VALUES (1), (2)",
+           "CREATE TABLE private_rows(k int PRIMARY KEY)",
+           "CREATE ROLE readers",
+           "CREATE ROLE reader LOGIN",
+           "GRANT readers TO reader",
+           "GRANT USAGE ON SCHEMA public TO readers",
+           "GRANT SELECT ON granted_rows TO readers",
+           "ALTER ROLE reader SET statement_timeout = '5s'",
+           "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO readers",
+           "CREATE TABLE later_rows(k int PRIMARY KEY)",
+           "CREATE DATABASE other_roles_db"}) {
+    ASSERT_OK(admin.Execute(statement));
+  }
+  pgwrapper::PGConnSettings settings{
+      .host = "127.0.0.1",
+      .port = server->SqlPort(),
+      .dbname = "yugabyte",
+      .user = "reader",
+      .connect_timeout = 20};
+  {
+    auto reader = ASSERT_RESULT(pgwrapper::PGConnBuilder(settings).Connect());
+    ASSERT_EQ(ASSERT_RESULT(reader.FetchRow<int64_t>("SELECT count(*) FROM granted_rows")), 2);
+    ASSERT_EQ(ASSERT_RESULT(reader.FetchRow<int64_t>("SELECT count(*) FROM later_rows")), 0);
+    ASSERT_EQ(ASSERT_RESULT(reader.FetchRow<std::string>("SHOW statement_timeout")), "5s");
+    const auto write = reader.Execute("INSERT INTO granted_rows VALUES (3)");
+    ASSERT_NOK(write);
+    ASSERT_EQ(PgsqlError(write), YBPgErrorCode::YB_PG_INSUFFICIENT_PRIVILEGE) << write;
+    const auto hidden = ResultToStatus(reader.Fetch("SELECT * FROM private_rows"));
+    ASSERT_EQ(PgsqlError(hidden), YBPgErrorCode::YB_PG_INSUFFICIENT_PRIVILEGE) << hidden;
+    // A revoke reaches the reader's next statement.
+    ASSERT_OK(admin.Execute("REVOKE SELECT ON granted_rows FROM readers"));
+    const auto revoked = ResultToStatus(reader.Fetch("SELECT count(*) FROM granted_rows"));
+    ASSERT_EQ(PgsqlError(revoked), YBPgErrorCode::YB_PG_INSUFFICIENT_PRIVILEGE) << revoked;
+  }
+  settings.dbname = "other_roles_db";
+  {
+    auto reader = ASSERT_RESULT(pgwrapper::PGConnBuilder(settings).Connect());
+    ASSERT_EQ(ASSERT_RESULT(reader.FetchRow<std::string>("SELECT current_user::text")), "reader");
+  }
+  for (const auto* statement :
+       {"REVOKE readers FROM reader", "DROP OWNED BY readers", "DROP ROLE readers",
+        "DROP ROLE reader"}) {
+    ASSERT_OK(admin.Execute(statement));
+  }
+  ASSERT_EQ(
+      ASSERT_RESULT(admin.FetchRow<int64_t>(
+          "SELECT count(*) FROM pg_roles WHERE rolname IN ('reader', 'readers')")),
+      0);
+}
+
 // Conflicts with pending transactions wait as in tablet wait queues, and lock status reports the
 // wait to a probe that joins yb_lock_status with pg_stat_activity.yb_backend_xid.
 TEST_F(ReadonlyPgServerTest, WaitsOnConflicts) {
