@@ -44,6 +44,8 @@
 #include "yb/util/status_format.h"
 #include "yb/util/sync_point.h"
 
+DECLARE_uint64(local_runtime_max_write_batch_bytes);
+
 namespace yb::local_runtime {
 namespace {
 
@@ -934,10 +936,7 @@ class PgCatalogTransaction::Impl {
     subtransaction = std::max(1u, subtransaction);
     // PgGate returns catalog-version writes to a live parent (including ID 1 at COMMIT).
     // A high-water mark cannot distinguish that from replay; only aborted IDs are forbidden.
-    for (const auto& [first, last] : aborted_ranges_) {
-      SCHECK(
-          subtransaction < first || subtransaction > last, IllegalState, "Aborted subtransaction");
-    }
+    SCHECK(!aborted_subtxns_.Test(subtransaction), IllegalState, "Aborted subtransaction");
     if (native_txn_) RETURN_NOT_OK(native_->SetCatalogSubtransaction(*native_txn_, subtransaction));
     highest_subtxn_ = std::max(highest_subtxn_, subtransaction);
     active_subtxn_ = subtransaction;
@@ -950,7 +949,8 @@ class PgCatalogTransaction::Impl {
     // Include the maximum tag, CF ID and length-varint overhead before extending the overlay.
     SCHECK_LE(
         pending_.GetWriteBatch()->GetDataSize() + key.size() + value.size() + 16,
-        16ULL * 1024 * 1024, InvalidArgument, "Local transaction exceeds 16 MiB staging limit");
+        FLAGS_local_runtime_max_write_batch_bytes, InvalidArgument,
+        "Local transaction exceeds staging limit (--local_runtime_max_write_batch_bytes)");
     staged_.push_back(
         {active_subtxn_, family, std::move(key), std::move(value), std::move(doc_key), write_id,
          deleted});
@@ -961,8 +961,9 @@ class PgCatalogTransaction::Impl {
     else
       pending_.Put(family, entry.key, entry.value);
     SCHECK_LE(
-        pending_.GetWriteBatch()->GetDataSize(), 16ULL * 1024 * 1024, InvalidArgument,
-        "Local transaction exceeds 16 MiB staging limit");
+        pending_.GetWriteBatch()->GetDataSize(), FLAGS_local_runtime_max_write_batch_bytes,
+        InvalidArgument,
+        "Local transaction exceeds staging limit (--local_runtime_max_write_batch_bytes)");
     return Status::OK();
   }
 
@@ -1223,8 +1224,9 @@ class PgCatalogTransaction::Impl {
     watermarks.Put(
         MetadataFamily(), MetadataKey("committed"), std::to_string(commit_time.ToUint64()));
     SCHECK_LE(
-        commit.GetDataSize() + watermarks.GetDataSize(), 16ULL * 1024 * 1024, NotSupported,
-        "Catalog commit exceeds 16 MiB batch limit");
+        commit.GetDataSize() + watermarks.GetDataSize(),
+        FLAGS_local_runtime_max_write_batch_bytes, NotSupported,
+        "Catalog commit exceeds batch limit (--local_runtime_max_write_batch_bytes)");
     TEST_SYNC_POINT("PgCatalogTransaction::BeforeCommit");
     failure_ = storage_->Write(&commit, true, commit_time);
     ++metadata_generation_;
@@ -1249,7 +1251,6 @@ class PgCatalogTransaction::Impl {
   Status RollbackTo(uint32_t subtransaction) {
     RETURN_NOT_OK(Status(failure_));
     SCHECK_GE(subtransaction, 1u, InvalidArgument, "Invalid subtransaction");
-    SCHECK_LT(aborted_ranges_.size(), 1024, NotSupported, "Catalog savepoint limit reached");
     if (!active_) return Status::OK();
     if (native_txn_) {
       highest_subtxn_ =
@@ -1257,12 +1258,16 @@ class PgCatalogTransaction::Impl {
     }
     highest_subtxn_ = std::max(highest_subtxn_, subtransaction);
     if (native_txn_) RETURN_NOT_OK(native_->RollbackCatalog(*native_txn_, subtransaction));
-    aborted_ranges_.emplace_back(subtransaction, highest_subtxn_);
-    std::erase_if(staged_, [subtransaction](const auto& entry) {
+    RETURN_NOT_OK(aborted_subtxns_.SetRange(subtransaction, highest_subtxn_));
+    if (error_subtxn_ >= subtransaction) aborted_ = false;
+    // Tables, bindings and families change only through staged entries. Keeping them, and
+    // metadata_generation_, when none is discarded spares a pass over every table per savepoint
+    // cycle.
+    const auto discarded = std::erase_if(staged_, [subtransaction](const auto& entry) {
       return entry.subtransaction >= subtransaction;
     });
+    if (!discarded) return Status::OK();
     Rebuild();
-    if (error_subtxn_ >= subtransaction) aborted_ = false;
     if (native_) {
       preserve_deleted_bindings_ = true;
       auto status = native_->RefreshCatalogBindings();
@@ -1281,7 +1286,7 @@ class PgCatalogTransaction::Impl {
     pending_.Clear();
     staged_.clear();
     ++metadata_generation_;
-    aborted_ranges_.clear();
+    aborted_subtxns_ = SubtxnSet();
     highest_subtxn_ = 1;
     error_subtxn_ = 0;
     active_ = false;
@@ -1308,7 +1313,7 @@ class PgCatalogTransaction::Impl {
     bool deleted;
   };
   std::vector<StagedEntry> staged_;
-  std::vector<std::pair<uint32_t, uint32_t>> aborted_ranges_;
+  SubtxnSet aborted_subtxns_;
   uint32_t active_subtxn_ = 1;
   uint32_t highest_subtxn_ = 1;
   uint32_t error_subtxn_ = 0;
@@ -1499,6 +1504,10 @@ Status PgCatalogTransaction::ValidateReadTime(HybridTime time) const {
 Status PgCatalogTransaction::CheckHealthy() const {
   std::lock_guard lock(impl_->storage_->mutex());
   return impl_->CheckHealthy();
+}
+uint64_t PgCatalogTransaction::MetadataGeneration() const {
+  std::lock_guard lock(impl_->storage_->mutex());
+  return impl_->metadata_generation_;
 }
 Status PgCatalogTransaction::Begin() {
   std::lock_guard lock(impl_->storage_->mutex());

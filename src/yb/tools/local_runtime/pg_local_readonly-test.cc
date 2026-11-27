@@ -14,13 +14,16 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cctype>
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <limits>
 #include <map>
 #include <set>
+#include <sstream>
 
 #include <rapidjson/document.h>
 
@@ -62,6 +65,7 @@
 DECLARE_int32(ysql_num_shards_per_tserver);
 DECLARE_bool(local_runtime_shared_memory);
 DECLARE_bool(local_runtime_wait_on_conflict);
+DECLARE_uint64(local_runtime_max_write_batch_bytes);
 DECLARE_bool(yb_enable_read_committed_isolation);
 DECLARE_string(ysql_sequence_cache_method);
 
@@ -629,6 +633,8 @@ TEST_F(ReadonlyPgServerTest, CatalogReloadFailureIsFailStop) {
       ASSERT_OK(c.Execute("ALTER TABLE cache_rows ADD COLUMN extra bigint"));
       ASSERT_OK(c.Execute("SAVEPOINT s"));
       ASSERT_OK(c.Execute("UPDATE cache_rows SET v=30 WHERE k=1"));
+      // Rollbacks rebuild descriptors only when they discard a catalog change.
+      ASSERT_OK(c.Execute("ALTER TABLE cache_rows ADD COLUMN discarded bigint"));
       auto* sync = SyncPoint::GetInstance();
       std::atomic<size_t> failures{0};
       auto cleanup = ScopeExit([&] {
@@ -960,6 +966,75 @@ TEST_F(ReadonlyPgServerTest, CommandAppliesCallerPgConf) {
   ASSERT_EQ(ASSERT_RESULT(show("autovacuum")), "off");
   ASSERT_STR_CONTAINS(ASSERT_RESULT(show("shared_preload_libraries")), "auto_explain");
   ASSERT_EQ(ASSERT_RESULT(show("auto_explain.log_min_duration")), "250ms");
+}
+
+// The command logs at WARNING and above unless --minloglevel asks for INFO; backends follow it.
+// PostgreSQL's own few INFO lines (at startup, and as each backend starts) precede PgGate's flag
+// setup and are not counted.
+TEST_F(ReadonlyPgServerTest, CommandLogsInfoOnlyOnRequest) {
+  const auto binary = env_util::GetRootDir("bin") + "/bin/yb-local-readonly";
+  for (const bool info : {false, true}) {
+    const auto port = AllocateFreePort();
+    const auto log = GetTestPath(Format("command-$0.log", info));
+    Subprocess process(
+        "/bin/sh",
+        {"/bin/sh", "-c",
+         Format(
+             "exec '$0' '--data_dir=$1' --sql_port=$2 --experimental_catalog_writes=true$3 "
+             "2>'$4'",
+             binary, GetTestPath(Format("command-logs-$0", info)), port,
+             info ? " --minloglevel=0" : "", log)});
+    process.PipeParentStdout();
+    ASSERT_OK(process.Start());
+    CancelableScopeExit stop([&process] {
+      WARN_NOT_OK(process.KillNoCheckIfRunning(SIGTERM), "Stopping local command");
+      WARN_NOT_OK(process.Wait(), "Reaping local command");
+    });
+    // Readiness follows the end of the command's own SQL session, which would block DDL.
+    const int ready = process.from_child_stdout_fd();
+    ASSERT_EQ(fcntl(ready, F_SETFL, fcntl(ready, F_GETFL) | O_NONBLOCK), 0);
+    std::string output;
+    ASSERT_OK(WaitFor(
+        [&]() -> Result<bool> {
+          char buffer[4096];
+          const auto count = read(ready, buffer, sizeof(buffer));
+          if (count < 0 && (errno == EAGAIN || errno == EINTR)) return false;
+          SCHECK_GT(count, 0, IOError, "Command exited without readiness");
+          output.append(buffer, count);
+          return output.find('\n') != std::string::npos;
+        },
+        60s, "waiting for local command readiness"));
+    pgwrapper::PGConnSettings settings{
+        .host = "127.0.0.1", .port = port, .dbname = "yugabyte", .user = "yugabyte"};
+    {
+      auto connection = ASSERT_RESULT(pgwrapper::PGConnBuilder(settings).Connect());
+      ASSERT_OK(connection.Execute("CREATE TABLE logged(k int PRIMARY KEY)"));
+      ASSERT_OK(connection.Execute("ALTER TABLE logged ADD COLUMN v int"));
+      ASSERT_OK(connection.Execute("INSERT INTO logged VALUES (1, 2)"));
+    }
+    stop.Cancel();
+    ASSERT_OK(process.KillNoCheckIfRunning(SIGTERM));
+    ASSERT_OK(process.Wait());
+    std::ifstream file(log);
+    std::string line;
+    size_t info_lines = 0, session_lines = 0;
+    while (std::getline(file, line)) {
+      if (line.find("Session id acquired") != std::string::npos) ++session_lines;
+      if (line.size() <= 5 || line[0] != 'I' || !std::isdigit(line[1])) continue;
+      std::istringstream fields(line);
+      std::string severity, time, thread, source;
+      fields >> severity >> time >> thread >> source;
+      if (source.find(".c:") == std::string::npos && !source.starts_with("tcmalloc_util.cc")) {
+        ++info_lines;
+      }
+    }
+    if (info) {
+      ASSERT_GT(info_lines, 0);
+      ASSERT_GT(session_lines, 0);
+    } else {
+      ASSERT_EQ(info_lines, 0);
+    }
+  }
 }
 
 TEST_F(ReadonlyPgServerTest, OidReservationsSurviveRestartAndFailure) {
@@ -1624,6 +1699,92 @@ TEST_F(ReadonlyPgServerTest, EnumTypes) {
   ASSERT_OK(c.Execute("DROP TABLE jobs"));
   ASSERT_OK(c.Execute("DROP TYPE job_state"));
   ASSERT_EQ(ASSERT_RESULT(c.FetchRow<int64_t>("SELECT count(*) FROM pg_enum")), 0);
+}
+
+// Savepoint rollbacks are unlimited, in a data transaction and in one with catalog changes: over
+// a thousand ROLLBACK TO SAVEPOINT cycles keep the writes around them and drop the rolled-back
+// ones, including a rolled-back CREATE TABLE. Read committed adds a statement subtransaction per
+// cycle, as in an application test wrapping each test in a transaction. Only the rollback that
+// discards a catalog change rebuilds the table descriptors.
+TEST_F(ReadonlyPgServerTest, ManySavepointRollbacks) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_yb_enable_read_committed_isolation) = true;
+  auto server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          GetTestPath("savepoint-cycles"), Snapshot(), AllocateFreePort(),
+          CatalogMode::kSerializedTransactions));
+  auto c = ASSERT_RESULT(Connect(*server));
+  ASSERT_OK(c.Execute("CREATE TABLE cycles(k int PRIMARY KEY)"));
+  const auto cycles = [](int first) {
+    std::string sql;
+    for (int i = 0; i < 1200; ++i) {
+      sql += "SAVEPOINT sp; SELECT count(*) FROM cycles; ";
+      if (i % 100 == 0) sql += Format("INSERT INTO cycles VALUES ($0); ", first + i);
+      sql += "ROLLBACK TO SAVEPOINT sp; RELEASE SAVEPOINT sp; ";
+    }
+    return sql;
+  };
+  std::atomic<size_t> reloads{0};
+  auto* sync = SyncPoint::GetInstance();
+  sync->SetCallBack("LocalRuntime::ReloadStatus", [&reloads](void*) { ++reloads; });
+  sync->EnableProcessing();
+  auto cleanup = ScopeExit([sync] {
+    sync->DisableProcessing();
+    sync->ClearAllCallBacks();
+  });
+  for (const bool ddl : {false, true}) {
+    const int base = ddl ? 100000 : 0;
+    ASSERT_OK(c.Execute("BEGIN"));
+    ASSERT_OK(c.Execute(Format("INSERT INTO cycles VALUES ($0)", base + 1)));
+    if (ddl) ASSERT_OK(c.Execute("CREATE TABLE created_between_cycles(k int)"));
+    reloads = 0;
+    ASSERT_OK(c.Execute(cycles(base + 10)));
+    ASSERT_EQ(reloads.load(), 0);
+    if (ddl) {
+      ASSERT_OK(c.Execute(
+          "SAVEPOINT sp; CREATE TABLE discarded_between_cycles(k int); "
+          "ROLLBACK TO SAVEPOINT sp; RELEASE SAVEPOINT sp"));
+      ASSERT_GE(reloads.load(), 1);
+    }
+    ASSERT_OK(c.Execute(Format("INSERT INTO cycles VALUES ($0)", base + 2)));
+    ASSERT_OK(c.Execute("COMMIT"));
+  }
+  ASSERT_EQ(
+      ASSERT_RESULT(c.FetchAllAsString("SELECT k FROM cycles ORDER BY k", ",", ",")),
+      "1,2,100001,100002");
+  ASSERT_EQ(ASSERT_RESULT(c.FetchRow<int64_t>("SELECT count(*) FROM created_between_cycles")), 0);
+  ASSERT_TRUE(ASSERT_RESULT(
+      c.FetchRow<bool>("SELECT to_regclass('discarded_between_cycles') IS NULL")));
+}
+
+// --local_runtime_max_write_batch_bytes bounds catalog staging: a DROP SCHEMA ... CASCADE past it
+// fails and leaves the schema intact, and the same drop succeeds under the default.
+TEST_F(ReadonlyPgServerTest, CatalogStagingLimit) {
+  auto server = ASSERT_RESULT(
+      ReadonlyPgServer::Start(
+          GetTestPath("staging-limit"), Snapshot(), AllocateFreePort(),
+          CatalogMode::kSerializedTransactions));
+  auto c = ASSERT_RESULT(Connect(*server));
+  ASSERT_OK(c.Execute("CREATE SCHEMA wide"));
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(c.Execute(Format("CREATE TABLE wide.t$0(k bigint PRIMARY KEY, a int, b text)", i)));
+    ASSERT_OK(c.Execute(Format("CREATE INDEX ON wide.t$0(a)", i)));
+  }
+  const auto relations = [&c] {
+    return c.FetchRow<int64_t>(
+        "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = 'wide'");
+  };
+  const auto created = ASSERT_RESULT(relations());
+  ASSERT_GE(created, 200);
+  const auto limit = FLAGS_local_runtime_max_write_batch_bytes;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_local_runtime_max_write_batch_bytes) = 64 * 1024;
+  const auto refused = c.Execute("DROP SCHEMA wide CASCADE");
+  ASSERT_NOK(refused);
+  ASSERT_STR_CONTAINS(refused.ToString(), "local_runtime_max_write_batch_bytes");
+  ASSERT_EQ(ASSERT_RESULT(relations()), created);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_local_runtime_max_write_batch_bytes) = limit;
+  ASSERT_OK(c.Execute("DROP SCHEMA wide CASCADE"));
+  ASSERT_TRUE(ASSERT_RESULT(c.FetchRow<bool>("SELECT to_regnamespace('wide') IS NULL")));
 }
 
 // Conflicts with pending transactions wait as in tablet wait queues, and lock status reports the
@@ -2895,6 +3056,8 @@ TEST_F(ReadonlyPgServerTest, RejectsForeignPostgresDirectory) {
 }
 
 TEST_F(ReadonlyPgServerTest, LargeNativeTransaction) {
+  // The 17 MiB row below must exceed the write-batch limit.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_local_runtime_max_write_batch_bytes) = 16 * 1024 * 1024;
   const auto path = GetTestPath("large-native-txn");
   auto server = ASSERT_RESULT(
       ReadonlyPgServer::Start(

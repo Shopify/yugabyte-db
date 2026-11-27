@@ -15,6 +15,7 @@
 
 #include <csignal>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -55,7 +56,13 @@ yb::Status ValidateSqlPort(int32_t port) {
 
 int main(int argc, char** argv) {
   FLAGS_logtostderr = true;
+  // At INFO, RocksDB logs every SST open, flush and compaction, DocDB every table schema load, and
+  // PgGate every backend's session. The runtime does these far more often than a tablet server, so
+  // a long run logs gigabytes. --minloglevel=0 restores INFO.
+  FLAGS_minloglevel = 1;
   yb::ParseCommandLineFlags(&argc, &argv, true);
+  // PgGate in each backend reads its flags from FLAGS_* variables.
+  setenv("FLAGS_minloglevel", std::to_string(FLAGS_minloglevel).c_str(), /* overwrite= */ 1);
   yb::InitGoogleLoggingSafeBasic(argv[0]);
 
   if (FLAGS_data_dir.empty()) {

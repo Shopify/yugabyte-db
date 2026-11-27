@@ -93,6 +93,9 @@ class PgCatalogTransaction {
   Status ValidateReadTime(HybridTime time) const;
   bool active() const;
   Status CheckHealthy() const;
+  // Changes with the staged catalog overlay. Equal values around a rollback mean it discarded
+  // no catalog change, so descriptors built before it remain valid.
+  uint64_t MetadataGeneration() const;
   Status Begin();
   // Internal integration gate: no other native transaction may exist. The joined transaction
   // cannot independently commit/abort; Commit/RollbackTo/Abort coordinate both participants.

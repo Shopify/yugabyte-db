@@ -40,5 +40,5 @@ message LocalTransactionPB {
   optional uint32 next_write_id = 6 [default = 0];
   optional uint64 intent_bytes = 7 [default = 0];
   optional uint32 failed_subtransaction = 8 [default = 0];
-  optional uint32 rollbacks = 9 [default = 0];
+  reserved 9;
 }

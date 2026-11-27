@@ -66,10 +66,9 @@ struct WaitingLocks {
 // begin time. SQL row locks write native lock intents. No serializable execution, retries, or
 // history GC. Finished transactions are reclaimed as on a tablet: committed intents are applied
 // to regular rows, then intents and the status record are removed. Bounds: 65536 unfinished
-// transactions, 64 active, 1024 rollbacks per txn. Cumulative encoded intents: 512 MiB per
-// attached SQL txn, 16 MiB per standalone txn. Each encoded intent batch plus resident catalog
-// pending bytes is limited to 16 MiB; the catalog coordinator also limits its final WAL batch to
-// 16 MiB.
+// transactions, 64 active. Cumulative encoded intents: 512 MiB per attached SQL txn, 16 MiB per
+// standalone txn. Each encoded intent batch plus resident catalog pending bytes, and the catalog
+// coordinator's final WAL batch, are limited by --local_runtime_max_write_batch_bytes.
 class PgLocalTxnStore {
  public:
   static Result<std::unique_ptr<PgLocalTxnStore>> Open(const std::string& directory);

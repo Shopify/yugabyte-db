@@ -26,7 +26,8 @@ build/latest/bin/yb-local-readonly \
 ```
 
 Use a new directory initially. Startup emits a one-line JSON readiness record on stdout
-after SQL verification; process logs go to stderr. The record has `protocol_version`
+after SQL verification; process logs go to stderr, at WARNING and above unless
+`--minloglevel=0` is passed. The record has `protocol_version`
 (currently 1), `state` (`ready`), `host`, `sql_port`, `rpc_address`, `mode` (`readonly`
 or `experimental-serialized-sql`), `pid` (the CLI process to signal for shutdown), and
 `data_directory` (the PostgreSQL data directory, matching `SHOW data_directory`).
@@ -209,11 +210,12 @@ identities. Native statement own-write limits remain distinct from the committed
 Joined transactions permit writes to live parent subtransactions, including ID 1 for PgGate's
 commit-time catalog updates; aborted IDs remain rejected.
 
-Limits are 16 MiB for the encoded catalog overlay/final commit batch and for an encoded
-intent batch plus pending catalog bytes, with additional arenas/overlay/rollback overhead.
-Attached SQL transactions may stream up to 512 MiB of cumulative encoded intents. These are
-not all buffered in the catalog overlay. There are 1,024 rollback ranges and 65,536 unfinished
-native transactions. History GC is disabled, so committed versions accumulate. Intents and
+--local_runtime_max_write_batch_bytes (256 MiB) limits the encoded catalog overlay, the final
+commit batch, and an encoded intent batch plus pending catalog bytes, with additional
+arenas/overlay/rollback overhead. Attached SQL transactions may stream up to 512 MiB of
+cumulative encoded intents. These are not all buffered in the catalog overlay. Savepoint
+rollbacks are unlimited, as on a tablet server; there are at most 65,536 unfinished native
+transactions. History GC is disabled, so committed versions accumulate. Intents and
 metadata families use small write buffers (--local_runtime_churn_write_buffer_bytes), and the
 largest intents families are flushed once unflushed intents exceed
 --local_runtime_intents_memtable_budget_bytes: removed intents otherwise stay in memtables beside

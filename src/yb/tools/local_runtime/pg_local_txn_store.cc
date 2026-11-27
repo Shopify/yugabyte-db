@@ -63,6 +63,10 @@ DEFINE_NON_RUNTIME_bool(local_runtime_cache_bindings, true,
 DEFINE_NON_RUNTIME_uint64(local_runtime_intents_memtable_budget_bytes, 64ULL * 1024 * 1024,
     "Unflushed intent bytes across all tables before the largest intents families are flushed. "
     "0 leaves flushing to each family's write buffer size.");
+DEFINE_NON_RUNTIME_uint64(local_runtime_max_write_batch_bytes, 256ULL * 1024 * 1024,
+    "Encoded size limit for write batches held in memory: a catalog transaction's staged "
+    "changes, its commit batch, and each intent batch together with any staged catalog changes. "
+    "Dropping thousands of relations in one statement stages tens of MiB.");
 
 namespace yb::local_runtime {
 namespace {
@@ -70,7 +74,6 @@ namespace {
 constexpr auto kFormat = "local-native-intents/2";
 constexpr size_t kMaxTransactions = 65536;
 constexpr size_t kMaxActive = 64;
-constexpr size_t kMaxResidentBytes = 16 * 1024 * 1024;
 constexpr size_t kMaxStandaloneIntentBytes = 16 * 1024 * 1024;
 constexpr size_t kMaxAttachedIntentBytes = 512 * 1024 * 1024;
 const TabletId kStatusLocation = "local-native-intents";
@@ -316,7 +319,7 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
                 !HybridTime(txn.pb.read_ht()).is_special() &&
                 txn.pb.read_ht() <= clock_.ToUint64() &&
                 txn.metadata.start_time.ToUint64() == txn.pb.read_ht() &&
-                txn.pb.intent_bytes() <= MaxIntentBytes() && txn.pb.rollbacks() <= 1024 &&
+                txn.pb.intent_bytes() <= MaxIntentBytes() &&
                 txn.subtransaction.subtransaction_id > 0 &&
                 txn.pb.failed_subtransaction() <= txn.subtransaction.subtransaction_id &&
                 (txn.pb.status() == TransactionStatus::PENDING ||
@@ -958,9 +961,12 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
     const auto batch_bytes = batch.GetDataSize();
     const auto catalog_bytes = staged_bytes_ ? staged_bytes_() : 0;
     // Earlier intents are already in RocksDB/WAL, not resident in the catalog overlay.
+    const uint64_t resident_limit = FLAGS_local_runtime_max_write_batch_bytes;
     SCHECK(
-        catalog_bytes <= kMaxResidentBytes && batch_bytes <= kMaxResidentBytes - catalog_bytes,
-        NotSupported, "Transaction exceeds native intent staging limit");
+        catalog_bytes <= resident_limit && batch_bytes <= resident_limit - catalog_bytes,
+        NotSupported,
+        "Transaction exceeds native intent staging limit "
+        "(--local_runtime_max_write_batch_bytes)");
     const auto max_intent_bytes = MaxIntentBytes();
     SCHECK(
         next.intent_bytes() <= max_intent_bytes &&
@@ -1496,16 +1502,18 @@ class PgLocalTxnStore::Impl : public TransactionStatusManager {
         !txn->catalog_owned || catalog_owned, NotSupported,
         "Rollback through the catalog coordinator");
     SCHECK(subtransaction > 0, InvalidArgument, "Invalid rollback subtransaction");
-    SCHECK_LT(txn->pb.rollbacks(), 1024, NotSupported, "Subtransaction rollback limit reached");
     // SQL may roll back to a savepoint this store never saw: no request used it or any later one.
+    // As on a tablet server, the aborted set is unbounded.
     auto sub = txn->subtransaction;
     sub.subtransaction_id = std::max(sub.subtransaction_id, subtransaction);
     RETURN_NOT_OK(sub.aborted.SetRange(subtransaction, sub.subtransaction_id));
+    const bool clears_failure = txn->pb.failed_subtransaction() >= subtransaction;
+    // ROLLBACK TO SAVEPOINT repeats the rollback to the target after restarting it.
+    if (sub == txn->subtransaction && !clears_failure) return Status::OK();
     auto next = txn->pb;
-    next.set_rollbacks(next.rollbacks() + 1);
     next.clear_subtransaction();
     sub.ToPB(next.mutable_subtransaction());
-    if (next.failed_subtransaction() >= subtransaction) next.clear_failed_subtransaction();
+    if (clears_failure) next.clear_failed_subtransaction();
     // Unsynced, like the intents it masks: recovery aborts a pending transaction outright, and a
     // later commit's sync covers this earlier WAL record. PgGate sends one before every abort.
     return Save(txn, std::move(next), false);

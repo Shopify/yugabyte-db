@@ -2613,8 +2613,16 @@ class ReadonlyService : public UnsupportedPgClientService,
           catalog_.transaction_->active() && req->options().txn_serial_no() != session.txn_serial) {
         status = STATUS(NotSupported, "Cannot roll back a different catalog transaction");
       } else {
-        status = catalog_.transaction_->RollbackTo(req->sub_transaction_id());
-        if (status.ok()) status = catalog_.ReloadTables();
+        auto& txn = *catalog_.transaction_;
+        const auto generation = txn.MetadataGeneration();
+        status = txn.RollbackTo(req->sub_transaction_id());
+        if (status.ok() && txn.MetadataGeneration() != generation) {
+          status = catalog_.ReloadTables();
+        } else if (status.ok()) {
+          // The descriptors stand; this is what ReloadTables checks before rebuilding them.
+          status = Status(catalog_.failure_);
+          if (status.ok()) status = txn.CheckHealthy();
+        }
         if (status.ok() && session.failed_subtxn >= req->sub_transaction_id())
           session.transaction_failed = false;
       }
